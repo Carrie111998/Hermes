@@ -360,8 +360,9 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     (tui_dir / "src").mkdir(parents=True)
     (tui_dir / "scripts").mkdir()
     (tui_dir / "packages" / "hermes-ink" / "src").mkdir(parents=True)
+    (repo / "apps" / "shared" / "src").mkdir(parents=True)
     (repo / "package.json").write_text(
-        '{"private":true,"workspaces":["ui-tui","ui-tui/packages/*"],'
+        '{"private":true,"workspaces":["apps/*","ui-tui","ui-tui/packages/*"],'
         '"overrides":{"lodash":"4.18.1"}}',
         encoding="utf-8",
     )
@@ -370,7 +371,8 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
         encoding="utf-8",
     )
     (tui_dir / "package.json").write_text(
-        '{"name":"hermes-tui","scripts":{"build":"node scripts/build.mjs"}}',
+        '{"name":"hermes-tui","scripts":{"build":"node scripts/build.mjs"},'
+        '"dependencies":{"@hermes/shared":"file:../apps/shared"}}',
         encoding="utf-8",
     )
     (tui_dir / "scripts" / "build.mjs").write_text(
@@ -381,6 +383,13 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     )
     (tui_dir / "packages" / "hermes-ink" / "package.json").write_text(
         '{"name":"@hermes/ink"}', encoding="utf-8"
+    )
+    (repo / "apps" / "shared" / "package.json").write_text(
+        '{"name":"@hermes/shared","exports":{".":"./src/index.ts"}}',
+        encoding="utf-8",
+    )
+    (repo / "apps" / "shared" / "src" / "index.ts").write_text(
+        "export const shared = true\n", encoding="utf-8"
     )
 
     cache_dir = tmp_path / "home" / "cache" / "tui-bundle"
@@ -399,6 +408,7 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
             assert '"overrides"' in root_manifest
             assert (build_dir / "package-lock.json").is_file()
             assert (build_dir / "ui-tui" / "package.json").is_file()
+            assert (build_dir / "apps" / "shared" / "src" / "index.ts").is_file()
         elif cmd == ["npm", "run", "build", "--workspace", "ui-tui"]:
             assert cwd == str(build_dir)
             entry = build_dir / "ui-tui" / "dist" / "entry.js"
@@ -430,6 +440,38 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
         "--progress=false",
     ]
     assert calls[1][0] == ["npm", "run", "build", "--workspace", "ui-tui"]
+
+
+def test_tui_bundle_stamp_tracks_external_file_workspace(main_mod, tmp_path):
+    repo = tmp_path / "repo"
+    tui_dir = repo / "ui-tui"
+    shared_source = repo / "apps" / "shared" / "src" / "index.ts"
+    (tui_dir / "src").mkdir(parents=True)
+    shared_source.parent.mkdir(parents=True)
+    (repo / "package.json").write_text(
+        '{"private":true,"workspaces":["apps/*","ui-tui"]}', encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text(
+        '{"name":"hermes-agent","lockfileVersion":3,"packages":{}}',
+        encoding="utf-8",
+    )
+    (tui_dir / "package.json").write_text(
+        '{"name":"hermes-tui","dependencies":'
+        '{"@hermes/shared":"file:../apps/shared"}}',
+        encoding="utf-8",
+    )
+    (tui_dir / "src" / "entry.tsx").write_text(
+        "console.log('tui')\n", encoding="utf-8"
+    )
+    (repo / "apps" / "shared" / "package.json").write_text(
+        '{"name":"@hermes/shared"}', encoding="utf-8"
+    )
+    shared_source.write_text("export const version = 1\n", encoding="utf-8")
+
+    first = main_mod._tui_bundle_stamp(tui_dir)
+    shared_source.write_text("export const version = 2\n", encoding="utf-8")
+
+    assert main_mod._tui_bundle_stamp(tui_dir) != first
 
 
 def test_tui_cache_refresh_keeps_previous_returned_generation_launchable(

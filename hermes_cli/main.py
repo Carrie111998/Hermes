@@ -1914,6 +1914,51 @@ def _cleanup_tui_cached_generations(cache_root: Path, active: Path) -> None:
         shutil.rmtree(candidate, ignore_errors=True)
 
 
+def _tui_external_local_workspaces(tui_dir: Path) -> list[tuple[Path, Path]]:
+    """Return external ``file:`` workspaces required by the TUI package.
+
+    Only directories inside the root npm workspace are accepted. Packages
+    already nested below ``ui-tui`` are copied with the TUI tree itself.
+    """
+    try:
+        manifest = json.loads((tui_dir / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return []
+
+    source_root = _workspace_root(tui_dir).resolve()
+    resolved_tui = tui_dir.resolve()
+    local_workspaces: dict[Path, Path] = {}
+    for section in ("dependencies", "devDependencies", "optionalDependencies"):
+        dependencies = manifest.get(section)
+        if not isinstance(dependencies, dict):
+            continue
+        for spec in dependencies.values():
+            if not isinstance(spec, str) or not spec.startswith("file:"):
+                continue
+            candidate = (tui_dir / spec.removeprefix("file:")).resolve()
+            try:
+                relative = candidate.relative_to(source_root)
+            except ValueError:
+                continue
+            if candidate == resolved_tui or resolved_tui in candidate.parents:
+                continue
+            if candidate.is_dir():
+                local_workspaces[relative] = candidate
+    return sorted(local_workspaces.items(), key=lambda item: item[0].as_posix())
+
+
+def _iter_tui_external_workspace_inputs(tui_dir: Path):
+    """Yield files copied from external local workspaces into the cache build."""
+    for relative, workspace in _tui_external_local_workspaces(tui_dir):
+        for path in workspace.rglob("*"):
+            if not path.is_file():
+                continue
+            workspace_relative = path.relative_to(workspace)
+            if any(part in {"node_modules", "dist"} for part in workspace_relative.parts):
+                continue
+            yield relative / workspace_relative, path
+
+
 def _tui_bundle_stamp(root: Path) -> str:
     """Content stamp for the self-contained TUI bundle cache."""
     h = hashlib.sha256()
@@ -1925,6 +1970,15 @@ def _tui_bundle_stamp(root: Path) -> str:
         except OSError:
             continue
         h.update(rel.encode("utf-8", "surrogateescape"))
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\0")
+    for rel, path in _iter_tui_external_workspace_inputs(root):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        h.update(f"workspace:{rel.as_posix()}".encode("utf-8", "surrogateescape"))
         h.update(b"\0")
         h.update(data)
         h.update(b"\0")
@@ -2037,6 +2091,14 @@ def _ensure_tui_cached_bundle(
                 tmp_build / "ui-tui",
                 ignore=shutil.ignore_patterns("node_modules", "dist"),
             )
+            for relative, workspace in _tui_external_local_workspaces(tui_dir):
+                destination = tmp_build / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    workspace,
+                    destination,
+                    ignore=shutil.ignore_patterns("node_modules", "dist"),
+                )
             if build_dir.exists():
                 shutil.rmtree(build_dir)
             tmp_build.replace(build_dir)
