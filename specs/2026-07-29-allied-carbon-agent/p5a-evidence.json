@@ -1,0 +1,1068 @@
+{
+  "dev_mailbox": {
+    "adapter_factory_callback": true,
+    "chat_handler_calls": 1,
+    "chat_handler_effect": "AsyncMock no-op; zero conversational egress",
+    "event": {
+      "event_type": "pickup_advice",
+      "external_id": "<CAPX646htrriJdGvnWP5dy_Nx897ydz=XKpXishjnouAHjM1Gng@mail.gmail.com>",
+      "id": 53,
+      "match_method": "deterministic",
+      "matched_task_id": "t_d43c6df6",
+      "source": "email",
+      "status": "applied"
+    },
+    "host": "pa-dev-sg",
+    "instance": {
+      "corr": "{\"booking_ref\":\"P5A-MAILBOX-20260730T225312Z\"}",
+      "entity_key": "mailbox:P5A-MAILBOX-20260730T225312Z",
+      "state": "advancing",
+      "task_id": "t_d43c6df6",
+      "template_id": "synthetic-freight-loop@1"
+    },
+    "mail": {
+      "body_exists": true,
+      "body_ref": "workflow/ingress/email/bodies/fe540f76b730a4217401bb5accb71a03621c44e94bcc2fbeff8bb56e04298a6b.txt",
+      "body_sha256": "fe540f76b730a4217401bb5accb71a03621c44e94bcc2fbeff8bb56e04298a6b",
+      "external_id": "<CAPX646htrriJdGvnWP5dy_Nx897ydz=XKpXishjnouAHjM1Gng@mail.gmail.com>",
+      "sender": "edna@papercut-labs.com",
+      "subject": "[P5A-SYNTHETIC] pickup advice P5A-MAILBOX-20260730T225312Z"
+    },
+    "release_sha": "ffc5a396987bf9d0f20d5cb9f70ccc1b19796ea9",
+    "task": {
+      "current_step_key": "create_job",
+      "id": "t_d43c6df6",
+      "status": "ready"
+    },
+    "transition": {
+      "applied_at": 1785452066,
+      "event_id": 53,
+      "step_key": "await_pickup",
+      "task_id": "t_d43c6df6",
+      "to_step": "create_job"
+    }
+  },
+  "environment": {
+    "host": "pa-dev-sg",
+    "live_pa_deploy_touched": false,
+    "name": "pa-workflow-dev",
+    "policy": "synthetic-only"
+  },
+  "phase": "p5a",
+  "recorded_at": "2026-07-30T22:56:57.690065+00:00",
+  "source_head": "709e8cbdf6e173c3b0196912e41fe14d6d9660c3",
+  "synthetic_harness": {
+    "cases": {
+      "chase_caps": {
+        "citations": [
+          {
+            "identity": "chase wait reached max_fires=3",
+            "observed": {
+              "fires_used": 3,
+              "id": 29,
+              "kind": "timer",
+              "status": "satisfied",
+              "step_key": "await_pickup",
+              "task_id": "t_45577c4c",
+              "timer_action": "chase",
+              "timer_at": 2000518400
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "chase timer event 1",
+            "observed": {
+              "event_type": "chase",
+              "external_id": "wf:t_45577c4c:await_pickup:29:1",
+              "id": 34,
+              "match_method": "deterministic:timer",
+              "matched_task_id": "t_45577c4c",
+              "source": "timer",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "chase timer event 2",
+            "observed": {
+              "event_type": "chase",
+              "external_id": "wf:t_45577c4c:await_pickup:29:2",
+              "id": 35,
+              "match_method": "deterministic:timer",
+              "matched_task_id": "t_45577c4c",
+              "source": "timer",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "chase timer event 3",
+            "observed": {
+              "event_type": "chase",
+              "external_id": "wf:t_45577c4c:await_pickup:29:3",
+              "id": 36,
+              "match_method": "deterministic:timer",
+              "matched_task_id": "t_45577c4c",
+              "source": "timer",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "chase outbox rows for t_45577c4c",
+            "observed": {
+              "count": 3,
+              "fourth_tick_created_no_event": true
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_outbox WHERE task_id = ? AND action = 'chase'",
+            "table": "wf_outbox"
+          },
+          {
+            "identity": "resumable exception after chase cap",
+            "observed": {
+              "corr": "{\"booking_ref\":\"BOOK-CHASE\"}",
+              "entity_key": "chase-cap",
+              "parked_since": 2000000000,
+              "state": "exception",
+              "task_id": "t_45577c4c",
+              "vars": "{\"customer\":\"synthetic-customer\",\"direction\":\"export\",\"vessel\":\"synthetic-vessel\"}"
+            },
+            "query": "SELECT task_id, entity_key, state, corr, vars, parked_since FROM wf_instance WHERE task_id = ?",
+            "table": "wf_instance"
+          },
+          {
+            "identity": "tasks.id=t_45577c4c",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "await_pickup",
+              "id": "t_45577c4c",
+              "status": "blocked",
+              "title": "chase-cap"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          }
+        ],
+        "ids": {
+          "task": "t_45577c4c",
+          "timer_events": [
+            34,
+            35,
+            36
+          ],
+          "wait": 29
+        },
+        "results": {
+          "fourth_tick_timer_results": [],
+          "outbox_count": 3,
+          "tick_timer_results": [
+            [
+              "chase"
+            ],
+            [
+              "chase"
+            ],
+            [
+              "exception"
+            ]
+          ]
+        }
+      },
+      "done_instance_retention": {
+        "citations": [
+          {
+            "identity": "completed task retained for late correlation",
+            "observed": {
+              "completed_at": 2000000000,
+              "current_step_key": "done",
+              "id": "t_6c59d396",
+              "status": "done",
+              "title": "done-retention"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "done workflow instance",
+            "observed": {
+              "corr": "{\"booking_ref\":\"BOOK-DONE\"}",
+              "entity_key": "done-retention",
+              "parked_since": null,
+              "state": "done",
+              "task_id": "t_6c59d396",
+              "vars": "{\"booking_ref\":\"BOOK-DONE\",\"customer\":\"synthetic-customer\",\"direction\":\"export\",\"vessel\":\"synthetic-vessel\"}"
+            },
+            "query": "SELECT task_id, entity_key, state, corr, vars, parked_since FROM wf_instance WHERE task_id = ?",
+            "table": "wf_instance"
+          },
+          {
+            "identity": "late non-mutation email softly superseded",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/ae8099f85c221adf9d890efa3b0906ec2ab81bc81f2ae1a154ed5e83c4c57fe9.txt",
+                "sha256": "ae8099f85c221adf9d890efa3b0906ec2ab81bc81f2ae1a154ed5e83c4c57fe9"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-done-late-normal-29@synthetic.test>",
+              "id": 31,
+              "match_method": "deterministic",
+              "matched_task_id": "t_6c59d396",
+              "source": "email",
+              "status": "superseded"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "late mutation email needs review",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/43b23c25ca3174b13931755c1c806f099725cf2f3700d25cd56ac495b15fa7a6.txt",
+                "sha256": "43b23c25ca3174b13931755c1c806f099725cf2f3700d25cd56ac495b15fa7a6"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-done-late-mutation-30@synthetic.test>",
+              "id": 32,
+              "match_method": "deterministic",
+              "matched_task_id": "t_6c59d396",
+              "source": "email",
+              "status": "needs_review"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          }
+        ],
+        "ids": {
+          "late_event": 31,
+          "mutation_event": 32,
+          "task": "t_6c59d396"
+        },
+        "results": {
+          "late_mutation": "needs_review",
+          "late_normal": "superseded"
+        }
+      },
+      "duplicates_three_layers": {
+        "citations": [
+          {
+            "identity": "email source/external_id <p5a-layer-one@synthetic.test>",
+            "observed": {
+              "count": 1,
+              "second_ingest_return": null
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_event WHERE source = 'email' AND external_id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "layer-one email event",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/6dbae8643f2fc411867504d4a6af34aa256676524f70c0f54f3e9c11e62d23d3.txt",
+                "sha256": "6dbae8643f2fc411867504d4a6af34aa256676524f70c0f54f3e9c11e62d23d3"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-layer-one@synthetic.test>",
+              "id": 17,
+              "match_method": "deterministic",
+              "matched_task_id": "t_77f5b7d2",
+              "source": "email",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "forwarded copy no-op",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/6dbae8643f2fc411867504d4a6af34aa256676524f70c0f54f3e9c11e62d23d3.txt",
+                "sha256": "6dbae8643f2fc411867504d4a6af34aa256676524f70c0f54f3e9c11e62d23d3"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-layer-two-forwarded-16@synthetic.test>",
+              "id": 18,
+              "match_method": "deterministic",
+              "matched_task_id": "t_77f5b7d2",
+              "source": "email",
+              "status": "superseded"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "one transition primary key for task t_3831b33d,event 20",
+            "observed": {
+              "count": 1,
+              "second_apply_result": "re_correlate"
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          },
+          {
+            "identity": "same event applied twice",
+            "observed": {
+              "event_type": "pickup_advice",
+              "external_id": "p5a-duplicate-transition-event-18",
+              "id": 20,
+              "match_method": "deterministic",
+              "matched_task_id": "t_3831b33d",
+              "source": "synthetic",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "tasks.id=t_3831b33d",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "create_job",
+              "id": "t_3831b33d",
+              "status": "ready",
+              "title": "duplicate-transition"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          }
+        ],
+        "ids": {
+          "duplicate_event": 17,
+          "first_event": 17,
+          "forwarded_event": 18,
+          "replay_task": "t_3831b33d",
+          "task": "t_77f5b7d2",
+          "transition_event": 20
+        },
+        "results": {
+          "first_apply": "applied",
+          "first_transition": "applied",
+          "forwarded": "superseded",
+          "same_source_external_second_ingest_returned_none": true,
+          "second_transition": "re_correlate",
+          "transition_count": 1
+        }
+      },
+      "manual_observation_advance": {
+        "citations": [
+          {
+            "identity": "wf_event.id=47 state observation",
+            "observed": {
+              "event_type": "container_assigned",
+              "external_id": "probe:t_4e4776d9:container",
+              "id": 47,
+              "match_method": "deterministic",
+              "matched_task_id": "t_4e4776d9",
+              "probe_read_only": true,
+              "second_observation_duplicate": 1,
+              "source": "state_poll",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "wf_transition.task_id=t_4e4776d9,event_id=47",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 47,
+              "step_key": "await_container",
+              "task_id": "t_4e4776d9",
+              "to_step": "notify_customer"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          },
+          {
+            "identity": "container observation advanced task",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "notify_customer",
+              "id": "t_4e4776d9",
+              "status": "ready",
+              "title": "manual-observation-first"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "poll duplicate ledger for probe:t_4e4776d9:container",
+            "observed": {
+              "count": 1,
+              "poll_duplicates": 1
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_event WHERE source = 'state_poll' AND external_id = ?",
+            "table": "wf_event"
+          }
+        ],
+        "ids": {
+          "held_probe_target": "t_d3ee293f",
+          "observation_event": 47,
+          "task": "t_4e4776d9"
+        },
+        "results": {
+          "first_resulting_step": "notify_customer",
+          "first_tick_applied": [
+            47
+          ],
+          "first_tick_poll_events": [
+            47
+          ],
+          "second_target_still_waiting": "await_container",
+          "second_tick_poll_duplicates": 1
+        }
+      },
+      "out_of_order_buffer": {
+        "citations": [
+          {
+            "identity": "tasks.id=t_58403237",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "invoice",
+              "id": "t_58403237",
+              "status": "ready",
+              "title": "out-of-order"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "gate_in buffered then consumed",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/d92b2bae4b3d234898c70c0ac0ded5b4f0d4eeb836a283e2b28e61dccf36f1d7.txt",
+                "sha256": "d92b2bae4b3d234898c70c0ac0ded5b4f0d4eeb836a283e2b28e61dccf36f1d7"
+              },
+              "event_type": "gate_in",
+              "external_id": "<p5a-out-of-order-gate-12@synthetic.test>",
+              "id": 13,
+              "match_method": "deterministic",
+              "matched_task_id": "t_58403237",
+              "source": "email",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "wf_transition.task_id=t_58403237,event_id=13",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 13,
+              "step_key": "await_gatein",
+              "task_id": "t_58403237",
+              "to_step": "invoice"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          },
+          {
+            "identity": "past vgm duplicate superseded",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/2b1e1f0a7dc5bf96f0266b3593f3df75526389a929440741e463d0405237fa1c.txt",
+                "sha256": "2b1e1f0a7dc5bf96f0266b3593f3df75526389a929440741e463d0405237fa1c"
+              },
+              "event_type": "vgm_reply",
+              "external_id": "<p5a-out-of-order-past-14@synthetic.test>",
+              "id": 15,
+              "match_method": "deterministic",
+              "matched_task_id": "t_58403237",
+              "source": "email",
+              "status": "superseded"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "transitions for task t_58403237",
+            "observed": {
+              "count": 3,
+              "expected_after_gate_in": true
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_transition WHERE task_id = ?",
+            "table": "wf_transition"
+          }
+        ],
+        "ids": {
+          "buffered_event": 13,
+          "past_event": 15,
+          "task": "t_58403237"
+        },
+        "results": {
+          "after_enter": "matched",
+          "apply": "applied",
+          "before_enter": "buffered",
+          "buffered": "buffered",
+          "past": "superseded"
+        }
+      },
+      "propose_approve_edit_diff": {
+        "citations": [
+          {
+            "identity": "wf_approval.id=1",
+            "observed": {
+              "action": "send_email",
+              "decided_by": "p5a-reviewer",
+              "decision_diff": null,
+              "id": 1,
+              "outbox_count": 1,
+              "status": "approved",
+              "task_id": "t_c900d96e"
+            },
+            "query": "SELECT id, task_id, action, status, decided_by, decision_diff, resume_token FROM wf_approval WHERE id = ?",
+            "table": "wf_approval"
+          },
+          {
+            "identity": "wf_outbox task_id=t_c900d96e",
+            "observed": {
+              "action": "send_email",
+              "id": 5,
+              "payload": "{\"body\":\"original\",\"to\":\"recipient@example.test\"}",
+              "status": "pending",
+              "task_id": "t_c900d96e"
+            },
+            "query": "SELECT id, task_id, action, payload, status FROM wf_outbox WHERE task_id = ?",
+            "table": "wf_outbox"
+          },
+          {
+            "identity": "wf_approval.id=2",
+            "observed": {
+              "action": "send_email",
+              "decided_by": "p5a-reviewer",
+              "decision_diff": "[{\"op\":\"replace\",\"path\":\"/body\",\"value\":\"edited\"},{\"op\":\"add\",\"path\":\"/field\",\"value\":\"added\"}]",
+              "id": 2,
+              "replay_result": null,
+              "status": "edited_approved",
+              "task_id": "t_ea042c13",
+              "token_rotated": true
+            },
+            "query": "SELECT id, task_id, action, status, decided_by, decision_diff, resume_token FROM wf_approval WHERE id = ?",
+            "table": "wf_approval"
+          },
+          {
+            "identity": "wf_outbox task_id=t_ea042c13",
+            "observed": {
+              "action": "send_email",
+              "id": 6,
+              "payload": "{\"body\":\"edited\",\"field\":\"added\",\"to\":\"recipient@example.test\"}",
+              "status": "pending",
+              "task_id": "t_ea042c13"
+            },
+            "query": "SELECT id, task_id, action, payload, status FROM wf_outbox WHERE task_id = ?",
+            "table": "wf_outbox"
+          }
+        ],
+        "ids": {
+          "edited_approval": 2,
+          "edited_event": 44,
+          "edited_task": "t_ea042c13",
+          "plain_approval": 1,
+          "plain_event": 43,
+          "plain_task": "t_c900d96e"
+        },
+        "results": {
+          "edited_outbox_count": 1,
+          "edited_status": "edited_approved",
+          "plain_outbox_count": 1,
+          "plain_status": "approved",
+          "replay_result": null,
+          "token_rotated": true
+        }
+      },
+      "shared_ref_two_live": {
+        "citations": [
+          {
+            "identity": "candidate task shared-first",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "await_gatein",
+              "id": "t_696ff8d2",
+              "status": "ready",
+              "title": "shared-first"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "candidate task shared-second",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "await_vgm",
+              "id": "t_610c605b",
+              "status": "blocked",
+              "title": "shared-second"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "chosen task current await_vgm wait",
+            "observed": {
+              "fires_used": 0,
+              "id": 6,
+              "kind": "timer",
+              "status": "superseded",
+              "step_key": "await_vgm",
+              "task_id": "t_696ff8d2",
+              "timer_action": "chase",
+              "timer_at": 2000086400
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "other candidate current await_vgm wait",
+            "observed": {
+              "fires_used": 0,
+              "id": 4,
+              "kind": "timer",
+              "status": "armed",
+              "step_key": "await_vgm",
+              "task_id": "t_610c605b",
+              "timer_action": "chase",
+              "timer_at": 2000086400
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "first event current compatibility match",
+            "observed": {
+              "event_type": "pickup_advice",
+              "external_id": "p5a-shared-first-event-3",
+              "id": 3,
+              "match_method": "deterministic",
+              "matched_task_id": "t_696ff8d2",
+              "source": "synthetic",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "wf_transition.task_id=t_696ff8d2,event_id=3",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 3,
+              "step_key": "await_pickup",
+              "task_id": "t_696ff8d2",
+              "to_step": "create_job"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          },
+          {
+            "identity": "second event direction discriminator match",
+            "observed": {
+              "event_type": "vgm_reply",
+              "external_id": "p5a-shared-second-event-5",
+              "id": 5,
+              "match_method": "deterministic",
+              "matched_task_id": "t_696ff8d2",
+              "source": "synthetic",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "wf_transition.task_id=t_696ff8d2,event_id=5",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 5,
+              "step_key": "await_vgm",
+              "task_id": "t_696ff8d2",
+              "to_step": "await_gatein"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          }
+        ],
+        "ids": {
+          "first_event": 3,
+          "first_task": "t_696ff8d2",
+          "second_event": 5,
+          "second_task": "t_610c605b"
+        },
+        "results": {
+          "first_apply": "applied",
+          "first_match": "matched",
+          "second_apply": "applied",
+          "second_match": "matched"
+        }
+      },
+      "timer_races": {
+        "citations": [
+          {
+            "identity": "event won before due timer",
+            "observed": {
+              "event_type": "pickup_advice",
+              "external_id": "p5a-race-event-first-33",
+              "id": 38,
+              "match_method": "deterministic",
+              "matched_task_id": "t_48215a74",
+              "source": "synthetic",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "event-winning timer superseded",
+            "observed": {
+              "fires_used": 0,
+              "id": 31,
+              "kind": "timer",
+              "status": "superseded",
+              "step_key": "await_pickup",
+              "task_id": "t_48215a74",
+              "timer_action": "chase",
+              "timer_at": 2000259200
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "no timer event for event-winning wait 31",
+            "observed": {
+              "count": 0
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_event WHERE source = 'timer' AND json_extract(payload, '$.wait_id') = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "timer event won first",
+            "observed": {
+              "event_type": "chase",
+              "external_id": "wf:t_73fcb394:await_vgm:33:1",
+              "id": 40,
+              "match_method": "deterministic:timer",
+              "matched_task_id": "t_73fcb394",
+              "source": "timer",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "timer-winning wait invalidated on later advance",
+            "observed": {
+              "fires_used": 1,
+              "id": 33,
+              "kind": "timer",
+              "status": "superseded",
+              "step_key": "await_vgm",
+              "task_id": "t_73fcb394",
+              "timer_action": "chase",
+              "timer_at": 2000086400
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "wf_transition.task_id=t_73fcb394,event_id=41",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 41,
+              "step_key": "await_vgm",
+              "task_id": "t_73fcb394",
+              "to_step": "await_gatein"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          },
+          {
+            "identity": "later vgm event is past and superseded",
+            "observed": {
+              "event_type": "vgm_reply",
+              "external_id": "p5a-race-late-event-36",
+              "id": 42,
+              "match_method": "deterministic",
+              "matched_task_id": "t_73fcb394",
+              "source": "synthetic",
+              "status": "superseded"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "no second transition after late event for t_73fcb394",
+            "observed": {
+              "after_late": 2,
+              "before_late": 2,
+              "count": 2
+            },
+            "query": "SELECT COUNT(*) AS count FROM wf_transition WHERE task_id = ?",
+            "table": "wf_transition"
+          }
+        ],
+        "ids": {
+          "event_wins_event": 38,
+          "event_wins_task": "t_48215a74",
+          "event_wins_wait": 31,
+          "late_event": 42,
+          "timer_event": 40,
+          "timer_wins_task": "t_73fcb394",
+          "timer_wins_wait": 33
+        },
+        "results": {
+          "event_wins_match": "matched",
+          "event_wins_tick_timer_results": [],
+          "event_wins_timer_count": 0,
+          "event_wins_wait_status": "superseded",
+          "timer_wins_late": "superseded",
+          "timer_wins_tick_timer_results": [
+            "chase"
+          ],
+          "transition_count_after_late": 2,
+          "transition_count_before_late": 2
+        }
+      },
+      "two_match_human_pick": {
+        "citations": [
+          {
+            "identity": "retained candidate first",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "await_pickup",
+              "id": "t_8636fdc5",
+              "status": "blocked",
+              "title": "human-first"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "human-selected candidate second",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "create_job",
+              "id": "t_c1b3a993",
+              "status": "ready",
+              "title": "human-second"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "wf_wait.id=9",
+            "observed": {
+              "fires_used": 0,
+              "id": 9,
+              "kind": "event",
+              "status": "armed",
+              "step_key": "await_pickup",
+              "task_id": "t_8636fdc5",
+              "timer_action": null,
+              "timer_at": null
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "wf_wait.id=11",
+            "observed": {
+              "fires_used": 0,
+              "id": 11,
+              "kind": "event",
+              "status": "satisfied",
+              "step_key": "await_pickup",
+              "task_id": "t_c1b3a993",
+              "timer_action": null,
+              "timer_at": null
+            },
+            "query": "SELECT id, task_id, step_key, kind, timer_action, fires_used, status, timer_at FROM wf_wait WHERE id = ?",
+            "table": "wf_wait"
+          },
+          {
+            "identity": "ambiguous event resolved by human",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/241d1ba465fc43f10d71dbf8061cf0d891ea1cc40c77475ca6abaf1e1c30e816.txt",
+                "sha256": "241d1ba465fc43f10d71dbf8061cf0d891ea1cc40c77475ca6abaf1e1c30e816"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-two-match-10@synthetic.test>",
+              "id": 10,
+              "match_method": "human",
+              "matched_task_id": "t_c1b3a993",
+              "source": "email",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "wf_event.id=11 human_resolution",
+            "observed": {
+              "corr": "{\"event_id\":10,\"task_id\":\"t_c1b3a993\"}",
+              "event_type": "human_resolution",
+              "external_id": "event:10:t_c1b3a993",
+              "id": 11,
+              "source": "human_resolution",
+              "status": "received"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, corr FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          }
+        ],
+        "ids": {
+          "event": 10,
+          "first_task": "t_8636fdc5",
+          "human_resolution": 11,
+          "second_task": "t_c1b3a993"
+        },
+        "results": {
+          "ambiguous": "ambiguous",
+          "candidate_task_ids": [
+            "t_8636fdc5",
+            "t_c1b3a993"
+          ],
+          "match_method": "human",
+          "resolved": "matched"
+        }
+      },
+      "zero_match_hold_heal": {
+        "citations": [
+          {
+            "identity": "unmatched before instance",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9.txt",
+                "sha256": "94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-zero-match-6@synthetic.test>",
+              "id": 6,
+              "match_method": "deterministic",
+              "matched_task_id": null,
+              "source": "email",
+              "status": "unmatched"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "buffered after instance creation",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9.txt",
+                "sha256": "94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-zero-match-6@synthetic.test>",
+              "id": 6,
+              "match_method": "deterministic",
+              "matched_task_id": "t_1f3baeb0",
+              "source": "email",
+              "status": "buffered"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "email event across matched-applied",
+            "observed": {
+              "body_ref": {
+                "exists": true,
+                "path": "workflow/ingress/email/bodies/94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9.txt",
+                "sha256": "94e0920ef3e44347819937db7eb1d754af6b7b70ca70f12d2ea32c0b103ce2e9"
+              },
+              "event_type": "pickup_advice",
+              "external_id": "<p5a-zero-match-6@synthetic.test>",
+              "id": 6,
+              "match_method": "deterministic",
+              "matched_task_id": "t_1f3baeb0",
+              "source": "email",
+              "status": "applied"
+            },
+            "query": "SELECT id, source, external_id, event_type, status, matched_task_id, match_method FROM wf_event WHERE id = ?",
+            "table": "wf_event"
+          },
+          {
+            "identity": "tasks.id=t_1f3baeb0",
+            "observed": {
+              "completed_at": null,
+              "current_step_key": "create_job",
+              "id": "t_1f3baeb0",
+              "status": "ready",
+              "title": "zero-instance"
+            },
+            "query": "SELECT id, title, status, current_step_key, completed_at FROM tasks WHERE id = ?",
+            "table": "tasks"
+          },
+          {
+            "identity": "wf_instance.task_id=t_1f3baeb0",
+            "observed": {
+              "corr": "{\"booking_ref\":\"BOOK-ZERO\"}",
+              "entity_key": "zero-instance",
+              "parked_since": null,
+              "state": "advancing",
+              "task_id": "t_1f3baeb0",
+              "vars": "{\"booking_ref\":\"BOOK-ZERO\",\"customer\":\"synthetic-customer\",\"direction\":\"export\",\"result\":\"ready\",\"vessel\":\"synthetic-vessel\"}"
+            },
+            "query": "SELECT task_id, entity_key, state, corr, vars, parked_since FROM wf_instance WHERE task_id = ?",
+            "table": "wf_instance"
+          },
+          {
+            "identity": "wf_transition.task_id=t_1f3baeb0,event_id=6",
+            "observed": {
+              "applied_at": 2000000000,
+              "event_id": 6,
+              "step_key": "await_pickup",
+              "task_id": "t_1f3baeb0",
+              "to_step": "create_job"
+            },
+            "query": "SELECT task_id, step_key, to_step, event_id, applied_at FROM wf_transition WHERE task_id = ? AND event_id = ?",
+            "table": "wf_transition"
+          }
+        ],
+        "ids": {
+          "event": 6,
+          "task": "t_1f3baeb0",
+          "transition_event": 6
+        },
+        "results": {
+          "apply": "applied",
+          "checkpoints": [
+            {
+              "label": "unmatched before instance",
+              "status": "unmatched"
+            },
+            {
+              "label": "buffered after instance creation",
+              "status": "buffered"
+            },
+            {
+              "label": "matched after wait armed",
+              "status": "matched"
+            },
+            {
+              "label": "applied",
+              "status": "applied"
+            }
+          ],
+          "initial_match": "unmatched"
+        }
+      }
+    }
+  },
+  "verification": {
+    "dev_mailbox": "real Gmail delivery into dorm1 on pa-workflow-dev; service stopped during probe and restarted active with Email connected",
+    "focused": "python -m pytest -q tests/integration/test_p5a_dress_rehearsal.py -> 1 passed",
+    "regression": "python -m pytest -q tests/hermes_cli/test_wf_engine_hard_cases.py tests/hermes_cli/test_wf_engine_extraction_approval.py tests/hermes_cli/test_wf_watcher.py tests/integration/test_p4_synthetic_full_loop.py tests/integration/test_p5a_dress_rehearsal.py -> 42 passed"
+  }
+}
