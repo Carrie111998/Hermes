@@ -138,9 +138,11 @@ export function ModelVisibilityDialog({
                   {!collapsed &&
                     models.map(family => {
                       const friendlyName = modelDisplayParts(family.id).name
+
                       const { name, tag } = modelDisplayParts(family.id, {
                         preserveProviderPrefix: ambiguousNames.has(friendlyName)
                       })
+
                       const key = modelVisibilityKey(provider.slug, family.id)
 
                       return (
