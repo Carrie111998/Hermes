@@ -132,6 +132,21 @@ def test_linear_priority_maps_to_kanban_priority_order():
     assert urgent > low > none
 
 
+def test_messages_are_written_for_jean_not_for_a_machine():
+    """Les notifications arrivent sur son telephone : pas de nom de profil brut,
+    pas de titre a rallonge, pas de pave technique."""
+    assert linear_loop.coder_label("hermes-code-a") == "Code A"
+    assert linear_loop.coder_label("hermes-code-b") == "Code B"
+    assert linear_loop.coder_label(None) == "un codeur"
+
+    long_title = "x" * 200
+    assert len(linear_loop.short_title(long_title)) <= 62
+
+    verbeux = "ligne\n\nautre   ligne " + "z" * 400
+    resume = linear_loop.quote(verbeux)
+    assert len(resume) <= 200 and "\n" not in resume and resume.endswith("…")
+
+
 def test_issue_key_is_read_back_from_a_card_title():
     assert linear_loop.issue_key_of_title("HER-118 — bootstrap owner") == "HER-118"
     assert linear_loop.issue_key_of_title("carte sans issue") is None
@@ -426,7 +441,7 @@ def test_no_mission_starts_when_the_disk_is_nearly_full(tmp_path):
 
     assert kanban.created == []
     assert "disk" in report.skipped
-    assert "Gio libres" in report.render()
+    assert "il ne reste que" in report.render()
 
 
 def test_dry_run_writes_nothing(tmp_path):
@@ -488,8 +503,8 @@ def test_finished_mission_asks_jean_for_the_merge_go(tmp_path):
 
     message = report.render()
     assert "HER-200" in message
-    assert "GO pour merger" in message
-    assert "1 commit(s)" in message
+    assert "À toi de jouer" in message
+    assert "1 commit " in message
     assert "Défaut reproduit" in message
     assert kanban.archived == ["t_done"]
 
@@ -534,7 +549,7 @@ def test_uncommitted_work_is_flagged_in_the_report(tmp_path):
         make_config(tmp_path), linear_loop.LinearClient("k", transport=linear), FakeKanban([done])
     )
 
-    assert "worktree non propre" in report.render()
+    assert "n'ont pas été commitées" in report.render()
 
 
 def test_a_card_jean_made_by_hand_is_never_archived_nor_reported(tmp_path):
@@ -645,7 +660,7 @@ def test_merged_issue_is_closed_and_its_worktree_freed(tmp_path):
         config, linear_loop.LinearClient("k", transport=merged_view), FakeKanban()
     )
 
-    assert "fusionnée" in report.render()
+    assert "Fusionnée" in report.render()
     assert merged_view.updates[0]["stateId"] == "state-done"
     assert not worktree.exists()
 
@@ -662,7 +677,7 @@ def test_an_unmerged_branch_keeps_its_issue_open(tmp_path):
         config, linear_loop.LinearClient("k", transport=review), FakeKanban()
     )
 
-    assert "fusionnée" not in report.render()
+    assert "Fusionnée" not in report.render()
     assert review.updates == []
     assert worktree.exists()
 
@@ -682,7 +697,7 @@ def test_an_issue_already_worked_on_is_held_not_relaunched(tmp_path):
     )
 
     assert kanban.created == []
-    assert "déjà terminée(s)" in report.render()
+    assert "déjà été traitée" in report.render()
     assert linear.labels[linear_loop.LABEL_BLOCKED] in linear.updates[-1]["labelIds"]
 
 
@@ -697,7 +712,7 @@ def test_a_mission_that_only_blocked_does_not_count_as_prior_work(tmp_path):
     )
 
     assert len(kanban.created) == 1
-    assert "déjà terminée" not in report.render()
+    assert "déjà été traitée" not in report.render()
 
 
 def test_a_fresh_issue_is_not_held(tmp_path):
@@ -708,7 +723,7 @@ def test_a_fresh_issue_is_not_held(tmp_path):
     )
 
     assert len(kanban.created) == 1
-    assert "déjà terminée" not in report.render()
+    assert "déjà été traitée" not in report.render()
 
 
 # ---------------------------------------------------------------------------

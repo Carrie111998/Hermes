@@ -291,6 +291,27 @@ class LinearClient:
 # --------------------------------------------------------------------------
 
 
+def coder_label(assignee: Optional[str]) -> str:
+    """`hermes-code-a` -> `Code A`. Les messages parlent a Jean, pas a la machine."""
+    name = (assignee or "").strip()
+    if name.startswith("hermes-code-"):
+        return f"Code {name.rsplit('-', 1)[-1].upper()}"
+    return name or "un codeur"
+
+
+def short_title(title: str, limit: int = 62) -> str:
+    text = (title or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def quote(text: str, limit: int = 200) -> str:
+    """Reprend les mots du worker sans les laisser envahir le message."""
+    cleaned = " ".join((text or "").split())
+    if len(cleaned) > limit:
+        cleaned = cleaned[: limit - 1].rstrip() + "…"
+    return cleaned
+
+
 def selection_rank(issue: Issue) -> tuple[int, str]:
     """Ordre de traitement : priorite Linear d'abord, puis anciennete."""
     priority = issue.priority if issue.priority else NO_PRIORITY_RANK
@@ -544,20 +565,21 @@ def _closeout_finished(config, client, kanban, conn, by_key, labels, states, rep
         result = mission_result(workspace, task.branch_name or "") if workspace else {}
         summary = _mission_summary(kanban, conn, task, result)
 
+        commits = result.get("commits", "?")
+        pluriel = "s" if commits not in ("0", "1", "?") else ""
         lines = [
-            f"✅ {key} — {issue.title if issue else task.title}",
-            f"Codeur : {task.assignee} · branche `{result.get('branch') or task.branch_name}` · "
-            f"{result.get('commits', '?')} commit(s) · HEAD `{result.get('head', '?')}`",
+            f"✅ {key} — {short_title(issue.title if issue else task.title)}",
+            f"{coder_label(task.assignee)} a terminé : {commits} commit{pluriel} "
+            f"sur `{result.get('branch') or task.branch_name}`.",
         ]
         if summary:
-            lines.append(f"Résumé : {summary}")
+            lines.append(f"\n📝 {quote(summary)}")
         if result.get("dirty"):
-            lines.append("⚠ worktree non propre — des changements ne sont pas commités")
-        if workspace:
-            lines.append(f"Worktree : {workspace}")
+            lines.append("\n⚠️ Attention : des modifications n'ont pas été commitées.")
+        lines.append("\n👉 À toi de jouer : relis, et fusionne si ça te va. "
+                     "Rien n'a été poussé.")
         if issue:
-            lines.append(issue.url)
-        lines.append("→ GO pour merger ? (rien n'est poussé, rien n'est fusionné)")
+            lines.append(f"🔗 {issue.url}")
         report.messages.append("\n".join(lines))
         report.closed.append({"issue": key or "", "task": task.id})
 
@@ -600,9 +622,10 @@ def _feed_free_coders(config, client, kanban, conn, issues, labels, states, repo
     free_disk = shutil.disk_usage(str(config.hermes_home)).free
     if free_disk < config.min_free_disk:
         message = (
-            f"⛔ Boucle en pause : {free_disk / 1024**3:.1f} Gio libres sur le disque "
-            f"(seuil {config.min_free_disk / 1024**3:.0f} Gio). Chaque mission crée un "
-            "worktree ; je ne démarre rien tant que la place n'est pas faite."
+            f"💾 Boucle en pause — il ne reste que {free_disk / 1024**3:.1f} Go "
+            "sur le disque.\nChaque mission a besoin de place pour travailler, "
+            "donc je ne démarre rien tant qu'il n'y en a pas davantage.\n"
+            "\n👉 Que faire : libère quelques Go, la boucle repartira toute seule."
         )
         report.skipped["disk"] = message
         report.messages.append(message)
@@ -721,15 +744,16 @@ def _prior_missions(kanban, conn, config, key: str) -> list[str]:
 
 def _hold_for_confirmation(config, client, issue, labels, prior, report) -> None:
     """Suspend une issue deja traitee au lieu de la relancer en silence."""
+    fois = "une fois" if len(prior) == 1 else f"{len(prior)} fois"
     message = (
-        f"⚠ {issue.key} — {issue.title}\n"
-        f"{len(prior)} mission(s) déjà terminée(s) sur cette issue. Je ne la relance "
-        "pas tout seul : soit le travail est fait et l'issue doit être fermée, soit "
-        "il faut préciser ce qu'il reste à faire.\n"
-        f"Pour relancer quand même : retire le label `{LABEL_BLOCKED}` de l'issue.\n"
-        f"{issue.url}"
+        f"⚠️ {issue.key} — {short_title(issue.title)}\n"
+        f"Cette issue a déjà été traitée {fois}. Je ne la relance pas tout seul, "
+        "pour éviter de refaire un travail existant.\n"
+        f"\n👉 Que faire : soit tu la fermes parce que c'est fait, soit tu précises "
+        f"ce qu'il reste et tu retires le label `{LABEL_BLOCKED}`.\n"
+        f"🔗 {issue.url}"
     )
-    report.skipped[issue.key] = f"{len(prior)} mission(s) antérieure(s)"
+    report.skipped[issue.key] = f"déjà traitée {fois}"
     report.messages.append(message)
     if not config.apply:
         return
@@ -760,9 +784,12 @@ def _report_blocked(config, client, kanban, conn, by_key, labels, report) -> Non
             continue
         reason = (kanban.latest_summary(conn, task.id) or task.result or "").strip()
         report.messages.append(
-            f"⛔ {key} — {issue.title}\n"
-            f"{task.assignee} s'est arrêté et attend une décision :\n"
-            f"{reason or '(aucune raison fournie)'}\n{issue.url}"
+            f"⛔ {key} — {short_title(issue.title)}\n"
+            f"{coder_label(task.assignee)} s'est arrêté et attend une décision de ta part.\n"
+            f"\n💬 Ce qu'il dit : {quote(reason) or 'il n’a pas donné de raison.'}\n"
+            f"\n👉 Que faire : précise ce qui manque dans l'issue, puis retire le "
+            f"label `{LABEL_BLOCKED}` pour qu'il reprenne.\n"
+            f"🔗 {issue.url}"
         )
         report.skipped[key] = "mission bloquée"
         if not config.apply:
@@ -802,10 +829,11 @@ def _close_merged(config, client, issues, labels, states, report) -> None:
         done_state = states.get(STATE_DONE)
         report.closed.append({"issue": issue.key, "merged_at": head})
         report.messages.append(
-            f"✅ {issue.key} fusionnée ({head}) — issue fermée, worktree libéré."
+            f"🎉 {issue.key} — {short_title(issue.title)}\n"
+            "Fusionnée : j'ai fermé l'issue et libéré l'espace de travail."
             if done_state else
-            f"✅ {issue.key} fusionnée ({head}), mais l'état « {STATE_DONE} » "
-            "n'existe pas dans cette team : ferme-la à la main."
+            f"🎉 {issue.key} est fusionnée, mais je ne trouve pas l'état "
+            f"« {STATE_DONE} » dans cette équipe : ferme-la à la main."
         )
         if not config.apply:
             continue
