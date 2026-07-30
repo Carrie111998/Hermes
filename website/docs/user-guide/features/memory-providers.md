@@ -70,6 +70,8 @@ hermes memory setup        # select "honcho" — runs the Honcho-specific post-s
 
 The legacy `hermes honcho setup` command still works (it now redirects to `hermes memory setup`), but is only registered after Honcho is selected as the active memory provider.
 
+**Headless / remote machines:** for cloud auth on a box without a browser (SSH, remote VM), pick **device** at the wizard's auth-method prompt. The CLI prints a short code and a verification link; open the link in a browser on any other machine, approve, and setup completes — no API key copy-paste. The wizard defaults to this option automatically when it detects no usable local browser.
+
 **Config:** `$HERMES_HOME/honcho.json` (profile-local) or `~/.honcho/config.json` (global). Resolution order: `$HERMES_HOME/honcho.json` > `~/.hermes/honcho.json` > `~/.honcho/config.json`. See the [config reference](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/honcho/README.md) and the [Honcho integration guide](https://docs.honcho.dev/v3/guides/integrations/hermes).
 
 <details>
@@ -216,6 +218,53 @@ The peer model above covers CLI, TUI, and desktop sessions, where every conversa
 
 Off-gateway these keys do nothing. `hermes memory setup` only prompts for them when it detects a connected gateway platform. See the [Honcho page](./honcho.md#gateway-identity-mapping) for the resolver ladder and the setup flow.
 
+### Per-channel project workspaces
+
+Identity mapping decides *who* a message is from. There is a second question a busy gateway runs into: *which body of memory does this conversation belong to?*
+
+By default every gateway chat writes into the one configured `workspace`, separated only by session name. That is the right default for a personal assistant. It stops being right once one Hermes serves several distinct efforts — a project's chat channels, a support channel, a personal DM — because a dialectic query asked in one of them can surface context drawn from all the others.
+
+An optional mapping file routes chosen channels into their own Honcho workspace. A workspace becomes the boundary for a project, and any number of channels (plus anything else you point at that workspace) share it:
+
+```mermaid
+flowchart LR
+    T["Telegram group<br/>-100123456789"] --> W1["workspace: myproject"]
+    S["Slack channel<br/>C0EXAMPLE123"] --> W1
+    E["Other clients writing<br/>to the same workspace"] --> W1
+    D["Personal DM"] --> W2["workspace: hermes (default)"]
+    W1 --> H[("Honcho")]
+    W2 --> H
+```
+
+Everything unmapped keeps using the default workspace, so this is additive — if you never create the file, nothing changes.
+
+**Where it lives:** `$HERMES_HOME/honcho-projects.json`. It is separate from `honcho.json` and is hand-written; no wizard produces it.
+
+```json
+{
+  "projects": {
+    "myproject": {
+      "sessions": {
+        "telegram-group--100123456789-42": "telegram",
+        "slack-group-C0EXAMPLE123": "slack"
+      }
+    }
+  }
+}
+```
+
+Read it as: *the workspace named `myproject` collects these channels, and inside it they are named `telegram` and `slack`.* The top-level key is a Honcho workspace ID; each `sessions` entry maps a pattern to the short session name used within that workspace.
+
+**Writing the patterns.** Patterns are matched against the gateway session key after sanitizing — every character outside `A-Z a-z 0-9 _ -` becomes `-`. The key `telegram:group:-100123456789:42` therefore becomes `telegram-group--100123456789-42`. The easiest way to get one right is to copy it from the session name Hermes already logs for that chat.
+
+**How a pattern matches.** A pattern has to line up with the *end* of the key: either the key ends with the pattern, or the pattern is followed by a `-`. That second case is what lets one Slack channel pattern cover its threads, whose keys carry a `-thread-…` suffix. If several patterns match the same key, the longest one wins, so you can map a whole channel and then override one topic inside it.
+
+The end-anchoring is not incidental. A plain "contains" test would let a pattern ending in `-1` swallow topic `-1578`, quietly filing one project's conversation under another.
+
+**Picking up changes.** Hermes re-reads the file whenever its modification time changes, so you can add or move a project and the next message routes correctly — no gateway restart. If the file is malformed, Hermes logs a warning and routes nothing rather than dropping the turn; every chat falls back to the default workspace until you fix it.
+
+Routing covers the whole memory path, not just writes: context injection, dialectic queries, search, conclusions and peer cards for a mapped channel all resolve inside its project workspace.
+
 <details>
 <summary>Full honcho.json example (multi-profile)</summary>
 
@@ -284,26 +333,42 @@ Context database by Volcengine (ByteDance) with filesystem-style knowledge hiera
 | | |
 |---|---|
 | **Best for** | Self-hosted knowledge management with structured browsing |
-| **Requires** | `pip install openviking` + running server |
+| **Requires** | OpenViking initialized, validated, and running |
 | **Data storage** | Self-hosted (local or cloud) |
 | **Cost** | Free (open-source, AGPL-3.0) |
 
-**Tools:** `viking_search` (semantic search), `viking_read` (tiered: abstract/overview/full), `viking_browse` (filesystem navigation), `viking_remember` (store facts), `viking_add_resource` (ingest URLs/docs)
+**Tools (6):** `viking_search` (semantic search), `viking_read` (tiered: abstract/overview/full), `viking_browse` (filesystem navigation), `viking_remember` (store facts), `viking_forget` (delete a memory file by exact `viking://` URI), `viking_add_resource` (ingest URLs/docs)
 
 **Setup:**
 ```bash
-# Start the OpenViking server first
-pip install openviking
+# Prepare OpenViking first
+openviking-server init
+openviking-server doctor
 openviking-server
 
 # Then configure Hermes
 hermes memory setup    # select "openviking"
 # Or manually:
 hermes config set memory.provider openviking
-echo "OPENVIKING_ENDPOINT=http://localhost:1933" >> ~/.hermes/.env
-# Authenticated servers should use a user/admin API key:
-echo "OPENVIKING_API_KEY=..." >> ~/.hermes/.env
 ```
+
+`hermes memory setup` can reuse or copy connection values from
+`~/.openviking/ovcli.conf`. Manual setup uses the active profile's `.env` file;
+for the default profile that is `~/.hermes/.env`, and for named profiles use
+`~/.hermes/profiles/<profile>/.env`.
+
+```text
+OPENVIKING_ENDPOINT=http://127.0.0.1:1933
+# OPENVIKING_API_KEY=...
+# OPENVIKING_ACCOUNT=default
+# OPENVIKING_USER=default
+# OPENVIKING_AGENT=hermes
+```
+
+OpenViking server settings live in `ov.conf` (`--config`,
+`OPENVIKING_CONFIG_FILE`, or `~/.openviking/ov.conf`). Client connection values
+live in `ovcli.conf` (`OPENVIKING_CLI_CONFIG_FILE` or
+`~/.openviking/ovcli.conf`).
 
 **Key features:**
 - Tiered context loading: L0 (~100 tokens) → L1 (~2k) → L2 (full)
@@ -487,7 +552,7 @@ Cloud memory API with hybrid search (Vector + BM25 + Reranking), 7 memory types,
 | **Data storage** | RetainDB Cloud |
 | **Cost** | $20/month |
 
-**Tools:** `retaindb_profile` (user profile), `retaindb_search` (semantic search), `retaindb_context` (task-relevant context), `retaindb_remember` (store with type + importance), `retaindb_forget` (delete memories)
+**Tools (10):** `retaindb_profile` (user profile), `retaindb_search` (semantic search), `retaindb_context` (task-relevant context), `retaindb_remember` (store with type + importance), `retaindb_forget` (delete memories), plus file tools: `retaindb_upload_file`, `retaindb_list_files`, `retaindb_read_file`, `retaindb_ingest_file`, `retaindb_delete_file`
 
 **Setup:**
 ```bash
@@ -641,11 +706,11 @@ hermes memory setup
 | Provider | Storage | Cost | Tools | Dependencies | Unique Feature |
 |----------|---------|------|-------|-------------|----------------|
 | **Honcho** | Cloud | Paid | 5 | `honcho-ai` | Dialectic user modeling + session-scoped context |
-| **OpenViking** | Self-hosted | Free | 5 | `openviking` + server | Filesystem hierarchy + tiered loading |
+| **OpenViking** | Self-hosted | Free | 6 | `openviking` + server | Filesystem hierarchy + tiered loading |
 | **Mem0** | Cloud/Self-hosted | Free/Paid | 4 | `mem0ai` | Server-side LLM extraction + self-hosted/OSS modes |
 | **Hindsight** | Cloud/Local | Free/Paid | 3 | `hindsight-client` | Knowledge graph + reflect synthesis |
 | **Holographic** | Local | Free | 2 | None | HRR algebra + trust scoring |
-| **RetainDB** | Cloud | $20/mo | 5 | `requests` | Delta compression |
+| **RetainDB** | Cloud | $20/mo | 10 | `requests` | Delta compression |
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
 | **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |

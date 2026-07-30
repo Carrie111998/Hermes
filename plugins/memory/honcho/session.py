@@ -14,7 +14,10 @@ from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
 from hermes_constants import get_hermes_home
-from plugins.memory.honcho.client import get_honcho_client
+from plugins.memory.honcho.client import (
+    get_honcho_client,
+    get_honcho_client_for_workspace,
+)
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -110,7 +113,6 @@ class HonchoSessionManager:
     # instances (e.g. tests constructing bare managers via __new__) behave as
     # plain unrouted managers. __init__ shadows these per instance.
     _project_workspace: str | None = None
-    _pinned_honcho: Honcho | None = None
     _project_map_cache: tuple[float, dict[str, tuple[str, str]]] | None = None
 
     def __init__(
@@ -133,15 +135,14 @@ class HonchoSessionManager:
             runtime_user_peer_name: Gateway user identity for per-user memory scoping.
             runtime_user_peer_name_alt: Optional stable alternate gateway identity.
             project_workspace: When set, this manager is a per-workspace child
-                    created by project routing (honcho-projects.json). It pins
-                    the provided ``honcho`` client — the ``honcho`` property
-                    otherwise refreshes through the global singleton, which is
-                    bound to the default workspace — and never routes further.
+                    created by project routing (honcho-projects.json). Its
+                    ``honcho`` property resolves through
+                    ``get_honcho_client_for_workspace`` instead of the default
+                    singleton, and it never routes further.
         """
         self._honcho = honcho
         # Per-channel project workspace routing state (honcho-projects.json).
         self._project_workspace = project_workspace
-        self._pinned_honcho = honcho if project_workspace else None
         self._project_managers: dict[str, HonchoSessionManager] = {}
         self._project_map_cache: tuple[float, dict[str, tuple[str, str]]] | None = None
         self._context_tokens = context_tokens
@@ -188,17 +189,16 @@ class HonchoSessionManager:
             config.dialectic_max_input_chars if config else 10000
         )
 
-        # Async write queue — started lazily on first enqueue
+        # Async write queue — the writer thread starts lazily on first enqueue
+        # (see _ensure_async_writer). Constructing a manager must not spawn
+        # background work or touch the network: unit tests build managers with
+        # mocked clients, and an eagerly-started writer raced ahead of the mock
+        # and wrote test messages to a live local Honcho.
         self._async_queue: queue.Queue | None = None
         self._async_thread: threading.Thread | None = None
+        self._async_thread_lock = threading.Lock()
         if write_frequency == "async":
             self._async_queue = queue.Queue()
-            self._async_thread = threading.Thread(
-                target=self._async_writer_loop,
-                name="honcho-async-writer",
-                daemon=True,
-            )
-            self._async_thread.start()
 
     @property
     def honcho(self) -> Honcho:
@@ -207,12 +207,19 @@ class HonchoSessionManager:
         Routes every access through ``get_honcho_client`` (which returns the same
         cached singleton) so a long session can't outlive its 1h access token.
 
-        Project-workspace child managers keep their pinned per-workspace
-        client instead: the singleton is bound to the default workspace, so
-        refreshing through it would silently snap a child's writes back there.
+        Project-workspace child managers resolve through
+        ``get_honcho_client_for_workspace`` instead. That keeps both invariants
+        at once: the client stays bound to the child's own workspace (the
+        default singleton would snap its writes back to the default
+        workspace), *and* it still goes through the shared OAuth refresh, so a
+        routed workspace picks up a rotated Bearer exactly like the default
+        one does. Never cache the returned client past the current call.
         """
-        if self._pinned_honcho is not None:
-            return self._pinned_honcho
+        if self._project_workspace is not None:
+            self._honcho = get_honcho_client_for_workspace(
+                self._project_workspace, self._config
+            )
+            return self._honcho
         self._honcho = get_honcho_client()
         return self._honcho
 
@@ -488,38 +495,21 @@ class HonchoSessionManager:
                 best = (pattern, target)
         return best[1] if best else None
 
-    def _build_project_client(self, workspace: str) -> Honcho:
-        """Build a dedicated Honcho client bound to a project workspace."""
-        from honcho import Honcho
-
-        config = self._config
-        kwargs: dict[str, Any] = {
-            "workspace_id": workspace,
-            # Local/self-hosted deployments may have no API key; the SDK
-            # requires a non-empty string (see get_honcho_client).
-            "api_key": config.api_key or "local",
-            "environment": config.environment,
-        }
-        if config.base_url:
-            # The SDK's route builders append their own version prefix; strip
-            # a trailing version segment exactly like get_honcho_client does.
-            kwargs["base_url"] = re.sub(r"/v\d+/*$", "", config.base_url).rstrip("/")
-        if config.timeout is not None:
-            kwargs["timeout"] = config.timeout
-        return Honcho(**kwargs)
-
     def _project_manager(self, workspace: str) -> HonchoSessionManager:
         """Get or lazily create this instance's child manager for a workspace.
 
         Children are built from config alone, so *any* manager instance can
         construct an equivalent child — routing never depends on which
         instance first created a session (the gateway runs several managers).
+
+        No client is passed: the child resolves one per access through
+        ``get_honcho_client_for_workspace``, which owns both the per-workspace
+        cache and the OAuth refresh.
         """
         with self._cache_lock:
             child = self._project_managers.get(workspace)
             if child is None:
                 child = HonchoSessionManager(
-                    honcho=self._build_project_client(workspace),
                     context_tokens=self._context_tokens,
                     config=self._config,
                     runtime_user_peer_name=self._runtime_user_peer_name,
@@ -710,6 +700,7 @@ class HonchoSessionManager:
 
         if wf == "async":
             if self._async_queue is not None:
+                self._ensure_async_writer()
                 self._async_queue.put(session)
         elif wf == "turn":
             self._flush_session(session)
@@ -750,18 +741,36 @@ class HonchoSessionManager:
                 except queue.Empty:
                     break
 
+    def _ensure_async_writer(self) -> None:
+        """Start the async writer on first enqueue (idempotent, thread-safe)."""
+        if self._async_thread is not None and self._async_thread.is_alive():
+            return
+        with self._async_thread_lock:
+            if self._async_thread is None or not self._async_thread.is_alive():
+                self._async_thread = threading.Thread(
+                    target=self._async_writer_loop,
+                    name="honcho-async-writer",
+                    daemon=True,
+                )
+                self._async_thread.start()
+
     def shutdown(self) -> None:
         """Gracefully shut down the async writer thread."""
+        # Project children own their own lazily-started writer threads, so
+        # shut them down first: each child drains its own queue (or just
+        # flushes, if its writer never started) before this manager's own
+        # flush_all runs.
         for child in self._project_children():
             try:
                 child.shutdown()
             except Exception as e:
                 logger.error("Honcho shutdown error for project child: %s", e)
 
-        if self._async_queue is not None and self._async_thread is not None:
+        if self._async_queue is not None:
             self.flush_all()
-            self._async_queue.put(_ASYNC_SHUTDOWN)
-            self._async_thread.join(timeout=10)
+            if self._async_thread is not None and self._async_thread.is_alive():
+                self._async_queue.put(_ASYNC_SHUTDOWN)
+                self._async_thread.join(timeout=10)
 
     def _project_children(self) -> list[HonchoSessionManager]:
         """Snapshot the per-workspace child managers created by routing."""
