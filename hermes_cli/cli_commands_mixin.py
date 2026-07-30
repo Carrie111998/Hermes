@@ -1099,24 +1099,75 @@ class CLICommandsMixin:
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
             try:
-                results = query_session_listing(
-                    self._session_db,
-                    source="cli",
-                    current_session_id=self.session_id,
-                    include_unnamed=True,
-                    search_query=search_query,
-                    limit=10,
+                # Use FTS5 content search — searches message text, not just
+                # session titles/IDs. Returns ranked results with match
+                # snippets, grouped by session.
+                import re as _re
+                from datetime import datetime as _dt
+
+                raw = self._session_db.search_messages(
+                    query=search_query,
+                    role_filter=["user", "assistant"],
+                    exclude_sources=["tool", "subagent", "cron"],
+                    limit=40,
                 )
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
                 return
-            if not results:
+
+            # Group by session_id, keep first (highest-ranked) per session
+            seen = {}
+            for r in raw:
+                sid = r["session_id"]
+                if sid == self.session_id:
+                    continue
+                if sid not in seen:
+                    seen[sid] = r
+                if len(seen) >= 10:
+                    break
+
+            if not seen:
                 _cprint(f"  No sessions matching \"{search_query}\".")
                 return
-            self._show_recent_sessions(
-                reason=f"search:{search_query}",
-                sessions=results,
-            )
+
+            _cprint()
+            _cprint(f"  ⚙️  /sessions search {search_query}")
+            _cprint()
+            _cprint(f"  Sessions matching \"{search_query}\":")
+            _cprint()
+
+            # Render as rich cards
+            for idx, (sid, r) in enumerate(seen.items(), 1):
+                meta = self._session_db.get_session(sid) or {}
+                title = meta.get("title") or "(no title)"
+                started = meta.get("started_at")
+                if started:
+                    when = _dt.fromtimestamp(started).strftime("%b %d")
+                else:
+                    when = "?"
+                source = r.get("source", "?")
+                model_raw = (r.get("model") or "?")
+                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                if len(model) > 18:
+                    model = model[:17] + "…"
+                mc = meta.get("message_count")
+                msgs = f" {mc} msgs" if mc else ""
+
+                # Clean FTS5 snippet: strip >>>...<<< markers, collapse whitespace
+                snippet = r.get("snippet", "") or ""
+                snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snippet))
+                snip_short = snip_clean.replace("\n", " ").strip()
+                if len(snip_short) > 80:
+                    snip_short = snip_short[:77] + "..."
+
+                _cprint(f"  {idx:<3}  {when}  {source:<6} {model:<18} {title[:40]}")
+                if snip_short:
+                    _cprint(f"      {snip_short}")
+                _cprint()
+
+            _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
+            _cprint("  Example: /resume 2")
+            _cprint()
             return
 
         sub = arg.lower()
