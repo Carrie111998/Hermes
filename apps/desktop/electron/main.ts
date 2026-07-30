@@ -2774,7 +2774,8 @@ async function pauseWindowsGatewaysForUpdate(updateRoot) {
     const parsed = JSON.parse(stdout)
 
     if (parsed && parsed.ok === true) {
-      return parsed.token ?? null
+      const t = parsed.token
+      return t && typeof t === 'object' && Object.keys(t).length > 0 ? t : null
     }
 
     rememberLog(`[updates] gateway pause returned failure: ${parsed?.error ?? 'unknown'}`)
@@ -3033,12 +3034,7 @@ async function applyUpdates(opts = {}) {
     // update — before the CLI updater even gets to run its own gateway pause.
     const gatewayToken = await pauseWindowsGatewaysForUpdate(updateRoot)
 
-    // Tracks whether we handled gateway cleanup ourselves (via taskkill as a
-    // second-line fallback, #74326) so the updater doesn't attempt a redundant
-    // resume from the token when no gateways remain to resume.
-    let noGatewayResumeNeeded = false
-
-    // Preflight: after releasing our own backends, check for remaining
+    // Start: pre-work before forking the updater
     // Hermes processes running from this venv.  The updater normally refuses
     // when it detects a holder, but because the updater is spawned detached
     // with stdio:ignore, the user never sees that refusal and the update
@@ -3069,9 +3065,8 @@ async function applyUpdates(opts = {}) {
             rememberLog(
               `[updates] stopped ${scanOutcome.result.processes.length} remaining gateway process(es) via taskkill; venv is clear, proceeding`
             )
-            // mark token as consumed since we handled gateways ourselves
-            // (do NOT pass the token to the updater — no gateways left to resume)
-            noGatewayResumeNeeded = true
+            // token still carries paused-profile data (PIDs, state).
+            // Always pass it — the resume already no-ops if there's nothing to resume.
           } else if (reScan.kind === 'blocked') {
             // Gateway kill freed some but not all, or new processes appeared.
             const message = formatBlockerMessage(reScan.result)
@@ -3133,7 +3128,7 @@ async function applyUpdates(opts = {}) {
       env: {
         ...process.env,
         HERMES_HOME,
-        HERMES_WINDOWS_GATEWAY_RESUME_TOKEN: !noGatewayResumeNeeded && gatewayToken
+        HERMES_WINDOWS_GATEWAY_RESUME_TOKEN: gatewayToken
           ? JSON.stringify(gatewayToken)
           : undefined,
         PATH: pathWithHermesManagedNode(venvBin)

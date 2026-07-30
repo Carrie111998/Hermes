@@ -29,7 +29,7 @@ def _emit_usage() -> NoReturn:
 def _cmd_pause() -> NoReturn:
     """Pause gateways, print JSON resume token to stdout, exit 0."""
     try:
-        from hermes_cli.main import (  # noqa: PLC0415
+        from hermes_cli.update_cmd import (  # noqa: PLC0415
             _pause_windows_gateways_for_update,
         )
 
@@ -39,9 +39,9 @@ def _cmd_pause() -> NoReturn:
         print(f"pause failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    # Serialise the token; None → empty dict so the caller can distinguish
+    # Serialise the token; None → None so the caller can distinguish
     # "no gateways running" from "probe failure".
-    payload = token if token is not None else {}
+    payload = token if token is not None else None
     print(json.dumps({"ok": True, "token": payload}))
     sys.exit(0)
 
@@ -64,7 +64,7 @@ def _cmd_resume() -> NoReturn:
         sys.exit(2)
 
     try:
-        from hermes_cli.main import (  # noqa: PLC0415
+        from hermes_cli.update_cmd import (  # noqa: PLC0415
             _resume_windows_gateways_after_update,
         )
 

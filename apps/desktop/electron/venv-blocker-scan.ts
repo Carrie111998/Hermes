@@ -41,11 +41,15 @@ export type ScanOutcome =
 const SCAN_TIMEOUT_MS = 15000
 const SCAN_MODULE = 'hermes_cli._scan_venv_blockers'
 
-// Used to identify gateway processes in the blocker scan output.  These are
-// processes running ``python.exe -m hermes_cli.main gateway run`` (or similar
-// variants) — always-running background gateways that the desktop's update
-// preflight should stop rather than abort on.  See #74326.
-const GATEWAY_CMDLINE_MARKER = 'gateway run'
+// Used to identify gateway processes in the blocker scan output.  The marker
+// is ``gateway`` (lower-cased substring match) to match the classification in
+// ``update_cmd.py``, which also checks ``\"gateway\" in cmdline.lower()``.
+// This catches both ``python.exe -m hermes_cli.main gateway`` and
+// ``python.exe -m hermes_cli.main gateway run`` — the first form is what the
+// venv shortcut uses; both forms are always-running background gateways that
+// the desktop's update preflight should stop rather than abort on.
+// See #74326, #74419.
+const GATEWAY_CMDLINE_MARKER = 'gateway'
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -225,7 +229,8 @@ export function formatProbeFailedMessage(): string {
 
 /**
  * Check whether a blocker process is a gateway (identified by having
- * ``gateway run`` in its command line, lower-cased).
+ * ``gateway`` in its command line, lower-cased — matching the Python
+ * classification in ``update_cmd.py``).
  */
 export function isGatewayProcess(proc: VenvBlockerProcess): boolean {
   return proc.cmdline.toLowerCase().includes(GATEWAY_CMDLINE_MARKER)
