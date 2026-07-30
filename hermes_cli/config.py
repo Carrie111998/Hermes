@@ -4855,23 +4855,34 @@ def set_config_value(key: str, value: str, force: bool = False):
 
     value = coerced_value
 
-    # Guard: refuse to overwrite a dict-typed section with a scalar value.
-    # `hermes config set model openai-codex/gpt-5.6-sol` would replace the
-    # entire ``model:`` mapping (losing ``provider``, ``base_url``,
-    # ``context_length``, etc.) with a bare string.  Route the user to the
-    # dotted key form instead (#71047).
+    # Guard against overwriting a dict-typed section with a scalar (#71047).
+    # Bare `hermes config set model <id>` is a documented shorthand that must
+    # become `model.default` when ``model`` is already a mapping, preserving
+    # sibling keys (provider/base_url/context_length).  Other bare top-level
+    # keys that already hold mappings still refuse the destructive overwrite.
     _top = key.split(".")[0]
     if "." not in key and isinstance(user_config.get(_top), dict):
-        print(
-            color(
-                f"⚠ Refusing to overwrite '{_top}' (a mapping with "
-                f"{len(user_config[_top])} keys) with a scalar value.\n"
-                f"  Use a dotted key, e.g. `hermes config set {_top}.default {value}`",
-                Colors.YELLOW,
-            ),
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        if _top == "model":
+            key = "model.default"
+            print(
+                color(
+                    f"  (note: bare 'model' is a shorthand — saving as model.default; "
+                    f"sibling keys under model: preserved)",
+                    Colors.YELLOW,
+                ),
+                file=sys.stderr,
+            )
+        else:
+            print(
+                color(
+                    f"⚠ Refusing to overwrite '{_top}' (a mapping with "
+                    f"{len(user_config[_top])} keys) with a scalar value.\n"
+                    f"  Use a dotted key, e.g. `hermes config set {_top}.<field> {value}`",
+                    Colors.YELLOW,
+                ),
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
