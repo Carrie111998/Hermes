@@ -2392,13 +2392,8 @@ def _manage_thinking_signatures(
     """
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
     _is_third_party = _is_third_party_anthropic_endpoint(base_url)
-    # Kimi / DeepSeek share a contract: strip signed Anthropic blocks
-    # (neither upstream can validate Anthropic signatures), preserve unsigned
-    # ones synthesised from reasoning_content.  See #13848, #16748.
-    _preserve_unsigned_thinking = (
-        _is_kimi_family_endpoint(base_url, model)
-        or _is_deepseek_anthropic_endpoint(base_url)
-    )
+    _is_kimi = _is_kimi_family_endpoint(base_url, model)
+    _is_deepseek = _is_deepseek_anthropic_endpoint(base_url)
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -2410,8 +2405,13 @@ def _manage_thinking_signatures(
         if m.get("role") != "assistant" or not isinstance(m.get("content"), list):
             continue
 
-        if _preserve_unsigned_thinking:
-            # Kimi / DeepSeek: strip signed, preserve unsigned.
+        if _is_kimi:
+            # Kimi does not enforce thinking signatures — replay as-is.
+            # The /coding endpoint may 400 on request-time thinking params,
+            # but on replay Kimi preserves both signed and unsigned blocks.
+            pass
+        elif _is_deepseek:
+            # DeepSeek: strip signed, preserve unsigned.
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
@@ -2779,7 +2779,7 @@ def build_anthropic_kwargs(
     # silently hides reasoning text that Hermes surfaces in its CLI. We
     # request "summarized" so the reasoning blocks stay populated — matching
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
-    _is_kimi_coding = _is_kimi_family_endpoint(base_url, model)
+    _is_kimi_coding = _is_kimi_coding_endpoint(base_url)
     if reasoning_config and isinstance(reasoning_config, dict) and not _is_kimi_coding:
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
