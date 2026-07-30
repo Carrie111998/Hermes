@@ -1,7 +1,8 @@
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 from agent.turn_finalizer import finalize_turn
+from run_agent import AIAgent
 
 
 class FakeAgent:
@@ -198,30 +199,33 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
-def test_empty_failure_sentinel_not_reappended_after_drop(monkeypatch):
-    """Marked ``(empty)`` terminal must stay out of durable history.
+def test_empty_failure_sentinel_absent_after_finalize_and_session_persist(monkeypatch):
+    """Marked terminal sentinel must stay out after real drop + session persist.
 
     ``conversation_loop`` appends assistant("(empty)") with
     ``_empty_terminal_sentinel`` then sets ``final_response="(empty)"``.
-    The finalizer drops the marked row before persist; the #43849 close
-    block must not re-append an unmarked copy just because final_response
-    is still truthy.
+    ``finalize_turn`` calls the production
+    ``AIAgent._drop_trailing_empty_response_scaffolding`` helper, then the
+    #43849 close block must not re-append an unmarked copy that
+    ``AIAgent._persist_session`` would keep in durable SessionDB / resume
+    history (unmarked ``(empty)`` survives persist by design).
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = FakeAgent()
+    agent._session_persist_lock = None
+    agent._session_messages = []
+    agent.flushed_session_db_messages = []
+    agent._save_session_log = lambda _messages: None
+    agent._flush_messages_to_session_db = (
+        lambda messages, conversation_history=None: agent.flushed_session_db_messages.append(
+            [dict(message) for message in messages]
+        )
+    )
+    agent._drop_trailing_empty_response_scaffolding = MethodType(
+        AIAgent._drop_trailing_empty_response_scaffolding, agent
+    )
+    agent._persist_session = MethodType(AIAgent._persist_session, agent)
 
-    def _drop_sentinel(messages):
-        while (
-            messages
-            and isinstance(messages[-1], dict)
-            and (
-                messages[-1].get("_empty_recovery_synthetic")
-                or messages[-1].get("_empty_terminal_sentinel")
-            )
-        ):
-            messages.pop()
-
-    agent._drop_trailing_empty_response_scaffolding = _drop_sentinel
     messages = [
         {"role": "user", "content": "do work"},
         {
@@ -247,11 +251,12 @@ def test_empty_failure_sentinel_not_reappended_after_drop(monkeypatch):
         _turn_exit_reason="empty_response_exhausted",
     )
 
-    persisted = agent.persisted_messages
-    assert persisted is not None
-    assert persisted == [{"role": "user", "content": "do work"}]
-    assert all(m.get("content") != "(empty)" for m in result["messages"])
-    assert all(not m.get("_empty_terminal_sentinel") for m in result["messages"])
+    assert agent.flushed_session_db_messages, "expected real _persist_session flush"
+    durable = agent.flushed_session_db_messages[-1]
+    assert durable == [{"role": "user", "content": "do work"}]
+    assert all(message.get("content") != "(empty)" for message in durable)
+    assert all(message.get("content") != "(empty)" for message in result["messages"])
+    assert all(not message.get("_empty_terminal_sentinel") for message in result["messages"])
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
