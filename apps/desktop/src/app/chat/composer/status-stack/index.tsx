@@ -236,12 +236,9 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
       return
     }
 
-    // Resolve the owning surface NOW, while the node is attached. The cleanup
-    // below runs after the stack collapsed and React removed the div, so
-    // closest() from the detached node misses [data-chat-surface] and would
-    // clear the document root instead — leaving the stale height on the
-    // surface, which keeps inflating the thread's bottom clearance until the
-    // next publish.
+    // Resolve the owning surface NOW, while the node is attached: the cleanup
+    // below runs after the stack collapsed and React removed the div, and a
+    // detached node can no longer find its [data-chat-surface].
     const root = chatSurfaceRoot(el)
     let last = -1
 
@@ -273,7 +270,10 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
       // Sits in the overlay lane above the composer. The composer root has pt-2
       // before the actual surface; translate by that amount so the stack returns
       // to its original attachment point without intruding into the repo strip.
-      className="absolute inset-x-0 bottom-full z-3 flex max-h-[40vh] flex-col translate-y-2"
+      // pl matches the surface's own left edge: `inset-x-0` resolves against the
+      // root's PADDING box, while the surface and the underside strip sit in its
+      // CONTENT box, so without it the lane hangs 5px further left than both.
+      className="absolute inset-x-0 bottom-full z-3 flex max-h-[40vh] flex-col translate-y-2 pl-[0.3125rem]"
       onPointerDownCapture={() => blurComposerInput()}
       ref={stackRef}
     >

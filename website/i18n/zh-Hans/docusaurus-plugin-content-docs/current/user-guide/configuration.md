@@ -1146,7 +1146,6 @@ display:
   tool_progress: all      # off | new | all | verbose
   tool_progress_command: false  # 在消息 gateway 中启用 /verbose 斜杠命令
   platforms: {}           # 每平台显示覆盖（见下文）
-  tool_progress_overrides: {}  # 已弃用 —— 改用 display.platforms
   interim_assistant_messages: true  # Gateway：将自然的轮次中 assistant 更新作为单独消息发送
   skin: default           # 内置或自定义 CLI 皮肤（参阅 user-guide/features/skins）
   personality: "kawaii"  # 旧版外观字段，仍在某些摘要中显示
@@ -1272,13 +1271,13 @@ stt:
   local:
     model: "base"              # tiny、base、small、medium、large-v3
   openai:
-    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
+    model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe | gpt-transcribe
   # model: "whisper-1"         # 旧版回退键仍受支持
 ```
 
 Provider 行为：
 
-- `local` 使用在您机器上运行的 `faster-whisper`。使用 `pip install faster-whisper` 单独安装。
+- `local` 使用在您机器上运行的 `faster-whisper`。使用 `pip install faster-whisper` 单独安装。静音幻觉防护默认开启:Silero VAD 过滤器让静音/噪声不会进入 Whisper,跨窗口条件预测被禁用,并且模型自己标记为"很可能不是语音"且低置信度的片段会被丢弃。设置 `stt.local.vad: false` 可用原始行为转录非语音音频(音乐、环境声)。
 - `groq` 使用 Groq 的 Whisper 兼容端点，读取 `GROQ_API_KEY`。
 - `openai` 使用 OpenAI 语音 API，读取 `VOICE_TOOLS_OPENAI_KEY`。
 
