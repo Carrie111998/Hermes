@@ -644,6 +644,7 @@ def finalize_turn(
         final_response=final_response,
         interrupted=interrupted,
         messages=messages,
+        messages_are_accumulated=conversation_history is not None,
     )
 
     # Background memory/skill review — runs AFTER the response is delivered

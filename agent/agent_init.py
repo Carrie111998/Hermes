@@ -1487,6 +1487,13 @@ def init_agent(
     
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []
+    # Provider-only transcript continuity for callers that invoke
+    # run_conversation() repeatedly without passing conversation_history
+    # (notably chat() and direct API embeddings). This is deliberately
+    # separate from _session_messages: it must never alter model context or
+    # prompt-cache prefixes.
+    agent._external_memory_messages: List[Dict[str, Any]] = []
+    agent._external_memory_session_id = agent.session_id or ""
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible
     # routes accept GPT-5 Responses requests but later reject replayed
     # encrypted reasoning blobs (HTTP 400 ``invalid_encrypted_content``).
