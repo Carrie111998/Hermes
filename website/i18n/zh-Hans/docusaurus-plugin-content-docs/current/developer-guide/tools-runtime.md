@@ -48,9 +48,8 @@ registry.register(
 每次调用都会创建一个 `ToolEntry`，以工具名称为键存储在单例 `ToolRegistry._tools` 字典中。如果该名称已被注册：
 
 - 在同一 toolset 中重新注册会静默替换已有条目，用于重连和刷新流程。
-- 如果新旧 toolset 均以 `mcp-` 开头，新的 MCP 条目会替换旧条目，并以 `DEBUG` 级别记录冲突。这用于 MCP 服务器刷新，以及处理不同 MCP 服务器间的同名工具。
-- 对于其他跨 toolset 替换，设置 `override=True` 会显式允许新条目替换旧条目，并以 `INFO` 级别记录覆盖。插件覆盖还要求操作者在 `config.yaml` 中启用 `plugins.entries.<plugin_id>.allow_tool_override`。
-- 否则，注册表会记录错误、拒绝新注册并保留已有条目。默认绝不允许意外的跨 toolset 遮蔽。
+- 来自**不同** toolset 的注册会被拒绝并记录错误，除非调用方传入 `override=True`。这也包括 MCP-to-MCP 冲突；MCP 重连和刷新流程会在同一个规范 toolset 内重新注册。
+- 显式的跨 toolset 覆盖会替换已有条目，并以 `INFO` 级别记录。插件覆盖还要求操作者在 `config.yaml` 中启用 `plugins.entries.<plugin_id>.allow_tool_override: true`。
 
 ### 发现机制：`discover_builtin_tools()`
 
@@ -226,6 +225,7 @@ Context engine 工具和 memory provider 工具也由各自的运行时组件路
 - singularity
 - modal
 - daytona
+- vercel_sandbox
 
 还支持：
 

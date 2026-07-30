@@ -48,9 +48,8 @@ registry.register(
 Each call creates a `ToolEntry` stored in the singleton `ToolRegistry._tools` dict keyed by tool name. If that name is already registered:
 
 - Re-registering it in the same toolset replaces the existing entry silently. This supports reconnect and refresh flows.
-- If both the existing and new toolsets start with `mcp-`, the new MCP entry replaces the old one and the collision is logged at `DEBUG` level. This supports MCP server refreshes and overlapping names from different MCP servers.
-- For any other cross-toolset replacement, `override=True` explicitly allows the new entry to replace the old one and logs the override at `INFO` level. Plugin overrides also require the operator to enable `plugins.entries.<plugin_id>.allow_tool_override` in `config.yaml`.
-- Otherwise, the registry logs an error, rejects the new registration, and keeps the existing entry. Accidental cross-toolset shadowing is never allowed by default.
+- A registration from a **different** toolset is rejected with an error log unless the caller passes `override=True`. This includes MCP-to-MCP collisions; MCP reconnect and refresh flows re-register within the same canonical toolset.
+- An explicit cross-toolset override replaces the existing entry and is logged at `INFO` level. Plugin overrides additionally require the operator opt-in `plugins.entries.<plugin_id>.allow_tool_override: true` in `config.yaml`.
 
 ### Discovery: `discover_builtin_tools()`
 
@@ -226,6 +225,7 @@ The terminal system supports multiple backends:
 - singularity
 - modal
 - daytona
+- vercel_sandbox
 
 It also supports:
 
