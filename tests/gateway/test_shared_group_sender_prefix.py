@@ -665,6 +665,91 @@ async def test_stop_consumes_adapter_head_and_refused_runner_fifo():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cmd", ["stop", "new", "reset"])
+async def test_control_command_discards_only_preexisting_debounce(cmd):
+    """Control completion drops stale debounce but drains an in-command follow-up."""
+    runner, adapter = _runner_with_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = build_session_key(_alice_source(), group_sessions_per_user=False)
+
+    alice = _photo_event(_alice_source(), "/tmp/a.jpg", message_id="a")
+    bob = _photo_event(_bob_source(), "/tmp/b.jpg", message_id="b")
+    stale = _text_event("stale-before-control", _carol_source(), message_id="c")
+    during = _text_event("follow-up-during-control", _bob_source(), message_id="d")
+    command = _text_event(f"/{cmd}", _alice_source(), message_id=f"cmd-{cmd}")
+
+    adapter._pending_messages[session_key] = alice
+    runner._queue_or_replace_pending_event(session_key, bob)
+    await adapter._queue_text_debounce(session_key, stale)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    delivered = []
+
+    async def _handler(event):
+        if event is command:
+            await runner._interrupt_and_clear_session(
+                session_key,
+                command.source,
+                interrupt_reason=f"test-{cmd}",
+                invalidation_reason=f"test-{cmd}",
+            )
+            await adapter._queue_text_debounce(session_key, during)
+            return f"/{cmd} complete"
+        delivered.append(event)
+        return None
+
+    adapter.set_message_handler(_handler)
+    await adapter._dispatch_active_session_command(command, session_key, cmd)
+    task = adapter._session_tasks.get(session_key)
+    if task is not None:
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert stale not in delivered, f"/{cmd} replayed pre-control debounce work"
+    assert delivered == [during], f"/{cmd} lost or duplicated the in-command follow-up"
+
+
+def test_refused_runner_fifo_is_preserved_in_shutdown_forensics(tmp_path, monkeypatch):
+    """A refused overflow turn must reach disk without stopping the gateway."""
+    from gateway import shutdown_flush
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:shutdown-refusal"
+    alice = _photo_event(
+        _alice_source(), "/tmp/a.jpg", caption=ALICE_MARK, message_id="a"
+    )
+    bob = _photo_event(
+        _bob_source(), "/tmp/b.jpg", caption="", message_id="b"
+    )
+
+    adapter._pending_messages[session_key] = alice
+    runner._queue_or_replace_pending_event(session_key, bob)
+
+    # Exercise the same stores used by adapter and runner graceful shutdown.
+    shutdown_flush.flush_pending_to_file(
+        dict(adapter._pending_messages), reason="test-adapter-shutdown"
+    )
+    shutdown_flush.flush_pending_to_file(
+        dict(runner._pending_messages), reason="test-runner-shutdown"
+    )
+    flush_fifo = getattr(
+        shutdown_flush,
+        "flush_queued_events_to_file",
+        lambda queued, *, reason: 0,
+    )
+    flush_fifo(dict(runner._queued_events), reason="test-runner-fifo-shutdown")
+
+    payload_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (tmp_path / "pending_messages").glob("*.json")
+    )
+    assert "/tmp/b.jpg" in payload_text, (
+        "refused runner-FIFO media is absent from shutdown forensics"
+    )
+
+
+@pytest.mark.asyncio
 async def test_refused_events_live_only_in_runner_fifo_not_adapter_reset_state():
     """Adapter discard paths must not leave refusal work that can resurrect."""
     runner, adapter = _runner_with_adapter()

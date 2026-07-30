@@ -137,14 +137,77 @@ def flush_pending_to_file(
     return flushed
 
 
+def flush_queued_events_to_file(
+    queued: Dict[str, Any],
+    *,
+    reason: str = "shutdown_queued",
+) -> int:
+    """Serialise every runner FIFO event without collapsing a session's tail.
+
+    ``SessionState.conversation.queued_events`` stores a list per session, while
+    :func:`flush_pending_to_file` stores one value per mapping key.  Write each
+    queued turn as its own payload so shutdown preserves both FIFO order and
+    the original session key for operator recovery.
+    """
+    if not queued:
+        return 0
+
+    flush_dir = _get_flush_dir()
+    ts = int(time.time())
+    flushed = 0
+    for session_key, events in list(queued.items()):
+        for value in list(events or []):
+            try:
+                serialised = _serialise_value(value)
+                if serialised is None:
+                    continue
+                _write_payload(
+                    flush_dir,
+                    {
+                        "session_key": session_key,
+                        "reason": reason,
+                        "ts": ts,
+                        "data": serialised,
+                    },
+                )
+                flushed += 1
+            except Exception as exc:
+                logger.debug(
+                    "Failed to flush queued event for %s: %s",
+                    session_key,
+                    exc,
+                )
+
+    if flushed:
+        logger.info(
+            "Flushed %d queued event(s) to %s (reason=%s)",
+            flushed,
+            flush_dir,
+            reason,
+        )
+    return flushed
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     # MessageEvent objects have a .text attribute and other fields
     if hasattr(value, "text"):
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
         # Preserve additional fields if present
-        for attr in ("session_id", "platform", "sender_id", "sender_name",
-                      "reply_to", "media", "raw_event"):
+        for attr in (
+            "session_id",
+            "platform",
+            "sender_id",
+            "sender_name",
+            "message_id",
+            "message_type",
+            "reply_to",
+            "reply_to_message_id",
+            "media",
+            "media_urls",
+            "media_types",
+            "raw_event",
+        ):
             val = getattr(value, attr, None)
             if val is not None:
                 try:

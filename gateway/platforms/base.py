@@ -5559,6 +5559,11 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
+        # This method is the ownership boundary for reset-like commands. Drop
+        # only debounce work that already existed when the command began;
+        # follow-ups arriving during the awaits below create fresh state and
+        # are intentionally drained after the command completes.
+        self._discard_text_debounce(session_key)
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
@@ -5666,7 +5671,6 @@ class BasePlatformAdapter(ABC):
                 # cancellation + runner response + pending drain.
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
-                    self._discard_text_debounce(session_key)
                     try:
                         await self._dispatch_active_session_command(event, session_key, cmd)
                     except Exception as e:
