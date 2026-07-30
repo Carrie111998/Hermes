@@ -224,6 +224,86 @@ def _index_path(store: Path, dir_hash: str) -> Path:
     return store / _INDEXES_DIRNAME / dir_hash
 
 
+# Widest window any single checkpoint git call can occupy: the longest caller
+# multiplier applied to _GIT_TIMEOUT. A lock older than this cannot belong to
+# a still-running call, which is what makes reclaiming it safe.
+_MAX_GIT_CALL_SECONDS: int = _GIT_TIMEOUT * 3
+
+# git's own message when it finds an index lock already present.
+_INDEX_LOCK_TAKEN_MARKER = "unable to create"
+
+
+def _index_lock_path(index_file: Optional[Path]) -> Optional[Path]:
+    """Path of the ``.lock`` git creates while writing ``index_file``."""
+    if index_file is None:
+        return None
+    return index_file.with_name(index_file.name + ".lock")
+
+
+def _clear_abandoned_index_lock(
+    index_file: Optional[Path],
+    reason: str,
+    *,
+    require_stale: bool = True,
+) -> bool:
+    """Reclaim an index ``.lock`` left behind by a git process that is gone.
+
+    Git creates ``<index>.lock`` with ``O_EXCL`` and renames it into place on
+    success. A git that is killed — notably by our own subprocess timeout,
+    which fires readily when the work tree is a WSL2 ``drvfs``/9p mount such
+    as ``/mnt/c`` — leaves the lock behind. The file records no owner, so git
+    can never reclaim it on its own: every later ``git add`` against that
+    index fails instantly with "Unable to create ... File exists", for the
+    rest of the session *and every future session*, until a human deletes it
+    (#74108).
+
+    ``require_stale`` keeps this safe under concurrency. Checkpoint git calls
+    are all bounded by ``_GIT_TIMEOUT`` (at most ``_MAX_GIT_CALL_SECONDS``
+    with the largest caller multiplier), so a lock whose mtime is older than
+    that window provably belongs to no live call. Callers that already know
+    the owning child is dead — the timeout handler, which has just reaped it —
+    pass ``require_stale=False``.
+
+    Returns True when a lock was removed.
+    """
+    lock_path = _index_lock_path(index_file)
+    if lock_path is None:
+        return False
+    try:
+        age = time.time() - lock_path.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.debug("Cannot stat checkpoint index lock %s: %s", lock_path, exc)
+        return False
+
+    if require_stale and age < _MAX_GIT_CALL_SECONDS:
+        logger.debug(
+            "Checkpoint index lock %s is %.1fs old — younger than the %ds "
+            "bound on a git call, so another call may still own it; leaving it.",
+            lock_path, age, _MAX_GIT_CALL_SECONDS,
+        )
+        return False
+
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Could not remove abandoned checkpoint index lock %s: %s",
+            lock_path, exc,
+        )
+        return False
+
+    logger.warning(
+        "Removed abandoned checkpoint index lock %s (%.1fs old, %s). Without "
+        "this every later checkpoint would fail with 'File exists'.",
+        lock_path, age, reason,
+    )
+    return True
+
+
 def _ref_name(dir_hash: str) -> str:
     return f"{_REFS_PREFIX}/{dir_hash}"
 
@@ -305,12 +385,17 @@ def _run_git(
     timeout: int = _GIT_TIMEOUT,
     allowed_returncodes: Optional[Set[int]] = None,
     index_file: Optional[Path] = None,
+    _retry_after_lock_recovery: bool = True,
 ) -> Tuple[bool, str, str]:
     """Run a git command against the shared store.  Returns (ok, stdout, stderr).
 
     ``allowed_returncodes`` suppresses error logging for known/expected non-zero
     exits while preserving the normal ``ok = (returncode == 0)`` contract.
     Example: ``git diff --cached --quiet`` returns 1 when changes exist.
+
+    ``_retry_after_lock_recovery`` is internal: when a call fails because a
+    stale ``<index>.lock`` is present, the lock is reclaimed and the call is
+    retried exactly once (see ``_clear_abandoned_index_lock``).
     """
     normalized_working_dir = _normalize_path(working_dir)
     if not normalized_working_dir.exists():
@@ -344,6 +429,22 @@ def _run_git(
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if not ok and result.returncode not in allowed_returncodes:
+            # A leftover index lock from a previously killed git blocks every
+            # call against this index forever. Reclaim it once (only when it
+            # is provably stale) and retry, so an install already wedged by an
+            # earlier timeout heals itself instead of needing manual cleanup.
+            if (
+                _retry_after_lock_recovery
+                and _INDEX_LOCK_TAKEN_MARKER in stderr.lower()
+                and _clear_abandoned_index_lock(index_file, "blocking a new git call")
+            ):
+                return _run_git(
+                    args, store, working_dir,
+                    timeout=timeout,
+                    allowed_returncodes=allowed_returncodes,
+                    index_file=index_file,
+                    _retry_after_lock_recovery=False,
+                )
             logger.error(
                 "Git command failed: %s (rc=%d) stderr=%s",
                 " ".join(cmd), result.returncode, stderr,
@@ -352,6 +453,12 @@ def _run_git(
     except subprocess.TimeoutExpired:
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
         logger.error(msg, exc_info=True)
+        # subprocess.run has already killed and reaped the child, so any lock
+        # it created is abandoned by definition — no staleness check needed.
+        _clear_abandoned_index_lock(
+            index_file, f"owning git timed out after {timeout}s",
+            require_stale=False,
+        )
         return False, "", msg
     except FileNotFoundError as exc:
         missing_target = getattr(exc, "filename", None)
