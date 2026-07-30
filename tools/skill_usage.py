@@ -458,6 +458,10 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
     Agent-created skills are always eligible. Bundled built-ins become eligible
     only when ``curator.prune_builtins`` is enabled. Hub-installed and external
     skill-dir skills are NEVER eligible — they have an external upstream owner.
+    Org-shared skills ARE eligible for improvement (the curator may patch them
+    like any other skill; edits stay local until proposed) but are protected
+    from ARCHIVE/DELETE elsewhere — removing a shared skill is an org-admin
+    action, not a local curation decision.
     Protected built-ins (``PROTECTED_BUILTIN_SKILLS``) are NEVER eligible
     regardless of any flag — they back load-bearing UX and must never be
     archived or consolidated.
@@ -479,10 +483,36 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
 
 
 def _is_curator_managed_record(record: Any) -> bool:
-    """Return True when a usage record opts a skill into curator management."""
+    """Return True when a usage record opts a skill into curator management.
+
+    NAMING (issue #67140): the on-disk field is ``created_by``, which reads
+    like provenance but is consumed as a **curator-management opt-in policy
+    flag**. The two are not the same question:
+
+    * provenance = "who authored this file" — historical fact, and for records
+      written before the marker existed it is simply unrecoverable.
+    * management = "may autonomous curation mutate/archive this" — a policy
+      decision the user can change at any time via ``hermes curator adopt``.
+
+    ``created_by: "agent"`` therefore means "curator-managed", NOT "proof the
+    agent wrote it". The field name is retained because it is already on disk
+    in every user's ``.usage.json``; renaming it would strand those records.
+    Read it as policy, and prefer ``is_curator_managed()`` at call sites so the
+    intent is unambiguous.
+    """
     if not isinstance(record, dict):
         return False
     return record.get("created_by") == "agent" or record.get("agent_created") is True
+
+
+def is_curator_managed(skill_name: str) -> bool:
+    """Whether *skill_name* is opted into curator management.
+
+    Policy-intent alias for the ``created_by``-marker check, so call sites read
+    as the question they are actually asking (see ``_is_curator_managed_record``
+    for why the stored field name says "created_by").
+    """
+    return _is_curator_managed_record(load_usage().get(skill_name))
 
 
 def list_unmanaged_skill_names() -> List[str]:
@@ -805,6 +835,26 @@ def set_pinned(skill_name: str, pinned: bool) -> None:
     _mutate(skill_name, _apply, require_curation_eligible=True)
 
 
+def set_sync(skill_name: str, sync: bool) -> None:
+    """Set the sync opt-in flag on a skill's usage record.
+
+    Sync is OPT-IN: nothing propagates to the sync plane unless the user marks
+    a skill with ``sync: true`` here. Sits alongside ``pinned``/``created_by``
+    on the ``.usage.json`` sidecar and is read by
+    ``tools.skills_sync_client.list_synced_skill_names``. Gated on curation
+    eligibility so bundled/hub/external skills (which never sync) can't be
+    marked. Provisional per the M1-D default.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["sync"] = bool(sync)
+    _mutate(skill_name, _apply, require_curation_eligible=True)
+
+
+def is_sync_enabled(skill_name: str) -> bool:
+    """Whether a skill is opted into sync (``sync: true`` in its record)."""
+    return get_record(skill_name).get("sync") is True
+
+
 def forget(skill_name: str) -> None:
     """Drop a skill's usage entry entirely. Called when the skill is deleted."""
     if not skill_name:
@@ -868,7 +918,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
 
     try:
         skill_dir.rename(dest)
-    except OSError as e:
+    except OSError:
         # Cross-device — fall back to shutil.move
         import shutil
         try:
@@ -963,14 +1013,16 @@ def _find_skill_dir(skill_name: str) -> Optional[Path]:
     """Locate the directory for a skill by its frontmatter `name:` field.
 
     Handles both flat (~/.hermes/skills/<skill>/SKILL.md) and category-nested
-    (~/.hermes/skills/<category>/<skill>/SKILL.md) layouts.
+    (~/.hermes/skills/<category>/<skill>/SKILL.md) layouts. Uses the gated
+    index iterator so M2 org mirrors resolve ONLY for the active org
+    (stale ``_org/<other>/`` trees never match).
     """
     base = _skills_dir()
     if not base.exists():
         return None
-    for skill_md in base.rglob("SKILL.md"):
-        if is_excluded_skill_path(skill_md):
-            continue
+    from agent.skill_utils import iter_skill_index_files
+
+    for skill_md in iter_skill_index_files(base, "SKILL.md"):
         if is_external_skill_path(skill_md):
             continue
         if _read_skill_name(skill_md, fallback=skill_md.parent.name) == skill_name:
