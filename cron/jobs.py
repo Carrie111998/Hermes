@@ -392,6 +392,45 @@ CANONICAL_SNAPSHOT_FIELDS = frozenset(
 )
 
 
+def _canonical_restore_projection(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the CLI convenience projection from a persisted record."""
+    schedule = record.get("schedule")
+    repeat = record.get("repeat")
+    repeat_mapping = repeat if isinstance(repeat, dict) else {}
+    raw_delivery = record.get("deliver") or "local"
+    if isinstance(raw_delivery, str):
+        targets = [part.strip() for part in raw_delivery.split(",") if part.strip()]
+    elif isinstance(raw_delivery, (list, tuple)):
+        targets = []
+        for value in raw_delivery:
+            targets.extend(part.strip() for part in str(value).split(",") if part.strip())
+    else:
+        targets = [str(raw_delivery).strip()] if raw_delivery else ["local"]
+    if not targets:
+        targets = ["local"]
+    delivery = targets[0] if len(targets) == 1 else targets
+    platform = recipient = thread = None
+    if len(targets) == 1:
+        parts = targets[0].split(":", 2)
+        if len(parts) >= 2 and parts[0] in {"telegram", "discord", "signal"}:
+            platform, recipient = parts[0], parts[1]
+            thread = parts[2] if len(parts) == 3 else None
+    return {
+        "id": record.get("id"), "name": record.get("name"),
+        "enabled": record.get("enabled", True),
+        "state": record.get("state", "scheduled"),
+        "schedule": record.get("schedule_display") or (schedule.get("display") if isinstance(schedule, dict) else None),
+        "run_at": schedule.get("run_at") if isinstance(schedule, dict) else None,
+        "next_run_at": record.get("next_run_at"),
+        "repeat": repeat_mapping.get("times"), "delivery": delivery, "deliver": delivery,
+        "platform": platform, "recipient": recipient, "thread": thread,
+        "script": record.get("script"), "skills": list(record.get("skills") or []),
+        "no_agent": record.get("no_agent", False), "prompt": record.get("prompt"),
+        "model": record.get("model"), "provider": record.get("provider"),
+        "workdir": record.get("workdir"),
+    }
+
+
 def _job_output_dir(job_id: str) -> Path:
     """Resolve a job's output directory, rejecting any path-escape attempt.
 
@@ -1727,10 +1766,13 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
             invalid("CRON_RESTORE_INVALID_PRESENCE")
         if record.get("id") != job_id:
             invalid("CRON_RESTORE_ID_MISMATCH")
-        # Convenience fields are checked against the exact record.  The two
-        # intentionally projected fields have their own lossless companions.
-        for field in PERSISTED_JOB_FIELDS - {"schedule", "repeat"}:
-            if field in snapshot and snapshot[field] != record.get(field):
+        # ``record`` plus ``presence`` is the lossless source of truth.  Check
+        # only the display/convenience projection here; comparing it directly
+        # with raw record values rejects valid legacy shapes (notably delivery
+        # comma strings) and absent/defaulted optional fields.
+        projection = _canonical_restore_projection(record)
+        for field in projection:
+            if field in snapshot and snapshot[field] != projection[field]:
                 invalid("CRON_RESTORE_RECORD_MISMATCH")
         if snapshot.get("schedule_state") != record.get("schedule"):
             invalid("CRON_RESTORE_SCHEDULE_MISMATCH")
