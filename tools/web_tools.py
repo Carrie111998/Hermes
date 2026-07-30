@@ -1500,15 +1500,30 @@ def check_web_api_key() -> bool:
     """Check whether the configured web backend is available.
 
     Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
+    tool registry entries — so an available provider selected by an explicit
+    chain, or a plugin-registered scalar provider, must light the tools up even
+    when no built-in backend has credentials (issues #28651, #31873).
+    Resolution funnels through :func:`_provider_available_for_chain` and
+    :func:`_is_backend_available`, which delegate non-legacy names to the
     registry.
     """
+    cfg = _load_web_config()
+    # Explicit chains are policy inputs to dispatch, but the scalar registry
+    # resolvers below do not read them. Probe the same parsed provider names
+    # here so the shared check_fn does not hide both schemas before dispatch
+    # can reach an otherwise available chain. Malformed chains still fall
+    # through to global availability, preserving legacy schema exposure.
+    for chain_key in ("search_backends", "extract_backends"):
+        try:
+            chain = _parse_backend_chain(cfg.get(chain_key))
+        except ValueError:
+            continue
+        if any(_provider_available_for_chain(name) for name in chain):
+            return True
+
     # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
     # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
+    configured = (cfg.get("backend") or "").lower().strip()
     if configured and _is_backend_available(configured):
         return True
     # Any built-in backend with credentials present. This is a boolean OR, so

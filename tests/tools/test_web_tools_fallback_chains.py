@@ -577,6 +577,47 @@ def test_unavailable_search_chain_does_not_hide_active_extract_provider(monkeypa
     assert wt.check_web_api_key() is True
 
 
+@pytest.mark.parametrize("chain_key", ["search_backends", "extract_backends"])
+def test_explicit_nonlegacy_chain_exposes_web_schemas(monkeypatch, chain_key):
+    import tools.web_tools as wt
+    from tools.registry import invalidate_check_fn_cache, registry
+
+    for name in ("custom-primary", "custom-fallback"):
+        web_search_registry.register_provider(
+            FakeWebProvider(
+                name,
+                search_response={"success": True, "data": {"web": []}},
+                extract_response=[],
+            )
+        )
+
+    monkeypatch.setattr(
+        wt,
+        "_load_web_config",
+        lambda: {chain_key: ["custom-primary", "custom-fallback"]},
+    )
+    monkeypatch.setattr(wt, "_is_backend_available", lambda name: False)
+
+    # Two available non-legacy providers do not activate the scalar resolver;
+    # schema exposure must therefore come from the explicit chain itself.
+    assert web_search_registry.get_active_search_provider() is None
+    assert web_search_registry.get_active_extract_provider() is None
+
+    invalidate_check_fn_cache()
+    try:
+        definitions = registry.get_definitions(
+            {"web_search", "web_extract"},
+            quiet=True,
+        )
+    finally:
+        invalidate_check_fn_cache()
+
+    assert {definition["function"]["name"] for definition in definitions} == {
+        "web_search",
+        "web_extract",
+    }
+
+
 def test_temp_hermes_home_config_drives_real_chain_resolution(tmp_path, monkeypatch):
     import hermes_cli.config as hermes_config
     import tools.web_tools as wt
