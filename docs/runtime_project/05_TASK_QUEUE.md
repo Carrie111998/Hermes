@@ -1,12 +1,58 @@
 # Task Queue — HTR
 
-**Last updated:** 2026-07-28 (Task 26C implementation candidate; Task 26C checkpoint not approved; Task 27/28 not started; entire Task 26 not complete)
+**Last updated:** 2026-07-30 (Task 27 Path-R1 creation-only v1 checkpoint approved and complete; Task 28 not started and not approved)
 
 ---
 
 ## Active Task
 
-**None** — Task 26 complete for the currently approved v1 scope. **Task 27/28 not started.** Path B marker disposition remains deferred and unimplemented.
+**None** — Task 27 Path-R1 creation-only v1 is checkpoint approved and complete. **Task 28 not started and not approved.**
+
+---
+
+## Completed (checkpointed)
+
+### Task 27 — Recovery/Successor Run creation (Path R1 v1 — creation-only)
+
+**Status:** ✅ Path-R1 creation-only v1 checkpoint approved and complete (parent `c1f4fdd8`)
+**Depends on:** Task 26C (Path-A v1 — closed); Task 26B.1 baseline stabilization (closed)
+
+**Delivered (13-file manifest):**
+
+- `htr/recovery_runs.py` — Path R1 only; six-file control store at `.control/recovery_runs/`; `recovery_origin.json` linkage; attempt-before-creation; creates **one approved linked Successor Run**; no Task 23 marker during bootstrap
+- `htr/io.py` — `reserve_run_root_exclusive`, `bootstrap_reserved_run_workspace` (no `@run_mutation_boundary`)
+- `tests/htr/test_recovery_runs.py` (NEW); `tests/htr/test_io.py` (+reserve/bootstrap tests)
+
+**Verification (`--file-retries 0`):** focused recovery + io **209 passed**; explicit 31-file HTR manifest **2252 passed**; **0 failed**; **0 skipped**; **0 FLAKY**; **0 retries**
+
+**Authority boundaries:**
+
+- The **original finalized source Run remains permanently immutable** — no reopen, unlock, edit, or rewrite
+- Successor creation **does not authorize successor execution**, completion, closure, or automatic follow-up
+- **No** retry, repair, invoke, artifact copy, external side effect, automatic execution, marker disposition, or outcome rewrite authority
+- All **six Task 27 outcome non-permission booleans remain `false`**
+- **`forward_fix` remains outside Task 27 v1**
+- **Path R1 remains the only approved Task 27 eligibility path**
+
+**Explicitly not implemented:** Task 28; push; successor execution/retry/repair/invoke; forward_fix scope; CLI
+
+---
+
+## Completed (checkpointed)
+
+### Task 26B.1 — Concurrent observation publication stabilization
+
+**Status:** ✅ Checkpoint approved and complete (parent `3147ef90`)
+**Depends on:** Task 26C (Path-A v1 — closed)
+
+**Delivered:**
+
+- `htr/reconciliation_cases.py` — flock-guarded exact replay for concurrent identical observation creators; `_read_optional_record_if_published`; `_exact_replay_published_record_under_lock`
+- `tests/htr/test_reconciliation_cases.py` — parametrized subprocess scenarios (2/4/8 workers); conflicting-intent case
+
+**Verification (`--file-retries 0`):** `test_reconciliation_cases.py` **180 passed**; explicit 30-file HTR manifest **2055 passed**; **0 failed**; **0 skipped**; **0 FLAKY**; **0 retries**
+
+**Explicitly not implemented:** Task 27/28 changes; docs in this narrow checkpoint
 
 ---
 

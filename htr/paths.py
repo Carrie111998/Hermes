@@ -148,6 +148,48 @@ def marker_disposition_outcome_path(disposition_id: str, base_dir: Path | None =
     return marker_disposition_dir(disposition_id, base_dir) / "outcome.json"
 
 
+RECOVERY_RUNS_DIR_NAME = "recovery_runs"
+
+
+def control_recovery_runs_root(base_dir: Path | None = None) -> Path:
+    return control_root(base_dir) / RECOVERY_RUNS_DIR_NAME
+
+
+def recovery_run_control_dir(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    _validate_path_component(recovery_request_id, "recovery_request_id")
+    if not validate_id(recovery_request_id, "recovery_run_request"):
+        raise ValueError(f"invalid recovery_request_id format: {recovery_request_id!r}")
+    return control_recovery_runs_root(base_dir) / recovery_request_id
+
+
+def recovery_run_request_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "request.json"
+
+
+def recovery_run_issue_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "issue.json"
+
+
+def recovery_run_revoke_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "revoke.json"
+
+
+def recovery_run_claim_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "claim.json"
+
+
+def recovery_run_attempt_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "attempt.json"
+
+
+def recovery_run_outcome_path(recovery_request_id: str, base_dir: Path | None = None) -> Path:
+    return recovery_run_control_dir(recovery_request_id, base_dir) / "outcome.json"
+
+
+def recovery_origin_path(run_id: str, base_dir: Path | None = None) -> Path:
+    return run_root(run_id, base_dir) / "recovery_origin.json"
+
+
 def reports_dir(run_id: str, base_dir: Path | None = None) -> Path:
     return run_root(run_id, base_dir) / "reports"
 

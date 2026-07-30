@@ -2,6 +2,41 @@
 
 ---
 
+## 2026-07-30 — Task 27: Approved Successor Run creation (Path R1 v1 — creation-only)
+
+**Implementer:** Cursor (isolated candidate tree `/home/unaliu/task27-candidate/`; parent `c1f4fdd8`)
+**Scope:** `htr/recovery_runs.py` (NEW), `htr/io.py`, `htr/paths.py`, `htr/ids.py`, `htr/state.py`, `htr/__init__.py`, `tests/htr/test_recovery_runs.py` (NEW), `tests/htr/test_io.py`, runtime docs (5 files)
+**Production Runtime modified:** Yes — Path R1 recovery/successor creation control API + exclusive successor reservation/bootstrap (no `@run_mutation_boundary` on reservation path)
+**Source Run mutation:** No — original finalized source Run remains permanently immutable
+**Task 26A:** Closed
+**Task 26B:** Checkpoint approved and complete
+**Task 26B.1:** Checkpoint approved and complete
+**Task 26C:** Path-A v1 checkpoint approved and complete
+**Task 27 checkpoint:** **Path-R1 creation-only v1 approved and complete**
+**Task 28:** Not started and not approved
+**Entire Task 26:** Complete for approved v1 scope (Path B deferred)
+**Verification:** focused recovery + io **209 passed**; explicit 31-file HTR manifest **2252 passed**; 0 failed; 0 skipped; 0 FLAKY; 0 retries (`--file-retries 0`)
+
+### Contract
+
+- Public APIs: `generate_recovery_request_id`, `create_recovery_run_request`, `issue_recovery_run_approval`, `revoke_recovery_run_approval`, `claim_recovery_run_approval`, `execute_approved_recovery_run_creation`, `load_recovery_run_bundle`, `reconcile_recovery_run_outcome`
+- Storage: `{runs_root}/.control/recovery_runs/{recovery_request_id}/` with immutable O_EXCL records; `{successor}/recovery_origin.json` linkage
+- **Path R1 only** — creates **one approved linked Successor Run**; **Path R1 remains the only approved eligibility path**
+- **`forward_fix` remains outside Task 27 v1**
+- Successor creation **does not authorize successor execution**, completion, closure, retry, repair, invoke, artifact copy, external side effect, automatic execution, marker disposition, or outcome rewrite
+- All **six Task 27 outcome non-permission booleans remain `false`**
+- Attempt-before-creation; exclusive successor directory reservation; no Task 23 marker during bootstrap
+- Forbidden production modules (`finalization`, `reconciliation_*`, `marker_disposition`, `approval_control`, `invoke_run_completion`, `events`, `execution_lock`) unchanged vs parent
+
+### Explicitly not implemented
+
+- Task 28 bounded repair
+- Successor execution / retry / repair / invoke / closure
+- forward_fix scope
+- push; CLI
+
+---
+
 ## 2026-07-28 — Task 26C: Approved marker disposition (Path A — checkpoint approved and complete)
 
 **Implementer:** Cursor (isolated candidate tree `/home/unaliu/task26c-candidate/`; parent `a40ec2d0`)
@@ -11,7 +46,7 @@
 **Task 26A:** Closed
 **Task 26B:** Checkpoint approved and complete
 **Task 26C checkpoint:** **Path-A v1 approved and complete**
-**Task 27/28:** Not started
+**Task 27/28:** Task 27 Path R1 **implementation candidate complete** (not checkpointed); Task 28 not started
 **Entire Task 26:** Complete for approved v1 scope (Path B deferred)
 **Verification:** focused marker-disposition + execution-lock **226 passed**; full explicit 30-file HTR manifest **2051 passed**; 0 failed; 0 skipped; 0 FLAKY; 0 retries (`HERMES_TEST_FILE_RETRIES=0`)
 
@@ -42,7 +77,7 @@
 **Marker mutation:** No — 26B does not acquire execution marker or call `begin_run_write`
 **Task 26A:** Closed (checkpoint approved)
 **Task 26C:** Not started and not approved
-**Task 27/28:** Not started
+**Task 27/28:** Task 27 Path R1 **implementation candidate complete** (not checkpointed); Task 28 not started
 **Entire Task 26:** Not complete
 **Verification:** `tests/htr/test_reconciliation_cases.py` — **176 passed**; full tracked HTR suite **1862 passed** (29 files; baseline 1686 + 176); 0 failed; 0 FLAKY; 0 retries
 

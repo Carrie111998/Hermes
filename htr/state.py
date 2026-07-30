@@ -667,6 +667,170 @@ class MarkerDispositionReconcileResult:
     notes: tuple[str, ...] = ()
 
 
+ERROR_CODE_RECOVERY_RUN_VALIDATION: Final = "RECOVERY_RUN_VALIDATION_FAILED"
+ERROR_CODE_RECOVERY_RUN_CONFLICT: Final = "RECOVERY_RUN_CONFLICT"
+ERROR_CODE_RECOVERY_RUN_STATE: Final = "RECOVERY_RUN_ILLEGAL_STATE"
+ERROR_CODE_RECOVERY_RUN_DURABILITY: Final = "RECOVERY_RUN_DURABILITY_FAILED"
+
+
+RecoveryRunDurabilityStage = Literal[
+    "record_write",
+    "record_fsync",
+    "recovery_case_dir_fsync",
+    "control_dir_fsync",
+    "parent_dir_fsync",
+    "successor_root_reservation",
+    "successor_root_fsync",
+    "runs_root_fsync",
+    "recovery_origin_write",
+    "bootstrap_write",
+]
+
+RecoveryRunRecordName = Literal[
+    "request.json",
+    "issue.json",
+    "revoke.json",
+    "claim.json",
+    "attempt.json",
+    "outcome.json",
+    "recovery_origin.json",
+]
+
+
+class RecoveryRunStateError(HTRStateError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str = ERROR_CODE_RECOVERY_RUN_STATE,
+        recovery_request_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.recovery_request_id = recovery_request_id
+
+
+class RecoveryRunValidationError(RecoveryRunStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_RECOVERY_RUN_VALIDATION, **kwargs)
+
+
+class RecoveryRunConflictError(RecoveryRunStateError):
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        super().__init__(message, error_code=ERROR_CODE_RECOVERY_RUN_CONFLICT, **kwargs)
+
+
+class RecoveryRunDurabilityError(RecoveryRunStateError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        recovery_request_id: str,
+        successor_run_id: str | None = None,
+        record_name: RecoveryRunRecordName | str,
+        durability_stage: RecoveryRunDurabilityStage | str,
+        record_may_have_committed: bool,
+        successor_may_have_been_created: bool,
+        exact_replay_status: ExactReplayStatus,
+    ) -> None:
+        super().__init__(
+            message,
+            error_code=ERROR_CODE_RECOVERY_RUN_DURABILITY,
+            recovery_request_id=recovery_request_id,
+        )
+        self.successor_run_id = successor_run_id
+        self.record_name = record_name
+        self.durability_stage = durability_stage
+        self.record_may_have_committed = record_may_have_committed
+        self.successor_may_have_been_created = successor_may_have_been_created
+        self.exact_replay_status = exact_replay_status
+
+
+@dataclass(frozen=True)
+class RecoveryRunWriteMetadata:
+    exact_replay: bool
+    exact_replay_status: ExactReplayStatus
+    record_may_have_committed: bool
+    durability_indeterminate: bool
+
+
+@dataclass(frozen=True)
+class RecoveryRunRequestRecord:
+    recovery_request_id: str
+    request_digest: str
+    reconciliation_case_id: str
+    recovery_of_run_id: str
+    successor_run_id: str
+    recovery_scope: str
+    requested_by: str
+    requested_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryRunIssueRecord:
+    recovery_request_id: str
+    recovery_approval_id: str
+    issue_digest: str
+    issued_by: str
+    issued_at: str
+    expires_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryRunClaimRecord:
+    recovery_request_id: str
+    claim_id: str
+    claim_digest: str
+    claimant: str
+    claimed_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryRunAttemptRecord:
+    recovery_request_id: str
+    attempt_id: str
+    attempt_digest: str
+    executor: str
+    attempted_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryRunOutcomeRecord:
+    recovery_request_id: str
+    outcome_class: str
+    outcome_digest: str
+    recorded_at: str
+
+
+@dataclass(frozen=True)
+class RecoveryRunBundle:
+    recovery_request_id: str
+    request_record: RecoveryRunRequestRecord | None
+    issue_record: RecoveryRunIssueRecord | None
+    revoke_record: dict[str, Any] | None
+    claim_record: RecoveryRunClaimRecord | None
+    attempt_record: RecoveryRunAttemptRecord | None
+    outcome_record: RecoveryRunOutcomeRecord | None
+
+
+@dataclass(frozen=True)
+class RecoveryRunExecutionResult:
+    recovery_request_id: str
+    successor_run_id: str
+    outcome_class: str
+    outcome_digest: str
+    exact_replay: bool
+
+
+@dataclass(frozen=True)
+class RecoveryRunReconcileResult:
+    recovery_request_id: str
+    classification: str
+    outcome_record: RecoveryRunOutcomeRecord | None
+    successor_present: bool | None
+    notes: tuple[str, ...] = ()
+
+
 def is_valid_task_transition(from_status: str, to_status: str) -> bool:
     """Return True when *to_status* is legal from *from_status*."""
     if from_status not in TASK_STATUSES or to_status not in TASK_STATUSES:

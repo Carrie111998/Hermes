@@ -1,11 +1,11 @@
 # Phase 2 — Runtime Integration Boundary
 
-**Status:** Phase 2 **implementation in progress** (Task 19 `57a1ed651`; Task 21 action plan ✅; Task 22 immutable seal ✅; Task 23 write barrier ✅); architecture checkpoint Task 20 (Policy C). **Updated:** 2026-07-28 (Task 26C Path-A v1 checkpoint approved and complete; Task 26 complete for approved v1 scope; Path B deferred; Task 27/28 not started)
+**Status:** Phase 2 **implementation in progress** (Task 19–27 checkpointed; **Task 27 Path-R1 creation-only v1 checkpoint approved and complete**); **Task 28 not started and not approved**. **Updated:** 2026-07-30
 **Date:** 2026-07-19 (planning); **updated** 2026-07-21 (Tasks 19–23)
 **Depends on:** Phase 1 closed — Task 17.1 `8fea4daa0`; baseline Git-reproducible at Task 18.5 `04b11bc4d`
 **Audience:** Architect + Cursor implementer
 
-This document defines what Phase 2 **may** and **may not** do. Task 20 accepts **Policy C** (immutable finalized-run seal + successor-based recovery). **Task 22 implements the finalized-run seal.** Recovery/Successor Run protocol remains **not implemented** until Task 27+.
+This document defines what Phase 2 **may** and **may not** do. Task 20 accepts **Policy C** (immutable finalized-run seal + successor-based recovery). **Task 22 implements the finalized-run seal.** **Task 27 Path-R1 creation-only v1 checkpoint approved and complete** — creates one approved linked Successor Run via `.control/recovery_runs/` (parent `c1f4fdd8`); the original finalized source Run remains permanently immutable; successor creation does not authorize successor execution; all six outcome non-permission booleans remain false; forward_fix remains outside v1; Path R1 remains the only approved eligibility path. **Task 28 bounded repair not started and not approved.**
 
 ---
 
@@ -53,14 +53,14 @@ final closure
 → read-only observation remains available
 → a problem may produce a recovery proposal (future)
 → explicit high-risk approval required (future)
-→ separate linked Recovery/Successor Run may be created (Task 27+)
+→ separate linked Recovery/Successor Run may be created (**Task 27 Path-R1 creation-only v1 ✅** — one approved linked Successor Run; creation does not authorize successor execution)
 → diagnosis, remediation, verification, closure in the successor
 → original run unchanged as historical evidence
 ```
 
 **Do not describe recovery as:** reopening, unlocking, editing final closure, rolling back closure, or resuming mutation on the original run.
 
-**Not implemented until Task 27** (separate Architect-approved architecture + schema task).
+**Implemented at Task 27 (Path-R1 creation-only v1).** Creates one approved linked Successor Run only. The original finalized source Run remains permanently immutable. Successor creation does not authorize successor execution, retry, repair, invoke, artifact copy, external side effect, automatic execution, completion, closure, marker disposition, or outcome rewrite. All six Task 27 outcome non-permission booleans remain false. forward_fix remains outside v1. Path R1 remains the only approved eligibility path.
 
 ### 1.3 Prohibited bypasses (normal operations)
 
@@ -83,7 +83,7 @@ Exceptional legal/security/data-governance correction of a finalized original ru
 | Approval persistence (Task 24) | ✅ Done (control plane only; invoke disabled) |
 | Human-gated lifecycle invoke (Task 25) | ✅ Implemented — `complete_run_manually` pilot only; ready for checkpoint |
 | Bounded repair / unattended automation | ❌ No |
-| Recovery/Successor Run creation | ❌ No (Task 27+) |
+| Recovery/Successor Run creation | ✅ Done (Task 27 Path-R1 creation-only v1 — checkpoint approved and complete) |
 
 Bounded self-healing of finalized-run problems requires the Recovery/Successor Run protocol; **never in-place repair of the original run**.
 
@@ -110,7 +110,7 @@ Bounded self-healing of finalized-run problems requires the Recovery/Successor R
 | Phase 1 JSON SoT | Yes (Task 19) | Manual APIs only | Via Task 25+ invoke after Task 23 |
 | Event log | Yes | Lifecycle APIs only | Same |
 | Finalized original run | Yes | **Task 22: sealed** | **Task 22: sealed** |
-| Recovery/Successor Run | N/A | N/A | Task 27+ protocol |
+| Recovery/Successor Run | N/A | N/A | Task 27 ✅ (Path-R1 creation-only v1 — one linked Successor Run; no successor execution authority) |
 
 Runtime must not append events or write SoT directly. Writes only through allowlisted canonical lifecycle APIs after Task 22 seal + Task 23 write barrier + Task 24 approval + Task 25 invoke gates pass.
 
@@ -128,7 +128,11 @@ Runtime must not append events or write SoT directly. Writes only through allowl
 
 **Task 26B durable reconciliation cases (checkpoint approved and complete):** Control store at `{runs_root}/.control/reconciliation/{case_id}/` with immutable O_EXCL records (`open.json`, `observation.json`, `decision.json`). Public APIs: `generate_reconciliation_case_id`, `open_reconciliation_case`, `record_reconciliation_observation`, `record_reconciliation_decision`, `load_reconciliation_case`. Observation persists proven Task 26A inspection projection; decision-time revalidation with drift detection; policy-derived decision classes. **Decisions grant reconciliation posture only**; all six non-permission booleans remain **`false`**. Does **not** acquire execution marker, call `begin_run_write`, invoke, repair, create Recovery Runs, or rewrite outcomes.
 
-**Task 26C approved marker disposition (Path A — checkpoint approved and complete):** Control store at `{runs_root}/.control/marker_dispositions/{disposition_id}/` with immutable records (`request.json`, `issue.json`, `revoke.json`, `claim.json`, `attempt.json`, `outcome.json`). Public APIs: `create_marker_disposition_request`, `issue_marker_disposition_approval`, `revoke_marker_disposition_approval`, `claim_marker_disposition_approval`, `execute_approved_marker_disposition`, `load_marker_disposition_bundle`, `reconcile_marker_disposition_outcome`. **Path A only** — requires Task 26B decision `case_closed_deferred_to_protocol` with `marker_disposition_review`. Coordination via `fcntl.flock(LOCK_EX)` on pinned `.execution_locks` directory fd; 15-minute max approval lifetime; ten outcome classes; all permission booleans remain **`false`**. Marker removal **only** via approved execution under coordination flock. Does **not** mutate Task 26B reconciliation records. Retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited**. Task 27/28 **not started**.
+**Task 26C approved marker disposition (Path A — checkpoint approved and complete):** Control store at `{runs_root}/.control/marker_dispositions/{disposition_id}/` with immutable records (`request.json`, `issue.json`, `revoke.json`, `claim.json`, `attempt.json`, `outcome.json`). Public APIs: `create_marker_disposition_request`, `issue_marker_disposition_approval`, `revoke_marker_disposition_approval`, `claim_marker_disposition_approval`, `execute_approved_marker_disposition`, `load_marker_disposition_bundle`, `reconcile_marker_disposition_outcome`. **Path A only** — requires Task 26B decision `case_closed_deferred_to_protocol` with `marker_disposition_review`. Coordination via `fcntl.flock(LOCK_EX)` on pinned `.execution_locks` directory fd; 15-minute max approval lifetime; ten outcome classes; all permission booleans remain **`false`**. Marker removal **only** via approved execution under coordination flock. Does **not** mutate Task 26B reconciliation records. Retry, repair, invoke, and outcome rewrite **remain prohibited** outside Path A.
+
+**Task 26B.1 concurrent observation stabilization (checkpoint approved and complete):** Hardens `record_reconciliation_observation` concurrent identical-intent paths via flock-guarded exact replay; parametrized subprocess evidence (2/4/8 workers).
+
+**Task 27 approved Successor Run creation (Path-R1 creation-only v1 — checkpoint approved and complete):** Control store at `{runs_root}/.control/recovery_runs/{recovery_request_id}/` with immutable records; `{successor}/recovery_origin.json` linkage. **Path R1 only** — creates **one approved linked Successor Run**; original finalized source Run **permanently immutable**; successor creation **does not authorize successor execution**; all six outcome non-permission booleans remain **`false`**; **`forward_fix` outside v1**; attempt-before-creation; exclusive successor reservation/bootstrap without Task 23 marker. Does **not** grant retry, repair, invoke, artifact copy, external side effect, automatic execution, completion, closure, marker disposition, or outcome rewrite. **Task 28 not started and not approved.**
 
 Ambiguous outcomes include: not started; completed and verified; failed before mutation; may-have-completed (lost ack); SoT/event disagree; post-write verification failed; escalation required.
 
@@ -152,7 +156,7 @@ No self-healing approved yet. Prerequisites: finding taxonomy, repair allowlist,
 
 Tasks 21–26: **no new lifecycle record or event types**. Reuse canonical APIs where semantics match. Derived plans, approvals, execution receipts, recovery lineage — **not** disguised as existing lifecycle events.
 
-Recovery/Successor protocol (Task 27+) may eventually require new authoritative types — **separate Architect schema task** each time.
+Recovery/Successor creation types introduced at **Task 27 Path-R1 v1** via control store + `recovery_origin.json` — future extensions require **separate Architect schema task** each time.
 
 ---
 
@@ -160,7 +164,7 @@ Recovery/Successor protocol (Task 27+) may eventually require new authoritative 
 
 Unchanged from Task 18 planning: no daemon, scheduler, queue, HTR SQLite lifecycle DB, browser automation, silent heal, unattended pipeline, direct raw JSONL/SoT writes by runtime, automatic delegate_task/HEAL loops, changes to frozen 11-record chain.
 
-Additionally: no in-place finalized-run recovery; no ordinary unlock/bypass; no ad hoc recovery-run format before Task 27.
+Additionally: no in-place finalized-run recovery; no ordinary unlock/bypass; no ad hoc recovery-run format outside approved Task 27 Path-R1 v1.
 
 ---
 
@@ -176,8 +180,8 @@ read-only observability          ← Task 19 ✅
 → read-only reconciliation inspection ← Task 26A ✅ (closed)
 → durable reconciliation cases ← Task 26B ✅ (checkpoint approved and complete)
 → marker disposition ← Task 26C ✅ (Path-A v1 checkpoint approved and complete)
-→ Recovery/Successor Run protocol ← Task 27 (not started)
-→ bounded retry and repair       ← Task 28 (not started)
+→ Recovery/Successor Run protocol ← Task 27 ✅ (Path-R1 creation-only v1 checkpoint approved and complete)
+→ bounded retry and repair       ← Task 28 (not started and not approved)
 → selective unattended automation
 → multi-project orchestration    ← Task 30
 → controlled learning            ← Task 31
@@ -216,7 +220,7 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 | 26B | Durable reconciliation cases | ✅ Checkpoint approved and complete |
 | 26C | Marker disposition protocol | ✅ Path-A v1 checkpoint approved and complete |
 | 26 | Execution reconciliation (umbrella) | ✅ Complete for approved v1 scope (26A/26B/26C Path A done; Path B deferred) |
-| 27 | Recovery/Successor Run protocol | Not started |
+| 27 | Recovery/Successor Run creation (Path R1 v1) | ✅ Path-R1 creation-only v1 checkpoint approved and complete |
 | 28 | Bounded retry/repair framework | Not started |
 | 29 | Advisory artifact/link inspection | |
 | 30 | Multi-project registry + isolation | |
@@ -229,12 +233,13 @@ P2-T0 (boundary acceptance) is **passed** for Task 19. Do not reopen “P2-T0 hu
 - Task 19 checkpointed at `57a1ed651d622b3af82939d970b9c7f235ea1764`.
 - Phase 2 **implementation has started** (read-only foundation + immutable seal).
 - Task 20 records Policy C; Task 22 **implements finalized-run seal**; Task 23 **implements durable run write barrier**.
-- Recovery/Successor protocol remains **defined, not implemented** (Task 27+).
+- Recovery/Successor creation **implemented** at Task 27 Path-R1 v1 (creation-only; no successor execution authority).
 - Task 24 **checkpointed** — authoritative approval control delivered.
 - Task 25 **checkpointed** (`c6a9e305`) — narrow `complete_run_manually` pilot only.
 - Task 26A **closed** (checkpoint approved) — read-only reconciliation inspection complete.
 - Task 26B **checkpoint approved and complete** — durable reconciliation case control records; decisions grant reconciliation posture only; all six non-permission booleans remain `false`.
-- Task 26C **Path-A v1 checkpoint approved and complete** (Path A marker disposition only) — coordination flock + immutable disposition records; retry, repair, invoke, Recovery Run creation, and outcome rewrite **remain prohibited** outside Path A.
-- Task 26 **complete for approved v1 scope** (Path B deferred); Task 27/28 **not started**.
+- Task 26A, 26B, 26B.1, and 26C **closed**; **Task 26 complete for approved v1 scope** (Path B deferred).
+- **Task 27 Path-R1 creation-only v1 checkpoint approved and complete** — creates one approved linked Successor Run; original finalized source Run permanently immutable; successor creation does not authorize successor execution; all six outcome non-permission booleans remain false; forward_fix outside v1; Path R1 only eligibility path.
+- **Task 28 not started and not approved.**
 - No general Phase 2 lifecycle invoke path is enabled outside the Task 25 pilot API.
 - Phase 1 frozen chain and Task 17.1 historical semantics preserved in §0.

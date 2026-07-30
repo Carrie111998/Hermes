@@ -23,6 +23,10 @@ IdKind = Literal[
     "marker_disposition_approval",
     "marker_disposition_claim",
     "marker_disposition_attempt",
+    "recovery_run_request",
+    "recovery_run_approval",
+    "recovery_run_claim",
+    "recovery_run_attempt",
 ]
 
 ID_PREFIXES: dict[IdKind, str] = {
@@ -41,10 +45,14 @@ ID_PREFIXES: dict[IdKind, str] = {
     "marker_disposition_approval": "mda_",
     "marker_disposition_claim": "mdc_",
     "marker_disposition_attempt": "mat_",
+    "recovery_run_request": "rcr_",
+    "recovery_run_approval": "rap_",
+    "recovery_run_claim": "rcl_",
+    "recovery_run_attempt": "rat_",
 }
 
 _ID_BODY_RE = re.compile(
-    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat)_(\d{8})_([a-f0-9]{6})$"
+    r"^(goal|run|task|att|evt|tc|art|ver|heal|apr|rcn|mdp|mda|mdc|mat|rcr|rap|rcl|rat)_(\d{8})_([a-f0-9]{6})$"
 )
 
 
@@ -148,3 +156,23 @@ def generate_marker_disposition_claim_id() -> str:
 
 def generate_marker_disposition_attempt_id() -> str:
     return generate_id("marker_disposition_attempt")
+
+
+def generate_recovery_request_id() -> str:
+    return generate_id("recovery_run_request")
+
+
+def generate_recovery_approval_id() -> str:
+    return generate_id("recovery_run_approval")
+
+
+def generate_recovery_claim_id() -> str:
+    return generate_id("recovery_run_claim")
+
+
+def generate_recovery_attempt_id() -> str:
+    return generate_id("recovery_run_attempt")
+
+
+def generate_successor_run_id() -> str:
+    return new_run_id()

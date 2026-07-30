@@ -1,5 +1,9 @@
+import os
 import tempfile
+import threading
 from unittest import mock
+
+import pytest
 
 from htr.ids import new_attempt_id, new_run_id, new_task_id
 from htr import io, paths
@@ -223,3 +227,155 @@ def test_repeated_create_workspace_does_not_truncate_jsonl(tmp_path):
     assert io.read_jsonl(
         paths.tool_calls_path(run_id, task_id, attempt_id, tmp_path)
     ) == [{"tool_call_id": "tc_keep"}]
+
+
+def test_reserve_run_root_exclusive_creates_empty_root(tmp_path):
+    run_id = new_run_id()
+    reservation = io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+    try:
+        assert reservation.created is True
+        assert paths.run_root(run_id, tmp_path).is_dir()
+        assert not paths.run_manifest_path(run_id, tmp_path).exists()
+    finally:
+        io.release_run_root_reservation(reservation)
+
+
+def test_reserve_run_root_exclusive_rejects_existing(tmp_path):
+    run_id = new_run_id()
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    with pytest.raises(io.RunRootReservationError, match="already exists"):
+        io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+
+
+def test_bootstrap_reserved_run_workspace_initial_state(tmp_path):
+    run_id = new_run_id()
+    reservation = io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+    try:
+        io.bootstrap_reserved_run_workspace(run_id, base_dir=tmp_path, reservation=reservation)
+    finally:
+        io.release_run_root_reservation(reservation)
+    assert paths.run_manifest_path(run_id, tmp_path).is_file()
+    assert paths.task_events_path(run_id, tmp_path).is_file()
+    assert paths.approvals_path(run_id, tmp_path).is_file()
+    assert paths.reports_dir(run_id, tmp_path).is_dir()
+    assert paths.tasks_dir(run_id, tmp_path).is_dir()
+    manifest = io.read_json(paths.run_manifest_path(run_id, tmp_path))
+    assert manifest["status"] == "created"
+
+
+# --- Task 27 reservation / bootstrap hardening ---
+
+
+def test_reserve_run_root_exclusive_rejects_symlink_run_root(tmp_path):
+    run_id = new_run_id()
+    runs_root = paths.runs_root(tmp_path)
+    runs_root.mkdir(parents=True, exist_ok=True)
+    link_target = tmp_path / "outside"
+    link_target.mkdir()
+    (runs_root / run_id).symlink_to(link_target)
+    with pytest.raises(io.RunRootReservationError, match="already exists"):
+        io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+
+
+def test_reserve_run_root_exclusive_rejects_nonempty_existing_dir(tmp_path):
+    run_id = new_run_id()
+    root = paths.run_root(run_id, tmp_path)
+    root.mkdir(parents=True)
+    (root / "leftover.txt").write_text("data", encoding="utf-8")
+    with pytest.raises(io.RunRootReservationError, match="already exists"):
+        io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+
+
+def test_reserve_run_root_exclusive_rejects_unrelated_existing_run(tmp_path):
+    existing_id = new_run_id()
+    io.create_run_workspace(existing_id, base_dir=tmp_path)
+    with pytest.raises(io.RunRootReservationError, match="already exists"):
+        io.reserve_run_root_exclusive(existing_id, base_dir=tmp_path)
+
+
+def test_reserve_run_root_exclusive_thread_simultaneous_one_winner(tmp_path):
+    run_id = new_run_id()
+    barrier = threading.Barrier(4)
+    slots: list[tuple[bool, bool] | Exception] = [()] * 4
+
+    def _worker(index: int) -> None:
+        try:
+            barrier.wait()
+            reservation = io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+            try:
+                slots[index] = (reservation.created, True)
+            finally:
+                io.release_run_root_reservation(reservation)
+        except Exception as exc:
+            slots[index] = exc
+
+    threads = [threading.Thread(target=_worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    ok = [s for s in slots if isinstance(s, tuple)]
+    errors = [s for s in slots if isinstance(s, io.RunRootReservationError)]
+    assert len(ok) == 1
+    assert len(errors) == 3
+    assert ok[0][0] is True
+
+
+@pytest.mark.parametrize(
+    "bad_run_id",
+    [
+        "../escape",
+        "..",
+        "not_a_run_id",
+        "",
+    ],
+)
+def test_reserve_run_root_exclusive_rejects_path_traversal_and_invalid_ids(
+    tmp_path, bad_run_id
+):
+    with pytest.raises(io.RunRootReservationError, match="invalid run_id"):
+        io.reserve_run_root_exclusive(bad_run_id, base_dir=tmp_path)
+
+
+def test_bootstrap_partial_without_manifest_fails_verification(tmp_path):
+    run_id = new_run_id()
+    reservation = io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+    try:
+        io.release_run_root_reservation(reservation)
+    except io.RunRootReservationError:
+        pass
+    root = paths.run_root(run_id, tmp_path)
+    assert root.is_dir()
+    assert not paths.run_manifest_path(run_id, tmp_path).exists()
+
+
+def test_bootstrap_reserved_run_workspace_rejects_mismatched_reservation(tmp_path):
+    run_id = new_run_id()
+    other_id = new_run_id()
+    reservation = io.reserve_run_root_exclusive(run_id, base_dir=tmp_path)
+    try:
+        with pytest.raises(io.RunRootReservationError, match="mismatch"):
+            io.bootstrap_reserved_run_workspace(
+                other_id,
+                base_dir=tmp_path,
+                reservation=reservation,
+            )
+    finally:
+        io.release_run_root_reservation(reservation)
+
+
+def test_create_run_workspace_regression_unchanged_after_reservation_helpers(tmp_path):
+    run_id = new_run_id()
+    manifest_path = paths.run_manifest_path(run_id, tmp_path)
+
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    first_created_at = io.read_json(manifest_path)["created_at"]
+
+    io.create_run_workspace(run_id, base_dir=tmp_path)
+    second_manifest = io.read_json(manifest_path)
+
+    assert second_manifest["created_at"] == first_created_at
+    assert second_manifest["status"] == "created"
+    assert paths.reports_dir(run_id, tmp_path).is_dir()
+    assert paths.tasks_dir(run_id, tmp_path).is_dir()
