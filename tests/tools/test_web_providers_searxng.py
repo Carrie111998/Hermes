@@ -109,6 +109,104 @@ class TestSearXNGSearchProviderSearch:
 
         assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
 
+    def test_query_params_in_url_are_passed_to_search(self, monkeypatch):
+        """Query params in SEARXNG_URL (e.g. p_token) should be merged into
+        every search request so reverse-proxy-authenticated instances work."""
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?p_token=abc123")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("test query", limit=5)
+
+        # The p_token should be present in the request params
+        assert captured_params.get("p_token") == "abc123"
+        # Standard search params should still be present
+        assert captured_params.get("q") == "test query"
+        assert captured_params.get("format") == "json"
+
+    def test_url_with_query_params_strips_them_from_base_url(self, monkeypatch):
+        """The base URL used for the endpoint should not include query params."""
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?p_token=abc123")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        calls = []
+        def capture_get(url, **kwargs):
+            calls.append(url)
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert calls[0] == "https://search.example.com/search", f"Got: {calls[0]}"
+
+    def test_multiple_query_params_in_url(self, monkeypatch):
+        """Multiple query params should all be passed through."""
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?p_token=abc&lang=en")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert captured_params.get("p_token") == "abc"
+        assert captured_params.get("lang") == "en"
+
+    def test_url_without_query_params_works_unchanged(self, monkeypatch):
+        """URLs without query params should behave exactly as before."""
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+
+        # No extra params should be present
+        assert "p_token" not in captured_params
+        assert captured_params.get("q") == "query"
+        assert captured_params.get("format") == "json"
+
+    def test_reserved_params_not_overridden_by_url(self, monkeypatch):
+        """URL query params must not override Hermes-owned fields (q, format, pageno).
+
+        Regression test: if SEARXNG_URL contains ?q=stale&format=html, the
+        provider must still use the actual query and JSON format.
+        """
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/?q=stale&format=html&pageno=99&p_token=abc")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("real query", limit=5)
+
+        # Hermes-owned fields must win
+        assert captured_params["q"] == "real query"
+        assert captured_params["format"] == "json"
+        assert captured_params["pageno"] == 1
+        # Non-reserved URL params should still pass through
+        assert captured_params["p_token"] == "abc"
+
 
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available recognizes "searxng"

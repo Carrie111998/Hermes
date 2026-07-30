@@ -18,6 +18,12 @@ Config keys this provider responds to::
 Env var::
 
     SEARXNG_URL=http://localhost:8080
+
+``SEARXNG_URL`` may include query parameters (e.g. for reverse-proxy
+authentication tokens like Pangolin's ``p_token``).  Any query params
+present in the URL are merged into every search request::
+
+    SEARXNG_URL=https://search.example.com/?p_token=abc123
 """
 
 from __future__ import annotations
@@ -69,15 +75,32 @@ class SearXNGWebSearchProvider(WebSearchProvider):
         """Execute a search against the configured SearXNG instance."""
         import httpx
 
-        base_url = _searxng_url().rstrip("/")
-        if not base_url:
+        raw_url = _searxng_url().strip()
+        if not raw_url:
             return {"success": False, "error": "SEARXNG_URL is not set"}
+
+        # Support query params in SEARXNG_URL (e.g. reverse-proxy auth tokens
+        # like Pangolin's p_token).  Parse and merge them into every request.
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(raw_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
+        # Collect extra query params from the URL (values are lists from parse_qs)
+        extra_params: Dict[str, str] = {}
+        for key, values in parse_qs(parsed.query).items():
+            if values:
+                extra_params[key] = values[0]
 
         params: Dict[str, Any] = {
             "q": query,
             "format": "json",
             "pageno": 1,
         }
+        # Merge extra params from the URL, but never let them override
+        # Hermes-owned request fields (q, format, pageno).
+        _reserved = {"q", "format", "pageno"}
+        for key, value in extra_params.items():
+            if key not in _reserved:
+                params[key] = value
 
         try:
             resp = httpx.get(
