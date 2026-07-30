@@ -717,19 +717,22 @@ class Mem0MemoryProvider(MemoryProvider):
         agent_id = self._agent_id
         metadata = {**self._write_metadata(), "source": "pre_compress", "sprint_automation": True}
 
-        def _extract():
+        # Snapshot tool content synchronously before spawning the background thread
+        # to avoid a race condition: the main thread may mutate or compress the
+        # messages list concurrently, causing RuntimeError or partial reads.
+        tool_content: list[str] = []
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 500:
+                    tool_content.append(content[:2000])  # cap to avoid token explosion
+
+        if not tool_content:
+            return ""
+
+        def _extract(content_list: list[str]) -> None:
             try:
-                tool_content = []
-                for msg in messages:
-                    if isinstance(msg, dict) and msg.get("role") == "tool":
-                        content = msg.get("content", "")
-                        if isinstance(content, str) and len(content) > 500:
-                            tool_content.append(content[:2000])  # cap to avoid token explosion
-
-                if not tool_content:
-                    return
-
-                combined = "\n\n---\n\n".join(tool_content[:5])  # max 5 large results
+                combined = "\n\n---\n\n".join(content_list[:5])  # max 5 large results
                 extraction_prompt = (
                     "Extract and remember the key facts from these tool results "
                     "that will be needed later:\n\n" + combined
@@ -746,7 +749,12 @@ class Mem0MemoryProvider(MemoryProvider):
                 self._record_failure()
                 logger.warning("on_pre_compress extraction failed: %s", e)
 
-        t = threading.Thread(target=_extract, daemon=True, name="mem0-pre-compress")
+        t = threading.Thread(
+            target=_extract,
+            args=(tool_content,),
+            daemon=True,
+            name="mem0-pre-compress",
+        )
         t.start()
         return ""
 
