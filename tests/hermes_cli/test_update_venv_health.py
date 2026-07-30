@@ -784,6 +784,104 @@ def test_quiesce_posix_gateway_reclaims_orphaned_update_marker(
 
 
 @patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_reclaims_reused_owner_pid(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        read_drain_request,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="stale-owner",
+        owner_pid=4242,
+        owner_start_time=111,
+    )
+
+    def process_start_time(pid):
+        return 222 if pid == 4242 else 333
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        side_effect=process_start_time,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is not None
+    body = read_drain_request(home=profile_home)
+    assert body is not None
+    assert body["request_id"] != "stale-owner"
+    assert body["owner_pid"] == os.getpid()
+    assert body["owner_start_time"] == 333
+
+    cli_main._release_posix_gateway_quiesce(token)
+    assert read_drain_request(home=profile_home) is None
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
+def test_quiesce_posix_gateway_preserves_live_foreign_updater(
+    _winp, tmp_path
+):
+    from gateway.drain_control import (
+        read_drain_request,
+        write_drain_request,
+    )
+
+    profile_home = tmp_path / "profiles" / "jasper"
+    profile_home.mkdir(parents=True)
+    proc = SimpleNamespace(profile="jasper", path=profile_home, pid=555)
+    original = write_drain_request(
+        principal="hermes-update",
+        home=profile_home,
+        request_id="live-owner",
+        owner_pid=4242,
+        owner_start_time=111,
+    )
+
+    with patch(
+        "hermes_cli.gateway.find_profile_gateway_processes",
+        return_value=[proc],
+    ), patch(
+        "hermes_cli.gateway._get_restart_drain_timeout",
+        return_value=1,
+    ), patch(
+        "gateway.status.get_process_start_time",
+        return_value=111,
+    ), patch(
+        "gateway.status.read_runtime_status",
+        return_value={
+            "pid": 555,
+            "gateway_state": "draining",
+            "active_agents": 0,
+        },
+    ):
+        token = cli_main._quiesce_posix_gateways_for_update({555})
+
+    assert token is not None
+    assert token["created_markers"] == []
+    cli_main._release_posix_gateway_quiesce(token)
+    assert read_drain_request(home=profile_home) == original
+
+
+@patch.object(cli_main, "_is_windows", return_value=False)
 def test_release_posix_gateway_preserves_replacement_drain(
     _winp, tmp_path
 ):

@@ -52,9 +52,11 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -62,6 +64,38 @@ from utils import atomic_json_write
 _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
+_DRAIN_REQUEST_LOCK_FILENAME = ".drain_request.lock"
+
+
+@contextmanager
+def _drain_request_transaction(
+    home: Optional[Path] = None,
+) -> Iterator[None]:
+    """Serialize marker ownership transitions across local processes."""
+    base = Path(home) if home is not None else get_hermes_home()
+    base.mkdir(parents=True, exist_ok=True)
+    lock_path = base / _DRAIN_REQUEST_LOCK_FILENAME
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            if lock_path.stat().st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @functools.lru_cache(maxsize=1)
@@ -139,6 +173,7 @@ def write_drain_request(
     home: Optional[Path] = None,
     request_id: Optional[str] = None,
     owner_pid: Optional[int] = None,
+    owner_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
 
@@ -161,7 +196,52 @@ def write_drain_request(
     of which drain causes set the flag lives entirely in the caller (NAS). The
     field defaults False so legacy/operator drains behave exactly as before.
     """
-    payload = {
+    payload = _drain_request_payload(
+        principal=principal,
+        suppress_notification=suppress_notification,
+        request_id=request_id,
+        owner_pid=owner_pid,
+        owner_start_time=owner_start_time,
+    )
+    with _drain_request_transaction(home):
+        atomic_json_write(drain_request_path(home), payload)
+    return payload
+
+
+def write_drain_request_if_unchanged(
+    expected: Optional[dict[str, Any]],
+    *,
+    principal: str = "drain-control",
+    suppress_notification: bool = False,
+    home: Optional[Path] = None,
+    request_id: Optional[str] = None,
+    owner_pid: Optional[int] = None,
+    owner_start_time: Optional[int] = None,
+) -> Optional[dict[str, Any]]:
+    """Replace the observed marker only if it has not changed meanwhile."""
+    payload = _drain_request_payload(
+        principal=principal,
+        suppress_notification=suppress_notification,
+        request_id=request_id,
+        owner_pid=owner_pid,
+        owner_start_time=owner_start_time,
+    )
+    with _drain_request_transaction(home):
+        if _read_drain_request_unlocked(home=home) != expected:
+            return None
+        atomic_json_write(drain_request_path(home), payload)
+    return payload
+
+
+def _drain_request_payload(
+    *,
+    principal: str,
+    suppress_notification: bool,
+    request_id: Optional[str],
+    owner_pid: Optional[int],
+    owner_start_time: Optional[int],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "action": "drain",
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "principal": principal,
@@ -172,7 +252,8 @@ def write_drain_request(
         payload["request_id"] = str(request_id)
     if owner_pid is not None:
         payload["owner_pid"] = int(owner_pid)
-    atomic_json_write(drain_request_path(home), payload)
+    if owner_start_time is not None:
+        payload["owner_start_time"] = int(owner_start_time)
     return payload
 
 
@@ -181,6 +262,29 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
 
     Best-effort: a missing file is not an error (cancel is idempotent).
     """
+    with _drain_request_transaction(home):
+        return _clear_drain_request_unlocked(home=home)
+
+
+def clear_drain_request_if_matches(
+    expected: dict[str, Any],
+    *,
+    home: Optional[Path] = None,
+) -> bool:
+    """Remove a marker only if its complete payload still matches ``expected``.
+
+    The comparison and unlink share the same cross-process transaction as
+    :func:`write_drain_request`, so a cooperating operator/NAS writer cannot
+    replace the marker between ownership validation and deletion.
+    """
+    with _drain_request_transaction(home):
+        current = _read_drain_request_unlocked(home=home)
+        if current is None or current != expected:
+            return False
+        return _clear_drain_request_unlocked(home=home)
+
+
+def _clear_drain_request_unlocked(*, home: Optional[Path] = None) -> bool:
     path = drain_request_path(home)
     try:
         path.unlink()
@@ -264,6 +368,13 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     via :func:`drain_requested`; callers that need the body get an empty dict
     rather than an exception). Never raises.
     """
+    return _read_drain_request_unlocked(home=home)
+
+
+def _read_drain_request_unlocked(
+    *,
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
     path = drain_request_path(home)
     try:
         raw = path.read_text(encoding="utf-8")
