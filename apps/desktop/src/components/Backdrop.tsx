@@ -69,7 +69,7 @@ export function Backdrop() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [])
 
-  // Resolve skin wallpaper → data URL via Electron when needed.
+  // Resolve skin wallpaper 竊・data URL via Electron when needed.
   useEffect(() => {
     let cancelled = false
     const raw = wallpaper

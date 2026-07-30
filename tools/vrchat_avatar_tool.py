@@ -6,9 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from hermes_constants import get_hermes_home
 from tools.openclaw.paths import default_openclaw_config_path
 from tools.openclaw.vrchat_avatar_registry import VrchatAvatarRegistry, catalog_to_dict
 from tools.registry import registry
@@ -29,17 +26,20 @@ def _load_vrchat_control_config(config_path: str = "") -> tuple[dict[str, Any], 
         except (OSError, json.JSONDecodeError):
             pass
 
-    harness_cfg = get_hermes_home() / "config.yaml"
-    if harness_cfg.is_file():
-        try:
-            hermes = yaml.safe_load(harness_cfg.read_text(encoding="utf-8")) or {}
-            harness_block = hermes.get("harness", {}) if isinstance(hermes, dict) else {}
-            if isinstance(harness_block.get("vrchat"), dict):
-                merged.setdefault("vrchat", {})
-                merged["vrchat"].setdefault("avatarControl", {})
-                merged["vrchat"]["avatarControl"].update(harness_block["vrchat"].get("avatarControl", {}))
-        except (OSError, yaml.YAMLError):
-            pass
+    try:
+        # Canonical loader: managed-scope overlay + ${VAR} expansion.
+        from hermes_cli.config import load_config_readonly
+
+        hermes = load_config_readonly()
+        harness_block = hermes.get("harness", {}) if isinstance(hermes, dict) else {}
+        if isinstance(harness_block.get("vrchat"), dict):
+            merged.setdefault("vrchat", {})
+            merged["vrchat"].setdefault("avatarControl", {})
+            merged["vrchat"]["avatarControl"].update(
+                harness_block["vrchat"].get("avatarControl", {})
+            )
+    except Exception:
+        pass
 
     return merged, repo_root
 

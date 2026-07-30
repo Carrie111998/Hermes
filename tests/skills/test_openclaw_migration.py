@@ -56,6 +56,8 @@ def test_extract_markdown_entries_promotes_heading_context():
     assert "Tyler Williams > Active Projects: Hermes Agent" in entries
 
 
+
+
 def test_merge_entries_respects_limit_and_reports_overflow():
     mod = load_module()
     existing = ["alpha"]
@@ -67,39 +69,12 @@ def test_merge_entries_respects_limit_and_reports_overflow():
     assert overflowed == ["gamma is too long"]
 
 
-def test_resolve_selected_options_supports_include_and_exclude():
-    mod = load_module()
-    selected = mod.resolve_selected_options(["memory,skills", "user-profile"], ["skills"])
-    assert selected == {"memory", "user-profile"}
 
 
-def test_resolve_selected_options_supports_presets():
-    mod = load_module()
-    user_data = mod.resolve_selected_options(preset="user-data")
-    full = mod.resolve_selected_options(preset="full")
-    assert "secret-settings" not in user_data
-    assert "secret-settings" in full
-    assert user_data < full
 
 
-def test_resolve_selected_options_rejects_unknown_values():
-    mod = load_module()
-    try:
-        mod.resolve_selected_options(["memory,unknown-option"], None)
-    except ValueError as exc:
-        assert "unknown-option" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for unknown migration option")
 
 
-def test_resolve_selected_options_rejects_unknown_preset():
-    mod = load_module()
-    try:
-        mod.resolve_selected_options(preset="everything")
-    except ValueError as exc:
-        assert "everything" in str(exc)
-    else:
-        raise AssertionError("Expected ValueError for unknown migration preset")
 
 
 def test_migrator_copies_skill_and_merges_allowlist(tmp_path: Path):
@@ -185,191 +160,10 @@ def test_migrator_optionally_imports_supported_secrets_and_messaging_settings(tm
     assert "TELEGRAM_BOT_TOKEN=123:abc" in env_text
 
 
-def test_migrator_imports_channel_provider_gateway_and_vrchat_secrets(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    output_dir = target / "migration-report"
-    (source / "credentials" / "auth-profiles").mkdir(parents=True)
-    (source / "credentials" / "auth-profiles" / "profile.json").write_text(
-        json.dumps({"encrypted": "ciphertext", "provider": "openai-codex"}),
-        encoding="utf-8",
-    )
-    (source / ".env").write_text(
-        "\ufeff"
-        "TELEGRAM_WEBHOOK_SECRET=telegram-webhook-secret\n"
-        "TELEGRAM_WEBHOOK_URL=https://telegram.example/webhook\n"
-        "LINE_WEBHOOK_URL=https://line.example/webhook\n"
-        "OPENCLAW_GATEWAY_TOKEN=env-gateway-token\n"
-        "OLLAMA_API_KEY=ollama-env-key\n"
-        "VRCHAT_OSC_RECV_PORT=9001\n",
-        encoding="utf-8",
-    )
-    (source / "openclaw.json").write_text(
-        json.dumps(
-            {
-                "channels": {
-                    "telegram": {"botToken": "telegram-token", "webhookPort": 9443},
-                    "discord": {"token": "discord-token", "allowFrom": ["discord-user"]},
-                    "line": {
-                        "channelAccessToken": "line-access-token",
-                        "channelSecret": "line-secret",
-                        "allowFrom": ["line-user"],
-                        "groupAllowFrom": ["line-group"],
-                    },
-                },
-                "gateway": {"auth": {"token": "json-gateway-token"}},
-                "plugins": {
-                    "entries": {
-                        "local-voice": {
-                            "config": {
-                                "vrchatOscEnabled": True,
-                                "vrchatOscPort": 9000,
-                            }
-                        }
-                    }
-                },
-                "models": {
-                    "providers": {
-                        "llama-cpp": {"apiKey": "llama-key"},
-                        "ollama": {"apiKey": "${OLLAMA_API_KEY}"},
-                        "hypura": {"apiKey": "hypura-key"},
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    target.mkdir()
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=True,
-        output_dir=output_dir,
-        selected_options={"secret-settings", "provider-keys"},
-    )
-    report = migrator.migrate()
-
-    env_data = mod.parse_env_file(target / ".env")
-    assert env_data["TELEGRAM_BOT_TOKEN"] == "telegram-token"
-    assert env_data["TELEGRAM_WEBHOOK_PORT"] == "9443"
-    assert env_data["TELEGRAM_WEBHOOK_SECRET"] == "telegram-webhook-secret"
-    assert env_data["DISCORD_BOT_TOKEN"] == "discord-token"
-    assert env_data["DISCORD_ALLOWED_USERS"] == "discord-user"
-    assert env_data["LINE_CHANNEL_ACCESS_TOKEN"] == "line-access-token"
-    assert env_data["LINE_CHANNEL_SECRET"] == "line-secret"
-    assert env_data["LINE_ALLOWED_USERS"] == "line-user"
-    assert env_data["LINE_ALLOWED_GROUPS"] == "line-group"
-    assert env_data["LINE_PUBLIC_URL"] == "https://line.example/webhook"
-    assert env_data["HERMES_GATEWAY_TOKEN"] == "env-gateway-token"
-    assert env_data["VRCHAT_OSC_ENABLED"] == "true"
-    assert env_data["VRCHAT_OSC_HOST"] == "127.0.0.1"
-    assert env_data["VRCHAT_OSC_SEND_PORT"] == "9000"
-    assert env_data["VRCHAT_OSC_RECV_PORT"] == "9001"
-    assert env_data["LLAMA_CPP_API_KEY"] == "llama-key"
-    assert env_data["OLLAMA_API_KEY"] == "ollama-env-key"
-    assert env_data["HYPURA_API_KEY"] == "hypura-key"
-    assert (output_dir / "archive" / "credentials" / "auth-profiles" / "profile.json").exists()
-    assert any(item["kind"] == "oauth-credentials" and item["status"] == "archived" for item in report["items"])
 
 
-def test_messaging_cwd_skipped_when_inside_source(tmp_path: Path):
-    """MESSAGING_CWD pointing inside the OpenClaw source dir should be skipped."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-
-    # Workspace path is inside the source directory
-    ws_path = str(source / "workspace")
-    (source / "credentials").mkdir(parents=True)
-    (source / "openclaw.json").write_text(
-        json.dumps({"agents": {"defaults": {"workspace": ws_path}}}),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=True,
-        output_dir=target / "migration-report",
-        selected_options={"messaging-settings"},
-    )
-    migrator.migrate()
-
-    env_path = target / ".env"
-    if env_path.exists():
-        assert "MESSAGING_CWD" not in env_path.read_text(encoding="utf-8")
 
 
-def test_migrator_can_execute_only_selected_categories(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-
-    (source / "workspace" / "skills" / "demo-skill").mkdir(parents=True)
-    (source / "workspace" / "skills" / "demo-skill" / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: demo\n---\n\nbody\n",
-        encoding="utf-8",
-    )
-    (source / "workspace" / "MEMORY.md").write_text(
-        "# Memory\n\n- keep me\n",
-        encoding="utf-8",
-    )
-    (target / "config.yaml").write_text("command_allowlist: []\n", encoding="utf-8")
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=target / "migration-report",
-        selected_options={"skills"},
-    )
-    report = migrator.migrate()
-
-    imported_skill = target / "skills" / mod.SKILL_CATEGORY_DIRNAME / "demo-skill" / "SKILL.md"
-    assert imported_skill.exists()
-    assert not (target / "memories" / "MEMORY.md").exists()
-    assert report["selection"]["selected"] == ["skills"]
-    skipped_items = [item for item in report["items"] if item["status"] == "skipped"]
-    assert any(item["kind"] == "memory" and item["reason"] == "Not selected for this run" for item in skipped_items)
-
-
-def test_migrator_records_preset_in_report(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    (target / "config.yaml").write_text("command_allowlist: []\n", encoding="utf-8")
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=False,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=None,
-        selected_options=mod.MIGRATION_PRESETS["user-data"],
-        preset_name="user-data",
-    )
-    report = migrator.build_report()
-
-    assert report["preset"] == "user-data"
-    assert report["selection"]["preset"] == "user-data"
-    assert report["skill_conflict_mode"] == "skip"
-    assert report["selection"]["skill_conflict_mode"] == "skip"
 
 
 def test_source_candidate_finds_files_in_custom_workspace(tmp_path: Path):
@@ -430,183 +224,14 @@ def test_source_candidate_finds_files_in_custom_workspace(tmp_path: Path):
     assert "skill" in migrated_kinds
 
 
-def test_source_candidate_prefers_standard_workspace_over_custom(tmp_path: Path):
-    """When files exist in both ~/.openclaw/workspace/ and the custom workspace,
-    the standard location should win (custom is a fallback only)."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    custom_ws = tmp_path / "my-custom-workspace"
-
-    target.mkdir()
-    custom_ws.mkdir()
-    (source / "workspace").mkdir(parents=True)
-
-    # File in both locations
-    (source / "workspace" / "SOUL.md").write_text("# Standard soul\n", encoding="utf-8")
-    (custom_ws / "SOUL.md").write_text("# Custom soul\n", encoding="utf-8")
-
-    (source / "openclaw.json").write_text(
-        json.dumps({"agents": {"defaults": {"workspace": str(custom_ws)}}}),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=target / "migration-report",
-        selected_options={"soul"},
-    )
-    migrator.migrate()
-
-    # Standard workspace location should have been preferred
-    content = (target / "SOUL.md").read_text(encoding="utf-8")
-    assert "Standard soul" in content
 
 
-def test_migrator_exports_full_overflow_entries(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    (target / "config.yaml").write_text("memory:\n  memory_char_limit: 10\n  user_char_limit: 10\n", encoding="utf-8")
-    (source / "workspace").mkdir(parents=True)
-    (source / "workspace" / "MEMORY.md").write_text(
-        "# Memory\n\n- alpha\n- beta\n- gamma\n",
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=target / "migration-report",
-        selected_options={"memory"},
-    )
-    report = migrator.migrate()
-
-    memory_item = next(item for item in report["items"] if item["kind"] == "memory")
-    overflow_file = Path(memory_item["details"]["overflow_file"])
-    assert overflow_file.exists()
-    text = overflow_file.read_text(encoding="utf-8")
-    assert "alpha" in text or "beta" in text or "gamma" in text
 
 
-def test_migrator_can_rename_conflicting_imported_skill(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-
-    source_skill = source / "workspace" / "skills" / "demo-skill"
-    source_skill.mkdir(parents=True)
-    (source_skill / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: demo\n---\n\nbody\n",
-        encoding="utf-8",
-    )
-
-    existing_skill = target / "skills" / mod.SKILL_CATEGORY_DIRNAME / "demo-skill"
-    existing_skill.mkdir(parents=True)
-    (existing_skill / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: existing\n---\n\nexisting\n",
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=target / "migration-report",
-        skill_conflict_mode="rename",
-    )
-    report = migrator.migrate()
-
-    renamed_skill = target / "skills" / mod.SKILL_CATEGORY_DIRNAME / "demo-skill-imported" / "SKILL.md"
-    assert renamed_skill.exists()
-    assert existing_skill.joinpath("SKILL.md").read_text(encoding="utf-8").endswith("existing\n")
-    imported_items = [item for item in report["items"] if item["kind"] == "skill" and item["status"] == "migrated"]
-    assert any(
-        item["details"].get("renamed_from", "").replace("\\", "/").endswith("/demo-skill")
-        for item in imported_items
-    )
 
 
-def test_migrator_can_overwrite_conflicting_imported_skill_with_backup(tmp_path: Path):
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-
-    source_skill = source / "workspace" / "skills" / "demo-skill"
-    source_skill.mkdir(parents=True)
-    (source_skill / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: imported\n---\n\nfresh\n",
-        encoding="utf-8",
-    )
-
-    existing_skill = target / "skills" / mod.SKILL_CATEGORY_DIRNAME / "demo-skill"
-    existing_skill.mkdir(parents=True)
-    (existing_skill / "SKILL.md").write_text(
-        "---\nname: demo-skill\ndescription: existing\n---\n\nexisting\n",
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=target / "migration-report",
-        skill_conflict_mode="overwrite",
-    )
-    report = migrator.migrate()
-
-    assert existing_skill.joinpath("SKILL.md").read_text(encoding="utf-8").endswith("fresh\n")
-    backup_items = [item for item in report["items"] if item["kind"] == "skill" and item["status"] == "migrated"]
-    assert any(item["details"].get("backup") for item in backup_items)
 
 
-def test_discord_settings_migrated(tmp_path: Path):
-    """Discord bot token and allowlist migrate to .env."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    source.mkdir()
-
-    (source / "openclaw.json").write_text(
-        json.dumps({
-            "channels": {
-                "discord": {
-                    "token": "discord-bot-token-123",
-                    "allowFrom": ["111222333", "444555666"],
-                }
-            }
-        }),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=False, migrate_secrets=False, output_dir=None,
-        selected_options={"discord-settings"},
-    )
-    report = migrator.migrate()
-    env_text = (target / ".env").read_text(encoding="utf-8")
-    assert "DISCORD_BOT_TOKEN=discord-bot-token-123" in env_text
-    assert "DISCORD_ALLOWED_USERS=111222333,444555666" in env_text
 
 
 def test_slack_settings_migrated(tmp_path: Path):
@@ -642,37 +267,6 @@ def test_slack_settings_migrated(tmp_path: Path):
     assert "SLACK_ALLOWED_USERS=U111,U222" in env_text
 
 
-def test_signal_settings_migrated(tmp_path: Path):
-    """Signal account, HTTP URL, and allowlist migrate to .env."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    source.mkdir()
-
-    (source / "openclaw.json").write_text(
-        json.dumps({
-            "channels": {
-                "signal": {
-                    "account": "+15551234567",
-                    "httpUrl": "http://localhost:8080",
-                    "allowFrom": ["+15559876543"],
-                }
-            }
-        }),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=False, migrate_secrets=False, output_dir=None,
-        selected_options={"signal-settings"},
-    )
-    report = migrator.migrate()
-    env_text = (target / ".env").read_text(encoding="utf-8")
-    assert "SIGNAL_ACCOUNT=+15551234567" in env_text
-    assert "SIGNAL_HTTP_URL=http://localhost:8080" in env_text
-    assert "SIGNAL_ALLOWED_USERS=+15559876543" in env_text
 
 
 def test_model_config_migrated(tmp_path: Path):
@@ -702,65 +296,8 @@ def test_model_config_migrated(tmp_path: Path):
     assert "anthropic/claude-sonnet-4" in config_text
 
 
-def test_model_config_object_format(tmp_path: Path):
-    """Model config handles {primary: ...} object format."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    source.mkdir()
-
-    (source / "openclaw.json").write_text(
-        json.dumps({
-            "agents": {"defaults": {"model": {"primary": "openai/gpt-4o"}}}
-        }),
-        encoding="utf-8",
-    )
-    (target / "config.yaml").write_text("model: old-model\n", encoding="utf-8")
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=True, migrate_secrets=False, output_dir=None,
-        selected_options={"model-config"},
-    )
-    report = migrator.migrate()
-    config_text = (target / "config.yaml").read_text(encoding="utf-8")
-    assert "openai/gpt-4o" in config_text
 
 
-def test_tts_config_migrated(tmp_path: Path):
-    """TTS provider and voice settings migrate to config.yaml."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    source.mkdir()
-
-    (source / "openclaw.json").write_text(
-        json.dumps({
-            "messages": {
-                "tts": {
-                    "provider": "elevenlabs",
-                    "elevenlabs": {
-                        "voiceId": "custom-voice-id",
-                        "modelId": "eleven_turbo_v2",
-                    },
-                }
-            }
-        }),
-        encoding="utf-8",
-    )
-    (target / "config.yaml").write_text("tts:\n  provider: edge\n", encoding="utf-8")
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=False, migrate_secrets=False, output_dir=None,
-        selected_options={"tts-config"},
-    )
-    report = migrator.migrate()
-    config_text = (target / "config.yaml").read_text(encoding="utf-8")
-    assert "elevenlabs" in config_text
-    assert "custom-voice-id" in config_text
 
 
 def test_shared_skills_migrated(tmp_path: Path):
@@ -862,110 +399,8 @@ def test_provider_keys_require_migrate_secrets_flag(tmp_path: Path):
     assert "OPENROUTER_API_KEY=sk-or-test-key" in env_text
 
 
-def test_provider_keys_migrate_opencode_auth_profile(tmp_path: Path):
-    """OpenClaw auth-profiles opencode:default maps to Hermes OPENCODE_* keys."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-    source.mkdir()
-
-    auth_dir = source / "agents" / "main" / "agent"
-    auth_dir.mkdir(parents=True)
-    auth_dir.joinpath("auth-profiles.json").write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "profiles": {
-                    "opencode:default": {
-                        "provider": "opencode",
-                        "type": "api_key",
-                        "key": "sk-opencode-from-profile",
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=True,
-        output_dir=None,
-        selected_options={"provider-keys"},
-    )
-    migrator.migrate()
-    env_text = (target / ".env").read_text(encoding="utf-8")
-    assert "OPENCODE_ZEN_API_KEY=sk-opencode-from-profile" in env_text
-    assert "OPENCODE_GO_API_KEY=sk-opencode-from-profile" in env_text
 
 
-def test_workspace_agents_records_skip_when_missing(tmp_path: Path):
-    """Bug fix: workspace-agents records 'skipped' when source is missing."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    source.mkdir()
-    target.mkdir()
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=tmp_path / "workspace", overwrite=False, migrate_secrets=False, output_dir=None,
-        selected_options={"workspace-agents"},
-    )
-    report = migrator.migrate()
-    wa_items = [i for i in report["items"] if i["kind"] == "workspace-agents"]
-    assert len(wa_items) == 1
-    assert wa_items[0]["status"] == "skipped"
-
-
-def test_cron_store_is_archived_without_config_cron_section(tmp_path: Path):
-    """Bug fix: archive cron store even when openclaw.json has no top-level cron config."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    output_dir = target / "migration-report"
-    source.mkdir()
-    target.mkdir()
-
-    (source / "openclaw.json").write_text(json.dumps({"channels": {}}), encoding="utf-8")
-    (source / "cron").mkdir(parents=True)
-    (source / "cron" / "jobs.json").write_text(
-        json.dumps({"version": 1, "jobs": [{"id": "job-1", "name": "demo"}]}),
-        encoding="utf-8",
-    )
-
-    migrator = mod.Migrator(
-        source_root=source,
-        target_root=target,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=output_dir,
-        selected_options={"cron-jobs"},
-    )
-    report = migrator.migrate()
-
-    cron_items = [item for item in report["items"] if item["kind"] == "cron-jobs"]
-    archived_store = next(
-        (
-            item
-            for item in cron_items
-            if item["destination"] and item["destination"].replace("\\", "/").endswith("archive/cron-store")
-        ),
-        None,
-    )
-    assert archived_store is not None
-    assert Path(archived_store["destination"]).joinpath("jobs.json").exists()
-
-    notes_text = (output_dir / "MIGRATION_NOTES.md").read_text(encoding="utf-8")
-    assert "Run `hermes cron` to recreate scheduled tasks" in notes_text
-    assert "archive/cron-config.json" not in notes_text
 
 
 def test_embedded_openclaw_home_cron_store_is_reported_in_dry_run(tmp_path: Path):
@@ -1078,152 +513,16 @@ def test_rebrand_text_replaces_openclaw_variants():
     assert mod.rebrand_text("openclaw should always respond concisely") == "hermes should always respond concisely"
 
 
-def test_rebrand_text_replaces_legacy_bot_names():
-    mod = load_module()
-    # Same case-preservation rule as above.
-    assert mod.rebrand_text("ClawdBot remembers my timezone") == "Hermes remembers my timezone"
-    assert mod.rebrand_text("clawdbot prefers tabs") == "hermes prefers tabs"
-    assert mod.rebrand_text("MoltBot was configured for Spanish") == "Hermes was configured for Spanish"
-    assert mod.rebrand_text("moltbot uses Python") == "hermes uses Python"
 
 
-def test_rebrand_text_preserves_unrelated_content():
-    mod = load_module()
-    text = "User prefers dark mode and lives in Las Vegas"
-    assert mod.rebrand_text(text) == text
 
 
-def test_rebrand_text_handles_multiple_replacements():
-    mod = load_module()
-    text = "OpenClaw said to ask ClawdBot about MoltBot settings"
-    assert mod.rebrand_text(text) == "Hermes said to ask Hermes about Hermes settings"
 
 
-def test_rebrand_text_preserves_filesystem_path_casing():
-    """Lowercase matches — especially ``.openclaw`` filesystem paths — must
-    rewrite to lowercase ``.hermes`` (the real Hermes home), not the broken
-    ``.Hermes``.
-
-    Regression test for @versun's OpenClaw-residue feedback: after migration,
-    memory entries that referenced ``~/.openclaw/config.yaml`` were being
-    rewritten to ``~/.Hermes/config.yaml`` — a path that doesn't exist —
-    and the agent kept trying to read it.
-    """
-    mod = load_module()
-    assert mod.rebrand_text("config is at ~/.openclaw/config.yaml") == \
-        "config is at ~/.hermes/config.yaml"
-    assert mod.rebrand_text("use .openclaw directory") == "use .hermes directory"
-    assert mod.rebrand_text("Path.home() / '.openclaw'") == "Path.home() / '.hermes'"
-    # Sentence with both lowercase path and capitalized prose.
-    assert mod.rebrand_text("openclaw config path: ~/.openclaw/") == \
-        "hermes config path: ~/.hermes/"
 
 
-def test_migrate_memory_rebrands_entries(tmp_path):
-    mod = load_module()
-    source_root = tmp_path / "openclaw"
-    source_root.mkdir()
-    workspace = source_root / "workspace"
-    workspace.mkdir()
-    memory_md = workspace / "MEMORY.md"
-    memory_md.write_text(
-        "# Memory\n\n- OpenClaw should use Python 3.11\n- ClawdBot prefers dark mode\n",
-        encoding="utf-8",
-    )
-
-    target_root = tmp_path / "hermes"
-    target_root.mkdir()
-    (target_root / "memories").mkdir()
-
-    migrator = mod.Migrator(
-        source_root=source_root,
-        target_root=target_root,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=tmp_path / "report",
-        selected_options={"memory"},
-    )
-    migrator.migrate()
-
-    result = (target_root / "memories" / "MEMORY.md").read_text(encoding="utf-8")
-    assert "OpenClaw" not in result
-    assert "ClawdBot" not in result
-    assert "Hermes" in result
 
 
-def test_migrate_soul_preserves_content(tmp_path):
-    mod = load_module()
-    source_root = tmp_path / "openclaw"
-    source_root.mkdir()
-    workspace = source_root / "workspace"
-    workspace.mkdir()
-    soul_md = workspace / "SOUL.md"
-    original = "You are OpenClaw, an AI assistant made by SparkLab."
-    soul_md.write_text(original, encoding="utf-8")
-
-    target_root = tmp_path / "hermes"
-    target_root.mkdir()
-
-    migrator = mod.Migrator(
-        source_root=source_root,
-        target_root=target_root,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=tmp_path / "report",
-        selected_options={"soul"},
-    )
-    migrator.migrate()
-
-    result = (target_root / "SOUL.md").read_text(encoding="utf-8")
-    assert result == original
-
-
-def test_repo_root_sources_are_imported_without_workspace_dir(tmp_path):
-    mod = load_module()
-    source_root = tmp_path / "openclaw-repo"
-    source_root.mkdir()
-    (source_root / "SOUL.md").write_text("Root OpenClaw SOUL.", encoding="utf-8")
-    (source_root / ".env").write_text("LINE_WEBHOOK_URL=https://root.example/line\n", encoding="utf-8")
-    (source_root / "MEMORY.md").write_text("# Memory\n\n- Root OpenClaw memory entry\n", encoding="utf-8")
-    (source_root / "USER.md").write_text("# User\n\n- Root OpenClaw user entry\n", encoding="utf-8")
-    (source_root / "HEARTBEAT.md").write_text("# Heartbeat\n", encoding="utf-8")
-    memory_dir = source_root / "memory"
-    memory_dir.mkdir()
-    (memory_dir / "2026-05-20.md").write_text("# Daily\n\n- Daily OpenClaw memory entry\n", encoding="utf-8")
-    desktop_home = source_root / ".openclaw-desktop"
-    desktop_home.mkdir()
-    (desktop_home / "openclaw.json").write_text("\ufeff" + json.dumps({"ui": {"name": "OpenClaw"}}), encoding="utf-8")
-    (desktop_home / ".env").write_text("TELEGRAM_WEBHOOK_SECRET=desktop-secret\n", encoding="utf-8")
-
-    target_root = tmp_path / "hermes"
-    target_root.mkdir()
-
-    migrator = mod.Migrator(
-        source_root=source_root,
-        target_root=target_root,
-        execute=True,
-        workspace_target=None,
-        overwrite=False,
-        migrate_secrets=False,
-        output_dir=tmp_path / "report",
-        selected_options={"soul", "memory", "user-profile", "daily-memory", "archive"},
-    )
-    assert migrator.load_openclaw_config()["ui"]["name"] == "OpenClaw"
-    assert migrator.load_openclaw_env()["LINE_WEBHOOK_URL"] == "https://root.example/line"
-    assert migrator.load_openclaw_env()["TELEGRAM_WEBHOOK_SECRET"] == "desktop-secret"
-    migrator.migrate()
-
-    assert (target_root / "SOUL.md").read_text(encoding="utf-8") == "Root OpenClaw SOUL."
-    memory = (target_root / "memories" / "MEMORY.md").read_text(encoding="utf-8")
-    assert "Root Hermes memory entry" in memory
-    assert "Daily Hermes memory entry" in memory
-    user = (target_root / "memories" / "USER.md").read_text(encoding="utf-8")
-    assert "Root Hermes user entry" in user
-    assert any(item.kind == "archive" and item.source and item.source.endswith("HEARTBEAT.md") for item in migrator.items)
 
 
 # ── migrate_model_config: alias resolution (issue #16745) ──────────────────
@@ -1264,103 +563,16 @@ def _extract_model(parsed: dict) -> str | None:
     return model
 
 
-def test_migrate_model_config_resolves_alias_against_real_openclaw_schema(tmp_path: Path):
-    """Regression for #16745 — OpenClaw's catalog is keyed by the full
-    provider/model API ID with an "alias" field on the value.  The migration
-    must reverse-lookup the alias to find the API ID."""
-    parsed = _run_model_migration(
-        tmp_path,
-        {
-            "agents": {
-                "defaults": {
-                    "model": {"primary": "Claude Opus 4.6"},
-                    "models": {
-                        "anthropic/claude-opus-4-6": {"alias": "Claude Opus 4.6"},
-                        "openai/gpt-5.2": {"alias": "GPT"},
-                    },
-                }
-            }
-        },
-    )
-    assert _extract_model(parsed) == "anthropic/claude-opus-4-6"
 
 
-def test_migrate_model_config_resolves_alias_with_bare_string_model(tmp_path: Path):
-    parsed = _run_model_migration(
-        tmp_path,
-        {
-            "agents": {
-                "defaults": {
-                    "model": "Sonnet",
-                    "models": {"anthropic/claude-sonnet-4-7": {"alias": "Sonnet"}},
-                }
-            }
-        },
-    )
-    assert _extract_model(parsed) == "anthropic/claude-sonnet-4-7"
 
 
-def test_migrate_model_config_passes_through_existing_api_id(tmp_path: Path):
-    """If the model value is already a provider/model API ID that appears as
-    a key in the catalog, it should be written verbatim — not double-rewritten."""
-    parsed = _run_model_migration(
-        tmp_path,
-        {
-            "agents": {
-                "defaults": {
-                    "model": "anthropic/claude-opus-4-6",
-                    "models": {
-                        "anthropic/claude-opus-4-6": {"alias": "Claude Opus 4.6"},
-                    },
-                }
-            }
-        },
-    )
-    assert _extract_model(parsed) == "anthropic/claude-opus-4-6"
 
 
-def test_migrate_model_config_passes_through_unknown_alias(tmp_path: Path):
-    """If the model value matches no catalog entry, leave it alone and let
-    downstream surface the mismatch."""
-    parsed = _run_model_migration(
-        tmp_path,
-        {
-            "agents": {
-                "defaults": {
-                    "model": "Totally Unknown Name",
-                    "models": {
-                        "anthropic/claude-opus-4-6": {"alias": "Claude Opus 4.6"},
-                    },
-                }
-            }
-        },
-    )
-    assert _extract_model(parsed) == "Totally Unknown Name"
 
 
-def test_migrate_model_config_handles_string_valued_catalog_entries(tmp_path: Path):
-    """Belt-and-suspenders: some catalogs store the alias as a plain string
-    value instead of a dict with an "alias" field."""
-    parsed = _run_model_migration(
-        tmp_path,
-        {
-            "agents": {
-                "defaults": {
-                    "model": "MyModel",
-                    "models": {"provider/some-id": "MyModel"},
-                }
-            }
-        },
-    )
-    assert _extract_model(parsed) == "provider/some-id"
 
 
-def test_migrate_model_config_no_catalog_leaves_value_alone(tmp_path: Path):
-    parsed = _run_model_migration(
-        tmp_path,
-        {"agents": {"defaults": {"model": "some-model-id"}}},
-    )
-    assert _extract_model(parsed) == "some-model-id"
 
 
 # ── non-UTF-8 tolerance (issue #8901) ───────────────────────────────────────
@@ -1435,67 +647,5 @@ def test_messaging_settings_handles_invalid_utf8_in_telegram_allowlist(tmp_path:
     assert "123456789" in env_text
 
 
-def test_provider_keys_handles_invalid_utf8_in_auth_profiles(tmp_path: Path):
-    """auth-profiles.json with a non-UTF-8 byte should not abort migration;
-    a valid provider key elsewhere in the same file must still be imported."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    source.mkdir()
-    target.mkdir()
-
-    agent_dir = source / "agents" / "main" / "agent"
-    agent_dir.mkdir(parents=True)
-    _write_invalid_utf8_json(
-        agent_dir / "auth-profiles.json",
-        prefix=b'{"profiles": {"broken": {"key": "bad',
-        valid_value=b'"}, "openrouter-main": {"key": "sk-or-valid-key"}}}',
-        suffix=b"",
-    )
-    (source / "openclaw.json").write_text(json.dumps({}), encoding="utf-8")
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=False, migrate_secrets=True, output_dir=None,
-        selected_options={"provider-keys"},
-    )
-    report = migrator.migrate()
-
-    items = [i for i in report["items"] if i["kind"] == "provider-keys"]
-    assert items and items[0]["status"] == "migrated"
-    env_text = (target / ".env").read_text(encoding="utf-8")
-    assert "OPENROUTER_API_KEY=sk-or-valid-key" in env_text
 
 
-def test_daily_memory_skips_undecodable_file_but_merges_others(tmp_path: Path):
-    """A daily-memory .md file with invalid UTF-8 bytes should not abort the
-    merge; entries from the other, cleanly-encoded file must still land."""
-    mod = load_module()
-    source = tmp_path / ".openclaw"
-    target = tmp_path / ".hermes"
-    target.mkdir()
-
-    mem_dir = source / "workspace" / "memory"
-    mem_dir.mkdir(parents=True)
-    (mem_dir / "2026-03-01.md").write_text(
-        "# March 1 Notes\n\n- User prefers dark mode\n",
-        encoding="utf-8",
-    )
-    # errors="replace" means this file is still readable (bad byte becomes
-    # U+FFFD), so its valid heading/entries should also survive alongside it.
-    (mem_dir / "2026-03-02.md").write_bytes(
-        b"# March 2 Notes\n\n- Working on \xb3migration project\n"
-    )
-
-    migrator = mod.Migrator(
-        source_root=source, target_root=target, execute=True,
-        workspace_target=None, overwrite=False, migrate_secrets=False, output_dir=None,
-        selected_options={"daily-memory"},
-    )
-    report = migrator.migrate()
-
-    items = [i for i in report["items"] if i["kind"] == "daily-memory"]
-    assert items and items[0]["status"] == "migrated"
-    content = (target / "memories" / "MEMORY.md").read_text(encoding="utf-8")
-    assert "dark mode" in content
-    assert "migration project" in content

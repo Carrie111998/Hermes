@@ -132,14 +132,10 @@ def _cfg_get(config: dict, *keys: str, default: Any = None) -> Any:
 
 def _load_plugin_config() -> dict:
     try:
-        from hermes_constants import get_hermes_home
-        import yaml
+        # Canonical loader: managed-scope overlay + ${VAR} expansion.
+        from hermes_cli.config import load_config_readonly
 
-        config_path = get_hermes_home() / "config.yaml"
-        if not config_path.exists():
-            return {}
-        with open(config_path, encoding="utf-8-sig") as handle:
-            all_config = yaml.safe_load(handle) or {}
+        all_config = load_config_readonly()
         return (
             _cfg_get(all_config, "plugins", "ebbinghaus", default={})
             or _cfg_get(all_config, "plugins", "ebbinghaus-memory", default={})
@@ -221,11 +217,11 @@ class EbbinghausMemoryProvider(MemoryProvider):
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         try:
             import yaml
+            # Write-back round-trip: raw read only (do not persist merged defaults).
+            from hermes_cli.config import read_user_config_raw
+
             config_path = Path(hermes_home) / "config.yaml"
-            existing = {}
-            if config_path.exists():
-                with open(config_path, encoding="utf-8-sig") as handle:
-                    existing = yaml.safe_load(handle) or {}
+            existing = read_user_config_raw(config_path)
             existing.setdefault("plugins", {})
             existing["plugins"]["ebbinghaus"] = values
             with open(config_path, "w", encoding="utf-8") as handle:

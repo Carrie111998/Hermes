@@ -132,6 +132,17 @@
       "note": "Upstream c918d07b5 moved stage2 hook contracts to tests/docker/ runtime tests."
     },
     {
+      "pattern": "tests/hermes_cli/test_setup_ollama_cloud_force_refresh.py",
+      "action": "upstream",
+      "note": "Upstream wave-1 low-value test prune deleted this file; take official deletion over fork retention."
+    },
+    {
+      "pattern": "tools/url_safety.py",
+      "action": "official_with_overlay",
+      "note": "Take upstream SSRF guards; keep fork SSRFProtectedTransport / DNS-timeout / env-proxy helpers and ensure httpx+URLPattern imports survive overlay.",
+      "context": "overlap_only"
+    },
+    {
       "pattern": "plugins/memory/ebbinghaus/**",
       "action": "preserve_custom",
       "note": "Fork-only Ebbinghaus bounded/dream memory; absent from NousResearch upstream."

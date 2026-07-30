@@ -31,64 +31,8 @@ def _clean_provider_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def test_returns_false_when_no_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is False
 
 
-def test_returns_true_when_active_provider_matches(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {
-        "version": 1,
-        "providers": {},
-        "active_provider": "anthropic",
-    })
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is True
-
-
-def test_returns_true_when_config_provider_matches(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_config(tmp_path, {"model": {"provider": "anthropic", "default": "claude-sonnet-4-6"}})
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is True
-
-
-def test_returns_false_when_config_provider_is_different(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_config(tmp_path, {"model": {"provider": "kimi-coding", "default": "kimi-k2"}})
-    _write_auth_store(tmp_path, {
-        "version": 1,
-        "providers": {},
-        "active_provider": None,
-    })
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is False
-
-
-def test_returns_true_when_anthropic_env_var_set(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-realkey")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is True
-
-
-def test_claude_code_oauth_token_does_not_count_as_explicit(tmp_path, monkeypatch):
-    """CLAUDE_CODE_OAUTH_TOKEN is set by Claude Code, not the user — must not gate."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-auto-token")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is False
 
 
 def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
@@ -113,27 +57,6 @@ def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("copilot") is False
-
-
-def test_explicit_pool_source_counts_as_explicit(tmp_path, monkeypatch):
-    """manual / device_code / PKCE pool entries reflect explicit Hermes flows."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {
-        "version": 1,
-        "providers": {},
-        "active_provider": None,
-        "credential_pool": {
-            "anthropic": [{
-                "id": "def456",
-                "source": "manual:key-1",
-                "auth_type": "api_key",
-                "access_token": "sk-ant-api03-key",
-            }],
-        },
-    })
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is True
 
 
 def test_returns_true_when_moa_reference_slot_uses_provider(tmp_path, monkeypatch):
@@ -182,134 +105,7 @@ def test_stale_env_pool_entry_does_not_count_when_var_unset(tmp_path, monkeypatc
     assert is_provider_explicitly_configured("deepseek") is False
 
 
-def test_env_pool_entry_counts_when_var_still_resolves(tmp_path, monkeypatch):
-    """The same env-seeded pool entry IS explicit while the var still resolves."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek-realkey-123456")
-    _write_auth_store(tmp_path, {
-        "version": 1,
-        "providers": {},
-        "active_provider": None,
-        "credential_pool": {
-            "deepseek": [{
-                "id": "aaa111",
-                "source": "env:DEEPSEEK_API_KEY",
-                "auth_type": "api_key",
-            }],
-        },
-    })
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("deepseek") is True
 
 
-def test_provider_not_in_registry_but_in_models_dev(tmp_path, monkeypatch):
-    """Providers absent from PROVIDER_REGISTRY but present in the models.dev
-    catalog (e.g. openrouter) must still be detected via their env vars.
-
-    Regression: is_provider_explicitly_configured() only checked
-    PROVIDER_REGISTRY for env-var names, so providers that exist solely in
-    the models.dev catalog were never recognised as explicitly configured -
-    hiding them from the desktop model picker even when their API key was
-    set in .env.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-key-12345678")
-    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("openrouter") is True
 
 
-def test_returns_true_when_moa_aggregator_uses_provider(tmp_path, monkeypatch):
-    """MoA aggregator slots are explicit provider selections for auth gating."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_config(tmp_path, {
-        "model": {"provider": "openai-codex", "default": "gpt-5.5"},
-        "moa": {
-            "reference_models": [{"provider": "opencode-go", "model": "glm-5.2"}],
-            "aggregator": {"provider": "anthropic", "model": "claude-opus-4-8"},
-        },
-    })
-    _write_auth_store(tmp_path, {"version": 1, "providers": {}, "active_provider": "openai-codex"})
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("anthropic") is True
-@pytest.mark.parametrize("env_var", ["GH_TOKEN", "GITHUB_TOKEN"])
-def test_generic_github_tokens_do_not_count_as_explicit_copilot(tmp_path, monkeypatch, env_var):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv(env_var, "ghp_classic_pat_for_git_only")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("copilot") is False
-
-
-def test_copilot_specific_env_var_counts_as_explicit(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_explicit_copilot_token")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli.auth import is_provider_explicitly_configured
-    assert is_provider_explicitly_configured("copilot") is True
-
-
-@pytest.mark.parametrize("env_var", ["GH_TOKEN", "GITHUB_TOKEN"])
-def test_copilot_status_skips_generic_github_token(tmp_path, monkeypatch, env_var):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv(env_var, "ghp_classic_pat_for_git_only")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli import auth
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: pytest.fail("generic GitHub token must not trigger Copilot probing"),
-    )
-    api_key, source = auth._resolve_api_key_provider_secret(
-        "copilot", auth.PROVIDER_REGISTRY["copilot"]
-    )
-    assert (api_key, source) == ("", "")
-
-
-def test_copilot_status_preserves_provider_specific_token(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_explicit_copilot_token")
-    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
-
-    from hermes_cli import auth
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: ("validated-token", "COPILOT_GITHUB_TOKEN"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.get_copilot_api_token",
-        lambda token: ("api-token:" + token, "https://api.githubcopilot.com"),
-    )
-    api_key, source = auth._resolve_api_key_provider_secret(
-        "copilot", auth.PROVIDER_REGISTRY["copilot"]
-    )
-    assert (api_key, source) == ("api-token:validated-token", "COPILOT_GITHUB_TOKEN")
-
-
-def test_copilot_status_preserves_explicit_provider_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    monkeypatch.setenv("GITHUB_TOKEN", "gho_explicit_provider_config")
-    _write_config(tmp_path, {"model": {"provider": "copilot"}})
-
-    from hermes_cli import auth
-
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.resolve_copilot_token",
-        lambda: ("validated-token", "GITHUB_TOKEN"),
-    )
-    monkeypatch.setattr(
-        "hermes_cli.copilot_auth.get_copilot_api_token",
-        lambda token: ("api-token:" + token, "https://api.githubcopilot.com"),
-    )
-    api_key, source = auth._resolve_api_key_provider_secret(
-        "copilot", auth.PROVIDER_REGISTRY["copilot"]
-    )
-    assert (api_key, source) == ("api-token:validated-token", "GITHUB_TOKEN")

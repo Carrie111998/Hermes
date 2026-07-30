@@ -97,7 +97,17 @@ def _ensure_parallel_sdk_installed() -> None:
     Swallows benign ImportError from the lazy_deps helper itself; if the
     SDK is genuinely missing the subsequent ``from parallel import ...``
     raises ImportError that the caller can handle.
+
+    Already-importable modules (including test doubles injected into
+    ``sys.modules``) skip the install path so hermetic suites and
+    ``security.allow_lazy_installs=false`` environments do not fail when
+    a stub is already present.
     """
+    try:
+        import parallel  # noqa: F401 — already satisfied (real or test stub)
+        return
+    except ImportError:
+        pass
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
 
