@@ -738,6 +738,30 @@ def build_subprocess_env(
     return env
 
 
+def _is_wsl_bash_stub(candidate: str | None) -> bool:
+    """Return True when ``candidate`` is the Windows Store / System32 WSL stub.
+
+    ``shutil.which("bash")`` on machines with WSL often resolves to
+    ``%WINDIR%\\System32\\bash.exe`` or the WindowsApps stub. Those are not
+    Git-for-Windows bash and cannot run Windows path scripts, so ``_find_bash``
+    must skip them when preferring a real Git bash.
+    """
+    if not candidate:
+        return False
+
+    try:
+        resolved = ntpath.normcase(ntpath.abspath(candidate))
+    except (OSError, ValueError):
+        resolved = os.path.normcase(str(candidate))
+
+    windows_dir = ntpath.normcase(os.environ.get("WINDIR", r"C:\Windows"))
+    windows_apps = ntpath.normcase(os.environ.get("LOCALAPPDATA", ""))
+    stubs = {ntpath.normcase(ntpath.join(windows_dir, "System32", "bash.exe"))}
+    if windows_apps:
+        stubs.add(ntpath.normcase(ntpath.join(windows_apps, "Microsoft", "WindowsApps", "bash.exe")))
+    return resolved in stubs
+
+
 def _find_bash() -> str:
     """Find bash for command execution."""
     if not _IS_WINDOWS:

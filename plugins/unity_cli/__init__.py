@@ -73,7 +73,14 @@ def _run_unity(args: list[str], binary_path: str = "", timeout: int = 60) -> dic
         return {"ok": False, "code": -1, "stdout": "", "stderr": "Unity CLI not found. Install it first with unity_cli_install."}
     cmd = [str(binary)] + args
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
         return {
             "ok": result.returncode == 0,
             "code": result.returncode,
