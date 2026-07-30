@@ -15,28 +15,31 @@ import {
   pickPrimaryPreviewTarget
 } from '@/components/assistant-ui/thread/content'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
-import { StreamStallIndicator } from '@/components/assistant-ui/thread/status'
+import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { TooltipIconButton } from '@/components/assistant-ui/tooltip-icon-button'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuLabel,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
 import { useI18n } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
-import { GitBranchIcon, Loader2Icon, Volume2Icon, VolumeXIcon, XIcon } from '@/lib/icons'
+import { AudioLines, GitForkIcon, Loader2Icon, RefreshCwIcon, SmilePlusIcon, VolumeXIcon, XIcon } from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
+import { formatAgo } from '@/lib/time'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
 import { notifyError } from '@/store/notifications'
+import { toggleMessageReaction } from '@/store/reactions'
+import { $reactionsEnabled } from '@/store/reactions-enabled'
+import { $agentReactions, $localReactions, mergeReactions, setLocalReaction } from '@/store/reactions-local'
 import { $voicePlayback } from '@/store/voice-playback'
+import type { MessageReaction } from '@/types/hermes'
+
+// Stable empty identity — a fresh [] per render would re-run every consumer.
+const EMPTY_REACTIONS: MessageReaction[] = []
 
 interface MessageActionProps {
   messageId: string
@@ -65,6 +68,10 @@ export const AssistantMessage: FC<{
   const isRunning = messageStatus === 'running'
   const isPlaceholder = useAuiState(s => s.message.status?.type === 'running' && s.message.content.length === 0)
   const hasVisibleText = useAuiState(s => contentHasVisibleText(s.message.content))
+  // Sealed mid-turn commentary keeps its text but not the footer, so a
+  // tool-heavy turn doesn't grow a copy/refresh bar per paragraph (see
+  // ChatMessage.interim).
+  const isInterim = useAuiState(s => s.message.metadata?.custom?.interim === true)
 
   // Preview targets only materialize once the turn completes — while running
   // the selector returns '' (stable), so per-token flushes skip the regex
@@ -85,10 +92,6 @@ export const AssistantMessage: FC<{
 
   const enterRef = useEnterAnimation(isRunning, `assistant-message:${messageId}`)
 
-  if (isPlaceholder) {
-    return null
-  }
-
   return (
     <MessagePrimitive.Root
       className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
@@ -103,7 +106,7 @@ export const AssistantMessage: FC<{
       >
         {/* Todos render in the composer status stack now, not inline. */}
         <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
-        {isRunning && <StreamStallIndicator />}
+        {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
         {previewTargets.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
             {previewTargets.map(target => (
@@ -130,7 +133,7 @@ export const AssistantMessage: FC<{
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
       </div>
-      {hasVisibleText && (
+      {hasVisibleText && !isInterim && (
         <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />
       )}
     </MessagePrimitive.Root>
@@ -140,12 +143,45 @@ export const AssistantMessage: FC<{
 const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText, onBranchInNewChat }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
-  const [menuOpen, setMenuOpen] = useState(false)
+
+  const reactions = useAuiState(s => {
+    const custom = (s.message.metadata?.custom ?? {}) as { reactions?: MessageReaction[] }
+
+    return custom.reactions ?? EMPTY_REACTIONS
+  })
+
+  const rowId = useAuiState(s => {
+    const custom = (s.message.metadata?.custom ?? {}) as { rowId?: number }
+
+    return custom.rowId
+  })
+
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const reactionsEnabled = useStore($reactionsEnabled)
+  const localAll = useStore($localReactions)
+  const agentLive = useStore($agentReactions)
+
+  const shownReactions = mergeReactions(
+    reactions,
+    localAll[messageId],
+    rowId !== undefined ? agentLive[rowId] : undefined
+  )
+
+  const react = useCallback(
+    (emoji: null | string) => {
+      setPickerOpen(false)
+      // Flip the UI immediately — a tapback is direct manipulation and must
+      // never wait on a round-trip. Persistence follows in the background.
+      setLocalReaction(messageId, emoji)
+      void toggleMessageReaction({ id: messageId, role: 'assistant', rowId, reactions } as ChatMessage, emoji)
+    },
+    [messageId, reactions, rowId]
+  )
 
   return (
-    <div className="relative flex w-full shrink-0 justify-end">
+    <div className="relative flex w-full shrink-0 items-center justify-end gap-1.5">
       <ActionBarPrimitive.Root
-        className={cn(
+        className={
           // NOTE: intentionally NOT `hideWhenRunning`. That prop unmounts the
           // bar while the thread streams, which collapses every completed
           // assistant message's footer by this bar's height and shifts the
@@ -153,38 +189,71 @@ const AssistantActionBar: FC<MessageActionProps> = ({ messageId, getMessageText,
           // invisible by default (opacity-0 + pointer-events-none, reveals on
           // hover), so keeping it mounted reserves stable layout height with
           // no visual change during streaming.
-          'relative flex flex-row items-center justify-end gap-2 py-1.5 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100',
-          menuOpen && 'pointer-events-auto opacity-100 [&_button]:opacity-100'
-        )}
+          'relative flex flex-row items-center justify-end gap-1.5 py-1.5 opacity-0 pointer-events-none group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100'
+        }
         data-slot="aui_msg-actions"
       >
+        <MessageAge />
+        {onBranchInNewChat && (
+          <TooltipIconButton
+            onClick={() => {
+              triggerHaptic('selection')
+              onBranchInNewChat(messageId)
+            }}
+            tooltip={copy.branchNewChat}
+          >
+            <GitForkIcon className="size-3.5" />
+          </TooltipIconButton>
+        )}
         <CopyButton appearance="icon" buttonSize="icon" label={copy.copy} text={getMessageText} />
+        <ReadAloudButton getText={getMessageText} messageId={messageId} />
         <ActionBarPrimitive.Reload asChild>
           <TooltipIconButton onClick={() => triggerHaptic('submit')} tooltip={copy.refresh}>
-            <Codicon name="refresh" />
+            <RefreshCwIcon className="size-3.5" />
           </TooltipIconButton>
         </ActionBarPrimitive.Reload>
-        <DropdownMenu onOpenChange={setMenuOpen} open={menuOpen}>
-          <DropdownMenuTrigger asChild>
-            <TooltipIconButton tooltip={copy.moreActions}>
-              <Codicon name="ellipsis" />
-            </TooltipIconButton>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" onCloseAutoFocus={e => e.preventDefault()} sideOffset={6}>
-            <MessageTimestamp />
-            <DropdownMenuItem onSelect={() => onBranchInNewChat?.(messageId)}>
-              <GitBranchIcon />
-              {copy.branchNewChat}
-            </DropdownMenuItem>
-            <ReadAloudItem getText={getMessageText} messageId={messageId} />
-          </DropdownMenuContent>
-        </DropdownMenu>
       </ActionBarPrimitive.Root>
+      {/* ONE slot, Slack-style: the picker trigger and the landed reaction are
+          the same element, so reacting never shifts layout. Empty → ☺, hidden
+          until hover like its action-bar neighbors (state lives in styles.css
+          — the aui_msg-reactions rules outweigh Tailwind utilities here).
+          Reacted → the emoji itself, always visible at full strength, and
+          clicking it reopens the picker to switch or retract. Outside
+          ActionBarPrimitive.Root so a landed reaction doesn't ride the bar's
+          hover opacity. */}
+      {(reactionsEnabled || shownReactions.length > 0) && (
+        <ReactionPicker
+          onOpenChange={setPickerOpen}
+          onSelect={react}
+          open={pickerOpen}
+          selected={shownReactions.find(reaction => reaction.author === 'user')?.emoji}
+        >
+          <TooltipIconButton
+            data-reacted={shownReactions.length > 0 || undefined}
+            data-slot="aui_msg-reactions"
+            data-state={pickerOpen ? 'open' : undefined}
+            onClick={reactionsEnabled ? () => setPickerOpen(open => !open) : undefined}
+            tooltip={copy.react}
+          >
+            {shownReactions.length > 0 ? (
+              <span className="flex items-center gap-0.5 text-[0.8125rem] leading-none">
+                {shownReactions.map(reaction => (
+                  <span className="reaction-pop" key={`${reaction.author}-${reaction.emoji}`}>
+                    {reaction.emoji}
+                  </span>
+                ))}
+              </span>
+            ) : (
+              <SmilePlusIcon className="size-3.5" />
+            )}
+          </TooltipIconButton>
+        </ReactionPicker>
+      )}
     </div>
   )
 }
 
-const ReadAloudItem: FC<{ getText: () => string; messageId: string }> = ({ getText, messageId }) => {
+const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ getText, messageId }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
   const voicePlayback = useStore($voicePlayback)
@@ -195,7 +264,8 @@ const ReadAloudItem: FC<{ getText: () => string; messageId: string }> = ({ getTe
   const isPreparing = readAloudStatus === 'preparing'
   const isSpeaking = readAloudStatus === 'speaking'
   const anyPlaybackActive = voicePlayback.status !== 'idle'
-  const Icon = isPreparing ? Loader2Icon : isSpeaking ? VolumeXIcon : Volume2Icon
+  const Icon = isPreparing ? Loader2Icon : isSpeaking ? VolumeXIcon : AudioLines
+  const tooltip = isPreparing ? copy.preparingAudio : isSpeaking ? copy.stopReading : copy.readAloud
 
   const read = useCallback(async () => {
     const text = getText()
@@ -212,29 +282,37 @@ const ReadAloudItem: FC<{ getText: () => string; messageId: string }> = ({ getTe
   }, [copy.readAloudFailed, getText, messageId])
 
   return (
-    <DropdownMenuItem
+    <TooltipIconButton
       disabled={isPreparing || (!isSpeaking && anyPlaybackActive)}
-      onSelect={e => {
-        e.preventDefault()
+      onClick={() => {
+        triggerHaptic('selection')
         void (isSpeaking ? stopVoicePlayback() : read())
       }}
+      tooltip={tooltip}
     >
-      <Icon className={isPreparing ? 'animate-spin' : undefined} />
-      {isPreparing ? copy.preparingAudio : isSpeaking ? copy.stopReading : copy.readAloud}
-    </DropdownMenuItem>
+      <Icon className={cn('size-3.5', isPreparing && 'animate-spin')} />
+    </TooltipIconButton>
   )
 }
 
-const MessageTimestamp: FC = () => {
+const MessageAge: FC = () => {
   const { t } = useI18n()
   const createdAt = useAuiState(s => s.message.createdAt)
-  const label = formatMessageTimestamp(createdAt, t.assistant.thread)
+  const date = createdAt ? new Date(createdAt) : null
 
-  if (!label) {
+  if (!date || Number.isNaN(date.getTime())) {
     return null
   }
 
-  return <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">{label}</DropdownMenuLabel>
+  // Compact "2h ago" (shared util) with the absolute time on hover.
+  return (
+    <span
+      className="px-0.5 text-[0.6875rem] tabular-nums text-muted-foreground"
+      title={formatMessageTimestamp(date, t.assistant.thread) || undefined}
+    >
+      {formatAgo(date.getTime(), t.agents)}
+    </span>
+  )
 }
 
 const AssistantFooter: FC<MessageActionProps> = props => (
