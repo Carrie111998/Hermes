@@ -6043,9 +6043,18 @@ def discover_mcp_tools() -> List[str]:
     Idempotent for already-connected servers. If some servers failed on a
     previous call, only the missing ones are retried.
 
+    Set ``HERMES_SKIP_MCP_DISCOVERY=1`` for latency-sensitive local services
+    such as the Desktop dashboard readiness backend. This keeps configured MCP
+    tools out of that process without mutating config.yaml for normal chat and
+    gateway sessions.
+
     Returns:
         List of all registered MCP tool names.
     """
+    if os.getenv("HERMES_SKIP_MCP_DISCOVERY", "").strip().lower() in {"1", "true", "yes", "on"}:
+        logger.info("HERMES_SKIP_MCP_DISCOVERY set -- skipping MCP tool discovery")
+        return _existing_tool_names()
+
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
