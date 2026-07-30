@@ -1660,10 +1660,20 @@ def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any
         raise ValueError("cron restore deliver and delivery disagree")
     if not isinstance(delivery, (str, list)) or (isinstance(delivery, list) and any(not isinstance(item, str) for item in delivery)):
         raise ValueError("cron restore delivery must be a string or list of strings")
+    next_run_at = snapshot.get("next_run_at")
+    if parsed_schedule.get("kind") == "once":
+        if not parsed_schedule.get("run_at"):
+            raise ValueError("cron restore one-shot schedule has no run_at")
+        if state == "scheduled" and snapshot["enabled"] and not isinstance(next_run_at, str):
+            raise ValueError("cron restore scheduled one-shot requires next_run_at")
+    if snapshot.get("no_agent") is True and not str(snapshot.get("script") or "").strip():
+        raise ValueError("cron restore no_agent job requires a non-empty script")
+    if snapshot.get("no_agent") is not True and not str(snapshot.get("prompt") or "").strip() and not skills:
+        raise ValueError("cron restore active agent requires a non-empty prompt or skills")
     restored = {
         "id": job_id, "name": snapshot["name"], "enabled": snapshot["enabled"],
         "state": state, "schedule": parsed_schedule,
-        "schedule_display": schedule, "next_run_at": snapshot.get("next_run_at"),
+        "schedule_display": schedule, "next_run_at": next_run_at,
         "repeat": None if repeat is None else {"times": repeat, "completed": 0},
         "deliver": delivery, "script": snapshot.get("script"), "skills": list(skills),
         "no_agent": snapshot.get("no_agent", False), "prompt": snapshot.get("prompt"),

@@ -926,6 +926,14 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
+            effective_no_agent = bool(updates.get("no_agent", job.get("no_agent", False)))
+            effective_script = updates.get("script", job.get("script"))
+            effective_prompt = updates.get("prompt", job.get("prompt"))
+            effective_skills = updates.get("skills", job.get("skills") or [])
+            if effective_no_agent and not effective_script:
+                return tool_error("no_agent=True requires a non-empty script", success=False)
+            if not effective_no_agent and not str(effective_prompt or "").strip() and not effective_skills:
+                return tool_error("active agent jobs require a non-empty prompt or at least one skill", success=False)
             updated = update_job(job_id, updates)
             _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
