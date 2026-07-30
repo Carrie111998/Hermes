@@ -419,6 +419,8 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        *,
+        run_start_event: dict | None = None,
     ) -> None:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -456,6 +458,7 @@ class PluginContext:
             is_async=is_async,
             description=description,
             emoji=emoji,
+            run_start_event=run_start_event,
             override=override,
         )
         self._manager._plugin_tool_names.add(name)

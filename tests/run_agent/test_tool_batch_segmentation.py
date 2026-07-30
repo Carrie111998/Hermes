@@ -106,6 +106,16 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel", "sequential"]
         assert [tc.id for tc in segments[1][1]] == ["c1"]
 
+    def test_unrecognized_plugin_tool_is_a_barrier_before_safe_work(self):
+        calls = [
+            _tc("report_intent", call_id="intent"),
+            _tc("web_search", call_id="search-1"),
+            _tc("web_search", call_id="search-2"),
+        ]
+        segments = _plan_tool_batch_segments(calls)
+        assert _kinds(segments) == ["sequential", "parallel"]
+        assert _flatten_ids(segments) == ["intent", "search-1", "search-2"]
+
 
 
     def test_overlapping_paths_split_across_segments(self, tmp_path, monkeypatch):
@@ -196,6 +206,45 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_plugin_start_callback_precedes_following_safe_work(self, agent):
+        calls = [
+            _tc(
+                "report_intent",
+                '{"text":"I will inspect the tests.","speech":"brief"}',
+                call_id="intent",
+            ),
+            _tc("web_search", '{"query":"a"}', call_id="search-1"),
+            _tc("web_search", '{"query":"b"}', call_id="search-2"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        events = []
+        events_lock = threading.Lock()
+
+        def record_progress(event, name, preview, args, **kwargs):
+            if event == "tool.started":
+                with events_lock:
+                    events.append(("projected", name))
+
+        def fake_handle(name, args, task_id, **kwargs):
+            with events_lock:
+                events.append(("dispatched", name))
+            return json.dumps({"ok": True})
+
+        agent.tool_progress_callback = record_progress
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, [], "task-1")
+
+        intent_projection = events.index(("projected", "report_intent"))
+        search_dispatches = [
+            index
+            for index, event in enumerate(events)
+            if event in {
+                ("dispatched", "web_search"),
+            }
+        ]
+        assert len(search_dispatches) == 2
+        assert all(intent_projection < index for index in search_dispatches)
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -127,6 +128,7 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+MAX_RUN_START_EVENT_FIELD_LENGTH = 160
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
 
@@ -5989,6 +5991,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        projected_event_sequence = 0
+        projected_event_lock = threading.Lock()
+
         def _push(event: Dict[str, Any]) -> None:
             self._set_run_status(
                 run_id,
@@ -6004,8 +6009,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+            nonlocal projected_event_sequence
             ts = time.time()
             if event_type == "tool.started":
+                from tools.registry import registry
+
+                projection = registry.get_run_start_event(tool_name or "")
+                if projection is not None:
+                    if not isinstance(args, dict):
+                        return
+                    projected_fields = {}
+                    for field in projection["fields"]:
+                        value = args.get(field)
+                        if not isinstance(value, str):
+                            return
+                        value = redact_sensitive_text(
+                            value,
+                            force=True,
+                            redact_url_credentials=True,
+                        )
+                        projected_fields[field] = value[:MAX_RUN_START_EVENT_FIELD_LENGTH]
+                    with projected_event_lock:
+                        projected_event_sequence += 1
+                        _push({
+                            "event": projection["event"],
+                            "run_id": run_id,
+                            "sequence": projected_event_sequence,
+                            "timestamp": time.time(),
+                            **projected_fields,
+                        })
+                    return
                 _push({
                     "event": "tool.started",
                     "run_id": run_id,
@@ -6014,6 +6047,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "preview": preview,
                 })
             elif event_type == "tool.completed":
+                from tools.registry import registry
+
+                if registry.get_run_start_event(tool_name or "") is not None:
+                    return
                 _push({
                     "event": "tool.completed",
                     "run_id": run_id,
