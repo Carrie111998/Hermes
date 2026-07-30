@@ -52,6 +52,237 @@ class TestBlueBubblesHelpers:
 
         assert check_bluebubbles_requirements() is True
 
+    @pytest.mark.asyncio
+    async def test_send_keeps_paragraphs_in_one_bubble_when_under_limit(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        sent = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            sent.append(payload["message"])
+            return {"data": {"guid": f"msg-{len(sent)}"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        content = "first thought\n\nsecond thought"
+        result = await adapter.send("user@example.com", content)
+
+        assert result.success is True
+        assert sent == [content]
+
+    @pytest.mark.asyncio
+    async def test_send_deduplicates_concurrent_content_for_same_origin(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        sent = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            sent.append(payload)
+            await asyncio.sleep(0.01)
+            return {"data": {"guid": "assistant-message-guid"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        metadata = {"reply_to_message_id": "origin-message-guid"}
+
+        first, second = await asyncio.gather(
+            adapter.send("user@example.com", "same answer", metadata=metadata),
+            adapter.send("user@example.com", "same answer", metadata=metadata),
+        )
+
+        assert first.success is True
+        assert second.success is True
+        assert [payload["message"] for payload in sent] == ["same answer"]
+        assert {first.raw_response.get("deduplicated"), second.raw_response.get("deduplicated")} == {None, True}
+
+    @pytest.mark.asyncio
+    async def test_send_without_origin_does_not_deduplicate_legitimate_repeats(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        sent = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            sent.append(payload["message"])
+            return {"data": {"guid": f"message-{len(sent)}"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        await adapter.send("user@example.com", "legitimate repeat")
+        await adapter.send("user@example.com", "legitimate repeat")
+
+        assert sent == ["legitimate repeat", "legitimate repeat"]
+
+    @pytest.mark.asyncio
+    async def test_send_reuses_idempotency_key_after_ambiguous_failure(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append(payload)
+            if len(payloads) == 1:
+                raise TimeoutError("response lost")
+            return {"data": {"guid": "assistant-message-guid"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        metadata = {"reply_to_message_id": "origin-message-guid"}
+
+        first = await adapter.send("user@example.com", "same answer", metadata=metadata)
+        second = await adapter.send("user@example.com", "same answer", metadata=metadata)
+
+        assert first.success is False
+        assert second.success is True
+        assert payloads[0]["tempGuid"] == payloads[1]["tempGuid"]
+
+    @pytest.mark.asyncio
+    async def test_send_suppresses_only_structured_internal_notice_over_sms(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        api_calls = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "SMS;-;+155****0100"
+
+        async def fake_api_post(path, payload):
+            api_calls.append((path, payload))
+            return {"data": {"guid": "sent-message"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        text = "Gateway shutting down for maintenance"
+
+        legitimate = await adapter.send("+155****0100", text)
+        suppressed = await adapter.send(
+            "+155****0100",
+            text,
+            metadata={"internal_notice": True},
+        )
+
+        assert legitimate.success is True
+        assert suppressed.success is True
+        assert suppressed.raw_response == {"suppressed": "internal_sms_notice"}
+        assert [payload["message"] for _, payload in api_calls] == [text]
+
+    @pytest.mark.asyncio
+    async def test_internal_notice_does_not_create_unresolved_phone_chat(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        create_calls = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return None
+
+        async def fake_create_chat(address, message, temp_guid=None):
+            create_calls.append((address, message, temp_guid))
+            raise AssertionError("internal notice must not create an unresolved phone chat")
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_create_chat_for_handle", fake_create_chat)
+
+        result = await adapter.send(
+            "+15555550100",
+            "Gateway restarting",
+            metadata={"internal_notice": True},
+        )
+
+        assert result.success is True
+        assert result.raw_response == {"suppressed": "internal_sms_notice"}
+        assert create_calls == []
+
+    @pytest.mark.asyncio
+    async def test_internal_notice_allows_plus_prefixed_email_handle(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return None
+
+        async def fake_api_post(path, payload):
+            payloads.append((path, payload))
+            return {"data": {"guid": "new-chat-message"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send(
+            "+15555550100@example.com",
+            "Internal iMessage notice",
+            metadata={"internal_notice": True},
+        )
+
+        assert result.success is True
+        assert [path for path, _ in payloads] == ["/api/v1/chat/new"]
+
+    @pytest.mark.asyncio
+    async def test_new_chat_retry_reuses_idempotency_key(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            return None
+
+        async def fake_api_post(path, payload):
+            assert path == "/api/v1/chat/new"
+            payloads.append(payload)
+            if len(payloads) == 1:
+                raise TimeoutError("response lost")
+            return {"data": {"guid": "new-chat-message"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        metadata = {"reply_to_message_id": "origin-message-guid"}
+
+        first = await adapter.send("user@example.com", "hello", metadata=metadata)
+        second = await adapter.send("user@example.com", "hello", metadata=metadata)
+
+        assert first.success is False
+        assert second.success is True
+        assert payloads[0]["tempGuid"] == payloads[1]["tempGuid"]
+
+    @pytest.mark.asyncio
+    async def test_new_chat_sends_remaining_chunks_after_creation(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+        resolve_calls = 0
+        payloads = []
+
+        async def fake_resolve_chat_guid(chat_id):
+            nonlocal resolve_calls
+            resolve_calls += 1
+            return None if resolve_calls == 1 else "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            payloads.append((path, payload))
+            return {"data": {"guid": f"message-{len(payloads)}"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+        text = "x" * (adapter.MAX_MESSAGE_LENGTH + 1)
+
+        result = await adapter.send(
+            "user@example.com",
+            text,
+            metadata={"reply_to_message_id": "origin-message-guid"},
+        )
+
+        assert result.success is True
+        assert [path for path, _ in payloads] == [
+            "/api/v1/chat/new",
+            "/api/v1/message/text",
+        ]
+        assert "".join(payload["message"] for _, payload in payloads) == text
 
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
@@ -112,6 +343,277 @@ class TestBlueBubblesMentionGating:
 
         assert response.status == 200
         assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_new_and_updated_events_are_handled_once(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        message = {
+            "guid": "same-message-guid",
+            "text": "hello once",
+            "handle": {"address": "user@example.com"},
+            "isFromMe": False,
+            "chatIdentifier": "user@example.com",
+        }
+
+        first, second = await asyncio.gather(
+            adapter._handle_webhook(_FakeBlueBubblesRequest({
+                "type": "new-message",
+                "data": {**message, "chatGuid": "iMessage;-;user@example.com"},
+            })),
+            adapter._handle_webhook(_FakeBlueBubblesRequest({
+                "type": "updated-message",
+                "data": message,
+            })),
+        )
+        await asyncio.sleep(0)
+
+        assert first.status == 200
+        assert second.status == 200
+        assert [event.text for event in handled] == ["hello once"]
+
+    @pytest.mark.asyncio
+    async def test_meaningful_text_revision_with_same_guid_is_processed(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        base = {
+            "guid": "edited-message-guid",
+            "handle": {"address": "user@example.com"},
+            "isFromMe": False,
+            "chatIdentifier": "user@example.com",
+        }
+
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {**base, "text": "original text"},
+        }))
+        await asyncio.sleep(0)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {**base, "text": "edited text"},
+        }))
+        await asyncio.sleep(0)
+
+        assert [event.text for event in handled] == ["original text", "edited text"]
+
+    @pytest.mark.asyncio
+    async def test_attachment_revision_with_same_guid_is_processed(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def fake_download_attachment(att_guid, att_meta):
+            return f"/tmp/{att_guid}"
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_download_attachment", fake_download_attachment)
+        base = {
+            "guid": "attachment-revision-guid",
+            "text": "",
+            "handle": {"address": "user@example.com"},
+            "isFromMe": False,
+            "chatIdentifier": "user@example.com",
+        }
+
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                **base,
+                "attachments": [
+                    {
+                        "guid": "same-attachment",
+                        "mimeType": "application/octet-stream",
+                        "uti": "public.data",
+                    }
+                ],
+            },
+        }))
+        await asyncio.sleep(0)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                **base,
+                "attachments": [
+                    {
+                        "guid": "same-attachment",
+                        "mimeType": "application/octet-stream",
+                        "uti": "public.caf",
+                    }
+                ],
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert [event.media_urls for event in handled] == [
+            ["/tmp/same-attachment"],
+            ["/tmp/same-attachment"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_attachment_readiness_transition_is_processed(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+        downloads = 0
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def fake_download_attachment(att_guid, att_meta):
+            nonlocal downloads
+            downloads += 1
+            return None if downloads == 1 else f"/tmp/{att_guid}"
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "_download_attachment", fake_download_attachment)
+        payload = {
+            "type": "updated-message",
+            "data": {
+                "guid": "attachment-ready-guid",
+                "text": "caption",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatIdentifier": "user@example.com",
+                "attachments": [{"guid": "same-attachment", "mimeType": "image/png"}],
+            },
+        }
+
+        await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+
+        assert [event.media_urls for event in handled] == [
+            [],
+            ["/tmp/same-attachment"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_releases_guid_for_retry(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        attempts = 0
+        handled = []
+
+        async def fake_handle_message(event):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("transient dispatch failure")
+            handled.append(event.text)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "data": {
+                "guid": "retryable-message-guid",
+                "text": "retry me",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatIdentifier": "user@example.com",
+            },
+        }
+
+        first = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+        second = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+
+        assert first.status == 200
+        assert second.status == 200
+        assert attempts == 2
+        assert handled == ["retry me"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_dispatch_releases_identity_for_retry(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        attempts = 0
+        handled = []
+
+        async def fake_handle_message(event):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError()
+            handled.append(event.text)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "data": {
+                "guid": "cancelled-message-guid",
+                "text": "retry cancellation",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatIdentifier": "user@example.com",
+            },
+        }
+
+        await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+
+        assert attempts == 2
+        assert handled == ["retry cancellation"]
+
+    @pytest.mark.asyncio
+    async def test_pending_identity_is_not_evicted_by_completed_lru(self, monkeypatch):
+        import gateway.platforms.bluebubbles as bluebubbles_module
+
+        monkeypatch.setattr(bluebubbles_module, "_MESSAGE_DEDUP_SIZE", 1)
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        started = asyncio.Event()
+        release = asyncio.Event()
+        attempts = {"pending-guid": 0, "completed-guid": 0}
+
+        async def fake_handle_message(event):
+            attempts[event.message_id] += 1
+            if event.message_id == "pending-guid":
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+
+        def payload(guid, text):
+            return {
+                "type": "new-message",
+                "data": {
+                    "guid": guid,
+                    "text": text,
+                    "handle": {"address": "user@example.com"},
+                    "isFromMe": False,
+                    "chatIdentifier": "user@example.com",
+                },
+            }
+
+        await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(payload("pending-guid", "still running"))
+        )
+        await started.wait()
+        await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(payload("completed-guid", "done"))
+        )
+        await asyncio.sleep(0)
+        await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(payload("pending-guid", "still running"))
+        )
+        await asyncio.sleep(0)
+        pending_attempts = attempts["pending-guid"]
+        release.set()
+        await asyncio.sleep(0)
+
+        assert pending_attempts == 1
 
 
 class TestBlueBubblesWebhookParsing:
@@ -283,6 +785,7 @@ class TestBlueBubblesWebhookUrl:
     """_webhook_url property normalises local hosts to 'localhost'."""
 
     def test_default_host(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_WEBHOOK_HOST", raising=False)
         adapter = _make_adapter(monkeypatch)
         # Default webhook_host is 0.0.0.0 → normalized to localhost
         assert "localhost" in adapter._webhook_url

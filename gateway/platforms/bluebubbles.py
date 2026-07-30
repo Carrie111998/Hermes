@@ -9,13 +9,13 @@ downloading from PR #4588 (YuhangLin).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import uuid
 from collections import OrderedDict
-from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
@@ -98,6 +98,13 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_MESSAGE_DEDUP_SIZE = 2048  # LRU cap for completed message identity caches
+
+
+def _is_phone_handle(target: str) -> bool:
+    """Return true only for a complete international-style phone handle."""
+    value = target.strip()
+    return "@" not in value and bool(re.fullmatch(r"\+[1-9]\d{6,14}", value))
 
 
 def _redact(text: str) -> str:
@@ -178,6 +185,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._seen_message_guids: OrderedDict[str, None] = OrderedDict()
+        self._pending_message_identities: set[str] = set()
+        self._sent_message_keys: OrderedDict[str, str] = OrderedDict()
+        self._inbound_dedup_lock = asyncio.Lock()
+        self._outbound_dedup_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -480,13 +492,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return None
 
     async def _create_chat_for_handle(
-        self, address: str, message: str
+        self,
+        address: str,
+        message: str,
+        temp_guid: Optional[str] = None,
     ) -> SendResult:
         """Create a new chat by sending the first message to *address*."""
         payload = {
             "addresses": [address],
             "message": message,
-            "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+            "tempGuid": temp_guid or f"temp-{uuid.uuid4().hex}",
         }
         try:
             res = await self._api_post("/api/v1/chat/new", payload)
@@ -517,32 +532,101 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         text = self.format_message(content)
         if not text:
             return SendResult(success=False, error="BlueBubbles send requires text")
-        # Split on paragraph breaks first (double newlines) so each thought
-        # becomes its own iMessage bubble, then truncate any that are still
-        # too long.
-        paragraphs = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-        chunks: List[str] = []
-        for para in (paragraphs or [text]):
-            if len(para) <= self.MAX_MESSAGE_LENGTH:
-                chunks.append(para)
-            else:
-                chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+        origin_id = reply_to or (
+            metadata.get("reply_to_message_id") if metadata else None
+        )
+        internal_notice = bool(metadata and metadata.get("internal_notice") is True)
+        if not origin_id:
+            return await self._send_formatted_text(
+                chat_id, text, reply_to, internal_notice=internal_notice
+            )
+
+        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        dedup_key = f"{chat_id}\0{origin_id}\0{content_hash}"
+        async with self._outbound_dedup_lock:
+            prior_message_id = self._sent_message_keys.get(dedup_key)
+            if prior_message_id is not None:
+                self._sent_message_keys.move_to_end(dedup_key)
+                logger.debug("[bluebubbles] suppressing duplicate outbound reply")
+                return SendResult(
+                    success=True,
+                    message_id=prior_message_id,
+                    raw_response={"deduplicated": True},
+                )
+            result = await self._send_formatted_text(
+                chat_id,
+                text,
+                reply_to,
+                internal_notice=internal_notice,
+                dedup_key=dedup_key,
+            )
+            if result.success and result.message_id:
+                self._sent_message_keys[dedup_key] = result.message_id
+                self._sent_message_keys.move_to_end(dedup_key)
+                while len(self._sent_message_keys) > _MESSAGE_DEDUP_SIZE:
+                    self._sent_message_keys.popitem(last=False)
+            return result
+
+    async def _send_formatted_text(
+        self,
+        chat_id: str,
+        text: str,
+        reply_to: Optional[str],
+        *,
+        internal_notice: bool,
+        dedup_key: Optional[str] = None,
+    ) -> SendResult:
+        # Keep a complete reply in one iMessage bubble whenever it fits. Only
+        # split when the platform's message-length limit requires it.
+        chunks = (
+            [text]
+            if len(text) <= self.MAX_MESSAGE_LENGTH
+            else self.truncate_message(text, max_length=self.MAX_MESSAGE_LENGTH)
+        )
         last = SendResult(success=True)
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
+            if dedup_key:
+                temp_guid = "temp-" + hashlib.sha256(
+                    f"{dedup_key}\0{chunk_index}".encode("utf-8")
+                ).hexdigest()
+            else:
+                temp_guid = f"temp-{uuid.uuid4().hex}"
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
+                if internal_notice and _is_phone_handle(chat_id):
+                    logger.info(
+                        "[bluebubbles] suppressed internal notice to unresolved phone target"
+                    )
+                    return SendResult(
+                        success=True,
+                        raw_response={"suppressed": "internal_sms_notice"},
+                    )
                 # If the target looks like an address, try creating a new chat
                 if self._private_api_enabled and (
-                    "@" in chat_id or re.match(r"^\+\d+", chat_id)
+                    "@" in chat_id or _is_phone_handle(chat_id)
                 ):
-                    return await self._create_chat_for_handle(chat_id, chunk)
+                    created = await self._create_chat_for_handle(
+                        chat_id, chunk, temp_guid=temp_guid
+                    )
+                    if not created.success:
+                        return created
+                    last = created
+                    if chunk_index == len(chunks) - 1:
+                        return created
+                    continue
                 return SendResult(
                     success=False,
                     error=f"BlueBubbles chat not found for target: {chat_id}",
                 )
+            if guid.lower().startswith("sms;") and internal_notice:
+                logger.info("[bluebubbles] suppressed internal notice over SMS")
+                return SendResult(
+                    success=True,
+                    raw_response={"suppressed": "internal_sms_notice"},
+                )
             payload: Dict[str, Any] = {
                 "chatGuid": guid,
-                "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
+                "tempGuid": temp_guid,
                 "message": chunk,
             }
             if reply_to and self._private_api_enabled and self._helper_connected:
@@ -869,6 +953,33 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    async def _handle_reserved_message(
+        self,
+        event: MessageEvent,
+        message_identity: Optional[str],
+    ) -> None:
+        """Dispatch a claimed inbound revision and release it on failure."""
+        try:
+            await self.handle_message(event)
+        except asyncio.CancelledError:
+            if message_identity:
+                async with self._inbound_dedup_lock:
+                    self._pending_message_identities.discard(message_identity)
+            raise
+        except Exception:
+            if message_identity:
+                async with self._inbound_dedup_lock:
+                    self._pending_message_identities.discard(message_identity)
+            logger.exception("[bluebubbles] inbound dispatch failed; revision released")
+        else:
+            if message_identity:
+                async with self._inbound_dedup_lock:
+                    self._pending_message_identities.discard(message_identity)
+                    self._seen_message_guids[message_identity] = None
+                    self._seen_message_guids.move_to_end(message_identity)
+                    while len(self._seen_message_guids) > _MESSAGE_DEDUP_SIZE:
+                        self._seen_message_guids.popitem(last=False)
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -915,6 +1026,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if is_from_me:
             return web.Response(text="ok")
 
+        message_guid = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+
         # Skip tapback reactions delivered as messages
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in {
@@ -934,6 +1051,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         attachments = record.get("attachments") or []
         media_urls: List[str] = []
         media_types: List[str] = []
+        downloaded_attachment_guids: set[str] = set()
         msg_type = MessageType.TEXT
 
         for att in attachments:
@@ -942,6 +1060,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 continue
             cached = await self._download_attachment(att_guid, att)
             if cached:
+                downloaded_attachment_guids.add(att_guid)
                 mime = (att.get("mimeType") or "").lower()
                 media_urls.append(cached)
                 media_types.append(mime)
@@ -1011,6 +1130,35 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
                 return web.Response(text="ok")
             text = self._clean_mention_text(text)
+
+        # Atomically claim the message only after validation and mention gating,
+        # so malformed payloads cannot poison the bounded identity cache and
+        # concurrent new/updated events cannot both dispatch.
+        message_identity: Optional[str] = None
+        if message_guid:
+            attachment_identity = [
+                {
+                    **att,
+                    "__hermes_downloaded": att.get("guid")
+                    in downloaded_attachment_guids,
+                }
+                for att in attachments
+                if isinstance(att, dict)
+            ]
+            revision_payload = json.dumps(
+                {"text": text, "attachments": attachment_identity},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            revision_hash = hashlib.sha256(revision_payload.encode("utf-8")).hexdigest()
+            message_identity = f"{message_guid}\0{revision_hash}"
+            async with self._inbound_dedup_lock:
+                if message_identity in self._pending_message_identities:
+                    return web.Response(text="ok")
+                if message_identity in self._seen_message_guids:
+                    self._seen_message_guids.move_to_end(message_identity)
+                    return web.Response(text="ok")
+                self._pending_message_identities.add(message_identity)
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=chat_identifier or sender,
@@ -1024,11 +1172,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=payload,
-            message_id=self._value(
-                record.get("guid"),
-                record.get("messageGuid"),
-                record.get("id"),
-            ),
+            message_id=message_guid,
             reply_to_message_id=self._value(
                 record.get("threadOriginatorGuid"),
                 record.get("associatedMessageGuid"),
@@ -1036,7 +1180,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
         )
-        task = asyncio.create_task(self.handle_message(event))
+        task = asyncio.create_task(
+            self._handle_reserved_message(event, message_identity)
+        )
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
 
