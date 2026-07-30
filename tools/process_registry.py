@@ -570,7 +570,7 @@ class ProcessRegistry:
         except psutil.NoSuchProcess:
             return identities
         except (psutil.AccessDenied, OSError) as exc:
-            raise RuntimeError(
+            raise OSError(
                 f"Could not snapshot owned Windows process tree for PID {pid}: {exc}"
             ) from exc
 
@@ -649,8 +649,9 @@ class ProcessRegistry:
 
         Returns ``False`` only when the root PID identity no longer matches;
         successful verified termination returns ``True``. Windows taskkill,
-        snapshot, timeout, and survivor failures raise ``RuntimeError`` so a
-        caller can never report ``killed`` without real cleanup evidence.
+        snapshot, timeout, and survivor failures raise ``OSError`` so existing
+        best-effort cleanup callers can handle them while ``kill_process`` can
+        never report ``killed`` without real cleanup evidence.
         """
         if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
             # PID was recycled (start time changed) or is gone — never signal a
@@ -673,13 +674,13 @@ class ProcessRegistry:
                     stdin=subprocess.DEVNULL,
                 )
             except subprocess.TimeoutExpired as exc:
-                raise RuntimeError(f"taskkill timed out for PID {pid}") from exc
+                raise OSError(f"taskkill timed out for PID {pid}") from exc
             except (FileNotFoundError, OSError) as exc:
-                raise RuntimeError(f"taskkill failed for PID {pid}: {exc}") from exc
+                raise OSError(f"taskkill failed for PID {pid}: {exc}") from exc
 
             if result.returncode != 0:
                 details = (result.stderr or result.stdout or "").strip()
-                raise RuntimeError(details or f"taskkill failed for PID {pid}")
+                raise OSError(details or f"taskkill failed for PID {pid}")
 
             survivors = cls._wait_for_host_identities_exit(
                 identities, WINDOWS_TREE_EXIT_TIMEOUT_SECONDS
@@ -688,7 +689,7 @@ class ProcessRegistry:
                 survivor_pids = ", ".join(
                     str(survivor_pid) for survivor_pid, _ in survivors
                 )
-                raise RuntimeError(
+                raise OSError(
                     "taskkill reported success but owned Windows PID(s) survived: "
                     f"{survivor_pids}"
                 )

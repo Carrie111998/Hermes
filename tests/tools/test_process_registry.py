@@ -832,9 +832,9 @@ class TestKillProcess:
         "tree_kill_outcome",
         [
             False,
-            RuntimeError("taskkill failed"),
-            RuntimeError("taskkill timed out"),
-            RuntimeError("owned process survived"),
+            OSError("taskkill failed"),
+            OSError("taskkill timed out"),
+            OSError("owned process survived"),
         ],
         ids=["pid-mismatch", "taskkill-failure", "taskkill-timeout", "survivor"],
     )
@@ -1076,7 +1076,7 @@ class TestTerminateHostPidWindows:
             ),
         )
 
-        with pytest.raises(RuntimeError, match="Access is denied"):
+        with pytest.raises(OSError, match="Access is denied"):
             pr.ProcessRegistry._terminate_host_pid(12345, 67890)
 
     def test_windows_taskkill_timeout_is_an_explicit_failure(self, monkeypatch):
@@ -1099,7 +1099,7 @@ class TestTerminateHostPidWindows:
 
         monkeypatch.setattr(pr.subprocess, "run", timeout)
 
-        with pytest.raises(RuntimeError, match="timed out"):
+        with pytest.raises(OSError, match="timed out"):
             pr.ProcessRegistry._terminate_host_pid(12345, 67890)
 
     def test_windows_surviving_owned_pid_is_an_explicit_failure(self, monkeypatch):
@@ -1127,7 +1127,7 @@ class TestTerminateHostPidWindows:
             lambda *args, **kwargs: MagicMock(returncode=0, stdout="", stderr=""),
         )
 
-        with pytest.raises(RuntimeError, match="22222"):
+        with pytest.raises(OSError, match="22222"):
             pr.ProcessRegistry._terminate_host_pid(12345, 67890)
 
 
