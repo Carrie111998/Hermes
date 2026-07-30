@@ -41,6 +41,7 @@ import {
   $activeGatewayProfile,
   $freshSessionRequest,
   $profileScope,
+  $profiles,
   ensureGatewayProfile,
   newSessionInProfile,
   normalizeProfileKey,
@@ -499,6 +500,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     void refreshHermesConfig(true)
     void refreshActiveProfile()
   }, [activeGatewayProfile, refreshCurrentModel, refreshHermesConfig])
+
+  // When the gateway becomes ready (e.g. remote backend handshake completes),
+  // re-fetch the profile list. In global remote mode the first refreshActiveProfile
+  // call above may fire before the remote proxy is fully routed, silently failing
+  // and leaving $profiles empty (issue #70679). Only runs when the list is empty
+  // to avoid redundant refetches on reconnect.
+  useEffect(() => {
+    if (gatewayState === 'open' && $profiles.get().length === 0) {
+      void refreshActiveProfile()
+    }
+  }, [gatewayState])
 
   // New session anchored to a workspace. Seeds cwd + branch from the clicked
   // workspace; an explicit worktree path also drills the sidebar into that
