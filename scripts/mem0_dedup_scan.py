@@ -7,6 +7,8 @@ user_id that have cosine similarity >= 0.92. Prints a report to stdout.
 Without --consolidate: reports only (does NOT delete anything).
 With --consolidate (alone): dry-run — prints what WOULD be deleted but does nothing.
 With --consolidate --yes: actually deletes the identified duplicates via Qdrant API.
+
+Supports both HTTP Qdrant (url=...) and embedded/local-path Qdrant (path=...).
 """
 
 import json
@@ -16,12 +18,39 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-MEM0_CONFIG = Path.home() / ".hermes" / "mem0.json"
+# ---------------------------------------------------------------------------
+# Profile-aware Hermes home resolution
+# ---------------------------------------------------------------------------
+
+try:
+    from hermes_constants import get_hermes_home as _get_hermes_home  # noqa: F401
+    _hermes_home: Path = _get_hermes_home()
+except Exception:  # noqa: BLE001  — script may be run standalone outside the venv
+    _hermes_home = Path.home() / ".hermes"
+
+
+def get_hermes_home() -> Path:
+    """Return the active Hermes home directory.
+
+    When run inside the hermes-agent venv, delegates to the canonical
+    ``hermes_constants.get_hermes_home()`` (which respects HERMES_HOME and
+    active-profile overrides).  When run standalone, falls back to
+    ``~/.hermes`` so the script still works outside the project.
+    """
+    try:
+        from hermes_constants import get_hermes_home as _ghh  # noqa: F401
+        return _ghh()
+    except Exception:  # noqa: BLE001
+        return Path.home() / ".hermes"
+
+
+MEM0_CONFIG = get_hermes_home() / "mem0.json"
 SIMILARITY_THRESHOLD = 0.92
 SCROLL_LIMIT = 100
 
 # Module-level constants — overridden by CLI flags in main()
-QDRANT_URL = "http://localhost:6333"
+QDRANT_URL: str | None = None        # None means "use embedded path mode"
+QDRANT_PATH: str | None = None       # Set when running in embedded/local mode
 COLLECTION = "hermes_memories"
 
 
@@ -29,15 +58,16 @@ COLLECTION = "hermes_memories"
 # Config helpers
 # ---------------------------------------------------------------------------
 
-def _load_mem0_config():
+def _load_mem0_config() -> dict:
     """Return parsed mem0.json as a dict, or {} if unavailable."""
+    config_path = get_hermes_home() / "mem0.json"
     try:
-        with open(MEM0_CONFIG) as f:
+        with open(config_path, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
         return {}
     except Exception as exc:  # noqa: BLE001
-        print(f"[WARN] Could not read {MEM0_CONFIG}: {exc}", file=sys.stderr)
+        print(f"[WARN] Could not read {config_path}: {exc}", file=sys.stderr)
         return {}
 
 
@@ -52,8 +82,65 @@ def _config_collection(cfg: dict) -> str | None:
         return None
 
 
+def _config_qdrant_path(cfg: dict) -> str | None:
+    """Return the local storage path if Qdrant is configured in embedded mode."""
+    try:
+        vs_config = cfg["oss"]["vector_store"]["config"]
+        return vs_config.get("path") or None
+    except (KeyError, TypeError):
+        return None
+
+
+def _config_qdrant_url(cfg: dict) -> str | None:
+    """Return the HTTP URL if Qdrant is configured in server mode."""
+    try:
+        vs_config = cfg["oss"]["vector_store"]["config"]
+        # Qdrant HTTP config uses 'url' or 'host'/'port'
+        url = vs_config.get("url")
+        if url:
+            return url
+        host = vs_config.get("host")
+        port = vs_config.get("port", 6333)
+        if host:
+            return f"http://{host}:{port}"
+        return None
+    except (KeyError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# Qdrant mode detection
+# ---------------------------------------------------------------------------
+
+def _is_embedded_mode() -> bool:
+    """Return True when the script should use qdrant-client with path= (embedded)."""
+    return QDRANT_PATH is not None
+
+
+def _require_qdrant_client():
+    """Import qdrant-client or exit with a helpful message."""
+    try:
+        from qdrant_client import QdrantClient  # noqa: F401
+        return QdrantClient
+    except ImportError:
+        print(
+            "[ERROR] qdrant-client is not installed. "
+            "Install it with: pip install qdrant-client",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _get_qdrant_client():
+    """Return a QdrantClient configured for the active mode (embedded or HTTP)."""
+    QdrantClient = _require_qdrant_client()
+    if QDRANT_PATH:
+        return QdrantClient(path=QDRANT_PATH)
+    return QdrantClient(url=QDRANT_URL)
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers (used only in HTTP mode)
 # ---------------------------------------------------------------------------
 
 def api_get(path, timeout=60):
@@ -74,16 +161,18 @@ def api_post(path, body, timeout=120):
         return json.loads(resp.read())
 
 
-def api_delete(path, body=None, timeout=30):
-    data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(
-        f"{QDRANT_URL}{path}",
-        data=data,
-        method="DELETE",
-        headers={"Content-Type": "application/json"} if data else {},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+def api_delete_points(point_ids: list) -> bool:
+    """Delete points by ID via HTTP API. Returns True on success."""
+    if not point_ids:
+        return True
+    body = {"points": point_ids}
+    try:
+        result = api_post(f"/collections/{COLLECTION}/points/delete", body)
+        status = result.get("result", {}).get("status", "unknown")
+        return status == "acknowledged"
+    except urllib.error.URLError as exc:
+        print(f"[ERROR] Qdrant delete failed: {exc}", file=sys.stderr)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +197,58 @@ def cosine_similarity(a, b):
 # Collection fetching
 # ---------------------------------------------------------------------------
 
-def scroll_all_points():
+def scroll_all_points() -> list:
     """Fetch all points from the collection with vectors and payloads."""
+    if _is_embedded_mode():
+        return _scroll_all_points_embedded()
+    return _scroll_all_points_http()
+
+
+def _scroll_all_points_embedded() -> list:
+    """Use qdrant-client SDK to scroll all points in embedded (local-path) mode."""
+    client = _get_qdrant_client()
     points = []
     offset = None
 
     while True:
-        body = {
+        try:
+            result, next_offset = client.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=None,
+                limit=SCROLL_LIMIT,
+                offset=offset,
+                with_payload=True,
+                with_vectors=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ERROR] Qdrant scroll failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        # Convert ScoredPoint / Record objects to plain dicts
+        for record in result:
+            vec = record.vector
+            if hasattr(vec, "tolist"):
+                vec = vec.tolist()
+            points.append({
+                "id": str(record.id),
+                "vector": vec,
+                "payload": dict(record.payload or {}),
+            })
+
+        if next_offset is None or not result:
+            break
+        offset = next_offset
+
+    return points
+
+
+def _scroll_all_points_http() -> list:
+    """Use raw HTTP API to scroll all points (HTTP/cloud Qdrant mode)."""
+    points = []
+    offset = None
+
+    while True:
+        body: dict = {
             "limit": SCROLL_LIMIT,
             "with_vector": True,
             "with_payload": True,
@@ -129,6 +263,9 @@ def scroll_all_points():
             sys.exit(1)
 
         batch = result.get("result", {}).get("points", [])
+        # Normalise IDs to str for consistency
+        for pt in batch:
+            pt["id"] = str(pt["id"])
         points.extend(batch)
 
         next_offset = result.get("result", {}).get("next_page_offset")
@@ -192,12 +329,11 @@ def group_pairs(pairs):
 
     Instead, each directly-similar pair becomes its own two-member group.
     If the same ID appears in multiple pairs it will appear in multiple groups,
-    and the consolidation step will handle it safely pair-by-pair, always
-    keeping the higher-ranked member of each direct pair.
+    and the consolidation step handles it safely by building a single
+    deduplicated delete-set before issuing any deletes.
     """
     point_map = {}
     edge_scores = {}
-    # Each pair becomes an independent two-member group keyed by a frozenset
     pair_groups = []
 
     for score, a, b in pairs:
@@ -305,52 +441,105 @@ def delete_points(point_ids: list) -> bool:
     """Delete a list of Qdrant points by ID. Returns True on success."""
     if not point_ids:
         return True
-    body = {"points": point_ids}
-    try:
-        result = api_post(f"/collections/{COLLECTION}/points/delete", body)
-        status = result.get("result", {}).get("status", "unknown")
-        return status == "acknowledged"
-    except urllib.error.URLError as exc:
-        print(f"[ERROR] Qdrant delete failed: {exc}", file=sys.stderr)
-        return False
+    if _is_embedded_mode():
+        client = _get_qdrant_client()
+        try:
+            from qdrant_client.models import PointIdsList
+            client.delete(
+                collection_name=COLLECTION,
+                points_selector=PointIdsList(points=point_ids),
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ERROR] Qdrant embedded delete failed: {exc}", file=sys.stderr)
+            return False
+    return api_delete_points(point_ids)
 
 
 def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
     """Keep the best memory per group and delete the rest.
 
+    Builds a single deduplicated set of IDs to delete before executing any
+    deletes, preventing the same ID from being submitted for deletion multiple
+    times when it appears in overlapping pairs.
+
     When dry_run=True (the default), only prints what WOULD be deleted without
     touching Qdrant. Pass dry_run=False (requires --yes on the CLI) to actually
     execute the deletes.
 
-    Returns (kept_count, deleted_count).
+    Returns (resolved_groups_count, deleted_count).
     """
-    kept = 0
-    deleted = 0
+    # --- Phase 1: determine keeper and losers for every group without touching Qdrant ---
+    plan: list[dict] = []           # {keeper_id, to_delete, group_idx, group}
+    ids_to_delete: set[str] = set() # deduplicated across all groups
 
     for idx, group in enumerate(groups, 1):
         members = group["members"]
         keeper_id = pick_keeper(group)
         to_delete = [pid for pid in members if pid != keeper_id]
+        ids_to_delete.update(to_delete)
+        plan.append({
+            "keeper_id": keeper_id,
+            "to_delete": to_delete,
+            "group_idx": idx,
+            "group": group,
+        })
 
+    prefix = "[DRY-RUN] " if dry_run else ""
+
+    # --- Phase 2: print the plan ---
+    for entry in plan:
+        keeper_id = entry["keeper_id"]
+        to_delete = entry["to_delete"]
+        group = entry["group"]
         keeper_text = extract_text(group["points"][keeper_id])
-        prefix = "[DRY-RUN] " if dry_run else ""
-        print(f"\n[GROUP {idx}] {prefix}Keeping {keeper_id}")
+        print(f"\n[GROUP {entry['group_idx']}] {prefix}Keeping {keeper_id}")
         print(f"  Text: {keeper_text[:160]}{'...' if len(keeper_text) > 160 else ''}")
         print(f"  {prefix}Would delete {len(to_delete)} duplicate(s): {to_delete}")
 
-        if dry_run:
-            kept += 1
-            deleted += len(to_delete)
-        else:
-            ok = delete_points(to_delete)
-            if ok:
-                kept += 1
-                deleted += len(to_delete)
-                print(f"  [OK] Deleted {len(to_delete)} point(s).")
-            else:
-                print(f"  [FAIL] Delete did not succeed for group {idx}.", file=sys.stderr)
+    deleted_count = len(ids_to_delete)
 
-    return kept, deleted
+    # --- Phase 3: execute (if not dry-run) using the deduplicated set ---
+    if not dry_run:
+        ok = delete_points(list(ids_to_delete))
+        if not ok:
+            print(
+                f"  [FAIL] Batch delete of {deleted_count} point(s) did not fully succeed.",
+                file=sys.stderr,
+            )
+            return len(plan), 0
+        print(f"  [OK] Deleted {deleted_count} point(s) in one batch.")
+
+    return len(plan), deleted_count
+
+
+# ---------------------------------------------------------------------------
+# Qdrant connectivity check
+# ---------------------------------------------------------------------------
+
+def verify_qdrant_connection(qdrant_url: str | None, qdrant_path: str | None) -> None:
+    """Verify Qdrant is reachable; exit(1) on failure."""
+    if qdrant_path:
+        # Embedded mode — check the path exists or can be created
+        p = Path(qdrant_path)
+        if not p.exists():
+            print(
+                f"[WARN] Embedded Qdrant path '{qdrant_path}' does not exist yet "
+                f"(will be created on first write).",
+                file=sys.stderr,
+            )
+        else:
+            print(f"Embedded Qdrant at: {qdrant_path}", file=sys.stderr)
+        return
+
+    # HTTP mode — hit the root endpoint
+    try:
+        info = api_get("/")
+        version = info.get("version", "unknown")
+        print(f"Qdrant {version} is up at {qdrant_url}", file=sys.stderr)
+    except urllib.error.URLError as exc:
+        print(f"[ERROR] Cannot reach Qdrant at {qdrant_url}: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +552,10 @@ def main():
     cfg = _load_mem0_config()
     cfg_user_id = _config_user_id(cfg)
     cfg_collection = _config_collection(cfg) or "hermes_memories"
+
+    # Detect default Qdrant mode from mem0.json
+    cfg_qdrant_path = _config_qdrant_path(cfg)
+    cfg_qdrant_url = _config_qdrant_url(cfg)
 
     parser = argparse.ArgumentParser(
         description=(
@@ -380,8 +573,22 @@ def main():
     )
     parser.add_argument(
         "--qdrant-url",
-        default=os.environ.get("QDRANT_URL", "http://localhost:6333"),
-        help="Qdrant base URL (default: QDRANT_URL env var, or http://localhost:6333).",
+        default=os.environ.get("QDRANT_URL", cfg_qdrant_url),
+        help=(
+            "Qdrant HTTP base URL (e.g. http://localhost:6333). "
+            "Takes precedence over --qdrant-path. "
+            "Default: QDRANT_URL env var, then mem0.json url config."
+        ),
+    )
+    parser.add_argument(
+        "--qdrant-path",
+        default=cfg_qdrant_path,
+        help=(
+            "Local filesystem path for embedded Qdrant storage. "
+            "Used when Qdrant runs in embedded (no server) mode. "
+            "Default: from mem0.json oss.vector_store.config.path, "
+            "or ~/.hermes/mem0_qdrant."
+        ),
     )
     parser.add_argument(
         "--collection",
@@ -423,13 +630,32 @@ def main():
 
     dry_run = args.consolidate and not args.yes
 
-    # Wire CLI flags into module-level constants used by the rest of the script
-    globals()["QDRANT_URL"] = args.qdrant_url
+    # ---------------------------------------------------------------------------
+    # Resolve Qdrant mode: --qdrant-url takes precedence over --qdrant-path.
+    # If neither is given, fall back to the default embedded path.
+    # ---------------------------------------------------------------------------
+    resolved_url: str | None = args.qdrant_url
+    resolved_path: str | None = None
+
+    if resolved_url:
+        # Explicit HTTP URL provided — use HTTP mode regardless of path config
+        resolved_path = None
+    else:
+        # No URL: use embedded mode
+        resolved_path = args.qdrant_path or str(get_hermes_home() / "mem0_qdrant")
+
+    # Wire into module-level constants used by helpers
+    globals()["QDRANT_URL"] = resolved_url
+    globals()["QDRANT_PATH"] = resolved_path
     globals()["COLLECTION"] = args.collection
     if args.threshold != SIMILARITY_THRESHOLD:
         globals()["SIMILARITY_THRESHOLD"] = args.threshold
 
-    print(f"Qdrant URL:  {args.qdrant_url}", file=sys.stderr)
+    # Logging
+    if resolved_path:
+        print(f"Qdrant mode: embedded path ({resolved_path})", file=sys.stderr)
+    else:
+        print(f"Qdrant mode: HTTP ({resolved_url})", file=sys.stderr)
     print(f"Collection:  {args.collection}", file=sys.stderr)
     if args.user:
         print(f"User filter: {args.user!r}", file=sys.stderr)
@@ -438,18 +664,15 @@ def main():
 
     if args.consolidate:
         if dry_run:
-            print("[CONSOLIDATE DRY-RUN] Will show what would be deleted. Re-run with --yes to execute.", file=sys.stderr)
+            print(
+                "[CONSOLIDATE DRY-RUN] Will show what would be deleted. "
+                "Re-run with --yes to execute.",
+                file=sys.stderr,
+            )
         else:
             print("[CONSOLIDATE MODE] Duplicates will be permanently deleted.", file=sys.stderr)
 
-    # Verify Qdrant is reachable — root endpoint returns JSON
-    try:
-        info = api_get("/")
-        version = info.get("version", "unknown")
-        print(f"Qdrant {version} is up.", file=sys.stderr)
-    except urllib.error.URLError as exc:
-        print(f"[ERROR] Cannot reach Qdrant at {args.qdrant_url}: {exc}", file=sys.stderr)
-        sys.exit(1)
+    verify_qdrant_connection(resolved_url, resolved_path)
 
     points = scroll_all_points()
     print(f"Fetched {len(points)} total points.", file=sys.stderr)
@@ -492,7 +715,10 @@ def main():
         print("=" * 72)
         kept, deleted = consolidate_groups(all_groups, dry_run=dry_run)
         if dry_run:
-            print(f"\nDry-run complete: {kept} group(s) would be resolved, {deleted} duplicate(s) would be deleted.")
+            print(
+                f"\nDry-run complete: {kept} group(s) would be resolved, "
+                f"{deleted} duplicate(s) would be deleted."
+            )
             print("Re-run with --consolidate --yes to actually execute the deletes.")
         else:
             print(f"\nConsolidation complete: {kept} group(s) resolved, {deleted} duplicate(s) deleted.")
