@@ -1058,8 +1058,20 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
 
 def estimate_enhanced_budget(goal: str, sub_task_count: int = 0) -> int:
     """Estimate turn budget from goal complexity and sub-task count.
-    Uses the same pattern as the basic budget but with wider range (5-200).
-    Only active when tool_calls are available for enhanced evaluation."""
+
+    Scans the goal text for complexity signals (file operations,
+    API integrations, multi-service architecture, etc.) and
+    combines them into a budget of 5-200 turns.
+
+    Args:
+        goal: The goal text to evaluate for complexity.
+        sub_task_count: Number of decomposed sub-tasks, used to
+            scale the budget when > 0.
+
+    Returns:
+        Turn budget clamped between ENHANCED_MIN_TURNS (5) and
+        ENHANCED_MAX_TURNS (200).
+    """
     goal_lower = goal.lower()
     base = max(10, len(goal.split()) // 3)
     bonuses = sum(bonus for pattern, bonus in _ENHANCED_COMPLEXITY_SIGNALS if re.search(pattern, goal_lower))
@@ -1070,8 +1082,21 @@ def estimate_enhanced_budget(goal: str, sub_task_count: int = 0) -> int:
 
 def decompose_goal(goal: str, *, timeout: float = 30.0) -> "List[SubTask]":
     """Break a goal into sub-tasks with dependency edges for DAG dispatch.
-    Only used by the enhanced evaluation path. Returns empty list when the
-    auxiliary model is unavailable or the goal is too short to decompose."""
+
+    Uses the auxiliary LLM (via call_llm with task='goal_judge') to
+    decompose a goal into 3-8 ordered sub-tasks with dependency edges.
+
+    Returns an empty list when enhanced modules are unavailable, the
+    goal is too short (<5 words), or the LLM call fails.
+
+    Args:
+        goal: The goal text to decompose. Must be at least 5 words.
+        timeout: Max seconds for the LLM API call.
+
+    Returns:
+        List of SubTask instances with dependency edges. Empty when
+        decomposition is unavailable or the goal is too simple.
+    """
     if not _HAS_ENHANCED_JUDGE:
         return []
     if len(goal.split()) < 5:
@@ -1118,10 +1143,23 @@ def decompose_goal(goal: str, *, timeout: float = 30.0) -> "List[SubTask]":
 
 
 def build_continuation_prompt(goal: str, scratchpad: "GoalScratchpad", verdict: "JudgeVerdict") -> str:
-    """Build a continuation prompt with enhanced context — scratchpad state,
-    negative constraints, error patterns, and hard enforcement signals.
-    Only used by the enhanced evaluation path. Preserves backward compatibility:
-    when scratchpad is empty, falls back to the basic template."""
+    """Build a continuation prompt with enhanced context for the agent.
+
+    Includes scratchpad state (sub-task progress, artifacts), negative
+    constraints, error patterns, and hard enforcement signals (pivot
+    directions, quality focus).
+
+    Falls back to the basic CONTINUATION_PROMPT_TEMPLATE when the
+    scratchpad is empty or enhanced modules are unavailable.
+
+    Args:
+        goal: The original goal text.
+        scratchpad: Current GoalScratchpad state for context.
+        verdict: The latest JudgeVerdict for signal injection.
+
+    Returns:
+        A prompt string, or empty string if the goal is done.
+    """
     if not _HAS_ENHANCED_JUDGE:
         return CONTINUATION_PROMPT_TEMPLATE.format(goal=goal)
     if verdict.action == "done":
@@ -1481,13 +1519,37 @@ class GoalManager:
     ) -> Dict[str, Any]:
         """Enhanced evaluation pipeline — wraps the basic judge with semantic
         loop detection, artifact extraction, verification gates, and adaptive
-        budget. Falls back to the standard evaluate_after_turn when the
-        enhanced judge modules are unavailable.
+        budget.
 
-        This is purely additive: it calls the existing evaluate_after_turn for
-        the base verdict, then layers enhanced post-processing on top when
+        Additive design: this calls the existing evaluate_after_turn for the
+        base verdict, then layers enhanced post-processing on top when
         tool_calls are available. Every existing contract (background_processes,
-        subgoals, wait barriers, completion contracts) is fully preserved."""
+        subgoals, wait barriers, completion contracts) is fully preserved.
+
+        Pipeline:
+        1. Extract artifacts from tool calls (write_file, patch, redirects)
+        2. Run semantic loop/error detection and progress trend analysis
+        3. Record verdict in scratchpad history for trend detection
+        4. Track error patterns and negative constraints for follow-up prompts
+        5. Auto-stat artifacts during 'done' verdict verification gate
+        6. Build enhanced continuation prompt with scratchpad context
+
+        Falls back to evaluate_after_turn when enhanced modules are
+        unavailable or no tool_calls are provided — zero risk.
+
+        Args:
+            last_response: The agent's final response text.
+            tool_calls: Tool calls this turn (for artifact extraction and
+                loop detection). None = basic mode.
+            background_processes: Running background processes, passed
+                through to the basic judge for wait-barrier logic.
+            user_initiated: Whether triggered by user action vs automated.
+                Passed through to the basic judge.
+
+        Returns:
+            Decision dict matching the same schema as evaluate_after_turn,
+            potentially with enhanced verdict action and continuation prompt.
+        """
         if not _HAS_ENHANCED_JUDGE:
             return self.evaluate_after_turn(
                 last_response, background_processes=background_processes,

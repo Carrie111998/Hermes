@@ -1,14 +1,14 @@
 """
-SOTA goal judge — 10/10 evaluation with semantic loop detection, calibrated
-scoring, error pattern tracking, and hard negative-constraint output.
+SOTA goal judge — multi-dimensional evaluation with semantic loop detection,
+calibrated scoring, error pattern tracking, and hard negative-constraint output.
 
-Key improvements over v2:
+Key capabilities:
 - Semantic loop detection: fingerprints outcome patterns, not just tool names
 - Calibrated scoring: reference anchors for each completion band with examples
 - Error pattern tracking: distinguishes transient failures from systemic bugs
 - Negative constraints: outputs "do NOT do" alongside "try this instead"
 - Progress trend: detects regression by comparing consecutive verdicts
-- Verification demands: requires explicit artifact confirmation when scoring high
+- Hard enforcement: pre-detected loops/errors override LLM judge verdicts
 """
 
 from __future__ import annotations
@@ -31,25 +31,48 @@ _ERROR_PATTERN_THRESHOLD = 3   # same error seen this many times = systemic
 
 @dataclass
 class JudgeVerdict:
-    """The judge's evaluation of the last turn."""
+    """The judge's evaluation of the last turn.
 
-    action: str  # continue_as_is | pivot_strategy | refine_output | decompose_further | ask_user | done | failed
-    completion: float  # 0.0 - 1.0
-    progress_signal: str  # "forward" | "stalled" | "looping" | "regressing" | "unclear"
-    quality_score: float  # 0.0 - 1.0
+    Attributes:
+        action: Verdict action — continue_as_is | pivot_strategy | refine_output
+            | decompose_further | ask_user | done | failed
+        completion: Estimated completion fraction 0.0–1.0
+        progress_signal: Movement direction — forward | stalled | looping
+            | regressing | unclear
+        quality_score: Output quality rating 0.0–1.0
+        stuck_details: Description of any blocked state, if relevant
+        reasoning: LLM judge's reasoning for the verdict
+        suggested_next_action: What the agent should do next (generic)
+        suggested_pivot: Specific pivot direction when action is pivot_strategy
+        negative_constraint: What to AVOID doing in subsequent turns
+        error_pattern: Systemic error pattern detected, if any
+        previous_completion: Completion score from the previous turn (for trend)
+    """
+
+    action: str
+    completion: float
+    progress_signal: str
+    quality_score: float
     stuck_details: str = ""
     reasoning: str = ""
     suggested_next_action: str = ""
     suggested_pivot: str = ""
-    negative_constraint: str = ""  # what to AVOID doing
-    error_pattern: str = ""  # systemic error detected (if any)
-    previous_completion: float = 0.0  # for trend comparison
+    negative_constraint: str = ""
+    error_pattern: str = ""
+    previous_completion: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
+        """Serialize verdict to a flat dictionary for storage."""
         return asdict(self)
 
     @classmethod
     def default_continue(cls) -> "JudgeVerdict":
+        """Return a safe fallback verdict when the judge is unavailable.
+
+        Returns a continue_as_is verdict with 0.0 completion, unclear progress,
+        0.5 quality, and a note that the judge was unavailable. Used for fail-open
+        behaviour — never block the agent because the judge crashed.
+        """
         return cls(
             action="continue_as_is",
             completion=0.0,
@@ -126,7 +149,21 @@ _VALID_PROGRESS = {"forward", "stalled", "looping", "regressing", "unclear"}
 
 
 def _parse_judge_response(raw: str) -> JudgeVerdict:
-    """Parse judge output. Returns fail-open default on any error."""
+    """Parse the LLM judge's JSON response into a JudgeVerdict.
+
+    Handles typical formatting quirks: markdown code fences, extra whitespace,
+    and malformed JSON. Returns a safe default_continue on any parsing failure
+    (fail-open — never crash the agent loop over a parse error).
+
+    Args:
+        raw: Raw response text from the LLM judge, expected to contain a
+            JSON object with keys: action, completion, progress_signal,
+            quality_score, and optional fields.
+
+    Returns:
+        A JudgeVerdict parsed from the response, or default_continue if parsing
+        fails or the response is empty.
+    """
     if not raw:
         return JudgeVerdict.default_continue()
 
@@ -191,8 +228,21 @@ def _parse_judge_response(raw: str) -> JudgeVerdict:
 
 
 def _outcome_fingerprint(tc: Dict[str, Any]) -> str:
-    """Build a semantic fingerprint from a tool call — captures what the tool
-    was TRYING to do, not just its name/args."""
+    """Build a semantic fingerprint from a single tool call.
+
+    Classifies what the tool was TRYING to do (intent), not just its name
+    or arguments. This enables higher-level loop detection — e.g. detecting
+    that the agent keeps trying to install packages regardless of which
+    specific package manager it uses.
+
+    Args:
+        tc: A tool call dict, either OpenAI format (with 'function' key) or
+            standard format (with 'name' / 'args' keys directly).
+
+    Returns:
+        A short intent string representing the semantic purpose of the call.
+        Examples: "write:main.py", "run_tests", "install", "git".
+    """
     name = tc.get("function", {}).get("name", tc.get("name", "?"))
     args_str = str(tc.get("function", {}).get("arguments", tc.get("args", "")))
     try:
@@ -245,11 +295,22 @@ def _outcome_fingerprint(tc: Dict[str, Any]) -> str:
 
 
 def _detect_error_patterns(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, str]:
-    """Detect recurring errors across tool calls. Returns (is_systemic, description)."""
+    """Detect recurring errors across a sequence of tool calls.
+
+    Looks for tool calls whose command text contains error-related keywords
+    (error, fail, retry). If the same error pattern appears at least
+    _ERROR_PATTERN_THRESHOLD times, it's flagged as systemic.
+
+    Args:
+        tool_calls: List of tool call dicts from the current turn.
+
+    Returns:
+        A tuple (is_systemic, description). is_systemic is True when the same
+        error has been repeated enough to be a pattern. description contains
+        details when a pattern is detected, empty string otherwise.
+    """
     errors: List[str] = []
     for tc in tool_calls:
-        # Errors may be in the result, but we only have calls here
-        # Check if the call itself looks like a retry of a failing pattern
         name = tc.get("function", {}).get("name", tc.get("name", ""))
         if name in ("terminal", "execute_code"):
             args_str = str(tc.get("function", {}).get("arguments", tc.get("args", "")))
@@ -270,9 +331,22 @@ def _detect_error_patterns(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, str]
 
 
 def _detect_semantic_loop(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, str]:
-    """Detect if the agent is repeating the same INTENT, not just the same command.
-    Returns (is_looping, description)."""
-    # Exact loop check runs first (lower threshold = more sensitive)
+    """Detect if the agent is repeating the same intent across tool calls.
+
+    Two-stage detection:
+    1. Exact loop: same tool name + same first argument value repeated
+       at least _EXACT_LOOP_THRESHOLD times (more sensitive).
+    2. Semantic loop: same outcome fingerprint repeated at least
+       _SEMANTIC_LOOP_THRESHOLD times (catches intent-level repetition).
+
+    Args:
+        tool_calls: List of tool call dicts from the current turn.
+
+    Returns:
+        A tuple (is_looping, description). is_looping is True when a loop
+        pattern is detected. description provides details about the loop
+        (which intent/command is being repeated and how many times).
+    """
     fingerprints = []
     for tc in tool_calls:
         name = tc.get("function", {}).get("name", tc.get("name", "?"))
@@ -293,7 +367,6 @@ def _detect_semantic_loop(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, str]:
         if count >= _EXACT_LOOP_THRESHOLD:
             return True, f"Exact loop: '{fp}' repeated {count}x"
 
-    # Semantic loop check (higher threshold)
     if len(tool_calls) < _SEMANTIC_LOOP_THRESHOLD:
         return False, ""
 
@@ -307,7 +380,25 @@ def _detect_semantic_loop(tool_calls: List[Dict[str, Any]]) -> Tuple[bool, str]:
 
 
 def _detect_progress_trend(verdicts: List[Dict[str, Any]]) -> str:
-    """Compare last few completion scores to detect regression."""
+    """Analyse recent turn verdicts to detect progress direction.
+
+    Compares the last 2–5 completion scores and determines if the agent is
+    making forward progress, stalled, regressing, or unclear.
+
+    Rules:
+    - 3+ consecutive decreasing scores → regressing
+    - Last score 0.05+ below previous → regressing
+    - Last score 0.02+ above previous → forward
+    - Flat (≤0.02 delta) over 3+ turns → stalled
+    - Otherwise → unclear
+
+    Args:
+        verdicts: List of verdict dictionaries from the scratchpad history.
+            Each must have a 'completion' key with a float value.
+
+    Returns:
+        One of: "forward", "stalled", "regressing", "unclear".
+    """
     if len(verdicts) < 2:
         return "unclear"
 
@@ -321,19 +412,15 @@ def _detect_progress_trend(verdicts: List[Dict[str, Any]]) -> str:
     if len(scores) < 2:
         return "unclear"
 
-    # Monotonic regression: last N scores strictly decreasing
     if len(scores) >= 3 and all(scores[i] > scores[i + 1] for i in range(len(scores) - 1)):
         return "regressing"
 
-    # Last score lower than previous
     if scores[-1] < scores[-2] - 0.05:
         return "regressing"
 
-    # Last score higher than previous
     if scores[-1] > scores[-2] + 0.02:
         return "forward"
 
-    # Flat
     if abs(scores[-1] - scores[-2]) <= 0.02:
         if len(scores) >= 3 and abs(scores[-1] - scores[-3]) <= 0.02:
             return "stalled"
@@ -342,7 +429,19 @@ def _detect_progress_trend(verdicts: List[Dict[str, Any]]) -> str:
 
 
 def _summarize_tools(tool_calls: List[Dict[str, Any]], limit: int = 8) -> str:
-    """Compress recent tool calls into a short list for the judge, with loop detection."""
+    """Compress recent tool calls into a short summary for the LLM judge.
+
+    The summary includes any detected loops or systemic errors, followed by
+    each tool call's intent fingerprint and a key argument value.
+
+    Args:
+        tool_calls: List of tool call dicts to summarise.
+        limit: Maximum number of calls to include in the output (default 8).
+
+    Returns:
+        A human-readable string summarising tool activity. Returns a placeholder
+        if no tools were called.
+    """
     if not tool_calls:
         return "(no tools called this turn)"
 
@@ -363,7 +462,6 @@ def _summarize_tools(tool_calls: List[Dict[str, Any]], limit: int = 8) -> str:
         except Exception:
             args_obj = {}
 
-        # Show intent + key detail
         intent = _outcome_fingerprint(tc)
         detail = ""
         for k in ("command", "path", "query", "url", "goal", "code", "prompt"):
@@ -379,7 +477,17 @@ def _summarize_tools(tool_calls: List[Dict[str, Any]], limit: int = 8) -> str:
 
 
 def _summarize_scratchpad(pad: GoalScratchpad) -> str:
-    """Build a compact scratchpad summary for the judge prompt."""
+    """Build a compact scratchpad summary for the LLM judge prompt.
+
+    Includes sub-task progress, confidence, artifact counts, blockers, pivots,
+    recent approaches, and turn history snapshot.
+
+    Args:
+        pad: The GoalScratchpad to summarise.
+
+    Returns:
+        A multi-line string summarising the scratchpad state.
+    """
     parts = []
     parts.append(f"Sub-tasks: {pad.completed_count}/{pad.total_count} done, {pad.in_progress_count} in progress, {pad.blocked_count} blocked")
     parts.append(f"Confidence: {pad.confidence}%")
@@ -427,6 +535,16 @@ Evaluate progress across completion, progress, and quality. Include negative_con
 
 
 def _truncate(text: str, limit: int) -> str:
+    """Truncate text to a maximum length with an ellipsis suffix.
+
+    Args:
+        text: Text to truncate.
+        limit: Maximum character count (including the ellipsis).
+
+    Returns:
+        Original text if within the limit, or truncated with '… [truncated]'
+        appended. Empty string if text is falsy.
+    """
     if not text:
         return ""
     if len(text) <= limit:
@@ -443,7 +561,31 @@ def evaluate_turn(
     timeout: float = DEFAULT_JUDGE_TIMEOUT,
     previous_completion: float = 0.0,
 ) -> JudgeVerdict:
-    """Run the full multi-dimensional evaluation with semantic loop detection."""
+    """Run the full multi-dimensional evaluation with semantic loop detection.
+
+    The evaluation pipeline:
+    1. Pre-processing: detect semantic loops and error patterns in tool calls
+    2. Trend analysis: compare recent completion scores for regression
+    3. LLM judge: call the auxiliary goal-judge model for calibrated scoring
+    4. Hard enforcement: override LLM verdict when pre-detected loops/errors
+       demand a pivot (system safety net — the LLM judge isn't trusted alone)
+    5. Score capping: clamp completion above 0.75 when no artifacts are verified
+
+    Args:
+        goal: The original goal text (used for context in the judge prompt).
+        last_response: The agent's final response text from this turn.
+        scratchpad: The GoalScratchpad with sub-task state, history, artifacts.
+        tool_calls: Tool calls made during this turn (optional). Used for
+            loop/error detection and artifact extraction.
+        timeout: Maximum seconds to wait for the LLM judge API call.
+        previous_completion: Completion score from the previous turn, for
+            trend comparison.
+
+    Returns:
+        A JudgeVerdict with the combined LLM + heuristic evaluation. On any
+        error (missing LLM, parse failure, API timeout), returns a safe
+        default_continue — never crashes the agent loop.
+    """
     if not goal.strip():
         return JudgeVerdict.default_continue()
 
@@ -565,10 +707,32 @@ _ACTION_LABELS = {
 
 
 def verdict_icon(verdict: JudgeVerdict) -> str:
+    """Return a single-character icon for the verdict action.
+
+    Args:
+        verdict: The JudgeVerdict to get an icon for.
+
+    Returns:
+        A Unicode symbol representing the verdict action (e.g. ✓ for done,
+        ✗ for failed, → for continuing). Returns '?' for unknown actions.
+    """
     return _ACTION_ICONS.get(verdict.action, "?")
 
 
 def verdict_label(verdict: JudgeVerdict) -> str:
+    """Build a human-readable label for the verdict.
+
+    Produces a short label annotated with context when available — the pivot
+    direction for pivot_strategy, the stuck details for ask_user, or the
+    suggested next action for refine_output.
+
+    Args:
+        verdict: The JudgeVerdict to build a label for.
+
+    Returns:
+        A short descriptive string (e.g. 'Goal achieved', 'Strategy pivot:
+        Stop repeating and try a different HTTP library').
+    """
     base = _ACTION_LABELS.get(verdict.action, verdict.action)
     if verdict.action == "pivot_strategy" and verdict.suggested_pivot:
         base += f": {verdict.suggested_pivot[:80]}"
@@ -580,7 +744,18 @@ def verdict_label(verdict: JudgeVerdict) -> str:
 
 
 def verdict_message(verdict: JudgeVerdict, turns: int, max_turns: int) -> str:
-    """Build a user-visible one-liner for the verdict."""
+    """Build a user-visible one-liner for the verdict with progress bar.
+
+    Format: "{icon} [{progress_bar}] ({turns}/{max_turns}) {label}{negative constraint}{error pattern}"
+
+    Args:
+        verdict: The JudgeVerdict to build a message for.
+        turns: Current turn number for display.
+        max_turns: Maximum allowed turns for display.
+
+    Returns:
+        A one-line string suitable for displaying in the CLI or status line.
+    """
     icon = verdict_icon(verdict)
     label = verdict_label(verdict)
     bar = _mini_progress(verdict.completion)
@@ -597,6 +772,16 @@ _PROGRESS_CHARS = " ▏▎▍▌▋▊▉█"
 
 
 def _mini_progress(fraction: float, width: int = 10) -> str:
+    """Render a compact progress bar string using Unicode block characters.
+
+    Args:
+        fraction: Progress fraction 0.0–1.0.
+        width: Character width of the bar (default 10).
+
+    Returns:
+        A string of Unicode eighth-block characters representing the progress
+        level, padded with spaces to the requested width.
+    """
     filled = int(fraction * width * 8)
     full = filled // 8
     partial = filled % 8
