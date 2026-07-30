@@ -402,6 +402,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws = None  # live websocket for ephemeral EVENT publishes (typing)
+        self._ws_send_lock = asyncio.Lock()
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
@@ -556,6 +558,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        self._ws = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -611,8 +614,34 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
+        """Publish a Buzz typing indicator (kind 20002) over the live WebSocket.
+
+        Desktop/mobile show "Rocky is typing…" from these ephemeral events.
+        ACP already does this; gateway previously no-oped, so Buzz felt dead
+        compared with Discord/Telegram. Best-effort: never block the agent.
+        """
+        if not chat_id or not self._private_key:
+            return
+        websocket = self._ws
+        if not self._ws_active or websocket is None:
+            return
+        try:
+            build_typing_event = _load_nostr_auth().build_typing_event
+            meta = metadata if isinstance(metadata, dict) else {}
+            event = build_typing_event(
+                private_key=self._private_key,
+                channel_id=str(chat_id),
+                parent_event_id=str(meta.get("reply_to") or meta.get("parent_event_id") or "") or None,
+                root_event_id=str(meta.get("root_event_id") or "") or None,
+            )
+            payload = json.dumps(["EVENT", event], separators=(",", ":"), ensure_ascii=False)
+            async with self._ws_send_lock:
+                # Re-check after lock; WS may have dropped mid-wait.
+                if not self._ws_active or self._ws is None:
+                    return
+                await self._ws.send(payload)
+        except Exception as exc:
+            logger.debug("Buzz: typing indicator failed for %s: %s", chat_id, exc)
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
@@ -834,6 +863,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
+                        self._ws = websocket
                         self._ws_active = True
                         if self._ws_ready is not None:
                             self._ws_ready.set()
@@ -868,11 +898,13 @@ class BuzzAdapter(BasePlatformAdapter):
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws = None
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws = None
 
     # ── Inbound polling ───────────────────────────────────────────────────
 
@@ -1216,14 +1248,22 @@ class BuzzAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
         )
 
+        # Ack immediately (fire-and-forget). Waiting until after handle_message
+        # made Buzz feel dead for the full agent turn (5-10s+) because
+        # handle_message awaits the whole agent loop. Discord/Telegram feel
+        # snappier because the user gets early platform feedback.
+        async def _ack_seen() -> None:
+            try:
+                await self.send_reaction(chat_id, message_id, "👀")
+            except Exception:
+                logger.debug(
+                    "Buzz: reaction failed for message %s",
+                    message_id[:12],
+                    exc_info=True,
+                )
+
+        asyncio.create_task(_ack_seen())
         await self.handle_message(event)
-        
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
 
 
 # ---------------------------------------------------------------------------

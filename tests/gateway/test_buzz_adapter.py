@@ -24,6 +24,15 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+
+import importlib.util
+from pathlib import Path as _Path
+_na_path = _Path(__file__).resolve().parents[2] / "plugins" / "platforms" / "buzz" / "nostr_auth.py"
+_spec = importlib.util.spec_from_file_location("buzz_nostr_auth_under_test", _na_path)
+_buzz_nostr = importlib.util.module_from_spec(_spec)
+assert _spec and _spec.loader
+_spec.loader.exec_module(_buzz_nostr)
+build_typing_event = _buzz_nostr.build_typing_event
 _normalize_buzz_auth_tag = _buzz_mod.normalize_buzz_auth_tag
 _buzz_recommended_setup_steps = _buzz_mod.buzz_recommended_setup_steps
 _format_no_channels_error = _buzz_mod.format_no_channels_error
@@ -638,3 +647,31 @@ def test_format_no_channels_error_is_actionable():
     assert "0 channels" in msg
     assert "join" in msg.lower()
     assert "set-profile" in msg or "profile" in msg.lower()
+
+
+def test_build_typing_event_channel_only():
+    sk = "22" * 32
+    channel = "58795faa-d93e-42c0-a070-d87511a89484"
+    event = build_typing_event(private_key=sk, channel_id=channel, created_at=1_700_000_000)
+    assert event["kind"] == 20002
+    assert event["tags"] == [["h", channel]]
+    assert event["content"] == ""
+    assert len(event["id"]) == 64
+    assert len(event["sig"]) == 128
+
+
+def test_build_typing_event_with_thread_refs():
+    sk = "33" * 32
+    channel = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    parent = "a" * 64
+    root = "b" * 64
+    event = build_typing_event(
+        private_key=sk,
+        channel_id=channel,
+        parent_event_id=parent,
+        root_event_id=root,
+        created_at=1_700_000_001,
+    )
+    assert ["h", channel] in event["tags"]
+    assert ["e", root, "", "root"] in event["tags"]
+    assert ["e", parent, "", "reply"] in event["tags"]
