@@ -251,6 +251,15 @@ class TestDetectProviderForModel:
         # Provider is deepseek (direct) or openrouter (fallback) depending on creds
         assert result[0] in {"deepseek", "openrouter"}
 
+    def test_deepseek_v4_flash_openrouter_routing(self):
+        """deepseek/deepseek-v4-flash should route to openrouter, not deepseek."""
+        live_models = [("deepseek/deepseek-v4-flash", "")]
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=live_models):
+            result = detect_provider_for_model("deepseek/deepseek-v4-flash", "openai")
+        assert result is not None
+        assert result[0] == "openrouter"
+        assert result[1] == "deepseek/deepseek-v4-flash"
+
     def test_current_provider_model_returns_none(self):
         """Models belonging to the current provider should not trigger a switch."""
         assert detect_provider_for_model("gpt-5.3-codex", "openai-codex") is None

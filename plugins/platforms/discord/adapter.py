@@ -5166,6 +5166,32 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
+        # Resolve Agent Hub bindings before mention gating. A bound channel is
+        # intentionally a direct coding-agent surface, so it behaves like a
+        # free-response channel instead of requiring an @mention every turn.
+        agent_hub_binding = None
+        try:
+            from hermes_cli.agent_hub import load_bindings
+
+            _early_bindings = load_bindings()
+            _early_channel_id = str(getattr(message.channel, "id", ""))
+            _early_combined_id = (
+                f"{parent_channel_id}:{_early_channel_id}"
+                if parent_channel_id
+                else ""
+            )
+            agent_hub_binding = (
+                _early_bindings.get(_early_combined_id)
+                or _early_bindings.get(_early_channel_id)
+                or (
+                    _early_bindings.get(parent_channel_id)
+                    if parent_channel_id
+                    else None
+                )
+            )
+        except Exception:
+            logger.debug("[%s] Agent Hub binding lookup failed", self.name, exc_info=True)
+
         is_voice_linked_channel = False
 
         # Save mention-stripped text before auto-threading since create_thread()
@@ -5223,6 +5249,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 "*" in free_channels
                 or bool(channel_ids & free_channels)
                 or is_voice_linked_channel
+                or agent_hub_binding is not None
             )
 
             # Skip the mention check if the message is in a thread where
@@ -5534,6 +5561,64 @@ class DiscordAdapter(BasePlatformAdapter):
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
+
+        # Agent Hub channel binding: a configured Discord channel talks
+        # directly to its selected coding harness instead of entering the
+        # ordinary Hermes conversation loop. Parent-channel bindings apply to
+        # threads as well, which keeps Discord's auto-thread isolation useful.
+        try:
+            from hermes_cli.agent_hub import run_turn
+
+            _binding = agent_hub_binding
+            if _binding:
+                _binding_channel = str(_binding.get("channel_id") or _chan_id)
+                _attachment_paths = [
+                    str(path)
+                    for path in media_urls
+                    if isinstance(path, str) and not path.startswith(("http://", "https://"))
+                ]
+                await self._add_reaction(message, "👀")
+                try:
+                    _reply = await asyncio.to_thread(
+                        run_turn,
+                        harness=str(_binding.get("harness") or ""),
+                        prompt=event_text,
+                        conversation_id=(
+                            f"discord-{_binding_channel}-"
+                            f"{str(_binding.get('harness') or '')}"
+                        ),
+                        cwd=_binding.get("cwd"),
+                        skills=list(_binding.get("skills") or []),
+                        attachments=_attachment_paths,
+                    )
+                    _response = str((_reply.get("messages") or [{}])[-1].get("content") or "")
+                    _send_chat_id = _parent_id if is_thread and _parent_id else _chan_id
+                    await self.send(
+                        _send_chat_id,
+                        _response,
+                        reply_to=str(message.id),
+                        metadata={"thread_id": _chan_id} if is_thread else None,
+                    )
+                    await self._remove_reaction(message, "👀")
+                    await self._add_reaction(message, "✅")
+                except Exception:
+                    logger.exception(
+                        "[%s] Agent Hub binding failed for channel %s",
+                        self.name,
+                        _binding_channel,
+                    )
+                    await self._remove_reaction(message, "👀")
+                    await self._add_reaction(message, "❌")
+                    await effective_channel.send(
+                        "The bound coding agent could not complete this turn. "
+                        "Check the Hermes gateway logs for details."
+                    )
+                return
+        except Exception:
+            # Binding lookup is best-effort. A malformed/missing Agent Hub
+            # state file must never break normal Discord message handling.
+            logger.debug("[%s] Agent Hub binding lookup failed", self.name, exc_info=True)
+
         _skills = self._resolve_channel_skills(_chan_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(_chan_id, _parent_id or None)
 

@@ -168,6 +168,51 @@ class GatewaySlashCommandsMixin:
             new_entry = self.session_store.get_or_create_session(source, force_new=True)
             header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
 
+        # Discord's /new must start with the configured default, rather than
+        # inheriting a /model override from the conversation it just closed.
+        # Resolve it here (after reset_session created the replacement) so the
+        # next message builds a fresh agent with a complete provider bundle.
+        if (
+            new_entry
+            and source.platform
+            and source.platform.value == "discord"
+        ):
+            try:
+                from gateway.run import _load_gateway_config, _resolve_gateway_model, _resolve_runtime_agent_kwargs
+                from hermes_cli.model_switch import switch_model
+
+                config = _load_gateway_config()
+                model_config = config.get("model") if isinstance(config.get("model"), dict) else {}
+                default_model = _resolve_gateway_model(config)
+                default_provider = str(model_config.get("provider") or "")
+                if default_model:
+                    runtime = _resolve_runtime_agent_kwargs()
+                    result = switch_model(
+                        raw_input=default_model,
+                        current_provider=default_provider,
+                        current_model=default_model,
+                        current_base_url=str(runtime.get("base_url") or ""),
+                        current_api_key=runtime.get("api_key") or "",
+                        is_global=False,
+                        explicit_provider=default_provider,
+                        user_providers=config.get("providers") if isinstance(config.get("providers"), dict) else None,
+                        custom_providers=config.get("custom_providers") if isinstance(config.get("custom_providers"), list) else None,
+                    )
+                    if result.success:
+                        self._session_model_overrides[session_key] = {
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                            "api_key": result.api_key,
+                            "base_url": result.base_url,
+                            "api_mode": result.api_mode,
+                        }
+                        if self._session_db:
+                            self._session_db.update_session_model(new_entry.session_id, result.new_model)
+                    else:
+                        logger.warning("Could not apply configured Discord default model: %s", result.error_message)
+            except Exception:
+                logger.warning("Could not apply configured Discord default model", exc_info=True)
+
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()
         _title_note = ""

@@ -752,6 +752,7 @@ _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
     "video/webm": ".webm",
 }
 _MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+_MAX_AGENT_HUB_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 def _audio_extension_for_mime(mime_type: str) -> str:
@@ -2673,6 +2674,201 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
         "transcript": str(result.get("transcript") or "").strip(),
         "provider": result.get("provider"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Agent Hub — direct chat over installed coding-agent harnesses.
+#
+# This remains a dashboard/service surface rather than a new model tool:
+# Codex, Claude Code, and Antigravity keep their native agent loops and session
+# state. Hermes provides the authenticated UI, uploads, selected-skill paths,
+# and Discord channel routing around them.
+# ---------------------------------------------------------------------------
+
+
+class AgentHubTurnRequest(BaseModel):
+    harness: str
+    prompt: str
+    conversation_id: Optional[str] = None
+    cwd: Optional[str] = None
+    skills: List[str] = []
+    attachments: List[str] = []
+    model: Optional[str] = None
+    profile: Optional[str] = None
+
+
+class AgentHubBindingRequest(BaseModel):
+    channel_id: str
+    channel_name: str = ""
+    harness: str
+    skills: List[str] = []
+    cwd: Optional[str] = None
+
+
+@app.get("/api/agent-hub")
+async def get_agent_hub(profile: Optional[str] = None):
+    from hermes_cli.agent_hub import harness_catalog, list_conversations, load_bindings
+
+    profile_home = None
+    if profile and profile.strip().lower() != "current":
+        profile_home = _resolve_profile_dir(profile)
+    return {
+        "harnesses": harness_catalog(),
+        "conversations": list_conversations(),
+        "bindings": list(load_bindings().values()),
+        "default_cwd": str(PROJECT_ROOT),
+        "profile_home": str(profile_home) if profile_home else str(get_hermes_home()),
+    }
+
+
+@app.get("/api/agent-hub/conversations/{conversation_id}")
+async def get_agent_hub_conversation(conversation_id: str):
+    from hermes_cli.agent_hub import get_conversation
+
+    conversation = get_conversation(conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Agent Hub conversation not found")
+    return conversation
+
+
+@app.delete("/api/agent-hub/conversations/{conversation_id}")
+async def delete_agent_hub_conversation(conversation_id: str):
+    from hermes_cli.agent_hub import delete_conversation
+
+    if not delete_conversation(conversation_id):
+        raise HTTPException(status_code=404, detail="Agent Hub conversation not found")
+    return {"ok": True}
+
+
+@app.post("/api/agent-hub/turn")
+async def run_agent_hub_turn(body: AgentHubTurnRequest):
+    from hermes_cli.agent_hub import run_turn
+
+    profile_home = None
+    if body.profile and body.profile.strip().lower() != "current":
+        profile_home = _resolve_profile_dir(body.profile)
+    try:
+        return await asyncio.to_thread(
+            run_turn,
+            harness=(body.harness or "").strip().lower(),
+            prompt=body.prompt,
+            conversation_id=body.conversation_id,
+            cwd=body.cwd,
+            skills=body.skills,
+            attachments=body.attachments,
+            model=(body.model or "").strip() or None,
+            profile_home=profile_home,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(
+            status_code=504, detail="The coding agent turn timed out."
+        ) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/agent-hub/uploads")
+async def upload_agent_hub_file(
+    file: UploadFile = File(...),
+    conversation_id: str = Form("draft"),
+):
+    safe_conversation = re.sub(r"[^a-zA-Z0-9_-]", "", conversation_id)[:80] or "draft"
+    safe_name = Path(file.filename or "attachment").name
+    safe_name = re.sub(r"[^a-zA-Z0-9._ -]", "_", safe_name)[:180] or "attachment"
+    upload_dir = get_hermes_home() / "agent-hub" / "uploads" / safe_conversation
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    destination = upload_dir / safe_name
+    if destination.exists():
+        destination = upload_dir / f"{destination.stem}-{secrets.token_hex(3)}{destination.suffix}"
+
+    size = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > _MAX_AGENT_HUB_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413, detail="Attachment exceeds the 25 MB limit"
+                    )
+                output.write(chunk)
+    except Exception:
+        try:
+            destination.unlink()
+        except OSError:
+            pass
+        raise
+    finally:
+        await file.close()
+    return {
+        "name": safe_name,
+        "path": str(destination.resolve()),
+        "size": size,
+        "mime_type": file.content_type or mimetypes.guess_type(safe_name)[0],
+    }
+
+
+def _agent_hub_discord_channels() -> List[Dict[str, Any]]:
+    from gateway.channel_directory import DIRECTORY_PATH
+
+    try:
+        payload = json.loads(DIRECTORY_PATH.read_text(encoding="utf-8"))
+        channels = payload.get("platforms", {}).get("discord", [])
+    except (OSError, ValueError, AttributeError):
+        channels = []
+    result = []
+    seen = set()
+    for channel in channels if isinstance(channels, list) else []:
+        if not isinstance(channel, dict):
+            continue
+        channel_id = str(channel.get("id") or "").strip()
+        if not channel_id or channel_id in seen:
+            continue
+        seen.add(channel_id)
+        result.append(
+            {
+                "id": channel_id,
+                "name": str(channel.get("name") or channel_id),
+                "guild": str(channel.get("guild") or ""),
+                "type": str(channel.get("type") or "channel"),
+            }
+        )
+    return sorted(result, key=lambda row: (row["guild"].lower(), row["name"].lower()))
+
+
+@app.get("/api/agent-hub/discord/channels")
+async def list_agent_hub_discord_channels():
+    return {"channels": _agent_hub_discord_channels()}
+
+
+@app.put("/api/agent-hub/discord/bindings/{channel_id}")
+async def set_agent_hub_discord_binding(
+    channel_id: str, body: AgentHubBindingRequest
+):
+    from hermes_cli.agent_hub import save_binding
+
+    if channel_id != body.channel_id:
+        raise HTTPException(status_code=400, detail="Channel id does not match URL")
+    try:
+        return save_binding(
+            channel_id,
+            (body.harness or "").strip().lower(),
+            channel_name=body.channel_name,
+            skills=body.skills,
+            cwd=body.cwd,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/agent-hub/discord/bindings/{channel_id}")
+async def remove_agent_hub_discord_binding(channel_id: str):
+    from hermes_cli.agent_hub import delete_binding
+
+    if not delete_binding(channel_id):
+        raise HTTPException(status_code=404, detail="Discord binding not found")
+    return {"ok": True}
 
 
 class TTSSpeakRequest(BaseModel):

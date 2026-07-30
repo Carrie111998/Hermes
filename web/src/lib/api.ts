@@ -71,6 +71,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/config",
   "/api/env",
   "/api/mcp",
+  "/api/agent-hub",
   "/api/messaging/platforms",
   "/api/messaging/telegram/onboarding",
   "/api/model/info",
@@ -661,6 +662,56 @@ export const api = {
   // runs under. Omitted/empty profile = the dashboard's own profile.
   getSkills: (profile?: string) =>
     fetchJSON<SkillInfo[]>(`/api/skills${profileQuery(profile)}`),
+  getAgentHub: (profile?: string) =>
+    fetchJSON<AgentHubResponse>(`/api/agent-hub${profileQuery(profile)}`),
+  getAgentHubConversation: (id: string) =>
+    fetchJSON<AgentHubConversation>(
+      `/api/agent-hub/conversations/${encodeURIComponent(id)}`,
+    ),
+  deleteAgentHubConversation: (id: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/agent-hub/conversations/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
+  runAgentHubTurn: (turn: AgentHubTurnRequest) =>
+    fetchJSON<AgentHubConversation>("/api/agent-hub/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(turn),
+    }),
+  uploadAgentHubFile: (file: File, conversationId = "draft") => {
+    const form = new FormData();
+    form.append("conversation_id", conversationId);
+    form.append("file", file, file.name);
+    return fetchJSON<AgentHubAttachment>("/api/agent-hub/uploads", {
+      method: "POST",
+      body: form,
+    });
+  },
+  getAgentHubDiscordChannels: () =>
+    fetchJSON<{ channels: AgentHubDiscordChannel[] }>(
+      "/api/agent-hub/discord/channels",
+    ),
+  setAgentHubDiscordBinding: (binding: AgentHubDiscordBinding) =>
+    fetchJSON<AgentHubDiscordBinding>(
+      `/api/agent-hub/discord/bindings/${encodeURIComponent(binding.channel_id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(binding),
+      },
+    ),
+  deleteAgentHubDiscordBinding: (channelId: string) =>
+    fetchJSON<{ ok: boolean }>(
+      `/api/agent-hub/discord/bindings/${encodeURIComponent(channelId)}`,
+      { method: "DELETE" },
+    ),
+  transcribeAudio: (dataUrl: string, mimeType?: string) =>
+    fetchJSON<AudioTranscriptionResponse>("/api/audio/transcribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data_url: dataUrl, mime_type: mimeType }),
+    }),
   toggleSkill: (name: string, enabled: boolean, profile?: string) =>
     fetchJSON<{ ok: boolean }>("/api/skills/toggle", {
       method: "PUT",
@@ -1938,6 +1989,88 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+}
+
+export interface AgentHubHarness {
+  id: "codex" | "claude" | "antigravity";
+  name: string;
+  description: string;
+  available: boolean;
+  executable: string | null;
+}
+
+export interface AgentHubAttachment {
+  name: string;
+  path: string;
+  size: number;
+  mime_type: string | null;
+}
+
+export interface AgentHubMessage {
+  role: "user" | "assistant";
+  content: string;
+  attachments?: string[];
+  created_at: number;
+}
+
+export interface AgentHubConversationSummary {
+  id: string;
+  title: string;
+  harness: AgentHubHarness["id"];
+  cwd: string;
+  skills: string[];
+  created_at: number;
+  updated_at: number;
+  message_count: number;
+  preview: string;
+}
+
+export interface AgentHubConversation
+  extends Omit<AgentHubConversationSummary, "message_count" | "preview"> {
+  native_session_id: string | null;
+  model: string;
+  messages: AgentHubMessage[];
+}
+
+export interface AgentHubDiscordChannel {
+  id: string;
+  name: string;
+  guild: string;
+  type: string;
+}
+
+export interface AgentHubDiscordBinding {
+  channel_id: string;
+  channel_name: string;
+  harness: AgentHubHarness["id"];
+  skills: string[];
+  cwd?: string;
+  updated_at?: number;
+}
+
+export interface AgentHubResponse {
+  harnesses: AgentHubHarness[];
+  conversations: AgentHubConversationSummary[];
+  bindings: AgentHubDiscordBinding[];
+  default_cwd: string;
+  profile_home: string;
+}
+
+export interface AgentHubTurnRequest {
+  harness: AgentHubHarness["id"];
+  prompt: string;
+  conversation_id?: string;
+  cwd?: string;
+  skills?: string[];
+  attachments?: string[];
+  model?: string;
+  profile?: string;
+}
+
+export interface AudioTranscriptionResponse {
+  ok: boolean;
+  transcript: string;
+  provider?: string;
 }
 
 export interface SkillContent {
