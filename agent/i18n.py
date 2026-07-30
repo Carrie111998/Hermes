@@ -25,8 +25,8 @@ Language resolution order:
     3. ``display.language`` from config.yaml
     4. ``"en"`` (baseline)
 
-Supported languages: en, zh, zh-hant, ja, de, es, fr, tr, uk, af, ko, it, ga,
-pt, ru, hu, ar.  Unknown values fall back to en.
+Supported languages: en, zh, zh-hant, ja, vi, de, es, fr, tr, uk, af, ko, it,
+ga, pt, ru, hu, ar.  Unknown values fall back to en.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGUAGES: tuple[str, ...] = (
-    "en", "zh", "zh-hant", "ja", "de", "es", "fr", "tr", "uk",
+    "en", "zh", "zh-hant", "ja", "vi", "de", "es", "fr", "tr", "uk",
     "af", "ko", "it", "ga", "pt", "ru", "hu", "ar",
 )
 DEFAULT_LANGUAGE = "en"
@@ -58,6 +58,7 @@ _LANGUAGE_ALIASES: dict[str, str] = {
     "traditional-chinese": "zh-hant", "traditional_chinese": "zh-hant",
     "zh-tw": "zh-hant", "zh-hk": "zh-hant", "zh-mo": "zh-hant",
     "japanese": "ja", "jp": "ja", "ja-jp": "ja",
+    "vietnamese": "vi", "tiếng việt": "vi", "tieng viet": "vi", "vi-vn": "vi", "vi_vn": "vi",
     "german": "de", "deutsch": "de", "de-de": "de", "de-at": "de", "de-ch": "de",
     "spanish": "es", "español": "es", "espanol": "es", "es-es": "es", "es-mx": "es", "es-ar": "es",
     "french": "fr", "français": "fr", "france": "fr", "fr-fr": "fr", "fr-be": "fr", "fr-ca": "fr", "fr-ch": "fr",
