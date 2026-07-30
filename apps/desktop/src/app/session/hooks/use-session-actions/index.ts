@@ -759,14 +759,19 @@ export function useSessionActions({
                   // that cache at the atomic update boundary so this stale
                   // activation projection cannot clobber accepted user intent.
                   const messages = reconcileProjectedMessages(activatedMessages, state.messages)
-                  const currentRunning = Boolean(activated.running ?? state.busy)
+                  // The activation payload snapshots `running` before this
+                  // response is delivered. A prompt accepted during that gap
+                  // has already armed the live cache, so a stale explicit
+                  // `false` must not clear either pending-turn indicator.
+                  const busy = Boolean(activated.running || state.busy)
+                  const awaitingResponse = Boolean(activated.running || state.awaitingResponse)
 
                   return {
                     ...state,
                     ...(runtimeInfo ?? {}),
                     messages,
-                    busy: currentRunning,
-                    awaitingResponse: currentRunning
+                    busy,
+                    awaitingResponse
                   }
                 },
                 storedSessionId

@@ -1472,7 +1472,13 @@ describe('resumeSession warm-cache mapping integrity', () => {
       return {} as never
     })
 
-    vi.mocked(getSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+    vi.mocked(getSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'old prompt', role: 'user', timestamp: 1 },
+        { content: 'old answer', role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'stored-A'
+    } as never)
 
     let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
     render(
@@ -1520,7 +1526,9 @@ describe('resumeSession warm-cache mapping integrity', () => {
         { content: 'old prompt', role: 'user', timestamp: 1 },
         { content: 'old answer', role: 'assistant', timestamp: 2 }
       ],
-      running: true,
+      // The backend captured this before the prompt was submitted, so the
+      // explicit false is stale by the time activation reaches the renderer.
+      running: false,
       info: {}
     })
 
