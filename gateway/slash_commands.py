@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -3458,6 +3459,76 @@ class GatewaySlashCommandsMixin:
             out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
                    "reject <id>, approval <on|off>.")
         return out
+
+    async def _handle_mem_command(self, event: MessageEvent) -> str:
+        """Handle /mem — inspect holographic memory (tree / list / probe / search).
+
+        Subcommands mirror fact_store actions with a TUI-friendly output:
+          /mem tree       Interactive tree viewer (CLI)
+          /mem list <N>  Table of facts (default 10, use --limit N)
+          /mem probe <entity>  Probe and display facts for entity
+          /mem search <query>  Search facts matching query
+        Runs as a blocking subprocess; the tree viewer is interactive.
+        """
+        from gateway.run import _hermes_home
+        from hermes_cli.config import read_user_config_raw
+        from plugins.memory.holographic import (
+            HolographicMemoryProvider, _load_plugin_config,
+        )
+
+        raw_args = event.get_command_args().strip()
+        args = shlex.split(raw_args) if raw_args else []
+        subcommand = args[0] if args else "tree"
+        config = _load_plugin_config()
+        provider = HolographicMemoryProvider(config=config)
+        provider.initialize("slash-command-session")
+
+        if subcommand == "tree":
+            proc = subprocess.run(
+                [sys.executable, str(_hermes_home / "scripts" / "holographic_tree.py")],
+                capture_output=True, text=True, timeout=30,
+            )
+            return proc.stdout or proc.stderr or "Tree viewer exited with no output."
+
+        if subcommand == "list":
+            output_format = "table"
+            limit = 10
+            remaining = args[1:]
+            i = 0
+            while i < len(remaining):
+                if remaining[i] in ("--limit", "-n") and i + 1 < len(remaining):
+                    limit = int(remaining[i + 1])
+                    i += 2
+                elif remaining[i] == "--format" and i + 1 < len(remaining):
+                    output_format = remaining[i + 1]
+                    i += 2
+                else:
+                    i += 1
+            result = provider._handle_fact_store({
+                "action": "list",
+                "output_format": output_format,
+                "limit": limit,
+            })
+            return result
+
+        if subcommand == "probe" and len(args) >= 2:
+            entity = args[1]
+            result = provider._handle_fact_store({
+                "action": "probe",
+                "entity": entity,
+            })
+            return result
+
+        if subcommand == "search" and len(args) >= 2:
+            query = " ".join(args[1:])
+            result = provider._handle_fact_store({
+                "action": "search",
+                "query": query,
+            })
+            return result
+
+        return ("Unknown /mem subcommand. Use: tree, list, probe <entity>, "
+                "search <query>.")
 
     async def _handle_skills_command(self, event: MessageEvent) -> str:
         """Handle /skills on the gateway — pending skill-write review only.

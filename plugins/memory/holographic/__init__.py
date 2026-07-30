@@ -69,6 +69,7 @@ FACT_STORE_SCHEMA = {
             "trust_delta": {"type": "number", "description": "Trust adjustment for 'update'."},
             "min_trust": {"type": "number", "description": "Minimum trust filter (default: 0.3)."},
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "output_format": {"type": "string", "enum": ["json", "table"], "description": "Output format (default: json)."},
         },
         "required": ["action"],
     },
@@ -191,13 +192,15 @@ class HolographicMemoryProvider(MemoryProvider):
             return (
                 "# Holographic Memory\n"
                 "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
-                "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
+                "MANDATORY: At session start, call fact_store(action='probe', entity='<name>') for every project/entity the user mentions.\n"
+                "MANDATORY: Before answering, search fact_store(action='search', query='<query>') for relevant stored facts.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
         return (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
-            f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
+            f"MANDATORY: At session start, call fact_store(action='probe', entity='<name>') for every project/entity the user mentions.\n"
+            f"MANDATORY: Before answering, search fact_store(action='search', query='<query>') for relevant stored facts.\n"
             f"Use fact_feedback to rate facts after using them (trains trust scores)."
         )
 
@@ -340,11 +343,14 @@ class HolographicMemoryProvider(MemoryProvider):
                 return json.dumps({"removed": removed})
 
             elif action == "list":
+                output_format = args.get("output_format", "json")
                 facts = store.list_facts(
                     category=args.get("category"),
                     min_trust=float(args.get("min_trust", 0.0)),
                     limit=int(args.get("limit", 10)),
                 )
+                if output_format == "table":
+                    return _render_facts_table(facts)
                 return json.dumps({"facts": facts, "count": len(facts)})
 
             else:
@@ -452,8 +458,53 @@ class HolographicMemoryProvider(MemoryProvider):
 
 
 # ---------------------------------------------------------------------------
-# Plugin entry point
+# Rich table renderer for list action
 # ---------------------------------------------------------------------------
+
+def _render_facts_table(facts: list) -> str:
+    """Render facts as a Rich table with trust-score coloring."""
+    try:
+        from rich.console import Console
+        from rich.table import Table
+        from rich.text import Text
+    except ImportError:
+        return json.dumps({"error": "rich not installed", "facts": facts})
+
+    if not facts:
+        return "No facts found."
+
+    console = Console(record=True, width=140, force_terminal=True)
+    table = Table(show_header=True, header_style="bold", show_lines=False, pad_edge=False)
+    table.add_column("ID", style="dim", width=5, justify="right")
+    table.add_column("Trust", width=8, justify="center")
+    table.add_column("Category", width=12)
+    table.add_column("Tags", width=18, style="dim")
+    table.add_column("Created", width=16, style="dim")
+    table.add_column("Content", ratio=1, overflow="fold")
+
+    for f in facts:
+        fid = str(f.get("fact_id", ""))
+        trust = f.get("trust_score", f.get("trust", 0))
+        cat = f.get("category", "")
+        tags = f.get("tags", "")
+        created = f.get("created_at", "")[:16]  # YYYY-MM-DD HH:MM
+        content = f.get("content", "")
+        if len(content) > 120:
+            content = content[:117] + "..."
+
+        # Color trust score
+        if trust >= 0.7:
+            trust_text = Text(f"{trust:.2f}", style="bold green")
+        elif trust >= 0.4:
+            trust_text = Text(f"{trust:.2f}", style="bold yellow")
+        else:
+            trust_text = Text(f"{trust:.2f}", style="bold red")
+
+        table.add_row(fid, trust_text, cat, tags, created, content)
+
+    with console.capture() as capture:
+        console.print(table)
+    return capture.get()
 
 def register(ctx) -> None:
     """Register the holographic memory provider with the plugin system."""
