@@ -1240,13 +1240,18 @@ async def vision_analyze_tool(
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
+            _vmt = _vision_cfg.get("max_tokens")
+            if _vmt is not None:
+                vision_max_tokens = int(_vmt)
+            else:
+                vision_max_tokens = 2000
         except Exception:
-            pass
+            vision_max_tokens = 2000
         call_kwargs = {
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
+            "max_tokens": vision_max_tokens,
             "timeout": vision_timeout,
         }
         if model:
