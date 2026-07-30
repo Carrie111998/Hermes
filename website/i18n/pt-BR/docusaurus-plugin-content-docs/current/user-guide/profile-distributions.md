@@ -184,7 +184,7 @@ errors.log
 .hermes_history
 ```
 
-Isso espelha os [caminhos hard-excluded](#o-que-nunca-esta-em-uma-distribuicao) que o instalador remove do lado dele. Qualquer outra coisa que queira manter fora do repositório (arquivos scratch, assets grandes, skills só locais) também deve ir aqui.
+Isso espelha os [caminhos hard-excluded](#whats-not-in-a-distribution-ever) que o instalador remove do lado dele. Qualquer outra coisa que queira manter fora do repositório (arquivos scratch, assets grandes, skills só locais) também deve ir aqui.
 
 ### Passo 4 — Push para um repositório git
 
@@ -201,7 +201,7 @@ git push -u origin main --tags
 O repositório agora é uma distribuição. Qualquer pessoa com acesso pode instalá-la.
 
 :::note
-O instalador também removerá os [caminhos hard-excluded](#o-que-nunca-esta-em-uma-distribuicao) mesmo se um autor de alguma forma os enviar — mas isso só protege instaladores, não o autor.
+O instalador também removerá os [caminhos hard-excluded](#whats-not-in-a-distribution-ever) mesmo se um autor de alguma forma os enviar — mas isso só protege instaladores, não o autor.
 :::
 
 ### Passo 5 — Marque releases versionados
@@ -275,7 +275,7 @@ O que acontece:
 2. Lê `distribution.yaml`, mostra o manifest (name, version, description, author, required env vars).
 3. Verifica cada env var obrigatória contra seu ambiente shell e o `.env` existente do profile alvo. Marca cada uma como `✓ set` ou `needs setting` para você saber exatamente o que configurar.
 4. Pede confirmação. Passe `-y` / `--yes` para pular.
-5. Copia arquivos distribution-owned para `~/.hermes/profiles/research-bot/` (ou onde o `name` do manifest resolver). Os [caminhos hard-excluded](#o-que-nunca-esta-em-uma-distribuicao) são removidos durante a cópia, mesmo se o autor os deixou no repositório por acidente.
+5. Copia arquivos distribution-owned para `~/.hermes/profiles/research-bot/` (ou onde o `name` do manifest resolver). Os [caminhos hard-excluded](#whats-not-in-a-distribution-ever) são removidos durante a cópia, mesmo se o autor os deixou no repositório por acidente.
 6. Grava `.env.EXAMPLE` com as chaves obrigatórias comentadas — copie para `.env` e preencha.
 7. Com `--alias`, cria wrapper para executar `research-bot chat` diretamente.
 
@@ -594,7 +594,7 @@ hermes profile install ~/.hermes/profiles/research-bot --name research-bot-test
 
 ---
 
-## O que NUNCA está em uma distribuição
+## O que NUNCA está em uma distribuição {#whats-not-in-a-distribution-ever}
 
 O instalador hard-exclui estes caminhos mesmo se um autor enviar por acidente. Nenhuma opção de config permite sobrescrever — a guarda de segurança é invariante testada por regressão:
 

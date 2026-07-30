@@ -168,7 +168,7 @@ Plataformas de polling/conexão (Telegram, Discord, Slack, Matrix, Signal, …) 
 bem multiplexadas, mas cada profile que habilita uma deve fornecer seu **próprio** token de bot
 — o mesmo token não pode ser polled por dois profiles ao mesmo tempo. Se dois profiles
 configuram o mesmo `(platform, token)`, a inicialização falha rápido nomeando ambos os profiles
-(veja [Segurança contra conflito de token](#seguranca-contra-conflito-de-token) — a regra não mudou,
+(veja [Segurança contra conflito de token](#token-conflict-safety) — a regra não mudou,
 só é aplicada dentro do único processo agora).
 
 #### 4. Session keys são namespaced por profile
@@ -448,7 +448,7 @@ Depois de habilitar lingering, suas units systemd de usuário (incluindo
 `hermes-gateway-<profile>.service`) continuam rodando entre desconexões SSH
 e reboots.
 
-## Segurança contra conflito de token
+## Segurança contra conflito de token {#token-conflict-safety}
 
 Cada profile deve usar tokens de bot únicos para cada plataforma. Se dois profiles
 compartilham um token Telegram, Discord, Slack, WhatsApp ou Signal, o segundo
