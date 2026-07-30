@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react'
 import type * as ReactRouterDom from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $terminalTakeover } from '@/app/right-sidebar/store'
 import { resetBinding, setBinding } from '@/store/keybinds'
 
 import { useKeybinds } from './use-keybinds'
@@ -72,6 +73,7 @@ describe('terminal close-tab keybind ownership', () => {
 
   afterEach(() => {
     resetBinding('view.closeTab')
+    $terminalTakeover.set(false)
     mocks.closeActiveTerminal.mockReset()
     mocks.navigate.mockReset()
     mocks.setMode.mockReset()
@@ -87,10 +89,29 @@ describe('terminal close-tab keybind ownership', () => {
     expect(mocks.closeActiveTerminal).not.toHaveBeenCalled()
   })
 
+  it('uses the layout-aware W key for interactive terminals', () => {
+    renderHook(() => useKeybinds(deps))
+
+    const event = pressCtrlW(focusedTerminal(true), { code: 'KeyZ', key: 'w' })
+
+    expect(event.defaultPrevented).toBe(false)
+    expect(mocks.closeActiveTerminal).not.toHaveBeenCalled()
+  })
+
   it('keeps close-tab behavior for a read-only agent terminal', () => {
     renderHook(() => useKeybinds(deps))
 
     const event = pressCtrlW(focusedTerminal(false))
+
+    expect(event.defaultPrevented).toBe(true)
+    expect(mocks.closeActiveTerminal).toHaveBeenCalledOnce()
+  })
+
+  it('keeps Ctrl+Shift+W as the explicit terminal-close chord', () => {
+    $terminalTakeover.set(true)
+    renderHook(() => useKeybinds(deps))
+
+    const event = pressCtrlW(focusedTerminal(true), { key: 'W', shiftKey: true })
 
     expect(event.defaultPrevented).toBe(true)
     expect(mocks.closeActiveTerminal).toHaveBeenCalledOnce()

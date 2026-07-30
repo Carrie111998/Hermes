@@ -335,7 +335,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
       // Agent terminals and rebound close-tab chords keep the close action.
       if (
         actionId === 'view.closeTab' &&
-        event.code === 'KeyW' &&
+        event.key.toLowerCase() === 'w' &&
         event.ctrlKey &&
         !event.metaKey &&
         !event.altKey &&
