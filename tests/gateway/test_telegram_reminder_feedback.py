@@ -166,9 +166,9 @@ def test_feedback_messages_do_not_use_rich_send_path():
     ) is False
 
 
-def test_scheduler_passes_job_feedback_to_live_adapter():
+def test_scheduler_routes_job_feedback_through_delivery_router_and_safe_schedule():
     adapter = AsyncMock()
-    adapter.send.return_value = MagicMock(success=True)
+    adapter.send.return_value = MagicMock(success=True, raw_response={})
 
     pconfig = MagicMock(enabled=True)
     mock_cfg = MagicMock()
@@ -176,7 +176,7 @@ def test_scheduler_passes_job_feedback_to_live_adapter():
     loop = MagicMock()
     loop.is_running.return_value = True
 
-    def fake_run_coro(coro, _loop):
+    def fake_schedule(coro, _loop):
         future = Future()
         try:
             future.set_result(asyncio.run(coro))
@@ -188,12 +188,18 @@ def test_scheduler_passes_job_feedback_to_live_adapter():
         "id": "abc123",
         "name": "Eric follow-up",
         "deliver": "origin",
-        "origin": {"platform": "telegram", "chat_id": "12345"},
+        "origin": {
+            "platform": "telegram",
+            "chat_id": "-1001234567890",
+            "thread_id": "777",
+        },
         "feedback": _feedback(),
     }
     with patch("gateway.config.load_gateway_config", return_value=mock_cfg), patch(
         "cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}
-    ), patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
+    ), patch(
+        "agent.async_utils.safe_schedule_threadsafe", side_effect=fake_schedule
+    ) as schedule:
         result = _deliver_result(
             job,
             "Follow up with a contact.",
@@ -202,9 +208,11 @@ def test_scheduler_passes_job_feedback_to_live_adapter():
         )
 
     assert result is None
+    schedule.assert_called_once()
     adapter.send.assert_called_once()
     metadata = adapter.send.call_args.kwargs["metadata"]
     assert metadata["job_id"] == "abc123"
+    assert metadata["thread_id"] == "777"
     assert metadata["reminder_feedback"] == _feedback()
 
 
