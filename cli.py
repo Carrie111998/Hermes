@@ -4356,6 +4356,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        # Startup-level selection, remembered for the life of the process.
+        #
+        # ``--model``/``--provider`` are NOT session-scoped runtime overrides
+        # like ``/model --session``, ``/fast`` or ``/model --once``: they are
+        # how the process was launched. ``new_session()`` deliberately drops
+        # the session-scoped kind at a conversation boundary (#67979), but it
+        # re-derives from config.yaml, which also discarded these — so a
+        # headless appliance started with explicit flags answered every
+        # wake-word turn (and every ``/new``) with ``model.default`` instead
+        # (#74329). Recorded only when the flag was actually passed, so an
+        # unflagged launch keeps re-deriving from config exactly as before.
+        self._startup_model = (model or "").strip() or None
+        self._startup_provider = (provider or "").strip() or None
         # A ``moa:<preset>`` model string selects the MoA virtual provider in
         # one shot (parity with interactive ``/moa`` and the model picker). Do
         # this before provider resolution so ``-Q -m moa:<preset>`` routes
@@ -7994,12 +8007,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if isinstance(_model_config, dict)
             else (_model_config or "")
         )
-        if _config_model and _config_model != getattr(self, "model", None):
-            _config_provider = (
-                _model_config.get("provider", "")
-                if isinstance(_model_config, dict)
-                else ""
+        _config_provider_default = (
+            _model_config.get("provider", "")
+            if isinstance(_model_config, dict)
+            else ""
+        )
+        # ...but the startup ``--model``/``--provider`` are the baseline this
+        # boundary resets *to*, not an override it resets away. They describe
+        # how the process was launched, so they outrank config.yaml here; a
+        # wake-word session or a plain /new must not silently answer on
+        # ``model.default`` when the operator launched with explicit flags
+        # (#74329).
+        _startup_model = getattr(self, "_startup_model", None)
+        if _startup_model:
+            _config_model = _startup_model
+            _config_provider_default = (
+                getattr(self, "_startup_provider", None) or _config_provider_default
             )
+        if _config_model and _config_model != getattr(self, "model", None):
+            _config_provider = _config_provider_default
             try:
                 from hermes_cli.model_switch import switch_model as _switch_model
 
