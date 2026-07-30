@@ -305,6 +305,29 @@ class TestRoutingIntents:
         assert "signal" not in platforms
         assert "matrix" not in platforms
 
+    def test_teams_origin_and_split_target_are_deduplicated(self):
+        from cron.scheduler import _resolve_delivery_targets
+
+        composite = "19:channel@thread.tacv2;messageid=1780267076971"
+        targets = _resolve_delivery_targets(
+            {
+                "deliver": f"origin,teams:{composite}",
+                "origin": {
+                    "platform": "teams",
+                    "chat_id": composite,
+                    "thread_id": None,
+                },
+            }
+        )
+
+        assert targets == [
+            {
+                "platform": "teams",
+                "chat_id": composite,
+                "thread_id": None,
+            }
+        ]
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -1653,6 +1676,31 @@ class TestCronDeliveryMirror:
         # boundary) still distinguishes it from a genuine user message.
         assert args[2].startswith("[Cron delivery: Morning Brief]")
         assert "Market movers today" in args[2]
+
+    def test_teams_mirror_uses_persisted_composite_origin(self):
+        from cron.scheduler import _maybe_mirror_cron_delivery
+
+        composite = "19:channel@thread.tacv2;messageid=1780267076971"
+        job = {
+            "id": "j1",
+            "origin": {
+                "platform": "teams",
+                "chat_id": composite,
+                "thread_id": None,
+            },
+        }
+        with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror:
+            _maybe_mirror_cron_delivery(
+                job,
+                "teams",
+                "19:channel@thread.tacv2",
+                "Daily brief",
+                thread_id="1780267076971",
+                enabled=True,
+            )
+
+        assert mirror.call_args.args[:2] == ("teams", composite)
+        assert mirror.call_args.kwargs["thread_id"] is None
 
 
     def test_delivery_mirrors_clean_content_not_wrapped(self):

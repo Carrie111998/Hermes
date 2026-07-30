@@ -523,7 +523,9 @@ def _handle_send(args):
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
-                source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
+                source_label = (
+                    get_session_env("HERMES_SESSION_PLATFORM", "") or "cli"
+                )
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
                 if mirror_to_session(
                     platform_name,

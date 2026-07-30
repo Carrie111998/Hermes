@@ -714,6 +714,21 @@ def _maybe_mirror_cron_delivery(
         return
     try:
         from gateway.mirror import mirror_to_session
+        from tools.send_message_tool import _target_identity
+
+        # Teams persists inbound thread sessions with the composite chat id,
+        # while outbound routing uses a split chat/thread pair.  Mirroring is
+        # already origin-scoped, so use the origin's exact stored shape when
+        # both representations identify the same lane.
+        origin = _resolve_origin(job)
+        if origin and _target_identity(
+            origin.get("platform", ""),
+            origin.get("chat_id", ""),
+            origin.get("thread_id"),
+        ) == _target_identity(platform_name, chat_id, thread_id):
+            platform_name = origin["platform"]
+            chat_id = origin["chat_id"]
+            thread_id = origin.get("thread_id")
 
         # Mirror as a USER turn with a labelled prefix, NOT an assistant turn.
         # The brief is not the agent speaking; an assistant-role mirror lands as
@@ -1296,12 +1311,18 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     for raw in raw_parts:
         parts.extend(_expand_routing_tokens(raw))
 
+    from tools.send_message_tool import _target_identity
+
     seen = set()
     targets = []
     for part in parts:
         target = _resolve_single_delivery_target(job, part)
         if target:
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            key = _target_identity(
+                target["platform"],
+                target["chat_id"],
+                target.get("thread_id"),
+            )
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
