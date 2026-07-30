@@ -1151,6 +1151,38 @@ class TestDoctorStaleMaxIterationsDrift:
 
 
 
+def test_run_doctor_missing_chromium_uses_browser_only_install(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / "node_modules" / "agent-browser").mkdir(parents=True)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setattr(doctor_mod.shutil, "which", lambda cmd: "/usr/bin/node" if cmd == "node" else None)
+    monkeypatch.setattr("tools.browser_tool._chromium_installed", lambda: False)
+    monkeypatch.setattr("tools.browser_tool._is_camofox_mode", lambda: False)
+    monkeypatch.setattr("tools.browser_tool._get_cdp_override_raw", lambda: "")
+    monkeypatch.setattr("tools.browser_tool._get_cloud_provider", lambda: None)
+    monkeypatch.setattr("tools.browser_tool._using_lightpanda_engine", lambda: False)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **k: ([], []), TOOLSET_REQUIREMENTS={}
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    out = buf.getvalue()
+
+    assert "Chromium browser not installed" in out
+    assert "npx agent-browser install" in out
+    assert "npx playwright install --with-deps chromium" not in out
+
+
 class TestDoctorDeprecatedConfigAndEnv:
     """Doctor must surface deprecated/legacy config keys and env vars with
     modern replacements as non-failing warnings — without auto-migrating.

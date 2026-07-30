@@ -67,7 +67,27 @@ class TestTimeoutErrorFormatting:
         monkeypatch.setattr(bt, "_is_local_mode", lambda: True)
         monkeypatch.setattr(bt, "_running_in_docker", lambda: False)
         err = bt._format_browser_timeout_error("open", 60, "", "")
-        assert "agent-browser install --with-deps" in err
+        assert "agent-browser install --with-deps" not in err
+        assert "Install Chromium system libraries with:" in err
+
+
+class TestBrowserSystemDependencyHint:
+    def test_arch_uses_the_installer_pacman_dependencies(self, monkeypatch):
+        monkeypatch.setattr(bt.platform, "freedesktop_os_release", lambda: {"ID": "arch"})
+
+        hint = bt._browser_system_dependency_hint()
+
+        assert hint == (
+            "Install Chromium system libraries with: sudo pacman -S --needed "
+            "nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib"
+        )
+
+    def test_debian_uses_agent_browser_system_dependency_install(self, monkeypatch):
+        monkeypatch.setattr(bt.platform, "freedesktop_os_release", lambda: {"ID": "debian"})
+
+        assert bt._browser_system_dependency_hint().endswith(
+            "npx agent-browser install --with-deps"
+        )
 
 
 class TestReadCommandOutputFiles:

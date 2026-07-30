@@ -553,3 +553,29 @@ def _fake_features(*, logged_in: bool, paid: bool = True):
 # ("browserbase") only the CLI, and camofox its npm package.
 
 
+def test_agent_browser_post_setup_installs_browser_without_system_dependencies(monkeypatch, tmp_path):
+    """The post-setup downloader must not assume an apt-family host."""
+    import hermes_cli.tools_config as tools_config
+    import tools.browser_tool as browser_tool
+
+    monkeypatch.setattr(tools_config, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        tools_config.shutil,
+        "which",
+        lambda name: {"npm": "/fake/npm", "npx": "/fake/npx"}.get(name),
+    )
+    monkeypatch.setattr(browser_tool, "_chromium_installed", lambda: False)
+    monkeypatch.setattr(browser_tool, "_running_in_docker", lambda: False)
+
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    _run_post_setup("agent_browser")
+
+    assert commands[-1] == ["/fake/npx", "-y", "agent-browser", "install"]
+    assert "--with-deps" not in commands[-1]
