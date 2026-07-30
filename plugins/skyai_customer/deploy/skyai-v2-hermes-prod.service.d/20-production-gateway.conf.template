@@ -1,0 +1,11 @@
+# Repository-owned render input for the current VM service.
+#
+# This is deliberately invalid while the *_MUST_BE_BOUND sentinels remain.
+# The release owner must resolve the exact interpreter, active release, and
+# owner-controlled environment file from the live unit before rendering a
+# reviewed drop-in. Never install this raw template.
+[Service]
+WorkingDirectory=SKYAI_ACTIVE_RELEASE_MUST_BE_BOUND
+EnvironmentFile=SKYAI_PRODUCTION_ENV_FILE_MUST_BE_BOUND
+ExecStart=
+ExecStart=SKYAI_SERVICE_PYTHON_MUST_BE_BOUND -m plugins.skyai_customer.production_gateway

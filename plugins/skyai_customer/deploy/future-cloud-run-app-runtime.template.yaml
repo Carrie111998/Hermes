@@ -1,0 +1,82 @@
+# FUTURE/INERT reference for a possible Cloud Run application runtime.
+#
+# This is not the current SkyAI PROD deployment path. The current
+# `skyai-prod-ingress` Cloud Run service is a proxy whose application upstream
+# is the VM-owned `skyai-v2-hermes-prod.service`; this file must never replace
+# that proxy. Every *_MUST_BE_BOUND sentinel intentionally keeps this reference
+# unapplyable until a separately reviewed migration exists.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: SKYAI_FUTURE_APP_SERVICE_NAME_MUST_BE_BOUND
+  annotations:
+    adventico.ai/lifecycle: future-inert
+spec:
+  template:
+    metadata:
+      annotations:
+        # The durable outbox must keep retrying even when customer traffic is
+        # idle. A zero-instance service cannot drain its persisted backlog.
+        autoscaling.knative.dev/minScale: "1"
+        # The mirror-only Cloud SQL role is reached over the existing private
+        # VPC path. Never silently fall back to public database connectivity.
+        run.googleapis.com/vpc-access-connector: SKYAI_VPC_CONNECTOR_MUST_BE_BOUND
+        run.googleapis.com/vpc-access-egress: private-ranges-only
+    spec:
+      serviceAccountName: SKYAI_SERVICE_ACCOUNT_MUST_BE_BOUND
+      containers:
+        - image: SKYAI_IMAGE_DIGEST_MUST_BE_BOUND
+          command:
+            - python
+          args:
+            - -m
+            - plugins.skyai_customer.production_gateway
+          ports:
+            - name: http1
+              containerPort: 8080
+          startupProbe:
+            httpGet:
+              path: /ready
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          env:
+            - name: SKYAI_RUNTIME_MODE
+              value: production
+            - name: SKYAI_V2_PROFILE_HOME
+              value: SKYAI_ABSOLUTE_PROFILE_HOME_MUST_BE_BOUND
+            - name: SKYAI_V2_BUILD_COMMIT
+              value: SKYAI_BUILD_COMMIT_MUST_BE_BOUND
+            - name: SKYAI_DISCORD_MIRROR_ENABLED
+              value: "1"
+            - name: SKYAI_DISCORD_MIRROR_CREATE_THREADS
+              value: "1"
+            - name: SKYAI_DISCORD_MIRROR_CHANNEL_ID
+              value: "1510888721614901358"
+            - name: SKYAI_DISCORD_MIRROR_WORKER_POLL_SECONDS
+              value: "1.0"
+            - name: SKYAI_DISCORD_MIRROR_LEASE_SECONDS
+              value: "30"
+            - name: SKYAI_DISCORD_MIRROR_BATCH_SIZE
+              value: "10"
+            - name: SKYAI_DISCORD_MIRROR_BASE_BACKOFF_SECONDS
+              value: "2"
+            - name: SKYAI_DISCORD_MIRROR_MAX_BACKOFF_SECONDS
+              value: "300"
+            - name: SKYAI_DISCORD_MIRROR_PAYLOAD_RETENTION_SECONDS
+              value: "604800"
+            - name: SKYAI_V2_CANARY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: SKYAI_AUTH_TOKEN_SECRET_MUST_BE_BOUND
+                  key: latest
+            - name: SKYAI_DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: SKYAI_DISCORD_BOT_TOKEN_SECRET_MUST_BE_BOUND
+                  key: latest
+            - name: SKYAI_DISCORD_MIRROR_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: SKYAI_DISCORD_MIRROR_DATABASE_URL_SECRET_MUST_BE_BOUND
+                  key: latest
