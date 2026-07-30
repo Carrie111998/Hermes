@@ -376,13 +376,24 @@ def _load_oneshot_resume(
         for message in conversation_history
         if message.get("role") != "session_meta"
     ]
-    session_db.reopen_session(resolved_session_id)
 
     if restore_resume_cwd:
         saved_cwd = str(session_meta.get("cwd") or "").strip()
-        if saved_cwd and os.path.isdir(saved_cwd):
-            os.chdir(saved_cwd)
+        if saved_cwd:
+            if not os.path.isdir(saved_cwd):
+                raise FileNotFoundError(
+                    "Recorded session working directory is unavailable: "
+                    f"{saved_cwd}"
+                )
+            try:
+                os.chdir(saved_cwd)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Failed to restore recorded session working directory: "
+                    f"{saved_cwd}"
+                ) from exc
 
+    session_db.reopen_session(resolved_session_id)
     return resolved_session_id, conversation_history
 
 
