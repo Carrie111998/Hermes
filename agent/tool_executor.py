@@ -102,7 +102,12 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
     """Parse model-emitted arguments without repairing or coercing them."""
     try:
         arguments = json.loads(raw_arguments)
-    except (json.JSONDecodeError, TypeError):
+    except (ValueError, TypeError):
+        # ValueError rather than JSONDecodeError: CPython >= 3.11 raises a
+        # bare ValueError from json.loads for integer literals longer than
+        # sys.get_int_max_str_digits().  JSONDecodeError subclasses
+        # ValueError, so malformed JSON is still covered and this parser
+        # stays fail-closed instead of propagating.
         arguments = None
     if isinstance(arguments, dict):
         return arguments, None

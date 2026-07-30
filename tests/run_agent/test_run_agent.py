@@ -2868,6 +2868,33 @@ class TestConcurrentToolExecution:
         assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
         assert "tool was not executed" in messages[0]["content"].lower()
 
+    def test_concurrent_long_numeric_literal_rejected_without_crash(self, agent):
+        """A >4300-digit literal must fail closed, not propagate.
+
+        _parse_tool_arguments guarded on (JSONDecodeError, TypeError); CPython
+        >= 3.11 raises a bare ValueError from json.loads past
+        sys.get_int_max_str_digits(), so the parser raised instead of
+        returning its structured error and the sibling call never ran.
+        """
+        tc1 = _mock_tool_call(
+            name="web_search", arguments='{"n": ' + "9" * 5000 + "}", call_id="c1"
+        )
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"ok"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        seen_args = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            seen_args.append((kwargs["tool_call_id"], args))
+            return "ok"
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert seen_args == [("c2", {"q": "ok"})]
+        assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
+        assert "tool was not executed" in messages[0]["content"].lower()
+
     def test_concurrent_preserves_order_despite_timing(self, agent):
         """Even if tools finish in different order, messages should be in original order."""
         import time as _time
@@ -7474,6 +7501,41 @@ class TestStreamingApiCall:
         assert tc[0].function.name == "write_file"
         assert tc[0].function.arguments == '{"path":"x.txt","content":"hel'
         assert resp.choices[0].finish_reason == "length"
+
+    def test_long_numeric_literal_does_not_escape_streaming_builder(self, agent):
+        # CPython >= 3.11 raises a bare ValueError (not JSONDecodeError) from
+        # json.loads when an integer literal exceeds
+        # sys.get_int_max_str_digits().  The streaming builder validated the
+        # accumulated arguments inside a JSONDecodeError-only guard, so a digit
+        # run-on propagated out of the response builder and killed the turn
+        # before the repair helper could run.
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "calc", '{"n": ' + "9" * 5000 + "}")]),
+            _make_chunk(finish_reason="tool_calls"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        assert resp is not None
+        assert resp.choices[0].message.tool_calls is not None
+
+    def test_nested_array_truncation_is_repaired_in_streaming_path(self, agent):
+        # End-to-end counterpart to the helper-level nesting tests: closing by
+        # delimiter count emitted '...3}]' here and degraded to "{}", dropping
+        # the arguments.  The stream ends with an explicit finish_reason so
+        # this is a repairable malformation, not a mid-stream drop.
+        chunks = [
+            _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "search", '{"items": [1, 2, 3')]),
+            _make_chunk(finish_reason="tool_calls"),
+        ]
+        agent.client.chat.completions.create.return_value = iter(chunks)
+
+        resp = agent._interruptible_streaming_api_call({"messages": []})
+
+        tc = resp.choices[0].message.tool_calls
+        assert tc is not None and len(tc) == 1
+        assert json.loads(tc[0].function.arguments) == {"items": [1, 2, 3]}
 
     def test_ollama_reused_index_separate_tool_calls(self, agent):
         """Ollama sends every tool call at index 0 with different ids.

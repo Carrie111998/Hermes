@@ -2940,7 +2940,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 if arguments and arguments.strip():
                     try:
                         json.loads(arguments)
-                    except json.JSONDecodeError:
+                    except ValueError:
+                        # ValueError, not JSONDecodeError: CPython >= 3.11
+                        # raises a bare ValueError from json.loads when an
+                        # integer literal exceeds sys.get_int_max_str_digits().
+                        # JSONDecodeError subclasses ValueError, so this still
+                        # catches every malformed-JSON case.
                         # Attempt repair before flagging as truncated.
                         # Models like GLM-5.1 via Ollama produce trailing
                         # commas, unclosed brackets, Python None, etc.
