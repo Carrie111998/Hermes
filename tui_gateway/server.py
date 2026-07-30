@@ -3072,6 +3072,56 @@ def _sessions_sig():
     return sig
 
 
+def _platforms_sig():
+    """mtime of gateway_state.json — the messaging gateway process persists
+    platform connect/disconnect/health there, so its movement is the
+    "connection status changed" signal for the Messaging page."""
+    try:
+        return (_watcher_home() / "gateway_state.json").stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _pairing_sig():
+    """Newest mtime across every profile's pairing store.
+
+    An unknown DMer's pending code is written by the messaging gateway — a
+    DIFFERENT process that never touches this gateway's transports — so the
+    files are the only shared signal. ``platforms.changed`` cannot stand in
+    for this: it tracks connect/disconnect/health, and a pairing request
+    moves nothing in gateway_state.json.
+    """
+    home = _watcher_home()
+    sig = None
+    # Global store (legacy `pairing/` and consolidated `platforms/pairing/`)
+    # plus every named profile's own — the Messaging page can be scoped to any
+    # of them, and a request landing in a profile store must still tick.
+    roots = [home / "pairing", home / "platforms" / "pairing"]
+    try:
+        for profile_dir in (home / "profiles").iterdir():
+            roots.append(profile_dir / "pairing")
+            roots.append(profile_dir / "platforms" / "pairing")
+    except OSError:
+        pass
+
+    for root in roots:
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            # Only the pending/approved ledgers — _rate_limits.json moves on
+            # every unauthorized DM, including ones that produce no new row.
+            if not entry.name.endswith(("-pending.json", "-approved.json")):
+                continue
+            try:
+                mtime = entry.stat().st_mtime_ns
+            except OSError:
+                continue
+            sig = mtime if sig is None else max(sig, mtime)
+    return sig
+
+
 # Watched change signals: event → (check interval, signature fn, payload fn).
 # Signatures are stat/dict-lookup cheap, same bar as the skin watcher; the
 # check interval keeps the pricier probes (pet resolves the active sheet off
@@ -3080,12 +3130,15 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
     "cron.changed": (1.0, _cron_sig, lambda: {}),
     "sessions.changed": (0.5, _sessions_sig, lambda: {}),
+    "platforms.changed": (2.0, _platforms_sig, lambda: {}),
+    "pairing.changed": (2.0, _pairing_sig, lambda: {}),
 }
 
-# state.db moves on every message append during a streaming turn; the floor
-# coalesces that burst to one broadcast per window (trailing edge included —
-# a floored change keeps its old signature and re-fires next tick).
-_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0}
+# state.db moves on every message append during a streaming turn, and the
+# gateway rewrites gateway_state.json for in-flight-count bookkeeping; the
+# floor coalesces those bursts to one broadcast per window (trailing edge
+# included — a floored change keeps its old signature and re-fires next tick).
+_CHANGE_BROADCAST_FLOOR_S = {"sessions.changed": 2.0, "platforms.changed": 5.0}
 
 _change_sigs: dict[str, Any] = {}
 _change_checked_at: dict[str, float] = {}
@@ -12616,9 +12669,11 @@ def _(rid, params: dict) -> dict:
         from tools.wake_word import (
             audio_is_silent,
             check_wake_word_requirements,
+            get_input_device_status,
             is_listening,
             load_wake_word_config,
             owns_listener,
+            silent_audio_hint,
         )
         cfg = load_wake_word_config()
         reqs = check_wake_word_requirements(cfg)
@@ -12627,23 +12682,26 @@ def _(rid, params: dict) -> dict:
         owned_by_caller = owns_listener(transport)
         listening = owned_by_caller and is_listening()
         silent = listening and audio_is_silent()
+        input_device = get_input_device_status(cfg)
         hint = reqs.get("hint", "")
+        if input_device.get("error") and not hint:
+            hint = f"Wake-word input device could not be resolved: {input_device['error']}"
         if silent and not hint:
-            hint = ("Microphone delivers only silence — on macOS grant the "
-                    "Hermes backend mic access (System Settings > Privacy & "
-                    "Security > Microphone), then toggle the wake word.")
+            hint = silent_audio_hint(input_device)
         return _ok(rid, {
             "listening": listening,
             "owned_by_caller": owned_by_caller,
             "owner_surface": owner_surface if owner is not None else None,
             "phrase": reqs["phrase"],
             "provider": reqs["provider"],
+            "configured_surface": str(cfg.get("surface") or "auto"),
+            "input_device": input_device,
             "available": reqs["available"],
             "hint": hint,
             # Config truth: clients use this to re-arm after a voice turn
             # ("permanent on") without guessing from runtime listener state.
             "enabled": bool(cfg.get("enabled")),
-            # Armed but deaf (macOS permission failure mode) — see hint.
+            # Armed but deaf despite an open stream; see platform-specific hint.
             "audio_silent": silent,
         })
     except Exception as e:
