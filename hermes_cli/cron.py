@@ -523,13 +523,22 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
 def cron_restore(args):
     from cron.jobs import restore_job
     try:
-        restored = restore_job(args.job_id, json.loads(args.snapshot))
+        if getattr(args, "snapshot_stdin", False):
+            raw = sys.stdin.buffer.read(64 * 1024 + 1)
+            if len(raw) > 64 * 1024:
+                raise ValueError("cron restore snapshot exceeds 64 KiB")
+            snapshot_text = raw.decode("utf-8")
+        else:
+            snapshot_text = args.snapshot
+        restored = restore_job(args.job_id, json.loads(snapshot_text))
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         print(color(f"Failed to restore job: {exc}", Colors.RED))
         return 1
     if restored is None:
         print(color(f"Job not found: {args.job_id}", Colors.RED))
         return 1
+    from cron.scheduler import _notify_provider_jobs_changed
+    _notify_provider_jobs_changed()
     if getattr(args, "json", False):
         print(json.dumps(_canonical_job(restored), ensure_ascii=False, sort_keys=True))
     else:

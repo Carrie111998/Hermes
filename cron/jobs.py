@@ -446,7 +446,9 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     normalized = _apply_skill_fields(job)
     job_id = _coerce_job_text(normalized.get("id"), "unknown")
-    prompt = _coerce_job_text(normalized.get("prompt"))
+    # A canonical restore can intentionally clear prompt. Preserve that null
+    # through readback instead of applying the legacy display default.
+    prompt = normalized.get("prompt") if "prompt" in normalized else _coerce_job_text(normalized.get("prompt"))
     normalized["id"] = job_id
     normalized["prompt"] = prompt
 
@@ -1606,25 +1608,75 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
 
 def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Atomically restore a complete canonical job snapshot in place."""
-    if not isinstance(snapshot, dict):
-        raise ValueError("cron restore snapshot must be an object")
-    restored = copy.deepcopy(snapshot)
-    restored["id"] = job_id
-    if "deliver" not in restored and "delivery" in restored:
-        restored["deliver"] = restored["delivery"]
-    if isinstance(restored.get("schedule"), str):
-        restored["schedule"] = parse_schedule(restored["schedule"])
-    if not isinstance(restored.get("schedule"), dict):
-        raise ValueError("cron restore snapshot requires schedule")
+    """Atomically restore one complete canonical job snapshot in place.
+
+    This is deliberately stricter than the edit API: the snapshot is an
+    interchange format, not a bag of updates. Validate and translate it before
+    taking the store lock so malformed input cannot cause a partial mutation.
+    """
+    if not isinstance(job_id, str) or not job_id or not isinstance(snapshot, dict):
+        raise ValueError("cron restore requires a job id and object snapshot")
+    if snapshot.get("id") != job_id:
+        raise ValueError("cron restore snapshot id does not match job id")
+    allowed = {
+        "id", "name", "enabled", "state", "schedule", "run_at", "next_run_at",
+        "repeat", "delivery", "deliver", "platform", "recipient", "thread",
+        "script", "skills", "no_agent", "prompt", "model", "provider", "workdir",
+    }
+    unknown = set(snapshot) - allowed
+    if unknown:
+        raise ValueError(f"cron restore snapshot has unknown fields: {', '.join(sorted(unknown))}")
+    if not isinstance(snapshot.get("name"), (str, type(None))):
+        raise ValueError("cron restore name must be a string or null")
+    if not isinstance(snapshot.get("enabled"), bool):
+        raise ValueError("cron restore enabled must be boolean")
+    state = snapshot.get("state")
+    if state not in {"scheduled", "paused", "completed"}:
+        raise ValueError("cron restore state is invalid")
+    if state == "paused" and snapshot["enabled"]:
+        raise ValueError("cron restore paused job cannot be enabled")
+    if state in {"scheduled", "completed"} and not snapshot["enabled"]:
+        raise ValueError("cron restore scheduled/completed job must be enabled")
+    if state == "completed":
+        raise ValueError("cron restore cannot restore a completed job")
+    schedule = snapshot.get("schedule")
+    if not isinstance(schedule, str) or not schedule.strip():
+        raise ValueError("cron restore schedule must be a non-empty string")
+    try:
+        parsed_schedule = parse_schedule(schedule)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"cron restore schedule is invalid: {exc}") from exc
+    repeat = snapshot.get("repeat")
+    if repeat is not None and (isinstance(repeat, bool) or not isinstance(repeat, int) or repeat < 0):
+        raise ValueError("cron restore repeat must be a non-negative integer or null")
+    skills = snapshot.get("skills")
+    if not isinstance(skills, list) or any(not isinstance(skill, str) for skill in skills):
+        raise ValueError("cron restore skills must be a list of strings")
+    for field in ("run_at", "next_run_at", "script", "prompt", "model", "provider", "workdir"):
+        if field in snapshot and snapshot[field] is not None and not isinstance(snapshot[field], str):
+            raise ValueError(f"cron restore {field} must be a string or null")
+    delivery = snapshot.get("deliver", snapshot.get("delivery"))
+    if "deliver" in snapshot and "delivery" in snapshot and snapshot["deliver"] != snapshot["delivery"]:
+        raise ValueError("cron restore deliver and delivery disagree")
+    if not isinstance(delivery, (str, list)) or (isinstance(delivery, list) and any(not isinstance(item, str) for item in delivery)):
+        raise ValueError("cron restore delivery must be a string or list of strings")
+    restored = {
+        "id": job_id, "name": snapshot["name"], "enabled": snapshot["enabled"],
+        "state": state, "schedule": parsed_schedule,
+        "schedule_display": schedule, "next_run_at": snapshot.get("next_run_at"),
+        "repeat": None if repeat is None else {"times": repeat, "completed": 0},
+        "deliver": delivery, "script": snapshot.get("script"), "skills": list(skills),
+        "no_agent": snapshot.get("no_agent", False), "prompt": snapshot.get("prompt"),
+        "model": snapshot.get("model"), "provider": snapshot.get("provider"),
+        "workdir": snapshot.get("workdir"),
+    }
+    if not isinstance(restored["no_agent"], bool):
+        raise ValueError("cron restore no_agent must be boolean")
     restored = _apply_skill_fields(restored)
-    if restored.get("repeat") is None:
-        restored["repeat"] = {"times": None, "completed": 0}
-    elif isinstance(restored.get("repeat"), int):
-        restored["repeat"] = {"times": restored["repeat"], "completed": 0}
-    restored.setdefault("repeat", {"times": None, "completed": 0})
-    restored.setdefault("enabled", True)
-    restored["state"] = restored.get("state") or ("scheduled" if restored["enabled"] else "paused")
+    # Normalization intentionally supplies edit-time defaults; restore must
+    # retain explicit nulls from the canonical interchange record.
+    for field in ("prompt", "model", "provider", "workdir", "script"):
+        restored[field] = snapshot.get(field)
     with _jobs_lock():
         jobs = load_jobs()
         for index, current in enumerate(jobs):
