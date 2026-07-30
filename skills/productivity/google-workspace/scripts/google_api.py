@@ -46,7 +46,6 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.settings.basic",
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/contacts.readonly",
@@ -472,8 +471,9 @@ def _normalize_event_time(dt_obj: dict, user_tz: str | None) -> str:
     if not dt_obj:
         return ""
     if "date" in dt_obj and "dateTime" not in dt_obj:
-        # All-day event
-        return dt_obj["date"] + " (all day)"
+        # All-day event — return raw date string regardless of user_tz for
+        # backward compatibility (all-day events have no time component to convert).
+        return dt_obj["date"]
     raw = dt_obj.get("dateTime", "")
     if not raw:
         return ""
@@ -501,8 +501,22 @@ def calendar_list(args):
     now = datetime.now(timezone.utc)
     time_min = _datetime_with_timezone(args.start or now.isoformat())
     time_max = _datetime_with_timezone(args.end or (now + timedelta(days=7)).isoformat())
-    # User timezone for normalizing event times. Default to America/New_York (US Eastern).
-    user_tz: str | None = getattr(args, "timezone", None) or "America/New_York"
+    # Timezone conversion is strictly opt-in. None means return raw timestamps
+    # (backward-compatible default).
+    user_tz: str | None = getattr(args, "timezone", None) or None
+
+    # Validate timezone BEFORE making any API call so we can fail fast with a
+    # clear error message rather than a confusing remote-side rejection.
+    if user_tz:
+        try:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+            ZoneInfo(user_tz)
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            print(json.dumps({"error": f"Invalid timezone '{user_tz}': {exc}"}))
+            sys.exit(1)
+        except ImportError:
+            print(json.dumps({"error": "Timezone support unavailable (requires Python 3.9+)."}))
+            sys.exit(1)
 
     if _gws_binary():
         params: dict = {
@@ -1148,9 +1162,10 @@ def main():
     p.add_argument("--calendar", default="primary")
     p.add_argument(
         "--timezone",
-        default="America/New_York",
-        help="IANA timezone name to display times in (default: America/New_York). "
-             "Overrides the event organizer's timezone so times always show in your local zone.",
+        default=None,
+        help="IANA timezone name to display event times in (e.g. America/New_York). "
+             "When omitted, raw timestamps from the API are returned unchanged. "
+             "Invalid zone names are rejected before any API call is made.",
     )
     p.set_defaults(func=calendar_list)
 
