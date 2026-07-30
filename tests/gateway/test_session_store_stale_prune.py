@@ -182,12 +182,15 @@ class TestPruneSaveConcurrencySafety:
         )
 
         store = _make_store_with_db(tmp_path, db)
-        # Model the post-load snapshot: the store read and now owns both rows.
-        store._entries = {
-            live_key: _make_entry(live_key, "sid_live"),
-            stale_key: _make_entry(stale_key, "sid_stale"),
+        # Model the post-load snapshot: the store read and now owns both rows
+        # at exactly these payloads (the persistence baseline).
+        live_entry = _make_entry(live_key, "sid_live")
+        stale_entry = _make_entry(stale_key, "sid_stale")
+        store._entries = {live_key: live_entry, stale_key: stale_entry}
+        store._persisted_routing_payloads = {
+            live_key: json.dumps(live_entry.to_dict(), sort_keys=True),
+            stale_key: json.dumps(stale_entry.to_dict(), sort_keys=True),
         }
-        store._persisted_routing_keys = {live_key, stale_key}
 
         # A sibling connection inserts a DIFFERENT row after the load snapshot.
         competitor = hermes_state.SessionDB()
@@ -204,6 +207,69 @@ class TestPruneSaveConcurrencySafety:
         assert set(rows) == {live_key, foreign_key}
         assert stale_key not in rows  # owned + removed -> deleted
         assert json.loads(rows[foreign_key])["session_id"] == "sid_foreign"
+        competitor.close()
+        db.close()
+
+    def test_prune_save_preserves_already_loaded_sibling_update(
+        self, tmp_path, monkeypatch
+    ):
+        """A row that was part of the load snapshot must not be re-upserted
+        unchanged by a prune-triggered save: a sibling's concurrent update to
+        that loaded row survives, while the pruned owned key is still deleted.
+        """
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        scope = str(tmp_path.resolve())
+
+        stale_key = "agent:main:telegram:dm:stale"
+        sibling_key = "agent:main:telegram:dm:sibling"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            stale_key,
+            json.dumps(_make_entry(stale_key, "sid_stale").to_dict()),
+            scope=scope,
+        )
+        db.save_gateway_routing_entry(
+            sibling_key,
+            json.dumps(_make_entry(sibling_key, "sid_sibling").to_dict()),
+            scope=scope,
+        )
+        real_get = db.get_session
+        db.get_session = lambda sid: (
+            {"end_reason": "agent_close", "id": sid}
+            if sid == "sid_stale"
+            else real_get(sid)
+        )
+
+        store = _make_store_with_db(tmp_path, db)
+        # Model the post-load snapshot: BOTH rows were read and are owned at
+        # exactly these payloads (baseline captured from the same objects).
+        stale_entry = _make_entry(stale_key, "sid_stale")
+        sibling_entry = _make_entry(sibling_key, "sid_sibling")
+        store._entries = {stale_key: stale_entry, sibling_key: sibling_entry}
+        store._persisted_routing_payloads = {
+            stale_key: json.dumps(stale_entry.to_dict(), sort_keys=True),
+            sibling_key: json.dumps(sibling_entry.to_dict(), sort_keys=True),
+        }
+
+        # A sibling connection UPDATES the loaded sibling row after our snapshot.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            sibling_key,
+            json.dumps(_make_entry(sibling_key, "sid_sibling2").to_dict()),
+            scope=scope,
+        )
+
+        # Pruning the stale key triggers the whole-index save immediately.
+        store._prune_stale_sessions_locked()
+
+        rows = db.load_gateway_routing_entries(scope=scope)
+        assert stale_key not in rows  # owned + removed -> deleted
+        # The loaded sibling row was unchanged locally, so it must not have been
+        # re-upserted over the sibling writer's newer value.
+        assert json.loads(rows[sibling_key])["session_id"] == "sid_sibling2"
         competitor.close()
         db.close()
 

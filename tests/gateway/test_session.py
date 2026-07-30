@@ -1628,6 +1628,42 @@ class TestGatewayRoutingTable:
         competitor.close()
         store._db.close()
 
+    def test_competing_writer_key_mismatch_fails_closed(self, tmp_path):
+        """When legacy seeding loses the insert-if-absent race, the authoritative
+        canonical winner must still satisfy the table-key/session_key invariant.
+        A raced writer that filled the slot with a payload claiming a different
+        key fails the load closed rather than routing under a disclaimed key."""
+        import hermes_state
+
+        key = "agent:main:telegram:dm:chat-1"
+        self._write_legacy_entry(tmp_path, key, "legacy-session")
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        competitor = hermes_state.SessionDB()
+        # Poison payload: table key is `key`, but session_key claims another.
+        poison = self._entry_data("agent:main:telegram:dm:other", "poison-session")
+        real_insert = store._db.insert_gateway_routing_entry_if_absent
+        raced = False
+
+        def insert_after_competitor(session_key, entry_json, *, scope=""):
+            nonlocal raced
+            if not raced:
+                raced = True
+                competitor.save_gateway_routing_entry(
+                    session_key, json.dumps(poison), scope=scope
+                )
+            return real_insert(session_key, entry_json, scope=scope)
+
+        store._db.insert_gateway_routing_entry_if_absent = insert_after_competitor
+        with pytest.raises(ValueError, match="does not match entry session_key"):
+            store._ensure_loaded()
+
+        assert raced is True
+        assert store._loaded is False
+        assert store._entries == {}
+        competitor.close()
+        store._db.close()
+
     def test_construction_failure_with_present_store_fails_closed(self, tmp_path):
         """An existing canonical store that fails to open must NOT authorize the
         legacy sessions.json mirror — construction failure fails closed."""
@@ -1727,6 +1763,59 @@ class TestGatewayRoutingTable:
         store._save()
         rows = store._db.load_gateway_routing_entries(scope=scope)
         assert set(rows) == {key_b}
+        competitor.close()
+        store._db.close()
+
+    def test_loaded_sibling_row_update_survives_ordinary_save(self, tmp_path):
+        """A row included in the canonical load snapshot must not be re-upserted
+        unchanged: a sibling's concurrent update to that row survives the next
+        whole-index save, while a genuine local edit to another loaded row still
+        persists and an owned removal still deletes (#9006 concurrency
+        follow-up)."""
+        import hermes_state
+
+        scope = str(tmp_path.resolve())
+        key_a = "agent:main:telegram:dm:chatA"
+        key_b = "agent:main:telegram:dm:chatB"
+
+        db = hermes_state.SessionDB()
+        db.save_gateway_routing_entry(
+            key_a, json.dumps(self._entry_data(key_a, "sessionA")), scope=scope
+        )
+        db.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB")), scope=scope
+        )
+        db.close()
+
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        store._ensure_loaded()
+        # Both rows are part of the load snapshot (unlike a post-load foreign
+        # insert), so both sit in the stale in-memory index.
+        assert set(store._entries) == {key_a, key_b}
+
+        # A sibling updates B AFTER our load; our in-memory B is now stale.
+        competitor = hermes_state.SessionDB()
+        competitor.save_gateway_routing_entry(
+            key_b, json.dumps(self._entry_data(key_b, "sessionB2")), scope=scope
+        )
+
+        # A genuine local edit to A triggers a whole-index save.
+        store._entries[key_a].session_id = "sessionA2"
+        store._save()
+
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        # The sibling's B update survives — unchanged B was not re-upserted...
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"
+        # ...while the genuine local change to A is persisted.
+        assert json.loads(rows[key_a])["session_id"] == "sessionA2"
+
+        # An owned key removed from the index is still deleted, and B still
+        # keeps the sibling value across the delete-driven save.
+        del store._entries[key_a]
+        store._save()
+        rows = store._db.load_gateway_routing_entries(scope=scope)
+        assert set(rows) == {key_b}
+        assert json.loads(rows[key_b])["session_id"] == "sessionB2"
         competitor.close()
         store._db.close()
 

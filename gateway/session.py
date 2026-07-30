@@ -1178,13 +1178,16 @@ class SessionStore:
         self._save_lock = threading.Lock()
         self._routing_generation = 0
         self._persisted_routing_generation = 0
-        # Keys this store owns in the canonical routing table (seeded from the
-        # canonical read, updated on every persist). A whole-index save deletes
-        # only owned keys that have since disappeared from the in-memory index
-        # (pruned/reset sessions); rows the store never owned — e.g. a sibling
-        # writer's concurrent insert into the same scope — are left untouched
-        # so a save/prune can no longer clobber another connection's write.
-        self._persisted_routing_keys: set[str] = set()
+        # Baseline of what this store believes each key currently holds in the
+        # canonical routing table: {session_key -> canonical payload signature}.
+        # Seeded from the canonical read (and legacy seeds) and refreshed on
+        # every persist. Its keys are the set this store owns. A whole-index
+        # save upserts only keys whose live payload differs from this baseline
+        # and deletes only owned keys that have since disappeared from the
+        # in-memory index (pruned/reset). An unchanged row is therefore never
+        # re-upserted, so a save/prune can no longer clobber a sibling writer's
+        # concurrent update to a row this store merely loaded and left alone.
+        self._persisted_routing_payloads: Dict[str, str] = {}
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: Dict[str, _SessionFlight] = {}
         # An unscoped pre-migration Slack key can represent at most one
@@ -1296,6 +1299,12 @@ class SessionStore:
         # Canonical rows below overwrite the same keys; this is not legacy-disk
         # fallback and remains available even when the canonical table is empty.
         loaded_entries: Dict[str, SessionEntry] = dict(self._entries)
+        # Canonical-backed baseline for the keys we prove are in the table
+        # (canonical rows + successful legacy seeds). Pre-seeded live entries
+        # not backed by the table are deliberately omitted so the first save
+        # still upserts them. Signatures are computed the same way as at save
+        # time so an unmutated entry compares equal and is not re-upserted.
+        persisted_payloads: Dict[str, str] = {}
         canonical_read_succeeded = False
         _db = getattr(self, "_db", None)
         # An existing canonical store that failed to open at construction must
@@ -1336,6 +1345,9 @@ class SessionStore:
                                 f"session_key {entry.session_key!r}"
                             )
                         loaded_entries[key] = entry
+                        persisted_payloads[key] = self._routing_payload_signature(
+                            entry.to_dict()
+                        )
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning(
                             "Invalid canonical routing entry %r: %s", key, e
@@ -1417,6 +1429,17 @@ class SessionStore:
                                 "canonical routing entry must decode to an object"
                             )
                         candidate = SessionEntry.from_dict(authoritative_data)
+                        # Losing the insert-if-absent race adopts whatever row
+                        # already filled the slot. That winner must still honor
+                        # the table-key/session_key invariant enforced on the
+                        # direct canonical load above — a raced writer can seed a
+                        # payload claiming a different key. Fail closed rather
+                        # than route under a key the entry disclaims.
+                        if candidate.session_key != key:
+                            raise ValueError(
+                                "canonical routing key does not match entry "
+                                f"session_key {candidate.session_key!r}"
+                            )
                     except (ValueError, KeyError, TypeError) as e:
                         logger.warning(
                             "Invalid canonical routing entry %r after legacy "
@@ -1425,6 +1448,9 @@ class SessionStore:
                             e,
                         )
                         raise
+                    persisted_payloads[key] = self._routing_payload_signature(
+                        candidate.to_dict()
+                    )
                 loaded_entries[key] = candidate
                 imported += 1
 
@@ -1438,12 +1464,14 @@ class SessionStore:
 
         self._entries = loaded_entries
         self._loaded = True
-        # The canonical read observed exactly these keys; the store now owns
-        # them. A later whole-index save deletes only owned keys that vanish
-        # from the in-memory index (below, or via prune/reset) and leaves any
-        # concurrently-inserted foreign key untouched. Seed before the startup
-        # prune so its save computes the pruned keys as the delete set.
-        self._persisted_routing_keys = set(loaded_entries.keys())
+        # The canonical read (plus any legacy seeds) observed exactly these
+        # keys at these payloads; the store now owns them. A later whole-index
+        # save upserts only keys whose payload has since changed locally and
+        # deletes only owned keys that vanish from the in-memory index (below,
+        # or via prune/reset), leaving any concurrently-updated sibling row
+        # untouched. Seed before the startup prune so its save computes the
+        # pruned keys as the delete set.
+        self._persisted_routing_payloads = persisted_payloads
 
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
@@ -1553,6 +1581,16 @@ class SessionStore:
             self._routing_generation,
         )
 
+    @staticmethod
+    def _routing_payload_signature(entry_dict: Dict[str, Any]) -> str:
+        """Order-insensitive signature of a routing payload for change detection.
+
+        Computed identically at load (baseline capture) and at save (live
+        comparison) so an entry that was loaded and never mutated compares
+        equal and is not re-upserted over a sibling's concurrent update.
+        """
+        return json.dumps(entry_dict, sort_keys=True)
+
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
@@ -1568,21 +1606,36 @@ class SessionStore:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
                     try:
-                        # Reconcile instead of blank-replacing the scope: upsert
-                        # the current index and delete only owned keys that have
-                        # since disappeared (pruned/reset). Foreign rows a
-                        # sibling writer inserted after our load are neither
-                        # named nor deleted, so a save can no longer clobber a
-                        # concurrent write (#9006 concurrency follow-up).
-                        owned = getattr(self, "_persisted_routing_keys", set())
-                        new_keys = set(data.keys())
+                        # Reconcile instead of blank-replacing the scope, and
+                        # upsert only genuinely local writes: a key whose live
+                        # payload matches the persisted baseline is left alone,
+                        # so a sibling's concurrent update to a row we merely
+                        # loaded survives. Delete only owned keys that have since
+                        # disappeared (pruned/reset). Foreign rows a sibling
+                        # inserted after our load are never named or deleted, so
+                        # a save can no longer clobber a concurrent write
+                        # (#9006 concurrency follow-up).
+                        baseline = getattr(self, "_persisted_routing_payloads", {})
+                        new_signatures = {
+                            k: self._routing_payload_signature(v)
+                            for k, v in data.items()
+                        }
+                        upserts = {
+                            k: json.dumps(data[k])
+                            for k, sig in new_signatures.items()
+                            if baseline.get(k) != sig
+                        }
+                        delete_keys = [k for k in baseline if k not in data]
                         replacer(
-                            {k: json.dumps(v) for k, v in data.items()},
+                            upserts,
                             scope=self._routing_scope(),
-                            delete_keys=list(owned - new_keys),
+                            delete_keys=delete_keys,
                         )
                         db_saved = True
-                        self._persisted_routing_keys = new_keys
+                        # New baseline is exactly the keys the live index now
+                        # holds. Unchanged owned keys keep their signature,
+                        # upserted keys adopt the new one, deleted keys drop out.
+                        self._persisted_routing_payloads = new_signatures
                     except Exception as exc:
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
