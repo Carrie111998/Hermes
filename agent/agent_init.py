@@ -714,6 +714,14 @@ def init_agent(
     agent._tool_guardrails = ToolCallGuardrailController()
     agent._tool_guardrail_halt_decision: ToolGuardrailDecision | None = None
 
+    # Trajectory quality routing defaults (overwritten later from config
+    # in the full init path; set early so turn_context and other code
+    # that reads getattr(agent, "_trajectory_quality", None) is safe).
+    agent._trajectory_quality = None
+    agent._trajectory_quality_store = None
+    agent._trajectory_quality_halt_decision = None
+    agent._pending_trajectory_quality_recommendation = None
+
     # Interrupt mechanism for breaking out of tool loops
     agent._interrupt_requested = False
     agent._interrupt_message = None  # Optional message that triggered interrupt
@@ -1564,6 +1572,35 @@ def init_agent(
         )
     except Exception as _tlg_err:
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
+
+    # Trajectory quality routing — opt-in parallel observer of the same
+    # tool-result signals the guardrails consume. Disabled by default;
+    # when enabled, it escalates a one-way recommendation ladder without
+    # mutating prompts or toolsets.
+    try:
+        from agent.trajectory_quality import TrajectoryQualityConfig, TrajectoryQualityController
+        _tqr_cfg_data = _agent_cfg.get("trajectory_quality_routing", {})
+        _tqr_cfg = TrajectoryQualityConfig.from_mapping(_tqr_cfg_data)
+        agent._trajectory_quality = TrajectoryQualityController(_tqr_cfg)
+        agent._trajectory_quality_store = None
+        if _tqr_cfg.enabled and _tqr_cfg.persist_decisions:
+            try:
+                from agent.trajectory_quality_store import TrajectoryQualityStore
+                agent._trajectory_quality_store = TrajectoryQualityStore(
+                    retention_days=_tqr_cfg.retention_days,
+                    max_decisions_per_session=_tqr_cfg.max_decisions_per_session,
+                )
+            except Exception as _store_err:
+                _ra().logger.warning(
+                    "Trajectory quality store disabled (fail-open): %s", _store_err
+                )
+                agent._trajectory_quality_store = None
+        agent._trajectory_quality_halt_decision = None
+        agent._pending_trajectory_quality_recommendation = None
+    except Exception as _tqr_err:
+        _ra().logger.warning(
+            "Trajectory quality routing config ignored: %s", _tqr_err
+        )
     # Cache only the derived auxiliary compression context override that is
     # needed later by the startup feasibility check.  Avoid exposing a
     # broad pseudo-public config object on the agent instance.

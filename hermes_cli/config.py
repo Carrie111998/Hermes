@@ -1396,6 +1396,33 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Trajectory quality routing observes authoritative tool-result events
+    # and escalates a one-way recommendation ladder (stronger model → clean
+    # restart → stop) when the agent thrashes. Disabled by default; does not
+    # mutate prompts/toolsets or call external services. Recommendation-only
+    # for model changes in this slice — execute_model_switch is reserved and
+    # hard-ignored.
+    "trajectory_quality_routing": {
+        "enabled": False,
+        "execute_stop": True,
+        "execute_model_switch": False,
+        "allow_deescalate_on_progress": False,
+        "persist_decisions": True,
+        "retention_days": 30,
+        "max_decisions_per_session": 200,
+        "stronger_model": {
+            "provider": None,
+            "model": None,
+        },
+        "thresholds": {
+            "identical_failure": 2,
+            "same_tool_failure": 4,
+            "failed_verification": 2,
+            "stagnation_window": 8,
+        },
+        "hysteresis_progress_needed": 2,
+    },
+
     "compression": {
         "enabled": True,
         "threshold": 0.50,            # compress when context usage exceeds this ratio.
