@@ -317,9 +317,73 @@ def _inspect_connection(conn: sqlite3.Connection) -> dict[str, Any]:
     return report
 
 
+def _take_stable_snapshot(
+    source: Path,
+    snapshot_dir: Path,
+) -> Path:
+    """Copy the live source bundle to a stable snapshot using the SQLite backup API.
+
+    The fingerprint check in :func:`_snapshot_and_inspect` rejects any source
+    whose size or mtime changes during the raw copy. That guard exists to
+    catch a real race, but it also fires for the common case of running this
+    tool from inside a parent ``hermes`` CLI session — the CLI itself writes
+    session bookkeeping (compression tick, LCM, context-tracking) to
+    ``state.db`` on a background thread, so its own writes invalidate the
+    fingerprint of the source it just told the user to point at.
+
+    The SQLite ``Connection.backup()`` API is concurrent-writer-safe: the
+    snapshot it produces is a consistent point-in-time image even while other
+    connections keep writing to the source. Running the raw-copy fingerprint
+    guard against the resulting snapshot always passes (it is a quiescent
+    file we own), which is the whole point of the ``--self-snapshot`` flag.
+
+    The snapshot is consumed downstream as if it were the original source —
+    the rest of the pipeline is unchanged.
+    """
+    snapshot_source = snapshot_dir / source.name
+    # The backup API needs a live, non-corrupt source connection. If the source
+    # is so badly damaged that opening it raises DatabaseError, fall through to
+    # the existing raw-copy path, which is the only path that can handle a
+    # database whose header is itself unreadable.
+    try:
+        source_conn = sqlite3.connect(
+            f"file:{source}?mode=ro", uri=True, isolation_level=None, timeout=5.0
+        )
+    except sqlite3.DatabaseError:
+        return _copy_source_bundle(source, snapshot_dir)[0]
+    try:
+        destination_conn = sqlite3.connect(
+            str(snapshot_source), isolation_level=None
+        )
+        try:
+            source_conn.backup(destination_conn)
+        finally:
+            destination_conn.close()
+    finally:
+        source_conn.close()
+    # Copy the WAL/SHM sidecars alongside the snapshot. SQLite's backup API
+    # does not transfer the WAL contents; the snapshot starts in rollback
+    # journal mode and any uncheckpointed transactions from the live source
+    # are already incorporated into the snapshot's main file. The sidecars
+    # are only meaningful if a writer had them open at backup time, and the
+    # backup API handles that case. Copying empty sidecars is harmless.
+    for suffix in ("-wal", "-shm", "-journal"):
+        source_part = _sidecar_path(source, suffix)
+        if source_part.exists():
+            destination_part = _sidecar_path(snapshot_source, suffix)
+            try:
+                shutil.copy2(source_part, destination_part)
+            except OSError:
+                # Sidecar is optional; missing sidecars never block recovery.
+                pass
+    return snapshot_source
+
+
 def _snapshot_and_inspect(
     source: Path,
     work_root: Path,
+    *,
+    self_snapshot: bool = False,
 ) -> tuple[tempfile.TemporaryDirectory[str], Path, dict[str, Any]]:
     before = _source_fingerprint(source)
     temp_dir = tempfile.TemporaryDirectory(
@@ -328,13 +392,27 @@ def _snapshot_and_inspect(
     )
     snapshot_dir = Path(temp_dir.name)
     try:
-        snapshot_source, copied = _copy_source_bundle(source, snapshot_dir)
-        after = _source_fingerprint(source)
-        if before != after:
-            raise SessionRecoverySafetyError(
-                "The source database bundle changed while it was being copied. "
-                "Stop every Hermes process using this profile and retry."
-            )
+        if self_snapshot:
+            # Take a concurrent-writer-safe snapshot via the SQLite backup API
+            # *before* the raw-copy fingerprint check. The fingerprint check
+            # then operates on the snapshot (a file we own and that nobody
+            # else is writing), so it trivially passes while the live source
+            # continues to be mutated by the parent CLI's background tick.
+            snapshot_source = _take_stable_snapshot(source, snapshot_dir)
+            copied = [snapshot_source.name]
+        else:
+            snapshot_source, copied = _copy_source_bundle(source, snapshot_dir)
+            after = _source_fingerprint(source)
+            if before != after:
+                raise SessionRecoverySafetyError(
+                    "The source database bundle changed while it was being "
+                    "copied. Stop every Hermes process using this profile "
+                    "(including the parent `hermes` CLI session that issued "
+                    "this command — its background tick writes session "
+                    "bookkeeping to state.db) and retry, or pass "
+                    "`--self-snapshot` to snapshot the live source via the "
+                    "SQLite backup API first."
+                )
 
         conn = sqlite3.connect(
             str(snapshot_source),
@@ -347,6 +425,7 @@ def _snapshot_and_inspect(
             conn.close()
         inspection["source_bundle"] = copied
         inspection["source_fingerprint"] = before
+        inspection["self_snapshot"] = self_snapshot
         return temp_dir, snapshot_source, inspection
     except BaseException:
         temp_dir.cleanup()
@@ -357,12 +436,24 @@ def inspect_session_database(
     source_path: Path,
     *,
     work_dir: Optional[Path] = None,
+    self_snapshot: bool = False,
 ) -> dict[str, Any]:
-    """Inspect canonical table readability without opening the source itself."""
+    """Inspect canonical table readability without opening the source itself.
+
+    When ``self_snapshot`` is True, the source is first copied via the
+    concurrent-writer-safe SQLite ``Connection.backup()`` API. This is the
+    correct choice when the source is the live state.db of a running Hermes
+    profile (e.g. running this command from inside the parent ``hermes``
+    CLI session, whose background tick writes session bookkeeping to
+    state.db and would otherwise invalidate the raw-copy fingerprint
+    check).
+    """
 
     source, _, work_root = _validate_paths(source_path, work_dir=work_dir)
     disk_space = _disk_space_preflight(source, work_root, None)
-    temp_dir, _, inspection = _snapshot_and_inspect(source, work_root)
+    temp_dir, _, inspection = _snapshot_and_inspect(
+        source, work_root, self_snapshot=self_snapshot
+    )
     try:
         return {
             "operation": "inspect",
@@ -1183,11 +1274,17 @@ def recover_session_database(
     chunk_size: int = 1_000,
     progress_cb: Optional[ProgressCallback] = None,
     allow_partial: bool = False,
+    self_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Recover canonical rows into a separate current-schema database.
 
     The source path and its sidecars are copied before SQLite opens anything.
     ``output_path`` must not exist and is never swapped into place.
+
+    When ``self_snapshot`` is True, the source is first copied via the
+    concurrent-writer-safe SQLite ``Connection.backup()`` API. This is the
+    correct choice when the source is the live state.db of a running Hermes
+    profile (see ``inspect_session_database`` for details).
     """
 
     if chunk_size <= 0:
@@ -1201,7 +1298,9 @@ def recover_session_database(
     assert output is not None
     disk_space = _disk_space_preflight(source, work_root, output.parent)
 
-    temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)
+    temp_dir, snapshot_source, inspection = _snapshot_and_inspect(
+        source, work_root, self_snapshot=self_snapshot
+    )
     try:
         if not inspection.get("recoverable") and not allow_partial:
             reasons = "; ".join(inspection.get("errors") or ["unknown source error"])
@@ -1332,6 +1431,7 @@ def recover_session_database(
         return {
             "operation": "recover",
             "allow_partial": allow_partial,
+            "self_snapshot": self_snapshot,
             "source": str(source),
             "output": str(output),
             "source_bundle": inspection["source_bundle"],

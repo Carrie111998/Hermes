@@ -16059,6 +16059,18 @@ def main():
         ),
     )
     sessions_recover.add_argument(
+        "--self-snapshot",
+        action="store_true",
+        help=(
+            "Snapshot the live source via the SQLite backup API before "
+            "inspecting it. Use this when the source is the live state.db of "
+            "a running Hermes profile (e.g. running this command from inside "
+            "the parent `hermes` CLI session, whose background tick writes "
+            "session bookkeeping to state.db and would otherwise invalidate "
+            "the raw-copy fingerprint check)"
+        ),
+    )
+    sessions_recover.add_argument(
         "--report",
         type=Path,
         help="JSON report path (defaults to <output>.recovery.json)",
@@ -16215,6 +16227,7 @@ def main():
                     report = inspect_session_database(
                         source,
                         work_dir=getattr(args, "work_dir", None),
+                        self_snapshot=getattr(args, "self_snapshot", False),
                     )
                 else:
                     last_progress = {"table": None}
@@ -16239,6 +16252,7 @@ def main():
                         chunk_size=getattr(args, "chunk_size", 1000),
                         progress_cb=_recovery_progress,
                         allow_partial=allow_partial,
+                        self_snapshot=getattr(args, "self_snapshot", False),
                     )
                     if last_progress["table"] is not None:
                         print()

@@ -6,8 +6,11 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1042,3 +1045,257 @@ def test_failed_repair_points_the_user_at_offline_recovery(tmp_path: Path) -> No
     # It must offer the source it actually preserved, not a placeholder.
     assert "--source" in combined, combined
     assert "malformed-backup" in combined, combined
+
+
+def test_self_snapshot_stable_under_concurrent_writer(tmp_path: Path) -> None:
+    """`--self-snapshot` must succeed even when the raw-copy fingerprint would fire.
+
+    Reported July 2026 (issue #72291): the source-fingerprint check on the
+    raw-copy path rejects any source whose size or mtime changes while the
+    copy is in flight. That guard correctly catches a real race, but it
+    also fires for the most common case: running this command from inside
+    the parent ``hermes`` CLI session, whose background tick writes session
+    bookkeeping to state.db on its own thread. With ``--self-snapshot``,
+    the tool first takes a concurrent-writer-safe snapshot via the SQLite
+    ``Connection.backup()`` API, so the fingerprint check operates on a
+    quiescent file and the inspection succeeds.
+
+    Regression contract for issue #72291: when self_snapshot=True, a writer
+    mutating the source during the inspection window must NOT cause the
+    fingerprint guard to reject the inspection. The writer thread may not
+    actually tick on a tiny test DB (the snapshot is fast), so this test
+    forces a concurrent mutation by patching the raw copy path to pause
+    and writing to the live source while it is paused — the same mutation
+    the guard is designed to catch — and asserts the self_snapshot path
+    short-circuits around it.
+    """
+    source = tmp_path / "live-state.db"
+    _make_source(source)
+
+    # Patch the snapshot path to pause mid-copy. While paused, mutate the
+    # live source. With self_snapshot=True this mutation is irrelevant
+    # because the snapshot is taken before the raw-copy fingerprint check
+    # runs; the snapshot itself is a quiescent file we own.
+    from hermes_cli import session_recovery as recovery_module
+
+    inside_snapshot = threading.Event()
+    release_snapshot = threading.Event()
+    real_backup = recovery_module.sqlite3.connect
+
+    def slow_connect(*args, **kwargs):
+        result = real_backup(*args, **kwargs)
+        # Slow down ONLY the snapshot's destination connection — the one
+        # _take_stable_snapshot uses for the snapshot. We detect it by the
+        # mode being absent (raw connections in our pipeline specify mode)
+        # and by the path being inside tmp_path (the snapshot destination
+        # is created in the work root).
+        if (
+            not inside_snapshot.is_set()
+            and args
+            and isinstance(args[0], str)
+            and str(tmp_path) in args[0]
+            and "mode=ro" not in args[0]
+        ):
+            inside_snapshot.set()
+            release_snapshot.wait(30)
+        return result
+
+    recovery_module.sqlite3.connect = slow_connect
+    mutator_done = threading.Event()
+
+    def mutate_during_snapshot() -> None:
+        assert inside_snapshot.wait(30), "snapshot never started"
+        # Bump the live source's size/mtime while the snapshot is paused.
+        # This is the exact mutation the fingerprint guard watches for.
+        with source.open("ab") as handle:
+            handle.write(b"\x00" * 4096)
+        os.utime(source, None)
+        mutator_done.set()
+
+    mutator = threading.Thread(target=mutate_during_snapshot, daemon=True)
+    mutator.start()
+    try:
+        report = inspect_session_database(
+            source, work_dir=tmp_path, self_snapshot=True
+        )
+    finally:
+        release_snapshot.set()
+        recovery_module.sqlite3.connect = real_backup
+        mutator.join(30)
+
+    assert mutator_done.wait(5), "mutator thread never finished"
+    # The inspection succeeded despite a concurrent source mutation that
+    # would have triggered the fingerprint guard on the raw-copy path.
+    # This is the load-bearing assertion: prior to the fix this same call
+    # raised SessionRecoverySafetyError from the fingerprint guard because
+    # the live source changed size/mtime during the raw copy.
+    assert report["recoverable"] is True
+    assert report["self_snapshot"] is True
+
+
+def test_self_snapshot_disabled_keeps_fingerprint_guard(tmp_path: Path) -> None:
+    """Without `--self-snapshot` the original fingerprint guard still fires.
+
+    Regression guard: changing the default would silently let concurrent
+    writers corrupt the recovered output. The flag is opt-in for backwards
+    compatibility and so the failure path remains visible if the user
+    passes `--source` against a live database by accident.
+    """
+    source = tmp_path / "live-state.db"
+    _make_source(source)
+
+    # Mutate the source AFTER the fingerprint-before snapshot is taken but
+    # BEFORE the raw-copy completes. We patch the raw-copy step to pause
+    # inside the copy and mutate the live source from the test thread.
+    from hermes_cli import session_recovery as recovery_module
+
+    inside_copy = threading.Event()
+    release_copy = threading.Event()
+    real_copy2 = recovery_module.shutil.copy2
+
+    def slow_copy2(src, dst, *args, **kwargs):
+        result = real_copy2(src, dst, *args, **kwargs)
+        if str(src).endswith("live-state.db") and not inside_copy.is_set():
+            inside_copy.set()
+            release_copy.wait(30)
+        return result
+
+    recovery_module.shutil.copy2 = slow_copy2
+    try:
+        def run_with_mutation() -> dict[str, Any]:
+            # Hold a writer open against the source so it stays a valid DB
+            # even after our mutation. We mutate the file from outside the
+            # connection (touch + rewrite) to force the size/mtime change
+            # the fingerprint guard watches for.
+            def mutate_after_delay() -> None:
+                assert inside_copy.wait(30), "raw copy never started"
+                # Give the copy a moment to actually enter the loop, then
+                # bump the source size/mtime so the after-fingerprint
+                # differs from the before-fingerprint.
+                time.sleep(0.05)
+                with source.open("ab") as handle:
+                    handle.write(b"\x00" * 4096)
+                os.utime(source, None)
+
+            mutator = threading.Thread(target=mutate_after_delay, daemon=True)
+            mutator.start()
+            try:
+                return inspect_session_database(source, work_dir=tmp_path)
+            finally:
+                release_copy.set()
+                mutator.join(30)
+
+        with pytest.raises(SessionRecoverySafetyError) as excinfo:
+            run_with_mutation()
+        message = str(excinfo.value)
+        # The message must mention the parent CLI so a reader who hit the
+        # dead-end error knows what they need to stop. And it must point
+        # them at the escape hatch.
+        assert "parent `hermes` CLI" in message, message
+        assert "--self-snapshot" in message, message
+    finally:
+        recovery_module.shutil.copy2 = real_copy2
+
+    # Source on disk has been mutated (we appended garbage) but the source
+    # _open connection_ in the test is closed. We've verified the guard
+    # fired; we don't need to re-hash the source.
+
+
+def test_fingerprint_error_message_offers_self_snapshot(tmp_path: Path) -> None:
+    """The improved error message must offer `--self-snapshot` as the fix.
+
+    Even users who do not know about the flag benefit from the explicit
+    mention in the failure message: it turns a "stop every process" dead
+    end into a one-flag retry.
+    """
+    source = tmp_path / "live-state.db"
+    _make_source(source)
+
+    # Force the fingerprint mismatch without patching internals: do it
+    # before the call by simply truncating, then bumping the file between
+    # the fingerprint-before and the copy. Simplest reliable trigger is
+    # the slow_copy2 patch above — reuse the same shape.
+    from hermes_cli import session_recovery as recovery_module
+
+    inside_copy = threading.Event()
+    release_copy = threading.Event()
+    real_copy2 = recovery_module.shutil.copy2
+
+    def slow_copy2(src, dst, *args, **kwargs):
+        result = real_copy2(src, dst, *args, **kwargs)
+        if str(src).endswith("live-state.db") and not inside_copy.is_set():
+            inside_copy.set()
+            release_copy.wait(30)
+        return result
+
+    recovery_module.shutil.copy2 = slow_copy2
+    try:
+        def trigger() -> None:
+            def mutate_after_delay() -> None:
+                assert inside_copy.wait(30)
+                time.sleep(0.05)
+                with source.open("ab") as handle:
+                    handle.write(b"\x00" * 4096)
+                os.utime(source, None)
+
+            mutator = threading.Thread(target=mutate_after_delay, daemon=True)
+            mutator.start()
+            try:
+                inspect_session_database(source, work_dir=tmp_path)
+            finally:
+                release_copy.set()
+                mutator.join(30)
+
+        with pytest.raises(SessionRecoverySafetyError) as excinfo:
+            trigger()
+        message = str(excinfo.value)
+        assert "--self-snapshot" in message
+        assert "parent `hermes` CLI" in message
+    finally:
+        recovery_module.shutil.copy2 = real_copy2
+
+
+def test_cli_self_snapshot_runs_end_to_end(tmp_path: Path) -> None:
+    """`hermes sessions recover --self-snapshot` must run end-to-end via the CLI.
+
+    Belt-and-suspenders for the CLI wiring: the flag has to actually reach
+    the recovery function and the report must mark the run as a self-snapshot.
+    """
+    source = tmp_path / "state.db"
+    output = tmp_path / "recovered.db"
+    expected = _make_source(source)
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path / "isolated-hermes-home")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "sessions",
+            "recover",
+            "--source",
+            str(source),
+            "--output",
+            str(output),
+            "--work-dir",
+            str(tmp_path),
+            "--self-snapshot",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "The active session database was not changed." in result.stdout
+    report_path = output.with_name(output.name + ".recovery.json")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["complete"] is True
+    assert report["self_snapshot"] is True
+    assert report["verification"]["table_counts"]["sessions"] == expected["sessions"]
+    assert report["verification"]["table_counts"]["messages"] == expected["messages"]
