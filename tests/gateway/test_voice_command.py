@@ -3,6 +3,7 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import queue
 import sys
@@ -70,6 +71,16 @@ def _make_event(text: str = "", message_type=MessageType.TEXT, chat_id="123") ->
     event = MessageEvent(text=text, message_type=message_type, source=source)
     event.message_id = "msg42"
     return event
+
+
+def _voice_like_pcm(duration_s: float, amplitude: int = 1000) -> bytes:
+    """Return deterministic 48 kHz stereo s16le PCM with sustained energy."""
+    sample_count = int(48000 * 2 * duration_s)
+    pair = (
+        int(amplitude).to_bytes(2, "little", signed=True)
+        + int(-amplitude).to_bytes(2, "little", signed=True)
+    )
+    return (pair * ((sample_count + 1) // 2))[:sample_count * 2]
 
 
 def _make_runner(tmp_path):
@@ -463,7 +474,7 @@ class TestVoiceReceiver:
         receiver.map_ssrc(100, 42)
         # 48kHz, stereo, 16-bit = 192000 bytes/sec
         # MIN_SPEECH_DURATION = 0.5s → need 96000 bytes
-        pcm_data = bytearray(b"\x00" * 96000)
+        pcm_data = bytearray(_voice_like_pcm(0.5))
         receiver._buffers[100] = pcm_data
         # Set last_packet_time far enough in the past to exceed SILENCE_THRESHOLD
         receiver._last_packet_time[100] = time.monotonic() - 3.0
@@ -475,6 +486,43 @@ class TestVoiceReceiver:
         # Buffer should be cleared after extraction
         assert len(receiver._buffers[100]) == 0
 
+    def test_check_silence_rejects_join_warmup_silence(self, caplog):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 192000)
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+        with caplog.at_level(logging.INFO):
+            completed = receiver.check_silence()
+
+        assert completed == []
+        assert len(receiver._buffers[100]) == 0
+        assert "non-speech PCM segment" in caplog.text
+
+    def test_check_silence_rejects_join_warmup_transient(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        transient = _voice_like_pcm(0.02, amplitude=3000)
+        receiver._buffers[100] = bytearray(
+            transient + b"\x00" * (192000 - len(transient))
+        )
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+        assert receiver.check_silence() == []
+
+    def test_first_and_followup_voice_segments_are_preserved(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+
+        for amplitude in (400, 1200):
+            pcm_data = _voice_like_pcm(0.6, amplitude=amplitude)
+            receiver._buffers[100] = bytearray(pcm_data)
+            receiver._last_packet_time[100] = time.monotonic() - 3.0
+
+            completed = receiver.check_silence()
+
+            assert completed == [(42, pcm_data)]
+
     def test_check_silence_ignores_short_buffer(self):
         receiver = self._make_receiver()
         receiver.map_ssrc(100, 42)
@@ -484,6 +532,48 @@ class TestVoiceReceiver:
         completed = receiver.check_silence()
         assert len(completed) == 0
 
+    def test_check_silence_ignores_recent_audio(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 96000)
+        receiver._last_packet_time[100] = time.monotonic()  # just now
+        completed = receiver.check_silence()
+        assert len(completed) == 0
+
+    def test_flush_pending_returns_recent_utterance_before_silence(self):
+        """Disconnect drains a valid utterance even before silence is detected."""
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        pcm_data = bytearray(_voice_like_pcm(0.5))
+        receiver._buffers[100] = pcm_data
+        receiver._last_packet_time[100] = time.monotonic()
+
+        assert receiver.flush_pending() == [(42, bytes(pcm_data))]
+        assert 100 not in receiver._buffers
+        assert 100 not in receiver._last_packet_time
+
+    def test_flush_pending_rejects_join_warmup_silence(self, caplog):
+        """The leave-time flush applies the same acoustic gate as check_silence."""
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 96000)
+        receiver._last_packet_time[100] = time.monotonic()
+
+        with caplog.at_level(logging.INFO):
+            completed = receiver.flush_pending()
+
+        assert completed == []
+        assert 100 not in receiver._buffers
+        assert 100 not in receiver._last_packet_time
+        assert "non-speech PCM segment" in caplog.text
+
+    def test_check_silence_unknown_user_discarded(self):
+        receiver = self._make_receiver()
+        # No SSRC mapping — user_id will be 0
+        receiver._buffers[100] = bytearray(b"\x00" * 96000)
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+        completed = receiver.check_silence()
+        assert len(completed) == 0
 
     def test_ffmpeg_resolver_finds_winget_install_when_not_on_path(self, monkeypatch, tmp_path):
         """Windows winget installs ffmpeg outside PATH; Discord voice should still find it."""
@@ -1513,8 +1603,7 @@ class TestVoiceReception:
     @staticmethod
     def _fill_buffer(receiver, ssrc, duration_s=1.0, age_s=3.0):
         """Add PCM data to buffer. 48kHz stereo 16-bit = 192000 bytes/sec."""
-        size = int(192000 * duration_s)
-        receiver._buffers[ssrc] = bytearray(b"\x00" * size)
+        receiver._buffers[ssrc] = bytearray(_voice_like_pcm(duration_s))
         receiver._last_packet_time[ssrc] = time.monotonic() - age_s
 
     # -- Known SSRC (normal flow) --
