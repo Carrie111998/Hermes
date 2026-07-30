@@ -115,6 +115,85 @@ class TestExtractAttachments(unittest.TestCase):
         self.assertEqual(result, [])
 
 
+class TestEmailReplyPolicy(unittest.TestCase):
+    """Deterministic category, keyword-group, and model-output filtering."""
+
+    def test_promotions_are_skipped_by_default(self):
+        from plugins.platforms.email.adapter import _should_skip_email
+
+        self.assertTrue(
+            _should_skip_email("限时优惠", "Save 20% with this promo code")
+        )
+
+    def test_category_can_be_opted_into_auto_reply(self):
+        from plugins.platforms.email.adapter import _should_skip_email
+
+        self.assertFalse(
+            _should_skip_email(
+                "限时优惠",
+                "Save 20% with this promo code",
+                category_auto_reply={"promotions": True},
+                custom_skip_patterns="",
+            )
+        )
+
+    def test_keyword_groups_require_every_term(self):
+        from plugins.platforms.email.adapter import _matching_keyword_group
+
+        rules = "紧急;invoice+overdue"
+        self.assertEqual(
+            _matching_keyword_group("The invoice is overdue", rules),
+            ("invoice", "overdue"),
+        )
+        self.assertIsNone(_matching_keyword_group("New invoice attached", rules))
+
+    def test_invalid_custom_regex_is_ignored(self):
+        from plugins.platforms.email.adapter import _should_skip_email
+
+        self.assertFalse(
+            _should_skip_email(
+                "Hello",
+                "A normal question",
+                category_auto_reply={},
+                custom_skip_patterns="[invalid",
+            )
+        )
+
+    def test_structured_json_false_is_parsed(self):
+        from plugins.platforms.email.adapter import _parse_agent_reply
+
+        decision, body = _parse_agent_reply(
+            '{"need_response": false, "response": ""}',
+            require_structured=True,
+        )
+        self.assertFalse(decision)
+        self.assertEqual(body, "")
+
+    def test_common_prefix_variants_are_parsed(self):
+        from plugins.platforms.email.adapter import _parse_agent_reply
+
+        for content in (
+            "need-response = FALSE\n",
+            "Should reply: no\n",
+            "NO_REPLY\n",
+            "无需回复\n",
+        ):
+            with self.subTest(content=content):
+                decision, _ = _parse_agent_reply(
+                    content, require_structured=True
+                )
+                self.assertFalse(decision)
+
+    def test_strict_mode_rejects_unstructured_output(self):
+        from plugins.platforms.email.adapter import _parse_agent_reply
+
+        decision, body = _parse_agent_reply(
+            "This is an ordinary answer.", require_structured=True
+        )
+        self.assertIsNone(decision)
+        self.assertEqual(body, "")
+
+
 class TestDispatchMessage(unittest.TestCase):
     """Test email message dispatch logic."""
 
@@ -233,6 +312,55 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(len(captured_events), 1)
         self.assertNotIn("[Subject:", captured_events[0].text)
         self.assertIn("Thanks for the help!", captured_events[0].text)
+
+    def test_no_reply_keyword_bypasses_agent(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._no_reply_keywords = "internal notice;do+not+reply"
+        adapter.handle_message = MagicMock()
+        msg_data = {
+            "uid": b"4",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "Internal notice",
+            "message_id": "<msg4@test.com>",
+            "in_reply_to": "",
+            "body": "For your information",
+            "attachments": [],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        adapter.handle_message.assert_not_called()
+
+    def test_force_reply_keyword_overrides_category_filter(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._force_reply_keywords = "VIP+offer"
+        captured_events = []
+
+        async def capture_handle(event):
+            captured_events.append(event)
+
+        adapter.handle_message = capture_handle
+        msg_data = {
+            "uid": b"44",
+            "sender_addr": "user@test.com",
+            "sender_name": "User",
+            "subject": "VIP promotional offer",
+            "message_id": "<msg44@test.com>",
+            "in_reply_to": "",
+            "body": "A special VIP offer for you",
+            "attachments": [],
+            "date": "",
+        }
+
+        asyncio.run(adapter._dispatch_message(msg_data))
+        self.assertEqual(len(captured_events), 1)
+        self.assertTrue(adapter._thread_context["user@test.com"]["force_reply"])
+        self.assertIn("requires a reply", captured_events[0].text)
 
 
     def test_image_attachment_sets_photo_type(self):
@@ -445,6 +573,115 @@ class TestSendMethods(unittest.TestCase):
         self.assertEqual(info["name"], "user@test.com")
         self.assertEqual(info["type"], "dm")
         self.assertEqual(info["subject"], "Test")
+
+
+class TestStructuredReplySend(unittest.TestCase):
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        with patch.dict(
+            os.environ,
+            {
+                "EMAIL_ADDRESS": "hermes@test.com",
+                "EMAIL_PASSWORD": "secret",
+                "EMAIL_IMAP_HOST": "imap.test.com",
+                "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_REQUIRE_STRUCTURED_RESPONSE": "true",
+            },
+        ):
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_false_decision_never_reaches_smtp(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "uid": b"12",
+            "force_reply": False,
+        }
+        adapter._send_email = MagicMock()
+        adapter._mark_as_unseen = MagicMock()
+
+        result = asyncio.run(
+            adapter.send(
+                "user@test.com",
+                '{"need_response": false, "response": ""}',
+            )
+        )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "skipped-no-response-needed")
+        adapter._send_email.assert_not_called()
+        adapter._mark_as_unseen.assert_not_called()
+
+    def test_true_json_sends_only_response_body(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._send_email = MagicMock(return_value="<reply@test.com>")
+
+        result = asyncio.run(
+            adapter.send(
+                "user@test.com",
+                '{"need_response": true, "response": "The answer."}',
+            )
+        )
+
+        self.assertTrue(result.success)
+        adapter._send_email.assert_called_once_with(
+            "user@test.com", "The answer.", None
+        )
+
+    def test_invalid_strict_output_is_blocked(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._send_email = MagicMock()
+
+        result = asyncio.run(adapter.send("user@test.com", "ordinary answer"))
+
+        self.assertEqual(result.message_id, "skipped-invalid-response-format")
+        adapter._send_email.assert_not_called()
+
+    def test_true_decision_with_empty_body_is_blocked(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._send_email = MagicMock()
+
+        result = asyncio.run(
+            adapter.send(
+                "user@test.com",
+                '{"need_response": true, "response": ""}',
+            )
+        )
+
+        self.assertEqual(result.message_id, "skipped-empty-response")
+        adapter._send_email.assert_not_called()
+
+    def test_force_rule_overrides_false_model_decision(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "uid": b"13",
+            "force_reply": True,
+        }
+        adapter._send_email = MagicMock(return_value="<forced@test.com>")
+        adapter._mark_as_unseen = MagicMock()
+
+        result = asyncio.run(
+            adapter.send(
+                "user@test.com",
+                '{"need_response": false, "response": ""}',
+            )
+        )
+
+        self.assertTrue(result.success)
+        adapter._send_email.assert_called_once_with(
+            "user@test.com", "Your email has been received.", None
+        )
 
 
 class TestConnectDisconnect(unittest.TestCase):

@@ -69,6 +69,38 @@ export interface Translations {
     pluginNotRegistered: string;
   };
 
+  emailPolicy?: {
+    connectionTitle: string;
+    connectionDescription: string;
+    advancedConnection: string;
+    advancedConnectionDescription: string;
+    title: string;
+    description: string;
+    categoriesTitle: string;
+    categoriesDescription: string;
+    promotions: string;
+    newsletters: string;
+    transactions: string;
+    security: string;
+    social: string;
+    calendar: string;
+    reports: string;
+    allowCategory: string;
+    keywordsTitle: string;
+    keywordsDescription: string;
+    neverReply: string;
+    neverReplyDescription: string;
+    mustReply: string;
+    mustReplyDescription: string;
+    keywordPlaceholder: string;
+    keywordSyntax: string;
+    decisionTitle: string;
+    strictDecision: string;
+    strictDecisionDescription: string;
+    priorityLabel: string;
+    priorityText: string;
+  };
+
   // ── App shell ──
   app: {
     brand: string;

@@ -13,11 +13,16 @@ Environment variables:
     EMAIL_PASSWORD      — Email password or app-specific password
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
+    EMAIL_FORCE_REPLY_KEYWORDS — Must-reply keyword groups (semicolon / + syntax)
+    EMAIL_NO_REPLY_KEYWORDS — No-reply keyword groups (semicolon / + syntax)
+    EMAIL_REQUIRE_STRUCTURED_RESPONSE — Fail closed on malformed model decisions
+    EMAIL_AUTO_REPLY_* — Per-category opt-in switches (default: false)
 """
 
 import asyncio
 import email as email_lib
 import imaplib
+import json
 import logging
 import os
 import re
@@ -61,60 +66,245 @@ _AUTOMATED_HEADERS = {
     "List-Unsubscribe": lambda v: bool(v),
 }
 
-# Default subject/body regex patterns for emails that should be silently
-# skipped without involving the LLM. Operators can extend via the
-# EMAIL_SKIP_PATTERNS env var (comma-separated regexes).
-_DEFAULT_SKIP_PATTERNS: Tuple[str, ...] = (
-    # Order confirmations & shipping
-    r"订单.*已发[货送]", r"order.*(?:shipped|confirmed|dispatched)",
-    r"运单号|tracking\s*(?:number|no|#)",
-    # Payment / invoice
-    r"(?:支付|付款|扣款).*成功", r"payment\s*(?:received|confirmed|successful)",
-    r"invoice|receipt|收据|发票",
-    # Verification / security codes
-    r"验证码|verification\s*code|security\s*code",
-    r"登录验证|login\s*verification",
-    # Newsletters & marketing
-    r"newsletter|subscribe|unsubscribe|退订",
-    r"促销|优惠|折扣|sale\b|discount|promo",
-    r"专题活动|活动.*提[升高]|推广|广告|marketing",
-    r"效率.*提升|工作.*效率|周.*报|月.*报|日报",
-    # Social / platform notifications
-    r"(?:新消息|new\s+message|mentioned\s+you)",
-    r"(?:关注|followed|liked|commented)",
-    # Calendar / reminders
-    r"(?:提醒|reminder|upcoming|日程)",
-    # System / automated
-    r"noreply|no-reply|automated\s+message",
-    r"do\s*not\s*reply",
+# Rule-based categories are evaluated before the LLM.  Every category defaults
+# to "do not auto-reply"; operators explicitly opt a category into auto-reply
+# with the corresponding EMAIL_AUTO_REPLY_* switch.
+_CATEGORY_PATTERNS: Dict[str, Tuple[str, ...]] = {
+    "promotions": (
+        r"促销|优惠|折扣|推广|广告|营销|sale\b|discount|promo(?:tion)?|marketing",
+        r"限时|秒杀|满减|coupon|special\s+offer",
+    ),
+    "newsletters": (
+        r"newsletter|subscribe|unsubscribe|退订|订阅",
+        r"mailing\s+list|digest\b|简报",
+    ),
+    "transactions": (
+        r"订单.*(?:已发[货送]|确认|完成)|order.*(?:shipped|confirmed|dispatched|delivered)",
+        r"运单号|tracking\s*(?:number|no|#)",
+        r"(?:支付|付款|扣款).*成功|payment\s*(?:received|confirmed|successful)",
+        r"invoice|receipt|收据|发票",
+    ),
+    "security": (
+        r"验证码|verification\s*code|security\s*code|one[- ]time\s*(?:code|password)",
+        r"登录验证|login\s*verification|password\s+reset|重置密码",
+        r"安全提醒|security\s+alert|new\s+sign[- ]in",
+    ),
+    "social": (
+        r"(?:新消息|new\s+message|mentioned\s+you)",
+        r"(?:关注|点赞|评论|followed|liked|commented)",
+        r"friend\s+request|好友请求",
+    ),
+    "calendar": (
+        r"(?:日程|会议|活动).*(?:提醒|邀请)|calendar\s+(?:invite|notification)",
+        r"(?:reminder|upcoming).*(?:meeting|event|appointment)",
+    ),
+    "reports": (
+        r"(?:日报|周报|月报|季报|年度报告)",
+        r"(?:daily|weekly|monthly|quarterly)\s+(?:report|summary|digest)",
+    ),
+}
+
+_CATEGORY_SWITCHES = {
+    "promotions": "EMAIL_AUTO_REPLY_PROMOTIONS",
+    "newsletters": "EMAIL_AUTO_REPLY_NEWSLETTERS",
+    "transactions": "EMAIL_AUTO_REPLY_TRANSACTIONS",
+    "security": "EMAIL_AUTO_REPLY_SECURITY",
+    "social": "EMAIL_AUTO_REPLY_SOCIAL",
+    "calendar": "EMAIL_AUTO_REPLY_CALENDAR",
+    "reports": "EMAIL_AUTO_REPLY_REPORTS",
+}
+
+
+def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
+    """Compile operator-provided regexes without breaking mail polling."""
+    compiled: List[re.Pattern] = []
+    for pattern in patterns:
+        try:
+            compiled.append(re.compile(pattern, re.IGNORECASE))
+        except re.error as exc:
+            logger.warning("[Email] Ignoring invalid skip regex %r: %s", pattern, exc)
+    return compiled
+
+
+def _split_regex_patterns(raw: str) -> List[str]:
+    """Split legacy comma-separated or new semicolon/newline regex lists."""
+    return [
+        part.strip()
+        for part in re.split(r"[\n;,]+", raw or "")
+        if part.strip()
+    ]
+
+
+def _classify_email(subject: str, body: str) -> List[str]:
+    """Return all built-in message categories matching subject or body."""
+    combined = f"{subject}\n{body}".casefold()
+    return [
+        category
+        for category, patterns in _CATEGORY_PATTERNS.items()
+        if any(re.search(pattern, combined, re.IGNORECASE) for pattern in patterns)
+    ]
+
+
+def _parse_keyword_groups(raw: str) -> List[Tuple[str, ...]]:
+    """Parse ``;``/newline separated groups whose terms are joined by ``+``.
+
+    Each group is an OR alternative.  Every term inside one group must occur.
+    For example ``urgent;invoice+overdue`` matches either ``urgent`` or a
+    message containing both ``invoice`` and ``overdue``.
+    """
+    groups: List[Tuple[str, ...]] = []
+    for raw_group in re.split(r"[\n;]+", raw or ""):
+        terms = tuple(
+            term.strip().casefold()
+            for term in re.split(r"\s*(?:\+|&&)\s*", raw_group)
+            if term.strip()
+        )
+        if terms:
+            groups.append(terms)
+    return groups
+
+
+def _matching_keyword_group(text: str, raw_groups: str) -> Optional[Tuple[str, ...]]:
+    haystack = text.casefold()
+    for group in _parse_keyword_groups(raw_groups):
+        if all(term in haystack for term in group):
+            return group
+    return None
+
+
+def _should_skip_email(
+    subject: str,
+    body: str,
+    *,
+    category_auto_reply: Optional[Dict[str, bool]] = None,
+    custom_skip_patterns: Optional[str] = None,
+) -> bool:
+    """Return whether deterministic filters should suppress the LLM.
+
+    ``category_auto_reply`` maps a category to its opt-in switch.  Missing
+    switches are false, preserving the safe default. ``EMAIL_SKIP_PATTERNS``
+    remains supported as an additional deny-only regex list.
+    """
+    enabled = category_auto_reply or {}
+    if any(not enabled.get(category, False) for category in _classify_email(subject, body)):
+        return True
+
+    raw_patterns = (
+        os.getenv("EMAIL_SKIP_PATTERNS", "")
+        if custom_skip_patterns is None
+        else custom_skip_patterns
+    )
+    combined = f"{subject}\n{body}" if subject else body
+    return any(
+        pattern.search(combined)
+        for pattern in _compile_patterns(_split_regex_patterns(raw_patterns))
+    )
+
+
+_RESPONSE_DECISION_RE = re.compile(
+    r"""^\s*(?:[-*]\s*)?
+    (?:
+        need[\s_-]*response|needs?[\s_-]*reply|should[\s_-]*(?:reply|respond)|
+        reply[\s_-]*required|respond|需要回复|是否回复
+    )
+    \s*[:=]\s*
+    (true|false|yes|no|1|0|是|否)
+    \s*(?:\r?\n|$)""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_NO_REPLY_SENTINEL_RE = re.compile(
+    r"^\s*(?:NO[\s_-]*REPLY|SKIP[\s_-]*REPLY|DO[\s_-]*NOT[\s_-]*REPLY|无需回复|不予回复)\s*(?:\r?\n|$)",
+    re.IGNORECASE,
 )
 
-# Compiled regex cache — built lazily on first use
-_SKIP_REGEXES: Optional[List[re.Pattern]] = None
+
+def _coerce_reply_decision(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().casefold()
+    if normalized in {"true", "yes", "1", "是"}:
+        return True
+    if normalized in {"false", "no", "0", "否"}:
+        return False
+    return None
 
 
-def _load_skip_patterns() -> List[re.Pattern]:
-    """Compile skip regexes from defaults + EMAIL_SKIP_PATTERNS env var."""
-    global _SKIP_REGEXES
-    if _SKIP_REGEXES is not None:
-        return _SKIP_REGEXES
+def _parse_agent_reply(content: str, *, require_structured: bool) -> Tuple[Optional[bool], str]:
+    """Parse JSON or prefix-style reply decisions.
 
-    patterns = list(_DEFAULT_SKIP_PATTERNS)
-    extra = os.getenv("EMAIL_SKIP_PATTERNS", "").strip()
-    if extra:
-        patterns.extend(p.strip() for p in extra.split(",") if p.strip())
+    The decision is only accepted at the beginning of the output (or as a
+    whole JSON object), so quoted email text cannot accidentally suppress a
+    reply.  ``None`` means no valid decision was present.
+    """
+    text = (content or "").strip()
+    unfenced = re.sub(
+        r"^\s*```(?:json|yaml|yml)?\s*\n([\s\S]*?)\n```\s*$",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
 
-    _SKIP_REGEXES = [re.compile(p, re.IGNORECASE) for p in patterns]
-    return _SKIP_REGEXES
+    try:
+        payload = json.loads(unfenced)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        normalized = {
+            re.sub(r"[^a-z]", "", str(key).casefold()): value
+            for key, value in payload.items()
+        }
+        decision = None
+        for key in (
+            "needresponse",
+            "needreply",
+            "needsreply",
+            "shouldreply",
+            "shouldrespond",
+            "replyrequired",
+            "responserequired",
+            "respond",
+        ):
+            if key in normalized:
+                decision = _coerce_reply_decision(normalized[key])
+                break
+        body = ""
+        for key in ("response", "reply", "message", "content", "body"):
+            if key in normalized and normalized[key] is not None:
+                body = str(normalized[key]).strip()
+                break
+        if decision is not None:
+            return decision, body
+
+    sentinel = _NO_REPLY_SENTINEL_RE.match(unfenced)
+    if sentinel:
+        return False, unfenced[sentinel.end():].strip()
+
+    match = _RESPONSE_DECISION_RE.match(unfenced)
+    if match:
+        return _coerce_reply_decision(match.group(1)), unfenced[match.end():].strip()
+
+    return (None, "") if require_structured else (True, text)
 
 
-def _should_skip_email(subject: str, body: str) -> bool:
-    """Return True if this email matches skip patterns and should not reach the LLM."""
-    combined = f"{subject}\n{body}" if subject else body
-    for pat in _load_skip_patterns():
-        if pat.search(combined):
-            return True
-    return False
+def _config_bool(
+    extra: Dict[str, Any], env_key: str, extra_key: str, default: bool
+) -> bool:
+    """Resolve an email policy bool from env first, then config.yaml extra."""
+    if env_key in os.environ:
+        return env_bool(env_key, default)
+    if extra_key not in extra:
+        return default
+    value = extra[extra_key]
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"true", "1", "yes", "on"}
+
+
+def _config_text(extra: Dict[str, Any], env_key: str, extra_key: str) -> str:
+    """Resolve a policy string from env first, then config.yaml extra."""
+    if env_key in os.environ:
+        return os.environ.get(env_key, "").strip()
+    return str(extra.get(extra_key, "") or "").strip()
 
 # Gmail-safe max length per email body
 MAX_MESSAGE_LENGTH = 50_000
@@ -503,6 +693,35 @@ class EmailAdapter(BasePlatformAdapter):
         #       skip_attachments: true
         self._skip_attachments = extra.get("skip_attachments", False)
 
+        # Deterministic auto-reply policy.  Category switches default off:
+        # common notifications are suppressed without spending LLM tokens.
+        # Keyword deny rules win over force rules, and force rules win over
+        # category filters.
+        self._category_auto_reply = {
+            category: _config_bool(
+                extra,
+                env_key,
+                f"auto_reply_{category}",
+                False,
+            )
+            for category, env_key in _CATEGORY_SWITCHES.items()
+        }
+        self._force_reply_keywords = _config_text(
+            extra, "EMAIL_FORCE_REPLY_KEYWORDS", "force_reply_keywords"
+        )
+        self._no_reply_keywords = _config_text(
+            extra, "EMAIL_NO_REPLY_KEYWORDS", "no_reply_keywords"
+        )
+        self._custom_skip_patterns = _config_text(
+            extra, "EMAIL_SKIP_PATTERNS", "skip_patterns"
+        )
+        self._require_structured_response = _config_bool(
+            extra,
+            "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
+            "require_structured_response",
+            True,
+        )
+
         # Require the sender's From: domain to be authenticated (SPF/DKIM/DMARC)
         # before trusting it for authorization. The From: header is
         # attacker-controlled and unauthenticated by IMAP, so an allowlist keyed
@@ -537,7 +756,7 @@ class EmailAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
 
         # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        self._thread_context: Dict[str, Dict[str, Any]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -901,29 +1120,61 @@ class EmailAdapter(BasePlatformAdapter):
         body = msg_data["body"].strip()
         attachments = msg_data["attachments"]
 
-        # Pre-filter: skip emails matching notification/advertisement patterns
-        # without ever involving the LLM, saving tokens and latency.
-        if _should_skip_email(subject, body):
+        searchable = f"{subject}\n{body}" if subject else body
+        deny_group = _matching_keyword_group(searchable, self._no_reply_keywords)
+        force_group = _matching_keyword_group(searchable, self._force_reply_keywords)
+
+        # Explicit deny wins conflicts.  It also bypasses the LLM entirely.
+        if deny_group:
             logger.info(
-                "[Email] Skipping (regex match): %s — %s",
-                sender_addr, subject[:80],
+                "[Email] Skipping (no-reply keyword group %r): %s — %s",
+                deny_group,
+                sender_addr,
+                subject[:80],
             )
             return
 
-        # Build message text: include subject as context.
-        # Tell the agent to use structured prefix so the adapter can skip
-        # replies when none are needed.
-        text = (
-            "[Email from "
-            + (msg_data["sender_name"] or sender_addr)
-            + ". First line of your response MUST be:\n"
-            "NEED_RESPONSE: true\n"
-            "or\n"
-            "NEED_RESPONSE: false\n"
-            "(then a blank line, then your message if true). "
-            "If there is NO question or task to address, USE FALSE.]\n\n"
-            + body
-        )
+        force_reply = force_group is not None
+        if not force_reply and _should_skip_email(
+            subject,
+            body,
+            category_auto_reply=self._category_auto_reply,
+            custom_skip_patterns=self._custom_skip_patterns,
+        ):
+            categories = _classify_email(subject, body)
+            logger.info(
+                "[Email] Skipping (policy categories=%s): %s — %s",
+                categories or ["custom-regex"],
+                sender_addr,
+                subject[:80],
+            )
+            return
+
+        # Build message text: include subject as context and a machine-readable
+        # response contract.  JSON is preferred because it is unambiguous, but
+        # send() accepts legacy prefix variants for model/provider compatibility.
+        sender_label = msg_data["sender_name"] or sender_addr
+        if self._require_structured_response:
+            decision_instruction = (
+                "Return ONLY one JSON object with this schema: "
+                '{"need_response": true|false, "response": "reply text"}. '
+                'When no reply is needed, use {"need_response": false, "response": ""}. '
+            )
+        else:
+            decision_instruction = (
+                "Start your response with NEED_RESPONSE: true or "
+                "NEED_RESPONSE: false, followed by a blank line and the reply text. "
+            )
+        if force_reply:
+            decision_instruction += (
+                "A user keyword rule requires a reply: set need_response to true. "
+            )
+        else:
+            decision_instruction += (
+                "If there is no question, request, or task to address, set "
+                "need_response to false. "
+            )
+        text = f"[Email from {sender_label}. {decision_instruction}]\n\n{body}"
         if subject and not subject.startswith("Re:"):
             text = f"[Subject: {subject}]\n\n{text}"
 
@@ -950,6 +1201,7 @@ class EmailAdapter(BasePlatformAdapter):
             "subject": subject,
             "message_id": msg_data["message_id"],
             "uid": msg_data["uid"],
+            "force_reply": force_reply,
         }
 
         source = self.build_source(
@@ -982,22 +1234,37 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an email reply to the given address.
 
-        Parses a NEED_RESPONSE: true/false prefix.  When false, the adapter
-        does NOT send an email — it just marks the original as unseen and
-        returns a no-op success so the agent's output is not delivered.
+        Parses JSON and common NEED_RESPONSE variants.  Explicit false results
+        and malformed strict-mode output never reach SMTP.  A user force-reply
+        keyword rule overrides the model decision.
         """
-        import re as _re
+        ctx = self._thread_context.get(chat_id, {})
+        force_reply = bool(ctx.get("force_reply"))
+        need_response, body = _parse_agent_reply(
+            content,
+            require_structured=self._require_structured_response,
+        )
 
-        need_response = True
-        body = content
-        m = _re.match(r"^NEED_RESPONSE:\s*(true|false)\s*(?:\n|$)", content, _re.IGNORECASE)
-        if m:
-            need_response = m.group(1).lower() == "true"
-            body = content[m.end():].strip()
-
-        if not need_response:
-            logger.info("[Email] NEED_RESPONSE=false — skipping send to %s", chat_id)
+        if force_reply:
+            need_response = True
+            if not body:
+                body = "Your email has been received."
+        elif need_response is None:
+            logger.warning(
+                "[Email] Structured response missing/invalid — suppressing send to %s",
+                chat_id,
+            )
+            return SendResult(success=True, message_id="skipped-invalid-response-format")
+        elif not need_response:
+            logger.info("[Email] Model requested no reply — skipping send to %s", chat_id)
             return SendResult(success=True, message_id="skipped-no-response-needed")
+        elif not body:
+            logger.warning(
+                "[Email] Structured response requested a reply with an empty body — "
+                "suppressing send to %s",
+                chat_id,
+            )
+            return SendResult(success=True, message_id="skipped-empty-response")
 
         try:
             loop = asyncio.get_running_loop()

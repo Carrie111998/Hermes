@@ -37,3 +37,43 @@ optional_env:
     description: "Default address for cron / notification delivery"
     prompt: "Home address"
     password: false
+  - name: EMAIL_AUTO_REPLY_PROMOTIONS
+    description: "Allow promotional and marketing emails to reach the agent"
+    prompt: "Auto-reply to promotions"
+    password: false
+  - name: EMAIL_AUTO_REPLY_NEWSLETTERS
+    description: "Allow newsletters and digests to reach the agent"
+    prompt: "Auto-reply to newsletters"
+    password: false
+  - name: EMAIL_AUTO_REPLY_TRANSACTIONS
+    description: "Allow order, shipping, payment, and invoice notices to reach the agent"
+    prompt: "Auto-reply to transaction notices"
+    password: false
+  - name: EMAIL_AUTO_REPLY_SECURITY
+    description: "Allow verification and security notices to reach the agent"
+    prompt: "Auto-reply to security notices"
+    password: false
+  - name: EMAIL_AUTO_REPLY_SOCIAL
+    description: "Allow social-network notifications to reach the agent"
+    prompt: "Auto-reply to social notifications"
+    password: false
+  - name: EMAIL_AUTO_REPLY_CALENDAR
+    description: "Allow calendar invitations and reminders to reach the agent"
+    prompt: "Auto-reply to calendar notices"
+    password: false
+  - name: EMAIL_AUTO_REPLY_REPORTS
+    description: "Allow recurring reports to reach the agent"
+    prompt: "Auto-reply to recurring reports"
+    password: false
+  - name: EMAIL_FORCE_REPLY_KEYWORDS
+    description: "Semicolon-separated must-reply keyword groups; use + for all terms"
+    prompt: "Must-reply keyword groups"
+    password: false
+  - name: EMAIL_NO_REPLY_KEYWORDS
+    description: "Semicolon-separated no-reply keyword groups; use + for all terms"
+    prompt: "No-reply keyword groups"
+    password: false
+  - name: EMAIL_REQUIRE_STRUCTURED_RESPONSE
+    description: "Require and validate a structured need_response decision"
+    prompt: "Require structured reply decisions"
+    password: false

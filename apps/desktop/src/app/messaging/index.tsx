@@ -75,7 +75,16 @@ function stateTone({ enabled, state }: MessagingPlatformInfo): StatusTone {
 const trimEdits = (edits: Record<string, string>): Record<string, string> =>
   Object.fromEntries(
     Object.entries(edits)
-      .map(([k, v]) => [k, v.trim()])
+      .map(([k, v]) => [
+        k,
+        k === 'EMAIL_FORCE_REPLY_KEYWORDS' || k === 'EMAIL_NO_REPLY_KEYWORDS'
+          ? v
+              .split(/\r?\n/)
+              .map(group => group.trim())
+              .filter(Boolean)
+              .join(';')
+          : v.trim()
+      ])
       .filter(([, v]) => v)
   )
 
@@ -110,6 +119,23 @@ const FIELD_COPY: Record<string, { advanced?: boolean }> = {
   WHATSAPP_ENABLED: { advanced: true },
   WHATSAPP_MODE: { advanced: true }
 }
+
+const EMAIL_CATEGORY_FIELDS = [
+  ['EMAIL_AUTO_REPLY_PROMOTIONS', 'promotions'],
+  ['EMAIL_AUTO_REPLY_NEWSLETTERS', 'newsletters'],
+  ['EMAIL_AUTO_REPLY_TRANSACTIONS', 'transactions'],
+  ['EMAIL_AUTO_REPLY_SECURITY', 'security'],
+  ['EMAIL_AUTO_REPLY_SOCIAL', 'social'],
+  ['EMAIL_AUTO_REPLY_CALENDAR', 'calendar'],
+  ['EMAIL_AUTO_REPLY_REPORTS', 'reports']
+] as const
+
+const EMAIL_POLICY_KEYS = new Set([
+  ...EMAIL_CATEGORY_FIELDS.map(([key]) => key),
+  'EMAIL_FORCE_REPLY_KEYWORDS',
+  'EMAIL_NO_REPLY_KEYWORDS',
+  'EMAIL_REQUIRE_STRUCTURED_RESPONSE'
+])
 
 function fieldCopy(field: MessagingEnvVarInfo, m: Translations['messaging']) {
   const copy = FIELD_COPY[field.key] || {}
@@ -554,9 +580,11 @@ function PlatformDetail({
   const m = t.messaging
   const [showAdvanced, setShowAdvanced] = useState(false)
 
-  const requiredFields = platform.env_vars.filter(field => field.required)
-  const optionalFields = platform.env_vars.filter(field => !field.required && !fieldCopy(field, m).advanced)
-  const advancedFields = platform.env_vars.filter(field => !field.required && fieldCopy(field, m).advanced)
+  const connectionFields =
+    platform.id === 'email' ? platform.env_vars.filter(field => !EMAIL_POLICY_KEYS.has(field.key)) : platform.env_vars
+  const requiredFields = connectionFields.filter(field => field.required)
+  const optionalFields = connectionFields.filter(field => !field.required && !fieldCopy(field, m).advanced)
+  const advancedFields = connectionFields.filter(field => !field.required && fieldCopy(field, m).advanced)
   const hiddenCount = advancedFields.length
 
   return (
@@ -738,7 +766,179 @@ function PlatformDetail({
           )}
         </section>
       )}
+
+      {platform.id === 'email' && (
+        <EmailReplyPolicy
+          edits={edits}
+          fields={platform.env_vars}
+          onClear={onClear}
+          onEdit={onEdit}
+          saving={saving}
+        />
+      )}
     </>
+  )
+}
+
+function EmailReplyPolicy({
+  edits,
+  fields,
+  onClear,
+  onEdit,
+  saving
+}: {
+  edits: Record<string, string>
+  fields: MessagingEnvVarInfo[]
+  onClear: (key: string) => void
+  onEdit: (key: string, value: string) => void
+  saving: string | null
+}) {
+  const { t } = useI18n()
+  const copy = t.messaging.emailPolicy
+  const fieldMap = new Map(fields.map(field => [field.key, field]))
+  const valueFor = (field: MessagingEnvVarInfo) =>
+    Object.hasOwn(edits, field.key) ? edits[field.key] : field.current_value || field.default_value || ''
+
+  return (
+    <section className="overflow-hidden rounded-lg border border-border/80 bg-muted/15">
+      <div className="border-b border-border/70 bg-muted/25 px-4 py-3">
+        <SectionTitle>{copy.title}</SectionTitle>
+        <p className="mt-1 max-w-2xl text-xs leading-5 text-(--ui-text-tertiary)">{copy.description}</p>
+      </div>
+
+      <div className="space-y-5 p-4">
+        <div>
+          <h5 className="text-xs font-medium text-foreground">{copy.categoriesTitle}</h5>
+          <p className="mt-1 text-xs leading-5 text-(--ui-text-tertiary)">{copy.categoriesDescription}</p>
+          <div className="mt-3 grid gap-2 sm:grid-cols-2">
+            {EMAIL_CATEGORY_FIELDS.map(([key, labelKey]) => {
+              const field = fieldMap.get(key)
+              if (!field) {
+                return null
+              }
+              const checked = valueFor(field).toLowerCase() === 'true'
+
+              return (
+                <label
+                  className="flex min-h-14 cursor-pointer items-center justify-between gap-3 rounded-md border border-border/70 bg-background/50 px-3 py-2 transition-colors hover:border-border"
+                  htmlFor={`messaging-policy-${key}`}
+                  key={key}
+                >
+                  <span>
+                    <span className="block text-xs font-medium text-foreground">{copy[labelKey]}</span>
+                    <span className="mt-0.5 block text-[0.68rem] text-(--ui-text-tertiary)">
+                      {copy.allowCategory}
+                    </span>
+                  </span>
+                  <Switch
+                    checked={checked}
+                    id={`messaging-policy-${key}`}
+                    onCheckedChange={next => onEdit(key, next ? 'true' : 'false')}
+                    size="xs"
+                  />
+                </label>
+              )
+            })}
+          </div>
+        </div>
+
+        <div className="border-t border-border/70 pt-5">
+          <h5 className="text-xs font-medium text-foreground">{copy.keywordsTitle}</h5>
+          <p className="mt-1 text-xs leading-5 text-(--ui-text-tertiary)">{copy.keywordsDescription}</p>
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            {[
+              {
+                key: 'EMAIL_NO_REPLY_KEYWORDS',
+                title: copy.neverReply,
+                description: copy.neverReplyDescription,
+                tone: 'border-destructive/30 bg-destructive/5'
+              },
+              {
+                key: 'EMAIL_FORCE_REPLY_KEYWORDS',
+                title: copy.mustReply,
+                description: copy.mustReplyDescription,
+                tone: 'border-primary/30 bg-primary/5'
+              }
+            ].map(rule => {
+              const field = fieldMap.get(rule.key)
+              if (!field) {
+                return null
+              }
+              const value = valueFor(field).replace(/;/g, '\n')
+
+              return (
+                <div className={cn('rounded-md border p-3', rule.tone)} key={rule.key}>
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <label className="text-xs font-medium text-foreground" htmlFor={`messaging-policy-${rule.key}`}>
+                        {rule.title}
+                      </label>
+                      <p className="mt-1 text-[0.68rem] leading-4 text-(--ui-text-tertiary)">
+                        {rule.description}
+                      </p>
+                    </div>
+                    {field.is_set && (
+                      <Button
+                        aria-label={copy.clearKeywords}
+                        disabled={saving === `clear:${rule.key}`}
+                        onClick={() => onClear(rule.key)}
+                        size="sm"
+                        variant="ghost"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                  <textarea
+                    className="mt-3 min-h-28 w-full resize-y rounded-md border border-border bg-background px-3 py-2 text-xs leading-5 outline-none transition-shadow focus:border-primary focus:ring-2 focus:ring-primary/15"
+                    id={`messaging-policy-${rule.key}`}
+                    onChange={event => onEdit(rule.key, event.target.value)}
+                    placeholder={copy.keywordPlaceholder}
+                    value={value}
+                  />
+                  <p className="mt-1.5 text-[0.66rem] leading-4 text-(--ui-text-tertiary)">{copy.keywordSyntax}</p>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        {(() => {
+          const field = fieldMap.get('EMAIL_REQUIRE_STRUCTURED_RESPONSE')
+          if (!field) {
+            return null
+          }
+          const checked = valueFor(field).toLowerCase() === 'true'
+
+          return (
+            <div className="border-t border-border/70 pt-5">
+              <h5 className="text-xs font-medium text-foreground">{copy.decisionTitle}</h5>
+              <label
+                className="mt-3 flex cursor-pointer items-start justify-between gap-4 rounded-md border border-border/70 bg-background/50 px-3 py-3"
+                htmlFor={`messaging-policy-${field.key}`}
+              >
+                <span>
+                  <span className="block text-xs font-medium text-foreground">{copy.strictDecision}</span>
+                  <span className="mt-1 block text-[0.68rem] leading-4 text-(--ui-text-tertiary)">
+                    {copy.strictDecisionDescription}
+                  </span>
+                </span>
+                <Switch
+                  checked={checked}
+                  id={`messaging-policy-${field.key}`}
+                  onCheckedChange={next => onEdit(field.key, next ? 'true' : 'false')}
+                  size="xs"
+                />
+              </label>
+              <div className="mt-3 border-l-2 border-primary/60 bg-primary/5 px-3 py-2 text-xs leading-5">
+                <span className="font-medium text-foreground">{copy.priorityLabel}: </span>
+                <span className="text-(--ui-text-tertiary)">{copy.priorityText}</span>
+              </div>
+            </div>
+          )
+        })()}
+      </div>
+    </section>
   )
 }
 

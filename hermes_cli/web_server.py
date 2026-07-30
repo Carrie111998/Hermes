@@ -8077,6 +8077,9 @@ def _messaging_env_info(key: str) -> dict[str, Any]:
         "url": info.get("url"),
         "is_password": info.get("password", False),
         "advanced": info.get("advanced", False),
+        "input_type": info.get("input_type", "password" if info.get("password") else "text"),
+        "default_value": str(info.get("default_value", "")),
+        "expose_value": bool(info.get("expose_value", False)),
     }
 
 
@@ -8134,13 +8137,20 @@ def _messaging_platform_payload(
         # (loaded at startup) and would falsely report the root credentials
         # as the profile's.
         value = env_on_disk.get(key) or ("" if scoped else os.getenv(key, ""))
+        info = _messaging_env_info(key)
+        current_value = ""
+        if info["input_type"] == "boolean":
+            current_value = value if value else info["default_value"]
+        elif info["expose_value"]:
+            current_value = value
         env_vars.append(
             {
                 "key": key,
                 "required": key in entry["required_env"],
                 "is_set": bool(value),
                 "redacted_value": redact_key(value) if value else None,
-                **_messaging_env_info(key),
+                "current_value": current_value,
+                **info,
             }
         )
 

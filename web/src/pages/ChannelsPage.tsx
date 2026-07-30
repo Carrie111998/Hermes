@@ -4,14 +4,18 @@ import {
   Bot,
   Check,
   CheckCircle2,
+  ChevronDown,
   ExternalLink,
   Info,
+  Mail,
   PlugZap,
   QrCode,
   Radio,
   RotateCw,
   Save,
   Settings2,
+  ShieldCheck,
+  Tags,
   WifiOff,
   X,
 } from "lucide-react";
@@ -35,6 +39,8 @@ import type {
 } from "@/lib/api";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { usePageHeader } from "@/contexts/usePageHeader";
+import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 import { cn, themedBody } from "@/lib/utils";
 
 // State → badge mapping. The backend emits a small, fixed vocabulary plus
@@ -64,6 +70,30 @@ const SLACK_TOKEN_PREFIXES: Record<string, string> = {
   SLACK_BOT_TOKEN: "xoxb-",
   SLACK_APP_TOKEN: "xapp-",
 };
+
+const EMAIL_PRIMARY_CONNECTION_KEYS = new Set([
+  "EMAIL_ADDRESS",
+  "EMAIL_PASSWORD",
+  "EMAIL_IMAP_HOST",
+  "EMAIL_SMTP_HOST",
+]);
+
+const EMAIL_CATEGORY_FIELDS = [
+  ["EMAIL_AUTO_REPLY_PROMOTIONS", "promotions"],
+  ["EMAIL_AUTO_REPLY_NEWSLETTERS", "newsletters"],
+  ["EMAIL_AUTO_REPLY_TRANSACTIONS", "transactions"],
+  ["EMAIL_AUTO_REPLY_SECURITY", "security"],
+  ["EMAIL_AUTO_REPLY_SOCIAL", "social"],
+  ["EMAIL_AUTO_REPLY_CALENDAR", "calendar"],
+  ["EMAIL_AUTO_REPLY_REPORTS", "reports"],
+] as const;
+
+const EMAIL_POLICY_KEYS = new Set([
+  ...EMAIL_CATEGORY_FIELDS.map(([key]) => key),
+  "EMAIL_FORCE_REPLY_KEYWORDS",
+  "EMAIL_NO_REPLY_KEYWORDS",
+  "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
+]);
 
 function validateMessagingEnvField(field: MessagingPlatformEnvVar, value: string): string | null {
   const trimmed = value.trim();
@@ -137,11 +167,14 @@ export default function ChannelsPage() {
   );
   const [loading, setLoading] = useState(true);
   const { toast, showToast } = useToast();
+  const { t } = useI18n();
+  const emailCopy = t.emailPolicy ?? en.emailPolicy!;
   const { setEnd } = usePageHeader();
 
   // Config modal state
   const [editing, setEditing] = useState<MessagingPlatform | null>(null);
   const [draftEnv, setDraftEnv] = useState<Record<string, string>>({});
+  const [touchedEnv, setTouchedEnv] = useState<Set<string>>(new Set());
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const closeEdit = useCallback(() => {
@@ -176,22 +209,51 @@ export default function ChannelsPage() {
   const openConfig = (platform: MessagingPlatform) => {
     const initial: Record<string, string> = {};
     platform.env_vars.forEach((v) => {
-      initial[v.key] = "";
+      initial[v.key] = v.current_value || "";
     });
     setDraftEnv(initial);
+    setTouchedEnv(new Set());
     setFieldErrors({});
     setEditing(platform);
   };
 
+  const updateDraftField = useCallback((key: string, value: string) => {
+    setDraftEnv((prev) => ({ ...prev, [key]: value }));
+    setTouchedEnv((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+    setFieldErrors((prev) => {
+      if (!prev[key]) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
   const handleSave = async () => {
     if (!editing) return;
-    // Only send fields the user actually filled in — leaving a field blank
-    // preserves the existing value rather than clobbering it.
+    // Only send fields the user touched. Untouched blanks preserve existing
+    // secrets, while clearing a touched keyword field removes that rule.
     const env: Record<string, string> = {};
-    Object.entries(draftEnv).forEach(([k, v]) => {
-      if (v.trim()) env[k] = v.trim();
+    const clear_env: string[] = [];
+    touchedEnv.forEach((key) => {
+      const field = editing.env_vars.find((item) => item.key === key);
+      let value = draftEnv[key] || "";
+      if (field?.input_type === "textarea") {
+        value = value
+          .split(/\r?\n/)
+          .map((part) => part.trim())
+          .filter(Boolean)
+          .join(";");
+      } else {
+        value = value.trim();
+      }
+      if (value) env[key] = value;
+      else clear_env.push(key);
     });
-    if (Object.keys(env).length === 0) {
+    if (Object.keys(env).length === 0 && clear_env.length === 0) {
       showToast("Nothing to save — fill in at least one field.", "error");
       return;
     }
@@ -214,7 +276,7 @@ export default function ChannelsPage() {
     }
     setSaving(true);
     try {
-      const body: MessagingPlatformUpdate = { env, enabled: true };
+      const body: MessagingPlatformUpdate = { env, clear_env, enabled: true };
       await api.updateMessagingPlatform(editing.id, body);
       showToast(`${editing.name} saved`, "success");
       setEditing(null);
@@ -294,6 +356,24 @@ export default function ChannelsPage() {
     () => platforms.filter((p) => p.configured).length,
     [platforms],
   );
+  const editingFieldMap = useMemo(
+    () => new Map((editing?.env_vars ?? []).map((field) => [field.key, field])),
+    [editing],
+  );
+  const emailPrimaryFields =
+    editing?.id === "email"
+      ? editing.env_vars.filter((field) =>
+          EMAIL_PRIMARY_CONNECTION_KEYS.has(field.key),
+        )
+      : [];
+  const emailAdvancedFields =
+    editing?.id === "email"
+      ? editing.env_vars.filter(
+          (field) =>
+            !EMAIL_PRIMARY_CONNECTION_KEYS.has(field.key) &&
+            !EMAIL_POLICY_KEYS.has(field.key),
+        )
+      : [];
 
   if (loading) {
     return (
@@ -302,6 +382,80 @@ export default function ChannelsPage() {
       </div>
     );
   }
+
+  const renderEnvField = (field: MessagingPlatformEnvVar) => (
+    <div className="grid gap-1.5" key={field.key}>
+      <div className="flex items-center gap-1.5">
+        <Label htmlFor={`field-${field.key}`}>
+          {field.prompt || field.key}
+          {field.required ? " *" : ""}
+        </Label>
+        {field.help && (
+          <span
+            aria-label={field.help}
+            className="inline-flex text-muted-foreground hover:text-foreground"
+            role="img"
+            title={field.help}
+          >
+            <Info className="h-3.5 w-3.5" />
+          </span>
+        )}
+      </div>
+      {field.description && (
+        <span className="text-xs text-muted-foreground">
+          {field.description}
+        </span>
+      )}
+      {field.input_type === "boolean" ? (
+        <div className="flex items-center justify-between border border-border px-3 py-2">
+          <span className="text-xs text-muted-foreground">
+            {(draftEnv[field.key] || field.default_value).toLowerCase() ===
+            "true"
+              ? t.common.enabled
+              : t.common.disabled}
+          </span>
+          <Switch
+            id={`field-${field.key}`}
+            checked={
+              (draftEnv[field.key] || field.default_value).toLowerCase() ===
+              "true"
+            }
+            onCheckedChange={(checked) =>
+              updateDraftField(field.key, checked ? "true" : "false")
+            }
+          />
+        </div>
+      ) : field.input_type === "textarea" ? (
+        <textarea
+          id={`field-${field.key}`}
+          className="min-h-24 w-full resize-y border border-input bg-transparent px-3 py-2 text-base leading-6 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 sm:text-xs sm:leading-4"
+          placeholder={emailCopy.keywordPlaceholder}
+          value={(draftEnv[field.key] ?? "").replace(/;/g, "\n")}
+          aria-invalid={Boolean(fieldErrors[field.key])}
+          onChange={(event) => updateDraftField(field.key, event.target.value)}
+        />
+      ) : (
+        <Input
+          id={`field-${field.key}`}
+          type={field.is_password ? "password" : "text"}
+          className="text-base leading-6 sm:text-xs sm:leading-4"
+          placeholder={
+            field.is_set
+              ? field.redacted_value || "••••••"
+              : field.prompt || field.key
+          }
+          value={draftEnv[field.key] ?? ""}
+          aria-invalid={Boolean(fieldErrors[field.key])}
+          onChange={(event) => updateDraftField(field.key, event.target.value)}
+        />
+      )}
+      {fieldErrors[field.key] && (
+        <span className="text-xs text-destructive">
+          {fieldErrors[field.key]}
+        </span>
+      )}
+    </div>
+  );
 
   return (
     <div className="flex flex-col gap-6">
@@ -366,7 +520,8 @@ export default function ChannelsPage() {
           <div
             className={cn(
               themedBody,
-              "relative flex max-h-[calc(100dvh-2rem)] w-full max-w-lg flex-col border border-border bg-card shadow-2xl sm:max-h-[90dvh]",
+              "relative flex max-h-[calc(100dvh-2rem)] w-full flex-col border border-border bg-card shadow-2xl sm:max-h-[90dvh]",
+              editing.id === "email" ? "max-w-2xl" : "max-w-lg",
             )}
           >
             <Button
@@ -374,7 +529,7 @@ export default function ChannelsPage() {
               size="icon"
               onClick={() => setEditing(null)}
               className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
-              aria-label="Close"
+              aria-label={t.common.close}
             >
               <X />
             </Button>
@@ -386,6 +541,8 @@ export default function ChannelsPage() {
               >
                 {editing.id === "telegram"
                   ? "Use your own Telegram bot"
+                  : editing.id === "email"
+                    ? emailCopy.title
                   : `Configure ${editing.name}`}
               </h2>
               {editing.docs_url && (
@@ -395,7 +552,9 @@ export default function ChannelsPage() {
                   rel="noopener noreferrer"
                   className="mt-1 inline-flex items-center gap-1 text-xs text-primary hover:underline"
                 >
-                  {editing.id === "telegram" ? "BotFather guide" : "Setup guide"}
+                  {editing.id === "telegram"
+                    ? "BotFather guide"
+                    : t.app.nav.documentation}
                   <ExternalLink className="h-3 w-3" />
                 </a>
               )}
@@ -445,61 +604,214 @@ export default function ChannelsPage() {
                   </p>
                 </div>
               )}
-              <p className="text-xs text-muted-foreground">
-                {editing.description}
-              </p>
-              {editing.env_vars.map((field: MessagingPlatformEnvVar) => (
-                <div className="grid gap-1.5" key={field.key}>
-                  <div className="flex items-center gap-1.5">
-                    <Label htmlFor={`field-${field.key}`}>
-                      {field.prompt || field.key}
-                      {field.required ? " *" : ""}
-                    </Label>
-                    {field.help && (
-                      <span
-                        aria-label={field.help}
-                        className="inline-flex text-muted-foreground hover:text-foreground"
-                        role="img"
-                        title={field.help}
-                      >
-                        <Info className="h-3.5 w-3.5" />
-                      </span>
+              {editing.id !== "email" && (
+                <p className="text-xs text-muted-foreground">
+                  {editing.description}
+                </p>
+              )}
+              {editing.id === "email" ? (
+                <>
+                  <section className="grid gap-4 border border-border bg-background/35 p-4">
+                    <div className="flex items-start gap-3">
+                      <Mail className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                      <div className="grid gap-0.5">
+                        <h3 className="text-sm font-medium">
+                          {emailCopy.connectionTitle}
+                        </h3>
+                        <p className="text-xs text-muted-foreground">
+                          {emailCopy.connectionDescription}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      {emailPrimaryFields.map(renderEnvField)}
+                    </div>
+                    {emailAdvancedFields.length > 0 && (
+                      <details className="group border-t border-border pt-3">
+                        <summary className="flex cursor-pointer list-none items-center justify-between gap-3 text-sm">
+                          <span>
+                            {emailCopy.advancedConnection}
+                            <span className="ms-2 text-xs text-muted-foreground">
+                              {emailAdvancedFields.length}
+                            </span>
+                          </span>
+                          <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+                        </summary>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {emailCopy.advancedConnectionDescription}
+                        </p>
+                        <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                          {emailAdvancedFields.map(renderEnvField)}
+                        </div>
+                      </details>
                     )}
-                  </div>
-                  {field.description && (
-                    <span className="text-xs text-muted-foreground">
-                      {field.description}
-                    </span>
-                  )}
-                  <Input
-                    id={`field-${field.key}`}
-                    type={field.is_password ? "password" : "text"}
-                    className="text-base leading-6 sm:text-xs sm:leading-4"
-                    placeholder={
-                      field.is_set
-                        ? field.redacted_value || "•••••• (set — leave blank to keep)"
-                        : field.key
-                    }
-                    value={draftEnv[field.key] ?? ""}
-                    aria-invalid={Boolean(fieldErrors[field.key])}
-                    onChange={(e) => {
-                      const nextValue = e.target.value;
-                      setDraftEnv((prev) => ({ ...prev, [field.key]: nextValue }));
-                      setFieldErrors((prev) => {
-                        if (!prev[field.key]) return prev;
-                        const next = { ...prev };
-                        delete next[field.key];
-                        return next;
-                      });
-                    }}
-                  />
-                  {fieldErrors[field.key] && (
-                    <span className="text-xs text-destructive">
-                      {fieldErrors[field.key]}
-                    </span>
-                  )}
-                </div>
-              ))}
+                  </section>
+
+                  <section className="grid gap-4 border border-border p-4">
+                    <div className="flex items-start gap-3">
+                      <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                      <div className="grid gap-0.5">
+                        <h3 className="text-sm font-medium">{emailCopy.title}</h3>
+                        <p className="text-xs text-muted-foreground">
+                          {emailCopy.description}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2">
+                      <div>
+                        <h4 className="text-xs font-medium">
+                          {emailCopy.categoriesTitle}
+                        </h4>
+                        <p className="mt-0.5 text-xs text-muted-foreground">
+                          {emailCopy.categoriesDescription}
+                        </p>
+                      </div>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        {EMAIL_CATEGORY_FIELDS.map(([key, labelKey]) => {
+                          const field = editingFieldMap.get(key);
+                          if (!field) return null;
+                          const enabled =
+                            (
+                              draftEnv[key] ||
+                              field.default_value
+                            ).toLowerCase() === "true";
+                          return (
+                            <div
+                              className="flex min-h-14 items-center justify-between gap-3 border border-border px-3 py-2"
+                              key={key}
+                            >
+                              <div className="grid gap-0.5">
+                                <Label htmlFor={`field-${key}`}>
+                                  {emailCopy[labelKey]}
+                                </Label>
+                                <span className="text-[11px] text-muted-foreground">
+                                  {emailCopy.allowCategory}
+                                </span>
+                              </div>
+                              <Switch
+                                id={`field-${key}`}
+                                checked={enabled}
+                                onCheckedChange={(checked) =>
+                                  updateDraftField(
+                                    key,
+                                    checked ? "true" : "false",
+                                  )
+                                }
+                              />
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2 border-t border-border pt-4">
+                      <div className="flex items-start gap-2">
+                        <Tags className="mt-0.5 h-3.5 w-3.5 text-muted-foreground" />
+                        <div>
+                          <h4 className="text-xs font-medium">
+                            {emailCopy.keywordsTitle}
+                          </h4>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            {emailCopy.keywordsDescription}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        {[
+                          {
+                            key: "EMAIL_NO_REPLY_KEYWORDS",
+                            title: emailCopy.neverReply,
+                            description: emailCopy.neverReplyDescription,
+                            tone: "border-destructive/35 bg-destructive/5",
+                          },
+                          {
+                            key: "EMAIL_FORCE_REPLY_KEYWORDS",
+                            title: emailCopy.mustReply,
+                            description: emailCopy.mustReplyDescription,
+                            tone: "border-primary/35 bg-primary/5",
+                          },
+                        ].map((rule) => (
+                          <div
+                            className={cn("grid gap-2 border p-3", rule.tone)}
+                            key={rule.key}
+                          >
+                            <div>
+                              <Label htmlFor={`field-${rule.key}`}>
+                                {rule.title}
+                              </Label>
+                              <p className="mt-0.5 text-[11px] leading-4 text-muted-foreground">
+                                {rule.description}
+                              </p>
+                            </div>
+                            <textarea
+                              id={`field-${rule.key}`}
+                              className="min-h-28 w-full resize-y border border-input bg-background px-3 py-2 text-base leading-6 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 sm:text-xs sm:leading-4"
+                              placeholder={emailCopy.keywordPlaceholder}
+                              value={(draftEnv[rule.key] ?? "").replace(/;/g, "\n")}
+                              onChange={(event) =>
+                                updateDraftField(rule.key, event.target.value)
+                              }
+                            />
+                            <span className="text-[11px] text-muted-foreground">
+                              {emailCopy.keywordSyntax}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {(() => {
+                      const strictField = editingFieldMap.get(
+                        "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
+                      );
+                      if (!strictField) return null;
+                      const checked =
+                        (
+                          draftEnv[strictField.key] ||
+                          strictField.default_value
+                        ).toLowerCase() === "true";
+                      return (
+                        <div className="grid gap-3 border-t border-border pt-4">
+                          <h4 className="text-xs font-medium">
+                            {emailCopy.decisionTitle}
+                          </h4>
+                          <div className="flex items-start justify-between gap-4 border border-border px-3 py-3">
+                            <div className="grid gap-0.5">
+                              <Label htmlFor={`field-${strictField.key}`}>
+                                {emailCopy.strictDecision}
+                              </Label>
+                              <p className="text-[11px] leading-4 text-muted-foreground">
+                                {emailCopy.strictDecisionDescription}
+                              </p>
+                            </div>
+                            <Switch
+                              id={`field-${strictField.key}`}
+                              checked={checked}
+                              onCheckedChange={(next) =>
+                                updateDraftField(
+                                  strictField.key,
+                                  next ? "true" : "false",
+                                )
+                              }
+                            />
+                          </div>
+                          <div className="border-s-2 border-primary/60 bg-primary/5 px-3 py-2 text-xs">
+                            <span className="font-medium">
+                              {emailCopy.priorityLabel}:{" "}
+                            </span>
+                            <span className="text-muted-foreground">
+                              {emailCopy.priorityText}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </section>
+                </>
+              ) : (
+                editing.env_vars.map(renderEnvField)
+              )}
 
               <div className="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:justify-end">
                 <Button
@@ -508,7 +820,7 @@ export default function ChannelsPage() {
                   className="w-full sm:w-auto"
                   onClick={() => setEditing(null)}
                 >
-                  Cancel
+                  {t.common.cancel}
                 </Button>
                 <Button
                   className="w-full uppercase sm:w-auto"
@@ -517,7 +829,7 @@ export default function ChannelsPage() {
                   disabled={saving}
                   prefix={saving ? <Spinner /> : undefined}
                 >
-                  {saving ? "Saving…" : "Save & enable"}
+                  {saving ? t.common.saving : t.common.save}
                 </Button>
               </div>
             </div>
