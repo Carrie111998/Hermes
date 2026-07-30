@@ -60,7 +60,7 @@ class ExampleGate:
 
 
 def register(ctx):
-    ctx.register_turn_gate_provider(ExampleGate())
+    ctx.register_turn_gate_provider(ExampleGate(), api_version=1)
 ```
 
 `acquire(request)` returns a `GateDecision`. `validate(decision, checkpoint)`
@@ -70,10 +70,15 @@ generation changes, state downgrades, widened tool permissions, and changed
 child-environment contributions. `release(decision)` runs in `finally` after the
 outer turn.
 
-Provider exceptions and async provider methods fail closed. A provider may
-implement `record_tool_observation(...)` when `RELOAD_ONLY` turns require a
-host-observed successful main `skill_view`; invalid or unrecordable evidence
-poisons the turn.
+Provider exceptions and async provider methods fail closed. A plugin must
+declare the exact host contract version when registering; this document defines
+`api_version=1`, and mismatches are rejected before the provider can replace a
+live registration. A provider may implement `record_tool_observation(...)` to
+interpret the generic `(tool_name, tool_args, tool_call_id, result)` envelope.
+Hermes does not recognize policy-specific tools or result fields. A provider
+rejection or exception poisons the turn; a provider without an observation
+callback leaves the gate state unchanged, so `RELOAD_ONLY` still cannot emit
+business output.
 
 ## Gate states
 

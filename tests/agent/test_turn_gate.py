@@ -22,6 +22,7 @@ from agent.turn_gate import (
     enforce_output_allowed,
     enforce_tool_allowed,
     inject_turn_gate_child_environment,
+    record_tool_observation,
     register_turn_gate_provider,
 )
 
@@ -223,6 +224,48 @@ def test_outer_turn_reuses_one_lease_and_releases_once() -> None:
     assert provider.acquire_calls == 1
     assert provider.release_calls == 1
     assert provider.validate_calls == ["tool:terminal", "output"]
+
+
+def test_tool_observation_is_policy_neutral_and_forwarded_to_provider() -> None:
+    class ObservingProvider(FakeProvider):
+        def __init__(self, decision: GateDecision) -> None:
+            super().__init__(decision)
+            self.observations: list[tuple[object, ...]] = []
+
+        def record_tool_observation(
+            self,
+            decision,
+            request,
+            tool_name,
+            tool_args,
+            tool_call_id,
+            result,
+        ) -> None:
+            self.observations.append(
+                (decision, request, tool_name, tool_args, tool_call_id, result)
+            )
+
+    _configure()
+    provider = ObservingProvider(_decision())
+    _register(provider)
+    opaque_result = object()
+
+    with acquire_outer_turn(_request()):
+        record_tool_observation(
+            tool_name="provider-owned-tool",
+            tool_args={"provider_owned": True},
+            tool_call_id="provider-owned-call",
+            result=opaque_result,
+        )
+
+    assert len(provider.observations) == 1
+    observation = provider.observations[0]
+    assert observation[2:] == (
+        "provider-owned-tool",
+        {"provider_owned": True},
+        "provider-owned-call",
+        opaque_result,
+    )
 
 
 def test_reload_only_uses_exact_tool_allowlist_and_blocks_output() -> None:

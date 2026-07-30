@@ -11,7 +11,6 @@ import asyncio
 import hashlib
 import hmac
 import inspect
-import json
 import os
 import re
 import threading
@@ -25,6 +24,7 @@ from typing import Any, Iterator, Mapping, Protocol, cast
 
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ALLOWED_PURPOSES = frozenset({"business", "reload"})
+TURN_GATE_API_VERSION = 1
 
 
 class GateState(str, Enum):
@@ -190,6 +190,7 @@ def register_turn_gate_provider(
     provider: TurnGateProvider,
     *,
     owner_id: str,
+    api_version: int = TURN_GATE_API_VERSION,
     replace: bool = False,
 ) -> None:
     """Register a provider owned by the plugin with the same manifest key."""
@@ -197,6 +198,11 @@ def register_turn_gate_provider(
         raise ValueError("turn gate provider id must be non-empty text")
     if type(owner_id) is not str or owner_id != provider_id:
         raise ValueError("turn gate provider id must match its plugin manifest owner")
+    if type(api_version) is not int or api_version != TURN_GATE_API_VERSION:
+        raise ValueError(
+            "turn gate provider API version mismatch: "
+            f"expected {TURN_GATE_API_VERSION}, got {api_version!r}"
+        )
     methods = tuple(getattr(provider, method, None) for method in (
         "acquire",
         "validate",
@@ -605,39 +611,25 @@ def record_tool_observation(
     tool_call_id: str,
     result: Any,
 ) -> None:
-    """Record a host-observed successful main ``skill_view`` invocation."""
-    if tool_name != "skill_view":
-        return
+    """Forward a host-observed tool result to the configured provider.
+
+    Hermes validates only the policy-neutral event envelope.  The provider
+    owns every semantic decision about which tool/result can satisfy its gate.
+    """
     decision = _revalidate_current("tool-observation")
     if decision is None:
         return
     try:
-        if not tool_call_id:
-            raise ValueError("skill observation requires tool_call_id")
+        if type(tool_name) is not str or not tool_name.strip():
+            raise ValueError("tool observation requires a tool name")
+        if type(tool_call_id) is not str or not tool_call_id.strip():
+            raise ValueError("tool observation requires tool_call_id")
         if (
             not isinstance(tool_args, dict)
-            or not isinstance(tool_args.get("name"), str)
-            or not tool_args["name"]
         ):
-            raise ValueError("skill observation requires a skill name")
-        if tool_args.get("file_path") not in (None, ""):
-            raise ValueError("linked skill files cannot satisfy reload observation")
-        if not isinstance(result, str):
-            raise ValueError("skill observation result must be JSON text")
-        payload = json.loads(result)
-        if (
-            not isinstance(payload, dict)
-            or payload.get("success") is not True
-            or payload.get("name") != tool_args["name"]
-            or not isinstance(payload.get("skill_dir"), str)
-            or not os.path.isabs(payload["skill_dir"])
-            or payload.get("file_path") not in (None, "")
-        ):
-            raise ValueError(
-                "skill observation result is not a successful main skill load"
-            )
+            raise ValueError("tool observation requires a tool argument mapping")
     except Exception as exc:
-        reason = "skill observation evidence is invalid"
+        reason = "tool observation envelope is invalid"
         _poison_current(reason)
         raise TurnGateBlocked(reason) from exc
 
@@ -647,10 +639,6 @@ def record_tool_observation(
     provider_id, provider = required
     recorder = getattr(provider, "record_tool_observation", None)
     if not callable(recorder):
-        if decision.state is GateState.RELOAD_ONLY:
-            reason = "required provider cannot record reload observations"
-            _poison_current(reason)
-            raise TurnGateBlocked(reason)
         return
     request = _current_request.get()
     if request is None:
@@ -738,6 +726,7 @@ __all__ = [
     "TurnGateBlocked",
     "TurnGateProvider",
     "TurnGateRequest",
+    "TURN_GATE_API_VERSION",
     "acquire_outer_turn",
     "build_runtime_identity",
     "clear_turn_gate_registry_for_testing",

@@ -78,18 +78,36 @@ def test_plugin_context_registers_provider_under_its_own_manifest_id():
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     context = PluginContext(manifest, manager)
-    context.register_turn_gate_provider(PluginGateProvider("secure-gate"))
+    context.register_turn_gate_provider(
+        PluginGateProvider("secure-gate"), api_version=1
+    )
     _configure_gate("secure-gate")
 
     with acquire_outer_turn(gate_request()) as lease:
         assert lease.provider_id == "secure-gate"
 
 
+def test_plugin_provider_must_declare_exact_turn_gate_api_version():
+    manager = PluginManager()
+    manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
+    context = PluginContext(manifest, manager)
+
+    with pytest.raises(ValueError, match="API version"):
+        context.register_turn_gate_provider(PluginGateProvider("secure-gate"))
+    with pytest.raises(ValueError, match="API version"):
+        context.register_turn_gate_provider(
+            PluginGateProvider("secure-gate"),
+            api_version=2,
+        )
+
+
 def test_plugin_provider_identity_mismatch_fails_closed():
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     context = PluginContext(manifest, manager)
-    context.register_turn_gate_provider(PluginGateProvider("impersonated-gate"))
+    context.register_turn_gate_provider(
+        PluginGateProvider("impersonated-gate"), api_version=1
+    )
     _configure_gate("secure-gate")
 
     with pytest.raises(TurnGateBlocked, match="identity mismatch"):
@@ -101,7 +119,9 @@ def test_force_reload_unregisters_stale_provider_even_in_safe_mode(monkeypatch):
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     context = PluginContext(manifest, manager)
-    context.register_turn_gate_provider(PluginGateProvider("secure-gate"))
+    context.register_turn_gate_provider(
+        PluginGateProvider("secure-gate"), api_version=1
+    )
     _configure_gate("secure-gate")
     manager._discovered = True
     monkeypatch.setenv("HERMES_SAFE_MODE", "1")
@@ -126,7 +146,7 @@ def test_failed_plugin_load_rolls_back_registered_gate_provider(tmp_path):
         "    def release(self, decision):\n"
         "        return None\n\n"
         "def register(ctx):\n"
-        "    ctx.register_turn_gate_provider(Provider())\n"
+        "    ctx.register_turn_gate_provider(Provider(), api_version=1)\n"
         "    raise RuntimeError('replacement failed after registration')\n",
         encoding="utf-8",
     )
@@ -152,7 +172,7 @@ def test_failed_same_id_replacement_restores_previous_gate_provider(tmp_path):
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     PluginContext(manifest, manager).register_turn_gate_provider(
-        PluginGateProvider("secure-gate")
+        PluginGateProvider("secure-gate"), api_version=1
     )
 
     plugin_dir = tmp_path / "replacement-gate"
@@ -165,7 +185,7 @@ def test_failed_same_id_replacement_restores_previous_gate_provider(tmp_path):
         "    def validate(self, decision, checkpoint): return decision\n"
         "    def release(self, decision): return None\n\n"
         "def register(ctx):\n"
-        "    ctx.register_turn_gate_provider(Replacement())\n"
+        "    ctx.register_turn_gate_provider(Replacement(), api_version=1)\n"
         "    raise RuntimeError('same-id replacement failed')\n",
         encoding="utf-8",
     )
@@ -204,7 +224,9 @@ def test_force_full_round_failure_restores_previous_gate_provider_and_state(
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     old_provider = PluginGateProvider("secure-gate")
-    PluginContext(manifest, manager).register_turn_gate_provider(old_provider)
+    PluginContext(manifest, manager).register_turn_gate_provider(
+        old_provider, api_version=1
+    )
 
     # Other pre-existing manager state that force-reload wipes before the round.
     sentinel_plugin = object()
@@ -227,7 +249,7 @@ def test_force_full_round_failure_restores_previous_gate_provider_and_state(
             "    def validate(self, decision, checkpoint): return decision\n"
             "    def release(self, decision): return None\n\n"
             "def register(ctx):\n"
-            "    ctx.register_turn_gate_provider(Replacement())\n"
+            "    ctx.register_turn_gate_provider(Replacement(), api_version=1)\n"
             "    raise RuntimeError('same-id replacement failed mid-round')\n"
         )
     (plugin_dir / "__init__.py").write_text(module_source, encoding="utf-8")
@@ -276,7 +298,9 @@ def test_force_round_rolls_back_unrelated_plugin_failure_after_gate_replacement(
     manager = PluginManager()
     manifest = PluginManifest(name="secure-gate", key="secure-gate", source="user")
     old_provider = PluginGateProvider("secure-gate")
-    PluginContext(manifest, manager).register_turn_gate_provider(old_provider)
+    PluginContext(manifest, manager).register_turn_gate_provider(
+        old_provider, api_version=1
+    )
 
     sentinel_plugin = object()
     sentinel_hook = lambda **_: None
@@ -296,7 +320,7 @@ def test_force_round_rolls_back_unrelated_plugin_failure_after_gate_replacement(
         "    def validate(self, decision, checkpoint): return decision\n"
         "    def release(self, decision): return None\n\n"
         "def register(ctx):\n"
-        "    ctx.register_turn_gate_provider(Replacement())\n",
+        "    ctx.register_turn_gate_provider(Replacement(), api_version=1)\n",
         encoding="utf-8",
     )
     replacement_manifest = PluginManifest(
@@ -423,7 +447,7 @@ def test_temp_hermes_home_discovers_required_gate_end_to_end(tmp_path, monkeypat
         "    def release(self, decision):\n"
         "        return None\n\n"
         "def register(ctx):\n"
-        "    ctx.register_turn_gate_provider(Provider())\n",
+        "    ctx.register_turn_gate_provider(Provider(), api_version=1)\n",
         encoding="utf-8",
     )
     (home / "config.yaml").write_text(
@@ -447,3 +471,56 @@ def test_temp_hermes_home_discovers_required_gate_end_to_end(tmp_path, monkeypat
     with acquire_outer_turn(gate_request()) as lease:
         assert lease.provider_id == "secure-gate"
         assert lease.lease_id == "e2e"
+
+
+def test_force_reload_refreshes_plugin_relative_submodules(tmp_path, monkeypatch):
+    import importlib
+    import shutil
+
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+    plugin_dir = tmp_path / "submodule-gate"
+    plugin_dir.mkdir()
+    (plugin_dir / "__init__.py").write_text(
+        "from .provider import Provider\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_turn_gate_provider(Provider(), api_version=1)\n",
+        encoding="utf-8",
+    )
+    provider_file = plugin_dir / "provider.py"
+
+    def write_provider(generation: int) -> None:
+        provider_file.write_text(
+            "from agent.turn_gate import GateDecision, GateState\n\n"
+            "class Provider:\n"
+            "    def acquire(self, request):\n"
+            f"        return GateDecision(provider_id='submodule-gate', state=GateState.OPEN, lease_id='submodule', generation={generation})\n"
+            "    def validate(self, decision, checkpoint): return self.acquire(None)\n"
+            "    def release(self, decision): return None\n",
+            encoding="utf-8",
+        )
+        shutil.rmtree(plugin_dir / "__pycache__", ignore_errors=True)
+        importlib.invalidate_caches()
+
+    write_provider(1)
+    manifest = PluginManifest(
+        name="submodule-gate",
+        key="submodule-gate",
+        source="user",
+        path=str(plugin_dir),
+    )
+    manager = PluginManager()
+    manager._load_plugin(manifest)
+    _configure_gate("submodule-gate")
+    with acquire_outer_turn(gate_request()) as lease:
+        assert lease.generation == 1
+
+    write_provider(2)
+    monkeypatch.setattr(
+        manager,
+        "_discover_and_load_inner",
+        lambda: manager._load_plugin(manifest),
+    )
+    manager.discover_and_load(force=True)
+    _configure_gate("submodule-gate")
+    with acquire_outer_turn(gate_request()) as lease:
+        assert lease.generation == 2

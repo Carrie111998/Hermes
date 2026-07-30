@@ -687,7 +687,11 @@ class ToolRegistry:
             from agent.turn_gate import tool_block_message
             block_message = tool_block_message(name)
         except Exception:
-            block_message = None
+            return tool_error(
+                "mandatory turn gate check failed closed",
+                error_type="turn_gate_block",
+                tool=name,
+            )
         if block_message is not None:
             return tool_error(
                 block_message,

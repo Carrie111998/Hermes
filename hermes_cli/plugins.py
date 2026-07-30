@@ -1175,15 +1175,30 @@ class PluginContext:
             display_name,
         )
 
-    def register_turn_gate_provider(self, provider: Any) -> None:
+    def register_turn_gate_provider(
+        self,
+        provider: Any,
+        *,
+        api_version: int | None = None,
+    ) -> None:
         """Register this plugin as a host-enforced outer-turn gate provider."""
-        from agent.turn_gate import register_turn_gate_provider
+        from agent.turn_gate import (
+            TURN_GATE_API_VERSION,
+            register_turn_gate_provider,
+        )
+
+        if type(api_version) is not int or api_version != TURN_GATE_API_VERSION:
+            raise ValueError(
+                "turn gate provider API version mismatch: "
+                f"expected {TURN_GATE_API_VERSION}, got {api_version!r}"
+            )
 
         provider_id = self.manifest.key or self.manifest.name
         register_turn_gate_provider(
             provider_id,
             provider,
             owner_id=provider_id,
+            api_version=api_version,
             replace=True,
         )
         self._manager._turn_gate_provider_ids.add(provider_id)
@@ -2198,6 +2213,17 @@ class PluginManager:
         key = manifest.key or manifest.name
         slug = key.replace("/", "__").replace("-", "_")
         module_name = f"{_NS_PARENT}.{slug}"
+        if self._force_reload_active:
+            # A package plugin may import policy and provider code from relative
+            # submodules. Replacing only ``__init__`` leaves those modules in
+            # ``sys.modules`` and silently reuses old code during an upgrade.
+            # The force-round host snapshot restores these exact objects if any
+            # later load or registration step fails.
+            for loaded_name in tuple(sys.modules):
+                if loaded_name == module_name or loaded_name.startswith(
+                    f"{module_name}."
+                ):
+                    sys.modules.pop(loaded_name, None)
         spec = importlib.util.spec_from_file_location(
             module_name,
             init_file,

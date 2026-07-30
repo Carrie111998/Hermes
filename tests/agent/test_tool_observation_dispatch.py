@@ -34,6 +34,26 @@ class _ReloadProvider:
     def release(self, decision):
         return None
 
+    def record_tool_observation(
+        self,
+        decision,
+        request,
+        tool_name,
+        tool_args,
+        tool_call_id,
+        result,
+    ):
+        if tool_name != "skill_view":
+            return
+        payload = json.loads(result)
+        if (
+            payload.get("success") is not True
+            or payload.get("name") != tool_args.get("name")
+            or not payload.get("skill_dir")
+            or tool_args.get("file_path") not in (None, "")
+        ):
+            raise ValueError("provider rejected reload observation")
+
 
 def _reload_request():
     identity = turn_gate.RuntimeIdentity(
@@ -106,6 +126,40 @@ def test_real_registry_handler_records_successful_skill_view_observation(monkeyp
             "tool_name": "skill_view",
             "tool_args": {"name": "example-skill"},
             "tool_call_id": "call-observation",
+            "result": json.dumps(payload),
+        }
+    ]
+
+
+def test_real_registry_handler_reports_policy_neutral_tool_observation(monkeypatch):
+    observed = []
+    payload = {"bytes": 17, "content": "opaque result"}
+    entry = model_tools.registry.get_entry("read_file")
+    assert entry is not None
+    monkeypatch.setattr(entry, "handler", lambda args, **kwargs: json.dumps(payload))
+    monkeypatch.setattr(
+        turn_gate,
+        "record_tool_observation",
+        lambda **kwargs: observed.append(kwargs),
+    )
+
+    result = model_tools.handle_function_call(
+        "read_file",
+        {"path": "/tmp/policy-neutral"},
+        task_id="task-observation",
+        session_id="session-observation",
+        turn_id="turn-observation",
+        tool_call_id="call-policy-neutral",
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+    )
+
+    assert json.loads(result) == payload
+    assert observed == [
+        {
+            "tool_name": "read_file",
+            "tool_args": {"path": "/tmp/policy-neutral"},
+            "tool_call_id": "call-policy-neutral",
             "result": json.dumps(payload),
         }
     ]

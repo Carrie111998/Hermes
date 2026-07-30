@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import agent.turn_gate as turn_gate
 import model_tools
 from agent.tool_executor import _host_gate_block_message
 from agent.turn_gate import (
@@ -119,3 +120,31 @@ def test_direct_tool_dispatch_without_required_outer_lease_fails_closed(monkeypa
     payload = json.loads(result)
     assert payload["error_type"] == "turn_gate_block"
     assert "outer-turn lease" in payload["error"]
+
+
+def test_direct_registry_dispatch_fails_closed_when_gate_check_raises(monkeypatch):
+    entry = model_tools.registry.get_entry("skill_view")
+    assert entry is not None
+    executed = []
+    monkeypatch.setattr(
+        entry,
+        "handler",
+        lambda args, **kwargs: executed.append(True) or json.dumps({"executed": True}),
+    )
+    monkeypatch.setattr(
+        turn_gate,
+        "tool_block_message",
+        lambda name: (_ for _ in ()).throw(RuntimeError("gate unavailable")),
+    )
+
+    result = model_tools.registry.dispatch(
+        "skill_view",
+        {"name": "must-not-run"},
+        task_id="task-direct-registry",
+    )
+
+    assert isinstance(result, str)
+    payload = json.loads(result)
+    assert executed == []
+    assert payload["error_type"] == "turn_gate_block"
+    assert "failed closed" in payload["error"]

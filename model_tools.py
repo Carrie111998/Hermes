@@ -1341,18 +1341,16 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                         _hermes_tool_call_id=tool_call_id or "",
                     )
-                    # Only the host-side registry handler may satisfy a
-                    # reload observation.  Keeping this immediately after
-                    # registry.dispatch means execution middleware that does
-                    # not invoke its callback cannot forge evidence.
-                    if function_name == "skill_view":
-                        from agent.turn_gate import record_tool_observation
-                        record_tool_observation(
-                            tool_name=function_name,
-                            tool_args=dict(next_args),
-                            tool_call_id=tool_call_id or "",
-                            result=result,
-                        )
+                    # Only the host-side registry handler may emit an
+                    # observation. Providers — not Hermes core — decide which
+                    # tool/result has policy meaning.
+                    from agent.turn_gate import record_tool_observation
+                    record_tool_observation(
+                        tool_name=function_name,
+                        tool_args=dict(next_args),
+                        tool_call_id=tool_call_id or "",
+                        result=result,
+                    )
                     return result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1365,14 +1363,13 @@ def handle_function_call(
                     )
                     # See the execute_code branch above: observation evidence
                     # is recorded only after the real registry handler returns.
-                    if function_name == "skill_view":
-                        from agent.turn_gate import record_tool_observation
-                        record_tool_observation(
-                            tool_name=function_name,
-                            tool_args=dict(next_args),
-                            tool_call_id=tool_call_id or "",
-                            result=result,
-                        )
+                    from agent.turn_gate import record_tool_observation
+                    record_tool_observation(
+                        tool_name=function_name,
+                        tool_args=dict(next_args),
+                        tool_call_id=tool_call_id or "",
+                        result=result,
+                    )
                     return result
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
