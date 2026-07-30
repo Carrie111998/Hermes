@@ -3,13 +3,20 @@
 ``_estimate_msg_budget_tokens`` used to charge _REPLAY_BUDGET_KEYS
 (reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
 codex_message_items) for **every** message in history, but adapters on
-upstream/main only replay thinking for the newest assistant turn.
-This inflated the tail budget by 19-24% with tokens that are provably
-stripped before the request is sent, causing the tail cut to land too
-early and discard more real transcript than configured.
+upstream/main only replay Anthropic thinking (``reasoning``,
+``reasoning_details``) for the newest assistant turn.  Codex carrier
+fields (``codex_reasoning_items``, ``codex_message_items``) and
+require-side ``reasoning_content`` are replayed from **every** historical
+assistant message.
 
-The fix adds an ``include_replay`` parameter so the budget walks only
-charge replay fields for the last assistant message.
+The fix splits replay keys into two groups:
+- **Always-counted**: reasoning_content, codex_reasoning_items, codex_message_items
+- **Newest-turn-only** (include_replay=True): reasoning, reasoning_details
+
+This avoids inflating the tail budget with Anthropic thinking tokens
+that are provably stripped before the request is sent (issue #73624)
+while still correctly charging for Codex carrier blobs and require-side
+reasoning_content that ARE replayed on every turn.
 """
 
 import pytest
@@ -43,7 +50,9 @@ class TestEstimateMsgBudgetTokensIncludeReplay:
         assert with_replay - without_replay >= expected_diff
 
     def test_replay_keys_not_charged_when_disabled(self):
-        """When include_replay=False, no replay fields are counted."""
+        """When include_replay=False, only Anthropic thinking fields
+        (reasoning, reasoning_details) are excluded. Codex carrier fields
+        and reasoning_content are always counted."""
         msg = {
             "role": "assistant",
             "content": "Hi",
@@ -55,12 +64,19 @@ class TestEstimateMsgBudgetTokensIncludeReplay:
         with_replay = _estimate_msg_budget_tokens(msg)
         without_replay = _estimate_msg_budget_tokens(msg, include_replay=False)
 
-        # With replay: big number
+        # With replay: includes reasoning + reasoning_details
         assert with_replay > 100
-        # Without replay: just content + overhead
-        assert without_replay < 50
-        # The gap is substantial because all replay fields are large.
-        assert with_replay - without_replay > 200
+        # Without replay: still counts reasoning_content + codex_reasoning_items
+        # So it's NOT near-zero — it's the always-counted keys
+        always_counted_chars = (
+            len(msg["reasoning_content"])
+            + len(msg["codex_reasoning_items"][0]["encrypted_content"])
+        )
+        always_counted_tokens = always_counted_chars // _CHARS_PER_TOKEN
+        assert without_replay >= always_counted_tokens
+        # The gap accounts for reasoning + reasoning_details (newest-turn-only)
+        gap = with_replay - without_replay
+        assert gap > 50  # reasoning (500 chars) + reasoning_details (200 chars)
 
     def test_non_assistant_msg_no_replay_overhead(self):
         """User/tool messages have no replay keys, so include_replay makes

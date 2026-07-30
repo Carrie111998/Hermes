@@ -747,21 +747,41 @@ def _estimate_msg_budget_tokens(
     See issue #28053.
 
     Also counts provider replay fields (``codex_reasoning_items`` etc. —
-    see ``_REPLAY_BUDGET_KEYS``) when *include_replay* is True.  The preflight
-    "should I compress?" estimator sees the full message shape, so the tail
-    walk must use the same size class; otherwise an assistant message with
-    tiny visible content but large hidden replay blobs is protected as if it
-    were small, the post-compression session stays near the context limit,
-    and compaction re-fires continuously (#55572).  Accounting-only: replay
-    fields are never mutated or pruned here.
+    see ``_REPLAY_BUDGET_KEYS``) with granular control over which subset to
+    include.  The preflight "should I compress?" estimator sees the full
+    message shape, so the tail walk must use the same size class; otherwise
+    an assistant message with tiny visible content but large hidden replay
+    blobs is protected as if it were small, the post-compression session
+    stays near the context limit, and compaction re-fires continuously
+    (#55572).  Accounting-only: replay fields are never mutated or pruned
+    here.
 
-    Adapters on ``upstream/main`` only replay thinking for the **newest
-    assistant turn** (e.g. ``anthropic_adapter.convert_messages_to_anthropic``
-    strips reasoning from all earlier assistant messages via the
-    ``idx != last_assistant_idx`` gate).  Passing ``include_replay=False``
-    for stale assistant turns avoids inflating the tail budget with 19-24%
-    of tokens that are provably stripped before the request is sent
-    (issue #73624).
+    Replay-field splitting (issue #73669):
+
+    Three keys are **always** counted because adapters replay them from
+    **every** historical assistant message, not just the newest turn:
+
+      - ``reasoning_content`` — require-side providers (``messages.py``)
+        preserve this on all assistant messages.
+      - ``codex_reasoning_items`` — Codex Responses adapter
+        (``codex_responses_adapter.py``) replays from *every* assistant
+        message (lines 391-465, 467-519).
+      - ``codex_message_items`` — same Codex replay path.
+
+    Two keys are **only** counted when *include_replay* is True (i.e. for
+    the newest assistant turn), because adapters strip them from all older
+    assistant messages:
+
+      - ``reasoning`` — Anthropic thinking, gated on
+        ``idx != last_assistant_idx`` in
+        ``anthropic_adapter.convert_messages_to_anthropic``.
+      - ``reasoning_details`` — same Anthropic gate.
+
+    Passing ``include_replay=False`` for stale assistant turns avoids
+    inflating the tail budget with 19-24% of tokens that are provably
+    stripped before the request is sent (issue #73624) while still
+    correctly charging for Codex carrier blobs and require-side
+    ``reasoning_content`` that **are** replayed on every turn.
     """
     content = msg.get("content") or ""
     if isinstance(content, str):
@@ -772,8 +792,14 @@ def _estimate_msg_budget_tokens(
     for tc in msg.get("tool_calls") or []:
         if isinstance(tc, dict):
             tokens += estimate_tokens_rough(str(tc))
+    # Always-counted replay keys: replayed from EVERY historical assistant
+    # message by Codex adapter and require-side providers.
+    for key in ("reasoning_content", "codex_reasoning_items", "codex_message_items"):
+        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    # Strict-newest-turn replay keys: Anthropic thinking fields gated on
+    # idx == last_assistant_idx — only count when include_replay=True.
     if include_replay:
-        for key in _REPLAY_BUDGET_KEYS:
+        for key in ("reasoning", "reasoning_details"):
             tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     return tokens
 
