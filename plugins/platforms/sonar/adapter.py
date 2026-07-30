@@ -32,6 +32,8 @@ import logging
 import os
 import re
 import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -61,6 +63,10 @@ def _expand(path: str) -> str:
 def _find_sonar_cli(explicit: Optional[str] = None) -> str:
     if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
         return explicit
+    # Prefer the user-local official build over whatever PATH resolves to.
+    local = os.path.expanduser("~/.local/bin/sonar-cli")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
     found = shutil.which("sonar-cli")
     if found:
         return found
@@ -68,6 +74,34 @@ def _find_sonar_cli(explicit: Optional[str] = None) -> str:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return "sonar-cli"
+
+
+def _find_ffmpeg() -> Optional[str]:
+    return shutil.which("ffmpeg")
+
+
+_MEDIA_KIND_BY_EXT = {
+    ".m4a": "voice",
+    ".aac": "voice",
+    ".mp3": "audio",
+    ".ogg": "audio",
+    ".opus": "audio",
+    ".wav": "audio",
+    ".flac": "audio",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".mp4": "video",
+    ".mov": "video",
+    ".webm": "video",
+    ".mkv": "video",
+}
+
+
+def _media_kind_for(path: str) -> Optional[str]:
+    return _MEDIA_KIND_BY_EXT.get(os.path.splitext(path)[1].lower())
 
 
 def _parse_sender_list(raw: str) -> List[str]:
@@ -450,6 +484,222 @@ class SonarAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _sonar_send_file(
+        self,
+        to_npub: str,
+        file_path: str,
+        kind: str,
+        caption: Optional[str] = None,
+        mime: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        def _sync_send_file():
+            args = [
+                self.sonar_cli, "send",
+                "--to", to_npub,
+                "--file", file_path,
+                "--kind", kind,
+            ]
+            if caption:
+                args += ["--caption", caption]
+            if mime:
+                args += ["--mime", mime]
+            proc = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=SEND_TIMEOUT_SECS,
+                env=_sonar_env(self.sonar_home),
+            )
+            if proc.returncode != 0:
+                raise RuntimeError((proc.stderr or proc.stdout or "media send failed")[:500])
+            line = (proc.stdout or "").strip().splitlines()[-1] if proc.stdout else ""
+            return json.loads(line) if line else {"type": "sent_media"}
+
+        return await asyncio.to_thread(_sync_send_file)
+
+    def _media_result_id(self, result: Dict[str, Any]) -> str:
+        return (
+            result.get("group_id")
+            or result.get("id")
+            or result.get("event_id")
+            or str(int(time.time() * 1000))
+        )
+
+    async def _send_local_media(
+        self,
+        chat_id: str,
+        file_path: str,
+        kind: str,
+        caption: Optional[str],
+        mime: Optional[str] = None,
+    ) -> SendResult:
+        if not chat_id:
+            return SendResult(success=False, error="missing chat_id (npub)")
+        src = _expand(file_path)
+        if not os.path.isfile(src):
+            return SendResult(success=False, error=f"media file not found: {file_path}")
+        try:
+            result = await self._sonar_send_file(chat_id, src, kind, caption=caption, mime=mime)
+            return SendResult(success=True, message_id=self._media_result_id(result))
+        except Exception as e:
+            logger.error("[Sonar] %s send failed: %s", kind, e)
+            return SendResult(success=False, error=str(e))
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send audio as a Sonar voice note (kind=voice).
+
+        iOS AVAudioPlayer is happiest with AAC in an m4a (ipod) container,
+        so non-m4a inputs are transcoded via ffmpeg when available:
+        mono 44.1kHz AAC 64k, -f ipod.
+        """
+        src = _expand(audio_path)
+        if not os.path.isfile(src):
+            return SendResult(success=False, error=f"audio file not found: {audio_path}")
+        send_path = src
+        converted: Optional[str] = None
+        if os.path.splitext(src)[1].lower() not in (".m4a", ".aac"):
+            ffmpeg = _find_ffmpeg()
+            if ffmpeg:
+                fd, tmp = tempfile.mkstemp(prefix="sonar-voice-", suffix=".m4a")
+                os.close(fd)
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        ffmpeg, "-y", "-i", src,
+                        "-vn", "-ac", "1", "-ar", "44100",
+                        "-c:a", "aac", "-b:a", "64k",
+                        "-movflags", "+faststart",
+                        "-f", "ipod", tmp,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                if proc.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+                    converted = tmp
+                    send_path = tmp
+                else:
+                    logger.warning(
+                        "[Sonar] ffmpeg voice transcode failed, sending original: %s",
+                        (proc.stderr or "")[-300:],
+                    )
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            else:
+                logger.warning("[Sonar] ffmpeg not found; sending %s as-is", src)
+        try:
+            return await self._send_local_media(chat_id, send_path, "voice", caption, mime="audio/mp4")
+        finally:
+            if converted:
+                try:
+                    os.unlink(converted)
+                except OSError:
+                    pass
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_local_media(chat_id, image_path, "image", caption)
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Download a remote image to a temp file, then send it natively."""
+        if image_url.startswith("file://"):
+            from urllib.parse import unquote as _unquote
+
+            return await self.send_image_file(
+                chat_id=chat_id,
+                image_path=_unquote(image_url[7:]),
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        tmp: Optional[str] = None
+        try:
+            import urllib.request
+
+            ext = os.path.splitext(image_url.split("?")[0])[1].lower() or ".png"
+            if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+                ext = ".png"
+            fd, tmp = tempfile.mkstemp(prefix="sonar-img-", suffix=ext)
+            os.close(fd)
+
+            def _download():
+                req = urllib.request.Request(image_url, headers={"User-Agent": "hermes-sonar/1.0"})
+                with urllib.request.urlopen(req, timeout=60) as resp, open(tmp, "wb") as out:
+                    shutil.copyfileobj(resp, out)
+
+            await asyncio.to_thread(_download)
+            if os.path.getsize(tmp) == 0:
+                raise RuntimeError("downloaded image is empty")
+            return await self._send_local_media(chat_id, tmp, "image", caption)
+        except Exception as e:
+            logger.error("[Sonar] image URL send failed: %s", e)
+            return SendResult(success=False, error=str(e))
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_local_media(chat_id, video_path, "video", caption)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """sonar-cli only models voice/audio/image/video; route by extension."""
+        kind = _media_kind_for(file_path)
+        if kind:
+            return await self._send_local_media(chat_id, file_path, kind, caption)
+        return await super().send_document(
+            chat_id=chat_id,
+            file_path=file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+            metadata=metadata,
+            **kwargs,
+        )
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {
             "chat_id": chat_id,
@@ -486,6 +736,21 @@ async def _standalone_send(
             )
         )
         last = result.get("group_id") or result.get("id")
+    for media_path in media_files or []:
+        src = _expand(media_path)
+        if not os.path.isfile(src):
+            logger.warning("[Sonar] standalone media missing, skipped: %s", media_path)
+            continue
+        kind = _media_kind_for(src)
+        if not kind:
+            logger.warning("[Sonar] standalone media type unsupported, skipped: %s", media_path)
+            continue
+        result = await asyncio.to_thread(
+            lambda p=src, k=kind: _run_sonar_json(
+                ["send", "--to", peer, "--file", p, "--kind", k], home, cli, SEND_TIMEOUT_SECS
+            )
+        )
+        last = result.get("group_id") or result.get("id") or last
     return {"success": True, "platform": "sonar", "chat_id": peer, "message_id": last or uuid.uuid4().hex[:12]}
 
 
