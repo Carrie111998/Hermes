@@ -244,6 +244,27 @@ def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
             runtime_workspace_roots=("C:/Users/diego/.hermes", "C:/source"),
             placement_generation=True,  # type: ignore[arg-type]
         ),
+        SidebarPlacement(
+            inbox_cwd="relative/inbox",
+            local_host="local",
+            runtime_workspace_roots=("relative/inbox", "C:/source"),
+            placement_generation=1,
+        ),
+        SidebarPlacement(
+            inbox_cwd="C:/Users/diego/.hermes",
+            local_host="local",
+            runtime_workspace_roots=("C:/Users/diego/.hermes", "relative/source"),
+            placement_generation=1,
+        ),
+        SidebarPlacement(
+            inbox_cwd="C:/Users/diego/.hermes",
+            local_host="local",
+            runtime_workspace_roots=(
+                "C:/Users/diego/../diego/.hermes",
+                "C:/source",
+            ),
+            placement_generation=1,
+        ),
     ],
 )
 def test_codex_delivery_rejects_malformed_placement_before_create_dispatch(
@@ -315,6 +336,61 @@ def test_sidebar_executor_settles_placement_failure_before_reservation() -> None
     )
     assert native.create_calls == 0
     assert not any(event[0] == "reserve" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("placement", "prebound"),
+    [
+        (
+            SidebarPlacement(
+                inbox_cwd="relative/inbox",
+                local_host="local",
+                runtime_workspace_roots=("relative/inbox", "C:/source"),
+                placement_generation=1,
+            ),
+            False,
+        ),
+        (
+            SidebarPlacement(
+                inbox_cwd="C:/Users/diego/.hermes",
+                local_host="local",
+                runtime_workspace_roots=(
+                    "C:/Users/diego/.hermes",
+                    "C:/source/../source",
+                ),
+                placement_generation=1,
+            ),
+            True,
+        ),
+    ],
+)
+def test_sidebar_executor_rejects_malformed_placement_before_native_paths(
+    placement: SidebarPlacement,
+    prebound: bool,
+) -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(
+        events,
+        [_job(SOURCE_1, thread_id=THREAD_1 if prebound else None)],
+    )
+    native = FakeNative(events)
+
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        placement_resolver=lambda _candidate: placement,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="inbox_unavailable",
+    )
+    assert native.create_calls == 0
+    assert not any(event[0] in {"reserve", "recover", "read"} for event in events)
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 import hmac
 import math
+import ntpath
 import os
 import re
 import sqlite3
@@ -850,11 +851,13 @@ class SidebarExecutor:
                 lease_token=lease_token,
                 error_code="bridge_temporarily_unavailable",
             )
-        if not isinstance(placement, SidebarPlacement):
+        try:
+            placement = _validated_sidebar_placement(placement, candidate)
+        except SidebarPlacementError as exc:
             return self._settle(
                 job_id=job_id,
                 lease_token=lease_token,
-                error_code="source_identity_mismatch",
+                error_code=exc.code,
             )
 
         expected = BridgeMarkerPayload(
@@ -1723,6 +1726,8 @@ def _validated_sidebar_placement(
         raise SidebarPlacementError("inbox_unavailable")
     try:
         inbox_cwd = _required_text(placement.inbox_cwd, "sidebar inbox cwd")
+        if not _is_absolute_canonical_windows_path(inbox_cwd):
+            raise SidebarPlacementError("inbox_unavailable")
         if (
             placement.local_host != "local"
             or type(placement.placement_generation) is not int
@@ -1733,7 +1738,9 @@ def _validated_sidebar_placement(
         if type(roots) is not tuple or len(roots) not in {1, 2}:
             raise SidebarPlacementError("inbox_unavailable")
         if any(
-            _required_text(root, "sidebar runtime workspace root") != root
+            not _is_absolute_canonical_windows_path(
+                _required_text(root, "sidebar runtime workspace root")
+            )
             for root in roots
         ):
             raise SidebarPlacementError("inbox_unavailable")
@@ -1747,6 +1754,19 @@ def _validated_sidebar_placement(
     except (AttributeError, TypeError, ValueError) as exc:
         raise SidebarPlacementError("inbox_unavailable") from exc
     return placement
+
+
+def _is_absolute_canonical_windows_path(value: object) -> bool:
+    if type(value) is not str or not value:
+        return False
+    try:
+        canonical = value.replace("/", "\\")
+        return (
+            ntpath.isabs(canonical)
+            and ntpath.normcase(ntpath.normpath(canonical)) == ntpath.normcase(canonical)
+        )
+    except (TypeError, ValueError):
+        return False
 
 
 def _finite_time(value: object) -> float:
