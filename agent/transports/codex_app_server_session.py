@@ -72,6 +72,10 @@ class TurnResult:
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    # True once Hermes has entered the turn/start JSON-RPC attempt.  A timed
+    # out or rejected request may never yield a turn id, but it still crossed
+    # the model-request boundary and must count as an API-call attempt.
+    turn_start_attempted: bool = False
     token_usage_last: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
@@ -100,7 +104,6 @@ _EXACT_SCOPE_METHODS = {
     "turn/completed",
     "turn/diff/updated",
     "thread/tokenUsage/updated",
-    "thread/compacted",
 }
 
 
@@ -766,6 +769,7 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        result.turn_start_attempted = True
         try:
             ts = self._client.request(
                 "turn/start",
@@ -803,8 +807,26 @@ class CodexAppServerSession:
             result.should_retire = True
             self._interrupt_event.clear()
             return result
+        except RuntimeError as exc:
+            # CodexAppServerError is a RuntimeError subclass and is handled
+            # above. Reaching this branch means the local JSON-RPC transport
+            # failed after Hermes entered the turn/start attempt (for example,
+            # a broken/closed app-server stdin). Retire the process and return
+            # the explicit attempted boundary so accounting cannot report a
+            # misleading zero-call turn.
+            result.error = self._format_error_with_stderr(
+                "turn/start transport failed", exc
+            )
+            result.should_retire = True
+            self.close()
+            self._interrupt_event.clear()
+            return result
 
-        result.turn_id = (ts.get("turn") or {}).get("id")
+        ts_obj = ts if isinstance(ts, dict) else {}
+        turn_obj = ts_obj.get("turn")
+        if not isinstance(turn_obj, dict):
+            turn_obj = {}
+        result.turn_id = turn_obj.get("id") or ts_obj.get("turnId")
         if not result.turn_id:
             result.error = self._format_error_with_stderr(
                 "turn/start returned no turn id"
@@ -1588,21 +1610,16 @@ def _apply_token_usage_notification(result: TurnResult, note: dict) -> None:
 def _apply_compaction_notification(result: TurnResult, note: dict) -> None:
     """Capture Codex-native context compaction boundaries.
 
-    Recent app-server builds expose compaction as a ContextCompaction item.
-    Older builds also emit the deprecated thread/compacted notification. Both
-    mean the underlying Codex thread history has been compacted.
+    A completed ContextCompaction item is the sole authoritative execution
+    boundary.  The deprecated ``thread/compacted`` notification is ignored:
+    its historical ordering/completion semantics are not strong enough to
+    persist a successful Hermes compaction checkpoint.
     """
     if not isinstance(note, dict):
         return
     method = note.get("method") or ""
     params = note.get("params") or {}
     if not isinstance(params, dict):
-        return
-
-    if method == "thread/compacted":
-        result.compacted = True
-        result.thread_id = params.get("threadId") or result.thread_id
-        result.turn_id = params.get("turnId") or result.turn_id
         return
 
     # item/started is only intent/progress. item/completed is the

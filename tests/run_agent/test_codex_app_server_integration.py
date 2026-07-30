@@ -124,6 +124,24 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert agent.session_api_calls == 1
 
+    def test_post_send_turn_start_timeout_counts_one_api_call(self, monkeypatch):
+        def timed_out_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                error="turn/start timed out",
+                thread_id="thread-started-1",
+                turn_start_attempted=True,
+                should_retire=True,
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", timed_out_turn)
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("count the attempted request")
+
+        assert result["completed"] is False
+        assert result["api_calls"] == 1
+        assert agent.session_api_calls == 1
+
     def test_codex_thread_binding_resumes_after_agent_recreation(
         self, monkeypatch, tmp_path
     ):

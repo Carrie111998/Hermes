@@ -969,9 +969,15 @@ def run_codex_app_server_turn(
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
     _record_codex_app_server_compaction(agent, turn)
-    # Startup/lease failures return a TurnResult without a Codex turn id.
-    # They sent no model request and must not inflate API-call accounting.
-    api_calls = 1 if getattr(turn, "turn_id", None) else 0
+    # Startup/lease failures occur before turn/start and count zero. Once the
+    # turn/start request is attempted, count it even if the JSON-RPC response
+    # times out, is rejected, or is malformed and therefore yields no turn id.
+    # A turn id is also incontrovertible post-hoc evidence for compatibility
+    # with older transport stubs/results that predate turn_start_attempted.
+    api_calls = 1 if (
+        getattr(turn, "turn_start_attempted", False)
+        or getattr(turn, "turn_id", None)
+    ) else 0
     usage_result = (
         _record_codex_app_server_usage(agent, turn)
         if api_calls

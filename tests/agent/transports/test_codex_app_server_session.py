@@ -192,6 +192,7 @@ class TestLifecycle:
         result = session.run_turn("blocked", turn_timeout=0.1)
 
         assert result.should_retire is True
+        assert result.turn_start_attempted is False
         assert result.error and "another Hermes/Codex client" in result.error
         client_factory.assert_not_called()
 
@@ -494,6 +495,7 @@ class TestRunTurn:
         r = s.run_turn("hi", turn_timeout=2.0)
         assert r.final_text == "hello world"
         assert r.interrupted is False
+        assert r.turn_start_attempted is True
         assert r.error is None
         assert any(m["role"] == "assistant" and m.get("content") == "hello world"
                    for m in r.projected_messages)
@@ -793,6 +795,7 @@ class TestRunTurn:
         assert "sk-live-deadbeefdeadbeef" not in r.error
         # Non-OAuth → should NOT retire (subprocess JSON-RPC is still healthy).
         assert r.should_retire is False
+        assert r.turn_start_attempted is True
 
     def test_turn_start_timeout_attaches_redacted_stderr_tail(self):
         """A non-OAuth TimeoutError on turn/start surfaces with codex stderr
@@ -816,6 +819,57 @@ class TestRunTurn:
         assert "provider request stalled" in r.error
         assert "sk-stalled-secret-abc123" not in r.error
         assert r.should_retire is True
+        assert r.turn_start_attempted is True
+
+    def test_turn_start_transport_failure_is_attempted_and_retires(self):
+        client = FakeClient()
+
+        def broken_transport(method, params):
+            if method == "turn/start":
+                raise RuntimeError("app-server stdin closed")
+            return {
+                "thread": {"id": "t"},
+                "activePermissionProfile": {"id": "x"},
+            }
+
+        client._request_handler = broken_transport
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.turn_start_attempted is True
+        assert result.should_retire is True
+        assert "turn/start transport failed" in (result.error or "")
+        assert client._closed is True
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"turn": {}},
+            None,
+            {"turn": "bad"},
+        ],
+    )
+    def test_turn_start_missing_id_fails_immediately_after_attempt(
+        self, response
+    ):
+        client = FakeClient()
+
+        def missing_id(method, params):
+            if method == "turn/start":
+                return response
+            return {
+                "thread": {"id": "t"},
+                "activePermissionProfile": {"id": "x"},
+            }
+
+        client._request_handler = missing_id
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.turn_start_attempted is True
+        assert result.turn_id is None
+        assert result.should_retire is True
+        assert "returned no turn id" in (result.error or "")
+        assert client._closed is True
 
 
 
@@ -867,6 +921,25 @@ class TestCompactThread:
         }
         _apply_compaction_notification(result, completed)
         assert result.compacted is True
+
+    def test_deprecated_thread_compacted_is_never_a_success_boundary(self):
+        result = TurnResult(
+            thread_id="thread-fake-001",
+            turn_id="compact-turn-1",
+        )
+
+        _apply_compaction_notification(
+            result,
+            {
+                "method": "thread/compacted",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "compact-turn-1",
+                },
+            },
+        )
+
+        assert result.compacted is False
 
     def test_compact_thread_honors_interrupt_before_rpc(self):
         client = FakeClient()
@@ -1107,6 +1180,33 @@ class TestCompactThread:
             "turn/started",
             threadId="thread-fake-001",
             turn={"id": "compact-turn-current"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={
+                "id": "compact-turn-current",
+                "status": "completed",
+                "error": None,
+            },
+        )
+
+        result = make_session(client).compact_thread(turn_timeout=2.0)
+
+        assert result.turn_id == "compact-turn-current"
+        assert result.compacted is False
+
+    def test_compact_thread_ignores_exact_scoped_deprecated_boundary(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/started",
+            threadId="thread-fake-001",
+            turn={"id": "compact-turn-current"},
+        )
+        client.queue_notification(
+            "thread/compacted",
+            threadId="thread-fake-001",
+            turnId="compact-turn-current",
         )
         client.queue_notification(
             "turn/completed",

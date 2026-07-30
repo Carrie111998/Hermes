@@ -356,6 +356,79 @@ class TestSessionLifecycle:
         assert db.get_codex_turn_lease("s1")["holder_uuid"] == owner
         assert db.get_codex_turn_lease("s1")["expires_at"] == 2060.0
 
+    def test_pid_reuse_lease_reclamation_requires_expiry_and_identity_change(
+        self, db, monkeypatch
+    ):
+        """PID reuse is recoverable only after the old lease has expired.
+
+        The stored owner PID is deliberately distinct from this test process.
+        A changed start fingerprint represents PID reuse, while the matching
+        value represents a live owner.  This exercises the three safety cases
+        Sol requested without depending on an actual recycled kernel PID.
+        """
+        owner_pid = 424242
+        old_start = 111111
+        current_start = 222222
+        caller_start = 333333
+        clock = [1000.0]
+        monkeypatch.setattr(hermes_state.time, "time", lambda: clock[0])
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: (
+                caller_start
+                if pid == os.getpid()
+                else current_start
+                if pid == owner_pid
+                else None
+            ),
+        )
+        db.create_session(session_id="s1", source="cli")
+        stale_holder = str(uuid.uuid4())
+        replacement_holder = str(uuid.uuid4())
+
+        def insert_lease(*, expires_at):
+            def _do(conn):
+                conn.execute("DELETE FROM codex_turn_leases WHERE session_id = ?", ("s1",))
+                conn.execute(
+                    "INSERT INTO codex_turn_leases "
+                    "(session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "s1", None, stale_holder, owner_pid, old_start,
+                        900.0, 900.0, expires_at,
+                    ),
+                )
+            db._execute_write(_do)
+
+        # Different start fingerprint is not enough before TTL expiry.
+        insert_lease(expires_at=1100.0)
+        assert not db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == stale_holder
+
+        # Once expired, that changed fingerprint proves PID reuse and permits
+        # recovery by a new owner.
+        insert_lease(expires_at=999.0)
+        assert db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == replacement_holder
+
+        # A matching fingerprint remains a live owner even after expiry.
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: (
+                caller_start
+                if pid == os.getpid()
+                else old_start
+                if pid == owner_pid
+                else None
+            ),
+        )
+        insert_lease(expires_at=999.0)
+        assert not db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == stale_holder
+
     def test_expired_dead_process_lease_is_recovered(self, db, monkeypatch):
         monkeypatch.setattr(
             hermes_state,
