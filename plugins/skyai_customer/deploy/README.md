@@ -56,15 +56,21 @@ Before an approved release, the release owner must:
    `load_production_settings(os.environ)` and
    `verify_production_dependencies()` from
    `plugins.skyai_customer.production_gateway`. Either failure blocks cutover.
-5. Bind the dedicated ingress bearer token, Discord bot token, and mirror-only
-   PostgreSQL URL through the existing owner-controlled secret/environment
-   mechanism. No secret belongs in the release archive or this repository.
-6. Render the drop-in with the exact candidate release, interpreter, and
+5. Bind the exact private VM address as `SKYAI_PRODUCTION_BIND_HOST` and the
+   exact Serverless VPC Access connector network as
+   `SKYAI_TRUSTED_PROXY_CIDR`. Authorization uses the transport peer address
+   only; `Forwarded` and `X-Forwarded-For` never participate. A dedicated
+   ingress bearer token may be bound as an additional authorization path, but
+   is not required when the exact trusted proxy boundary is present.
+6. Bind the Discord bot token and mirror-only PostgreSQL URL through the
+   existing owner-controlled secret/environment mechanism. No secret belongs
+   in the release archive or this repository.
+7. Render the drop-in with the exact candidate release, interpreter, and
    environment-file paths. Its `ExecStart` has no `--dev` compatibility path.
-7. Apply the mirror-only schema and least-privilege grants in a separately
+8. Apply the mirror-only schema and least-privilege grants in a separately
    approved database gate, then validate the rendered unit before the one
    bounded service cutover.
-8. Preserve the previous release target for automatic rollback and verify
+9. Preserve the previous release target for automatic rollback and verify
    `/health`, `/version`, and `/ready`. `/ready` stays false until the durable
    worker completes its first successful database poll.
 

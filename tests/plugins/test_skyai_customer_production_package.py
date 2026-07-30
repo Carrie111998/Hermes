@@ -154,6 +154,9 @@ def test_current_topology_is_not_misidentified_as_cloud_run_app() -> None:
     assert "Cloud Run **proxy only**" in text
     assert "skyai-runtime-prod-01" in text
     assert "skyai-v2-hermes-prod.service" in text
+    assert "SKYAI_PRODUCTION_BIND_HOST" in text
+    assert "SKYAI_TRUSTED_PROXY_CIDR" in text
+    assert "X-Forwarded-For" in text
     assert "root Dockerfile as the current PROD application build" in text
     assert "must never be applied to `skyai-prod-ingress`" in text
 

@@ -18,6 +18,8 @@ def production_env() -> dict[str, str]:
         "SKYAI_V2_BUILD_COMMIT": (
             "92fd0078b20f42f3d0227f8f47f04a5cf7bb8fca"
         ),
+        "SKYAI_PRODUCTION_BIND_HOST": "10.80.0.4",
+        "SKYAI_TRUSTED_PROXY_CIDR": "10.80.2.0/28",
         "SKYAI_V2_CANARY_TOKEN": "exact-ingress-token",
         "SKYAI_DISCORD_MIRROR_ENABLED": "1",
         "SKYAI_DISCORD_MIRROR_CREATE_THREADS": "1",
@@ -50,7 +52,8 @@ def test_load_production_settings_is_live_durable_and_exact() -> None:
     assert settings.runtime_mode == dev_gateway.RUNTIME_MODE_PRODUCTION
     assert settings.version == production_gateway.PRODUCTION_VERSION
     assert settings.profile_home == production_gateway.PRODUCTION_PROFILE_HOME
-    assert settings.host == "0.0.0.0"
+    assert settings.host == "10.80.0.4"
+    assert settings.trusted_proxy_cidr == "10.80.2.0/28"
     assert settings.port == 8080
     assert settings.live_model is True
     assert settings.allow_public_bind is True
@@ -75,7 +78,8 @@ def test_load_production_settings_is_live_durable_and_exact() -> None:
         "SKYAI_RUNTIME_MODE",
         "SKYAI_V2_PROFILE_HOME",
         "SKYAI_V2_BUILD_COMMIT",
-        "SKYAI_V2_CANARY_TOKEN",
+        "SKYAI_PRODUCTION_BIND_HOST",
+        "SKYAI_TRUSTED_PROXY_CIDR",
         "SKYAI_DISCORD_MIRROR_ENABLED",
         "SKYAI_DISCORD_MIRROR_CREATE_THREADS",
         "SKYAI_DISCORD_MIRROR_CHANNEL_ID",
@@ -115,6 +119,12 @@ def test_load_production_settings_fails_closed_on_missing_binding(
             "SKYAI_V2_BUILD_COMMIT",
             "92fd0078b20f42f3d0227f8f47f04a5cf7bb8fca ",
         ),
+        ("SKYAI_PRODUCTION_BIND_HOST", "0.0.0.0"),
+        ("SKYAI_PRODUCTION_BIND_HOST", "10.80.0.4 "),
+        ("SKYAI_PRODUCTION_BIND_HOST", "not-an-ip"),
+        ("SKYAI_TRUSTED_PROXY_CIDR", "0.0.0.0/0"),
+        ("SKYAI_TRUSTED_PROXY_CIDR", "10.80.2.1/28"),
+        ("SKYAI_TRUSTED_PROXY_CIDR", "10.80.2.0/28 "),
         ("PORT", " 8080"),
         ("PORT", "0"),
         ("PORT", "65536"),
@@ -151,6 +161,17 @@ def test_production_does_not_use_generic_secret_aliases() -> None:
     discord_environ["DISCORD_BOT_TOKEN"] = "generic-discord-token"
     with pytest.raises(ValueError, match="SKYAI_DISCORD_BOT_TOKEN"):
         production_gateway.load_production_settings(discord_environ)
+
+
+def test_production_token_is_optional_with_exact_trusted_proxy_boundary() -> None:
+    environ = production_env()
+    del environ["SKYAI_V2_CANARY_TOKEN"]
+
+    settings = production_gateway.load_production_settings(environ)
+
+    assert settings.auth_token == ""
+    assert settings.host == "10.80.0.4"
+    assert settings.trusted_proxy_cidr == "10.80.2.0/28"
 
 
 def test_verify_production_dependencies_requires_both_exact_distributions() -> None:
@@ -221,7 +242,7 @@ def test_production_main_uses_only_production_settings(
     assert settings.live_model is True
     assert settings.discord_mirror_durable_required is True
     assert captured["dependencies_verified"] is True
-    assert captured["run_kwargs"] == {"host": "0.0.0.0", "port": 8080}
+    assert captured["run_kwargs"] == {"host": "10.80.0.4", "port": 8080}
 
 
 @pytest.mark.asyncio
