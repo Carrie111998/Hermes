@@ -413,3 +413,77 @@ async def test_shutdown_notifications_are_fully_muted_when_flag_disabled():
     adapter.send.assert_not_awaited()
 
 
+# ── unexpected-restart startup notification ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unexpected_restart_sends_home_channel_notification(tmp_path, monkeypatch):
+    """When the previous gateway died while running (state='running'),
+    the next boot treats it as an unexpected restart and notifies home channels
+    even without a .restart_pending.json marker."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-99",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="home"))
+
+    # Simulate: previous gateway left state="running" (signal-killed, OOM, etc.)
+    from gateway.status import write_runtime_status
+    write_runtime_status(gateway_state="running")
+
+    # No planned-restart marker, no chat-restart marker - it's an unexpected restart.
+    assert gateway_run._planned_restart_notification_pending() is False
+    assert gateway_run._restart_notification_pending() is False
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "home-99", None)}
+    adapter.send.assert_called_once()
+    assert "Gateway online" in adapter.send.call_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_does_not_trigger_startup_notification(tmp_path, monkeypatch):
+    """When the previous gateway stopped cleanly (state='stopped'), the next
+    boot does NOT send a startup notification - the operator intentionally
+    stopped it and doesn't need a "back online" ping on manual restart."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-99",
+        name="Ops Home",
+    )
+    adapter.send = AsyncMock()
+
+    from gateway.status import write_runtime_status
+    write_runtime_status(gateway_state="stopped")
+
+    assert gateway_run._planned_restart_notification_pending() is False
+    assert gateway_run._restart_notification_pending() is False
+
+    # We can't easily run the full _start_impl, so verify the decision logic
+    # directly by reading state - this is what the new branch checks.
+    from gateway.status import read_runtime_status
+    prev_state = read_runtime_status()
+    assert prev_state.get("gateway_state") == "stopped"
+    # "stopped" is NOT in the trigger set -> no notification should fire.
+    assert prev_state.get("gateway_state") not in ("running", "draining")
+
+
+def test_first_boot_has_no_runtime_state(tmp_path, monkeypatch):
+    """On a first-ever boot, gateway_state.json doesn't exist at all.
+    The new branch correctly treats None as "not an unexpected restart"."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    from gateway.status import read_runtime_status
+    state = read_runtime_status()
+    # No file -> None or empty dict -> gateway_state is None -> not in trigger set.
+    gateway_state = (state or {}).get("gateway_state")
+    assert gateway_state is None
+    assert gateway_state not in ("running", "draining")

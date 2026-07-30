@@ -10951,6 +10951,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             finally:
                 _clear_planned_restart_notification()
+        elif not chat_restart_notification_pending:
+            # Also notify on unexpected restarts (SIGTERM from systemd, OOM kill,
+            # etc.) so the operator always knows when the gateway has come back
+            # online — not just on planned restarts.  We detect an "unexpected
+            # restart" by checking whether the previous gateway left a
+            # "running" / "draining" state behind (meaning it died while active)
+            # rather than a clean "stopped" state.  A first-ever boot has no
+            # state file at all, so we don't spam on initial install.
+            try:
+                from gateway.status import read_runtime_status
+                prev_state = read_runtime_status()
+                prev_gateway_state = (prev_state or {}).get("gateway_state")
+            except Exception:
+                prev_gateway_state = None
+            if prev_gateway_state in ("running", "draining"):
+                logger.info(
+                    "Previous gateway state was '%s' — treating as unexpected restart, "
+                    "sending home-channel startup notification",
+                    prev_gateway_state,
+                )
+                await self._send_home_channel_startup_notifications(
+                    skip_targets=None,
+                )
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
