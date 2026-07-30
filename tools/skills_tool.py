@@ -777,6 +777,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     return [dict(s) for s in skills]
 
 
+def available_skill_names() -> frozenset[str]:
+    """Return the names Hermes can actually load from its active registry."""
+
+    return frozenset(
+        str(skill.get("name", "")).strip()
+        for skill in _find_all_skills()
+        if str(skill.get("name", "")).strip()
+    )
+
+
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
@@ -1796,10 +1806,39 @@ registry.register(
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
+    try:
+        from agent.request_phase import guard_tool_call
+
+        phase_block = guard_tool_call("skill_view", args)
+    except Exception:
+        phase_block = (
+            "Skill-selection safety block: the per-turn skill guard failed "
+            "closed."
+        )
+    if phase_block is not None:
+        return json.dumps(
+            {"success": False, "error": phase_block},
+            ensure_ascii=False,
+        )
     name = args.get("name", "")
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=kw.get("task_id")
     )
+    try:
+        from agent.request_phase import enforce_skill_payload_budget
+
+        result = enforce_skill_payload_budget(args, result)
+    except Exception:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Skill payload safety block: the per-turn payload guard "
+                    "failed closed."
+                ),
+            },
+            ensure_ascii=False,
+        )
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict) and parsed.get("success"):

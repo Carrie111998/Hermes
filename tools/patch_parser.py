@@ -30,9 +30,13 @@ Usage:
 
 import difflib
 import re
+import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Any
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from enum import Enum
+
+if TYPE_CHECKING:
+    from tools.file_operations import PatchResult
 
 
 class OperationType(Enum):
@@ -64,6 +68,96 @@ class PatchOperation:
     new_path: Optional[str] = None  # For move operations
     hunks: List[Hunk] = field(default_factory=list)
     content: Optional[str] = None  # For add file operations
+
+
+PATCH_APPLY_TIMEOUT_SECONDS = 120
+PATCH_COMPENSATION_TIMEOUT_SECONDS = 30
+
+
+@dataclass(frozen=True)
+class _PathState:
+    exists: bool
+    content: str = ""
+    read_error: str = ""
+
+
+def _operation_paths(op: PatchOperation) -> List[str]:
+    paths = [op.file_path]
+    if op.operation == OperationType.MOVE and op.new_path:
+        paths.append(op.new_path)
+    return paths
+
+
+def _read_path_state(file_ops: Any, path: str) -> _PathState:
+    try:
+        result = file_ops.read_file_raw(path)
+    except Exception as exc:
+        return _PathState(
+            exists=False,
+            read_error=f"{type(exc).__name__}: {exc}",
+        )
+    if result.error:
+        error = str(result.error)
+        if re.search(
+            r"(?:file|path)\s+not\s+found|no\s+such\s+file|does\s+not\s+exist",
+            error,
+            re.IGNORECASE,
+        ):
+            return _PathState(exists=False)
+        return _PathState(exists=False, read_error=error)
+    return _PathState(exists=True, content=result.content or "")
+
+
+def _restore_transaction(
+    file_ops: Any,
+    *,
+    initial: Dict[str, _PathState],
+    expected_current: Dict[str, _PathState],
+) -> Tuple[bool, List[str]]:
+    """Compensate a failed multi-file patch without overwriting later edits.
+
+    A path is restored only while its current state still matches the state
+    produced (or observed) by this patch.  Any mismatch is treated as a
+    concurrent/unknown change and left untouched rather than blindly rolled
+    back.
+    """
+    issues: List[str] = []
+    for path in reversed(list(initial)):
+        current = _read_path_state(file_ops, path)
+        if current.read_error:
+            issues.append(
+                f"{path}: rollback readback failed closed: {current.read_error}"
+            )
+            continue
+        if current != expected_current[path]:
+            issues.append(
+                f"{path}: protected rollback refused because current state "
+                "no longer matches this patch's expected state"
+            )
+            continue
+
+        before = initial[path]
+        if current == before:
+            continue
+        if before.exists:
+            result = file_ops.write_file(path, before.content)
+        elif current.exists:
+            result = file_ops.delete_file(path)
+        else:
+            result = None
+
+        if result is not None and result.error:
+            issues.append(f"{path}: rollback failed: {result.error}")
+            continue
+        restored = _read_path_state(file_ops, path)
+        if restored.read_error:
+            issues.append(
+                f"{path}: rollback verification failed: {restored.read_error}"
+            )
+        elif restored != before:
+            issues.append(f"{path}: rollback readback did not match original state")
+
+    return not issues, issues
 
 
 def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[str]]:
@@ -240,6 +334,8 @@ def _count_occurrences(text: str, pattern: str) -> int:
 def _validate_operations(
     operations: List[PatchOperation],
     file_ops: Any,
+    *,
+    deadline: Optional[float] = None,
 ) -> List[str]:
     """Validate all operations without writing any files.
 
@@ -256,6 +352,11 @@ def _validate_operations(
     real_change_count = 0
 
     for op in operations:
+        if deadline is not None and time.monotonic() >= deadline:
+            errors.append(
+                f"Patch validation exceeded {PATCH_APPLY_TIMEOUT_SECONDS}s"
+            )
+            break
         if op.operation != OperationType.UPDATE:
             real_change_count += 1
         if op.operation == OperationType.UPDATE:
@@ -316,19 +417,33 @@ def _validate_operations(
                     simulated = new_simulated
 
         elif op.operation == OperationType.DELETE:
-            read_result = file_ops.read_file_raw(op.file_path)
-            if read_result.error:
+            state = _read_path_state(file_ops, op.file_path)
+            if state.read_error:
+                errors.append(
+                    f"{op.file_path}: preflight read failed: {state.read_error}"
+                )
+            elif not state.exists:
                 errors.append(f"{op.file_path}: file not found for deletion")
 
         elif op.operation == OperationType.MOVE:
             if not op.new_path:
                 errors.append(f"{op.file_path}: MOVE operation missing destination path")
                 continue
-            src_result = file_ops.read_file_raw(op.file_path)
-            if src_result.error:
+            src_state = _read_path_state(file_ops, op.file_path)
+            if src_state.read_error:
+                errors.append(
+                    f"{op.file_path}: preflight read failed: "
+                    f"{src_state.read_error}"
+                )
+            elif not src_state.exists:
                 errors.append(f"{op.file_path}: source file not found for move")
-            dst_result = file_ops.read_file_raw(op.new_path)
-            if not dst_result.error:
+            dst_state = _read_path_state(file_ops, op.new_path)
+            if dst_state.read_error:
+                errors.append(
+                    f"{op.new_path}: preflight read failed: "
+                    f"{dst_state.read_error}"
+                )
+            elif dst_state.exists:
                 errors.append(
                     f"{op.new_path}: destination already exists — move would overwrite"
                 )
@@ -341,8 +456,43 @@ def _validate_operations(
     return errors
 
 
-def apply_v4a_operations(operations: List[PatchOperation],
-                          file_ops: Any) -> 'PatchResult':
+_NO_DEADLINE = object()
+
+
+def apply_v4a_operations(
+    operations: List[PatchOperation],
+    file_ops: Any,
+) -> 'PatchResult':
+    """Apply one bounded patch transaction and restore backend deadline state."""
+
+    deadline = time.monotonic() + PATCH_APPLY_TIMEOUT_SECONDS
+    previous_deadline = getattr(file_ops, "_operation_deadline", _NO_DEADLINE)
+    try:
+        setattr(file_ops, "_operation_deadline", deadline)
+    except Exception:
+        previous_deadline = _NO_DEADLINE
+    try:
+        return _apply_v4a_operations_bounded(
+            operations,
+            file_ops,
+            deadline=deadline,
+        )
+    finally:
+        try:
+            if previous_deadline is _NO_DEADLINE:
+                delattr(file_ops, "_operation_deadline")
+            else:
+                setattr(file_ops, "_operation_deadline", previous_deadline)
+        except (AttributeError, TypeError):
+            pass
+
+
+def _apply_v4a_operations_bounded(
+    operations: List[PatchOperation],
+    file_ops: Any,
+    *,
+    deadline: float,
+) -> 'PatchResult':
     """Apply V4A patch operations using a file operations interface.
 
     Uses a two-phase validate-then-apply approach:
@@ -363,13 +513,62 @@ def apply_v4a_operations(operations: List[PatchOperation],
     from tools.file_operations import PatchResult
 
     # ---- Phase 1: validate ----
-    validation_errors = _validate_operations(operations, file_ops)
+    validation_errors = _validate_operations(
+        operations,
+        file_ops,
+        deadline=deadline,
+    )
     if validation_errors:
         return PatchResult(
             success=False,
             error="Patch validation failed (no files were modified):\n"
                   + "\n".join(f"  • {e}" for e in validation_errors),
         )
+
+    # The built-in backend exposes enough primitives for protected
+    # compensation. Minimal third-party/test doubles without delete support
+    # keep the legacy single-operation behavior.
+    transaction_capable = all(
+        callable(getattr(file_ops, name, None))
+        for name in ("read_file_raw", "write_file", "delete_file")
+    )
+    initial_states: Dict[str, _PathState] = {}
+    expected_current: Dict[str, _PathState] = {}
+    if transaction_capable:
+        for op in operations:
+            for path in _operation_paths(op):
+                if path not in initial_states:
+                    if time.monotonic() >= deadline:
+                        return PatchResult(
+                            success=False,
+                            error=(
+                                "Patch preflight exceeded "
+                                f"{PATCH_APPLY_TIMEOUT_SECONDS}s; no files "
+                                "were modified"
+                            ),
+                        )
+                    state = _read_path_state(file_ops, path)
+                    if state.read_error:
+                        return PatchResult(
+                            success=False,
+                            error=(
+                                "Patch preflight failed closed (no files were "
+                                f"modified): {path}: {state.read_error}"
+                            ),
+                        )
+                    initial_states[path] = state
+            if (
+                op.operation == OperationType.ADD
+                and initial_states[op.file_path].exists
+            ):
+                return PatchResult(
+                    success=False,
+                    error=(
+                        "Patch validation failed (no files were modified): "
+                        f"{op.file_path}: add target already exists"
+                    ),
+                )
+        expected_current = dict(initial_states)
 
     # ---- Phase 2: apply ----
     files_modified = []
@@ -385,6 +584,31 @@ def apply_v4a_operations(operations: List[PatchOperation],
     errors = []
 
     for op in operations:
+        if time.monotonic() >= deadline:
+            errors.append(
+                f"Patch apply exceeded {PATCH_APPLY_TIMEOUT_SECONDS}s; "
+                "remaining operations were cancelled"
+            )
+            break
+
+        error_count_before = len(errors)
+        planned_after: Dict[str, _PathState] = {}
+        if transaction_capable:
+            if op.operation == OperationType.ADD:
+                planned_after[op.file_path] = _PathState(
+                    exists=True,
+                    content=_add_content(op),
+                )
+            elif op.operation == OperationType.DELETE:
+                planned_after[op.file_path] = _PathState(exists=False)
+            elif op.operation == OperationType.MOVE and op.new_path:
+                source_before = expected_current[op.file_path]
+                planned_after[op.file_path] = _PathState(exists=False)
+                planned_after[op.new_path] = _PathState(
+                    exists=True,
+                    content=source_before.content,
+                )
+
         try:
             if op.operation == OperationType.ADD:
                 result = _apply_add(op, file_ops)
@@ -414,6 +638,11 @@ def apply_v4a_operations(operations: List[PatchOperation],
 
             elif op.operation == OperationType.UPDATE:
                 result = _apply_update(op, file_ops)
+                if result[3] is not None:
+                    planned_after[op.file_path] = _PathState(
+                        exists=True,
+                        content=result[3],
+                    )
                 if result[0]:
                     files_modified.append(op.file_path)
                     all_diffs.append(result[1])
@@ -425,9 +654,56 @@ def apply_v4a_operations(operations: List[PatchOperation],
         except Exception as e:
             errors.append(f"Error processing {op.file_path}: {str(e)}")
 
+        if transaction_capable:
+            observed = {
+                path: _read_path_state(file_ops, path)
+                for path in _operation_paths(op)
+            }
+            readback_errors = {
+                path: state.read_error
+                for path, state in observed.items()
+                if state.read_error
+            }
+            for path, read_error in readback_errors.items():
+                errors.append(
+                    f"Post-patch readback failed for {path}: {read_error}"
+                )
+
+            planned_matches = (
+                bool(planned_after)
+                and not readback_errors
+                and all(
+                    observed.get(path) == planned_state
+                    for path, planned_state in planned_after.items()
+                )
+            )
+            operation_failed = len(errors) != error_count_before
+            if planned_matches:
+                # This exact effect is now protected. It is safe to compensate
+                # even when write_file reported an unknown outcome after the
+                # write, because source readback matches the deterministic
+                # bytes/state this operation attempted.
+                expected_current.update(planned_after)
+            elif not operation_failed:
+                errors.append(
+                    "Post-patch readback did not match the exact planned "
+                    f"state for {op.file_path}"
+                )
+        if time.monotonic() >= deadline:
+            errors.append(
+                f"Patch apply exceeded {PATCH_APPLY_TIMEOUT_SECONDS}s; "
+                "remaining operations were cancelled"
+            )
+            break
+
     # Run lint on all modified/created files
     lint_results = {}
-    for f in files_modified + files_created:
+    for f in ([] if errors else files_modified + files_created):
+        if time.monotonic() >= deadline:
+            errors.append(
+                f"Patch verification exceeded {PATCH_APPLY_TIMEOUT_SECONDS}s"
+            )
+            break
         if hasattr(file_ops, '_check_lint'):
             lint_result = file_ops._check_lint(f)
             lint_results[f] = lint_result.to_dict()
@@ -442,6 +718,35 @@ def apply_v4a_operations(operations: List[PatchOperation],
     combined_lsp = "\n\n".join(lsp_blocks) if lsp_blocks else None
 
     if errors:
+        rollback_note = ""
+        if transaction_capable:
+            # Effect execution is cancelled at the main deadline. Give
+            # compensation its own small bounded window so a timeout cannot
+            # disable the safest available path back to the captured state.
+            try:
+                setattr(
+                    file_ops,
+                    "_operation_deadline",
+                    time.monotonic() + PATCH_COMPENSATION_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass
+            rolled_back, rollback_issues = _restore_transaction(
+                file_ops,
+                initial=initial_states,
+                expected_current=expected_current,
+            )
+            if rolled_back:
+                rollback_note = (
+                    "\nAll changes from this patch were safely compensated "
+                    "and original state was verified."
+                )
+            else:
+                rollback_note = (
+                    "\nProtected compensation was incomplete; no mismatched "
+                    "state was overwritten:\n"
+                    + "\n".join(f"  - {e}" for e in rollback_issues)
+                )
         return PatchResult(
             success=False,
             diff=combined_diff,
@@ -450,8 +755,9 @@ def apply_v4a_operations(operations: List[PatchOperation],
             files_deleted=files_deleted,
             lint=lint_results if lint_results else None,
             lsp_diagnostics=combined_lsp,
-            error="Apply phase failed (state may be inconsistent — run `git diff` to assess):\n"
-                  + "\n".join(f"  • {e}" for e in errors),
+            error="Apply phase failed:\n"
+                  + "\n".join(f"  - {e}" for e in errors)
+                  + rollback_note,
         )
 
     return PatchResult(
@@ -465,6 +771,15 @@ def apply_v4a_operations(operations: List[PatchOperation],
     )
 
 
+def _add_content(op: PatchOperation) -> str:
+    return "\n".join(
+        line.content
+        for hunk in op.hunks
+        for line in hunk.lines
+        if line.prefix == "+"
+    )
+
+
 def _apply_add(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[str]]:
     """Apply an add file operation.
 
@@ -475,13 +790,8 @@ def _apply_add(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[s
     tier would silently swallow them on the V4A code path.
     """
     # Extract content from hunks (all + lines)
-    content_lines = []
-    for hunk in op.hunks:
-        for line in hunk.lines:
-            if line.prefix == '+':
-                content_lines.append(line.content)
-    
-    content = '\n'.join(content_lines)
+    content = _add_content(op)
+    content_lines = content.split("\n") if content else []
     
     result = file_ops.write_file(op.file_path, content)
     if result.error:
@@ -524,7 +834,10 @@ def _apply_move(op: PatchOperation, file_ops: Any) -> Tuple[bool, str]:
     return True, diff
 
 
-def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optional[str]]:
+def _apply_update(
+    op: PatchOperation,
+    file_ops: Any,
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Apply an update file operation.
 
     Returns ``(success, diff_or_error, lsp_diagnostics)`` — see
@@ -537,7 +850,7 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
     read_result = file_ops.read_file_raw(op.file_path)
 
     if read_result.error:
-        return False, f"Cannot read file: {read_result.error}", None
+        return False, f"Cannot read file: {read_result.error}", None, None
 
     current_content = read_result.content
 
@@ -594,7 +907,7 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
                         err_msg += format_no_match_hint(error, 0, search_pattern, new_content)
                     except Exception:
                         pass
-                    return False, err_msg, None
+                    return False, err_msg, None, None
         else:
             # Addition-only hunk (no context or removed lines).
             # Insert at the location indicated by the context hint, or at end of file.
@@ -608,7 +921,7 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
                     return False, (
                         f"Addition-only hunk: context hint '{hunk.context_hint}' is ambiguous "
                         f"({occurrences} occurrences) — provide a more unique hint"
-                    ), None
+                    ), None, None
                 else:
                     hint_pos = new_content.find(hunk.context_hint)
                     # Insert after the line containing the context hint
@@ -623,7 +936,7 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
     # Write new content
     write_result = file_ops.write_file(op.file_path, new_content)
     if write_result.error:
-        return False, write_result.error, None
+        return False, write_result.error, None, new_content
     
     # Generate diff
     diff_lines = difflib.unified_diff(
@@ -634,4 +947,9 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> Tuple[bool, str, Optiona
     )
     diff = ''.join(diff_lines)
     
-    return True, diff, getattr(write_result, "lsp_diagnostics", None)
+    return (
+        True,
+        diff,
+        getattr(write_result, "lsp_diagnostics", None),
+        new_content,
+    )

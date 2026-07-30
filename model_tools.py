@@ -1126,6 +1126,10 @@ def handle_function_call(
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}
+    else:
+        # This key is reserved for trusted dispatcher metadata. Never accept
+        # a model/plugin-supplied value or pass one to a registered handler.
+        function_args.pop("_request_phase_cwd", None)
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
@@ -1226,10 +1230,58 @@ def handle_function_call(
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
+    if not isinstance(function_args, dict):
+        function_args = {}
+    else:
+        function_args.pop("_request_phase_cwd", None)
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
+
+        # Non-bypassable request-phase seam for every registered tool,
+        # including calls unwrapped from tool_search and calls whose plugin
+        # pre-hook was already handled by the agent loop.
+        from agent.request_phase import guard_tool_call
+
+        trusted_phase_cwd = None
+        if function_name in {"terminal", "write_file", "patch", "execute_code"}:
+            # Terminal and file tools resolve relative paths against the task's
+            # stateful cwd record. Guard that exact directory rather than the
+            # turn's original workspace, otherwise `cd <dirty-repo>` followed
+            # by a relative file operation can inspect one repository and
+            # mutate another.
+            try:
+                from tools.terminal_tool import get_session_cwd
+
+                recorded_cwd = get_session_cwd(task_id or "default")
+            except Exception:
+                recorded_cwd = None
+            if recorded_cwd:
+                trusted_phase_cwd = recorded_cwd
+
+        phase_block_message = guard_tool_call(
+            function_name,
+            function_args,
+            trusted_cwd=trusted_phase_cwd,
+        )
+        if phase_block_message is not None:
+            result = tool_error(phase_block_message)
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="request_phase_block",
+                error_message=phase_block_message,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
 
         # Check plugin hooks for a block/approve directive (unless caller
         # already checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1321,21 +1373,51 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            def _guarded_final_args(
+                next_args: Dict[str, Any],
+            ) -> tuple[Dict[str, Any], Optional[str]]:
+                # Execution middleware may replace the payload after the
+                # earlier hook/approval guard. Re-check the exact final
+                # arguments at the last in-process seam before registry
+                # dispatch, and strip reserved metadata again.
+                effective_args = (
+                    dict(next_args) if isinstance(next_args, dict) else {}
+                )
+                effective_args.pop("_request_phase_cwd", None)
+                block = guard_tool_call(
+                    function_name,
+                    effective_args,
+                    trusted_cwd=trusted_phase_cwd,
+                )
+                return effective_args, block
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    effective_args, final_block = _guarded_final_args(next_args)
+                    if final_block is not None:
+                        return tool_error(
+                            final_block,
+                            error_type="request_phase_block",
+                        )
                     return registry.dispatch(
-                        function_name, next_args,
+                        function_name, effective_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    effective_args, final_block = _guarded_final_args(next_args)
+                    if final_block is not None:
+                        return tool_error(
+                            final_block,
+                            error_type="request_phase_block",
+                        )
                     return registry.dispatch(
-                        function_name, next_args,
+                        function_name, effective_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
@@ -1410,6 +1492,17 @@ def handle_function_call(
                         break
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
+
+        if function_name == "skill_view":
+            try:
+                from agent.request_phase import enforce_skill_payload_budget
+
+                result = enforce_skill_payload_budget(function_args, result)
+            except Exception:
+                result = tool_error(
+                    "Skill payload safety block: the final per-turn payload "
+                    "guard failed closed."
+                )
 
         return result
 
