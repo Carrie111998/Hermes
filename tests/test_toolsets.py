@@ -220,6 +220,18 @@ class TestToolsetConsistency:
             for inc in ts["includes"]:
                 assert inc in TOOLSETS, f"{name} includes unknown toolset '{inc}'"
 
+    def test_coding_toolset_includes_preview_and_focus_pane(self):
+        """coding toolset must include open_preview and focus_pane.
+
+        These tools are gated on HERMES_DESKTOP via check_fn — hidden
+        outside the GUI — and coding posture sessions (auto-selected in code
+        workspaces) need them to open the preview pane and focus panes.
+        Regression for PR #70786.
+        """
+        coding_tools = set(TOOLSETS["coding"]["tools"])
+        assert "open_preview" in coding_tools, "coding toolset missing open_preview"
+        assert "focus_pane" in coding_tools, "coding toolset missing focus_pane"
+
     def test_hermes_platforms_share_core_tools(self):
         """All hermes-* platform toolsets share the same core tools.
 
