@@ -62,7 +62,8 @@ validated structured event fields returned by `wf_context`.
 
 ### 3. Settle once
 
-- `wf_advance`: the stage work is complete and evidence is structured.
+- `wf_advance`: the stage work is complete and evidence is structured. Set
+  `to_step` to the exact value in `step.advance_to`; never use `step.key`.
 - `wf_propose`: an allowlisted side effect requires approval; supply the
   complete payload.
 - `wf_review`: the stage cannot choose safely; provide the bounded options.

@@ -32,7 +32,11 @@ def _workflow(conn, *, runtime=321):
                 },
                 "advance_to": "three",
             },
-            {"key": "three", "turn": {"brief": "synthetic-stage"}},
+            {
+                "key": "three",
+                "turn": {"brief": "synthetic-stage"},
+                "advance_to": "done",
+            },
             {"key": "done"},
         ],
     }
@@ -191,6 +195,23 @@ def test_each_workflow_stage_closes_its_run_before_requeue(tmp_path):
             ("three", "completed", "done"),
         ]
         assert kb.get_task(conn, task_id).status == "done"
+    finally:
+        conn.close()
+
+
+def test_workflow_advance_rejects_target_not_declared_by_current_step(tmp_path):
+    conn = kb.connect(tmp_path / "board.sqlite")
+    try:
+        task_id, event_id = _workflow(conn)
+        assert kb.claim_task(conn, task_id) is not None
+        try:
+            wf_engine.advance(conn, task_id, to_step="one", event_id=event_id)
+        except wf_engine.WorkflowConflictError as exc:
+            assert "may advance only to 'two'" in str(exc)
+        else:
+            raise AssertionError("undeclared self-transition was accepted")
+        task = kb.get_task(conn, task_id)
+        assert (task.status, task.current_step_key) == ("running", "one")
     finally:
         conn.close()
 

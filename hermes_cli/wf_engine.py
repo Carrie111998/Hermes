@@ -778,6 +778,15 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
         instance = _instance(conn, task_id)
         spec = _load_template(conn, instance["template_id"])
         current_step = task["current_step_key"]
+        if not current_step:
+            raise WorkflowConflictError(f"workflow task has no current step: {task_id}")
+        current_spec = _step(spec, str(current_step))
+        declared_target = current_spec.get("advance_to")
+        if str(to_step) != str(declared_target):
+            raise WorkflowConflictError(
+                f"workflow step {current_step!r} may advance only to "
+                f"{declared_target!r}, not {to_step!r}"
+            )
         next_step = _step(spec, str(to_step))
         duplicate = conn.execute(
             """
@@ -788,8 +797,6 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
         ).fetchone()
         if duplicate is not None:
             return
-        if not current_step:
-            raise WorkflowConflictError(f"workflow task has no current step: {task_id}")
         if not _cas_step(conn, task_id, str(current_step), str(to_step)):
             raise WorkflowConflictError(f"workflow stage changed: {task_id}")
         conn.execute(
