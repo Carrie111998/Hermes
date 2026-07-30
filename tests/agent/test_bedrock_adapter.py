@@ -388,6 +388,17 @@ class TestBuildConverseKwargs:
 
         assert kwargs["inferenceConfig"]["temperature"] == 0.2
 
+    def test_temperature_above_bedrock_limit_is_omitted(self):
+        from agent.bedrock_adapter import build_converse_kwargs
+
+        kwargs = build_converse_kwargs(
+            model="meta.llama3-70b-instruct-v1:0",
+            messages=[{"role": "user", "content": "Hi"}],
+            temperature=1.5,
+        )
+
+        assert "temperature" not in kwargs["inferenceConfig"]
+
     def test_includes_tools(self):
         from agent.bedrock_adapter import build_converse_kwargs
         tools = [{"type": "function", "function": {
