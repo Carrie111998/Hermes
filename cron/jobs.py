@@ -1605,6 +1605,36 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def restore_job(job_id: str, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Atomically restore a complete canonical job snapshot in place."""
+    if not isinstance(snapshot, dict):
+        raise ValueError("cron restore snapshot must be an object")
+    restored = copy.deepcopy(snapshot)
+    restored["id"] = job_id
+    if "deliver" not in restored and "delivery" in restored:
+        restored["deliver"] = restored["delivery"]
+    if isinstance(restored.get("schedule"), str):
+        restored["schedule"] = parse_schedule(restored["schedule"])
+    if not isinstance(restored.get("schedule"), dict):
+        raise ValueError("cron restore snapshot requires schedule")
+    restored = _apply_skill_fields(restored)
+    if restored.get("repeat") is None:
+        restored["repeat"] = {"times": None, "completed": 0}
+    elif isinstance(restored.get("repeat"), int):
+        restored["repeat"] = {"times": restored["repeat"], "completed": 0}
+    restored.setdefault("repeat", {"times": None, "completed": 0})
+    restored.setdefault("enabled", True)
+    restored["state"] = restored.get("state") or ("scheduled" if restored["enabled"] else "paused")
+    with _jobs_lock():
+        jobs = load_jobs()
+        for index, current in enumerate(jobs):
+            if current.get("id") == job_id:
+                jobs[index] = restored
+                save_jobs(jobs)
+                return _normalize_job_record(restored)
+    return None
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)

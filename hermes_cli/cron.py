@@ -520,6 +520,23 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     return 0
 
 
+def cron_restore(args):
+    from cron.jobs import restore_job
+    try:
+        restored = restore_job(args.job_id, json.loads(args.snapshot))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        print(color(f"Failed to restore job: {exc}", Colors.RED))
+        return 1
+    if restored is None:
+        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(_canonical_job(restored), ensure_ascii=False, sort_keys=True))
+    else:
+        print(color(f"Restored job: {args.job_id}", Colors.GREEN))
+    return 0
+
+
 def cron_command(args):
     """Handle cron subcommands."""
     subcmd = getattr(args, 'cron_command', None)
@@ -546,6 +563,9 @@ def cron_command(args):
 
     if subcmd == "edit":
         return cron_edit(args)
+
+    if subcmd == "restore":
+        return cron_restore(args)
 
     if subcmd == "pause":
         return _job_action("pause", args.job_id, "Paused")

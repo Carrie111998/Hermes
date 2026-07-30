@@ -166,6 +166,11 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     cron_edit.add_argument("--json", action="store_true", help="Emit canonical JSON")
 
+    cron_restore = cron_subparsers.add_parser("restore", help="Atomically restore a canonical job snapshot")
+    cron_restore.add_argument("job_id", help="Job ID to restore")
+    cron_restore.add_argument("--snapshot", required=True, help="Canonical JSON object")
+    cron_restore.add_argument("--json", action="store_true", help="Emit canonical JSON")
+
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
     cron_pause.add_argument("job_id", help="Job ID to pause")
