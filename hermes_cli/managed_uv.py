@@ -693,6 +693,7 @@ def _smoke_candidate_venv(venv_dir: Path) -> tuple[bool, str, SQLiteRuntimeInfo 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "core import smoke failed").strip()
         last_line = detail.splitlines()[-1] if detail else "core import smoke failed"
+        logger.debug("candidate venv smoke stderr:\n%s", detail)
         return False, last_line, info
     return True, "", info
 
