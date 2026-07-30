@@ -17,7 +17,8 @@ of ``atexit`` — not a snapshot of the module's source.
 """
 
 import atexit
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import MagicMock, call, patch
 
 from tools.computer_use import tool as cu_tool
 
@@ -63,3 +64,75 @@ class TestAtexitTeardown:
         finally:
             atexit.unregister(cu_tool._shutdown_backend_atexit)
             atexit.register(cu_tool._shutdown_backend_atexit)
+
+
+class TestEndedSessionRecovery:
+    def test_ended_driver_session_is_released_then_retried_once(self):
+        """A stale cached cua-driver session gets one fresh-backend replay."""
+        stale = MagicMock()
+        fresh = MagicMock()
+        args = {"action": "list_apps"}
+        with patch.object(cu_tool, "_get_backend", side_effect=[stale, fresh]) as get, \
+             patch.object(cu_tool, "release_computer_use_session") as release, \
+             patch.object(
+                 cu_tool,
+                 "_dispatch",
+                 side_effect=[
+                     RuntimeError("session 'cua-123' has ended"),
+                     json.dumps({"apps": [], "count": 0}),
+                 ],
+             ) as dispatch, \
+             patch.object(cu_tool, "_backend_call_locks", {}):
+            result = cu_tool.handle_computer_use(args, session_id="run-123")
+
+        assert json.loads(result) == {"apps": [], "count": 0}
+        release.assert_called_once_with("run-123")
+        assert get.call_args_list == [
+            call(session_id="run-123"),
+            call(session_id="run-123"),
+        ]
+        assert dispatch.call_args_list == [
+            call(stale, "list_apps", args),
+            call(fresh, "list_apps", args),
+        ]
+
+    def test_unrelated_runtime_error_does_not_reset_or_retry(self):
+        """Only cua-driver's ended-session signature permits a replay."""
+        backend = MagicMock()
+        with patch.object(cu_tool, "_get_backend", return_value=backend) as get, \
+             patch.object(cu_tool, "release_computer_use_session") as release, \
+             patch.object(
+                 cu_tool,
+                 "_dispatch",
+                 side_effect=RuntimeError("driver connection dropped"),
+             ) as dispatch, \
+             patch.object(cu_tool, "_backend_call_locks", {}):
+            result = json.loads(
+                cu_tool.handle_computer_use({"action": "list_apps"}, session_id="run-123")
+            )
+
+        assert result["error"] == "list_apps failed: driver connection dropped"
+        release.assert_not_called()
+        assert get.call_count == 1
+        assert dispatch.call_count == 1
+
+    def test_ended_driver_session_failed_retry_is_not_repeated(self):
+        """A failed fresh-backend replay returns an error instead of looping."""
+        stale = MagicMock()
+        fresh = MagicMock()
+        with patch.object(cu_tool, "_get_backend", side_effect=[stale, fresh]) as get, \
+             patch.object(cu_tool, "release_computer_use_session") as release, \
+             patch.object(
+                 cu_tool,
+                 "_dispatch",
+                 side_effect=RuntimeError("session 'cua-123' has ended"),
+             ) as dispatch, \
+             patch.object(cu_tool, "_backend_call_locks", {}):
+            result = json.loads(
+                cu_tool.handle_computer_use({"action": "list_apps"}, session_id="run-123")
+            )
+
+        assert result["error"] == "list_apps failed: session 'cua-123' has ended"
+        release.assert_called_once_with("run-123")
+        assert get.call_count == 2
+        assert dispatch.call_count == 2

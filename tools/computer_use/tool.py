@@ -506,6 +506,27 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
             call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
         with call_lock:
             return _dispatch(backend, action, args)
+    except RuntimeError as e:
+        # cua-driver can end a cached session underneath Hermes. Reset only
+        # that exact, recognized failure through the normal lifecycle seam,
+        # then replay the original action once against a fresh backend.
+        if not re.search(r"\bsession\b.*\bhas ended\b", str(e), re.IGNORECASE):
+            logger.exception("computer_use %s failed", action)
+            return json.dumps({"error": f"{action} failed: {e}"})
+
+        logger.warning("cua-driver session ended; recreating it once")
+        try:
+            release_computer_use_session(session_id)
+            backend = _get_backend(session_id=session_id)
+            with _backend_lock:
+                call_lock = _backend_call_locks.setdefault(
+                    session_id, threading.RLock()
+                )
+            with call_lock:
+                return _dispatch(backend, action, args)
+        except Exception as retry_error:
+            logger.exception("computer_use %s recovery retry failed", action)
+            return json.dumps({"error": f"{action} failed: {retry_error}"})
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
