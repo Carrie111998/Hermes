@@ -904,9 +904,11 @@ class Task:
     workflow_template_id: Optional[str] = None
     current_step_key: Optional[str] = None
     # Force-loaded skills for the worker on this task (passed via
-    # --skills). Stored as a JSON array of skill names. None = use only
-    # the defaults; empty list = explicitly no extra skills.
-    skills: Optional[list] = None
+    # --skills). Canonical rows decode to a list, while malformed/legacy
+    # stored values remain raw until the final pre-Popen validator can reject
+    # or normalize them. None = use only the defaults; empty list = explicitly
+    # no extra skills.
+    skills: object = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -953,15 +955,23 @@ class Task:
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         keys = set(row.keys())
-        # Parse skills JSON blob if present
-        skills_value: Optional[list] = None
-        if "skills" in keys and row["skills"]:
-            try:
-                parsed = json.loads(row["skills"])
-                if isinstance(parsed, list):
-                    skills_value = [str(s) for s in parsed if s]
-            except Exception:
-                skills_value = None
+        # Preserve the stored value until the final pre-Popen validation
+        # boundary. Canonical JSON arrays still decode to lists for the public
+        # Task API, but malformed JSON, non-array JSON, and unsupported SQLite
+        # values must not be swallowed, stringified, or filtered here: doing so
+        # would let a corrupt legacy row spawn with altered or missing skills.
+        skills_value: object = None
+        if "skills" in keys:
+            stored_skills = row["skills"]
+            skills_value = stored_skills
+            if isinstance(stored_skills, str):
+                try:
+                    parsed = json.loads(stored_skills)
+                except (json.JSONDecodeError, RecursionError):
+                    pass
+                else:
+                    if isinstance(parsed, list):
+                        skills_value = parsed
         return cls(
             id=row["id"],
             title=row["title"],
@@ -8788,6 +8798,77 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_SPAWN_SKILL_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:[/:][A-Za-z0-9][A-Za-z0-9._-]*)*$"
+)
+_SPAWN_SKILL_IDENTIFIER_MAX_LENGTH = 256
+
+
+def _invalid_spawn_skills(task_id: object, reason: str) -> ValueError:
+    """Build a bounded, single-line worker-skill validation error."""
+    task_label = re.sub(r"\s+", " ", str(task_id)).strip() or "<unknown>"
+    if len(task_label) > 64:
+        task_label = f"{task_label[:61]}..."
+    return ValueError(
+        f"task {task_label} has invalid skills ({reason}); expected None, "
+        "list[str]/tuple[str, ...], a JSON-array string, or a "
+        "single/comma-delimited identifier string; identifiers may use only "
+        "letters, digits, '.', '_', '/', ':', and '-'"
+    )
+
+
+def _normalize_spawn_skills(value: object, *, task_id: object) -> list[str]:
+    """Normalize task skills at the final boundary before worker ``Popen``.
+
+    Keeping this independent of database decoding protects direct ``Task``
+    callers and broker serializers that hydrate the dataclass without calling
+    :meth:`Task.from_row`.
+    """
+    if value is None:
+        return []
+
+    raw_items: Iterable[object]
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return []
+        try:
+            decoded = json.loads(stripped)
+        except (json.JSONDecodeError, RecursionError):
+            if stripped[0] in '[{"':
+                raise _invalid_spawn_skills(
+                    task_id, "malformed JSON-looking value"
+                ) from None
+            raw_items = stripped.split(",")
+        else:
+            if not isinstance(decoded, list):
+                raise _invalid_spawn_skills(task_id, "JSON value must be an array")
+            raw_items = decoded
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raise _invalid_spawn_skills(task_id, "unsupported value type")
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        if not isinstance(item, str):
+            raise _invalid_spawn_skills(task_id, "members must be strings")
+        name = item.strip()
+        if not name:
+            raise _invalid_spawn_skills(task_id, "members must be non-empty")
+        if (
+            len(name) > _SPAWN_SKILL_IDENTIFIER_MAX_LENGTH
+            or _SPAWN_SKILL_IDENTIFIER_RE.fullmatch(name) is None
+        ):
+            raise _invalid_spawn_skills(task_id, "member is not a valid identifier")
+        if name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8807,8 +8888,10 @@ def _default_spawn(
     from. Workers cannot accidentally see other boards.
     """
     import subprocess
+
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+    spawn_skills = _normalize_spawn_skills(task.skills, task_id=task.id)
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -8926,10 +9009,8 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    for skill in spawn_skills:
+        cmd.extend(["--skills", skill])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
