@@ -5517,6 +5517,26 @@ def run_conversation(
             except Exception:
                 pass
 
+            # Native cron accounting is context-scoped by the scheduler.  This
+            # sits beside the post-request hook so it observes every completed
+            # model request (including tool-follow-up turns) without asking a
+            # plugin or model to reconstruct usage.  It is a no-op outside an
+            # active cron execution and failures must never affect a response.
+            try:
+                from cron.usage_footer import record_native_usage
+                record_native_usage(
+                    normalize_usage(
+                        getattr(response, "usage", None),
+                        provider=agent.provider,
+                        api_mode=agent.api_mode,
+                    ) if getattr(response, "usage", None) else None,
+                    agent.provider or "",
+                    getattr(response, "model", None) or agent.model or "",
+                    agent.base_url or "",
+                )
+            except Exception:
+                logger.debug("Native cron usage collection failed", exc_info=True)
+
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
                 if agent.verbose_logging:

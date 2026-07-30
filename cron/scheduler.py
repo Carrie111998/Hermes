@@ -1447,7 +1447,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    usage_footer: str = "",
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1506,6 +1513,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
     else:
         delivery_content = content
+
+    # Application-generated usage belongs after the existing cron wrapper, so
+    # platform splitters retain exactly one footer on the final outbound chunk.
+    if usage_footer:
+        delivery_content = f"{delivery_content.rstrip()}\n\n{usage_footer}"
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -3941,21 +3953,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
-        try:
-            success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
-            )
-        except BaseException:
-            # run_job's finally still hands back the agent when it raises; tear
-            # it down here so a failed run never leaks its async resources
-            # (#10200), then re-raise into the outer handler. BaseException
-            # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
-            # still triggers teardown before propagating.
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
-        finally:
-            reset_secret_scope(_scope_token)
+        # A fresh ContextVar-backed bucket confines request accounting to this
+        # exact run even when tick() executes other jobs concurrently.
+        from cron.usage_footer import activate_cron_usage
+        with activate_cron_usage() as _run_usage:
+            try:
+                success, output, final_response, error = run_job(
+                    job, defer_agent_teardown=_deferred_agents
+                )
+            except BaseException:
+                # run_job's finally still hands back the agent when it raises; tear
+                # it down here so a failed run never leaks its async resources
+                # (#10200), then re-raise into the outer handler. BaseException
+                # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run
+                # still triggers teardown before propagating.
+                for _deferred_agent in _deferred_agents:
+                    _teardown_cron_agent(_deferred_agent, job["id"])
+                raise
+            finally:
+                reset_secret_scope(_scope_token)
+        usage_footer = _run_usage.footer()
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4008,7 +4025,19 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    # Preserve the established call shape when no native usage
+                    # was observed; it keeps alternate delivery implementations
+                    # and tests compatible. A non-empty footer is appended only
+                    # by the generic delivery path.
+                    if usage_footer:
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop,
+                            usage_footer=usage_footer,
+                        )
+                    else:
+                        delivery_error = _deliver_result(
+                            job, deliver_content, adapters=adapters, loop=loop,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)

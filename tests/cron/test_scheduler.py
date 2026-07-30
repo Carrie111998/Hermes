@@ -285,6 +285,26 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    def test_delivery_keeps_prepared_usage_footer_once_at_end(self):
+        """The generic transport sees one footer after the unchanged result."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        footer = "──\nUsage: 842 input · 91 output · 933 total\nEstimated cost: $0.0003 · 1 LLM call"
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            _deliver_result(
+                {"id": "usage-job", "deliver": "origin", "origin": {"platform": "telegram", "chat_id": "123"}},
+                "Report body",
+                usage_footer=footer,
+            )
+
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content.count("Usage:") == 1
+        assert sent_content.endswith(footer)
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
         """Persisted Slack home survives restart without native Slack config."""
