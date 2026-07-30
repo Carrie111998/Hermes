@@ -11,7 +11,8 @@ sites, fixed here:
   Now passes ``active_only=True`` unconditionally.
 - ``tui_gateway/methods_prompt.py`` edit/regenerate truncation: bare
   ``replace_messages`` deleted the archived transcript on every
-  edit/regenerate of a compacted session.  Now ``active_only=True``.
+  edit/regenerate of a compacted session. It now uses an atomic conditional
+  active-only rewrite and archives the replaced live rows.
 
 Behavior contract on a fresh (never-compacted) session: every row is
 ``active=1``, so the active-only replace is identical to the full replace —
@@ -125,20 +126,22 @@ class TestAcpPersistPreservesArchives:
 
 
 class TestTuiPromptTruncationPreservesArchives:
-    def test_truncation_source_uses_active_only(self):
-        """The edit/regenerate persistence call must pass active_only=True."""
+    def test_truncation_source_uses_conditional_active_replace(self):
+        """The edit/regenerate write must stay atomic, active-only, and recoverable."""
         import inspect
         import tui_gateway.methods_prompt as mp
 
         src = inspect.getsource(mp)
-        # The truncation write is the only replace_messages call in the module;
-        # it must carry active_only=True.
+        # The helper name pins active-only behavior; archive_dropped preserves
+        # the replaced live rows instead of hard-deleting them.
         import re
-        calls = re.findall(r"db\.replace_messages\([^)]*\)", src, re.S)
-        assert calls, "expected the truncation replace_messages call"
+        calls = re.findall(
+            r"db\.replace_active_messages_if_unchanged\([^)]*\)", src, re.S
+        )
+        assert calls, "expected the conditional truncation rewrite"
         for call in calls:
-            assert "active_only=True" in call, (
-                f"bare replace_messages in methods_prompt — #80216 class: {call}"
+            assert "archive_dropped=True" in call, (
+                f"hard-delete conditional rewrite in methods_prompt — #80216 class: {call}"
             )
 
     def test_truncation_write_keeps_archived_rows(self, state_db):
@@ -148,10 +151,18 @@ class TestTuiPromptTruncationPreservesArchives:
         _seed_compacted_session(state_db, sid)
         assert _archived_count(state_db, sid) == 4
 
+        expected, _display = state_db.get_resume_conversations(sid)
         truncated = [{"role": "user", "content": "kept head"}]
-        state_db.replace_messages(sid, truncated, active_only=True)
+        replaced = state_db.replace_active_messages_if_unchanged(
+            sid,
+            expected,
+            truncated,
+            archive_dropped=True,
+        )
 
-        assert _archived_count(state_db, sid) == 4
+        assert replaced is True
+        # Four compacted rows plus the three replaced live rows survive.
+        assert _archived_count(state_db, sid) == 7
         live = [
             m for m in state_db.get_messages_as_conversation(sid)
             if m.get("role") in ("user", "assistant")

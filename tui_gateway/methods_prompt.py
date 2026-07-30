@@ -227,11 +227,14 @@ def _(rid, params: dict) -> dict:
                 if message.get("role") == "user" and not message.get("display_kind")
             )
             segment_ordinal = ordinal - prefix_user_count
+            expected_history = list(history)
             if db is not None and session.get("session_key"):
                 try:
-                    history = db.get_messages_as_conversation(
-                        session["session_key"], repair_alternation=True
+                    raw_history, _display_history = db.get_resume_conversations(
+                        session["session_key"]
                     )
+                    expected_history = list(raw_history)
+                    history = sanitize_replay_history(raw_history)
                 except Exception as exc:
                     # This path immediately performs a destructive transcript
                     # replacement. If the authoritative read fails, do not fall
@@ -291,25 +294,14 @@ def _(rid, params: dict) -> dict:
             # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
-                    # active_only=True: replace only the live (active=1) rows.
-                    # In-place compaction (#38763) keeps the pre-compaction
-                    # transcript as active=0/compacted=1 rows under this same
-                    # session key; a bare replace_messages() would DELETE that
-                    # durable archive on every edit/regenerate — the same bug
-                    # class #80216 fixed for /retry. On an uncompacted session
-                    # all rows are active=1, so this is behaviorally identical
-                    # to the full replace.
-                    # archive_dropped: a rewind overwrites turns the user may
-                    # not have meant to drop, and this write is the last step
-                    # before they are gone — three reported incidents ended
-                    # here with nothing to restore from (#70516, #80763,
-                    # #82756). Soft-archiving keeps them on disk (active=0) and
-                    # in the FTS index, so a mis-aimed cut is recoverable
-                    # instead of terminal. The live transcript is unchanged.
-                    db.replace_messages(
+                    # Compare and rewrite inside one transaction so a writer
+                    # cannot append between the refresh and truncation. Soft-
+                    # archive the replaced active rows so a mis-aimed rewind
+                    # remains recoverable without touching compacted history.
+                    replaced = db.replace_active_messages_if_unchanged(
                         session["session_key"],
+                        expected_history,
                         truncated,
-                        active_only=True,
                         archive_dropped=True,
                     )
                 except Exception as exc:
@@ -326,6 +318,12 @@ def _(rid, params: dict) -> dict:
                         rid,
                         5008,
                         f"failed to persist history truncation: {exc}",
+                    )
+                if not replaced:
+                    return _err(
+                        rid,
+                        4091,
+                        "session history changed while editing; reload and retry",
                     )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
