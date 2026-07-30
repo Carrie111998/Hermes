@@ -849,8 +849,10 @@ def submit_review(task_id: str, payload: FrozenHeadReviewBody, board: Optional[s
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         try:
-            kanban_db.submit_task_for_review(
+            kanban_db.submit_frozen_head_for_review(
                 conn,
                 task_id,
                 head_sha=payload.head_sha,

@@ -2250,7 +2250,7 @@ def _cmd_submit_review(args: argparse.Namespace) -> int:
         return 2
     try:
         with kb.connect_closing() as conn:
-            kb.submit_task_for_review(
+            kb.submit_frozen_head_for_review(
                 conn,
                 args.task_id,
                 head_sha=args.head_sha,

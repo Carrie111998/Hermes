@@ -4693,6 +4693,92 @@ class FrozenHeadReviewError(ValueError):
 def submit_task_for_review(
     conn: sqlite3.Connection,
     task_id: str,
+    reviewer: str,
+) -> Optional[Task]:
+    """Atomically hand a running or legacy review-required block to a reviewer."""
+    reviewer = _canonical_assignee(reviewer)
+    if not reviewer:
+        raise ValueError("reviewer is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] not in {"running", "blocked"}:
+            raise RuntimeError(
+                f"cannot submit {task_id} for review from status {row['status']!r}"
+            )
+        if row["status"] == "blocked":
+            legacy = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+                "ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            try:
+                blocked_payload = json.loads(legacy["payload"] or "{}") if legacy else {}
+            except (TypeError, ValueError):
+                blocked_payload = {}
+            if not str(blocked_payload.get("reason") or "").startswith("review-required:"):
+                raise RuntimeError(
+                    f"cannot submit {task_id} for review from unrelated blocked state"
+                )
+        if row["status"] == "running" and row["claim_lock"] is None:
+            raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
+        old_run_id = _end_run(conn, task_id, outcome="review_submitted", status="review")
+        conn.execute(
+            "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, block_recurrences=0 "
+            "WHERE id=?", (reviewer, task_id),
+        )
+        _append_event(
+            conn, task_id, "submitted_for_review",
+            {"reviewer": reviewer, "previous_assignee": row["assignee"]},
+            run_id=old_run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def _worktree_writer_pids(worktree: Path) -> list[int]:
+    """Return non-control processes with a writable relationship to worktree."""
+    target = worktree.resolve()
+    control_pid = os.getpid()
+    found: set[int] = set()
+    try:
+        pids = [int(p.name) for p in Path("/proc").iterdir() if p.name.isdigit()]
+    except OSError:
+        return []
+    for pid in pids:
+        if pid == control_pid:
+            continue
+        base = Path("/proc") / str(pid)
+        try:
+            cwd = (base / "cwd").resolve()
+            if cwd == target or target in cwd.parents:
+                found.add(pid)
+            for fd in (base / "fd").iterdir():
+                resolved = fd.resolve()
+                if resolved != target and target not in resolved.parents:
+                    continue
+                fdinfo = (base / "fdinfo" / fd.name).read_text()
+                flags_line = next((line for line in fdinfo.splitlines() if line.startswith("flags:")), "")
+                if flags_line and int(flags_line.split()[1], 8) & (os.O_WRONLY | os.O_RDWR):
+                    found.add(pid)
+            for line in (base / "maps").read_text().splitlines():
+                fields = line.split()
+                if len(fields) < 6 or "w" not in fields[1]:
+                    continue
+                mapped = Path(" ".join(fields[5:])).resolve()
+                if mapped == target or target in mapped.parents:
+                    found.add(pid)
+        except (OSError, ValueError, RuntimeError):
+            continue
+    return sorted(found)
+
+
+def submit_frozen_head_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
     *,
     head_sha: str,
     worktree_path: str,
@@ -4708,7 +4794,14 @@ def submit_task_for_review(
     the transition.  Every rejection is recorded, but no task state is
     changed on rejection.
     """
+    row = conn.execute(
+        "SELECT status, workspace_path, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+
     def reject(reason: str) -> NoReturn:
+        if row is None:
+            raise FrozenHeadReviewError(reason)
         with write_txn(conn):
             _append_event(conn, task_id, "review_submission_rejected", {
                 "route": "frozen_head",
@@ -4728,8 +4821,15 @@ def submit_task_for_review(
     evidence = dict(evidence)
     if evidence.get("head_sha") != head_sha:
         reject("evidence head_sha must exactly match head_sha")
-    if evidence.get("worktree_path") != worktree_path:
-        reject("evidence worktree_path must exactly match worktree_path")
+    if evidence.get("worktree_path"):
+        try:
+            evidence_path = Path(evidence["worktree_path"]).expanduser().resolve(strict=True)
+        except (OSError, TypeError):
+            reject("evidence worktree_path is not a resolvable directory")
+    else:
+        evidence_path = None
+    if evidence_path is not None and evidence_path != Path(worktree_path).expanduser().resolve():
+        reject("evidence worktree_path is unrelated to the submitted worktree")
     if evidence.get("clean") is not True:
         reject("evidence clean must be true")
     if evidence.get("implementation_complete") is not True:
@@ -4754,16 +4854,26 @@ def submit_task_for_review(
     if dirty:
         reject("worktree is dirty")
 
-    row = conn.execute(
-        "SELECT status, current_run_id, claim_lock, claim_expires, worker_pid "
-        "FROM tasks WHERE id = ?", (task_id,),
-    ).fetchone()
     if row is None:
         reject(f"task {task_id} not found")
-    if row["status"] != "done":
-        reject(f"task must be done; current status is {row['status']!r}")
+    if row["status"] in {"triage", "running", "archived"}:
+        reject(f"frozen head cannot be submitted from status {row['status']!r}")
+    if row["status"] not in {"scheduled", "ready", "todo", "done"}:
+        reject(f"frozen head cannot be submitted from status {row['status']!r}")
+    if not row["workspace_path"]:
+        reject("task has no canonical workspace")
+    try:
+        canonical_path = Path(row["workspace_path"]).expanduser().resolve(strict=True)
+        submitted_path = path.resolve(strict=True)
+    except OSError as exc:
+        reject(f"unable to resolve canonical workspace: {exc}")
+    if submitted_path != canonical_path:
+        reject("worktree is unrelated to the task canonical workspace")
     if row["current_run_id"] is not None or row["claim_lock"] is not None or row["worker_pid"] is not None:
         reject("task has a live claim or current writer")
+    writer_pids = _worktree_writer_pids(submitted_path)
+    if writer_pids:
+        reject(f"worktree has active OS writers: {writer_pids}")
 
     run = conn.execute(
         "SELECT id, metadata FROM task_runs WHERE task_id = ? "
@@ -4780,11 +4890,14 @@ def submit_task_for_review(
         reject("completed implementation evidence metadata is malformed")
     if not run_metadata.get("changed_files") or "tests_run" not in run_metadata:
         reject("completed implementation evidence requires changed_files and tests_run")
+    if run_metadata.get("head_sha") and str(run_metadata["head_sha"]).lower() != head_sha.lower():
+        reject("completed implementation evidence head_sha does not match exact head_sha")
 
     try:
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'review' WHERE id = ? AND status = 'done' "
+                "UPDATE tasks SET status = 'review' WHERE id = ? "
+                "AND status IN ('scheduled', 'ready', 'todo', 'done') "
                 "AND current_run_id IS NULL AND claim_lock IS NULL AND worker_pid IS NULL",
                 (task_id,),
             )
