@@ -2,6 +2,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { BargeMonitorCallbacks } from '@/lib/voice-barge-in'
+import { setVoicePlaybackState } from '@/store/voice-playback'
 
 import type { MicRecording } from './use-mic-recorder'
 import { useVoiceConversation } from './use-voice-conversation'
@@ -24,13 +25,16 @@ vi.mock('@/lib/voice-barge-in', () => ({
   }
 }))
 
-const markVoicePlaybackInterrupted = vi.fn()
-const stopVoicePlayback = vi.fn()
+const { markVoicePlaybackInterrupted, startSpeechStream, stopVoicePlayback } = vi.hoisted(() => ({
+  markVoicePlaybackInterrupted: vi.fn(),
+  startSpeechStream: vi.fn(),
+  stopVoicePlayback: vi.fn()
+}))
 
 vi.mock('@/lib/voice-playback', () => ({
   markVoicePlaybackInterrupted: () => markVoicePlaybackInterrupted(),
   playSpeechText: vi.fn(async () => true),
-  startSpeechStream: vi.fn(async () => null),
+  startSpeechStream,
   stopVoicePlayback: () => stopVoicePlayback()
 }))
 
@@ -140,6 +144,14 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     vi.clearAllMocks()
     micHandle.start.mockResolvedValue(undefined)
     micHandle.stop.mockResolvedValue(null)
+    startSpeechStream.mockResolvedValue(null)
+    setVoicePlaybackState({
+      audioElement: null,
+      messageId: null,
+      sequence: 0,
+      source: null,
+      status: 'idle'
+    })
   })
 
   afterEach(cleanup)
@@ -262,5 +274,71 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     hook.rerender({ busy: true })
 
     expect(monitorCalls.length).toBe(armed)
+  })
+
+  it('re-arms the microphone after a normal streaming reply', async () => {
+    let reply: { id: string; pending: boolean; text: string } | null = null
+    const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
+    const onSubmit = vi.fn(async () => onBusyChange.current(true))
+
+    const session = {
+      append: vi.fn(),
+      done: Promise.resolve<'done'>('done'),
+      finish: vi.fn()
+    }
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          onSubmit,
+          onTranscribeAudio: vi.fn(async () => 'first request'),
+          pendingResponse: () => reply
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    onBusyChange.current = busy => hook.rerender({ busy })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('listening'))
+
+    micHandle.stop.mockResolvedValueOnce({
+      audio: new Blob(['q'], { type: 'audio/webm' }),
+      durationMs: 900,
+      heardSpeech: true
+    })
+    await act(async () => {
+      hook.result.current.stopTurn()
+    })
+    await waitFor(() => expect(hook.result.current.status).toBe('thinking'))
+
+    // `startSpeechStream()` begins by clearing stale playback, which advances
+    // the shared sequence. That internal change must not be mistaken for the
+    // user pressing Stop at the end of the reply.
+    startSpeechStream.mockImplementationOnce(async () => {
+      setVoicePlaybackState({
+        audioElement: null,
+        messageId: null,
+        sequence: 1,
+        source: 'voice-conversation',
+        status: 'preparing'
+      })
+
+      return session
+    })
+    reply = { id: 'reply-1', pending: false, text: 'First answer.' }
+    hook.rerender({ busy: false })
+
+    await waitFor(() => expect(startSpeechStream).toHaveBeenCalledTimes(1))
+    await act(async () => {
+      await new Promise(resolve => window.setTimeout(resolve, 20))
+    })
+    expect(startSpeechStream).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(micHandle.start).toHaveBeenCalledTimes(2))
   })
 })

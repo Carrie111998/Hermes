@@ -458,9 +458,14 @@ export function useVoiceConversation({
         // this is a safety net for read-aloud-style entries into the loop.
         ensureBargeMonitor()
 
+        // `playSpeechText()` synchronously clears any previous clip before it
+        // returns its promise, advancing the playback sequence itself. Capture
+        // the baseline after that internal reset so it is not mistaken for the
+        // user pressing Stop; only a later sequence advance suppresses re-arm.
+        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
         speechStartSequenceRef.current = $voicePlayback.get().sequence
 
-        void playSpeechText(response.text, { source: 'voice-conversation' })
+        void playback
           .catch(error => notifyError(error, voiceCopy.playbackFailed))
           .finally(() => {
             if (responseIdRef.current === responseId) {
@@ -484,7 +489,6 @@ export function useVoiceConversation({
     (responseId: string) => {
       responseIdRef.current = responseId
       spokenSourceLengthRef.current = 0
-      speechStartSequenceRef.current = $voicePlayback.get().sequence
       setStatus('speaking')
 
       // VAD barge-in: the user talking over the reply cuts playback, drops
@@ -504,6 +508,11 @@ export function useVoiceConversation({
 
           return
         }
+
+        // `startSpeechStream()` clears stale playback internally. Its sequence
+        // advance establishes the new clip, not a user-requested stop, so the
+        // baseline must be taken only after the stream has opened.
+        speechStartSequenceRef.current = $voicePlayback.get().sequence
 
         if (!session) {
           // No streaming backend/provider: speak the whole reply once it lands.
