@@ -1325,6 +1325,29 @@ class HonchoMemoryProvider(MemoryProvider):
             ),
         }
 
+    @staticmethod
+    def _coerce_turn_text(value: Any) -> str:
+        """Flatten structured message content into plain text.
+
+        The agent core can hand ``sync_turn`` content in the OpenAI
+        content-parts shape (a list of ``{"type": ..., "text": ...}``
+        dicts) rather than a plain string.  ``sanitize_context`` runs
+        regexes over the value, so a list raises ``TypeError: expected
+        string or bytes-like object`` and the turn is silently dropped —
+        Honcho then never receives any conversation data.
+        """
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text") or item.get("content") or ""))
+                else:
+                    parts.append(str(item))
+            return "\n".join(part for part in parts if part)
+        if isinstance(value, str):
+            return value
+        return "" if value is None else str(value)
+
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Record the conversation turn in Honcho (non-blocking).
 
@@ -1340,8 +1363,8 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        clean_user_content = sanitize_context(self._coerce_turn_text(user_content) or "").strip()
+        clean_assistant_content = sanitize_context(self._coerce_turn_text(assistant_content) or "").strip()
 
         def _sync():
             try:
