@@ -4632,12 +4632,20 @@ class DirtyWorkspaceError(ValueError):
 
 def _git_porcelain_status_lines(workspace_path: Path | str, *, timeout: int = 10) -> Optional[list[str]]:
     """Return porcelain status lines for a git checkout, or ``None`` if the path
-    is not a repo or git could not be queried safely.
+    is not a git repository.
 
     The output preserves ignored-file filtering by using git porcelain status
     rather than filesystem scanning.
+
+    Raises ``DirtyWorkspaceError`` if the path *is* a repository but ``git
+    status`` queries fail — failing closed is safer than treating an
+    unqueriable worktree as clean.
     """
     import subprocess
+
+    git_dir = Path(workspace_path) / ".git"
+    if not git_dir.exists():
+        return None
 
     try:
         result = subprocess.run(
@@ -4645,10 +4653,20 @@ def _git_porcelain_status_lines(workspace_path: Path | str, *, timeout: int = 10
             capture_output=True, text=True, timeout=timeout, cwd=workspace_path,
         )
         if result.returncode != 0:
-            return None
+            raise DirtyWorkspaceError(
+                "unknown",  # task_id not available at this layer
+                str(workspace_path),
+                [result.stderr.strip() or f"git status exit {result.returncode}"],
+            )
         return [line for line in result.stdout.splitlines() if line.strip()]
-    except Exception:
-        return None
+    except DirtyWorkspaceError:
+        raise
+    except Exception as exc:
+        raise DirtyWorkspaceError(
+            "unknown",
+            str(workspace_path),
+            [f"git status query failed: {exc}"],
+        )
 
 
 def _task_dirty_workspace_status(
@@ -4657,10 +4675,14 @@ def _task_dirty_workspace_status(
     max_status_lines: int = 5,
 ) -> Optional[tuple[str, list[str]]]:
     """Return ``(workspace_path, status_lines)`` if the task's workspace is a dirty
-    git checkout.
+    git worktree checkout.
 
-    Non-git scratch/research workspaces return ``None`` rather than blocking.
+    Only inspects workspaces with ``workspace_kind=\"worktree\"`` — shared
+    ``dir:`` workspaces and ``scratch`` spaces are never blocked. Non-git
+    worktree directories return ``None`` rather than blocking.
     """
+    if task.workspace_kind != "worktree":
+        return None
     if not task.workspace_path:
         return None
     workspace = Path(task.workspace_path).expanduser()

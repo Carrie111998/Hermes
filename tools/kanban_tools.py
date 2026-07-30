@@ -565,6 +565,7 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    allow_dirty = args.get("allow_dirty_workspace", False) is True
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -671,6 +672,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    allow_dirty_workspace=allow_dirty,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.ArtifactPreservationError as artifact_err:
@@ -699,6 +701,13 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.DirtyWorkspaceError as dirty_err:
+                return tool_error(
+                    f"kanban_complete blocked: {dirty_err}. "
+                    "Your task is still in-flight. Commit your changes "
+                    "and retry, or a human reviewer can complete with "
+                    "allow_dirty_workspace=true."
                 )
             if not ok:
                 return tool_error(
@@ -1594,6 +1603,16 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "allow_dirty_workspace": {
+                "type": "boolean",
+                "description": (
+                    "Explicit reviewer override: set to true when the "
+                    "worktree is intentionally dirty (already committed "
+                    "or parked) and you want to complete anyway. "
+                    "Workers should NOT set this -- it is for human "
+                    "reviewers using the tool directly. Default false."
                 ),
             },
             "board": _board_schema_prop(),

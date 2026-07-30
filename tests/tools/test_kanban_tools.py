@@ -315,7 +315,12 @@ def test_complete_happy_path(worker_env):
 
 
 def test_complete_rejects_dirty_git_workspace(worker_env, tmp_path):
-    """The tool surface must refuse dirty git checkouts before completion."""
+    """The tool surface must refuse dirty git worktree checkouts before completion.
+
+    Scratch workspaces are intentionally skipped by the dirty-worktree guard
+    (only ``workspace_kind=\"worktree\"`` is inspected), so this test creates
+    a worktree-kind task over a dirty git repository.
+    """
     repo = tmp_path / "repo"
     from tests.hermes_cli.test_kanban_db import _init_git_repo
 
@@ -326,6 +331,12 @@ def test_complete_rejects_dirty_git_workspace(worker_env, tmp_path):
     conn = kb.connect()
     try:
         kb.set_workspace_path(conn, worker_env, str(repo))
+        # Switch from scratch to worktree so the dirty guard applies.
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree' WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -334,6 +345,97 @@ def test_complete_rejects_dirty_git_workspace(worker_env, tmp_path):
     d = json.loads(out)
     assert "dirty git workspace" in json.dumps(d)
     assert "dirty.txt" in json.dumps(d)
+
+
+def test_complete_allows_dirty_with_override(worker_env, tmp_path):
+    """allow_dirty_workspace=true bypasses the dirty-worktree guard."""
+    repo = tmp_path / "repo"
+    from tests.hermes_cli.test_kanban_db import _init_git_repo
+
+    _init_git_repo(repo)
+    (repo / "dirty.txt").write_text("unstaged\n", encoding="utf-8")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, str(repo))
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree' WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({
+        "summary": "ok",
+        "allow_dirty_workspace": True,
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
+def test_complete_skips_dirty_check_for_scratch_workspaces(worker_env, tmp_path):
+    """Scratch and dir workspaces are never gated by the dirty-worktree guard."""
+    repo = tmp_path / "repo"
+    from tests.hermes_cli.test_kanban_db import _init_git_repo
+
+    _init_git_repo(repo)
+    (repo / "scratch.txt").write_text("dirty\n", encoding="utf-8")
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        # workspace_kind stays 'scratch' (the default)
+        kb.set_workspace_path(conn, worker_env, str(repo))
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "should pass"})
+    d = json.loads(out)
+    assert d["ok"] is True
+
+
+def test_complete_raises_on_git_status_failure(worker_env, tmp_path, monkeypatch):
+    """git status failure in a worktree must fail closed, not pass as clean."""
+    repo = tmp_path / "repo"
+    from tests.hermes_cli.test_kanban_db import _init_git_repo
+
+    _init_git_repo(repo)
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        kb.set_workspace_path(conn, worker_env, str(repo))
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'worktree' WHERE id = ?",
+            (worker_env,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Make git status fail inside the worktree
+    import subprocess
+    _real_run = subprocess.run
+
+    def _failing_run(*args, **kwargs):
+        if args and args[0][:1] == ["git"] and "status" in args[0]:
+            return subprocess.CompletedProcess(
+                args[0], returncode=128, stdout="", stderr="fatal: not a git repository"
+            )
+        return _real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", _failing_run)
+
+    from tools import kanban_tools as kt
+    out = kt._handle_complete({"summary": "should fail"})
+    d = json.loads(out)
+    # tool_error responses don't have "ok" — they have "error"
+    assert "ok" not in d or d.get("ok") is False
+    assert "fatal" in json.dumps(d) or "git status" in json.dumps(d)
 
 
 def test_complete_metadata_round_trips_through_show(worker_env):
