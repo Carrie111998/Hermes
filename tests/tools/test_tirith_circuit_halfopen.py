@@ -142,9 +142,13 @@ def test_failed_probe_rearms_timer(monkeypatch):
     monkeypatch.setattr(ts.subprocess, "run", boom)
     before = time.monotonic()
     out = ts.check_command_security("x")
+    after = time.monotonic()
     assert out["action"] == "allow"
     assert ts._circuit_open is True
-    assert ts._circuit_open_at >= before  # timer re-armed for a fresh window
+    # Bounded on BOTH sides: >= before alone would accept an epoch value from
+    # time.time() (always astronomically larger), i.e. it would not pin the
+    # re-arm to the monotonic domain at all.
+    assert before <= ts._circuit_open_at <= after  # timer re-armed for a fresh window
 
 
 def test_block_verdict_resets_crash_streak(monkeypatch):
