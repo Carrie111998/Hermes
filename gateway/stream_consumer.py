@@ -331,6 +331,35 @@ class GatewayStreamConsumer:
             meta["notify"] = True
         return meta or None
 
+    def _prepare_outbound_message(self, text: str, *, final: bool) -> Any:
+        """Prepare one logical outbound value before any transport retries."""
+        if final and isinstance(self.adapter, _BasePlatformAdapter):
+            return self.adapter.prepare_outbound_message(text)
+        return text
+
+    async def _transport_outbound_message(
+        self,
+        message: Any,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[dict] = None,
+        final: bool,
+    ) -> Any:
+        """Deliver an already-prepared value without rebuilding it."""
+        if final and isinstance(self.adapter, _BasePlatformAdapter):
+            return await self.adapter.send_outbound_message(
+                chat_id=self.chat_id,
+                message=message,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        return await self.adapter.send(
+            chat_id=self.chat_id,
+            content=message,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def _send_outbound_message(
         self,
         text: str,
@@ -340,19 +369,12 @@ class GatewayStreamConsumer:
         final: bool,
     ) -> Any:
         """Deliver text through the adapter's structured final-message hook."""
-        if final and isinstance(self.adapter, _BasePlatformAdapter):
-            message = self.adapter.prepare_outbound_message(text)
-            return await self.adapter.send_outbound_message(
-                chat_id=self.chat_id,
-                message=message,
-                reply_to=reply_to,
-                metadata=metadata,
-            )
-        return await self.adapter.send(
-            chat_id=self.chat_id,
-            content=text,
+        message = self._prepare_outbound_message(text, final=final)
+        return await self._transport_outbound_message(
+            message,
             reply_to=reply_to,
             metadata=metadata,
+            final=final,
         )
 
     @property
@@ -1381,11 +1403,12 @@ class GatewayStreamConsumer:
         last_successful_chunk = ""
         sent_any_chunk = False
         for chunk in chunks:
+            message = self._prepare_outbound_message(chunk, final=True)
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self._send_outbound_message(
-                    chunk,
+                result = await self._transport_outbound_message(
+                    message,
                     metadata=self._metadata_for_send(final=True),
                     final=True,
                 )
@@ -1476,11 +1499,12 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(str(self._message_id))
 
+        message = self._prepare_outbound_message(final_text, final=True)
         result = None
         for attempt in range(2):
             try:
-                result = await self._send_outbound_message(
-                    final_text,
+                result = await self._transport_outbound_message(
+                    message,
                     metadata=self._metadata_for_send(final=True),
                     final=True,
                 )

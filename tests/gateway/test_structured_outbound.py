@@ -116,6 +116,53 @@ def test_retry_pipeline_uses_adapter_owned_outbound_representation() -> None:
     asyncio.run(exercise())
 
 
+def test_fallback_retry_reuses_adapter_owned_outbound_representation() -> None:
+    async def exercise() -> None:
+        adapter = _StructuredCaptureAdapter()
+        adapter._results = [
+            SendResult(
+                success=False,
+                error="flood_control",
+                retry_after=0.01,
+            ),
+            SendResult(success=True, message_id="structured-2"),
+        ]
+        consumer = GatewayStreamConsumer(adapter, "chat")
+
+        with patch("gateway.stream_consumer.asyncio.sleep"):
+            await consumer._send_fallback_final("Title\n\nBody")
+
+        assert len(adapter.structured_sent) == 2
+        assert adapter.structured_sent[0] is adapter.structured_sent[1]
+        assert adapter.prepared == ["Title\n\nBody"]
+
+    asyncio.run(exercise())
+
+
+def test_empty_fallback_retry_reuses_adapter_owned_outbound_representation() -> None:
+    async def exercise() -> None:
+        adapter = _StructuredCaptureAdapter()
+        adapter._results = [
+            SendResult(
+                success=False,
+                error="flood_control",
+                retry_after=0.01,
+            ),
+            SendResult(success=True, message_id="structured-2"),
+        ]
+        consumer = GatewayStreamConsumer(adapter, "chat")
+
+        with patch("gateway.stream_consumer.asyncio.sleep"):
+            delivery = await consumer._send_empty_fallback_final("Title\n\nBody")
+
+        assert delivery == "delivered"
+        assert len(adapter.structured_sent) == 2
+        assert adapter.structured_sent[0] is adapter.structured_sent[1]
+        assert adapter.prepared == ["Title\n\nBody"]
+
+    asyncio.run(exercise())
+
+
 def test_complete_response_adapter_buffers_and_prepares_once() -> None:
     async def exercise() -> None:
         adapter = _StructuredCaptureAdapter()
