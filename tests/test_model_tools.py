@@ -115,6 +115,46 @@ class TestHandleFunctionCall:
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
 
+    def test_skipped_execution_middleware_dispatches_inside_runtime_effect_scope(
+        self, monkeypatch
+    ):
+        from agent.tool_runtime_effects import (
+            consume_tool_runtime_effect,
+            record_current_tool_runtime_effect,
+        )
+
+        def fake_dispatch(_tool_name, _args, **_kwargs):
+            assert record_current_tool_runtime_effect({"kind": "test-effect"})
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("execution middleware must be skipped")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "web_search",
+                {"q": "test"},
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
+                turn_id="turn-1",
+                skip_tool_execution_middleware=True,
+            )
+        )
+
+        assert result == {"ok": True}
+        assert consume_tool_runtime_effect(
+            tool_name="web_search",
+            session_id="session-1",
+            turn_id="turn-1",
+            tool_call_id="tool-1",
+        ) == {"kind": "test-effect"}
+
 
 # =========================================================================
 # Agent loop tools
