@@ -4013,39 +4013,108 @@ def _event_payload_object(raw: object) -> Optional[dict]:
     return payload if isinstance(payload, dict) else None
 
 
+def _human_gate_attachment_digest(stored_path: object) -> dict[str, str]:
+    """Hash the bytes a worker will read, failing closed when unavailable."""
+    if not isinstance(stored_path, str) or not stored_path:
+        return {"state": "invalid-path"}
+    digest = hashlib.sha256()
+    try:
+        with Path(stored_path).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        return {"state": "unreadable", "error": type(exc).__name__}
+    return {"state": "ok", "sha256": digest.hexdigest()}
+
+
 def _human_gate_task_fingerprint(
     conn: sqlite3.Connection,
     task_id: str,
 ) -> Optional[str]:
-    """Hash the execution-relevant task definition for gate authorization.
+    """Hash the complete task-specific execution definition.
 
-    Runtime state (status, claims, timestamps, counters) is deliberately
-    excluded. A later edit to what will execute, where it will execute, or
-    which profile will execute it invalidates the recorded authorization.
+    Runtime history (claim state, retries, role history, timestamps) is
+    deliberately excluded so legitimate retries do not need fresh approval.
+    Card-controlled spawn options, dependencies and handoffs, attachments,
+    and comments/instructions are all authorization-bound.
     """
     row = conn.execute(
         """
         SELECT title, body, assignee, workspace_kind, workspace_path,
                branch_name, project_id, tenant, max_runtime_seconds,
                workflow_template_id, current_step_key, skills,
-               model_override, max_retries, goal_mode, goal_max_turns,
-               session_id
-        FROM tasks WHERE id = ?
+               model_override, provider_override, max_retries, goal_mode,
+               goal_max_turns, session_id
+          FROM tasks WHERE id = ?
         """,
         (task_id,),
     ).fetchone()
     if row is None:
         return None
-    parents = [
-        parent["parent_id"]
-        for parent in conn.execute(
-            "SELECT parent_id FROM task_links WHERE child_id = ? "
-            "ORDER BY parent_id",
+
+    parents: list[dict[str, Any]] = []
+    parent_rows = conn.execute(
+        """
+        SELECT p.id, p.title, p.body, p.assignee, p.status, p.result
+          FROM task_links l
+          JOIN tasks p ON p.id = l.parent_id
+         WHERE l.child_id = ?
+         ORDER BY p.id
+        """,
+        (task_id,),
+    ).fetchall()
+    for parent in parent_rows:
+        handoff = conn.execute(
+            """
+            SELECT summary, metadata
+              FROM task_runs
+             WHERE task_id = ? AND outcome = 'completed'
+             ORDER BY started_at DESC, id DESC
+             LIMIT 1
+            """,
+            (parent["id"],),
+        ).fetchone()
+        parents.append(
+            {
+                "id": parent["id"],
+                "title": parent["title"],
+                "body": parent["body"],
+                "assignee": parent["assignee"],
+                "status": parent["status"],
+                "result": parent["result"],
+                "handoff_summary": handoff["summary"] if handoff else None,
+                "handoff_metadata": handoff["metadata"] if handoff else None,
+            }
+        )
+    comments = [
+        {"id": item["id"], "author": item["author"], "body": item["body"]}
+        for item in conn.execute(
+            "SELECT id, author, body FROM task_comments "
+            "WHERE task_id = ? ORDER BY created_at ASC, id ASC",
+            (task_id,),
+        ).fetchall()
+    ]
+    attachments = [
+        {
+            "id": item["id"],
+            "filename": item["filename"],
+            "stored_path": item["stored_path"],
+            "content_type": item["content_type"],
+            "size": item["size"],
+            "uploaded_by": item["uploaded_by"],
+            "content": _human_gate_attachment_digest(item["stored_path"]),
+        }
+        for item in conn.execute(
+            "SELECT id, filename, stored_path, content_type, size, uploaded_by "
+            "FROM task_attachments WHERE task_id = ? "
+            "ORDER BY created_at ASC, id ASC",
             (task_id,),
         ).fetchall()
     ]
     definition = {key: row[key] for key in row.keys()}
     definition["parents"] = parents
+    definition["comments"] = comments
+    definition["attachments"] = attachments
     canonical = json.dumps(
         definition,
         sort_keys=True,
@@ -4058,23 +4127,39 @@ def _human_gate_task_fingerprint(
 def _valid_human_gate_authorization(
     payload: Optional[dict],
     *,
-    task_fingerprint: Optional[str],
+    task_fingerprint: Optional[str] = None,
+    authorized_at: Optional[int] = None,
 ) -> bool:
-    """Return whether an authorization matches current task content."""
+    """Return whether an authorization has verified session provenance."""
     if payload is None:
         return False
     actor = payload.get("actor")
     reason = payload.get("reason")
     recorded_fingerprint = payload.get("task_fingerprint")
-    return (
+    provenance_valid = (
         isinstance(actor, str)
         and bool(actor.strip())
         and isinstance(reason, str)
         and bool(reason.strip())
-        and isinstance(task_fingerprint, str)
         and isinstance(recorded_fingerprint, str)
-        and secrets.compare_digest(recorded_fingerprint, task_fingerprint)
+        and bool(re.fullmatch(r"[0-9a-f]{64}", recorded_fingerprint))
+        and payload.get("source") == "dashboard_session"
+        and isinstance(payload.get("provider"), str)
+        and bool(payload["provider"].strip())
+        and isinstance(payload.get("user_id"), str)
+        and bool(payload["user_id"].strip())
+        and isinstance(payload.get("session_expires_at"), int)
+        and payload["session_expires_at"] > 0
+        and actor == f"{payload['provider'].strip()}:{payload['user_id'].strip()}"
     )
+    if not provenance_valid:
+        return False
+    if authorized_at is not None and payload["session_expires_at"] <= authorized_at:
+        return False
+    if task_fingerprint is None:
+        return True
+    assert isinstance(recorded_fingerprint, str)
+    return secrets.compare_digest(recorded_fingerprint, task_fingerprint)
 
 
 def _human_gate_state(
@@ -4092,14 +4177,15 @@ def _human_gate_state(
     audit history cannot make a gate runnable.
     """
     rows = conn.execute(
-        "SELECT kind, payload FROM task_events "
+        "SELECT kind, payload, created_at FROM task_events "
         "WHERE task_id = ? AND kind IN "
-        "('created', 'human_gate_created', 'human_gate_authorized') "
+        "('created', 'human_gate_created', 'human_gate_authorized', "
+        " 'human_gate_materialized') "
         "ORDER BY id",
         (task_id,),
     ).fetchall()
     is_gate = False
-    authorized = False
+    authorized_fingerprint: Optional[str] = None
     for row in rows:
         kind = row["kind"]
         payload = _event_payload_object(row["payload"])
@@ -4107,7 +4193,7 @@ def _human_gate_state(
             # The event kind itself is the explicit marker. Even a damaged
             # marker payload must fail closed as a pending gate.
             is_gate = True
-            authorized = False
+            authorized_fingerprint = None
         elif kind == "created":
             status = payload.get("status") if payload is not None else None
             from_decompose_of = (
@@ -4119,7 +4205,7 @@ def _human_gate_state(
             )
             if status == "blocked":
                 is_gate = True
-                authorized = False
+                authorized_fingerprint = None
             elif status is None and is_decompose_creation:
                 # Auto-decompose historically emitted created events with
                 # provenance but no status. Those records are legitimate
@@ -4127,30 +4213,61 @@ def _human_gate_state(
                 # New events include status explicitly; keep this branch for
                 # existing boards that predate that fix.
                 if is_gate:
-                    authorized = False
+                    authorized_fingerprint = None
             elif not isinstance(status, str) or status not in VALID_STATUSES:
                 # Normal task creation always records a canonical status. A
                 # malformed/unknown legacy creation record is ambiguous, so
                 # treat it as a pending gate instead of failing open.
                 is_gate = True
-                authorized = False
+                authorized_fingerprint = None
             elif is_gate:
                 # Duplicate or contradictory creation history is ambiguous.
-                authorized = False
+                authorized_fingerprint = None
         elif kind == "human_gate_authorized" and is_gate:
             # The latest attempt after the marker decides the state. Invalid
             # JSON, non-object payloads, wrong types and blanks all fail closed.
-            authorized = _valid_human_gate_authorization(
-                payload,
-                task_fingerprint=_human_gate_task_fingerprint(conn, task_id),
+            authorized_fingerprint = (
+                payload["task_fingerprint"]
+                if isinstance(payload, dict)
+                and _valid_human_gate_authorization(
+                    payload,
+                    authorized_at=int(row["created_at"]),
+                )
+                else None
             )
-    return is_gate, authorized
+        elif kind == "human_gate_materialized" and is_gate:
+            if (
+                isinstance(payload, dict)
+                and payload.get("from_fingerprint") == authorized_fingerprint
+                and isinstance(payload.get("to_fingerprint"), str)
+                and bool(re.fullmatch(r"[0-9a-f]{64}", payload["to_fingerprint"]))
+            ):
+                authorized_fingerprint = payload["to_fingerprint"]
+            else:
+                authorized_fingerprint = None
+    if not is_gate:
+        # Ordinary tasks never need the expensive execution-definition scan
+        # (parent handoffs, comments, and attachment byte hashing).  This
+        # predicate runs in board-scale promotion, health, and dispatch loops.
+        return False, False
+    current_fingerprint = _human_gate_task_fingerprint(conn, task_id)
+    return (
+        is_gate,
+        is_gate
+        and current_fingerprint is not None
+        and authorized_fingerprint == current_fingerprint,
+    )
 
 
 def _is_human_gate(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether a task was created as an initial-status human gate."""
     is_gate, _authorized = _human_gate_state(conn, task_id)
     return is_gate
+
+
+def is_human_gate(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Public read-only predicate for API surfaces handling gate transitions."""
+    return _is_human_gate(conn, task_id)
 
 
 def _has_unresolved_human_gate(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4242,7 +4359,17 @@ def recompute_ready(
             if _has_unresolved_human_gate(conn, task_id):
                 # Initial-status blocked cards are explicit human gates. Parent
                 # completion must never make them runnable; only an audited
-                # authorization through unblock_task may resolve the gate.
+                # authorization through authorize_human_gate may resolve the
+                # gate.  An authorized gate can legitimately sit in ``todo``
+                # while parents run; if their final handoff changes the bound
+                # fingerprint, restore the visible blocked state so the gate
+                # can be authorized again instead of stranding it in todo.
+                if cur_status == "todo":
+                    _relock_human_gate_locked(
+                        conn,
+                        task_id,
+                        source="recompute",
+                    )
                 continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
@@ -4293,6 +4420,61 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _relock_human_gate_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    source: str,
+) -> bool:
+    """Relock a stale gate inside an existing write transaction."""
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("todo", "ready", "review", "running"):
+        return False
+    prior_status = row["status"]
+    now = int(time.time())
+    run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+    if run_id is not None:
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'blocked', outcome = 'blocked',
+                   summary = COALESCE(summary, 'human gate authorization became stale'),
+                   ended_at = ?, claim_lock = NULL, claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ? AND ended_at IS NULL
+            """,
+            (now, run_id),
+        )
+    conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'blocked', claim_lock = NULL, claim_expires = NULL,
+               worker_pid = NULL, current_run_id = NULL
+         WHERE id = ?
+        """,
+        (task_id,),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "blocked",
+        {"reason": "human_gate_not_authorized", "source": source},
+        run_id=run_id,
+    )
+    if prior_status != "todo":
+        _append_event(
+            conn,
+            task_id,
+            "claim_rejected",
+            {"reason": "human_gate_not_authorized"},
+            run_id=run_id,
+        )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4312,16 +4494,7 @@ def claim_task(
         if _has_unresolved_human_gate(conn, task_id):
             # Defense in depth: even if a buggy/manual writer flipped a gate
             # to ready, claiming fails closed and restores blocked.
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'blocked' "
-                "WHERE id = ? AND status = 'ready'",
-                (task_id,),
-            )
-            if cur.rowcount:
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {"reason": "human_gate_not_authorized"},
-                )
+            _relock_human_gate_locked(conn, task_id, source="claim")
             return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -4456,16 +4629,7 @@ def claim_review_task(
             # Review is another runnable lane. Apply the same fail-closed
             # defense as claim_task so a buggy/manual review transition
             # cannot bypass an unresolved initial-status human gate.
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'blocked' "
-                "WHERE id = ? AND status = 'review'",
-                (task_id,),
-            )
-            if cur.rowcount:
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {"reason": "human_gate_not_authorized"},
-                )
+            _relock_human_gate_locked(conn, task_id, source="review_claim")
             return None
         cur = conn.execute(
             """
@@ -5961,8 +6125,8 @@ def promote_task(
             )
         if _has_unresolved_human_gate(conn, task_id):
             return False, (
-                "human gate is not authorized; use unblock --reason with an "
-                "affirmative authorization record"
+                "human gate is not authorized; use an authenticated dashboard "
+                "session with an explicit reason"
             )
 
         if not force:
@@ -6011,9 +6175,9 @@ def unblock_task(
 ) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 
-    Initial-status blocked cards are human gates. They require non-empty
-    ``actor`` and ``reason`` values, which are persisted as an affirmative
-    ``human_gate_authorized`` event before the task becomes runnable.
+    Initial-status blocked cards are human gates and cannot be authorized by
+    caller-supplied ``actor`` labels. Use :func:`authorize_human_gate`, which
+    requires a dashboard-auth ``Session`` produced by verified middleware.
 
     Defensively closes any stale ``current_run_id`` pointer before flipping
     status. In the common path (``block_task`` closed the run already) this
@@ -6022,8 +6186,65 @@ def unblock_task(
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    del actor  # Backward-compatible parameter; never trusted as provenance.
+    return _unblock_task(conn, task_id, reason=reason, authorization=None)
+
+
+def authorize_human_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    session: Any,
+) -> bool:
+    """Authorize an initial gate from a verified dashboard human session."""
+    from hermes_cli.dashboard_auth import Session
+
+    if not isinstance(session, Session):
+        return False
+    provider = session.provider.strip() if isinstance(session.provider, str) else ""
+    user_id = session.user_id.strip() if isinstance(session.user_id, str) else ""
+    access_token = (
+        session.access_token.strip()
+        if isinstance(session.access_token, str)
+        else ""
+    )
+    try:
+        session_expires_at = int(session.expires_at)
+    except (TypeError, ValueError):
+        return False
+    normalized_reason = reason.strip() if isinstance(reason, str) else ""
+    if (
+        not provider
+        or not user_id
+        or not access_token
+        or session_expires_at <= int(time.time())
+        or not normalized_reason
+    ):
+        return False
+    return _unblock_task(
+        conn,
+        task_id,
+        reason=normalized_reason,
+        authorization={
+            "actor": f"{provider}:{user_id}",
+            "source": "dashboard_session",
+            "provider": provider,
+            "user_id": user_id,
+            "session_expires_at": session_expires_at,
+        },
+    )
+
+
+def _unblock_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    authorization: Optional[dict[str, Any]],
+) -> bool:
+    """Shared unblock transition; ``authorization`` is trusted provenance."""
     now = int(time.time())
-    normalized_actor = actor.strip() if isinstance(actor, str) else ""
     normalized_reason = reason.strip() if isinstance(reason, str) else ""
     with write_txn(conn):
         human_gate = _has_unresolved_human_gate(conn, task_id)
@@ -6032,7 +6253,7 @@ def unblock_task(
         )
         if human_gate:
             if (
-                not normalized_actor
+                not authorization
                 or not normalized_reason
                 or task_fingerprint is None
             ):
@@ -6085,12 +6306,13 @@ def unblock_task(
         if cur.rowcount != 1:
             return False
         if human_gate:
+            assert authorization is not None
             _append_event(
                 conn,
                 task_id,
                 "human_gate_authorized",
                 {
-                    "actor": normalized_actor,
+                    **authorization,
                     "reason": normalized_reason,
                     "task_fingerprint": task_fingerprint,
                 },
@@ -6826,6 +7048,79 @@ def set_branch_name(
             "UPDATE tasks SET branch_name = ? WHERE id = ?",
             (str(branch_name), task_id),
         )
+
+
+def _materialize_claim_execution(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    workspace_path: str,
+    branch_name: Optional[str],
+) -> bool:
+    """Persist dispatcher-derived workspace fields without false re-gating.
+
+    The authorization revision is advanced only when the pre-update
+    fingerprint is still valid and the same claimed run still owns the card.
+    Any concurrent task edit makes this fail closed instead.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != expected_run_id
+        ):
+            return False
+        is_gate, authorized = _human_gate_state(conn, task_id)
+        if is_gate and not authorized:
+            _relock_human_gate_locked(
+                conn,
+                task_id,
+                source="workspace_materialization",
+            )
+            return False
+        before = _human_gate_task_fingerprint(conn, task_id) if is_gate else None
+        conn.execute(
+            """
+            UPDATE tasks
+               SET workspace_path = ?,
+                   branch_name = CASE WHEN ? IS NULL THEN branch_name ELSE ? END
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (
+                str(workspace_path),
+                branch_name,
+                branch_name,
+                task_id,
+                expected_run_id,
+            ),
+        )
+        if is_gate:
+            after = _human_gate_task_fingerprint(conn, task_id)
+            if before is None or after is None:
+                _relock_human_gate_locked(
+                    conn,
+                    task_id,
+                    source="workspace_materialization",
+                )
+                return False
+            if after != before:
+                _append_event(
+                    conn,
+                    task_id,
+                    "human_gate_materialized",
+                    {
+                        "from_fingerprint": before,
+                        "to_fingerprint": after,
+                        "fields": ["workspace_path", "branch_name"],
+                    },
+                    run_id=expected_run_id,
+                )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -8129,6 +8424,85 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
 
 
+def _invoke_spawn_fn(
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Optional[int]:
+    """Invoke old/new spawn callback signatures without duplicating dispatch code."""
+    import inspect
+
+    try:
+        signature = inspect.signature(spawn_fn)
+        if "board" in signature.parameters:
+            return spawn_fn(task, workspace, board=board)
+        return spawn_fn(task, workspace)
+    except (TypeError, ValueError):
+        return spawn_fn(task, workspace)
+
+
+def _spawn_claim_with_final_cas(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    workspace: str,
+    spawn_fn,
+    board: Optional[str],
+    skills_override: Optional[list[str]] = None,
+) -> tuple[bool, Optional[int], Optional[Task]]:
+    """Revalidate a claim and spawn while holding the board write lock.
+
+    This closes the claim-to-spawn TOCTOU window: no task-specific write can
+    land after fingerprint validation but before ``Popen``/the test callback.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "running"
+            or row["current_run_id"] != expected_run_id
+        ):
+            return False, None, None
+        if _has_unresolved_human_gate(conn, task_id):
+            _relock_human_gate_locked(conn, task_id, source="pre_spawn_cas")
+            return False, None, None
+        fresh = get_task(conn, task_id)
+        if fresh is None:
+            return False, None, None
+        if skills_override is not None:
+            fresh.skills = list(skills_override)
+        pid = _invoke_spawn_fn(
+            spawn_fn,
+            fresh,
+            workspace,
+            board=board,
+        )
+        if pid:
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (int(pid), task_id),
+            )
+            if expected_run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (int(pid), expected_run_id),
+                )
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {"pid": int(pid)},
+                run_id=expected_run_id,
+            )
+        return True, pid, fresh
+
+
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     """Reset the unified consecutive-failures counter.
 
@@ -8697,27 +9071,35 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
+        materialized_branch = None
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            materialized_branch = (
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}"
+            )
+        if not _materialize_claim_execution(
+            conn,
+            claimed.id,
+            expected_run_id=claimed.current_run_id,
+            workspace_path=str(workspace),
+            branch_name=materialized_branch,
+        ):
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            allowed, _pid, refreshed = _spawn_claim_with_final_cas(
+                conn,
+                claimed.id,
+                expected_run_id=claimed.current_run_id,
+                workspace=str(workspace),
+                spawn_fn=_spawn,
+                board=board,
+            )
+            if not allowed:
+                continue
+            claimed = refreshed or claimed
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -8791,30 +9173,41 @@ def _dispatch_once_locked(
             if auto:
                 result.auto_blocked.append(claimed.id)
             continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
+        materialized_branch = None
         if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+            materialized_branch = (
+                resolved_branch_name
+                or (claimed.branch_name or "").strip()
+                or f"wt/{claimed.id}"
+            )
+        if not _materialize_claim_execution(
+            conn,
+            claimed.id,
+            expected_run_id=claimed.current_run_id,
+            workspace_path=str(workspace),
+            branch_name=materialized_branch,
+        ):
+            continue
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load the sdlc-review skill for review agents — it carries
         # the review logic (AC verification, merge, etc.). The mandatory
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
+            allowed, _pid, refreshed = _spawn_claim_with_final_cas(
+                conn,
+                claimed.id,
+                expected_run_id=claimed.current_run_id,
+                workspace=str(workspace),
+                spawn_fn=_spawn,
+                board=board,
+                skills_override=["sdlc-review"],
+            )
+            if not allowed:
+                continue
+            claimed = refreshed or claimed
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -9379,6 +9772,17 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     task = get_task(conn, task_id)
     if not task:
         raise ValueError(f"unknown task {task_id}")
+    if task.status == "running" and _has_unresolved_human_gate(conn, task_id):
+        with write_txn(conn):
+            if _has_unresolved_human_gate(conn, task_id):
+                _relock_human_gate_locked(
+                    conn,
+                    task_id,
+                    source="worker_context",
+                )
+        raise RuntimeError(
+            "human gate authorization is stale; task was relocked before context delivery"
+        )
 
     # Single clock reading shared by every relative-age stamp below, so all
     # ages in one rendering are consistent ("3h ago" / "3h ago", not drifting

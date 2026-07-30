@@ -2326,11 +2326,11 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if not kb.unblock_task(conn, tid, reason=reason, actor=author):
+            if not kb.unblock_task(conn, tid, reason=reason):
                 failed.append(tid)
                 print(
                     f"cannot unblock {tid} (not blocked/scheduled, or human gate "
-                    "requires --reason authorization)",
+                    "requires an authenticated dashboard session)",
                     file=sys.stderr,
                 )
             else:

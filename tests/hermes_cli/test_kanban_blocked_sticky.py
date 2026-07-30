@@ -38,17 +38,40 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.dashboard_auth import Session
 
 
 @pytest.fixture
-def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Isolated HERMES_HOME with an empty kanban DB."""
+def kanban_home(tmp_path, monkeypatch):
+    """Isolate all board state from the operator's active Kanban database."""
+    for key in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+    ):
+        monkeypatch.delenv(key, raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    assert kb.kanban_db_path().is_relative_to(home)
     return home
+
+
+def _human_session() -> Session:
+    return Session(
+        user_id="user-123",
+        email="operator@example.com",
+        display_name="Test Operator",
+        provider="test",
+        org_id="org-1",
+        access_token="verified-by-auth-middleware",
+        expires_at=9_999_999_999,
+        refresh_token="refresh-token",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +123,20 @@ def test_initial_gate_preserves_blocked_lifecycle_event(
             "reason": "initial-status: created-blocked",
             "source": "create_task",
         }
+
+
+def test_normal_tasks_skip_execution_fingerprint_work(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordinary task")
+
+        def unexpected_fingerprint(*_args, **_kwargs):
+            raise AssertionError("ordinary tasks must not build gate fingerprints")
+
+        monkeypatch.setattr(kb, "_human_gate_task_fingerprint", unexpected_fingerprint)
+        assert kb._human_gate_state(conn, task_id) == (False, False)
 
 
 def test_initial_gate_idempotency_refuses_existing_runnable_task(
@@ -277,11 +314,11 @@ def test_authorization_is_bound_to_task_execution_content(
             assignee="worker",
             initial_status="blocked",
         )
-        assert kb.unblock_task(
+        assert kb.authorize_human_gate(
             conn,
             gate,
-            actor="chief",
             reason="approved safe report",
+            session=_human_session(),
         )
         authorization = next(
             event
@@ -306,15 +343,193 @@ def test_authorization_is_bound_to_task_execution_content(
         assert rejected.kind == "claim_rejected"
         assert rejected.payload == {"reason": "human_gate_not_authorized"}
 
-        assert kb.unblock_task(
+        assert kb.authorize_human_gate(
             conn,
             gate,
-            actor="chief",
             reason="approved changed operation",
+            session=_human_session(),
         )
         claimed = kb.claim_task(conn, gate, claimer="worker")
         assert claimed is not None
         assert claimed.body == "perform different operation"
+
+
+def test_authorization_fingerprint_includes_provider_override(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        gate = kb.create_task(
+            conn,
+            title="provider-bound operation",
+            assignee="worker",
+            initial_status="blocked",
+            model_override="model-a",
+            provider_override="provider-a",
+        )
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved provider-a/model-a",
+            session=_human_session(),
+        )
+
+        assert kb.set_model_override(
+            conn,
+            gate,
+            model="model-a",
+            provider="provider-b",
+        )
+
+        assert kb.claim_task(conn, gate, claimer="dispatcher") is None
+        assert kb.get_task(conn, gate).status == "blocked"
+
+
+@pytest.mark.parametrize("mutation", ["comment", "attachment", "dependency"])
+def test_authorization_fingerprint_includes_task_specific_context(
+    kanban_home: Path,
+    mutation: str,
+) -> None:
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved exact task context",
+            session=_human_session(),
+        )
+
+        if mutation == "comment":
+            kb.add_comment(conn, gate, "operator", "Use the privileged fallback")
+        elif mutation == "attachment":
+            kb.add_attachment(
+                conn,
+                gate,
+                filename="instructions.txt",
+                stored_path=str(kanban_home / "instructions.txt"),
+                content_type="text/plain",
+                size=24,
+                uploaded_by="operator",
+            )
+        else:
+            parent = kb.create_task(conn, title="new prerequisite")
+            claimed = kb.claim_task(conn, parent)
+            assert claimed is not None
+            assert kb.complete_task(
+                conn,
+                parent,
+                result="dependency result",
+                expected_run_id=claimed.current_run_id,
+            )
+            kb.link_tasks(conn, parent, gate)
+
+        assert kb.claim_task(conn, gate, claimer="dispatcher") is None
+        assert kb.get_task(conn, gate).status == "blocked"
+
+
+def test_authorization_fingerprint_binds_attachment_bytes(
+    kanban_home: Path,
+) -> None:
+    attachment = kanban_home / "approved-instructions.txt"
+    attachment.write_bytes(b"approved bytes")
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        kb.add_attachment(
+            conn,
+            gate,
+            filename=attachment.name,
+            stored_path=str(attachment),
+            content_type="text/plain",
+            size=attachment.stat().st_size,
+            uploaded_by="operator",
+        )
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved attached instructions",
+            session=_human_session(),
+        )
+
+        attachment.write_bytes(b"tampered bytes")
+
+        assert kb.claim_task(conn, gate, claimer="dispatcher") is None
+        task = kb.get_task(conn, gate)
+        assert task is not None and task.status == "blocked"
+
+
+def test_dispatch_revalidates_authorization_after_claim_before_spawn(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved pre-claim definition",
+            session=_human_session(),
+        )
+        original_materialize = kb._materialize_claim_execution
+
+        def mutate_after_claim(*args, **kwargs):
+            materialized = original_materialize(*args, **kwargs)
+            if materialized:
+                with kb.connect() as attacker_conn:
+                    kb.add_comment(
+                        attacker_conn,
+                        gate,
+                        "operator",
+                        "Changed after claim but before spawn",
+                    )
+            return materialized
+
+        monkeypatch.setattr(kb, "_materialize_claim_execution", mutate_after_claim)
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+
+        assert result.spawned == []
+        assert spawned == []
+        task = kb.get_task(conn, gate)
+        assert task is not None and task.status == "blocked"
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (gate,),
+        ).fetchone()
+        assert run is not None
+        assert (run["status"], run["outcome"]) == ("blocked", "blocked")
+
+
+def test_dispatch_runtime_materialization_preserves_valid_authorization(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawned: list[tuple[str, str]] = []
+
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved scratch execution",
+            session=_human_session(),
+        )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append((task.id, workspace)),
+        )
+
+        assert len(result.spawned) == 1
+        assert spawned and spawned[0][0] == gate
+        assert kb.get_task(conn, gate).status == "running"
+        assert "human_gate_materialized" in _event_kinds(conn, gate)
 
 
 def test_initial_blocked_gate_survives_parent_completion(kanban_home: Path) -> None:
@@ -325,6 +540,36 @@ def test_initial_blocked_gate_survives_parent_completion(kanban_home: Path) -> N
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, gate).status == "blocked"
         assert "promoted" not in _event_kinds(conn, gate)
+
+
+def test_gate_relocks_and_can_be_reauthorized_after_parent_handoff_changes(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        gate, parent = _initial_gate(conn, with_parent=True)
+        assert parent is not None
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved pending parent handoff",
+            session=_human_session(),
+        )
+        pending = kb.get_task(conn, gate)
+        assert pending is not None and pending.status == "todo"
+
+        assert kb.complete_task(conn, parent, result="new executable handoff")
+        assert kb.recompute_ready(conn) == 0
+        relocked = kb.get_task(conn, gate)
+        assert relocked is not None and relocked.status == "blocked"
+
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved final parent handoff",
+            session=_human_session(),
+        )
+        claimed = kb.claim_task(conn, gate, claimer="dispatcher")
+        assert claimed is not None
 
 
 def test_legacy_initial_gate_is_detected_without_new_marker(kanban_home: Path) -> None:
@@ -392,7 +637,7 @@ def test_ambiguous_legacy_created_payload_fails_closed(
         ("chief", 123),
     ],
 )
-def test_initial_gate_unblock_requires_typed_nonblank_actor_and_reason(
+def test_raw_actor_labels_cannot_authorize_initial_gate(
     kanban_home: Path, actor, reason
 ) -> None:
     with kb.connect() as conn:
@@ -403,16 +648,16 @@ def test_initial_gate_unblock_requires_typed_nonblank_actor_and_reason(
         assert _event_kinds(conn, gate) == before
 
 
-def test_human_gate_authorization_event_precedes_unblocked_with_trimmed_payload(
+def test_human_gate_authorization_event_precedes_unblocked_with_verified_principal(
     kanban_home: Path,
 ) -> None:
     with kb.connect() as conn:
         gate, _ = _initial_gate(conn)
-        assert kb.unblock_task(
+        assert kb.authorize_human_gate(
             conn,
             gate,
-            actor="  chief  ",
             reason="  User authorized exact SHA abc123 in session s_1  ",
+            session=_human_session(),
         )
         assert kb.get_task(conn, gate).status == "ready"
         events = kb.list_events(conn, gate)
@@ -426,7 +671,11 @@ def test_human_gate_authorization_event_precedes_unblocked_with_trimmed_payload(
         authorization, unblocked = events[-2:]
         assert authorization.id < unblocked.id
         assert authorization.payload is not None
-        assert authorization.payload["actor"] == "chief"
+        assert authorization.payload["actor"] == "test:user-123"
+        assert authorization.payload["source"] == "dashboard_session"
+        assert authorization.payload["provider"] == "test"
+        assert authorization.payload["user_id"] == "user-123"
+        assert authorization.payload["session_expires_at"] == 9_999_999_999
         assert (
             authorization.payload["reason"]
             == "User authorized exact SHA abc123 in session s_1"
@@ -434,6 +683,78 @@ def test_human_gate_authorization_event_precedes_unblocked_with_trimmed_payload(
         assert isinstance(authorization.payload["task_fingerprint"], str)
         assert len(authorization.payload["task_fingerprint"]) == 64
         assert unblocked.payload is None
+
+
+def test_expired_dashboard_session_cannot_authorize_human_gate(
+    kanban_home: Path,
+) -> None:
+    expired = Session(
+        user_id="user-123",
+        email="operator@example.com",
+        display_name="Test Operator",
+        provider="test",
+        org_id="org-1",
+        access_token="expired-token",
+        expires_at=1,
+        refresh_token="refresh-token",
+    )
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approval from expired session",
+            session=expired,
+        ) is False
+        task = kb.get_task(conn, gate)
+        assert task is not None
+        assert task.status == "blocked"
+        assert "human_gate_authorized" not in _event_kinds(conn, gate)
+
+
+def test_authorized_gate_allows_review_claim_when_definition_is_unchanged(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved exact reviewable operation",
+            session=_human_session(),
+        )
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (gate,))
+        conn.commit()
+
+        claimed = kb.claim_review_task(conn, gate, claimer="reviewer")
+        assert claimed is not None
+        assert claimed.status == "running"
+
+
+def test_authorized_gate_allows_sticky_block_recovery_for_same_definition(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        gate, _ = _initial_gate(conn)
+        assert kb.authorize_human_gate(
+            conn,
+            gate,
+            reason="approved exact retryable operation",
+            session=_human_session(),
+        )
+        claimed = kb.claim_task(conn, gate, claimer="worker")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            gate,
+            reason="transient dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        assert kb.unblock_task(conn, gate, reason="dependency recovered")
+        retried = kb.claim_task(conn, gate, claimer="worker")
+        assert retried is not None
+        assert retried.status == "running"
 
 
 @pytest.mark.parametrize(
