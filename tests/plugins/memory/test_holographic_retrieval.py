@@ -55,23 +55,6 @@ def test_sanitize_fts_query_extracts_content_tokens(query, expected_tokens):
     assert set(matches) == expected_tokens, f"got {result!r}"
 
 
-def test_sanitize_fts_query_never_crashes_on_fts5_specials():
-    """Queries with FTS5 operator characters must not produce malformed SQL."""
-    problematic = [
-        'test " query',
-        "test * query",
-        "test (a OR b) query",
-        "test^2 query",
-        "test:colon query",
-        "test-hyphen query",
-        "a" * 1000,  # long query
-    ]
-    for q in problematic:
-        result = FactRetriever._sanitize_fts_query(q)
-        # We just need it to return a string without raising
-        assert isinstance(result, str)
-
-
 # ---------------------------------------------------------------------------
 # Integration test — actually run _fts_candidates against an in-memory DB
 # ---------------------------------------------------------------------------

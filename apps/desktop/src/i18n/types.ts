@@ -195,6 +195,7 @@ export interface Translations {
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
+      sayStopToEnd: (phrase: string) => string
       transcriptionFailed: string
       transcriptionUnavailable: string
       tryRecordingAgain: string
@@ -786,6 +787,9 @@ export interface Translations {
       ready: string
       needsSignIn: string
       needsSetup: string
+      activeBackend: string
+      activeBackendHint: string
+      useBackend: string
       nousIncluded: string
       nousAuthNeededTitle: string
       nousAuthNeededMessage: (provider: string) => string
