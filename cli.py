@@ -69,6 +69,7 @@ from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.enums import EditingMode
 from prompt_toolkit import print_formatted_text as _pt_print
 from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
 try:
@@ -515,7 +516,8 @@ def load_cli_config() -> Dict[str, Any]:
             # Print a one-line summary of resolved modal prompts (approval /
             # clarify) into scrollback so the decision survives the repaint.
             "persist_prompts": True,
-
+            # Input editing mode: "emacs" (default) or "vi" for vim-style modal editing
+            "input_mode": "emacs",
             "skin": "default",
         },
         "clarify": {
@@ -16012,12 +16014,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cpr_disabled_output = _select_classic_cli_pt_output(sys.stdout)
 
         # Create the application
+        # Resolve input editing mode from config: "vi" enables vim-style modal
+        # editing in the input area; "emacs" (default) preserves existing behavior.
+        _input_mode = str(CLI_CONFIG.get("display", {}).get("input_mode", "emacs")).strip().lower()
+        _editing_mode = EditingMode.VI if _input_mode == "vi" else EditingMode.EMACS
         app = Application(
             layout=layout,
             key_bindings=kb,
             style=style,
             full_screen=False,
             mouse_support=False,
+            editing_mode=_editing_mode,
             **({"output": _cpr_disabled_output} if _cpr_disabled_output is not None else {}),
             # Read from display.cli_refresh_interval (default 0 = disabled).
             # When non-zero, prompt_toolkit redraws the UI on this cadence

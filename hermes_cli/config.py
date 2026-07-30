@@ -2092,6 +2092,12 @@ DEFAULT_CONFIG = {
             "fields": ["model", "context_pct", "cwd"],  # Order shown; drop any to hide
         },
         "copy_shortcut": "auto",  # "auto" (platform default) | "ctrl_c" | "ctrl_shift_c" | "disabled"
+        # Input editing mode for the classic CLI (prompt_toolkit):
+        #   "emacs" — standard Ctrl-based keybindings (default, preserves prior behavior)
+        #   "vi"    — vim-style modal editing (Esc to enter command mode, i/a to insert)
+        # Only affects the text input area; slash-commands and other keybindings
+        # remain unchanged. Set to "vi" to enable vim mode.
+        "input_mode": "emacs",
         # Petdex animated mascot (https://github.com/crafter-station/petdex).
         # A purely cosmetic sprite that reacts to agent activity across the
         # CLI, TUI, and desktop app. Manage with `hermes pets`. Disabled until
