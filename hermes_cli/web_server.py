@@ -970,6 +970,7 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
         ):
             try:
                 await PTY_REGISTRY.close_all()
+                await _close_legacy_ptys_for_update()
                 from tui_gateway.server import close_sessions_for_update
 
                 close_sessions_for_update()
@@ -14561,7 +14562,11 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull  # noqa: E402
+from hermes_cli.pty_session import (  # noqa: E402
+    PtySessionRegistry,
+    RegistryFull,
+    close_and_verify_bridge,
+)
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -14569,6 +14574,19 @@ PTY_REGISTRY = PtySessionRegistry(
     buffer_cap=1 * 1024 * 1024,
     read_timeout=_PTY_READ_CHUNK_TIMEOUT,
 )
+_LEGACY_PTY_BRIDGES: set[object] = set()
+
+
+async def _close_legacy_pty(bridge) -> None:
+    """Verify one legacy PTY and retain failures for the update boundary."""
+    await close_and_verify_bridge(bridge)
+    _LEGACY_PTY_BRIDGES.discard(bridge)
+
+
+async def _close_legacy_ptys_for_update() -> None:
+    """Close every legacy PTY, failing closed if any tree survives."""
+    for bridge in list(_LEGACY_PTY_BRIDGES):
+        await _close_legacy_pty(bridge)
 
 
 async def _dashboard_pty_reaper_loop(interval: float = 60.0) -> None:
@@ -14626,7 +14644,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             # can be skipped, leaking the PTY. Closing from the EOF path makes
             # the reap independent of that cancellation race (#54028).
             try:
-                await asyncio.to_thread(bridge.close)
+                await _close_legacy_pty(bridge)
             except Exception:
                 pass
             try:
@@ -14667,7 +14685,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             await reader_task
         except (asyncio.CancelledError, Exception):
             pass
-        await asyncio.to_thread(bridge.close)
+        await _close_legacy_pty(bridge)
 
 
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
@@ -15917,6 +15935,7 @@ async def pty_ws(ws: WebSocket) -> None:
             await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
             await ws.close(code=1011)
             return
+        _LEGACY_PTY_BRIDGES.add(bridge)
         await _legacy_pump(ws, bridge)
         return
 

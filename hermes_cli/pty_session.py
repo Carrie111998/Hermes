@@ -17,6 +17,34 @@ WS_CLOSE_SUPERSEDED = 4409
 _PTY_CLOSE_VERIFY_TIMEOUT_S = 5.0
 
 
+async def close_and_verify_bridge(bridge) -> None:
+    """Close a PTY bridge off-loop and prove its process tree terminated."""
+
+    def _close_and_verify() -> None:
+        # Both production bridges expose a strict verify_closed() probe.
+        # Their close methods are intentionally tolerant of individual
+        # signal/reap errors, so successful return alone is not proof that
+        # the child exited.
+        bridge.close()
+        verify_closed = getattr(bridge, "verify_closed", None)
+        if not callable(verify_closed):
+            is_alive = getattr(bridge, "is_alive", None)
+            if callable(is_alive):
+                verify_closed = lambda: not is_alive()
+        if not callable(verify_closed):
+            raise RuntimeError("PTY bridge cannot verify child termination")
+        deadline = time.monotonic() + _PTY_CLOSE_VERIFY_TIMEOUT_S
+        while not verify_closed() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not verify_closed():
+            raise RuntimeError("PTY child did not terminate")
+
+    # bridge.close() and the bounded liveness wait are blocking; keep both
+    # off the event loop (#53227). Propagate failure so update quiescence
+    # cannot treat a surviving checkout/venv process as closed.
+    await asyncio.to_thread(_close_and_verify)
+
+
 class RingBuffer:
     """Keeps only the most recent ``capacity`` bytes appended to it."""
 
@@ -113,29 +141,7 @@ class PtySession:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        def _close_and_verify() -> None:
-            # Both production bridges expose a strict verify_closed() probe.
-            # Their close methods are intentionally tolerant of individual
-            # signal/reap errors, so successful return alone is not proof that
-            # the child exited.
-            self.bridge.close()
-            verify_closed = getattr(self.bridge, "verify_closed", None)
-            if not callable(verify_closed):
-                is_alive = getattr(self.bridge, "is_alive", None)
-                if callable(is_alive):
-                    verify_closed = lambda: not is_alive()
-            if not callable(verify_closed):
-                raise RuntimeError("PTY bridge cannot verify child termination")
-            deadline = time.monotonic() + _PTY_CLOSE_VERIFY_TIMEOUT_S
-            while not verify_closed() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            if not verify_closed():
-                raise RuntimeError("PTY child did not terminate")
-
-        # bridge.close() and the bounded liveness wait are blocking; keep both
-        # off the event loop (#53227). Propagate failure so update quiescence
-        # cannot treat a surviving checkout/venv process as closed.
-        await asyncio.to_thread(_close_and_verify)
+        await close_and_verify_bridge(self.bridge)
         self.alive = False
 
 

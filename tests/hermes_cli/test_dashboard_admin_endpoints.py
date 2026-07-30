@@ -1211,6 +1211,51 @@ async def test_dashboard_quiesce_fails_closed_on_pty_shutdown(monkeypatch):
     assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
 
 
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_fails_closed_on_legacy_pty_shutdown(
+    monkeypatch,
+):
+    import hermes_cli.web_server as ws
+
+    bridge = object()
+    ws._LEGACY_PTY_BRIDGES.clear()
+    ws._LEGACY_PTY_BRIDGES.add(bridge)
+    monkeypatch.setattr(ws.PTY_REGISTRY, "close_all", AsyncMock())
+    monkeypatch.setattr(
+        ws,
+        "close_and_verify_bridge",
+        AsyncMock(side_effect=RuntimeError("legacy PTY did not stop")),
+    )
+    ws._end_dashboard_update_quiesce()
+    try:
+        with pytest.raises(RuntimeError, match="legacy PTY did not stop"):
+            await ws._begin_dashboard_update_quiesce(timeout=0.5)
+
+        assert bridge in ws._LEGACY_PTY_BRIDGES
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is False
+    finally:
+        ws._LEGACY_PTY_BRIDGES.clear()
+        ws._end_dashboard_update_quiesce()
+
+
+@pytest.mark.asyncio
+async def test_verified_legacy_pty_is_removed(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    bridge = object()
+    verify = AsyncMock()
+    ws._LEGACY_PTY_BRIDGES.clear()
+    ws._LEGACY_PTY_BRIDGES.add(bridge)
+    monkeypatch.setattr(ws, "close_and_verify_bridge", verify)
+    try:
+        await ws._close_legacy_ptys_for_update()
+
+        verify.assert_awaited_once_with(bridge)
+        assert bridge not in ws._LEGACY_PTY_BRIDGES
+    finally:
+        ws._LEGACY_PTY_BRIDGES.clear()
+
+
 def test_dashboard_rejects_duplicate_live_action(monkeypatch):
     import hermes_cli.web_server as ws
 
