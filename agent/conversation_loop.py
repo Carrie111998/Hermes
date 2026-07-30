@@ -279,6 +279,41 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return False
 
 
+def _collect_trailing_incomplete_text(messages: List[Dict[str, Any]]) -> str:
+    """Return the visible text of the trailing run of incomplete assistant turns.
+
+    Codex ``incomplete`` continuations park each partial answer in ``messages``
+    as an interim assistant message (``finish_reason == "incomplete"``).  When
+    the continuation budget runs out, that text is everything the model managed
+    to write for this turn -- walk the tail of ``messages`` and stitch it back
+    together instead of dropping it on the floor.
+
+    Chunks are continuations of one another, so they are concatenated the same
+    way the length-continuation path joins ``truncated_response_parts``.
+    """
+    parts: List[str] = []
+    for msg in reversed(messages or []):
+        if not isinstance(msg, dict):
+            break
+        if msg.get("role") != "assistant" or msg.get("finish_reason") != "incomplete":
+            break
+        text = (msg.get("content") or "").strip()
+        if not text:
+            # Content can be empty while the replayable Codex message items
+            # still carry visible output_text (provider-state-only interims).
+            chunks = []
+            for item in msg.get("codex_message_items") or []:
+                if not isinstance(item, dict):
+                    continue
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        chunks.append(str(part.get("text") or ""))
+            text = "".join(chunks).strip()
+        if text:
+            parts.append(text)
+    return "".join(reversed(parts)).strip()
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -4405,13 +4440,27 @@ def run_conversation(
 
                 agent._codex_incomplete_retries = 0
                 agent._persist_session(messages, conversation_history)
+                _incomplete_error = "Codex response remained incomplete after 3 continuation attempts"
+                # Don't throw away what the model already wrote: the interim
+                # assistant turns hold the visible text of this turn.  Return
+                # it with an honest cut-off note; the bare service line is
+                # only for the case where there is nothing to salvage.
+                _salvaged_text = _collect_trailing_incomplete_text(messages)
+                if _salvaged_text:
+                    _incomplete_final = (
+                        f"{_salvaged_text}\n\n"
+                        "⚠️ Response incomplete after 3 continuation attempts — "
+                        "the text above may be cut off."
+                    )
+                else:
+                    _incomplete_final = _incomplete_error
                 return {
-                    "final_response": "Codex response remained incomplete after 3 continuation attempts",
+                    "final_response": _incomplete_final,
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "partial": True,
-                    "error": "Codex response remained incomplete after 3 continuation attempts",
+                    "error": _incomplete_error,
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
