@@ -48,8 +48,18 @@ def test_breakdown_includes_major_categories():
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
     assert data["estimated_total"] > 0
+    assert data["context_used_estimated"] is True
 
 
+def test_breakdown_uses_measured_context_when_available():
+    agent, parts = _make_agent(last_prompt_tokens=42_000)
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    assert data["context_used"] == 42_000
+    assert data["context_percent"] == 21
+    assert data["context_used_estimated"] is False
 
 # ── /context renderers (pure functions over the payload) ────────────────────
 

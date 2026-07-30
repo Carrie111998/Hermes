@@ -228,6 +228,12 @@ class TestFlushAfterCompression:
             awaiting_real_usage_after_compression = False
 
             def compress(self, messages, **_kwargs):
+                # Model a plugin compressor that pollutes an already-durable
+                # compacted dict before reporting an abort. Rollback must
+                # restore this same object (not a deep-copy replacement), or
+                # the identity-based flush baseline appends it again.
+                messages[0]["content"] = "CORRUPTED speculative summary"
+                messages[0]["_speculative"] = True
                 self._last_compress_aborted = True
                 return messages
 

@@ -60,15 +60,6 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
-        compressor = getattr(agent, "context_compressor", None)
-        if (
-            compressor is not None
-            and getattr(compressor, "awaiting_real_usage_after_compression", False)
-        ):
-            # No usage means this turn cannot adjudicate the pending compaction.
-            # Consume the marker so a later unrelated reading is not charged to
-            # it and preflight deferral cannot stay latched indefinitely.
-            compressor.update_from_response({})
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:
@@ -124,7 +115,12 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            # ``thread/tokenUsage/updated`` is a sibling notification and can
+            # contain a partial/empty latest bucket.  A completed compaction
+            # remains pending until a real prompt count arrives; otherwise an
+            # empty usage update would erase its effectiveness verdict.
+            if prompt_tokens > 0:
+                compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
@@ -242,7 +238,17 @@ def _record_codex_app_server_compaction(
             record_boundary(compressor, used_fallback=False)
         elif hasattr(compressor, "_verify_compaction_cleared_threshold"):
             compressor._verify_compaction_cleared_threshold = True
-        if not getattr(turn, "token_usage_last", None):
+        last_usage = getattr(turn, "token_usage_last", None)
+        # A non-empty sibling usage object is still not a compaction verdict
+        # unless it contains the input side of the request.  Codex can emit a
+        # partial ``last`` bucket (for example output/total only) before the
+        # prompt-size update arrives.
+        has_real_prompt_tokens = isinstance(last_usage, dict) and (
+            _coerce_usage_int(last_usage.get("inputTokens"))
+            + _coerce_usage_int(last_usage.get("cachedInputTokens"))
+            > 0
+        )
+        if not has_real_prompt_tokens:
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
             compressor.awaiting_real_usage_after_compression = True

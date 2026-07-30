@@ -693,6 +693,7 @@ export interface ContextBreakdown {
   context_max: number
   context_percent: number
   context_used: number
+  context_used_estimated?: boolean
   estimated_total: number
   model?: string
 }

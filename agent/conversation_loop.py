@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -58,6 +59,16 @@ from agent.message_sanitization import (
     _strip_images_from_messages,
     _strip_non_ascii,
 )
+
+
+def _request_local_llama_cpp_tools(
+    tools: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], int]:
+    """Return llama.cpp-compatible tools without mutating the agent registry."""
+    from tools.schema_sanitizer import strip_pattern_and_format
+
+    request_tools = copy.deepcopy(tools)
+    return strip_pattern_and_format(request_tools)
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     _estimate_tools_tokens_rough,
@@ -2001,6 +2012,12 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        # A llama.cpp grammar rejection is recovered with a sanitized copy for
+        # this route only.  Never mutate ``agent.tools``: it is the canonical
+        # per-session registry and must remain byte-stable across retries,
+        # provider failover, and later turns.
+        _llama_cpp_tools_override: Optional[List[Dict[str, Any]]] = None
+        _llama_cpp_tools_route: Optional[tuple[str, str, str, str]] = None
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2076,6 +2093,25 @@ def run_conversation(
                     )
                 )
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if _llama_cpp_tools_override is not None:
+                    _current_tool_route = (
+                        str(getattr(agent, "provider", "") or ""),
+                        str(getattr(agent, "base_url", "") or ""),
+                        str(getattr(agent, "model", "") or ""),
+                        str(getattr(agent, "api_mode", "") or ""),
+                    )
+                    if _current_tool_route == _llama_cpp_tools_route:
+                        # Middleware and provider adapters may sanitize request
+                        # dictionaries in place, so each retry receives its own
+                        # copy of the already-sanitized route-local schema.
+                        api_kwargs["tools"] = copy.deepcopy(
+                            _llama_cpp_tools_override
+                        )
+                    else:
+                        # A fallback/model switch must rebuild from the full
+                        # canonical tool registry for the new route.
+                        _llama_cpp_tools_override = None
+                        _llama_cpp_tools_route = None
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -3137,7 +3173,75 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    agent.context_compressor.update_from_response(usage_dict)
+                    # Capture this before update_from_response() consumes it.
+                    # Only a completed compaction boundary arms the latch, so
+                    # an unrelated low-usage response after a failed/no-op
+                    # attempt cannot reopen the retry budget.
+                    _awaiting_compaction_verdict = bool(
+                        getattr(
+                            agent.context_compressor,
+                            "awaiting_real_usage_after_compression",
+                            False,
+                        )
+                    )
+                    # Let the engine observe the armed latch while it processes
+                    # the provider's real usage.  The built-in compressor uses
+                    # that edge to retain the rough-token baseline that proved
+                    # to fit; clearing it first loses the baseline and makes
+                    # hgfast/preflight deferral regress into repeated
+                    # compaction.  A zero/missing prompt count is not a verdict:
+                    # keep the latch armed until the provider supplies a real
+                    # prompt size, including for third-party engines.
+                    # Do not even forward an empty/zero prompt reading to a
+                    # plug-in compressor: unlike the built-in engine, an
+                    # arbitrary ContextEngine may consume its latch whenever
+                    # update_from_response() is called. Session accounting and
+                    # context-length discovery below still process the response.
+                    if prompt_tokens > 0:
+                        agent.context_compressor.update_from_response(usage_dict)
+                        if (
+                            _awaiting_compaction_verdict
+                            and getattr(
+                                agent.context_compressor,
+                                "awaiting_real_usage_after_compression",
+                                False,
+                            )
+                        ):
+                            agent.context_compressor.awaiting_real_usage_after_compression = False
+
+                    # ``compression_attempts`` is a consecutive-recovery
+                    # backstop, not a lifetime quota for the whole tool turn.
+                    # A long-running turn may legitimately regrow past the
+                    # threshold several times. Once the provider proves that a
+                    # completed compaction restored the real prompt below the
+                    # threshold, give a later regrowth a fresh retry budget.
+                    # Without this reset, three effective compactions early in
+                    # a 100-iteration turn permanently disable compression and
+                    # the request can grow into the hard context limit.
+                    _effective_threshold = int(
+                        getattr(
+                            agent.context_compressor,
+                            "threshold_tokens",
+                            0,
+                        )
+                        or 0
+                    )
+                    if (
+                        compression_attempts > 0
+                        and _awaiting_compaction_verdict
+                        and prompt_tokens > 0
+                        and _effective_threshold > 0
+                        and prompt_tokens < _effective_threshold
+                    ):
+                        logger.info(
+                            "Compression retry budget reset after provider "
+                            "confirmed prompt recovery: %s < %s tokens",
+                            f"{prompt_tokens:,}",
+                            f"{_effective_threshold:,}",
+                        )
+                        compression_attempts = 0
+                        _preflight_compression_blocked = False
+                        _last_preflight_pressure = None
 
                     # Stash this response's canonical usage so the post-turn
                     # on_turn_complete() observation hook can forward it (the
@@ -3146,18 +3250,6 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
-                elif getattr(
-                    agent.context_compressor,
-                    "awaiting_real_usage_after_compression",
-                    False,
-                ):
-                    # A response with no usage cannot adjudicate whether the
-                    # prior compaction cleared the threshold. Consume the pending
-                    # verdict now so a much later, unrelated reading is not
-                    # charged to that old compaction, and so preflight deferral
-                    # does not remain latched indefinitely.
-                    agent.context_compressor.update_from_response({})
-
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.
                     # Only persist limits confirmed by the provider (parsed
@@ -4004,8 +4096,8 @@ def run_conversation(
                 # regex escape classes (``\d``, ``\w``, ``\s``) and most
                 # ``format`` values in tool schemas.  MCP servers emit
                 # these routinely for date/phone/email params.  Recovery:
-                # strip ``pattern``/``format`` from ``agent.tools`` and
-                # retry once.  We keep the keywords by default so cloud
+                # strip ``pattern``/``format`` from a request-local copy and
+                # retry once.  We keep the canonical registry intact so cloud
                 # providers get the full prompting hints; this branch
                 # fires only for users on llama.cpp's OAI server.
                 if (
@@ -4014,13 +4106,23 @@ def run_conversation(
                 ):
                     _retry.llama_cpp_grammar_retry_attempted = True
                     try:
-                        from tools.schema_sanitizer import strip_pattern_and_format
-                        _, _stripped = strip_pattern_and_format(agent.tools)
+                        (
+                            _llama_cpp_tools_override,
+                            _stripped,
+                        ) = _request_local_llama_cpp_tools(agent.tools)
+                        _llama_cpp_tools_route = (
+                            str(getattr(agent, "provider", "") or ""),
+                            str(getattr(agent, "base_url", "") or ""),
+                            str(getattr(agent, "model", "") or ""),
+                            str(getattr(agent, "api_mode", "") or ""),
+                        )
                     except Exception as _strip_exc:  # pragma: no cover — defensive
                         logger.warning(
                             "%sllama.cpp grammar recovery: strip helper failed: %s",
                             agent.log_prefix, _strip_exc,
                         )
+                        _llama_cpp_tools_override = None
+                        _llama_cpp_tools_route = None
                         _stripped = 0
                     if _stripped:
                         agent._vprint(
@@ -4030,7 +4132,7 @@ def run_conversation(
                         )
                         logger.warning(
                             "%sllama.cpp grammar recovery: stripped %d "
-                            "pattern/format keyword(s) from tool schemas",
+                            "pattern/format keyword(s) from request-local tool schemas",
                             agent.log_prefix, _stripped,
                         )
                         continue

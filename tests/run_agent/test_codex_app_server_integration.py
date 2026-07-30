@@ -186,6 +186,61 @@ class TestRunConversationCodexPath:
             )
         ]
 
+    def test_native_codex_compaction_waits_through_empty_usage_for_real_prompt(
+        self, monkeypatch
+    ):
+        """The app-server usage notification is a sibling of compaction.
+
+        Codex may finish the compaction turn before it has a ``last`` usage
+        bucket.  That empty update is not evidence the compaction worked; the
+        next real low prompt must be the one that clears the verdict.
+        """
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-compact-empty-usage",
+                thread_id="thread-compact-empty-usage",
+                compacted=True,
+                # A non-empty partial sibling payload is still not a prompt
+                # measurement, so it must leave the latch armed just like an
+                # entirely absent usage notification.
+                token_usage_last={"totalTokens": 10, "outputTokens": 10},
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-compact-empty-usage",
+        )
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert agent.context_compressor.awaiting_real_usage_after_compression is True
+        assert agent.context_compressor._verify_compaction_cleared_threshold is True
+        assert agent.context_compressor.last_prompt_tokens == -1
+
+        from agent.codex_runtime import _record_codex_app_server_usage
+
+        _record_codex_app_server_usage(
+            agent,
+            TurnResult(
+                token_usage_last={
+                    "totalTokens": 5_010,
+                    "inputTokens": 5_000,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 10,
+                }
+            ),
+        )
+
+        assert agent.context_compressor.last_prompt_tokens == 5_000
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+        assert agent.context_compressor._verify_compaction_cleared_threshold is False
+
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):

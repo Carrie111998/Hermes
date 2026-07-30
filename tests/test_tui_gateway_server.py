@@ -118,6 +118,93 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_context_breakdown_without_live_agent_marks_fallback_as_estimated():
+    sid = "context-breakdown-fallback"
+    server._sessions[sid] = {"agent": None}
+    try:
+        response = server._methods["session.context_breakdown"](
+            "context-1",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["context_used_estimated"] is True
+
+
+def test_context_breakdown_without_live_agent_never_uses_cumulative_total():
+    sid = "context-breakdown-cumulative-total"
+    server._sessions[sid] = {
+        "agent": None,
+        "_metadata_mirror": {
+            "usage": {
+                "total": 1_900_000,
+                "context_max": 120_000,
+            }
+        },
+    }
+    try:
+        response = server._methods["session.context_breakdown"](
+            "context-2",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    result = response["result"]
+    assert result["context_used"] == 0
+    assert result["estimated_total"] == 0
+    assert result["context_percent"] == 0
+    assert result["context_used_estimated"] is True
+
+
+def test_context_breakdown_without_live_agent_preserves_measured_window_usage():
+    sid = "context-breakdown-measured-window"
+    server._sessions[sid] = {
+        "agent": None,
+        "_metadata_mirror": {
+            "usage": {
+                "total": 300_600,
+                "context_used": 128_200,
+                "context_max": 272_000,
+                "context_percent": 47,
+            }
+        },
+    }
+    try:
+        response = server._methods["session.context_breakdown"](
+            "context-3",
+            {"session_id": sid},
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    result = response["result"]
+    assert result["context_used"] == 128_200
+    assert result["estimated_total"] == 128_200
+    assert result["context_percent"] == 47
+    assert result["context_used_estimated"] is False
+
+
+def test_live_context_output_never_uses_cumulative_total():
+    session = {
+        "history": [],
+        "history_lock": threading.RLock(),
+        "session_key": "",
+        "_metadata_mirror": {
+            "usage": {
+                "total": 1_900_000,
+                "context_max": 120_000,
+            }
+        },
+    }
+
+    output = server._format_live_context_output(session)
+
+    assert "Context usage:" not in output
+    assert "1,900,000" not in output
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -662,8 +749,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
+        assert built.is_set()
     finally:
+        server._teardown_session(session)
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
@@ -717,11 +806,573 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=2)
+        assert built.is_set()
     finally:
+        server._teardown_session(session)
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
+
+
+def test_agent_build_reaped_midflight_emits_nothing_and_closes_orphan(
+    monkeypatch,
+):
+    entered = threading.Event()
+    release = threading.Event()
+    ready = threading.Event()
+    emitted = []
+
+    class Agent:
+        model = "test"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = Agent()
+
+    def make_agent(*_args, **_kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return agent
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server,
+        "_start_notification_poller",
+        lambda *_args: pytest.fail("reaped session started a poller"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda *_args: pytest.fail("reaped session emitted a boundary"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args: emitted.append(args),
+    )
+
+    sid = "reaped-during-build"
+    session = {
+        "agent_ready": ready,
+        "session_key": "reaped-key",
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert entered.wait(timeout=2)
+        server._sessions.pop(sid, None)
+        release.set()
+        assert ready.wait(timeout=2)
+    finally:
+        release.set()
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+    assert agent.closed is True
+
+
+def test_agent_build_worker_rejects_sid_reused_before_thread_runs(monkeypatch):
+    """A queued build belongs to the exact record passed by its caller."""
+    ready = threading.Event()
+    captured = {}
+    built_with = []
+    sid = "reused-before-build-thread"
+    session = {
+        "agent_ready": ready,
+        "session_key": "old-key",
+    }
+    replacement = {"session_key": "replacement-key"}
+
+    class DeferredThread:
+        def __init__(self, *, target, daemon, **_kwargs):
+            captured["target"] = target
+            self.daemon = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **_kwargs: built_with.append("old-key"),
+    )
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert captured["started"] is True
+        server._sessions[sid] = replacement
+
+        captured["target"]()
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert ready.is_set()
+    assert built_with == []
+    assert "agent" not in replacement
+    assert "_agent_build_publish_lock" not in replacement
+
+
+def test_deferred_credits_notice_rejects_reused_sid_and_new_transport(
+    monkeypatch,
+):
+    """A late notice belongs to the exact session record and agent that seeded it."""
+    from agent import credits_tracker
+    from tools import approval
+
+    notice_waiting = threading.Event()
+    release_notice = threading.Event()
+    notice_done = threading.Event()
+    ready = threading.Event()
+    notice_thread = None
+
+    class RecordingTransport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    class Agent:
+        model = "test"
+
+        def close(self):
+            return None
+
+    def make_agent(
+        build_sid,
+        _key,
+        *,
+        _callback_session=None,
+        **_kwargs,
+    ):
+        identity = server._new_agent_callback_binding(
+            build_sid, _callback_session
+        )
+        callbacks = server._agent_notice_cbs(build_sid, identity)
+        built_agent = Agent()
+        built_agent.notice_callback = callbacks["notice_callback"]
+        built_agent.notice_clear_callback = callbacks["notice_clear_callback"]
+        identity["agent"] = built_agent
+        built_agent._tui_callback_identity = identity
+        return built_agent
+
+    def seed_credits(agent):
+        nonlocal notice_thread
+
+        def late_notice():
+            notice_waiting.set()
+            assert release_notice.wait(timeout=2)
+            agent.notice_callback(
+                types.SimpleNamespace(
+                    text="old session credits",
+                    level="warn",
+                    kind="sticky",
+                    ttl_ms=None,
+                    key="credits.old",
+                    id="credits.old",
+                )
+            )
+            notice_done.set()
+
+        notice_thread = threading.Thread(target=late_notice, daemon=True)
+        notice_thread.start()
+        return True
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_load_memory_notifications", lambda: "off")
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda _cfg: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(credits_tracker, "seed_credits_at_session_start", seed_credits)
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda *_args: None)
+    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
+    monkeypatch.setattr(approval, "unregister_gateway_notify", lambda *_args: None)
+
+    sid = "credits-sid-reuse"
+    old_transport = RecordingTransport()
+    new_transport = RecordingTransport()
+    old_session = {
+        "agent_ready": ready,
+        "session_key": "old-credits-key",
+        "transport": old_transport,
+    }
+    replacement = {
+        "agent": object(),
+        "session_key": "new-credits-key",
+        "transport": new_transport,
+    }
+
+    server._sessions[sid] = old_session
+    try:
+        server._start_agent_build(sid, old_session)
+        assert notice_waiting.wait(timeout=2)
+        assert ready.wait(timeout=2)
+        assert server._pop_session_by_id(sid) is old_session
+        server._sessions[sid] = replacement
+
+        release_notice.set()
+        assert notice_done.wait(timeout=2)
+    finally:
+        release_notice.set()
+        if notice_thread is not None:
+            notice_thread.join(timeout=2)
+        server._sessions.pop(sid, None)
+
+    # The old build may publish its own ready frame before reap, but its late
+    # credits callback must be completely silent on the replacement transport.
+    assert old_transport.frames
+    assert new_transport.frames == []
+
+
+def test_agent_build_reaped_between_boundary_and_info_emits_nothing(
+    monkeypatch,
+):
+    """A reap/reuse after the old gate must suppress the later info frame."""
+    ready = threading.Event()
+    emitted = []
+
+    class Agent:
+        model = "test"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = Agent()
+    sid = "reaped-after-boundary"
+    session = {"agent_ready": ready, "session_key": "reaped-boundary-key"}
+    replacement = {"session_key": "new-owner"}
+
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        # The old still_attached gate has already passed when the boundary
+        # hook runs. Reap and immediately reuse the sid so key-presence checks
+        # would publish this build's info to the wrong live session.
+        lambda *_args: server._sessions.__setitem__(sid, replacement),
+    )
+    monkeypatch.setattr(
+        server,
+        "_schedule_mcp_late_refresh",
+        lambda *_args: pytest.fail("reaped session scheduled a late refresh"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+    assert agent.closed is True
+
+
+def test_agent_build_exception_after_reap_suppresses_ghost_error(monkeypatch):
+    """An init failure after reap closes its agent but emits no stale error."""
+    ready = threading.Event()
+    emitted = []
+
+    class Agent:
+        model = "test"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = Agent()
+    sid = "reaped-before-build-error"
+    session = {"agent_ready": ready, "session_key": "reaped-error-key"}
+
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args: None)
+
+    def reap_then_fail(*_args, **_kwargs):
+        server._sessions.pop(sid, None)
+        raise RuntimeError("post-reap init failure")
+
+    monkeypatch.setattr(server, "_session_info", reap_then_fail)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+    assert agent.closed is True
+
+
+def test_agent_build_boundary_and_reap_are_linearized(monkeypatch):
+    """A real reap waits for an in-flight boundary, then suppresses later work."""
+    boundary_entered = threading.Event()
+    release_boundary = threading.Event()
+    reap_started = threading.Event()
+    reaped = threading.Event()
+    ready = threading.Event()
+    emitted = []
+
+    class Agent:
+        model = "test"
+
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    agent = Agent()
+    sid = "reap-during-boundary"
+    session = {"agent_ready": ready, "session_key": "boundary-key"}
+
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: threading.Event()
+    )
+
+    def hold_boundary(*_args):
+        boundary_entered.set()
+        assert release_boundary.wait(timeout=2)
+
+    monkeypatch.setattr(server, "_notify_session_boundary", hold_boundary)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    def reap():
+        reap_started.set()
+        server._pop_session_by_id(sid)
+        reaped.set()
+
+    server._sessions[sid] = session
+    reap_thread = None
+    try:
+        server._start_agent_build(sid, session)
+        assert boundary_entered.wait(timeout=2)
+        reap_thread = threading.Thread(target=reap)
+        reap_thread.start()
+        assert reap_started.wait(timeout=2)
+        assert not reaped.wait(timeout=0.05)
+        release_boundary.set()
+        assert reaped.wait(timeout=2)
+        assert ready.wait(timeout=2)
+    finally:
+        release_boundary.set()
+        if reap_thread is not None:
+            reap_thread.join(timeout=2)
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+    assert agent.closed is True
+
+
+def test_reaper_rechecks_publish_lock_installed_between_registry_reads(
+    monkeypatch,
+):
+    """A late lock installation must close the reaper's no-lock window."""
+    first_registry_read_done = threading.Event()
+    allow_second_registry_read = threading.Event()
+    publish_lock_requested = threading.Event()
+    real_registry_lock = threading.RLock()
+
+    class RegistryLock:
+        def __init__(self):
+            self.entries = 0
+
+        def __enter__(self):
+            real_registry_lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, *_exc):
+            first = self.entries == 1
+            real_registry_lock.release()
+            if first:
+                first_registry_read_done.set()
+                assert allow_second_registry_read.wait(timeout=2)
+
+    real_publish_lock = threading.RLock()
+
+    class PublishLock:
+        def __enter__(self):
+            publish_lock_requested.set()
+            real_publish_lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            real_publish_lock.release()
+
+    sid = "publish-lock-installed-late"
+    session = {"session_key": "old-key"}
+    result = {}
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_sessions_lock", RegistryLock())
+
+    def reap():
+        result["session"] = server._pop_session_by_id(sid)
+
+    reap_thread = threading.Thread(target=reap)
+    real_publish_lock.acquire()
+    try:
+        reap_thread.start()
+        assert first_registry_read_done.wait(timeout=2)
+        session["_agent_build_publish_lock"] = PublishLock()
+        allow_second_registry_read.set()
+        assert publish_lock_requested.wait(timeout=2)
+        assert server._sessions.get(sid) is session
+        assert reap_thread.is_alive()
+    finally:
+        real_publish_lock.release()
+        allow_second_registry_read.set()
+        reap_thread.join(timeout=2)
+        server._sessions.pop(sid, None)
+
+    assert result["session"] is session
+
+
+def test_late_mcp_refresh_rejects_sid_reused_before_worker_runs(monkeypatch):
+    """A queued refresh cannot rediscover a replacement by the same id."""
+    from tui_gateway import entry
+    from tools import mcp_tool
+
+    captured = {}
+    refreshed = []
+    emitted = []
+    sid = "reused-before-late-refresh"
+    agent = type("Agent", (), {"_user_turn_count": 0, "_api_call_count": 0})()
+    session = {"agent": agent, "session_key": "old-key"}
+    replacement = {"agent": object(), "session_key": "replacement-key"}
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon):
+            captured["target"] = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(entry, "mcp_discovery_in_flight", lambda: True)
+    monkeypatch.setattr(entry, "join_mcp_discovery", lambda timeout=None: True)
+    monkeypatch.setattr(
+        mcp_tool,
+        "refresh_agent_mcp_tools",
+        lambda *_args, **_kwargs: refreshed.append(True),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    server._sessions[sid] = session
+    try:
+        server._schedule_mcp_late_refresh(sid, agent, session)
+        assert captured["started"] is True
+        server._sessions[sid] = replacement
+
+        captured["target"]()
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert refreshed == []
+    assert emitted == []
+    assert "tools" not in replacement
+
+
+def test_late_mcp_refresh_rechecks_identity_after_refresh(monkeypatch):
+    """A non-funnel replacement during refresh still suppresses stale info."""
+    from tui_gateway import entry
+    from tools import mcp_tool
+
+    captured = {}
+    emitted = []
+    sid = "reused-during-late-refresh"
+    agent = type("Agent", (), {"_user_turn_count": 0, "_api_call_count": 0})()
+    session = {"agent": agent, "session_key": "old-key"}
+    replacement = {"agent": object(), "session_key": "replacement-key"}
+
+    class DeferredThread:
+        def __init__(self, *, target, name, daemon):
+            captured["target"] = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self):
+            pass
+
+    def replace_during_refresh(*_args, **_kwargs):
+        server._sessions[sid] = replacement
+        return ["mcp__late__tool"]
+
+    monkeypatch.setattr(server.threading, "Thread", DeferredThread)
+    monkeypatch.setattr(entry, "mcp_discovery_in_flight", lambda: True)
+    monkeypatch.setattr(entry, "join_mcp_discovery", lambda timeout=None: True)
+    monkeypatch.setattr(
+        mcp_tool, "refresh_agent_mcp_tools", replace_during_refresh
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda *_args: pytest.fail("stale session info was derived"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+    server._sessions[sid] = session
+    try:
+        server._schedule_mcp_late_refresh(sid, agent, session)
+        captured["target"]()
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+    assert "tools" not in replacement
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
@@ -4316,10 +4967,10 @@ def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
         {"origin_ui_session_id": "missing-owner-sid"},
     ],
 )
-def test_notification_poller_live_loop_drops_addressed_orphan(
+def test_notification_poller_live_loop_requeues_addressed_owner_gap(
     monkeypatch, routing
 ):
-    """A live poll never injects an addressed event whose owner is gone."""
+    """A live poll preserves an addressed event while its owner is absent."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -4355,7 +5006,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
 
         assert delivered == []
         assert emitted == []
-        assert isolated_queue.empty()
+        assert isolated_queue.qsize() == 1
     finally:
         server._sessions.pop("sid-live-orphan", None)
         process_registry._completion_consumed.discard(event["session_id"])
@@ -4370,8 +5021,8 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
         {"origin_ui_session_id": "sid_gone"},
     ],
 )
-def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
-    """Addressed completions whose owner is gone are dropped, not hijacked."""
+def test_notification_poller_requeues_orphaned_events(monkeypatch, routing):
+    """Addressed completions whose owner is gone are preserved, not hijacked."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -4410,19 +5061,217 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
 
         assert [a for a in emitted if a[0] == "status.update"] == []
         assert delivered == []
+        assert isolated_queue.qsize() == 1
     finally:
         server._sessions.pop("sid_a", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_delivers_requeued_event_after_durable_owner_recovers(monkeypatch):
+    """A temporary owner gap preserves one completion for the resumed owner."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": "recoverable-owner-event",
+        "session_key": "durable-owner-key",
+        "command": "echo recover",
+        "exit_code": 0,
+        "output": "recover",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    delivered = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: delivered.append(text),
+    )
+    process_registry._completion_consumed.discard(event["session_id"])
+    isolated_queue.put(event)
+
+    unrelated = _session(agent=types.SimpleNamespace(), session_key="unrelated-key")
+    recovered = _session(agent=types.SimpleNamespace(), session_key="durable-owner-key")
+    server._sessions["unrelated-sid"] = unrelated
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "unrelated-sid", unrelated
+        )
+        assert isolated_queue.qsize() == 1
+        assert delivered == []
+
+        server._sessions.pop("unrelated-sid", None)
+        server._sessions["recovered-sid"] = recovered
+        stop = threading.Event()
+        stop.set()
+        server._notification_poller_loop(stop, "recovered-sid", recovered)
+        assert len(delivered) == 1
+        assert isolated_queue.empty()
+
+        server._notification_poller_loop(stop, "recovered-sid", recovered)
+        assert len(delivered) == 1
+    finally:
+        server._sessions.pop("unrelated-sid", None)
+        server._sessions.pop("recovered-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+@pytest.mark.parametrize("shutdown_drain", [False, True])
+def test_notification_requeue_reservation_follows_compression_lineage(
+    monkeypatch, shutdown_drain
+):
+    """An owner-gap reservation for P must permit its compressed child C."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    class _CompressionDB:
+        def resolve_resume_session_id(self, key):
+            return "child-key" if key == "parent-key" else key
+
+    event = {
+        "type": "completion",
+        "session_id": f"compression-reservation-{shutdown_drain}",
+        "session_key": "parent-key",
+        "_tui_requeue_session_key": "parent-key",
+        "command": "echo compressed",
+        "exit_code": 0,
+        "output": "compressed",
+    }
+    delivered = []
+    child = _session(agent=types.SimpleNamespace(), session_key="child-key")
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.append(True),
+    )
+    server._sessions["compressed-owner-sid"] = child
+    process_registry._completion_consumed.discard(event["session_id"])
+    try:
+        stop = threading.Event() if shutdown_drain else _StopAfterOneNotificationPoll()
+        if shutdown_drain:
+            stop.set()
+        server._notification_poller_loop(stop, "compressed-owner-sid", child)
+        assert delivered == [True]
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("compressed-owner-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+def test_notification_poller_recovers_origin_only_event_without_unrelated_key(monkeypatch):
+    """Origin-only owner gaps wait for that SID, never an observer's key."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": "origin-only-recoverable",
+        "origin_ui_session_id": "original-owner-sid",
+        "command": "echo origin",
+        "exit_code": 0,
+        "output": "origin",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    delivered = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text: delivered.append(text),
+    )
+    process_registry._completion_consumed.discard(event["session_id"])
+    isolated_queue.put(event)
+
+    observer = _session(agent=types.SimpleNamespace(), session_key="unrelated-key")
+    recovered = _session(agent=types.SimpleNamespace(), session_key="different-new-key")
+    server._sessions["observer-sid"] = observer
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "observer-sid", observer
+        )
+        queued = isolated_queue.get_nowait()
+        assert queued["_tui_requeue_origin_sid"] == "original-owner-sid"
+        assert "_tui_requeue_session_key" not in queued
+        isolated_queue.put(queued)
+
+        server._sessions.pop("observer-sid", None)
+        server._sessions["original-owner-sid"] = recovered
+        stop = threading.Event()
+        stop.set()
+        server._notification_poller_loop(stop, "original-owner-sid", recovered)
+        assert len(delivered) == 1
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("observer-sid", None)
+        server._sessions.pop("original-owner-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+def test_notification_poller_same_sid_replacement_cannot_take_requeued_event(monkeypatch):
+    """A replacement short SID cannot adopt an event reserved for old key."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": "replacement-must-not-take",
+        "session_key": "old-durable-key",
+        "_tui_requeue_session_key": "old-durable-key",
+        "command": "echo old",
+        "exit_code": 0,
+        "output": "old",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    delivered = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.append(True),
+    )
+    replacement = _session(agent=types.SimpleNamespace(), session_key="replacement-key")
+    isolated_queue.put(event)
+    server._sessions["reused-sid"] = replacement
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, "reused-sid", replacement)
+        assert delivered == []
+        assert isolated_queue.qsize() == 1
+    finally:
+        server._sessions.pop("reused-sid", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 @pytest.mark.parametrize(
-    ("routing", "resolved_key"),
+        ("routing", "resolved_key"),
     [
         ({"session_key": "session-a"}, None),
         (
             {
-                "session_key": "stale-durable-key",
                 "origin_ui_session_id": "sid_a",
             },
             None,
@@ -4485,6 +5334,162 @@ def test_notification_poller_delivers_owned_events(
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_requeues_when_sid_reused_after_status_emit(monkeypatch):
+    """A paused old poller cannot inject its completion into a SID replacement."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    sid = "poller-sid-reuse"
+    old_session = _session(agent=types.SimpleNamespace(model="old"), session_key="old-key")
+    replacement = _session(
+        agent=types.SimpleNamespace(model="replacement"), session_key="new-key"
+    )
+    emitted = []
+    dispatched = []
+    reaped = threading.Event()
+    reapers = []
+    original_emit_bound = server._emit_bound_agent_event
+
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: dispatched.append(_args),
+    )
+
+    def pause_after_status(binding, event, payload):
+        result = original_emit_bound(binding, event, payload)
+        if event == "status.update":
+            reaper = threading.Thread(target=reap_and_reuse)
+            reapers.append(reaper)
+            reaper.start()
+            assert reaped.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(server, "_emit_bound_agent_event", pause_after_status)
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    isolated_queue.put(
+        {
+            "type": "completion",
+            "session_id": "reuse-proc",
+            "command": "echo old",
+            "exit_code": 0,
+            "output": "old",
+        }
+    )
+    server._sessions[sid] = old_session
+    stop = threading.Event()
+    stop.set()  # Exercise the deterministic shutdown-drain delivery path once.
+
+    def reap_and_reuse():
+        assert server._pop_session_by_id(sid) is old_session
+        server._sessions[sid] = replacement
+        reaped.set()
+
+    try:
+        server._notification_poller_loop(stop, sid, old_session)
+    finally:
+        for reaper in reapers:
+            reaper.join(timeout=2)
+        server._sessions.pop(sid, None)
+
+    assert reaped.is_set()
+    assert dispatched == []
+    assert replacement["running"] is False
+    assert not isolated_queue.empty()
+
+
+def test_notification_turn_reuse_drops_late_frames_and_requeues_claim(monkeypatch, tmp_path):
+    """A worker that outlives SID replacement cannot complete or leak its event."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _RecordingTransport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    class _BlockedAgent(_RecordingAgent):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            if stream_callback is not None:
+                stream_callback("late old output")
+            return {"final_response": "late old output", "messages": []}
+
+    old_transport = _RecordingTransport()
+    replacement_transport = _RecordingTransport()
+    turns = []
+    sid = "notification-turn-reuse"
+    old_session = _session(
+        agent=_BlockedAgent(turns),
+        session_key="old-notification-key",
+        transport=old_transport,
+    )
+    replacement = _session(
+        agent=_RecordingAgent([]),
+        session_key="replacement-notification-key",
+        transport=replacement_transport,
+    )
+    event = {
+        "type": "completion",
+        "session_id": "blocked-notification-event",
+        "session_key": "old-notification-key",
+        "command": "echo old",
+        "exit_code": 0,
+        "output": "old",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_name, event_sid, payload=None: server.write_json(
+            server._event_frame(event_name, event_sid, payload)
+        ),
+    )
+    server._sessions[sid] = old_session
+    process_registry._completion_consumed.discard(event["session_id"])
+    try:
+        stop = threading.Event()
+        stop.set()
+        server._notification_poller_loop(stop, sid, old_session)
+        assert entered.wait(timeout=5)
+
+        server._sessions[sid] = replacement
+        release.set()
+        worker = old_session["_run_thread"]
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+        assert replacement_transport.frames == []
+        assert not process_registry.is_completion_consumed(event["session_id"])
+        assert any(
+            queued.get("session_id") == event["session_id"]
+            for queued in list(isolated_queue.queue)
+        )
+    finally:
+        release.set()
+        worker = old_session.get("_run_thread")
+        if worker is not None:
+            worker.join(timeout=5)
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
@@ -4518,6 +5523,525 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
     monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "result"),
+    [
+        ("success", {"final_response": "done", "messages": []}),
+        ("returned_error", {"final_response": "", "error": "provider failed", "messages": []}),
+        ("interrupted", {"final_response": "partial", "interrupted": True, "messages": []}),
+        ("blocked", None),
+    ],
+)
+def test_notification_turn_only_completes_successful_results(
+    monkeypatch, tmp_path, outcome, result
+):
+    """Every non-success notification outcome releases and requeues its claim."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    calls = {"complete": [], "release": [], "runs": []}
+
+    class _Agent:
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, prompt, **_kwargs):
+            calls["runs"].append(prompt)
+            return result
+
+    sid = f"notification-{outcome}"
+    session = _session(agent=_Agent(), session_key=f"{outcome}-key")
+    event = {"type": "completion", "session_id": f"{outcome}-event"}
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda *args: calls["complete"].append(args) or True,
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *args: calls["release"].append(args),
+    )
+    if outcome == "blocked":
+        monkeypatch.setattr(
+            "agent.context_references.preprocess_context_references",
+            lambda *_args, **_kwargs: types.SimpleNamespace(
+                blocked=True, warnings=["blocked for test"]
+            ),
+        )
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length", lambda *_args, **_kwargs: 1
+        )
+
+    server._sessions[sid] = session
+    try:
+        binding = server._notification_session_binding(sid, session)
+        assert binding is not None
+        server._start_bound_notification_turn(
+            "rid", binding, event, object(), "@blocked" if outcome == "blocked" else "notice"
+        )
+
+        if outcome == "success":
+            assert len(calls["complete"]) == 1
+            assert calls["release"] == []
+            assert isolated_queue.empty()
+        else:
+            assert calls["complete"] == []
+            assert len(calls["release"]) == 1
+            assert isolated_queue.get_nowait() is event
+            assert isolated_queue.empty()
+        assert session["running"] is False
+        assert calls["runs"] == ([] if outcome == "blocked" else ["notice"])
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_complete_event_delivery_requires_durable_ack_but_keeps_empty_claim_compatibility(
+    monkeypatch,
+):
+    """Only durable async-delegation claims need a successful DB acknowledgement."""
+    from tools import async_delegation
+
+    acknowledgements = []
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        lambda *args: acknowledgements.append(args) or True,
+    )
+    assert async_delegation.complete_event_delivery(
+        {"type": "async_delegation", "delegation_id": "delegation"}, "claim"
+    ) is True
+    assert acknowledgements == [("delegation", "claim")]
+    monkeypatch.setattr(
+        async_delegation, "complete_completion_delivery", lambda *_args: False
+    )
+    assert async_delegation.complete_event_delivery(
+        {"type": "async_delegation", "delegation_id": "delegation"}, "claim"
+    ) is False
+    assert async_delegation.complete_event_delivery(
+        {"type": "completion", "session_id": "process"}, ""
+    ) is True
+
+
+@pytest.mark.parametrize("terminal_state", ["delivered", "dropped"])
+@pytest.mark.parametrize("prune_terminal_row", [False, True])
+def test_notification_claim_rollover_terminal_event_converges_without_duplicate_turn(
+    monkeypatch, tmp_path, terminal_state, prune_terminal_row
+):
+    """A stale claimant must not replay an event consumed by its successor.
+
+    This is the real SQLite sequence from the cross-process rollover race:
+    claimant A pauses past the lease, claimant B takes over and terminally
+    consumes the durable row, then A's late release loses its CAS.  The stale
+    in-memory event must converge instead of being requeued forever or injected
+    into a second agent turn.
+    """
+    import queue as _queue_mod
+    import sqlite3
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    event = {
+        "type": "async_delegation",
+        "delegation_id": f"rollover-{terminal_state}",
+        "session_key": "rollover-owner",
+        "status": "completed",
+        "completed_at": 2.0,
+    }
+    async_delegation._persist_dispatch(
+        {
+            "delegation_id": event["delegation_id"],
+            "session_key": event["session_key"],
+            "origin_ui_session_id": "",
+            "parent_session_id": None,
+            "dispatched_at": 1.0,
+        }
+    )
+    async_delegation._persist_completion(
+        event, {"status": "completed", "summary": "done"}
+    )
+
+    claim_a = async_delegation.claim_event_delivery(event, "claimant-a")
+    assert claim_a
+    busy = async_delegation.claim_event_delivery_state(event, "busy-contender")
+    assert busy.state == "busy_pending"
+    assert busy.claim_id == ""
+    legacy = async_delegation.claim_event_delivery_state(
+        {"type": "completion", "session_id": "legacy-process"}, "legacy"
+    )
+    assert legacy.state == "legacy_non_durable"
+    assert legacy.claim_id == ""
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_claimed_at=0
+               WHERE delegation_id=?""",
+            (event["delegation_id"],),
+        )
+
+    claim_b = async_delegation.claim_event_delivery_state(event, "claimant-b")
+    assert claim_b.state == "claimed"
+    assert claim_b.claim_id
+    if terminal_state == "delivered":
+        assert async_delegation.complete_event_delivery(event, claim_b.claim_id)
+    else:
+        assert async_delegation.drop_completion_delivery(
+            event["delegation_id"], claim_b.claim_id
+        )
+    consumed = async_delegation.claim_event_delivery_state(event, "late-contender")
+    assert consumed.state == "terminal_consumed"
+    assert consumed.claim_id == ""
+
+    # A no longer owns the row. A false release is expected and must not make
+    # the already-consumed durable notification live again.
+    assert not async_delegation.release_completion_delivery(
+        event["delegation_id"], claim_a
+    )
+    if prune_terminal_row:
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            conn.execute(
+                "DELETE FROM async_delegations WHERE delegation_id=?",
+                (event["delegation_id"],),
+            )
+
+    turns = []
+    sid = f"rollover-{terminal_state}-sid"
+    session = _session(
+        agent=_RecordingAgent(turns), session_key=event["session_key"]
+    )
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        server,
+        "_start_bound_notification_turn",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("terminally consumed notification was injected again")
+        ),
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit_bound_agent_event",
+        lambda *args: emitted.append(args) or True,
+    )
+    assert not server._release_or_requeue_notification_event(
+        sid, session, event, claim_a
+    )
+    assert isolated_queue.empty()
+    server._sessions[sid] = session
+    try:
+        outcome = server._dispatch_poller_notification(
+            sid, session, event, "completed", set()
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert outcome == "consumed"
+    assert session["running"] is False
+    assert turns == []
+    assert emitted == []
+    assert isolated_queue.empty()
+
+
+@pytest.mark.parametrize("failure_site", ["complete", "ack_false", "release"])
+def test_notification_settlement_failures_requeue_once_and_leave_old_session_idle(
+    monkeypatch, tmp_path, failure_site
+):
+    """Settlement exceptions cannot consume the event or strand its worker busy."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    calls = {"complete": [], "release": []}
+
+    class _Agent:
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(self, _prompt, **_kwargs):
+            if failure_site == "release":
+                return {"final_response": "", "error": "failed", "messages": []}
+            return {"final_response": "done", "messages": []}
+
+    sid = f"settlement-{failure_site}"
+    session = _session(agent=_Agent(), session_key=f"{failure_site}-key")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": f"{failure_site}-delegation",
+        "session_id": f"{failure_site}-event",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    def _complete(*args):
+        calls["complete"].append(args)
+        if failure_site == "complete":
+            raise RuntimeError("completion store unavailable")
+        return failure_site != "ack_false"
+
+    def _release(*args):
+        calls["release"].append(args)
+        if failure_site == "release":
+            raise RuntimeError("release store unavailable")
+
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", _complete)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", _release)
+    server._sessions[sid] = session
+    try:
+        binding = server._notification_session_binding(sid, session)
+        assert binding is not None
+        server._start_bound_notification_turn("rid", binding, event, "durable-claim", "notice")
+
+        assert len(calls["complete"]) == (0 if failure_site == "release" else 1)
+        assert len(calls["release"]) == 1
+        assert session["running"] is False
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_notification_dispatch_identity_loss_after_start_settles_once(monkeypatch):
+    """A post-effect SID replacement delegates exactly one failed settlement."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    sid = "notification-dispatch-reused"
+    old = _session(agent=types.SimpleNamespace(), session_key="dispatch-old-key")
+    replacement = _session(
+        agent=types.SimpleNamespace(), session_key="dispatch-new-key", running=True
+    )
+    event = {
+        "type": "completion",
+        "session_id": "notification-dispatch-reused-event",
+        "command": "echo old",
+        "exit_code": 0,
+        "output": "old",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: "claim")
+    released = []
+    settles = []
+    monkeypatch.setattr(
+        async_delegation, "release_event_delivery", lambda *args: released.append(args)
+    )
+
+    def _started(_rid, _binding, settled_event, claim, _text, **_kwargs):
+        # The bound effect has executed, but its after-effect identity check
+        # must reject this same-SID replacement and settle only the old claim.
+        server._sessions[sid] = replacement
+
+        def _settle(success):
+            settles.append(success)
+            async_delegation.release_event_delivery(settled_event, claim)
+            server._requeue_notification_event(sid, old, settled_event)
+
+        return _settle
+
+    monkeypatch.setattr(server, "_start_bound_notification_turn", _started)
+    server._sessions[sid] = old
+    try:
+        assert server._dispatch_poller_notification(sid, old, event, "notice", set()) == "requeued"
+        assert settles == [False]
+        assert len(released) == 1
+        assert old["running"] is False
+        assert replacement["running"] is True
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize("claim_outcome", [None, RuntimeError("claim unavailable")])
+def test_notification_poller_claim_failure_requeues_and_stays_idle(
+    monkeypatch, claim_outcome
+):
+    """A live poller must not drop or wedge an event when claiming fails."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    sid = "claim-failure-poller"
+    session = _session(agent=types.SimpleNamespace(), session_key="claim-failure-key")
+    event = {
+        "type": "completion",
+        "session_id": "claim-failure-event",
+        "command": "echo claim",
+        "exit_code": 0,
+        "output": "claim",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def _claim(*_args):
+        if isinstance(claim_outcome, Exception):
+            raise claim_outcome
+        return claim_outcome
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    server._sessions[sid] = session
+    stop = threading.Event()
+    stop.set()
+    try:
+        server._notification_poller_loop(stop, sid, session)
+        assert session["running"] is False
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
+@pytest.mark.parametrize("claim_outcome", [None, RuntimeError("claim unavailable")])
+def test_post_turn_claim_failure_requeues_and_clears_reservation(
+    monkeypatch, tmp_path, claim_outcome
+):
+    """Post-turn draining has the same fail-closed claim contract as polling."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    session = _session(
+        agent=_RecordingAgent(turns), session_key="post-turn-claim-key", running=True
+    )
+    event = {
+        "type": "completion",
+        "session_id": "post-turn-claim-event",
+        "session_key": "post-turn-claim-key",
+        "command": "echo claim",
+        "exit_code": 0,
+        "output": "claim",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+
+    def _claim(*_args):
+        if isinstance(claim_outcome, Exception):
+            raise claim_outcome
+        return claim_outcome
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    server._sessions["post-turn-claim-sid"] = session
+    try:
+        server._run_prompt_submit("rid", "post-turn-claim-sid", session, "main turn")
+        assert turns == ["main turn"]
+        assert session["running"] is False
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("post-turn-claim-sid", None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
+def test_post_turn_claim_identity_loss_releases_and_requeues_once(monkeypatch, tmp_path):
+    """A claim returned just before SID reuse cannot be delivered to its replacement."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    sid = "post-turn-claim-reused-sid"
+    old = _session(
+        agent=_RecordingAgent([]), session_key="post-turn-claim-old", running=True
+    )
+    replacement = _session(
+        agent=_RecordingAgent([]), session_key="post-turn-claim-new", running=True
+    )
+    event = {
+        "type": "completion",
+        "session_id": "post-turn-claim-reused-event",
+        "session_key": "post-turn-claim-old",
+        "command": "echo old",
+        "exit_code": 0,
+        "output": "old",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    released = []
+
+    def _claim(*_args):
+        server._sessions[sid] = replacement
+        return "claim"
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", _claim)
+    monkeypatch.setattr(
+        async_delegation, "release_event_delivery", lambda *args: released.append(args)
+    )
+    server._sessions[sid] = old
+    try:
+        server._run_prompt_submit("rid", sid, old, "old main turn")
+        assert len(released) == 1
+        assert old["running"] is False
+        assert replacement["running"] is True
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard(event["session_id"])
+
+
+def test_post_turn_identity_loss_requeues_without_touching_sid_replacement(
+    monkeypatch, tmp_path
+):
+    """A post-turn owner gap clears only the captured old session record."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    sid = "post-turn-reused-sid"
+    old = _session(
+        agent=_RecordingAgent([]), session_key="post-turn-old-key", running=True
+    )
+    replacement = _session(
+        agent=_RecordingAgent([]), session_key="post-turn-new-key", running=True
+    )
+    event = {
+        "type": "completion",
+        "session_id": "post-turn-identity-loss-event",
+        "session_key": "post-turn-old-key",
+        "command": "echo old",
+        "exit_code": 0,
+        "output": "old",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    # The old worker still holds its exact record, but its short SID now names
+    # a replacement; no action may mutate that replacement's reservation.
+    server._sessions[sid] = replacement
+    try:
+        server._run_prompt_submit("rid", sid, old, "old main turn")
+        assert old["running"] is False
+        assert replacement["running"] is True
+        assert isolated_queue.get_nowait() is event
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard(event["session_id"])
 
 
 class _RecordingAgent:
@@ -13976,6 +15500,165 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
     assert "create_reasoning_override" not in session
     assert "create_service_tier_override" not in session
     assert session["agent"] is new_agent
+
+
+def test_reset_session_agent_fails_closed_after_sid_reuse(monkeypatch):
+    """A /new build that loses its record cannot publish into the new owner."""
+    sid = "reset-reused"
+    old_agent = types.SimpleNamespace(model="old")
+    session = _session(agent=old_agent)
+    replacement_agent = types.SimpleNamespace(model="replacement")
+    replacement = _session(agent=replacement_agent, session_key="new-key")
+
+    class NewAgent:
+        model = "new"
+
+        def __init__(self):
+            self.closed = False
+            self._tui_callback_identity = server._new_agent_callback_binding(sid, session)
+
+        def close(self):
+            self.closed = True
+
+    new_agent = NewAgent()
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+
+    def make_agent(*_args, **_kwargs):
+        server._sessions[sid] = replacement
+        return new_agent
+
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    try:
+        assert server._reset_session_agent(sid, session) == {}
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert new_agent.closed is True
+    assert replacement["agent"] is replacement_agent
+
+
+def test_reset_waits_for_old_bound_callback_before_agent_swap(monkeypatch):
+    """/new cannot swap agents across an already-authorized old callback."""
+    sid = "reset-waits-for-callback"
+    old_agent = types.SimpleNamespace(model="old")
+    session = _session(agent=old_agent)
+    callback_binding = {"sid": sid, "session": session, "agent": old_agent}
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    reset_done = threading.Event()
+    emitted = []
+
+    class NewAgent:
+        model = "new"
+
+        def __init__(self):
+            self._tui_callback_identity = server._new_agent_callback_binding(sid, session)
+
+    new_agent = NewAgent()
+
+    def emit(event, *_args):
+        emitted.append(event)
+        if event == "status.update":
+            callback_entered.set()
+            assert release_callback.wait(timeout=2)
+
+    monkeypatch.setattr(server, "_emit", emit)
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: new_agent)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {"model": "new"})
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+
+    server._sessions[sid] = session
+    callback_thread = threading.Thread(
+        target=lambda: server._bound_agent_cbs(sid, callback_binding)["status_callback"](
+            "old callback"
+        )
+    )
+    reset_result = {}
+    reset_thread = threading.Thread(
+        target=lambda: (reset_result.setdefault("info", server._reset_session_agent(sid, session)), reset_done.set())
+    )
+    try:
+        callback_thread.start()
+        assert callback_entered.wait(timeout=2)
+        reset_thread.start()
+        assert not reset_done.wait(timeout=0.05)
+        assert session["agent"] is old_agent
+
+        release_callback.set()
+        callback_thread.join(timeout=2)
+        reset_thread.join(timeout=2)
+    finally:
+        release_callback.set()
+        callback_thread.join(timeout=2)
+        reset_thread.join(timeout=2)
+        server._sessions.pop(sid, None)
+
+    assert reset_done.is_set()
+    assert reset_result["info"] == {"model": "new"}
+    assert session["agent"] is new_agent
+    assert emitted == ["status.update", "session.info"]
+
+
+def test_bound_agent_callback_rejects_reused_sid(monkeypatch):
+    """Ordinary AIAgent callbacks use the exact record, not SID presence."""
+    sid = "callback-reused"
+    old_agent = types.SimpleNamespace()
+    session = _session(agent=old_agent)
+    replacement = _session(agent=types.SimpleNamespace(), session_key="new-key")
+    binding = {"sid": sid, "session": session, "agent": old_agent}
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    server._sessions[sid] = session
+    try:
+        callback = server._bound_agent_cbs(sid, binding)["status_callback"]
+        server._sessions[sid] = replacement
+        callback("old status")
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert emitted == []
+
+
+def test_eager_init_stops_after_sid_reuse_before_wiring(monkeypatch):
+    """An old eager init cannot wire/publish against a replacement record."""
+    sid = "eager-reused"
+    replacement = _session(agent=types.SimpleNamespace(), session_key="new-key")
+    agent = types.SimpleNamespace(model="old", background_review_callback=None)
+    calls = []
+
+    monkeypatch.setattr(server, "_load_show_reasoning", lambda: False)
+    monkeypatch.setattr(server, "_load_tool_progress_mode", lambda: "all")
+    monkeypatch.setattr(
+        server,
+        "_register_session_cwd",
+        lambda _session: server._sessions.__setitem__(sid, replacement),
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_args: calls.append("wire"))
+    monkeypatch.setattr(
+        server, "_start_notification_poller", lambda *_args: calls.append("poller")
+    )
+    monkeypatch.setattr(
+        server, "_notify_session_boundary", lambda *_args: calls.append("boundary")
+    )
+    monkeypatch.setattr(
+        server, "_schedule_mcp_late_refresh", lambda *_args: calls.append("refresh")
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args: calls.append("emit"))
+
+    try:
+        server._init_session(sid, "old-key", agent, [], cols=80)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert calls == []
+    assert replacement["agent"] is not agent
 
 
 @pytest.mark.parametrize(

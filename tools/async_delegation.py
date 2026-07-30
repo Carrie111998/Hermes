@@ -44,6 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -84,6 +85,25 @@ _MAX_DURABLE_PENDING = 1000
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class EventDeliveryClaim:
+    """Outcome of trying to reserve one process-notification delivery.
+
+    ``None`` historically represented both a live competing claim and an
+    already terminal durable row.  Consumers that requeue on ``None`` cannot
+    converge after a lease rollover, so keep those states explicit.
+    """
+
+    state: str
+    claim_id: str = ""
+
+
+DELIVERY_CLAIMED = "claimed"
+DELIVERY_BUSY_PENDING = "busy_pending"
+DELIVERY_TERMINAL_CONSUMED = "terminal_consumed"
+DELIVERY_LEGACY_NON_DURABLE = "legacy_non_durable"
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -271,6 +291,11 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    # Keep enough provenance on the in-memory/restored event to distinguish a
+    # pruned terminal durable row from a truly legacy non-durable event.  A
+    # stale claimant can outlive retention pruning after another claimant has
+    # already consumed the row.
+    event["_durable_delivery"] = True
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -318,6 +343,7 @@ def recover_abandoned_delegations() -> int:
             task = json.loads(task_json or "{}")
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
+                "_durable_delivery": True,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
@@ -411,6 +437,56 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
 
 
+def inspect_event_delivery_state(evt: Dict[str, Any]) -> str:
+    """Classify an event without mutating its durable delivery row."""
+    if evt.get("type") != "async_delegation":
+        return DELIVERY_LEGACY_NON_DURABLE
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return DELIVERY_LEGACY_NON_DURABLE
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    if row is None:
+        return (
+            DELIVERY_TERMINAL_CONSUMED
+            if evt.get("_durable_delivery") is True
+            else DELIVERY_LEGACY_NON_DURABLE
+        )
+    if str(row[0]) in {"delivered", "dropped"}:
+        return DELIVERY_TERMINAL_CONSUMED
+    return DELIVERY_BUSY_PENDING
+
+
+def claim_event_delivery_state(
+    evt: Dict[str, Any], consumer: str
+) -> EventDeliveryClaim:
+    """Claim an event while preserving why a claim was unavailable.
+
+    The historical ``claim_event_delivery`` call remains the compatibility
+    seam for CLI consumers and tests.  A follow-up read is sufficient here:
+    a pending row may move to terminal after the read (the next queue pass
+    then consumes it), while a terminal row can never become pending again.
+    """
+    claim_id = claim_event_delivery(evt, consumer)
+    if claim_id is None:
+        if evt.get("type") != "async_delegation":
+            return EventDeliveryClaim(DELIVERY_BUSY_PENDING)
+        return EventDeliveryClaim(inspect_event_delivery_state(evt))
+    if not claim_id:
+        return EventDeliveryClaim(DELIVERY_LEGACY_NON_DURABLE)
+    state = inspect_event_delivery_state(evt)
+    if state == DELIVERY_LEGACY_NON_DURABLE:
+        # Async events predating the durable registry are intentionally
+        # delivered with no database acknowledgement.
+        return EventDeliveryClaim(state)
+    if state == DELIVERY_TERMINAL_CONSUMED:
+        return EventDeliveryClaim(state)
+    return EventDeliveryClaim(DELIVERY_CLAIMED, claim_id)
+
+
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Release a failed delivery claim so another consumer may retry.
 
@@ -484,14 +560,27 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    """Return whether this event's delivery was durably acknowledged.
+
+    Ordinary process notifications have no durable delivery row, so completing
+    them remains a successful no-op (including the historical empty-claim
+    path).  Async-delegation notifications are successful only when the
+    claimed database row was actually transitioned to ``delivered``.
+    """
     if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        return complete_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        )
+    return True
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        return release_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        )
+    return True
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

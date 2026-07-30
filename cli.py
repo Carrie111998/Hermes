@@ -4177,6 +4177,25 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _ProcessNotificationInput:
+    """A queued notification whose durable claim follows the actual turn.
+
+    Keeping the raw event in the CLI queue avoids acknowledging it merely
+    because ``_pending_input.put`` succeeded. The process loop claims just
+    before the synthetic turn and acknowledges only after that turn completes
+    successfully, matching the TUI delivery lifetime.
+    """
+
+    __slots__ = ("text", "event", "consumer", "claim_id", "durable")
+
+    def __init__(self, text: str, event: dict, consumer: str):
+        self.text = text
+        self.event = event
+        self.consumer = consumer
+        self.claim_id = ""
+        self.durable = False
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -10314,24 +10333,139 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         ``process_registry`` restores durable delegation completions into every
         process using the same Hermes profile.  Always pass this CLI's stable
         session identity when draining so another window cannot claim and mark
-        delivered a completion that belongs to this one.
+        delivered a completion that belongs to this one. The queued envelope
+        is claimed by ``process_loop`` immediately before its agent turn, not
+        here, so a process crash between drain and turn cannot lose the event.
         """
         from tools.process_registry import process_registry
-        from tools.async_delegation import (
-            claim_event_delivery,
-            complete_event_delivery,
-        )
-
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
-            if claim is None:
-                continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            self._pending_input.put(
+                _ProcessNotificationInput(synthetic_message, event, consumer)
+            )
+
+    @staticmethod
+    def _requeue_process_notification_if_pending(
+        notification: _ProcessNotificationInput,
+    ) -> None:
+        """Release a failed claim and preserve only a still-live event."""
+        from tools.async_delegation import (
+            DELIVERY_BUSY_PENDING,
+            DELIVERY_TERMINAL_CONSUMED,
+            inspect_event_delivery_state,
+            release_event_delivery,
+        )
+        from tools.process_registry import process_registry
+
+        if notification.claim_id:
+            try:
+                release_event_delivery(
+                    notification.event, notification.claim_id
+                )
+            except Exception:
+                logger.warning(
+                    "CLI notification delivery release failed",
+                    exc_info=True,
+                )
+        try:
+            state = inspect_event_delivery_state(notification.event)
+        except Exception:
+            # A state-store read failure is not proof that another consumer
+            # terminally accepted the event. Preserve it for a later pass.
+            logger.warning(
+                "CLI notification delivery state inspection failed",
+                exc_info=True,
+            )
+            state = DELIVERY_BUSY_PENDING
+        # Terminal is the only positive proof that retry would duplicate an
+        # already-consumed event. A failure while classifying a legacy event
+        # has not run its turn, so it remains retryable too.
+        if state != DELIVERY_TERMINAL_CONSUMED:
+            process_registry.completion_queue.put(notification.event)
+
+    def _claim_process_notification(
+        self, notification: _ProcessNotificationInput
+    ) -> bool:
+        """Claim immediately before the synthetic turn becomes visible."""
+        from tools.async_delegation import (
+            DELIVERY_BUSY_PENDING,
+            DELIVERY_CLAIMED,
+            DELIVERY_LEGACY_NON_DURABLE,
+            DELIVERY_TERMINAL_CONSUMED,
+            claim_event_delivery_state,
+        )
+        from tools.process_registry import process_registry
+
+        try:
+            result = claim_event_delivery_state(
+                notification.event, notification.consumer
+            )
+        except Exception:
+            logger.warning(
+                "CLI notification delivery claim failed",
+                exc_info=True,
+            )
+            self._requeue_process_notification_if_pending(notification)
+            return False
+        if result.state == DELIVERY_BUSY_PENDING:
+            process_registry.completion_queue.put(notification.event)
+            return False
+        if result.state == DELIVERY_TERMINAL_CONSUMED:
+            return False
+        if result.state == DELIVERY_LEGACY_NON_DURABLE:
+            notification.durable = False
+            return True
+        if result.state != DELIVERY_CLAIMED or not result.claim_id:
+            self._requeue_process_notification_if_pending(notification)
+            return False
+        notification.claim_id = result.claim_id
+        notification.durable = True
+        return True
+
+    def _settle_process_notification(
+        self,
+        notification: _ProcessNotificationInput,
+        succeeded: bool,
+    ) -> None:
+        """Acknowledge only a successful terminal turn; otherwise retry."""
+        if not notification.durable:
+            if not succeeded:
+                from tools.process_registry import process_registry
+
+                process_registry.completion_queue.put(notification.event)
+            return
+        acknowledged = False
+        if succeeded:
+            try:
+                from tools.async_delegation import complete_event_delivery
+
+                acknowledged = bool(
+                    complete_event_delivery(
+                        notification.event, notification.claim_id
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "CLI notification delivery completion failed",
+                    exc_info=True,
+                )
+        if not acknowledged:
+            self._requeue_process_notification_if_pending(notification)
+
+    @staticmethod
+    def _process_notification_turn_succeeded(result: Any) -> bool:
+        """Return whether an agent result is safe to acknowledge durably."""
+        return bool(
+            isinstance(result, dict)
+            and result.get("completed") is True
+            and not result.get("interrupted")
+            and not result.get("error")
+            and not result.get("failed")
+            and not result.get("partial")
+        )
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -13333,6 +13467,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        # Notification delivery uses this stricter terminal outcome instead
+        # of treating any return value (including an error string) as success.
+        self._last_turn_succeeded = False
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -14124,6 +14261,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
                 self._pending_input.put(_leftover_steer)
 
+            self._last_turn_succeeded = (
+                self._process_notification_turn_succeeded(result)
+            )
             return response
             
         except Exception as e:
@@ -16777,6 +16917,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
+                notification_input = None
                 try:
                     # Check for pending input with timeout
                     try:
@@ -16792,6 +16933,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             except Exception:
                                 pass
                         continue
+
+                    if isinstance(user_input, _ProcessNotificationInput):
+                        notification_input = user_input
+                        if not self._claim_process_notification(
+                            notification_input
+                        ):
+                            notification_input = None
+                            continue
+                        user_input = notification_input.text
 
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
@@ -16902,8 +17052,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
+                        self._last_turn_succeeded = False
                         self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
                     finally:
+                        if notification_input is not None:
+                            notification_to_settle = notification_input
+                            notification_input = None
+                            try:
+                                self._settle_process_notification(
+                                    notification_to_settle,
+                                    bool(
+                                        getattr(
+                                            self,
+                                            "_last_turn_succeeded",
+                                            False,
+                                        )
+                                    ),
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "CLI notification settlement failed",
+                                    exc_info=True,
+                                )
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
@@ -16979,6 +17149,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 except Exception as e:
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
+                finally:
+                    if notification_input is not None:
+                        notification_to_settle = notification_input
+                        notification_input = None
+                        try:
+                            self._settle_process_notification(
+                                notification_to_settle, False
+                            )
+                        except Exception:
+                            logger.warning(
+                                "CLI notification rollback failed",
+                                exc_info=True,
+                            )
         
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)

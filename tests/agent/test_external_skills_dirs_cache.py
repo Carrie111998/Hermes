@@ -48,6 +48,38 @@ def hermes_home_with_config(tmp_path, monkeypatch):
 
 
 
+def test_cold_cache_retains_missing_configured_root(tmp_path, monkeypatch):
+    """Root availability must not erase the configured discovery scope."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    missing = tmp_path / "not-created-yet"
+    (home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {missing}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == [missing.resolve()]
+    assert get_external_skills_dirs() == [missing.resolve()]
+
+
+def test_cache_reuses_result_without_reparsing(hermes_home_with_config):
+    """Subsequent calls hit the cache and skip YAML parsing entirely."""
+    _home, _external, _cfg = hermes_home_with_config
+
+    # Prime cache
+    get_external_skills_dirs()
+
+    # Patch yaml_load to raise — if cache works, it's never called again.
+    with patch.object(
+        skill_utils,
+        "yaml_load",
+        side_effect=AssertionError("yaml_load should not run on cache hit"),
+    ):
+        # Many calls, none should trigger the patched yaml_load.
+        for _ in range(100):
+            get_external_skills_dirs()
 
 
 def test_cache_invalidates_on_mtime_change(hermes_home_with_config):

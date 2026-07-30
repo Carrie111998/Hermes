@@ -2,8 +2,11 @@
 
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,6 +21,7 @@ from tools.skills_tool import (
     skills_list,
     skill_view,
     MAX_DESCRIPTION_LENGTH,
+    MAX_LINKED_FILES_PER_CATEGORY,
 )
 
 
@@ -184,6 +188,64 @@ class TestFindAllSkills:
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "skill-a")
             _make_skill(tmp_path, "skill-b")
+            skills = _find_all_skills()
+        assert len(skills) == 2
+        names = {s["name"] for s in skills}
+        assert "skill-a" in names
+        assert "skill-b" in names
+
+    def test_empty_directory(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skills = _find_all_skills()
+        assert skills == []
+
+    @pytest.mark.parametrize(
+        "broken",
+        (
+            "---\nname: steals-valid\n# no closing fence\n",
+            "---\n- steals-valid\n---\n",
+        ),
+        ids=("unclosed-fence", "non-mapping-yaml"),
+    )
+    def test_list_refuses_partial_catalog_for_invalid_fenced_skill(self, tmp_path, broken):
+        _make_skill(tmp_path, "valid")
+        corrupt = _make_skill(tmp_path, "corrupt") / "SKILL.md"
+        corrupt.write_text(broken, encoding="utf-8")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(skills_list())
+
+        assert result["success"] is True
+        assert result["skills"] == []
+
+    def test_list_and_view_reject_canonical_skill_symlink(self, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text(
+            "---\nname: escaped\ndescription: outside\n---\n", encoding="utf-8"
+        )
+        skill_dir = tmp_path / "escaped"
+        skill_dir.mkdir()
+        try:
+            (skill_dir / "SKILL.md").symlink_to(outside)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            listed = json.loads(skills_list())
+            viewed = json.loads(skill_view("escaped"))
+
+        assert listed["success"] is True
+        assert listed["skills"] == []
+        assert viewed["success"] is False
+        assert viewed.get("error_code") == "skills_discovery_incomplete"
+
+    def test_nonexistent_directory(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "nope"):
+            skills = _find_all_skills()
+        assert skills == []
+
+    def test_categorized_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "axolotl", category="mlops")
 
             # .git internals are not skills.
@@ -214,8 +276,8 @@ class TestFindAllSkills:
 
             skills = _find_all_skills()
 
-        assert {s["name"] for s in skills} == {"skill-a", "skill-b", "axolotl"}
-        assert [s["category"] for s in skills if s["name"] == "axolotl"] == ["mlops"]
+        assert {s["name"] for s in skills} == {"axolotl"}
+        assert skills[0]["category"] == "mlops"
 
 
     def test_description_falls_back_to_body_and_is_truncated(self, tmp_path):
@@ -251,6 +313,134 @@ class TestFindAllSkills:
         assert [s["name"] for s in skills] == ["knowledge-brain"]
         assert skills[0]["category"] == "linked"
 
+    def test_cache_invalidates_when_kanban_environment_changes(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "tools.kanban_tools._profile_has_kanban_toolset",
+                return_value=False,
+            ),
+        ):
+            _make_skill(
+                tmp_path,
+                "kanban-only",
+                frontmatter_extra="environments: [kanban]\n",
+            )
+            skills_tool_module._SKILLS_CACHE.clear()
+            assert _find_all_skills() == []
+
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+            assert [s["name"] for s in _find_all_skills()] == ["kanban-only"]
+
+            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+            assert _find_all_skills() == []
+
+    def test_read_error_returns_same_scope_last_good_not_partial(
+        self, tmp_path, monkeypatch
+    ):
+        """A selected file can fail after walk; retain its same-root catalog."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skills_tool_module._SKILLS_CACHE.clear()
+            _make_skill(tmp_path, "good")
+            assert [s["name"] for s in _find_all_skills()] == ["good"]
+
+            bad_file = _make_skill(tmp_path, "bad") / "SKILL.md"
+            original_reader = skills_tool_module.read_strict_skill_index_file
+
+            def fail_only_bad_file(path, *args, **kwargs):
+                if path == bad_file:
+                    raise OSError("simulated file read denial")
+                return original_reader(path, *args, **kwargs)
+
+            monkeypatch.setattr(
+                skills_tool_module, "read_strict_skill_index_file", fail_only_bad_file
+            )
+            monkeypatch.setattr(skills_tool_module, "_SKILLS_CACHE_TTL_SECONDS", 0)
+            assert [s["name"] for s in _find_all_skills()] == ["good"]
+
+    def test_stat_error_does_not_commit_partial_catalog(self, tmp_path, monkeypatch):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skills_tool_module._SKILLS_CACHE.clear()
+            _make_skill(tmp_path, "good")
+            assert [s["name"] for s in _find_all_skills()] == ["good"]
+
+            bad_file = _make_skill(tmp_path, "bad") / "SKILL.md"
+            original_reader = skills_tool_module.read_strict_skill_index_file
+
+            def fail_only_bad_file(path, *args, **kwargs):
+                if path == bad_file:
+                    raise OSError("simulated file stat denial")
+                return original_reader(path, *args, **kwargs)
+
+            monkeypatch.setattr(
+                skills_tool_module, "read_strict_skill_index_file", fail_only_bad_file
+            )
+            monkeypatch.setattr(skills_tool_module, "_SKILLS_CACHE_TTL_SECONDS", 0)
+            assert [s["name"] for s in _find_all_skills()] == ["good"]
+
+    def test_walk_error_does_not_leak_another_scope_cache(self, tmp_path, monkeypatch):
+        first_root = tmp_path / "first"
+        second_root = tmp_path / "second"
+        first_root.mkdir()
+        second_root.mkdir()
+        with patch("tools.skills_tool.SKILLS_DIR", first_root):
+            skills_tool_module._SKILLS_CACHE.clear()
+            _make_skill(first_root, "first-only")
+            assert [s["name"] for s in _find_all_skills()] == ["first-only"]
+
+        def denied_walk(*_args, **kwargs):
+            kwargs["onerror"](OSError("simulated walk denial"))
+            return []
+
+        with patch("tools.skills_tool.SKILLS_DIR", second_root):
+            monkeypatch.setattr("agent.skill_utils.os.walk", denied_walk)
+            assert _find_all_skills() == []
+
+    def test_active_root_stat_error_does_not_cache_external_only_result(
+        self, tmp_path, monkeypatch
+    ):
+        """An unreadable local root is not equivalent to an empty local root."""
+        active_root = tmp_path / "active"
+        external_root = tmp_path / "external"
+        active_root.mkdir()
+        external_root.mkdir()
+        _make_skill(active_root, "local-skill")
+        _make_skill(external_root, "external-skill")
+        original_stat = Path.stat
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", active_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            assert sorted(s["name"] for s in _find_all_skills()) == [
+                "external-skill",
+                "local-skill",
+            ]
+            monkeypatch.setattr(
+                skills_tool_module, "_SKILLS_CACHE_TTL_SECONDS", 0
+            )
+
+            def fail_only_active_root(path, *args, **kwargs):
+                if path == active_root:
+                    raise PermissionError("simulated active-root denial")
+                return original_stat(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "stat", fail_only_active_root)
+            # The same full-scope last-good catalog is retained; the scan must
+            # not replace it with the external-only subset.
+            assert sorted(s["name"] for s in _find_all_skills()) == [
+                "external-skill",
+                "local-skill",
+            ]
+
 
 # ---------------------------------------------------------------------------
 # skills_list
@@ -266,6 +456,39 @@ class TestSkillsList:
         assert result["success"] is True
         assert result["skills"] == []
         assert skills_dir.exists()
+
+    @pytest.mark.parametrize("root_kind", ["missing", "file"])
+    def test_invalid_configured_external_root_returns_structured_error(
+        self, tmp_path, root_kind
+    ):
+        skills_dir = tmp_path / "skills"
+        _make_skill(skills_dir, "local-only")
+        external_root = tmp_path / "configured-external"
+        if root_kind == "file":
+            external_root.write_text("not a directory", encoding="utf-8")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_root],
+            ),
+        ):
+            skills_tool_module._SKILLS_CACHE.clear()
+            result = json.loads(skills_list())
+
+        assert result["success"] is False
+        assert result["error_code"] == "skills_discovery_incomplete"
+        assert "local-only" not in json.dumps(result)
+        assert skills_tool_module._SKILLS_CACHE == {}
+
+    def test_lists_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "alpha")
+            _make_skill(tmp_path, "beta")
+            raw = skills_list()
+        result = json.loads(raw)
+        assert result["count"] == 2
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -304,6 +527,99 @@ class TestSkillsList:
 class TestSkillView:
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            raw = skill_view("my-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "my-skill"
+        assert "Step 1" in result["content"]
+
+    def test_missing_configured_external_root_blocks_ambiguous_local_lookup(
+        self, tmp_path
+    ):
+        local_root = tmp_path / "skills"
+        missing_external = tmp_path / "configured-external"
+        _make_skill(local_root, "possibly-colliding")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[missing_external],
+            ),
+        ):
+            result = json.loads(skill_view("possibly-colliding"))
+
+        assert result["success"] is False
+        assert result["error_code"] == "skills_discovery_incomplete"
+        assert "Step 1" not in json.dumps(result)
+
+    def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
+        # The on-disk directory ("alias-dir") differs from the skill's
+        # frontmatter name ("real-skill-name"). skills_list() exposes the
+        # frontmatter name, so skill_view(name) must resolve it too.
+        skill_dir = tmp_path / "alias-dir"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: real-skill-name\n"
+            "description: A skill whose directory name differs from its name.\n"
+            "---\n\n"
+            "# real-skill-name\n\n"
+            "Step 1: Do the thing.\n"
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_view("real-skill-name")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "Step 1" in result["content"]
+
+    def test_frontmatter_like_body_prefix_is_not_treated_as_a_fence(self, tmp_path):
+        skill_dir = tmp_path / "plain-body"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---not-a-fence\n\nKeep this as ordinary body text.\n",
+            encoding="utf-8",
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            result = json.loads(skill_view("plain-body"))
+
+        assert result["success"] is True
+        assert "---not-a-fence" in result["content"]
+
+    def test_skill_view_applies_template_vars(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={"template_vars": True, "inline_shell": False},
+            ),
+        ):
+            skill_dir = _make_skill(
+                tmp_path,
+                "templated",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh in ${HERMES_SESSION_ID}",
+            )
+            raw = skill_view("templated", task_id="session-123")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert f"Run {skill_dir}/scripts/do.sh in session-123" in result["content"]
+        assert "${HERMES_SKILL_DIR}" not in result["content"]
+
+    def test_skill_view_applies_inline_shell_when_enabled(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={
+                    "template_vars": True,
+                    "inline_shell": True,
+                    "inline_shell_timeout": 5,
+                },
+            ),
+        ):
             _make_skill(
                 tmp_path,
                 "my-skill",
@@ -333,6 +649,234 @@ class TestSkillView:
 
         assert by_name["success"] is True
         assert "Step 1" in by_name["content"]
+    def test_inline_shell_cwd_remains_bound_across_category_symlink_swap(
+        self, tmp_path, monkeypatch
+    ):
+        skills_root = tmp_path / "skills"
+        packages = tmp_path / "packages"
+        original_category = packages / "original"
+        replacement_category = packages / "replacement"
+        skills_root.mkdir()
+        original_skill = _make_skill(
+            original_category,
+            "dynamic",
+            body="Marker: !`cat marker.txt`",
+        )
+        replacement_skill = replacement_category / "dynamic"
+        replacement_skill.mkdir(parents=True)
+        os.link(
+            original_skill / "SKILL.md",
+            replacement_skill / "SKILL.md",
+        )
+        (original_skill / "marker.txt").write_text("ORIGINAL", encoding="utf-8")
+        (replacement_skill / "marker.txt").write_text(
+            "REPLACEMENT", encoding="utf-8"
+        )
+        category_link = skills_root / "linked"
+        category_link.symlink_to(original_category, target_is_directory=True)
+        swapped = False
+
+        def swap_while_loading_config():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                category_link.unlink()
+                category_link.symlink_to(
+                    replacement_category, target_is_directory=True
+                )
+            return {
+                "template_vars": True,
+                "inline_shell": True,
+                "inline_shell_timeout": 5,
+            }
+
+        monkeypatch.setattr(
+            "agent.skill_preprocessing.load_skills_config",
+            swap_while_loading_config,
+        )
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[],
+            ),
+        ):
+            result = json.loads(skill_view("dynamic"))
+
+        assert swapped is True
+        assert result["success"] is True
+        assert "Marker: ORIGINAL" in result["content"]
+        assert "REPLACEMENT" not in result["content"]
+
+    def test_windows_inline_shell_rewrites_only_commands_to_bound_snapshot(
+        self, tmp_path
+    ):
+        from tools import skills_tool
+        from tools import nt_secure_fs_optional as nt_secure_fs
+
+        original = Path("C:/skills/dynamic")
+        handle = MagicMock()
+        handle.final_path.return_value = original
+        content = (
+            "Visible path: ${HERMES_SKILL_DIR}\n"
+            "Marker: !`cat ${HERMES_SKILL_DIR}/marker.txt`"
+        )
+
+        def materialize(_handle, destination):
+            assert str(destination).replace("\\", "/").endswith(
+                "C:/Temp/inline/skill"
+            )
+
+        def expand(bound_content, cwd, timeout):
+            assert timeout == 5
+            assert str(original) in bound_content.splitlines()[0]
+            command = bound_content.split("!`", 1)[1].split("`", 1)[0]
+            assert str(original) not in command
+            assert "\\" not in command
+            assert "C:/Temp/inline/skill" in command
+            return bound_content.replace(f"!`{command}`", "ORIGINAL")
+
+        with (
+            patch.object(
+                skills_tool, "os", SimpleNamespace(name="nt")
+            ),
+            patch(
+                "tools.skills_tool.tempfile.TemporaryDirectory"
+            ) as temp_dir,
+            patch.object(
+                nt_secure_fs,
+                "copy_tree_no_reparse",
+                side_effect=materialize,
+            ),
+            patch(
+                "agent.skill_preprocessing.expand_inline_shell",
+                side_effect=expand,
+            ),
+        ):
+            temp_dir.return_value.__enter__.return_value = (
+                r"C:\Temp\inline"
+            )
+            temp_dir.return_value.__exit__.return_value = False
+            result = skills_tool._expand_inline_shell_bound(
+                content,
+                handle,
+                5,
+                skill_dir=original,
+            )
+
+        assert f"Visible path: {original}" in result
+        assert "Marker: ORIGINAL" in result
+
+    def test_posix_inline_shell_template_path_stays_on_held_package(
+        self, tmp_path
+    ):
+        from tools import skills_tool
+
+        package_path = tmp_path / "dynamic"
+        package_path.mkdir()
+        (package_path / "marker.txt").write_text(
+            "ORIGINAL", encoding="utf-8"
+        )
+        package_fd = os.open(
+            package_path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        moved_path = tmp_path / "moved"
+        package_path.rename(moved_path)
+        package_path.mkdir()
+        (package_path / "marker.txt").write_text(
+            "REPLACEMENT", encoding="utf-8"
+        )
+        try:
+            result = skills_tool._expand_inline_shell_bound(
+                (
+                    "Visible: ${HERMES_SKILL_DIR}\n"
+                    f"Marker: !`cd {package_path} && "
+                    "cat marker.txt`"
+                ),
+                package_fd,
+                5,
+                skill_dir=package_path,
+            )
+        finally:
+            os.close(package_fd)
+
+        assert f"Visible: {package_path}" in result
+        assert "Marker: ORIGINAL" in result
+        assert "REPLACEMENT" not in result
+
+    def test_inline_shell_template_path_with_spaces_is_shell_safe(
+        self, tmp_path, monkeypatch
+    ):
+        from tools import skills_tool
+
+        package_path = tmp_path / "dynamic"
+        package_path.mkdir()
+        (package_path / "marker.txt").write_text(
+            "ORIGINAL", encoding="utf-8"
+        )
+        temp_base = tmp_path / "snapshot base with spaces"
+        temp_base.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_base))
+        package_fd = os.open(
+            package_path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            result = skills_tool._expand_inline_shell_bound(
+                (
+                    "Marker: "
+                    "!`cat ${HERMES_SKILL_DIR}/marker.txt`"
+                ),
+                package_fd,
+                5,
+                skill_dir=package_path,
+            )
+        finally:
+            os.close(package_fd)
+
+        assert result == "Marker: ORIGINAL"
+
+    def test_inline_shell_literal_path_with_spaces_is_shell_safe(
+        self, tmp_path, monkeypatch
+    ):
+        from tools import skills_tool
+
+        package_path = tmp_path / "dynamic"
+        package_path.mkdir()
+        (package_path / "marker.txt").write_text(
+            "ORIGINAL", encoding="utf-8"
+        )
+        temp_base = tmp_path / "snapshot base with spaces"
+        temp_base.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_base))
+        package_fd = os.open(
+            package_path,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            result = skills_tool._expand_inline_shell_bound(
+                (
+                    f"Marker: !`cd {package_path} && "
+                    "cat marker.txt`"
+                ),
+                package_fd,
+                5,
+                skill_dir=package_path,
+            )
+        finally:
+            os.close(package_fd)
+
+        assert result == "Marker: ORIGINAL"
+
+    def test_view_nonexistent_skill(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "other-skill")
+            raw = skill_view("nonexistent")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "not found" in result["error"].lower()
+        assert "available_skills" in result
 
 
     def test_view_reference_files(self, tmp_path):
@@ -343,17 +887,239 @@ class TestSkillView:
             (refs_dir / "api.md").write_text("# API Docs\nEndpoint info.")
 
             existing = json.loads(skill_view("my-skill", file_path="references/api.md"))
-            missing = json.loads(skill_view("my-skill", file_path="references/nope.md"))
             skill = json.loads(skill_view("my-skill"))
 
         assert existing["success"] is True
         assert "Endpoint info" in existing["content"]
-        assert missing["success"] is False
         # The skill view advertises what else can be opened.
         assert skill["linked_files"] is not None
         assert "references" in skill["linked_files"]
 
+    def test_view_nonexistent_file(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "my-skill")
+            refs_dir = skill_dir / "references"
+            refs_dir.mkdir()
+            for index in reversed(range(MAX_LINKED_FILES_PER_CATEGORY + 5)):
+                (refs_dir / f"{index:03d}.md").write_text("reference")
+            raw = skill_view("my-skill", file_path="references/nope.md")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert (
+            len(result["available_files"]["references"])
+            == MAX_LINKED_FILES_PER_CATEGORY
+        )
+        assert result["available_files"]["references"] == sorted(
+            result["available_files"]["references"]
+        )
+        assert result["linked_files_summary"]["truncated"] is True
+
     def test_disabled_skill_blocked_enabled_allowed(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", return_value=True),
+        ):
+            _make_skill(tmp_path, "hidden-skill")
+            blocked = json.loads(skill_view("hidden-skill"))
+        assert blocked["success"] is False
+        assert "disabled" in blocked["error"].lower()
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("tools.skills_tool._is_skill_disabled", return_value=False),
+        ):
+            _make_skill(tmp_path, "active-skill")
+            allowed = json.loads(skill_view("active-skill"))
+        assert allowed["success"] is True
+
+    def test_view_bounds_and_sorts_linked_file_preview(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "many-assets")
+            assets_dir = skill_dir / "assets"
+            assets_dir.mkdir()
+            for index in reversed(range(MAX_LINKED_FILES_PER_CATEGORY + 5)):
+                (assets_dir / f"{index:03d}.txt").write_text("asset")
+            raw = skill_view("many-assets")
+
+        result = json.loads(raw)
+        shown = result["linked_files"]["assets"]
+        summary = result["linked_files_summary"]
+        assert len(shown) == MAX_LINKED_FILES_PER_CATEGORY
+        assert shown == sorted(shown)
+        assert summary["truncated"] is True
+        assert summary["truncated_categories"] == ["assets"]
+
+        # A file outside the preview remains explicitly readable.
+        omitted = f"assets/{MAX_LINKED_FILES_PER_CATEGORY + 4:03d}.txt"
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            explicit = json.loads(skill_view("many-assets", file_path=omitted))
+        assert explicit["success"] is True
+        assert explicit["content"] == "asset"
+
+    def test_view_does_not_follow_linked_file_category_symlink(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "private.txt").write_text("outside", encoding="utf-8")
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "linked-assets")
+            try:
+                (skill_dir / "assets").symlink_to(
+                    outside, target_is_directory=True
+                )
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip(f"symlinks unavailable: {exc}")
+            raw = skill_view("linked-assets")
+
+        result = json.loads(raw)
+        assert not result["linked_files"]
+        assert result["linked_files_summary"]["shown"] == 0
+
+    def test_support_file_read_remains_bound_across_category_symlink_swap(
+        self, tmp_path, monkeypatch
+    ):
+        skills_root = tmp_path / "skills"
+        packages = tmp_path / "packages"
+        original_category = packages / "original"
+        replacement_category = packages / "replacement"
+        skills_root.mkdir()
+        original_skill = _make_skill(original_category, "bound-support")
+        replacement_skill = replacement_category / "bound-support"
+        replacement_skill.mkdir(parents=True)
+        os.link(
+            original_skill / "SKILL.md",
+            replacement_skill / "SKILL.md",
+        )
+        for skill_dir, value in (
+            (original_skill, "ORIGINAL SUPPORT"),
+            (replacement_skill, "REPLACEMENT SUPPORT"),
+        ):
+            (skill_dir / "assets").mkdir()
+            (skill_dir / "assets" / "value.txt").write_text(
+                value, encoding="utf-8"
+            )
+        category_link = skills_root / "linked"
+        category_link.symlink_to(original_category, target_is_directory=True)
+        real_path_read_text = Path.read_text
+        real_os_open = os.open
+        swapped = False
+
+        def swap_package():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                category_link.unlink()
+                category_link.symlink_to(
+                    replacement_category, target_is_directory=True
+                )
+
+        def swap_before_legacy_read(path, *args, **kwargs):
+            if path.name == "value.txt":
+                swap_package()
+            return real_path_read_text(path, *args, **kwargs)
+
+        def swap_during_bound_open(path, *args, **kwargs):
+            if path == "assets" and kwargs.get("dir_fd") is not None:
+                swap_package()
+            return real_os_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", swap_before_legacy_read)
+        monkeypatch.setattr(os, "open", swap_during_bound_open)
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[],
+            ),
+        ):
+            result = json.loads(
+                skill_view("bound-support", file_path="assets/value.txt")
+            )
+
+        assert swapped is True
+        assert result["success"] is True
+        assert result["content"] == "ORIGINAL SUPPORT"
+
+    def test_linked_manifest_remains_bound_across_category_symlink_swap(
+        self, tmp_path, monkeypatch
+    ):
+        skills_root = tmp_path / "skills"
+        packages = tmp_path / "packages"
+        original_category = packages / "original"
+        replacement_category = packages / "replacement"
+        skills_root.mkdir()
+        original_skill = _make_skill(original_category, "bound-manifest")
+        replacement_skill = replacement_category / "bound-manifest"
+        replacement_skill.mkdir(parents=True)
+        os.link(
+            original_skill / "SKILL.md",
+            replacement_skill / "SKILL.md",
+        )
+        (original_skill / "assets").mkdir()
+        (original_skill / "assets" / "original.txt").write_text("original")
+        (replacement_skill / "assets").mkdir()
+        (replacement_skill / "assets" / "replacement.txt").write_text(
+            "replacement"
+        )
+        category_link = skills_root / "linked"
+        category_link.symlink_to(original_category, target_is_directory=True)
+        real_walk = os.walk
+        real_scandir = os.scandir
+        swapped = False
+
+        def swap_package():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                category_link.unlink()
+                category_link.symlink_to(
+                    replacement_category, target_is_directory=True
+                )
+
+        def swap_before_legacy_walk(*args, **kwargs):
+            if str(args[0]).endswith("/assets"):
+                swap_package()
+            return real_walk(*args, **kwargs)
+
+        def swap_during_bound_scan(path):
+            if isinstance(path, int):
+                swap_package()
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "walk", swap_before_legacy_walk)
+        monkeypatch.setattr(os, "scandir", swap_during_bound_scan)
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[],
+            ),
+        ):
+            result = json.loads(skill_view("bound-manifest"))
+
+        assert swapped is True
+        assert result["success"] is True
+        assert result["linked_files"]["assets"] == ["assets/original.txt"]
+
+    def test_view_tags_from_metadata(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "tagged",
+                frontmatter_extra="metadata:\n  hermes:\n    tags: [fine-tuning, llm]\n",
+            )
+            raw = skill_view("tagged")
+        result = json.loads(raw)
+        assert "fine-tuning" in result["tags"]
+        assert "llm" in result["tags"]
+
+    def test_view_nonexistent_skills_dir(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "nope"):
+            raw = skill_view("anything")
+        result = json.loads(raw)
+        assert result["success"] is False
+
+    def test_view_disabled_skill_blocked(self, tmp_path):
+        """Disabled skills should not be viewable via skill_view."""
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("tools.skills_tool._is_skill_disabled", return_value=True),
@@ -388,6 +1154,48 @@ class TestSkillView:
 
 
 class TestSkillViewSecureSetupOnLoad:
+    def test_context_secret_callbacks_do_not_cross_concurrent_turns(self, monkeypatch):
+        """Two gateway turns retain their own secure-prompt destination."""
+        monkeypatch.setattr(skills_tool_module, "_secret_capture_callback", None)
+        a_entered = threading.Event()
+        b_entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def run(label, name, entered, other_entered):
+            def callback(var_name, _prompt, _metadata=None):
+                calls.append((label, var_name))
+                entered.set()
+                assert other_entered.wait(timeout=2)
+                assert release.wait(timeout=2)
+                return {
+                    "success": True,
+                    "stored_as": var_name,
+                    "validated": False,
+                    "skipped": False,
+                }
+
+            token = skills_tool_module.set_secret_capture_callback_context(callback)
+            try:
+                skills_tool_module._capture_required_environment_variables(
+                    label,
+                    [{"name": name, "prompt": f"prompt for {label}"}],
+                )
+            finally:
+                skills_tool_module.reset_secret_capture_callback_context(token)
+
+        thread_a = threading.Thread(target=run, args=("A", "A_SECRET", a_entered, b_entered))
+        thread_b = threading.Thread(target=run, args=("B", "B_SECRET", b_entered, a_entered))
+        thread_a.start()
+        thread_b.start()
+        assert a_entered.wait(timeout=2)
+        assert b_entered.wait(timeout=2)
+        release.set()
+        thread_a.join(timeout=2)
+        thread_b.join(timeout=2)
+
+        assert sorted(calls) == [("A", "A_SECRET"), ("B", "B_SECRET")]
+
     def test_requests_missing_required_env_and_continues(self, tmp_path, monkeypatch):
         monkeypatch.delenv("TENOR_API_KEY", raising=False)
         calls = []
@@ -727,6 +1535,18 @@ class TestSkillViewPrerequisites:
         assert result["missing_required_environment_variables"] == []
         assert "setup_note" not in result
 
+    def test_skill_view_surfaces_skill_read_errors(self, tmp_path, monkeypatch):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "broken-skill")
+            skill_md = tmp_path / "broken-skill" / "SKILL.md"
+            skill_md.write_bytes(b"\xff")
+            raw = skill_view("broken-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["error_code"] == "skills_discovery_incomplete"
+        assert "partial" in result["error"].lower()
+        assert "invalid start byte" in result["detail"]
 
     def test_legacy_flat_md_skill_preserves_frontmatter_metadata(self, tmp_path):
         flat_skill = tmp_path / "legacy-skill.md"
@@ -923,3 +1743,220 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is False
         assert "Ambiguous" in result["error"]
         assert len(result["matches"]) == 2
+
+    def test_local_only_skill_loads_normally(self, tmp_path):
+        """Sanity: a single local skill (no external collision) loads
+        without any error."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(
+            local_dir,
+            "my-skill",
+            category="foundations/runtime",
+            body="LOCAL BODY",
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            raw = skill_view("my-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "LOCAL BODY" in result["content"]
+
+
+class TestSkillViewIncompleteExternalDiscovery:
+    """Accessible external roots must still be complete before local loading."""
+
+    def _patch_dirs(self, local_dir, external_dir):
+        return (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[external_dir],
+            ),
+        )
+
+    @staticmethod
+    def _assert_incomplete(raw):
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert result["error_code"] == "skills_discovery_incomplete"
+        assert "partial" in result["error"].lower()
+        return result
+
+    def test_corrupt_external_skill_frontmatter_refuses_local_candidate(self, tmp_path):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "local-only", body="LOCAL BODY")
+        corrupt = _make_skill(external_dir, "broken-external") / "SKILL.md"
+        corrupt.write_text("---\nname: [unterminated\n---\n", encoding="utf-8")
+        p1, p2 = self._patch_dirs(local_dir, external_dir)
+        with p1, p2:
+            result = self._assert_incomplete(skill_view("local-only"))
+
+        assert str(corrupt) in result["detail"]
+
+    @pytest.mark.parametrize(
+        "broken_frontmatter",
+        (
+            "---\nname: hidden-collision\n# missing closing fence\n",
+            "---\n- name: hidden-collision\n---\n\nBody.\n",
+        ),
+        ids=("unclosed-fence", "non-mapping-top-level"),
+    )
+    def test_structurally_invalid_external_frontmatter_refuses_local_candidate(
+        self, tmp_path, broken_frontmatter
+    ):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "local-only", body="LOCAL BODY")
+        broken = _make_skill(external_dir, "broken-external") / "SKILL.md"
+        broken.write_text(broken_frontmatter, encoding="utf-8")
+
+        p1, p2 = self._patch_dirs(local_dir, external_dir)
+        with p1, p2:
+            result = self._assert_incomplete(skill_view("local-only"))
+
+        assert str(broken) in result["detail"]
+
+    def test_invalid_unrelated_markdown_and_support_package_do_not_block(
+        self, tmp_path
+    ):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "local-only", body="LOCAL BODY")
+        unrelated = external_dir / "notes" / "unrelated.md"
+        unrelated.parent.mkdir()
+        unrelated.write_text("---\n- not-a-skill\n---\n", encoding="utf-8")
+        umbrella = _make_skill(external_dir, "umbrella")
+        support_package = umbrella / "references" / "preserved" / "SKILL.md"
+        support_package.parent.mkdir(parents=True)
+        support_package.write_text(
+            "---\nname: never-closed\n", encoding="utf-8"
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, external_dir)
+        with p1, p2:
+            result = json.loads(skill_view("local-only"))
+
+        assert result["success"] is True
+        assert "LOCAL BODY" in result["content"]
+
+    def test_symlinked_skill_root_swap_cannot_change_discovered_canonical_file(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "local"
+        linked_parent = tmp_path / "linked-packages"
+        original_category = linked_parent / "original"
+        replacement_category = linked_parent / "replacement"
+        local_dir.mkdir()
+        original_category.mkdir(parents=True)
+        replacement_category.mkdir(parents=True)
+        original_skill = _make_skill(
+            original_category, "linked-skill", body="ORIGINAL BODY"
+        )
+        replacement_skill = replacement_category / "linked-skill"
+        replacement_skill.mkdir()
+        try:
+            os.link(
+                original_skill / "SKILL.md",
+                replacement_skill / "SKILL.md",
+            )
+        except OSError as exc:
+            pytest.skip(f"hard links unavailable in test environment: {exc}")
+        (replacement_skill / "assets").mkdir()
+        (replacement_skill / "assets" / "swapped.txt").write_text(
+            "SWAPPED PACKAGE", encoding="utf-8"
+        )
+        category_link = local_dir / "linked"
+        try:
+            category_link.symlink_to(original_category, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        real_parse = skills_tool_module._parse_frontmatter
+        swapped = False
+
+        def swap_after_discovery(content):
+            nonlocal swapped
+            result = real_parse(content)
+            if not swapped and "ORIGINAL BODY" in content:
+                swapped = True
+                category_link.unlink()
+                category_link.symlink_to(
+                    replacement_category, target_is_directory=True
+                )
+            return result
+
+        monkeypatch.setattr(
+            skills_tool_module, "_parse_frontmatter", swap_after_discovery
+        )
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch(
+                "agent.skill_utils.get_external_skills_dirs",
+                return_value=[],
+            ),
+        ):
+            result = self._assert_incomplete(skill_view("linked-skill"))
+
+        assert swapped is True
+        assert "changed during discovery" in result["detail"]
+
+    def test_unreadable_external_skill_refuses_local_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "local-only", body="LOCAL BODY")
+        unreadable = _make_skill(external_dir, "unreadable-external") / "SKILL.md"
+        real_open = os.open
+
+        def reject_external_open(path, *args, **kwargs):
+            if Path(path) == unreadable:
+                raise PermissionError("external SKILL.md is unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", reject_external_open)
+        p1, p2 = self._patch_dirs(local_dir, external_dir)
+        with p1, p2:
+            result = self._assert_incomplete(skill_view("local-only"))
+
+        assert "unreadable" in result["detail"]
+
+    def test_external_subtree_traversal_error_refuses_local_candidate(
+        self, tmp_path, monkeypatch
+    ):
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+        _make_skill(local_dir, "local-only", body="LOCAL BODY")
+
+        from agent.skill_utils import iter_skill_index_files as real_iter_skill_index_files
+
+        def traversal_error_iterator(root, filename, *, on_error=None):
+            if root == external_dir and on_error is not None:
+                on_error(PermissionError("cannot traverse external subtree"))
+            yield from real_iter_skill_index_files(root, filename, on_error=on_error)
+
+        monkeypatch.setattr(
+            "agent.skill_utils.iter_skill_index_files", traversal_error_iterator
+        )
+        p1, p2 = self._patch_dirs(local_dir, external_dir)
+        with p1, p2:
+            result = self._assert_incomplete(skill_view("local-only"))
+
+        assert "cannot traverse external subtree" in result["detail"]

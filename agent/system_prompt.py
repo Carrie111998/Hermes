@@ -318,10 +318,28 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        _prompt_index_mode = "full"
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            _skills_cfg = (load_config_readonly().get("skills") or {})
+            _configured_mode = str(
+                _skills_cfg.get("prompt_index_mode", "full") or "full"
+            ).strip().lower()
+            if _configured_mode in {"full", "category_compact"}:
+                _prompt_index_mode = _configured_mode
+            else:
+                logger.warning(
+                    "Unknown skills.prompt_index_mode=%r; using full",
+                    _configured_mode,
+                )
+        except Exception:
+            pass
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            prompt_index_mode=_prompt_index_mode,
         )
     else:
         skills_prompt = ""

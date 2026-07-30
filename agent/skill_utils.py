@@ -8,9 +8,10 @@ tool registration or provider resolution.
 import logging
 import os
 import re
+import stat
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -220,6 +221,99 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     return frontmatter, body
 
 
+def parse_strict_fenced_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
+    """Parse canonical fenced YAML frontmatter without the legacy fallback.
+
+    Active skill discovery treats a leading, exact ``---`` fence as a
+    declaration boundary.  Such a fence must close and contain a YAML mapping;
+    otherwise a malformed skill could silently claim a directory-derived name
+    and shadow a legitimate package in another root.  Markdown with no exact
+    opening fence remains a supported legacy skill and returns empty metadata.
+
+    ``parse_frontmatter`` intentionally keeps a permissive key/value fallback
+    for compatibility in non-discovery consumers.  Do not use it to decide
+    whether a filesystem entry is an active skill.
+    """
+    if content.startswith("\ufeff"):
+        content = content[1:]
+
+    opening = re.match(r"---[ \t]*\r?\n", content)
+    if opening is None:
+        return {}, content
+
+    remainder = content[opening.end():]
+    closing = re.search(r"\r?\n---[ \t]*(?:\r?\n|$)", remainder)
+    if closing is None:
+        raise ValueError("frontmatter fence is not closed")
+
+    parsed = yaml_load(remainder[:closing.start()])
+    if not isinstance(parsed, dict):
+        raise ValueError("frontmatter is not a mapping")
+    return parsed, remainder[closing.end():]
+
+
+def read_strict_skill_index_file(skill_file: Path) -> Tuple[str, Dict[str, Any], str]:
+    """Open one canonical SKILL.md without following an entry-file symlink.
+
+    Discovery may traverse configured category symlinks, but the canonical
+    entry file itself must be a regular file in the selected package.  Opening
+    it with ``O_NOFOLLOW`` prevents an attacker from redirecting only
+    ``SKILL.md`` outside that package after the directory has been accepted.
+    """
+    if os.name == "nt":
+        from tools.nt_secure_fs_optional import open_directory, read_regular_file
+
+        # Configured roots and category links are an existing compatibility
+        # feature. Resolve that package alias once, then bind the resulting
+        # physical directory with the NT no-reparse open; the canonical file
+        # itself is still opened handle-relative and can never be a symlink.
+        package_path = skill_file.parent.resolve(strict=True)
+        with open_directory(package_path, writable=False) as package:
+            payload, _metadata = read_regular_file(package, skill_file.name)
+        content = payload.decode("utf-8")
+        frontmatter, body = parse_strict_fenced_frontmatter(content)
+        return content, frontmatter, body
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("secure SKILL.md opens are unsupported on this platform")
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(skill_file, flags)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("SKILL.md is not a regular file")
+        chunks: List[bytes] = []
+        while True:
+            chunk = os.read(fd, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise RuntimeError("SKILL.md changed during discovery")
+    finally:
+        os.close(fd)
+
+    content = b"".join(chunks).decode("utf-8")
+    frontmatter, body = parse_strict_fenced_frontmatter(content)
+    return content, frontmatter, body
+
+
 # ── Platform matching ─────────────────────────────────────────────────────
 
 
@@ -280,7 +374,10 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
 # never need it — but it can ALWAYS still be loaded explicitly (``skill_view``,
 # ``--skills``), because an explicit request is explicit consent.
 #
-# Detection is cached for the process lifetime via ``_ENV_DETECT_CACHE``.
+# Container/supervisor detection is stable for the process lifetime and is
+# cached via ``_ENV_DETECT_CACHE``. Kanban relevance is intentionally dynamic:
+# a long-lived gateway can move between ordinary sessions, dispatcher workers,
+# and profiles with the kanban toolset without restarting.
 _KNOWN_ENVIRONMENTS = frozenset({"kanban", "docker", "s6"})
 
 _ENV_DETECT_CACHE: Dict[str, bool] = {}
@@ -289,10 +386,12 @@ _ENV_DETECT_CACHE: Dict[str, bool] = {}
 def _detect_environment(env: str) -> bool:
     """Return True when the named runtime environment is currently active.
 
-    Cached per process. Unknown env names return True (fail-open: never hide a
-    skill because of a tag we don't understand).
+    Stable process environments are cached. Kanban is evaluated on every call
+    because its env/profile signals can change in a long-lived process.
+    Unknown env names return True (fail-open: never hide a skill because of a
+    tag we don't understand).
     """
-    if env in _ENV_DETECT_CACHE:
+    if env != "kanban" and env in _ENV_DETECT_CACHE:
         return _ENV_DETECT_CACHE[env]
 
     result = True
@@ -328,8 +427,21 @@ def _detect_environment(env: str) -> bool:
             "/package/admin/s6-overlay"
         )
 
-    _ENV_DETECT_CACHE[env] = result
+    if env != "kanban":
+        _ENV_DETECT_CACHE[env] = result
     return result
+
+
+def get_skill_environment_fingerprint() -> Tuple[Tuple[str, bool], ...]:
+    """Return the current offer-time environment state for cache keys.
+
+    Discovery, slash-command, and system-prompt caches all filter skills via
+    :func:`skill_matches_environment`. Sharing one fingerprint keeps those
+    surfaces coherent when a process enters or leaves dynamic Kanban mode.
+    """
+    return tuple(
+        (env, _detect_environment(env)) for env in sorted(_KNOWN_ENVIRONMENTS)
+    )
 
 
 def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
@@ -377,43 +489,93 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 _RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
 
 
+class SkillsConfigError(RuntimeError):
+    """The configured skills scope could not be determined safely."""
+
+
 def _raw_config_cache_clear() -> None:
     """Test hook — drop the shared raw config cache."""
     _RAW_CONFIG_CACHE.clear()
 
 
-def _load_raw_config() -> Dict[str, Any]:
+def _stat_skills_config(
+    config_path: Path,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Stat config while distinguishing absence from a dangling path entry."""
+    try:
+        return config_path.stat(), None
+    except FileNotFoundError as exc:
+        # stat() follows symlinks, so a dangling config symlink raises the same
+        # exception as a genuinely absent path. lstat() preserves that
+        # distinction for strict mutation/collision callers.
+        try:
+            config_path.lstat()
+        except FileNotFoundError:
+            return None, None
+        except OSError as lstat_exc:
+            return (
+                None,
+                f"Could not inspect skills config {config_path}: {lstat_exc}",
+            )
+        return (
+            None,
+            f"Could not resolve skills config {config_path}: {exc}",
+        )
+    except OSError as exc:
+        return None, f"Could not stat skills config {config_path}: {exc}"
+
+
+def _load_raw_config_with_error(
+    *, use_cache: bool = True
+) -> Tuple[Dict[str, Any], Optional[str]]:
     """Read config.yaml with a shared mtime+size keyed cache.
 
     This module intentionally avoids importing ``hermes_cli.config`` on the
     skill prompt/build path. A tiny local cache gives the same repeated-read
     win without pulling the heavier CLI config stack into startup.
+
+    The second return value distinguishes a genuinely absent/empty config from
+    a config that exists but could not be read or parsed.  Ordinary discovery
+    remains best-effort through :func:`_load_raw_config`; mutation collision
+    scans use this status to fail closed instead of silently forgetting
+    configured external roots.
     """
     config_path = get_config_path()
-    if not config_path.exists():
-        return {}
-    try:
-        stat = config_path.stat()
-        cache_key = (str(config_path), stat.st_mtime_ns, stat.st_size)
-    except OSError:
-        cache_key = None
+    config_stat, stat_error = _stat_skills_config(config_path)
+    if stat_error is not None:
+        return {}, stat_error
+    if config_stat is None:
+        return {}, None
+    cache_key = (
+        str(config_path),
+        config_stat.st_mtime_ns,
+        config_stat.st_size,
+    )
 
-    if cache_key is not None:
+    if use_cache:
         cached = _RAW_CONFIG_CACHE.get(cache_key)
         if cached is not None:
-            return cached
+            return cached, None
 
     try:
         parsed = yaml_load(config_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.debug("Could not read skill config %s: %s", config_path, e)
-        return {}
+        return {}, f"Could not read or parse skills config {config_path}: {e}"
+    if parsed is None:
+        parsed = {}
     if not isinstance(parsed, dict):
-        return {}
+        return {}, f"Skills config {config_path} must contain a YAML mapping"
 
-    if cache_key is not None:
+    if use_cache:
         _RAW_CONFIG_CACHE.clear()
         _RAW_CONFIG_CACHE[cache_key] = parsed
+    return parsed, None
+
+
+def _load_raw_config() -> Dict[str, Any]:
+    """Best-effort compatibility view of ``config.yaml``."""
+    parsed, _error = _load_raw_config_with_error()
     return parsed
 
 
@@ -480,46 +642,90 @@ def _external_dirs_cache_clear() -> None:
     _raw_config_cache_clear()
 
 
-def get_external_skills_dirs() -> List[Path]:
-    """Read ``skills.external_dirs`` from config.yaml and return validated paths.
+def _configured_skill_root(path: Path) -> Path:
+    """Return an absolute, comparison-safe spelling without requiring I/O.
+
+    ``Path.resolve()`` normally gives the best deduplication behavior, but it
+    can fail for an inaccessible path or a symlink loop.  A configured root is
+    still part of the discovery scope in those cases, so fall back to a purely
+    lexical absolute path instead of dropping it.
+    """
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path.absolute()
+
+
+def _resolve_external_skills_dirs(
+    *, require_valid_config: bool = False
+) -> List[Path]:
+    """Read ``skills.external_dirs`` and return every configured root.
 
     Each entry is expanded (``~`` and ``${VAR}``) and resolved to an absolute
-    path.  Only directories that actually exist are returned.  Duplicates and
-    paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
+    path.  Roots are intentionally retained when they are missing,
+    inaccessible, or not directories: configuration defines discovery scope,
+    while callers separately decide which roots are currently scannable.
+    Duplicates and paths that resolve to the local ``~/.hermes/skills/`` are
+    silently skipped.
 
     Cached in-process, keyed on ``config.yaml`` mtime — the function is
     called once per skill during banner / tool-registry scans, and YAML
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
+
+    ``require_valid_config=True`` is reserved for mutation/collision scans.
+    It bypasses successful parse caches and raises :class:`SkillsConfigError`
+    when an existing config cannot be read, parsed, or interpreted.  This
+    prevents an unreadable config from masquerading as ``external_dirs: []``
+    while preserving the historical best-effort result for ordinary callers.
     """
     config_path = get_config_path()
-    if not config_path.exists():
-        return []
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.
-    try:
-        stat = config_path.stat()
-        cache_key: Tuple[str, int] = (str(config_path), stat.st_mtime_ns)
-    except OSError:
-        cache_key = None  # type: ignore[assignment]
+    config_stat, stat_error = _stat_skills_config(config_path)
+    if stat_error is None and config_stat is not None:
+        cache_key: Optional[Tuple[str, int]] = (
+            str(config_path),
+            config_stat.st_mtime_ns,
+        )
+    elif stat_error is None:
+        return []
+    else:
+        if require_valid_config:
+            raise SkillsConfigError(stat_error)
+        return []
 
-    if cache_key is not None:
+    if not require_valid_config:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
         if cached is not None:
             # Return a copy so callers can't mutate the cached list.
             return list(cached)
 
-    parsed = _load_raw_config()
-    if not parsed:
+    parsed, config_error = _load_raw_config_with_error(
+        use_cache=not require_valid_config
+    )
+    if config_error is not None:
+        if require_valid_config:
+            raise SkillsConfigError(config_error)
         return []
 
     skills_cfg = parsed.get("skills")
+    if skills_cfg is None:
+        return []
     if not isinstance(skills_cfg, dict):
+        if require_valid_config:
+            raise SkillsConfigError(
+                f"Skills config {config_path} field 'skills' must be a mapping"
+            )
         return []
 
     raw_dirs = skills_cfg.get("external_dirs")
-    if not raw_dirs:
+    if raw_dirs is None or (
+        isinstance(raw_dirs, str) and not raw_dirs.strip()
+    ) or (
+        isinstance(raw_dirs, list) and not raw_dirs
+    ):
         result: List[Path] = []
         if cache_key is not None:
             _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
@@ -527,50 +733,107 @@ def get_external_skills_dirs() -> List[Path]:
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
+        if require_valid_config:
+            raise SkillsConfigError(
+                f"Skills config {config_path} field "
+                "'skills.external_dirs' must be a string or list"
+            )
         return []
 
     from hermes_constants import get_hermes_home
 
     hermes_home = get_hermes_home()
-    local_skills = get_skills_dir().resolve()
+    local_skills = _configured_skill_root(get_skills_dir())
     seen: Set[Path] = set()
     result = []
 
     for entry in raw_dirs:
+        if require_valid_config and not isinstance(entry, str):
+            raise SkillsConfigError(
+                f"Skills config {config_path} field "
+                "'skills.external_dirs' entries must be strings"
+            )
         entry = str(entry).strip()
         if not entry:
+            if require_valid_config:
+                raise SkillsConfigError(
+                    f"Skills config {config_path} field "
+                    "'skills.external_dirs' entries must be non-empty strings"
+                )
             continue
         # Expand ~ and environment variables
         expanded = os.path.expanduser(os.path.expandvars(entry))
         p = Path(expanded)
         # Resolve relative paths against HERMES_HOME, not cwd
         if not p.is_absolute():
-            p = (hermes_home / p).resolve()
-        else:
-            p = p.resolve()
+            p = hermes_home / p
+        p = _configured_skill_root(p)
         if p == local_skills:
             continue
         if p in seen:
             continue
-        if p.is_dir():
-            seen.add(p)
-            result.append(p)
-        else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+        seen.add(p)
+        result.append(p)
 
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+def get_external_skills_dirs() -> List[Path]:
+    """Return configured external skill roots using compatibility semantics.
+
+    Read-only/discovery callers historically receive an empty list when
+    ``config.yaml`` is unavailable or malformed. Keep this public no-argument
+    contract stable; security-sensitive callers use
+    ``get_all_skills_dirs(require_valid_config=True)``.
+    """
+    return _resolve_external_skills_dirs()
+
+
+def get_scannable_external_skills_dirs(
+    *, on_error: Optional[Callable[[OSError], None]] = None
+) -> List[Path]:
+    """Return configured external roots that currently stat as directories.
+
+    This is the explicit best-effort view for non-catalog maintenance callers.
+    Catalog and cache builders should use :func:`get_external_skills_dirs`
+    directly so an unavailable configured root remains in their scope identity
+    and can make the scan fail closed.
+    """
+    result: List[Path] = []
+    for root in get_external_skills_dirs():
+        try:
+            root_stat = root.stat()
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
+            continue
+        if not stat.S_ISDIR(root_stat.st_mode):
+            error = NotADirectoryError(f"External skills root is not a directory: {root}")
+            if on_error is not None:
+                on_error(error)
+            continue
+        result.append(root)
+    return result
+
+
+def get_all_skills_dirs(
+    *, require_valid_config: bool = False
+) -> List[Path]:
+    """Return the complete configured skill-root scope, local first.
 
     The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    yet — callers handle that). Configured external roots follow in config
+    order even when they cannot currently be scanned. Mutation/collision scans
+    pass ``require_valid_config=True`` so a broken config cannot shrink that
+    security boundary to the local root.
     """
     dirs = [get_skills_dir()]
-    dirs.extend(get_external_skills_dirs())
+    if require_valid_config:
+        dirs.extend(_resolve_external_skills_dirs(require_valid_config=True))
+    else:
+        dirs.extend(get_external_skills_dirs())
     return dirs
 
 
@@ -591,15 +854,14 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     if not identifier_path.is_absolute():
         return raw_identifier.lstrip("/")
 
-    # Look the primary skills root up on tools.skills_tool at CALL time
-    # (not via get_skills_dir()): callers and tests patch
-    # ``tools.skills_tool.SKILLS_DIR`` and skill_view() itself resolves
-    # against that module attribute, so normalization must agree with the
-    # exact root skill_view() will enforce.  Import deferred to avoid a
-    # module cycle (tools.skills_tool imports agent.skill_utils).
+    # Look the primary skills root up at CALL time. ``_skills_dir()`` resolves
+    # the active profile/HERMES_HOME, while retaining the legacy patched
+    # ``SKILLS_DIR`` behavior used by callers and tests. This must agree with
+    # the exact root ``skill_view()`` enforces, otherwise a slash command from
+    # one profile can be normalised relative to another profile's root.
     try:
         from tools import skills_tool as _skills_tool
-        primary_root = Path(_skills_tool.SKILLS_DIR)
+        primary_root = Path(_skills_tool._skills_dir())
     except Exception:
         primary_root = get_skills_dir()
 
@@ -748,20 +1010,70 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
     a deduplicated list of config var dicts.  Each dict also includes a
     ``skill`` key with the skill name for attribution.
 
-    Disabled and platform-incompatible skills are excluded.
+    Disabled, platform-incompatible, and environment-incompatible skills are
+    excluded. Any unreadable or malformed candidate makes the entire result
+    unsafe to use, so discovery fails closed instead of returning a partial
+    configuration prompt.
     """
     all_vars: List[Dict[str, Any]] = []
     seen_keys: set = set()
 
     disabled = get_disabled_skill_names()
-    for skills_dir in get_all_skills_dirs():
-        if not skills_dir.is_dir():
+    scan_errors: List[OSError] = []
+    skills_dirs: List[Path] = []
+    local_skills_dir = get_skills_dir()
+    try:
+        local_stat = local_skills_dir.stat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        scan_errors.append(exc)
+    else:
+        if stat.S_ISDIR(local_stat.st_mode):
+            skills_dirs.append(local_skills_dir)
+        else:
+            scan_errors.append(
+                NotADirectoryError(
+                    f"Local skills root is not a directory: {local_skills_dir}"
+                )
+            )
+
+    try:
+        configured_external_dirs = _resolve_external_skills_dirs(
+            require_valid_config=True
+        )
+    except SkillsConfigError as exc:
+        scan_errors.append(exc)
+        configured_external_dirs = []
+    for root in configured_external_dirs:
+        try:
+            root_stat = root.stat()
+        except OSError as exc:
+            scan_errors.append(exc)
             continue
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
+        if not stat.S_ISDIR(root_stat.st_mode):
+            scan_errors.append(
+                NotADirectoryError(
+                    f"External skills root is not a directory: {root}"
+                )
+            )
+            continue
+        skills_dirs.append(root)
+    if scan_errors:
+        logger.warning(
+            "Skill config discovery is incomplete; refusing a partial result: %s",
+            scan_errors[0],
+        )
+        return []
+
+    for skills_dir in skills_dirs:
+        for skill_file in iter_skill_index_files(
+            skills_dir, "SKILL.md", on_error=scan_errors.append
+        ):
             try:
-                raw = skill_file.read_text(encoding="utf-8")
-                frontmatter, _ = parse_frontmatter(raw)
-            except Exception:
+                _, frontmatter, _ = read_strict_skill_index_file(skill_file)
+            except Exception as exc:
+                scan_errors.append(exc)
                 continue
 
             skill_name = frontmatter.get("name") or skill_file.parent.name
@@ -769,13 +1081,23 @@ def discover_all_skill_config_vars() -> List[Dict[str, Any]]:
                 continue
             if not skill_matches_platform(frontmatter):
                 continue
+            if not skill_matches_environment(frontmatter):
+                continue
 
             config_vars = extract_skill_config_vars(frontmatter)
             for var in config_vars:
                 if var["key"] not in seen_keys:
-                    var["skill"] = str(skill_name)
-                    all_vars.append(var)
+                    entry = dict(var)
+                    entry["skill"] = str(skill_name)
+                    all_vars.append(entry)
                     seen_keys.add(var["key"])
+
+    if scan_errors:
+        logger.warning(
+            "Skill config discovery is incomplete; refusing a partial result: %s",
+            scan_errors[0],
+        )
+        return []
 
     return all_vars
 
@@ -858,7 +1180,12 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
 # ── File iteration ────────────────────────────────────────────────────────
 
 
-def iter_skill_index_files(skills_dir: Path, filename: str):
+def iter_skill_index_files(
+    skills_dir: Path,
+    filename: str,
+    *,
+    on_error: Optional[Callable[[OSError], None]] = None,
+):
     """Walk skills_dir yielding sorted paths matching *filename*.
 
     Excludes Hermes metadata, VCS, virtualenv/dependency, cache, and skill
@@ -872,12 +1199,42 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     every other ``_org/<id>/`` (stale mirror from a previous org, or no
     marker at all) is pruned — leave an org and its skills stop resolving,
     without any manual cleanup.
+
+    Directory traversal errors are skipped for best-effort callers and reported
+    through ``on_error`` when supplied. Catalog builders that cache the result
+    must provide this callback so a partial walk is never committed as a
+    complete snapshot.
     """
     skills_dir_str = str(skills_dir)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
     matches: list[str] = []
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+
+    def report_error(error: OSError) -> None:
+        if on_error is not None:
+            on_error(error)
+
+    # ``followlinks=True`` is required for supported symlinked skill roots, but
+    # os.walk does not detect directory cycles. Track physical directories so a
+    # ``loop -> ..`` link cannot make startup/indexing recurse forever.
+    visited_dirs: set[tuple[int, int]] = set()
+    for root, dirs, files in os.walk(
+        skills_dir_str,
+        followlinks=True,
+        onerror=report_error,
+    ):
+        try:
+            stat = os.stat(root, follow_symlinks=True)
+            identity = (stat.st_dev, stat.st_ino)
+        except OSError as exc:
+            report_error(exc)
+            dirs[:] = []
+            continue
+        if identity in visited_dirs:
+            dirs[:] = []
+            continue
+        visited_dirs.add(identity)
+
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)

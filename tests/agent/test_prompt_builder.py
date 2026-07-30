@@ -4,6 +4,8 @@ import builtins
 import importlib
 import logging
 import sys
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -234,7 +236,7 @@ class TestParseSkillFile:
         def boom(*args, **kwargs):
             raise OSError("read exploded")
 
-        monkeypatch.setattr(type(skill_file), "read_text", boom)
+        monkeypatch.setattr("agent.prompt_builder.read_strict_skill_index_file", boom)
         with caplog.at_level(logging.DEBUG, logger="agent.prompt_builder"):
             is_compat, frontmatter, desc = _parse_skill_file(skill_file)
 
@@ -282,6 +284,358 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    @pytest.mark.parametrize(
+        "broken",
+        (
+            "---\nname: steals-valid\n# no closing fence\n",
+            "---\n- steals-valid\n---\n",
+        ),
+        ids=("unclosed-fence", "non-mapping-yaml"),
+    )
+    def test_invalid_fenced_skill_refuses_partial_system_prompt(
+        self, monkeypatch, tmp_path, broken
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        valid = tmp_path / "skills" / "general" / "valid" / "SKILL.md"
+        corrupt = tmp_path / "skills" / "general" / "corrupt" / "SKILL.md"
+        valid.parent.mkdir(parents=True)
+        corrupt.parent.mkdir(parents=True)
+        valid.write_text(
+            "---\nname: valid\ndescription: valid skill\n---\n", encoding="utf-8"
+        )
+        corrupt.write_text(broken, encoding="utf-8")
+
+        result = build_skills_system_prompt()
+
+        assert result == ""
+        assert not (tmp_path / ".skills_prompt_snapshot.json").exists()
+
+    def test_snapshot_manifest_breaks_symlink_cycles(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        try:
+            (skill_dir / "loop").symlink_to(
+                tmp_path / "skills", target_is_directory=True
+            )
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        first = build_skills_system_prompt()
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache()
+        second = build_skills_system_prompt()
+
+        assert first == second
+        assert first.count("- python-debug") == 1
+
+    def test_walk_error_uses_same_scope_snapshot_without_caching_partial_result(
+        self, monkeypatch, tmp_path
+    ):
+        """A failed walk must retain the prior complete snapshot, never a subset."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        monkeypatch.setattr(
+            prompt_builder, "get_all_skills_dirs", lambda: [tmp_path / "skills"]
+        )
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        complete = build_skills_system_prompt()
+        snapshot_path = tmp_path / ".skills_prompt_snapshot.json"
+        snapshot_before = snapshot_path.read_bytes()
+        prompt_builder.clear_skills_system_prompt_cache()
+
+        def denied_walk(*_args, **kwargs):
+            kwargs["onerror"](OSError("simulated walk denial"))
+            return []
+
+        monkeypatch.setattr("agent.skill_utils.os.walk", denied_walk)
+        recovered = build_skills_system_prompt()
+
+        assert recovered == complete
+        assert snapshot_path.read_bytes() == snapshot_before
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+    def test_file_read_error_never_overwrites_snapshot_or_lru(
+        self, monkeypatch, tmp_path
+    ):
+        """A file that fails after enumeration invalidates the whole cold scan."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        good_dir = tmp_path / "skills" / "coding" / "good"
+        good_dir.mkdir(parents=True)
+        (good_dir / "SKILL.md").write_text(
+            "---\nname: good\ndescription: Complete catalog entry\n---\n"
+        )
+        assert "good" in build_skills_system_prompt()
+        snapshot_path = tmp_path / ".skills_prompt_snapshot.json"
+        snapshot_before = snapshot_path.read_bytes()
+        prompt_builder.clear_skills_system_prompt_cache()
+
+        bad_file = tmp_path / "skills" / "coding" / "bad" / "SKILL.md"
+        bad_file.parent.mkdir()
+        bad_file.write_text("---\nname: bad\ndescription: unreadable\n---\n")
+        original_reader = prompt_builder.read_strict_skill_index_file
+
+        def fail_only_bad_file(path, *args, **kwargs):
+            if path == bad_file:
+                raise OSError("simulated file read denial")
+            return original_reader(path, *args, **kwargs)
+
+        monkeypatch.setattr(
+            prompt_builder, "read_strict_skill_index_file", fail_only_bad_file
+        )
+        build_skills_system_prompt()
+        assert snapshot_path.read_bytes() == snapshot_before
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+    def test_external_walk_error_does_not_render_local_only_snapshot(
+        self, monkeypatch, tmp_path
+    ):
+        """A local snapshot is not a valid full-scope fallback with externals."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+        from agent import skill_utils
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_root = tmp_path / "skills"
+        external_root = tmp_path / "external-skills"
+        local_skill = local_root / "local" / "SKILL.md"
+        external_skill = external_root / "external" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        external_skill.parent.mkdir(parents=True)
+        local_skill.write_text(
+            "---\nname: local\ndescription: Local skill\n---\n"
+        )
+        external_skill.write_text(
+            "---\nname: external\ndescription: External skill\n---\n"
+        )
+        monkeypatch.setattr(
+            prompt_builder,
+            "get_all_skills_dirs",
+            lambda: [local_root, external_root],
+        )
+        complete = build_skills_system_prompt()
+        assert "- local:" in complete
+        assert (tmp_path / ".skills_prompt_snapshot.json").exists()
+        prompt_builder.clear_skills_system_prompt_cache()
+
+        original_walk = skill_utils.os.walk
+
+        walked_external = []
+
+        def fail_external_walk(top, *args, **kwargs):
+            if Path(top).resolve() == external_root.resolve():
+                walked_external.append(top)
+                kwargs["onerror"](OSError("simulated external walk denial"))
+                return []
+            return original_walk(top, *args, **kwargs)
+
+        monkeypatch.setattr(skill_utils.os, "walk", fail_external_walk)
+        result = build_skills_system_prompt()
+        assert walked_external, "external directory was not scanned"
+        assert result == ""
+        assert [Path(path).resolve() for path in walked_external] == [
+            external_root.resolve(),
+            external_root.resolve(),
+        ]
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+    def test_external_root_stat_error_does_not_render_local_snapshot(
+        self, monkeypatch, tmp_path
+    ):
+        """Path.exists must not silently turn an inaccessible external into empty."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_root = tmp_path / "skills"
+        external_root = tmp_path / "external-skills"
+        local_skill = local_root / "local" / "SKILL.md"
+        external_skill = external_root / "external" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        external_skill.parent.mkdir(parents=True)
+        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        external_skill.write_text(
+            "---\nname: external\ndescription: External skill\n---\n"
+        )
+        monkeypatch.setattr(
+            prompt_builder,
+            "get_all_skills_dirs",
+            lambda: [local_root, external_root],
+        )
+        assert "- external:" in build_skills_system_prompt()
+        prompt_builder.clear_skills_system_prompt_cache()
+
+        original_stat = Path.stat
+
+        def fail_external_root(path, *args, **kwargs):
+            if path == external_root:
+                raise PermissionError("simulated external root denial")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", fail_external_root)
+        assert build_skills_system_prompt() == ""
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+    @pytest.mark.parametrize("root_kind", ["missing", "file"])
+    def test_cold_start_invalid_configured_external_root_fails_closed(
+        self, monkeypatch, tmp_path, root_kind
+    ):
+        """A configured root is scope even before it becomes scannable."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+        from agent import skill_utils
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_skill = tmp_path / "skills" / "local" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        local_skill.write_text(
+            "---\nname: local\ndescription: Local skill\n---\n",
+            encoding="utf-8",
+        )
+        external_root = tmp_path / "configured-external"
+        if root_kind == "file":
+            external_root.write_text("not a directory", encoding="utf-8")
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_root}\n",
+            encoding="utf-8",
+        )
+        skill_utils._external_dirs_cache_clear()
+        prompt_builder.clear_skills_system_prompt_cache()
+
+        assert skill_utils.get_all_skills_dirs() == [
+            tmp_path / "skills",
+            external_root.resolve(),
+        ]
+        assert build_skills_system_prompt() == ""
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+    def test_first_scan_external_root_permission_failure_is_not_cached_and_retries(
+        self, monkeypatch, tmp_path
+    ):
+        """A selected-but-unreadable external root must not create local-only LRU."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_root = tmp_path / "skills"
+        external_root = tmp_path / "external-skills"
+        local_skill = local_root / "local" / "SKILL.md"
+        external_skill = external_root / "external" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        external_skill.parent.mkdir(parents=True)
+        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        external_skill.write_text(
+            "---\nname: external\ndescription: External skill\n---\n"
+        )
+        monkeypatch.setattr(
+            prompt_builder,
+            "get_all_skills_dirs",
+            lambda: [local_root, external_root],
+        )
+
+        original_stat = Path.stat
+        deny_external = True
+
+        def deny_external_root(path, *args, **kwargs):
+            if deny_external and path == external_root:
+                raise PermissionError("simulated first-scan external denial")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", deny_external_root)
+        assert build_skills_system_prompt() == ""
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+        deny_external = False
+        result = build_skills_system_prompt()
+        assert "- local:" in result
+        assert "- external:" in result
+
+    def test_external_root_deleted_after_scope_resolution_returns_empty_until_new_scope(
+        self, monkeypatch, tmp_path
+    ):
+        """A deleted configured root invalidates its old local+external scope."""
+        prompt_builder = sys.modules[build_skills_system_prompt.__module__]
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_root = tmp_path / "skills"
+        external_root = tmp_path / "external-skills"
+        local_skill = local_root / "local" / "SKILL.md"
+        external_skill = external_root / "external" / "SKILL.md"
+        local_skill.parent.mkdir(parents=True)
+        external_skill.parent.mkdir(parents=True)
+        local_skill.write_text("---\nname: local\ndescription: Local skill\n---\n")
+        external_skill.write_text(
+            "---\nname: external\ndescription: External skill\n---\n"
+        )
+
+        roots = [local_root, external_root]
+        monkeypatch.setattr(prompt_builder, "get_all_skills_dirs", lambda: roots)
+        complete = build_skills_system_prompt()
+        assert "- local:" in complete
+        assert "- external:" in complete
+        assert prompt_builder._SKILLS_PROMPT_CACHE
+
+        external_skill.unlink()
+        external_skill.parent.rmdir()
+        external_root.rmdir()
+        assert build_skills_system_prompt() == ""
+        assert prompt_builder._SKILLS_PROMPT_CACHE == {}
+
+        # The next config/root resolution creates a different scope and may
+        # safely render the local snapshot again.
+        roots[:] = [local_root]
+        rebuilt = build_skills_system_prompt()
+        assert "- local:" in rebuilt
+        assert "external" not in rebuilt
+
+    def test_omits_manage_instructions_when_tool_is_unavailable(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "coding" / "python-debug"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts.\n---\n"
+        )
+
+        read_only = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view"}
+        )
+        writable = build_skills_system_prompt(
+            available_tools={"skills_list", "skill_view", "skill_manage"}
+        )
+
+        assert "skill_manage" not in read_only
+        assert "skill_manage" in writable
+
+    def test_rebuilds_for_dynamic_kanban_environment(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+        skill_dir = tmp_path / "skills" / "workflow" / "kanban-only"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: kanban-only\ndescription: Manage board work.\n"
+            "environments: [kanban]\n---\n"
+        )
+
+        with patch(
+            "tools.kanban_tools._profile_has_kanban_toolset",
+            return_value=False,
+        ):
+            assert "kanban-only" not in build_skills_system_prompt()
+            monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+            assert "kanban-only" in build_skills_system_prompt()
+            monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+            assert "kanban-only" not in build_skills_system_prompt()
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -313,6 +667,43 @@ class TestBuildSkillsSystemPrompt:
         # Unfiltered call must not be served from the compacted cache entry.
         full = build_skills_system_prompt()
         assert "Write threads" in full
+
+    def test_category_compact_keeps_names_and_hermes_anchor(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        entries = [
+            ("hermes-agent", "Canonical Hermes setup and troubleshooting."),
+            ("long-workflow", "ordinary workflow " * 40),
+            ("another-skill", "another workflow " * 40),
+            *[
+                (f"workflow-{index}", f"workflow {index} details " * 40)
+                for index in range(8)
+            ],
+        ]
+        for name, description in entries:
+            skill_dir = tmp_path / "skills" / "operations" / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        compact = build_skills_system_prompt(
+            prompt_index_mode="category_compact"
+        )
+        full = build_skills_system_prompt(prompt_index_mode="full")
+
+        assert "hermes-agent" in compact
+        assert "long-workflow" in compact
+        assert "another-skill" in compact
+        assert all(name in compact for name, _ in entries)
+        assert "Canonical Hermes setup and troubleshooting." in compact
+        assert "ordinary workflow ordinary workflow" not in compact
+        assert "another workflow another workflow" not in compact
+        assert "skills_list(category='...')" in compact
+        assert len(compact) < len(full)
+        # The rendering mode is part of the cache key.
+        assert "ordinary workflow ordinary workflow" in full
 
 
 
@@ -919,5 +1310,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

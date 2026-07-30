@@ -8,6 +8,7 @@ Covers:
 
 import json
 import logging
+from unittest.mock import patch
 
 import pytest
 
@@ -268,6 +269,125 @@ class TestSkillViewPluginGuards:
         assert result["success"] is True
         assert "Ignore previous instructions" in result["content"]
         assert any("injection" in r.message.lower() for r in caplog.records)
+
+    def test_malformed_fenced_frontmatter_is_refused(self, tmp_path):
+        """Plugin skills cannot use the local parser's lenient YAML fallback."""
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\ndescription: broken\n")
+        result = json.loads(skill_view("myplugin:foo"))
+
+        assert result["success"] is False
+        assert "invalid frontmatter" in result["error"].lower()
+
+    def test_support_file_uses_qualified_bound_reader(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\n---\nBody.\n")
+        package = tmp_path / "plugins" / "myplugin" / "skills" / "foo"
+        references = package / "references"
+        references.mkdir()
+        (references / "guide.md").write_text("BOUND GUIDE", encoding="utf-8")
+
+        result = json.loads(
+            skill_view("myplugin:foo", file_path="references/guide.md")
+        )
+
+        assert result["success"] is True
+        assert result["name"] == "myplugin:foo"
+        assert result["content"] == "BOUND GUIDE"
+
+    def test_support_file_traversal_is_refused(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\n---\nBody.\n")
+        result = json.loads(
+            skill_view("myplugin:foo", file_path="../outside.txt")
+        )
+
+        assert result["success"] is False
+        assert "not safely readable" in result["error"]
+
+    def test_package_replacement_between_snapshot_and_inline_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """A registry path cannot redirect preprocessing to a replacement dir."""
+        from tools.skills_tool import skill_view
+
+        self._reg(
+            tmp_path,
+            "---\nname: foo\ndescription: foo\n---\nMarker: !`cat marker.txt`\n",
+        )
+        package = tmp_path / "plugins" / "myplugin" / "skills" / "foo"
+        (package / "marker.txt").write_text("ORIGINAL", encoding="utf-8")
+        replacement = tmp_path / "replacement-plugin-skill"
+        replacement.mkdir()
+        (replacement / "SKILL.md").write_text(
+            "---\nname: foo\ndescription: replacement\n---\nMarker: REPLACEMENT\n",
+            encoding="utf-8",
+        )
+        swapped = False
+
+        def swap_before_inline():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                displaced = package.with_name("foo-original")
+                package.rename(displaced)
+                replacement.rename(package)
+            return {
+                "template_vars": True,
+                "inline_shell": True,
+                "inline_shell_timeout": 5,
+            }
+
+        monkeypatch.setattr(
+            "agent.skill_preprocessing.load_skills_config", swap_before_inline
+        )
+        result = json.loads(skill_view("myplugin:foo"))
+
+        assert swapped is True
+        assert result["success"] is False
+        assert "REPLACEMENT" not in json.dumps(result)
+
+    def test_inline_caller_defers_template_vars_to_bound_expander(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        self._reg(
+            tmp_path,
+            (
+                "---\nname: foo\ndescription: foo\n---\n"
+                "Visible: ${HERMES_SKILL_DIR}\n"
+                "Marker: !`cat ${HERMES_SKILL_DIR}/marker.txt`\n"
+                "Session: ${HERMES_SESSION_ID}\n"
+            ),
+        )
+        monkeypatch.setattr(
+            "agent.skill_preprocessing.load_skills_config",
+            lambda: {
+                "template_vars": True,
+                "inline_shell": True,
+                "inline_shell_timeout": 7,
+            },
+        )
+        with patch(
+            "tools.skills_tool._expand_inline_shell_bound",
+            return_value="BOUND",
+        ) as expand:
+            result = json.loads(
+                skill_view("myplugin:foo", task_id="session-123")
+            )
+
+        assert result["success"] is True
+        assert result["content"].endswith("BOUND")
+        raw_content, _package_handle, timeout = expand.call_args.args
+        assert "${HERMES_SKILL_DIR}" in raw_content
+        assert "${HERMES_SESSION_ID}" in raw_content
+        assert timeout == 7
+        assert expand.call_args.kwargs["session_id"] == "session-123"
+        assert expand.call_args.kwargs["template_vars"] is True
 
 
 class TestBundleContextBanner:

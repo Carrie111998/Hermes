@@ -57,12 +57,14 @@ import type {
 import { resolveTargetSessionId } from './resolve-target-session'
 import {
   type GatewayRequest,
+  isSessionBusyError,
   isSessionIdCandidate,
   isTargetSessionBusy,
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionBusyRetry
 } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
@@ -518,14 +520,41 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           })
 
           try {
-            const result = await requestGateway<SessionCompressResponse>(
-              'session.compress',
-              {
-                session_id: sessionId,
-                ...(focusTopic ? { focus_topic: focusTopic } : {})
-              },
-              SESSION_COMPRESS_TIMEOUT_MS
-            )
+            const compress = () =>
+              requestGateway<SessionCompressResponse>(
+                'session.compress',
+                {
+                  session_id: sessionId,
+                  ...(focusTopic ? { focus_topic: focusTopic } : {})
+                },
+                SESSION_COMPRESS_TIMEOUT_MS
+              )
+
+            let result: SessionCompressResponse
+
+            try {
+              result = await compress()
+            } catch (err) {
+              if (!isSessionBusyError(err)) {
+                throw err
+              }
+
+              // A manual compression request is an explicit request to create
+              // a context boundary now. If a turn is still running, stop it
+              // first and wait for the gateway's running flag/history flush to
+              // settle before retrying. Rewind/edit already use this same
+              // bounded busy-retry contract; without it Desktop merely echoed
+              // "session busy — /interrupt..." and made the user issue two
+              // more commands by hand.
+              notify({
+                durationMs: 0,
+                id: noticeId,
+                kind: 'info',
+                message: 'interrupting the current turn before compression...'
+              })
+              await requestGateway('session.interrupt', { session_id: sessionId })
+              result = await withSessionBusyRetry(compress)
+            }
 
             // Replace the transcript with the post-compress history so the
             // summarized bubbles actually disappear. `messages` is the same

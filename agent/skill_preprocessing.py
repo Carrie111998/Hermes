@@ -20,6 +20,8 @@ _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 
 # Cap inline-shell output so a runaway command can't blow out the context.
 _INLINE_SHELL_MAX_OUTPUT = 4000
+_INLINE_SHELL_DEFAULT_TIMEOUT = 10
+_INLINE_SHELL_MAX_TIMEOUT = 60
 
 
 def load_skills_config() -> dict:
@@ -36,9 +38,28 @@ def load_skills_config() -> dict:
     return {}
 
 
+def normalize_preprocessing_config(
+    skills_cfg: dict | None,
+) -> tuple[bool, bool, int]:
+    """Return strict, fail-closed preprocessing switches and timeout."""
+    cfg = skills_cfg if isinstance(skills_cfg, dict) else {}
+    template_vars = cfg.get("template_vars", True) is True
+    inline_shell = cfg.get("inline_shell", False) is True
+    raw_timeout = cfg.get(
+        "inline_shell_timeout", _INLINE_SHELL_DEFAULT_TIMEOUT
+    )
+    if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int):
+        timeout = _INLINE_SHELL_DEFAULT_TIMEOUT
+    else:
+        timeout = max(
+            1, min(raw_timeout, _INLINE_SHELL_MAX_TIMEOUT)
+        )
+    return template_vars, inline_shell, timeout
+
+
 def substitute_template_vars(
     content: str,
-    skill_dir: Path | None,
+    skill_dir: Path | str | None,
     session_id: str | None,
 ) -> str:
     """Replace ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in skill content.
@@ -136,9 +157,11 @@ def preprocess_skill_content(
         return content
 
     cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
-    if cfg.get("template_vars", True):
+    template_vars, inline_shell, timeout = normalize_preprocessing_config(
+        cfg
+    )
+    if template_vars:
         content = substitute_template_vars(content, skill_dir, session_id)
-    if cfg.get("inline_shell", False):
-        timeout = int(cfg.get("inline_shell_timeout", 10) or 10)
+    if inline_shell:
         content = expand_inline_shell(content, skill_dir, timeout)
     return content

@@ -93,6 +93,13 @@ class TestGetDisabledSkillNames:
 
     def test_session_platform_env_var(self, tmp_path, monkeypatch):
         """HERMES_SESSION_PLATFORM should be used when HERMES_PLATFORM is unset."""
+        # Earlier gateway-oriented tests deliberately leave the current
+        # ContextVar scope explicitly cleared (""), which suppresses the
+        # legacy os.environ fallback. This case models a fresh CLI/test scope,
+        # so establish the corresponding _UNSET state explicitly.
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
         config = tmp_path / "config.yaml"
         config.write_text(
             "skills:\n"

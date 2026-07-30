@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import stat
 import sys
 import threading
 import contextvars
@@ -27,9 +28,11 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_skill_environment_fingerprint,
     iter_skill_index_files,
     org_id_of_path,
     parse_frontmatter,
+    read_strict_skill_index_file,
     read_active_org_id,
     skill_matches_environment,
     skill_matches_platform,
@@ -1346,9 +1349,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
-# org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# v3 retains org provenance fields and adds strict scan semantics; older
+# snapshots are discarded and rebuilt.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1366,7 +1369,7 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
             logger.debug("Could not remove skills prompt snapshot: %s", e)
 
 
-def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
+def _build_skills_manifest(skills_dir: Path, *, on_error=None) -> dict[str, list[int]]:
     """Build an mtime/size manifest of all SKILL.md and DESCRIPTION.md files.
 
     Org mirrors (M2): only the ACTIVE org's mirror participates, and the
@@ -1387,7 +1390,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
         ]
     except OSError:
         pass
-    for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+    for root, dirs, files in os.walk(skills_dir_str, followlinks=True, onerror=on_error):
         has_skill_md = "SKILL.md" in files
         if root == skills_dir_str and ORG_MIRROR_DIR_NAME in dirs and active_org is None:
             dirs.remove(ORG_MIRROR_DIR_NAME)
@@ -1402,16 +1405,19 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
         for filename in ("SKILL.md", "DESCRIPTION.md"):
             if filename not in files:
                 continue
-            path = os.path.join(root, filename)
+            path = Path(os.path.join(root, filename))
             try:
-                st = os.stat(path)
-            except OSError:
+                st = path.stat()
+                relative_path = path.relative_to(skills_dir).as_posix()
+            except (OSError, ValueError) as exc:
+                if on_error is not None:
+                    on_error(exc)
                 continue
-            manifest[path[prefix_len:]] = [st.st_mtime_ns, st.st_size]
+            manifest[relative_path] = [st.st_mtime_ns, st.st_size]
     return manifest
 
 
-def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
+def _load_skills_snapshot(skills_dir: Path, *, on_error=None) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
     if not snapshot_path.exists():
@@ -1424,7 +1430,25 @@ def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
         return None
     if snapshot.get("version") != _SKILLS_SNAPSHOT_VERSION:
         return None
-    if snapshot.get("manifest") != _build_skills_manifest(skills_dir):
+    # A profile can switch its skills root without changing HERMES_HOME. Never
+    # reuse the prior root's snapshot merely because a transient scan error
+    # made its manifest unknowable.
+    if snapshot.get("skills_dir") != str(skills_dir):
+        return None
+    scan_errors: list[Exception] = []
+
+    def _record(error) -> None:
+        scan_errors.append(error)
+        if on_error is not None:
+            on_error(error)
+
+    manifest = _build_skills_manifest(skills_dir, on_error=_record)
+    if scan_errors:
+        # The on-disk data is a same-scope, previously complete snapshot. It
+        # is safer than committing or rendering a newly discovered partial
+        # catalog while a directory/file is temporarily unreadable.
+        return snapshot
+    if snapshot.get("manifest") != manifest:
         return None
     return snapshot
 
@@ -1438,6 +1462,7 @@ def _write_skills_snapshot(
     """Persist skill metadata to disk for fast cold-start reuse."""
     payload = {
         "version": _SKILLS_SNAPSHOT_VERSION,
+        "skills_dir": str(skills_dir),
         "manifest": manifest,
         "skills": skill_entries,
         "category_descriptions": category_descriptions,
@@ -1476,6 +1501,9 @@ def _build_snapshot_entry(
     platforms = frontmatter.get("platforms") or []
     if isinstance(platforms, str):
         platforms = [platforms]
+    environments = frontmatter.get("environments") or []
+    if not isinstance(environments, list):
+        environments = [environments]
 
     entry = {
         "skill_name": skill_name,
@@ -1483,6 +1511,11 @@ def _build_snapshot_entry(
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
+        "environments": [
+            str(environment).strip()
+            for environment in environments
+            if str(environment).strip()
+        ],
         "conditions": extract_skill_conditions(frontmatter),
     }
     if org_id:
@@ -1507,15 +1540,18 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
-def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
+def _parse_skill_file(
+    skill_file: Path, *, on_error=None, fail_closed: bool = False
+) -> tuple[bool, dict | None, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
-    Returns (is_compatible, frontmatter, description). On any error, returns
-    (True, {}, "") to err on the side of showing the skill.
+    Returns (is_compatible, frontmatter, description). Direct callers retain
+    the historic permissive error value; active discovery passes
+    ``fail_closed=True`` so malformed fenced YAML and canonical-entry
+    symlinks cannot be advertised or saved in a prompt snapshot.
     """
     try:
-        raw = skill_file.read_text(encoding="utf-8")
-        frontmatter, _ = parse_frontmatter(raw)
+        _, frontmatter, _ = read_strict_skill_index_file(skill_file)
 
         if not skill_matches_platform(frontmatter):
             return False, frontmatter, ""
@@ -1530,7 +1566,9 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, frontmatter, extract_skill_description(frontmatter)
     except Exception as e:
         logger.warning("Failed to parse skill file %s: %s", skill_file, e)
-        return True, {}, ""
+        if on_error is not None:
+            on_error(e)
+        return (False, None, "") if fail_closed else (True, {}, "")
 
 
 def _skill_should_show(
@@ -1584,6 +1622,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    prompt_index_mode: str = "full",
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1604,11 +1643,41 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    ``prompt_index_mode="category_compact"`` applies that treatment to every
+    category while preserving category descriptions and the full
+    ``hermes-agent`` routing anchor. This keeps all skill names discoverable
+    without injecting every long description into every conversation.
     """
+    prompt_index_mode = str(prompt_index_mode or "full").strip().lower()
+    if prompt_index_mode not in {"full", "category_compact"}:
+        logger.warning(
+            "Unknown skills.prompt_index_mode=%r; using full",
+            prompt_index_mode,
+        )
+        prompt_index_mode = "full"
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
-    if not skills_dir.exists() and not external_dirs:
+    # Do not use ``Path.exists()`` for a selected root: it suppresses
+    # PermissionError and can make an incomplete catalog look like a valid
+    # empty one.  A missing local root is the ordinary first-run case; a
+    # missing configured external root is handled below once the full cache
+    # scope has been assembled.
+    try:
+        local_root_stat = skills_dir.stat()
+    except FileNotFoundError:
+        local_root_missing = True
+    except OSError as exc:
+        logger.debug("Local skills root is inaccessible: %s", exc)
+        return ""
+    else:
+        if not stat.S_ISDIR(local_root_stat.st_mode):
+            logger.debug("Local skills root is not a directory: %s", skills_dir)
+            return ""
+        local_root_missing = False
+
+    if local_root_missing and not external_dirs:
         return ""
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
@@ -1622,17 +1691,53 @@ def build_skills_system_prompt(
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
+        get_skill_environment_fingerprint(),
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        prompt_index_mode,
     )
+
+    # External roots are part of the cache scope.  Validate them before an LRU
+    # lookup so a root deleted after a prior complete render cannot return a
+    # stale local+external prompt.  Treat FileNotFoundError as incomplete too:
+    # the root was present when this scope was resolved, and omitting it would
+    # turn the result into a silently partial catalog.
+    root_error = None
+    for external_dir in external_dirs:
+        try:
+            external_stat = external_dir.stat()
+        except OSError as exc:
+            root_error = exc
+            break
+        if not stat.S_ISDIR(external_stat.st_mode):
+            root_error = NotADirectoryError(
+                f"External skills root is not a directory: {external_dir}"
+            )
+            break
+    if root_error is not None:
+        logger.debug("External skills root is inaccessible: %s", root_error)
+        with _SKILLS_PROMPT_CACHE_LOCK:
+            _SKILLS_PROMPT_CACHE.pop(cache_key, None)
+        return ""
+
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
             return cached
 
+    # Every cacheable scan reports traversal, stat, read, and parse errors.
+    # A scan that has omitted even one path is not a valid replacement for a
+    # previous catalog: do not write it to disk or the in-process LRU.
+    scan_incomplete = False
+
+    def _mark_scan_incomplete(error) -> None:
+        nonlocal scan_incomplete
+        scan_incomplete = True
+        logger.debug("Skills prompt scan incomplete: %s", error)
+
     # ── Layer 2: disk snapshot ────────────────────────────────────────
-    snapshot = _load_skills_snapshot(skills_dir)
+    snapshot = _load_skills_snapshot(skills_dir, on_error=_mark_scan_incomplete)
 
     skills_by_category: dict[str, list[tuple[str, str]]] = {}
     category_descriptions: dict[str, str] = {}
@@ -1651,6 +1756,10 @@ def build_skills_system_prompt(
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
+            if not skill_matches_environment(
+                {"environments": entry.get("environments") or []}
+            ):
+                continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1666,9 +1775,24 @@ def build_skills_system_prompt(
         }
     else:
         # Cold path: full filesystem scan + write snapshot for next time
-        for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
-            is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
-            entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
+        skill_entries: list[dict] = []
+        for skill_file in iter_skill_index_files(
+            skills_dir, "SKILL.md", on_error=_mark_scan_incomplete
+        ):
+            try:
+                is_compatible, frontmatter, desc = _parse_skill_file(
+                    skill_file, on_error=_mark_scan_incomplete, fail_closed=True
+                )
+                entry = _build_snapshot_entry(
+                    skill_file, skills_dir, frontmatter or {}, desc
+                )
+            except Exception as exc:
+                _mark_scan_incomplete(exc)
+                continue
+            if frontmatter is None:
+                # Strict read/parse failure: it is not a valid snapshot entry
+                # and must not become visible on the next cache hit.
+                continue
             skill_entries.append(entry)
             if not is_compatible:
                 continue
@@ -1714,7 +1838,9 @@ def build_skills_system_prompt(
     if snapshot is None:
         # (continuation of the cold path below: category descriptions + write)
         # Read category-level DESCRIPTION.md files
-        for desc_file in iter_skill_index_files(skills_dir, "DESCRIPTION.md"):
+        for desc_file in iter_skill_index_files(
+            skills_dir, "DESCRIPTION.md", on_error=_mark_scan_incomplete
+        ):
             try:
                 content = desc_file.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(content)
@@ -1726,13 +1852,24 @@ def build_skills_system_prompt(
                 category_descriptions[cat] = str(cat_desc).strip().strip("'\"")
             except Exception as e:
                 logger.debug("Could not read skill description %s: %s", desc_file, e)
+                _mark_scan_incomplete(e)
 
-        _write_skills_snapshot(
-            skills_dir,
-            _build_skills_manifest(skills_dir),
-            skill_entries,
-            category_descriptions,
+        manifest = _build_skills_manifest(
+            skills_dir, on_error=_mark_scan_incomplete
         )
+        if scan_incomplete:
+            # No prior valid snapshot exists (otherwise _load would have used
+            # it). Do not let a transient permissions/race failure create a
+            # partial prompt catalog.
+            skills_by_category = {}
+            category_descriptions = {}
+        else:
+            _write_skills_snapshot(
+                skills_dir,
+                manifest,
+                skill_entries,
+                category_descriptions,
+            )
 
     # ── External skill directories ─────────────────────────────────────
     # Scan external dirs directly (no snapshot caching — they're read-only
@@ -1743,12 +1880,43 @@ def build_skills_system_prompt(
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
 
+    external_skills: dict[str, list[tuple[str, str]]] = {}
+    external_descriptions: dict[str, str] = {}
+
+    def _mark_external_scan_incomplete(error) -> None:
+        _mark_scan_incomplete(error)
+
     for ext_dir in external_dirs:
-        if not ext_dir.exists():
+        try:
+            external_stat = ext_dir.stat()
+        except FileNotFoundError:
+            # The configured root was selected into this scope but disappeared
+            # during the scan.  Do not let the local snapshot masquerade as a
+            # complete local+external index; a later config resolution with a
+            # new root set can safely build a new scope.
+            _mark_external_scan_incomplete(
+                FileNotFoundError(f"External skills root disappeared: {ext_dir}")
+            )
             continue
-        for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
+        except OSError as exc:
+            _mark_external_scan_incomplete(exc)
+            continue
+        if not stat.S_ISDIR(external_stat.st_mode):
+            _mark_external_scan_incomplete(
+                NotADirectoryError(
+                    f"External skills root is not a directory: {ext_dir}"
+                )
+            )
+            continue
+        for skill_file in iter_skill_index_files(
+            ext_dir, "SKILL.md", on_error=_mark_external_scan_incomplete
+        ):
             try:
-                is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
+                is_compatible, frontmatter, desc = _parse_skill_file(
+                    skill_file,
+                    on_error=_mark_external_scan_incomplete,
+                    fail_closed=True,
+                )
                 if not is_compatible:
                     continue
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
@@ -1765,14 +1933,17 @@ def build_skills_system_prompt(
                 ):
                     continue
                 seen_skill_names.add(frontmatter_name)
-                skills_by_category.setdefault(entry["category"], []).append(
+                external_skills.setdefault(entry["category"], []).append(
                     (frontmatter_name, entry["description"])
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
+                _mark_external_scan_incomplete(e)
 
         # External category descriptions
-        for desc_file in iter_skill_index_files(ext_dir, "DESCRIPTION.md"):
+        for desc_file in iter_skill_index_files(
+            ext_dir, "DESCRIPTION.md", on_error=_mark_external_scan_incomplete
+        ):
             try:
                 content = desc_file.read_text(encoding="utf-8")
                 fm, _ = parse_frontmatter(content)
@@ -1781,9 +1952,28 @@ def build_skills_system_prompt(
                     continue
                 rel = desc_file.relative_to(ext_dir)
                 cat = "/".join(rel.parts[:-1]) if len(rel.parts) > 1 else "general"
-                category_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
+                external_descriptions.setdefault(cat, str(cat_desc).strip().strip("'\""))
             except Exception as e:
                 logger.debug("Could not read external skill description %s: %s", desc_file, e)
+                _mark_external_scan_incomplete(e)
+
+    # External directories have no disk snapshot. Keep their changes staged
+    # until every configured external scan is complete so a failed directory
+    # cannot create a partial prompt or poison its LRU entry.
+    if not scan_incomplete:
+        for category, entries in external_skills.items():
+            skills_by_category.setdefault(category, []).extend(entries)
+        for category, description in external_descriptions.items():
+            category_descriptions.setdefault(category, description)
+    elif external_dirs:
+        # The disk snapshot deliberately covers only the writable local root.
+        # If an external root fails, rendering that local snapshot alone would
+        # still be a partial result for this full (local + external) scope.
+        # An exact full-scope LRU entry would already have been returned above;
+        # with no such entry, fail closed instead of advertising a catalog that
+        # silently omitted externally configured skills.
+        skills_by_category = {}
+        category_descriptions = {}
 
     # Posture-driven category demotion (e.g. non-coding skills while pairing
     # on code). Demoted categories stay in the index as a single names-only
@@ -1794,13 +1984,23 @@ def build_skills_system_prompt(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
-    )
+    if prompt_index_mode == "category_compact":
+        demoted = frozenset(skills_by_category)
+    else:
+        demoted = frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in (compact_categories or frozenset())
+        )
 
     hidden_note = ""
-    if demoted:
+    if prompt_index_mode == "category_compact" and demoted:
+        hidden_note = (
+            "\n(The skill index is category-compact: every skill name remains "
+            "visible, while ordinary descriptions load on demand. Use "
+            "skills_list(category='...') to inspect a category, then "
+            "skill_view(name='...') before following a skill.)"
+        )
+    elif demoted:
         hidden_note = (
             "\n(Categories marked [names only] are outside the current coding "
             "context, so their descriptions are omitted — the skills work "
@@ -1815,8 +2015,32 @@ def build_skills_system_prompt(
             # Deduplicate and sort skills within each category
             seen = set()
             if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
-                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
+                entries = sorted(
+                    set(skills_by_category[category]), key=lambda item: item[0]
+                )
+                if prompt_index_mode == "category_compact":
+                    cat_desc = category_descriptions.get(category, "")
+                    index_lines.append(
+                        f"  {category}:"
+                        + (f" {cat_desc}" if cat_desc else "")
+                    )
+                    ordinary_names = [
+                        name for name, _ in entries if name != "hermes-agent"
+                    ]
+                    if ordinary_names:
+                        index_lines.append(
+                            f"    [names only]: {', '.join(ordinary_names)}"
+                        )
+                    for name, desc in entries:
+                        if name == "hermes-agent":
+                            index_lines.append(
+                                f"    - {name}" + (f": {desc}" if desc else "")
+                            )
+                else:
+                    names = [name for name, _ in entries]
+                    index_lines.append(
+                        f"  {category} [names only]: {', '.join(names)}"
+                    )
                 continue
             cat_desc = category_descriptions.get(category, "")
             if cat_desc:
@@ -1831,6 +2055,15 @@ def build_skills_system_prompt(
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
+
+        maintenance_guidance = ""
+        if available_tools is None or "skill_manage" in available_tools:
+            maintenance_guidance = (
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+            )
 
         result = (
             "## Skills (mandatory)\n"
@@ -1849,25 +2082,23 @@ def build_skills_system_prompt(
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
+            + maintenance_guidance
+            + "\n"
+            + "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
+            + "</available_skills>\n"
+            + "\n"
+            + "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
-    with _SKILLS_PROMPT_CACHE_LOCK:
-        _SKILLS_PROMPT_CACHE[cache_key] = result
-        _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
-        while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
-            _SKILLS_PROMPT_CACHE.popitem(last=False)
+    if not scan_incomplete:
+        with _SKILLS_PROMPT_CACHE_LOCK:
+            _SKILLS_PROMPT_CACHE[cache_key] = result
+            _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
+                _SKILLS_PROMPT_CACHE.popitem(last=False)
 
     return result
 

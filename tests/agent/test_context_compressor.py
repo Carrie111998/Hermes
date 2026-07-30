@@ -98,6 +98,23 @@ class TestUpdateFromResponse:
         compressor.update_from_response({})
         assert compressor.last_prompt_tokens == 0
 
+    def test_zero_prompt_keeps_post_compaction_verdict_pending(self, compressor):
+        """A normalised zero is indistinguishable from missing provider usage."""
+        compressor.awaiting_real_usage_after_compression = True
+        compressor._verify_compaction_cleared_threshold = True
+        compressor.last_prompt_tokens = -1
+
+        compressor.update_from_response({"prompt_tokens": 0})
+
+        assert compressor.last_prompt_tokens == -1
+        assert compressor.awaiting_real_usage_after_compression is True
+        assert compressor._verify_compaction_cleared_threshold is True
+
+        compressor.update_from_response({"prompt_tokens": 5_000})
+
+        assert compressor.awaiting_real_usage_after_compression is False
+        assert compressor._verify_compaction_cleared_threshold is False
+
 class TestPreflightDeferral:
 
     def test_does_not_defer_when_rough_growth_is_large(self, compressor):
@@ -163,6 +180,134 @@ class TestCompress:
             f"active_task line should appear at most once (was triplicated in "
             f"#49307), found {count}x:\n{summary}"
         )
+
+    def test_fallback_preserves_failed_attempt_and_safe_resume_step(self):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+
+        turns = [
+            {"role": "user", "content": "run the migration"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command":"migrate"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "ERROR: migration timed out",
+            },
+        ]
+
+        summary = c._build_static_fallback_summary(
+            turns, reason="provider down"
+        )
+
+        assert "## Failed Attempts" in summary
+        assert "migration timed out" in summary
+        assert "do not repeat the same call unchanged" in summary
+        assert "## Next Safe Step" in summary
+        assert "Verify the current repository/session state" in summary
+
+    def test_static_fallback_ignores_explicit_zero_failure_counters(self):
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+
+        summary = c._build_static_fallback_summary(
+            [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "terminal",
+                                "arguments": '{"command":"pytest -q"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "1312 passed, 0 failed, no errors",
+                },
+            ]
+        )
+
+        failed_section = summary.split("## Failed Attempts", 1)[1].split(
+            "## Next Safe Step", 1
+        )[0]
+        assert failed_section.strip() == "None."
+
+    def test_iterative_prompt_pins_failed_attempts_and_next_safe_step(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100000,
+        ):
+            c = ContextCompressor(model="test/model", quiet_mode=True)
+        c._previous_summary = (
+            "## Historical Task Snapshot\nold task\n\n"
+            "## Failed Attempts\n- old failed call"
+        )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            return_value=mock_response,
+        ) as mock_call:
+            summary = c._generate_summary(
+                [
+                    {"role": "user", "content": "continue safely"},
+                    {"role": "assistant", "content": "checking state"},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": '{"command":"migrate"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "ERROR: migration timed out",
+                    },
+                ]
+            )
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "## Failed Attempts" in prompt
+        assert "## Next Safe Step" in prompt
+        assert "Preserve failed approaches" in prompt
+        assert "Do not repeat unchanged" in prompt
+        assert 'Move items from "In Progress"' not in prompt
+        assert "## Failed Attempts" in summary
+        assert "migration timed out" in summary
+        assert "do not repeat the same call unchanged" in summary
+        assert "## Next Safe Step" in summary
+        assert "Verify the current repository/session state" in summary
 
     def test_threshold_below_window_at_minimum_ctx(self):
         """Regression for #14690: at context_length == MINIMUM_CONTEXT_LENGTH
@@ -464,7 +609,9 @@ class TestNonStringContent:
 
         assert summary.startswith(f"{SUMMARY_PREFIX}\n{HISTORICAL_TASK_HEADING}\n")
         assert "do something" in summary
-        assert summary.endswith("plain summary text")
+        assert "plain summary text" in summary
+        assert "## Failed Attempts" in summary
+        assert "## Next Safe Step" in summary
 
 
 
@@ -2693,4 +2840,3 @@ class TestContextLengthSetterCoherence:
         assert c.threshold_percent == 0.75
         # ...and budgets recompute from the same window+percent.
         assert c.threshold_tokens == 150_000
-

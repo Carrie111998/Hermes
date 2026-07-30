@@ -737,8 +737,7 @@ def apply_wal_with_fallback(
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
             raise WalUnsupportedError(str(exc)) from exc
         _log_wal_fallback_once(db_label, exc)
-        conn.execute("PRAGMA journal_mode=DELETE")
-        return "delete"
+        return _set_delete_journal_mode(conn, reason="fallback")
 
 
 def _apply_delete_for_wal_reset_bug(
@@ -3353,8 +3352,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         cooldown_until: float,
         error: Optional[str] = None,
+        *,
+        raise_on_error: bool = False,
     ) -> None:
-        """Persist the active compression-failure cooldown for a session."""
+        """Persist the active compression-failure cooldown for a session.
+
+        The default remains best-effort for ordinary compressor failure
+        handling.  A transaction rollback passes ``raise_on_error=True`` so
+        it never claims that its durable checkpoint was restored when SQLite
+        rejected the write.
+        """
         if not session_id:
             return
 
@@ -3372,6 +3379,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "record_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+            if raise_on_error:
+                raise
 
     def get_compression_failure_cooldown(
         self,
@@ -3410,8 +3419,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "error": error,
         }
 
-    def clear_compression_failure_cooldown(self, session_id: str) -> None:
-        """Clear any persisted compression-failure cooldown for a session."""
+    def clear_compression_failure_cooldown(
+        self,
+        session_id: str,
+        *,
+        raise_on_error: bool = False,
+    ) -> None:
+        """Clear any persisted compression-failure cooldown for a session.
+
+        ``raise_on_error`` is reserved for transactional rollback, where a
+        swallowed SQLite error would leave the durable cooldown divergent from
+        the restored in-memory compressor state.
+        """
         if not session_id:
             return
 
@@ -3429,6 +3448,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "clear_compression_failure_cooldown(%s) failed: %s",
                 session_id, exc,
             )
+            if raise_on_error:
+                raise
 
     def get_compression_fallback_streak(self, session_id: str) -> int:
         """Return the persisted deterministic-fallback streak."""
@@ -6025,7 +6046,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        system_prompt: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6068,10 +6093,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (inserted, tool_calls_total, session_id),
-            )
+            if system_prompt is None:
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                    (inserted, tool_calls_total, session_id),
+                )
+            else:
+                # The active transcript and assembled prompt describe one
+                # compaction boundary. Keep them in this same transaction so
+                # a prompt-write error rolls the archive/insert back too.
+                conn.execute(
+                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
+                    "system_prompt = ? WHERE id = ?",
+                    (inserted, tool_calls_total, system_prompt, session_id),
+                )
             return inserted
 
         return self._execute_write(_do)

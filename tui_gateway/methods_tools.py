@@ -984,6 +984,11 @@ def _(rid, params: dict) -> dict:
                 rid,
                 {"type": "exec", "output": str(ack.get("output") or "")},
             )
+        compression_reservation = _reserve_manual_compression(session)
+        if compression_reservation is None:
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /compress"
+            )
         try:
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
@@ -1066,6 +1071,9 @@ def _(rid, params: dict) -> dict:
                 committed=False,
             )
             return _err(rid, 5009, f"compress failed: {exc}")
+        finally:
+            _release_manual_compression(session, compression_reservation)
+            _drain_queued_prompt(rid, sid, session)
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 

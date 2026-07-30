@@ -40,11 +40,19 @@ export function ContextUsagePanel({
       .then(data => {
         if (!cancelled) {
           setBreakdown(data)
-          onUsageSnapshotRef.current?.({
-            context_max: data.context_max,
-            context_percent: data.context_percent,
-            context_used: data.context_used
-          })
+          // The breakdown falls back to a rough request-size estimate while
+          // compaction is waiting for the provider's next real usage report.
+          // Keep rendering that useful estimate in this panel, but do not let
+          // it replace the statusbar's last measured provider usage.
+          onUsageSnapshotRef.current?.(
+            data.context_used_estimated === false
+              ? {
+                  context_max: data.context_max,
+                  context_percent: data.context_percent,
+                  context_used: data.context_used
+                }
+              : { context_max: data.context_max }
+          )
         }
       })
       .catch(() => {

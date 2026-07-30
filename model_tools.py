@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+import copy
 import logging
 import threading
 import time
@@ -340,9 +341,10 @@ def get_tool_definitions(
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
-            # Return a shallow copy of the list but share the dict references —
-            # schemas are treated as read-only by all known callers.
-            return list(cached)
+            # Provider recovery paths sanitize nested schemas in-place. Return
+            # a deep copy so one agent cannot weaken the canonical cache entry
+            # (and therefore every later agent) through those mutations.
+            return copy.deepcopy(cached)
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
@@ -359,8 +361,9 @@ def get_tool_definitions(
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
-        return list(result)
+        canonical = copy.deepcopy(result)
+        _tool_defs_cache[cache_key] = canonical
+        return copy.deepcopy(canonical)
     return result
 
 
