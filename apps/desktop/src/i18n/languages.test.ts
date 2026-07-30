@@ -18,6 +18,10 @@ describe('desktop i18n languages', () => {
     expect(normalizeLocale('ar')).toBe('ar')
     expect(normalizeLocale('AR-SA')).toBe('ar')
     expect(normalizeLocale(' ar_eg ')).toBe('ar')
+    expect(normalizeLocale('ru')).toBe('ru')
+    expect(normalizeLocale('ru-RU')).toBe('ru')
+    expect(normalizeLocale('ru_ru')).toBe('ru')
+    expect(normalizeLocale('Russian')).toBe('ru')
   })
 
   it('falls back to English for empty or unsupported values', () => {
