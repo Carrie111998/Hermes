@@ -1,6 +1,7 @@
 """Tests for acp_adapter.server — HermesACPAgent ACP server."""
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -471,6 +472,7 @@ class TestSessionConfiguration:
                         "name": "OpenAI Codex",
                         "source": "built-in",
                         "models": [{"id": "gpt-5.4"}],
+                        "total_models": 1,
                     }
                 ]
             }
@@ -567,6 +569,100 @@ class TestSessionConfiguration:
             db.close()
 
     @pytest.mark.asyncio
+    async def test_set_session_model_allows_model_omitted_from_capped_canonical_catalog(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        try:
+            manager = SessionManager(
+                db=db,
+                agent_factory=lambda: SimpleNamespace(
+                    model="gpt-5.4",
+                    provider="openai-codex",
+                    base_url="https://api.openai.com/v1",
+                    api_mode="codex_responses",
+                ),
+            )
+            acp_agent = HermesACPAgent(session_manager=manager)
+            picker_context = MagicMock()
+            picker_context.with_overrides.return_value = picker_context
+            payload = {
+                "providers": [
+                    {
+                        "slug": "openai-codex",
+                        "name": "OpenAI Codex",
+                        "source": "built-in",
+                        "models": [{"id": "gpt-5.4"}],
+                        "total_models": 2,
+                    }
+                ]
+            }
+
+            with (
+                patch(
+                    "hermes_cli.inventory.load_picker_context",
+                    return_value=picker_context,
+                ),
+                patch(
+                    "hermes_cli.inventory.build_models_payload",
+                    return_value=payload,
+                ),
+                patch(
+                    "acp_adapter.server._named_custom_provider_catalogs",
+                    return_value=[],
+                ),
+            ):
+                new_resp = await acp_agent.new_session(cwd=str(tmp_path))
+                state = manager.get_session(new_resp.session_id)
+                assert state is not None
+                assert new_resp.models is not None
+
+                requested_choice = "openai-codex:gpt-5.5"
+                advertised_ids = {
+                    model.model_id for model in new_resp.models.available_models
+                }
+                assert requested_choice not in advertised_ids
+
+                replacement_agent = SimpleNamespace(
+                    model="gpt-5.5",
+                    provider="openai-codex",
+                    base_url="https://api.openai.com/v1",
+                    api_mode="codex_responses",
+                )
+                make_agent = MagicMock(return_value=replacement_agent)
+                monkeypatch.setattr(manager, "_make_agent", make_agent)
+                save_session = MagicMock(wraps=manager.save_session)
+                monkeypatch.setattr(manager, "save_session", save_session)
+
+                result = await acp_agent.set_session_model(
+                    model_id=requested_choice,
+                    session_id=state.session_id,
+                )
+
+            assert isinstance(result, SetSessionModelResponse)
+            make_agent.assert_called_once_with(
+                session_id=state.session_id,
+                cwd=str(tmp_path),
+                model="gpt-5.5",
+                requested_provider="openai-codex",
+                base_url="https://api.openai.com/v1",
+                api_mode="codex_responses",
+            )
+            save_session.assert_called_once_with(state.session_id)
+            assert state.model == "gpt-5.5"
+            assert state.agent is replacement_agent
+
+            persisted = db.get_session(state.session_id)
+            assert persisted is not None
+            assert persisted["model"] == "gpt-5.5"
+            persisted_route = json.loads(persisted["model_config"])
+            assert persisted_route["provider"] == "openai-codex"
+            assert persisted_route["base_url"] == "https://api.openai.com/v1"
+            assert persisted_route["api_mode"] == "codex_responses"
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "payload",
         [
@@ -595,6 +691,31 @@ class TestSessionConfiguration:
                     ]
                 },
                 id="custom-provider",
+            ),
+            pytest.param(
+                {
+                    "providers": [
+                        {
+                            "slug": "openrouter",
+                            "source": "built-in",
+                            "models": ["old-model"],
+                        }
+                    ]
+                },
+                id="missing-completeness",
+            ),
+            pytest.param(
+                {
+                    "providers": [
+                        {
+                            "slug": "openrouter",
+                            "source": "built-in",
+                            "models": ["old-model"],
+                            "total_models": "1",
+                        }
+                    ]
+                },
+                id="malformed-completeness",
             ),
         ],
     )

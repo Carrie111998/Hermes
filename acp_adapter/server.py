@@ -742,8 +742,9 @@ class HermesACPAgent(acp.Agent):
                 provider_name = str(row.get("name") or "").strip() or provider_label(
                     row_provider
                 )
+                row_models = row.get("models") or []
                 row_has_models = False
-                for model_entry in row.get("models") or []:
+                for model_entry in row_models:
                     if isinstance(model_entry, dict):
                         rendered_model = str(
                             model_entry.get("id")
@@ -775,10 +776,18 @@ class HermesACPAgent(acp.Agent):
                     seen_ids.add(choice_id)
 
                 row_source = str(row.get("source") or "").strip()
+                total_models = row.get("total_models")
+                row_is_exhaustive = (
+                    isinstance(row_models, list)
+                    and type(total_models) is int
+                    and total_models == len(row_models)
+                )
                 # These rows are fallbacks or non-exhaustive user catalogs.
-                # Keep them selectable without treating omission as invalid.
+                # ACP caps populated canonical rows, so only an exhaustive row
+                # has enough provenance to treat an omitted selection as invalid.
                 if (
                     row_has_models
+                    and row_is_exhaustive
                     and not row.get("is_user_defined")
                     and row_source not in {"configured-current", "model-config"}
                 ):
