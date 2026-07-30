@@ -4048,6 +4048,24 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    @staticmethod
+    def _is_stale_thread_error(error: Optional[str]) -> bool:
+        """Return True if the send was rejected because its topic/thread is gone.
+
+        Telegram rejects a send into a deleted or closed forum topic with
+        "Message thread not found".  The routing itself is dead, so replaying
+        it, which is what the plain-text fallback does by default, reproduces
+        the same rejection and the response is lost entirely.
+        """
+        if not error:
+            return False
+        lowered = error.lower()
+        return (
+            "message thread not found" in lowered
+            or "topic_closed" in lowered
+            or "topic_deleted" in lowered
+        )
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -4151,11 +4169,27 @@ class BasePlatformAdapter(ABC):
 
         # Non-network / post-retry formatting failure: try plain text as fallback
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
+        fallback_metadata = metadata
+        fallback_reply_to = reply_to
+        fallback_prefix = "(Response formatting failed, plain text:)"
+        if self._is_stale_thread_error(error_str):
+            # The topic this response was bound to no longer exists.  Sending
+            # again with the same routing reproduces the same rejection, so the
+            # fallback can only land if it drops the dead binding and goes to
+            # the chat root.  reply_to anchors inside that topic, so it has to
+            # go too, otherwise the retry just fails on the anchor instead.
+            if isinstance(metadata, dict):
+                fallback_metadata = {k: v for k, v in metadata.items() if k != "thread_id"}
+            fallback_reply_to = None
+            fallback_prefix = "(Original topic is gone, delivering here:)"
+            logger.warning(
+                "[%s] Stale topic - retrying fallback without the thread binding", self.name
+            )
         fallback_result = await self.send(
             chat_id=chat_id,
-            content=f"(Response formatting failed, plain text:)\n\n{content[:3500]}",
-            reply_to=reply_to,
-            metadata=metadata,
+            content=f"{fallback_prefix}\n\n{content[:3500]}",
+            reply_to=fallback_reply_to,
+            metadata=fallback_metadata,
         )
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
