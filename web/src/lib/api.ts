@@ -398,9 +398,13 @@ export const api = {
   },
   getSessionMessages: (
     id: string,
-    options: SessionMessageQuery = {},
+    profileOrOptions: string | SessionMessageQuery = {},
     profile = getManagementProfile(),
   ) => {
+    const options =
+      typeof profileOrOptions === "string" ? {} : profileOrOptions;
+    const resolvedProfile =
+      typeof profileOrOptions === "string" ? profileOrOptions : profile;
     const params = new URLSearchParams();
     if (options.includeCompacted !== undefined) {
       params.set("include_compacted", String(options.includeCompacted));
@@ -418,7 +422,9 @@ export const api = {
     const path =
       `/api/sessions/${encodeURIComponent(id)}/messages` +
       (query ? `?${query}` : "");
-    return fetchJSON<SessionMessagesResponse>(appendProfileParam(path, profile));
+    return fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(path, resolvedProfile),
+    );
   },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(

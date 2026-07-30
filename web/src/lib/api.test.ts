@@ -50,6 +50,19 @@ describe("api.getModelOptions", () => {
 });
 
 describe("api.getSessionMessages", () => {
+  it("preserves the legacy explicit-profile call signature", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({ session_id: "one", messages: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSessionMessages("one", "worker");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/one/messages?profile=worker",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
   it("requests the newest full-history page including compacted messages", async () => {
     vi.stubGlobal("window", {});
     const fetchMock = jsonFetchMock({ session_id: "session/one", messages: [] });
