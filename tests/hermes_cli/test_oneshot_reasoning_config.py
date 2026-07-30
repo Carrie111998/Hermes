@@ -98,6 +98,43 @@ def test_oneshot_applies_per_model_reasoning_override(monkeypatch):
     assert captured["reasoning_config"] is not None
 
 
+def test_oneshot_resolves_reasoning_for_remapped_model(monkeypatch):
+    """When provider auto-detection remaps an explicitly requested model
+    (oneshot.py's ``detect_provider_for_model`` branch), reasoning must be
+    resolved against the REMAPPED model, not the name the caller typed --
+    otherwise a per-model override keyed by the real model id is missed."""
+    import hermes_cli.models as models_mod
+    from hermes_cli import model_switch as ms_mod
+
+    cfg = {
+        "model": {"default": "cfg/unused"},
+        "agent": {
+            "reasoning_effort": "low",
+            "reasoning_overrides": {"real/remapped-model": "high"},
+        },
+    }
+    _wire_oneshot_stubs(monkeypatch, cfg)
+    # Force the catalog-detection branch: no direct alias, and detection
+    # remaps the requested name to the catalog's real model id.
+    monkeypatch.setattr(ms_mod, "_ensure_direct_aliases", lambda: None)
+    monkeypatch.setattr(ms_mod, "DIRECT_ALIASES", {})
+    monkeypatch.setattr(
+        models_mod,
+        "detect_provider_for_model",
+        lambda _model, _provider: ("openrouter", "real/remapped-model"),
+    )
+
+    oneshot._run_agent("hello", model="requested-alias", use_config_toolsets=False)
+
+    captured = _CapturingAgent.captured
+    assert captured["model"] == "real/remapped-model"
+    expected = resolve_reasoning_config(cfg, "real/remapped-model")
+    assert captured["reasoning_config"] == expected
+    # Guard that the assertion bites: resolving with the raw requested name
+    # would yield a different (global-effort) config.
+    assert expected != resolve_reasoning_config(cfg, "requested-alias")
+
+
 def test_oneshot_reasoning_absent_config_passes_none(monkeypatch):
     """No reasoning config anywhere -> the constructor receives None
     (unchanged default behavior, pinned so the wiring can't invent one)."""
