@@ -703,6 +703,30 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+def _check_plugin_configuration(manual_issues: list[str]) -> None:
+    """Report enabled plugin IDs that runtime discovery cannot resolve."""
+    _section("Plugins")
+    try:
+        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+        discover_plugins()
+        missing_plugins = get_plugin_manager().list_missing_enabled_plugins()
+        if missing_plugins:
+            for plugin_id in missing_plugins:
+                check_fail(
+                    f"Enabled plugin '{plugin_id}' not found",
+                    f"(reinstall it or run `hermes plugins disable {plugin_id}`)",
+                )
+                manual_issues.append(
+                    f"Reinstall enabled plugin '{plugin_id}' or remove it from "
+                    f"plugins.enabled with `hermes plugins disable {plugin_id}`"
+                )
+        else:
+            check_ok("All enabled plugins found")
+    except Exception as e:
+        check_warn("Plugin discovery check failed", str(e))
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -1335,6 +1359,8 @@ def run_doctor(args):
             report_deprecated_config_and_env({}, _env_for_depr)
         except Exception:
             pass
+
+    _check_plugin_configuration(manual_issues)
 
     _section("xAI Model Retirement (May 15, 2026)")
 

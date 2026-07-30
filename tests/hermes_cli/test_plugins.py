@@ -15,6 +15,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    find_missing_enabled_plugins,
     get_plugin_command_handler,
     get_plugin_commands,
     get_pre_tool_call_block_message,
@@ -91,6 +92,71 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
+
+    def test_missing_enabled_plugin_is_reported(self, tmp_path, monkeypatch, caplog):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(exist_ok=True)
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["vanished-plugin"]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        manager = PluginManager()
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            manager.discover_and_load()
+
+        assert manager.list_missing_enabled_plugins() == ["vanished-plugin"]
+        assert "Configured plugin(s) not found: vanished-plugin" in caplog.text
+
+    def test_present_plugin_satisfies_enabled_manifest_name_or_key(self):
+        manifests = [
+            ("manifest-name", "category/plugin-dir"),
+        ]
+
+        assert find_missing_enabled_plugins(
+            {"manifest-name", "category/plugin-dir"},
+            manifests,
+        ) == []
+
+    def test_explicitly_disabled_missing_plugin_is_not_reported(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / "hermes_test"
+        hermes_home.mkdir(exist_ok=True)
+        config = {
+            "plugins": {
+                "enabled": ["retired-plugin"],
+                "disabled": ["retired-plugin"],
+            }
+        }
+        (hermes_home / "config.yaml").write_text(yaml.safe_dump(config))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        manager = PluginManager()
+        manager.discover_and_load()
+
+        assert manager.list_missing_enabled_plugins() == []
+
+    def test_doctor_reports_missing_enabled_plugin(self, monkeypatch, capsys):
+        from hermes_cli import doctor
+        from hermes_cli import plugins as plugins_module
+
+        manager = types.SimpleNamespace(
+            list_missing_enabled_plugins=lambda: ["vanished-plugin"]
+        )
+        monkeypatch.setattr(plugins_module, "discover_plugins", lambda: None)
+        monkeypatch.setattr(plugins_module, "get_plugin_manager", lambda: manager)
+        manual_issues = []
+
+        doctor._check_plugin_configuration(manual_issues)
+
+        output = capsys.readouterr().out
+        assert "Enabled plugin 'vanished-plugin' not found" in output
+        assert "hermes plugins disable vanished-plugin" in output
+        assert manual_issues == [
+            "Reinstall enabled plugin 'vanished-plugin' or remove it from "
+            "plugins.enabled with `hermes plugins disable vanished-plugin`"
+        ]
 
 
     def test_plugin_can_register_and_invoke_middleware(self, tmp_path, monkeypatch):

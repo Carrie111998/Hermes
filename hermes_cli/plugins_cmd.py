@@ -952,13 +952,18 @@ def cmd_disable(name: str) -> None:
     from rich.console import Console
 
     console = Console()
-    key = _resolve_plugin_key(name)
-    if key is None:
-        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
-        sys.exit(1)
-
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
+    key = _resolve_plugin_key(name)
+    if key is None:
+        # A configured plugin can disappear from disk after an interrupted
+        # install/update or manual deletion.  Let users clear that stale
+        # allow-list entry even though discovery can no longer resolve it.
+        if name in enabled or name in disabled:
+            key = name
+        else:
+            console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+            sys.exit(1)
 
     if key not in enabled and key in disabled:
         console.print(f"[dim]Plugin '{key}' is already disabled.[/dim]")
@@ -1134,23 +1139,43 @@ def cmd_list(args: Any | None = None) -> None:
     """List all plugins (bundled + user) with enabled/disabled state."""
     from rich.console import Console
     from rich.table import Table
+    from hermes_cli.plugins import find_missing_enabled_plugins
 
     console = Console()
     entries = _discover_all_plugins()
+    enabled = _get_enabled_set()
+    disabled = _get_disabled_set()
+    missing = find_missing_enabled_plugins(
+        enabled - disabled,
+        ((name, key) for name, _version, _description, _source, _dir, key in entries),
+    )
+    entries.extend(
+        (
+            plugin_id,
+            "",
+            "Configured as enabled but not found",
+            "missing",
+            None,
+            plugin_id,
+        )
+        for plugin_id in missing
+    )
     if not entries:
         console.print("[dim]No plugins installed.[/dim]")
         console.print("[dim]Install with:[/dim] hermes plugins install owner/repo")
         return
 
-    enabled = _get_enabled_set()
-    disabled = _get_disabled_set()
     entries = _filter_plugin_entries(entries, args, enabled, disabled)
 
     if getattr(args, "json", False):
         payload = [
             {
                 "name": name,
-                "status": _plugin_status(name, enabled, disabled, key=key),
+                "status": (
+                    "missing"
+                    if source == "missing"
+                    else _plugin_status(name, enabled, disabled, key=key)
+                ),
                 "version": str(version),
                 "description": description,
                 "source": source,
@@ -1162,7 +1187,11 @@ def cmd_list(args: Any | None = None) -> None:
 
     if getattr(args, "plain", False):
         for name, version, _description, source, _dir, key in entries:
-            status = _plugin_status(name, enabled, disabled, key=key)
+            status = (
+                "missing"
+                if source == "missing"
+                else _plugin_status(name, enabled, disabled, key=key)
+            )
             print(f"{status:12} {source:8} {str(version):8} {name}")
         return
 
@@ -1178,9 +1207,15 @@ def cmd_list(args: Any | None = None) -> None:
     table.add_column("Source", style="dim")
 
     for name, version, description, source, _dir, key in entries:
-        status_name = _plugin_status(name, enabled, disabled, key=key)
+        status_name = (
+            "missing"
+            if source == "missing"
+            else _plugin_status(name, enabled, disabled, key=key)
+        )
         if status_name == "disabled":
             status = "[red]disabled[/red]"
+        elif status_name == "missing":
+            status = "[red]missing[/red]"
         elif status_name == "enabled":
             status = "[green]enabled[/green]"
         else:

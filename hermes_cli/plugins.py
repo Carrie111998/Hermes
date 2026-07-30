@@ -44,7 +44,7 @@ import threading
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home
 from utils import env_var_enabled, fast_safe_load
@@ -268,6 +268,33 @@ def _get_enabled_plugins() -> Optional[set]:
         return set(enabled)
     except Exception:
         return None
+
+
+def find_missing_enabled_plugins(
+    enabled: Optional[Iterable[str]],
+    available: Iterable[Tuple[str, str]],
+) -> List[str]:
+    """Return configured plugin IDs that discovery could not resolve.
+
+    ``plugins.enabled`` historically accepted either a manifest name or the
+    path-derived registry key, so both identifiers count as available.  Keep
+    this comparison side-effect free so runtime discovery, ``plugins list``,
+    and ``doctor`` can share the same contract.
+    """
+    if enabled is None:
+        return []
+
+    known: Set[str] = set()
+    for name, key in available:
+        if name:
+            known.add(name)
+        if key:
+            known.add(key)
+    return sorted(
+        plugin_id
+        for plugin_id in enabled
+        if isinstance(plugin_id, str) and plugin_id not in known
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1277,6 +1304,7 @@ class PluginManager:
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
         self._discovered: bool = False
+        self._missing_enabled_plugins: List[str] = []
         self._cli_ref = None  # Set by CLI after plugin discovery
         # Plugin skill registry: qualified name → metadata dict.
         self._plugin_skills: Dict[str, Dict[str, Any]] = {}
@@ -1319,6 +1347,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._missing_enabled_plugins.clear()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -1401,6 +1430,19 @@ class PluginManager:
         winners: Dict[str, PluginManifest] = {}
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
+        self._missing_enabled_plugins = find_missing_enabled_plugins(
+            enabled - disabled if enabled is not None else None,
+            (
+                (manifest.name, manifest.key or manifest.name)
+                for manifest in winners.values()
+            ),
+        )
+        if self._missing_enabled_plugins:
+            logger.warning(
+                "Configured plugin(s) not found: %s. Reinstall them or remove "
+                "them from plugins.enabled with `hermes plugins disable <name>`.",
+                ", ".join(self._missing_enabled_plugins),
+            )
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
 
@@ -2017,6 +2059,10 @@ class PluginManager:
                 }
             )
         return result
+
+    def list_missing_enabled_plugins(self) -> List[str]:
+        """Return enabled plugin identifiers that were not discovered."""
+        return list(self._missing_enabled_plugins)
 
     # -----------------------------------------------------------------------
     # Plugin skill lookups
