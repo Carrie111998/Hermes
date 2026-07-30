@@ -6,6 +6,16 @@ from pathlib import Path, PureWindowsPath
 
 
 _WIN32_COMPONENT_FORBIDDEN = frozenset('<>:"|?*')
+_RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+    }
+)
 
 
 class SidebarPlacementError(ValueError):
@@ -60,24 +70,25 @@ def ordinary_windows_path_identity(value: object) -> str | None:
         ):
             return None
         components = [part for part in tail.lstrip("\\").split("\\") if part]
-        reserved_names = {
-            "con", "prn", "aux", "nul",
-            *(f"com{number}" for number in range(1, 10)),
-            *(f"lpt{number}" for number in range(1, 10)),
-        }
-        if any(
-            component.endswith((".", " "))
-            or any(
-                ord(character) <= 31 or character in _WIN32_COMPONENT_FORBIDDEN
-                for character in component
-            )
-            or component.split(".", 1)[0].casefold() in reserved_names
-            for component in components
-        ):
+        if is_unc_qualified:
+            components = [*unc_parts, *components]
+        if any(not _is_ordinary_windows_component(component) for component in components):
             return None
         return identity
     except (TypeError, ValueError):
         return None
+
+
+def _is_ordinary_windows_component(component: str) -> bool:
+    return (
+        not component.endswith((".", " "))
+        and not any(
+            ord(character) <= 31 or character in _WIN32_COMPONENT_FORBIDDEN
+            for character in component
+        )
+        and component.split(".", 1)[0].casefold()
+        not in _RESERVED_WINDOWS_COMPONENT_NAMES
+    )
 
 
 def resolve_sidebar_placement(

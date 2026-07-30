@@ -19,6 +19,10 @@ from session_bridge.sidebar_placement import (
         ("C:/Users/diego/.hermes", "c:\\users\\diego\\.hermes"),
         ("c:\\USERS\\diego\\.hermes", "c:\\users\\diego\\.hermes"),
         ("\\\\server\\share\\workspace", "\\\\server\\share\\workspace"),
+        (
+            "\\\\servidor東京\\shareüber\\workspace",
+            "\\\\servidor東京\\shareüber\\workspace",
+        ),
         ("C:/workspace/東京/über", "c:\\workspace\\東京\\über"),
     ],
 )
@@ -72,6 +76,46 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
     component: str,
 ) -> None:
     assert ordinary_windows_path_identity(f"C:/workspace/{component}") is None
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        "bad*server",
+        "bad?server",
+        'bad"server',
+        "bad<server",
+        "bad>server",
+        "bad|server",
+        "bad\x00server",
+        "bad\x07server",
+        "bad\x1fserver",
+    ],
+)
+def test_ordinary_windows_path_identity_rejects_invalid_unc_server(
+    server: str,
+) -> None:
+    assert ordinary_windows_path_identity(f"\\\\{server}\\share\\workspace") is None
+
+
+@pytest.mark.parametrize(
+    "share",
+    [
+        "bad*share",
+        "bad?share",
+        'bad"share',
+        "bad<share",
+        "bad>share",
+        "bad|share",
+        "bad\x00share",
+        "bad\x07share",
+        "bad\x1fshare",
+    ],
+)
+def test_ordinary_windows_path_identity_rejects_invalid_unc_share(
+    share: str,
+) -> None:
+    assert ordinary_windows_path_identity(f"\\\\server\\{share}\\workspace") is None
 
 
 def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) -> None:
