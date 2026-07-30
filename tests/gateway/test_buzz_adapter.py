@@ -549,7 +549,80 @@ def test_normalize_buzz_auth_tag_compacts_json():
     raw = """[\n  \"auth\",\n  \"ownerhex\",\n  \"agenthex\",\n  \"sig\"\n]"""
     assert _normalize_buzz_auth_tag(raw) == '["auth","ownerhex","agenthex","sig"]'
     assert _normalize_buzz_auth_tag("   ") == ""
-    assert _normalize_buzz_auth_tag("not-json") == "not-json"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "not-json",
+        "{}",
+        '["auth","ownerhex","agenthex"]',
+        '["other","ownerhex","agenthex","sig"]',
+        '["auth","ownerhex","agenthex",1]',
+    ],
+)
+def test_normalize_buzz_auth_tag_rejects_values_the_live_auth_path_cannot_use(raw):
+    with pytest.raises(ValueError, match="BUZZ_AUTH_TAG"):
+        _normalize_buzz_auth_tag(raw)
+
+
+def test_interactive_setup_resolves_cli_and_reprompts_invalid_auth_tag(monkeypatch):
+    import hermes_cli.setup as setup_mod
+
+    valid_auth_tag = '["auth","ownerhex","agenthex","sig"]'
+    answers = iter(
+        [
+            "",
+            "https://community.example",
+            "nsec1test",
+            "not-json",
+            valid_auth_tag,
+            "",
+            "",
+            "",
+        ]
+    )
+    yes_no_answers = iter([True, False])
+    saved = {}
+    writes = []
+    warnings = []
+    resolver_calls = []
+
+    def fake_save_env_value(key, value):
+        saved[key] = value
+        writes.append((key, value))
+
+    def fake_resolve_cli_path(configured=""):
+        resolver_calls.append(configured)
+        return ""
+
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt_yes_no",
+        lambda *_args, **_kwargs: next(yes_no_answers),
+    )
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: saved.get(key, ""))
+    monkeypatch.setattr(setup_mod, "save_env_value", fake_save_env_value)
+    monkeypatch.setattr(setup_mod, "print_header", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(setup_mod, "print_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(setup_mod, "print_success", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        setup_mod,
+        "print_warning",
+        lambda message, *_args, **_kwargs: warnings.append(message),
+    )
+    monkeypatch.setattr(_buzz_mod, "_resolve_cli_path", fake_resolve_cli_path)
+    monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda *_args, **_kwargs: "nsec1test")
+
+    _buzz_mod.interactive_setup()
+
+    assert resolver_calls == ["", ""]
+    assert saved["BUZZ_RELAY_URL"] == "https://community.example"
+    assert saved["BUZZ_PRIVATE_KEY"] == "nsec1test"
+    assert saved["BUZZ_AUTH_TAG"] == valid_auth_tag
+    assert [value for key, value in writes if key == "BUZZ_AUTH_TAG"] == [valid_auth_tag]
+    assert any("must be valid JSON" in warning for warning in warnings)
 
 
 def test_buzz_recommended_setup_steps_cover_field_path():

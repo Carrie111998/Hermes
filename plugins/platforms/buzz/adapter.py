@@ -1387,16 +1387,24 @@ def normalize_buzz_auth_tag(raw: str) -> str:
     """Normalize a pasted NIP-OA auth tag for ``BUZZ_AUTH_TAG``.
 
     Accepts pretty-printed JSON or compact JSON. Returns compact JSON suitable
-    for ``save_env_value`` (which will quote the line). Empty / whitespace
-    input returns empty string.
+    for ``save_env_value`` (which will quote the line). Raises ``ValueError``
+    when the value cannot be used by the live WebSocket authentication path.
+    Empty / whitespace input returns empty string.
     """
     text = (raw or "").strip()
     if not text:
         return ""
     try:
         parsed = json.loads(text)
-    except ValueError:
-        return text
+    except json.JSONDecodeError as exc:
+        raise ValueError("BUZZ_AUTH_TAG must be valid JSON") from exc
+    if (
+        not isinstance(parsed, list)
+        or len(parsed) != 4
+        or parsed[0] != "auth"
+        or not all(isinstance(part, str) for part in parsed)
+    ):
+        raise ValueError('BUZZ_AUTH_TAG must be a four-string ["auth", ...] tag')
     return json.dumps(parsed, separators=(",", ":"))
 
 
@@ -1468,7 +1476,7 @@ def interactive_setup() -> None:
 
     # CLI presence
     cli_default = get_env_value("BUZZ_CLI_PATH") or ""
-    resolved_cli = _find_buzz_cli(cli_default or None)
+    resolved_cli = _resolve_cli_path(cli_default)
     if resolved_cli:
         print_info(f"Found buzz CLI: {resolved_cli}")
     else:
@@ -1506,10 +1514,18 @@ def interactive_setup() -> None:
         "NIP-OA auth tag (Desktop agent create shows this; required on many community relays)."
     )
     print_info('Paste the full JSON array, e.g. ["auth","<owner>","<agent>","<sig>"].')
-    auth_raw = prompt("BUZZ_AUTH_TAG JSON (blank keeps current / none)", default="")
-    if auth_raw.strip():
-        save_env_value("BUZZ_AUTH_TAG", normalize_buzz_auth_tag(auth_raw))
+    while True:
+        auth_raw = prompt("BUZZ_AUTH_TAG JSON (blank keeps current / none)", default="")
+        if not auth_raw.strip():
+            break
+        try:
+            auth_tag = normalize_buzz_auth_tag(auth_raw)
+        except ValueError as exc:
+            print_warning(f"Invalid auth tag: {exc}")
+            continue
+        save_env_value("BUZZ_AUTH_TAG", auth_tag)
         print_success("Auth tag saved")
+        break
 
     # Mentions: recommended default for multi-agent channels
     print()
@@ -1548,7 +1564,7 @@ def interactive_setup() -> None:
 
     # Live membership / join assist when CLI + key are present
     private_key = _resolve_private_key()
-    cli_bin = resolved_cli or _find_buzz_cli(get_env_value("BUZZ_CLI_PATH") or None)
+    cli_bin = resolved_cli or _resolve_cli_path(get_env_value("BUZZ_CLI_PATH") or "")
     if private_key and cli_bin:
         print()
         print_info("Probing relay membership with buzz CLI…")
