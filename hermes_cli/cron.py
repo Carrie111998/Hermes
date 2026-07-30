@@ -96,11 +96,40 @@ def _warn_if_gateway_not_running() -> None:
     print(color("     Check status:  hermes cron status", Colors.DIM))
 
 
-def cron_list(show_all: bool = False):
+def _canonical_job(job: dict) -> dict:
+    """Return the stable persisted-job shape used by automation clients."""
+    repeat = job.get("repeat") or {}
+    schedule = job.get("schedule") or {}
+    deliver = job.get("deliver") or "local"
+    platform = recipient = thread = None
+    if isinstance(deliver, str):
+        parts = deliver.split(":", 2)
+        if len(parts) >= 2 and parts[0] in {"telegram", "discord", "signal"}:
+            platform, recipient = parts[0], parts[1]
+            thread = parts[2] if len(parts) == 3 else None
+    return {
+        "id": job.get("id"), "name": job.get("name"),
+        "enabled": bool(job.get("enabled", True)),
+        "state": job.get("state", "scheduled"),
+        "schedule": job.get("schedule_display") or schedule.get("display"),
+        "run_at": schedule.get("run_at"), "next_run_at": job.get("next_run_at"),
+        "repeat": repeat.get("times"), "delivery": deliver, "deliver": deliver,
+        "platform": platform, "recipient": recipient, "thread": thread,
+        "script": job.get("script"), "skills": list(job.get("skills") or []),
+        "no_agent": bool(job.get("no_agent", False)),
+        "prompt": job.get("prompt"), "model": job.get("model"),
+        "provider": job.get("provider"), "workdir": job.get("workdir"),
+    }
+
+
+def cron_list(show_all: bool = False, *, json_mode: bool = False):
     """List all scheduled jobs."""
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+    if json_mode:
+        print(json.dumps([_canonical_job(job) for job in jobs], ensure_ascii=False, sort_keys=True))
+        return
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -356,6 +385,10 @@ def cron_create(args):
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
+    if getattr(args, "json", False):
+        from cron.jobs import get_job
+        print(json.dumps(_canonical_job(get_job(result["job_id"]) or {}), ensure_ascii=False, sort_keys=True))
+        return 0
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}")
     print(f"  Schedule: {result['schedule']}")
@@ -422,6 +455,11 @@ def cron_edit(args):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
 
+    if getattr(args, "json", False):
+        from cron.jobs import get_job
+        print(json.dumps(_canonical_job(get_job(args.job_id) or {}), ensure_ascii=False, sort_keys=True))
+        return 0
+
     updated = result["job"]
     print(color(f"Updated job: {updated['job_id']}", Colors.GREEN))
     print(f"  Name: {updated['name']}")
@@ -466,7 +504,7 @@ def cron_command(args):
 
     if subcmd is None or subcmd == "list":
         show_all = getattr(args, 'all', False)
-        cron_list(show_all)
+        cron_list(show_all, json_mode=bool(getattr(args, "json", False)))
         return 0
 
     if subcmd == "status":

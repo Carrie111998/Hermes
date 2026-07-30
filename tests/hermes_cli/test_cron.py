@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 from types import SimpleNamespace
+import json
 
 import pytest
 
@@ -234,3 +235,47 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "Failed to create job: boom" in out
+
+
+def test_json_list_exposes_canonical_persisted_fields(tmp_cron_dir, capsys):
+    job = create_job(
+        prompt="",
+        schedule="every 1m",
+        name="Recovery",
+        repeat=0,
+        deliver="telegram:-1004416879179:4",
+        script="kanban_blocked_recovery_controller.py",
+        skills=[],
+        no_agent=True,
+    )
+    cron_command(SimpleNamespace(cron_command="list", all=True, json=True))
+    value = json.loads(capsys.readouterr().out)
+    assert value == [{
+        "delivery": "telegram:-1004416879179:4", "deliver": "telegram:-1004416879179:4",
+        "enabled": True, "id": job["id"], "model": None, "name": "Recovery",
+        "no_agent": True, "next_run_at": job["next_run_at"], "platform": "telegram",
+        "prompt": "", "provider": None, "recipient": "-1004416879179", "repeat": None,
+        "run_at": None, "schedule": "every 1m", "script": "kanban_blocked_recovery_controller.py",
+        "skills": [], "state": "scheduled", "thread": "4", "workdir": None,
+    }]
+
+
+def test_json_create_and_edit_emit_canonical_job(tmp_cron_dir, capsys):
+    args = SimpleNamespace(
+        cron_command="create", schedule="every 1m", prompt="", name="Recovery",
+        deliver="telegram:-1004416879179:4", repeat=0, skill=None, skills=None,
+        script="recovery.py", workdir=None, no_agent=True, model=None,
+        model_provider=None, json=True,
+    )
+    assert cron_cli.cron_create(args) == 0
+    created = json.loads(capsys.readouterr().out)
+    assert created["id"] and created["repeat"] is None and created["no_agent"] is True
+    edit = SimpleNamespace(
+        cron_command="edit", job_id=created["id"], schedule=None, prompt=None, name="Recovery",
+        deliver="telegram:-1004416879179:4", repeat=0, skill=None, skills=None,
+        clear_skills=True, add_skills=None, remove_skills=None, script="recovery.py",
+        workdir="", no_agent=True, model="", model_provider="", json=True,
+    )
+    assert cron_cli.cron_edit(edit) == 0
+    updated = json.loads(capsys.readouterr().out)
+    assert updated["id"] == created["id"] and updated["repeat"] is None

@@ -22,6 +22,7 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron list
     cron_list = cron_subparsers.add_parser("list", help="List scheduled jobs")
     cron_list.add_argument("--all", action="store_true", help="Include disabled jobs")
+    cron_list.add_argument("--json", action="store_true", help="Emit canonical JSON")
 
     # cron create/add
     cron_create = cron_subparsers.add_parser(
@@ -83,6 +84,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+
+    cron_create.add_argument("--json", action="store_true", help="Emit canonical JSON")
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -160,6 +163,8 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+
+    cron_edit.add_argument("--json", action="store_true", help="Emit canonical JSON")
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")
