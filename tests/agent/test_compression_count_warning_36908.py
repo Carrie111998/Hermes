@@ -146,6 +146,8 @@ def _agent_from_compression_config(warn_after_compressions):
     cfg = {"compression": {"warn_after_compressions": warn_after_compressions}}
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}), patch(
         "hermes_cli.config.load_config", return_value=cfg
+    ), patch(
+        "hermes_cli.config.load_config_readonly", return_value=cfg
     ):
         from run_agent import AIAgent
 
