@@ -113,6 +113,20 @@ class TestMattermostDMThreadContext:
         assert message.text == "follow up"
         self.adapter._api_get.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_top_level_dm_roots_session_without_fetching_thread_context(self):
+        self.adapter._reply_mode = "thread"
+        self.adapter._api_get = AsyncMock()
+
+        await self.adapter._handle_ws_event(
+            self._event(root_id="", post_id="opening_post")
+        )
+
+        message = self.adapter.handle_message.call_args.args[0]
+        assert message.source.thread_id == "opening_post"
+        assert message.text == "follow up"
+        self.adapter._api_get.assert_not_awaited()
+
     def test_active_thread_detection_survives_session_store_restart(
         self, tmp_path, monkeypatch
     ):
