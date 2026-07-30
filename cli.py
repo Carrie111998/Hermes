@@ -5293,6 +5293,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             width = self._get_tui_terminal_width()
         return width < 64
 
+    def _get_vim_mode_label(self) -> str:
+        """Return current vim mode label for status bar, or empty if not in vi mode."""
+        try:
+            app = getattr(self, '_app', None)
+            if not app:
+                return ""
+            # Only show vim mode indicator when editing_mode is VI
+            if app.editing_mode != EditingMode.VI:
+                return ""
+            # Get the vi_state from the app
+            vi_state = getattr(app, 'vi_state', None)
+            if not vi_state:
+                return ""
+            from prompt_toolkit.key_binding.vi_state import InputMode
+            mode = vi_state.input_mode
+            if mode == InputMode.NAVIGATION:
+                return "NORMAL"
+            elif mode == InputMode.INSERT:
+                return "INSERT"
+            elif mode == InputMode.REPLACE:
+                return "REPLACE"
+            else:
+                return ""
+        except Exception:
+            return ""
+
     @staticmethod
     def _scrollback_box_width(width: Optional[int] = None) -> int:
         """Return the full viewport width for printed scrollback box rules.
@@ -5757,6 +5783,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_label = snapshot.get("battery_label") or ""
             battery_prefix = f"{battery_label} │ " if battery_label else ""
             focus_label = snapshot.get("focus_label") or ""
+            vim_mode_label = self._get_vim_mode_label()
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
@@ -5768,6 +5795,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += f" · {focus_label}"
                 if yolo_active:
                     text += " · ⚠ YOLO"
+                if vim_mode_label:
+                    text += f" · {vim_mode_label}"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
@@ -5792,6 +5821,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     parts.append(focus_label)
                 if yolo_active:
                     parts.append("⚠ YOLO")
+                if vim_mode_label:
+                    parts.append(vim_mode_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
 
             if snapshot["context_length"]:
@@ -5829,6 +5860,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(focus_label)
             if yolo_active:
                 parts.append("⚠ YOLO")
+            if vim_mode_label:
+                parts.append(vim_mode_label)
             return self._trim_status_bar_text(" │ ".join(parts), width)
         except Exception:
             return f"⚕ {self.model if getattr(self, 'model', None) else 'Hermes'}"
@@ -5850,6 +5883,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_label = snapshot.get("battery_label") or ""
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
+            vim_mode_label = self._get_vim_mode_label()
 
             if width < 52:
                 frags = [
@@ -5867,6 +5901,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if yolo_active:
                     frags.append(("class:status-bar-dim", " · "))
                     frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                if vim_mode_label:
+                    frags.append(("class:status-bar-dim", " · "))
+                    frags.append(("class:status-bar-strong", vim_mode_label))
                 frags.append(("class:status-bar", " "))
             else:
                 percent = snapshot["context_percent"]
@@ -5907,6 +5944,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if vim_mode_label:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-strong", vim_mode_label))
                     frags.append(("class:status-bar", " "))
                 else:
                     if snapshot["context_length"]:
@@ -5968,6 +6008,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if yolo_active:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append(("class:status-bar-yolo", "⚠ YOLO"))
+                    if vim_mode_label:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", vim_mode_label))
                     frags.append(("class:status-bar", " "))
 
             # Battery is the first status-bar element when enabled: prepend it
