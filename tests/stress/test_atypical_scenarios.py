@@ -937,7 +937,7 @@ def _(home, kb):
     kb.init_db()
     conn = kb.connect()
     try:
-        # Create one parent in each possible non-done state
+        # Create parents spanning open and terminal states.
         p_ready = kb.create_task(conn, title="p-ready", assignee="w")
         p_running = kb.create_task(conn, title="p-running", assignee="w")
         kb.claim_task(conn, p_running)
@@ -952,7 +952,7 @@ def _(home, kb):
 
         # Child with just one parent, cycle it through each state
         for parent, expected in [
-            (p_ready, "todo"),     # parent not done → child stays todo
+            (p_ready, "todo"),     # open parent → child stays todo
             (p_running, "todo"),
             (p_blocked, "todo"),
             (p_triage, "todo"),

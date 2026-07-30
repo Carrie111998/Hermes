@@ -110,7 +110,7 @@ def run() -> int:
                 if claimed is None:
                     continue
                 # Invariant: a successful claim on `tid` must mean all
-                # parents are 'done'. Check in the same connection txn
+                # parents are terminal. Check in the same connection txn
                 # so we see the post-claim state.
                 undone = conn.execute(
                     "SELECT l.parent_id, p.status FROM task_links l "
@@ -120,7 +120,7 @@ def run() -> int:
                 ).fetchall()
                 if undone:
                     violations.append(
-                        f"claimed {tid} while parents not done: "
+                        f"claimed {tid} while parents not terminal: "
                         + ",".join(f"{r['parent_id']}={r['status']}" for r in undone)
                     )
                 # Release so the run doesn't leak and the next round sees ready.
@@ -142,7 +142,7 @@ def run() -> int:
         w.join(timeout=WORKERS_RUN_DURATION_S + 2)
 
     # Post-run audit: the DB event log must show no 'claimed' event on any
-    # task whose parents were not 'done' at the time of the claim.
+    # task whose parents were not terminal at the time of the claim.
     conn = kb.connect()
     try:
         bad = conn.execute(

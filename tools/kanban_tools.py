@@ -1862,7 +1862,7 @@ KANBAN_CREATE_SCHEMA = {
                 "items": {"type": "string"},
                 "description": (
                     "Parent task ids. The new task stays in 'todo' "
-                    "until every parent reaches 'done'; then it "
+                    "until every parent reaches 'done' or 'archived'; then it "
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
@@ -2029,7 +2029,7 @@ KANBAN_LINK_SCHEMA = {
     "description": (
         "Add a parent→child dependency edge after both tasks already "
         "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "are 'done' or 'archived'. Cycles and self-links are rejected."
     ),
     "parameters": {
         "type": "object",

@@ -19,13 +19,25 @@ import pytest
 # Gating
 # ---------------------------------------------------------------------------
 
-def test_kanban_block_schema_requires_explicit_dependency_unblock():
-    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+def test_kanban_tool_schemas_describe_current_dependency_contract():
+    from tools.kanban_tools import (
+        KANBAN_BLOCK_SCHEMA,
+        KANBAN_CREATE_SCHEMA,
+        KANBAN_LINK_SCHEMA,
+    )
 
-    description = KANBAN_BLOCK_SCHEMA["description"].lower()
-    assert "explicit unblock" in description
-    assert "auto-resumes" not in description
-    assert "goes to todo" not in description
+    block_description = KANBAN_BLOCK_SCHEMA["description"].lower()
+    assert "explicit unblock" in block_description
+    assert "auto-resumes" not in block_description
+    assert "goes to todo" not in block_description
+
+    parent_description = (
+        KANBAN_CREATE_SCHEMA["parameters"]["properties"]["parents"]["description"]
+    ).lower()
+    link_description = KANBAN_LINK_SCHEMA["description"].lower()
+    for description in (parent_description, link_description):
+        assert "done" in description
+        assert "archived" in description
 
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
