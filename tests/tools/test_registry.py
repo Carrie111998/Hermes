@@ -40,7 +40,7 @@ class TestRegisterAndDispatch:
         metadata = {"event": "agent.intent", "fields": ["text", "speech"]}
         reg.register(
             name="report_intent",
-            toolset="voicepilot",
+            toolset="plugin",
             schema=_make_schema("report_intent"),
             handler=_dummy_handler,
             run_start_event=metadata,
@@ -116,7 +116,7 @@ class TestRegisterAndDispatch:
         with pytest.raises(ValueError):
             reg.register(
                 name="report_intent",
-                toolset="voicepilot",
+                toolset="plugin",
                 schema=_make_schema("report_intent"),
                 handler=_dummy_handler,
                 run_start_event=metadata,
