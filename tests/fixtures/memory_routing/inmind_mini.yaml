@@ -1,0 +1,123 @@
+version: 0.1
+name: inmind_mini
+cases:
+  - id: ko-global-direct-color
+    prompt: "내 커피잔 취향을 기억하고 있나?"
+    task_type: direct_recall
+    memory_location: global
+    split: known_domain
+    control: false
+    memory: "사용자는 파란색 머그에 핸드드립 커피를 마시는 것을 선호한다."
+    expected:
+      judged_claims:
+        - lang: ko
+          must_satisfy: ["파란색 머그", "핸드드립"]
+          must_not_satisfy: ["라떼"]
+  - id: en-global-direct-name
+    prompt: "What name should you use for my weekly planning ritual?"
+    task_type: direct_recall
+    memory_location: global
+    split: known_domain
+    control: false
+    memory: "The user's weekly planning ritual is called Friday Map."
+    expected:
+      judged_claims:
+        - lang: en
+          must_satisfy: ["Friday Map"]
+          must_not_satisfy: ["Monday Map"]
+  - id: ko-project-indirect-style
+    prompt: "이 저장소의 PR 요약을 어떻게 쓰면 좋을까?"
+    task_type: indirect_application
+    memory_location: project
+    split: known_domain
+    control: false
+    memory: "이 프로젝트의 PR 요약은 한국어 bullet list와 검증 명령을 포함한다."
+    expected:
+      judged_claims:
+        - lang: ko
+          must_satisfy: ["한국어", "검증 명령"]
+          must_not_satisfy: ["영어로만"]
+  - id: en-project-indirect-tests
+    prompt: "Draft the verification section for this repo change."
+    task_type: indirect_application
+    memory_location: project
+    split: known_domain
+    control: false
+    memory: "Project verification summaries should include exact commands and pass/fail scope."
+    expected:
+      judged_claims:
+        - lang: en
+          must_satisfy: ["exact commands", "pass/fail scope"]
+          must_not_satisfy: ["fully verified"]
+  - id: ko-skill-direct-tdd
+    prompt: "새 기능은 어떤 순서로 구현해야 해?"
+    task_type: direct_recall
+    memory_location: skill
+    split: known_domain
+    control: false
+    memory: "TDD 작업은 실패 테스트 작성, 실패 확인, 최소 구현, 통과 확인 순서로 진행한다."
+    expected:
+      judged_claims:
+        - lang: ko
+          must_satisfy: ["실패 테스트", "최소 구현"]
+          must_not_satisfy: ["테스트 없이"]
+  - id: en-skill-indirect-guardrail
+    prompt: "How should I approach this risky memory benchmark?"
+    task_type: indirect_application
+    memory_location: skill
+    split: known_domain
+    control: false
+    memory: "Memory benchmark work must use an isolated Hermes home and never touch the live ~/.hermes tree."
+    expected:
+      judged_claims:
+        - lang: en
+          must_satisfy: ["isolated Hermes home", "live ~/.hermes"]
+          must_not_satisfy: ["safe to reuse"]
+  - id: ko-unseen-global-routing
+    prompt: "처음 보는 도메인의 답변에 개인 취향을 적용해야 하나?"
+    task_type: indirect_application
+    memory_location: global
+    split: unseen_topic
+    control: false
+    memory: "사용자는 낯선 주제라도 답변 형식은 먼저 요약 bullets를 선호한다."
+    expected:
+      judged_claims:
+        - lang: ko
+          must_satisfy: ["요약", "bullets"]
+          must_not_satisfy: ["장문 단락만"]
+  - id: en-unseen-project-routing
+    prompt: "For an unfamiliar subsystem, what repo convention should guide the answer?"
+    task_type: indirect_application
+    memory_location: project
+    split: unseen_topic
+    control: false
+    memory: "Unknown subsystem notes should explicitly label assumptions and cite changed files."
+    expected:
+      judged_claims:
+        - lang: en
+          must_satisfy: ["label assumptions", "changed files"]
+          must_not_satisfy: ["guess"]
+  - id: ko-control-no-personalization
+    prompt: "일반적인 파이썬 함수 이름 규칙은?"
+    task_type: direct_recall
+    memory_location: none
+    split: known_domain
+    control: true
+    memory: null
+    expected:
+      judged_claims:
+        - lang: ko
+          must_satisfy: ["snake_case"]
+          must_not_satisfy: ["Ryan"]
+  - id: en-control-unseen-no-personalization
+    prompt: "Explain what a cache hit means in general terms."
+    task_type: direct_recall
+    memory_location: none
+    split: unseen_topic
+    control: true
+    memory: null
+    expected:
+      judged_claims:
+        - lang: en
+          must_satisfy: ["stored result"]
+          must_not_satisfy: ["your preference"]
