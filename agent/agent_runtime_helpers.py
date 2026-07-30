@@ -1397,6 +1397,13 @@ def _model_requires_text_image_blocks_only(model: str, base_url: str = "") -> bo
     an Anthropic-style ``{"type": "thinking", ...}`` block with HTTP 400
     "type has to be either 'image_url' or 'text'". This bites when a session
     that ran on a Claude model is switched mid-conversation to Copilot Gemini.
+
+    Requires **affirmative Copilot evidence**: either the request targets the
+    Copilot host, or the model carries the ``github_copilot/`` namespace that
+    litellm uses to route these same models. An unknown or empty base URL is
+    NOT treated as Copilot — the 400 was only ever observed on that endpoint,
+    so stripping blocks for an unverified endpoint would discard reasoning
+    content no provider asked us to drop.
     """
     m = (model or "").strip().lower()
     # Strip a provider namespace prefix (litellm routes these models as
@@ -1405,7 +1412,7 @@ def _model_requires_text_image_blocks_only(model: str, base_url: str = "") -> bo
     if not bare.startswith("gemini"):
         return False
     url = (base_url or "").strip().lower()
-    return "githubcopilot.com" in url or "github_copilot/" in m or not url
+    return "githubcopilot.com" in url or "github_copilot/" in m
 
 
 def strip_unsupported_content_blocks(
