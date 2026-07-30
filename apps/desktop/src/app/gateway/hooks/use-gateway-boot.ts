@@ -1,7 +1,7 @@
 import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
 
-import type { HermesConnection } from '@/global'
+import type { DesktopBootProgress, HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
@@ -324,7 +324,7 @@ export function useGatewayBoot({
       }
     }
 
-    const offBootProgress = desktop.onBootProgress(payload => {
+    const handleBootProgress = (payload: DesktopBootProgress) => {
       // Soft switch / post-boot startHermes re-emits progress — ignore so the
       // cold-boot CONNECTING overlay stays down. Errors still surface. A boot
       // that ended in failure counts as ended too: its retries re-emit the same
@@ -338,11 +338,13 @@ export function useGatewayBoot({
       }
 
       applyDesktopBootProgress(payload)
-    })
+    }
+
+    const offBootProgress = desktop.onBootProgress(handleBootProgress)
 
     void desktop
       .getBootProgress()
-      .then(snapshot => applyDesktopBootProgress(snapshot))
+      .then(handleBootProgress)
       .catch(() => undefined)
 
     setDesktopBootStep({

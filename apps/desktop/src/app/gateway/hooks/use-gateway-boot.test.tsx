@@ -309,6 +309,44 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().running).toBe(false)
   })
 
+  it('FIX: a stale boot snapshot cannot hide the recovery surface after boot fails', async () => {
+    const desktop = fakeDesktop()
+    type BootSnapshot = Awaited<ReturnType<typeof desktop.getBootProgress>>
+    let resolveSnapshot: (snapshot: BootSnapshot) => void = () => undefined
+
+    desktop.getBootProgress = vi.fn(
+      () =>
+        new Promise<BootSnapshot>(resolve => {
+          resolveSnapshot = resolve
+        })
+    )
+    desktop.getConnection = vi.fn(async () => {
+      throw new Error('Hermes backend did not become ready: connect ECONNREFUSED 127.0.0.1:9119')
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($desktopBoot.get().error).toBeTruthy()
+
+    await act(async () => {
+      resolveSnapshot({
+        error: null,
+        fakeMode: false,
+        message: 'Resolving Hermes backend',
+        phase: 'backend.resolve',
+        progress: 8,
+        running: true,
+        timestamp: Date.now()
+      })
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect($desktopBoot.get().error).toBeTruthy()
+    expect($desktopBoot.get().running).toBe(false)
+  })
+
   it('FIX: the same holds when the boot fails at the gateway socket instead of getConnection', async () => {
     // The other way a cold boot ends badly, and the one a stale token produces:
     // the backend answers and reports ready, so boot() gets past getConnection,
