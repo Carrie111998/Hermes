@@ -184,15 +184,13 @@ _YAML_ASSIGN_RE = re.compile(
 _CLI_SENSITIVE_SPACE_VALUE_RE = re.compile(
     r"(?<![A-Za-z0-9_\-])"
     r"(--(?:password|passwd|secret|token|api[-_]key|client-secret))"
-    r"([ \t]+)"
-    r"(?:(['\"])([^\r\n'\"]*)\3|((?!--)[^\s'\"]+))",
+    r"([ \t]+)",
     re.IGNORECASE,
 )
 _CLI_SENSITIVE_EQUALS_VALUE_RE = re.compile(
     r"(?<![A-Za-z0-9_\-])"
     r"(--(?:password|passwd|secret|token|api[-_]key|client-secret))"
-    r"(=)"
-    r"(?:(['\"])([^\r\n'\"]*)\3|([^\s'\"]+))",
+    r"(=)",
     re.IGNORECASE,
 )
 
@@ -383,20 +381,106 @@ def _redact_cli_sensitive_space_values(text: str) -> str:
     if "--" not in text:
         return text
 
-    def _redact_flag_value(match: re.Match) -> str:
-        quote = match.group(3) or ""
-        quoted_value = match.group(4)
-        bare_value = match.group(5)
-        if quote:
-            if quoted_value == "":
-                return match.group(0)
-            return f"{match.group(1)}{match.group(2)}{quote}***{quote}"
-        if not bare_value:
-            return match.group(0)
-        return f"{match.group(1)}{match.group(2)}***"
+    text = _redact_cli_sensitive_value_matches(
+        text,
+        _CLI_SENSITIVE_SPACE_VALUE_RE,
+        skip_next_flag=True,
+    )
+    return _redact_cli_sensitive_value_matches(
+        text,
+        _CLI_SENSITIVE_EQUALS_VALUE_RE,
+        skip_next_flag=False,
+    )
 
-    text = _CLI_SENSITIVE_SPACE_VALUE_RE.sub(_redact_flag_value, text)
-    return _CLI_SENSITIVE_EQUALS_VALUE_RE.sub(_redact_flag_value, text)
+
+def _count_preceding_backslashes(text: str, index: int) -> int:
+    """Count consecutive backslashes immediately before ``index``."""
+    count = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        count += 1
+        cursor -= 1
+    return count
+
+
+def _find_unescaped_closing_quote(text: str, start: int, quote: str) -> int | None:
+    """Find a same-type closing quote, respecting shell-style backslash parity."""
+    cursor = start
+    while cursor < len(text):
+        char = text[cursor]
+        if char in "\r\n":
+            return None
+        if char == quote and _count_preceding_backslashes(text, cursor) % 2 == 0:
+            return cursor
+        cursor += 1
+    return None
+
+
+def _redact_cli_sensitive_value_match(
+    text: str,
+    match: re.Match,
+    *,
+    skip_next_flag: bool,
+) -> tuple[str, int]:
+    """Return replacement text and original end offset for one CLI flag value."""
+    value_start = match.end()
+    if value_start >= len(text) or text[value_start] in "\r\n":
+        return match.group(0), match.end()
+
+    flag_and_separator = f"{match.group(1)}{match.group(2)}"
+    quote = text[value_start]
+    if quote in {"'", '"'}:
+        value_content_start = value_start + 1
+        closing_quote = _find_unescaped_closing_quote(text, value_content_start, quote)
+        if closing_quote is None:
+            value_end = value_content_start
+            while value_end < len(text) and text[value_end] not in "\r\n":
+                value_end += 1
+            # Unterminated quoted CLI secrets are redacted through EOL so an
+            # escaped quote cannot expose the sensitive suffix that follows it.
+            return f"{flag_and_separator}{quote}***", value_end
+        if closing_quote == value_content_start:
+            return text[match.start():closing_quote + 1], closing_quote + 1
+        return f"{flag_and_separator}{quote}***{quote}", closing_quote + 1
+
+    if skip_next_flag and text.startswith("--", value_start):
+        return match.group(0), match.end()
+
+    value_end = value_start
+    while value_end < len(text) and text[value_end] not in "\r\n\t ' \"":
+        value_end += 1
+    if value_end == value_start:
+        return match.group(0), match.end()
+    return f"{flag_and_separator}***", value_end
+
+
+def _redact_cli_sensitive_value_matches(
+    text: str,
+    pattern: re.Pattern,
+    *,
+    skip_next_flag: bool,
+) -> str:
+    """Redact CLI sensitive values matched by a flag/separator pattern."""
+    chunks: list[str] = []
+    last_end = 0
+    changed = False
+    for match in pattern.finditer(text):
+        if match.start() < last_end:
+            continue
+        replacement, value_end = _redact_cli_sensitive_value_match(
+            text,
+            match,
+            skip_next_flag=skip_next_flag,
+        )
+        chunks.append(text[last_end:match.start()])
+        chunks.append(replacement)
+        last_end = value_end
+        changed = changed or replacement != text[match.start():value_end]
+    if not chunks:
+        return text
+    chunks.append(text[last_end:])
+    redacted = "".join(chunks)
+    return redacted if changed else text
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"

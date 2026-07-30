@@ -851,6 +851,24 @@ class TestExtraSensitiveKeys:
 
 
 class TestCliSensitiveSeparateValues:
+    def _assert_secret_redacted(
+        self,
+        text,
+        *,
+        secrets,
+        preserved=(),
+        expected=None,
+    ):
+        result = redact_sensitive_text(text, force=True)
+        assert "***" in result
+        for secret in secrets:
+            assert secret not in result
+        for external in preserved:
+            assert external in result
+        if expected is not None:
+            assert result == expected
+        assert redact_sensitive_text(result, force=True) == result
+
     @pytest.mark.parametrize(
         "text,secret,expected",
         [
@@ -897,6 +915,7 @@ class TestCliSensitiveSeparateValues:
 
     def test_quoted_empty_not_changed(self):
         assert redact_sensitive_text('cmd --password ""', force=True) == 'cmd --password ""'
+        assert redact_sensitive_text('cmd --password=""', force=True) == 'cmd --password=""'
 
     def test_does_not_cross_newline(self):
         text = "cmd --password\nsecret-value"
@@ -908,6 +927,82 @@ class TestCliSensitiveSeparateValues:
 
     def test_similar_prefix_flag_unchanged(self):
         text = "cmd --password-file path"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_space_quoted_value_with_escaped_quote_redacts_full_value(self):
+        text = 'cmd --secret "prefix ' + '\\"' + ' sensitive-suffix" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \" sensitive-suffix', "sensitive-suffix"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret "***" --next',
+        )
+
+    def test_equals_quoted_value_with_escaped_quote_redacts_full_value(self):
+        text = 'cmd --secret="prefix ' + '\\"' + ' sensitive-suffix" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \" sensitive-suffix', "sensitive-suffix"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret="***" --next',
+        )
+
+    def test_multiple_escaped_quotes_stay_inside_space_value(self):
+        text = 'cmd --secret "a ' + '\\"' + ' b ' + '\\"' + ' final-sensitive" tail'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'a \" b \" final-sensitive', "final-sensitive"),
+            preserved=("cmd ", " tail"),
+            expected='cmd --secret "***" tail',
+        )
+
+    def test_even_backslash_parity_closes_quote(self):
+        text = 'cmd --secret "prefix ' + ("\\" * 2) + '" outside-suffix --next'
+        result = redact_sensitive_text(text, force=True)
+        assert result == 'cmd --secret "***" outside-suffix --next'
+        assert "prefix" not in result
+        assert "outside-suffix --next" in result
+        assert redact_sensitive_text(result, force=True) == result
+
+    def test_odd_backslash_parity_above_one_keeps_quote_inside_value(self):
+        text = 'cmd --secret "prefix ' + ("\\" * 3) + '" final-sensitive" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \\\" final-sensitive', "final-sensitive"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret "***" --next',
+        )
+
+    def test_next_flag_preserved_after_escaped_quote_value(self):
+        text = 'cmd --token "hidden ' + '\\"' + ' sensitive-tail" --verbose'
+        self._assert_secret_redacted(
+            text,
+            secrets=("hidden", "sensitive-tail"),
+            preserved=("cmd ", " --verbose"),
+            expected='cmd --token "***" --verbose',
+        )
+
+    def test_equals_simple_quoted_value_redacts_and_preserves_tail(self):
+        text = 'cmd --api-key="secret-value" tail'
+        self._assert_secret_redacted(
+            text,
+            secrets=("secret-value",),
+            preserved=("cmd ", " tail"),
+            expected='cmd --api-key="***" tail',
+        )
+
+    def test_unterminated_escaped_quote_redacts_through_eol_only(self):
+        text = 'cmd --secret "prefix ' + '\\"' + ' sensitive-suffix --next' + "\nvisible-next-line"
+        result = redact_sensitive_text(text, force=True)
+        assert result == 'cmd --secret "***\nvisible-next-line'
+        assert "prefix" not in result
+        assert "sensitive-suffix" not in result
+        assert "--next" not in result
+        assert "visible-next-line" in result
+        assert redact_sensitive_text(result, force=True) == result
+
+    def test_non_sensitive_equivalent_quoting_remains_exact(self):
+        text = 'cmd --public "prefix ' + '\\"' + ' sensitive-suffix" --next'
         assert redact_sensitive_text(text, force=True) == text
 
 
