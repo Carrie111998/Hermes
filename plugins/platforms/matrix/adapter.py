@@ -2226,8 +2226,8 @@ class MatrixAdapter(BasePlatformAdapter):
         )
 
     # Template attrs for the shared _format_exec_approval core. Matrix keeps
-    # the smart-deny/scope wording in its local tail (reaction legend), so the
-    # core is used for the header + fence + reason head only.
+    # the scope wording in its local tail (reaction legend), so the core is
+    # used for the header + fence + reason head only.
     _EA_HEADER = "⚠️ **Dangerous command requires approval**\n"
     _EA_CMD_BUDGET = 2000
 
@@ -2240,7 +2240,6 @@ class MatrixAdapter(BasePlatformAdapter):
         metadata: Optional[dict] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Send a reaction-based exec approval prompt for Matrix."""
         if not self._client:
@@ -2248,14 +2247,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
         scope_choices = ""
-        if smart_denied:
-            scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
-        else:
-            scope_choices = ""
-            if allow_session:
-                scope_choices += "Reply `!approve session` to approve this pattern for the session, "
-            if allow_permanent:
-                scope_choices += "`!approve always` to approve permanently, "
+        if allow_session:
+            scope_choices += "Reply `!approve session` to approve this pattern for the session, "
+        if allow_permanent:
+            scope_choices += "`!approve always` to approve permanently, "
         reaction_legend_parts = ["✅ = approve once"]
         if allow_session:
             reaction_legend_parts.append("🌀 = approve for this session")

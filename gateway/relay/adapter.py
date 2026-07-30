@@ -1718,7 +1718,6 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Native-button exec approval over the relay (Phase 3).
 
@@ -1732,7 +1731,7 @@ class RelayAdapter(BasePlatformAdapter):
         failed button send).
         """
         options: list = [{"id": "once", "label": "Allow Once", "style": "primary"}]
-        if not smart_denied and allow_session:
+        if allow_session:
             options.append({"id": "session", "label": "Allow Session"})
             if allow_permanent:
                 options.append({
@@ -1747,10 +1746,6 @@ class RelayAdapter(BasePlatformAdapter):
             f"```\n{cmd_preview}\n```\n"
             f"Reason: {description}"
         )
-        if smart_denied:
-            text += (
-                "\n\n**Smart DENY:** owner override applies to this one operation only."
-            )
 
         prompt_id = self._mint_prompt(
             "exec_approval",

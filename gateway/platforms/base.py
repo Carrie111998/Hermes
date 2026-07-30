@@ -3670,15 +3670,11 @@ class BasePlatformAdapter(ABC):
     # ── Shared interactive-prompt formatting cores ─────────────────────────
     # Template attrs for ``_format_exec_approval``. Adapters override these to
     # keep their historical, platform-specific wording byte-identical while
-    # sharing the assembly logic (header → fenced command preview → reason →
-    # optional smart-deny note).
+    # sharing the assembly logic (header → fenced command preview → reason).
     _EA_HEADER: str = "⚠️ Command Approval Required\n\n"
     _EA_CODE_OPEN: str = "```\n"
     _EA_CODE_CLOSE: str = "\n```\n"
     _EA_REASON_LABEL: str = "Reason: "
-    _EA_SMART_DENY_LINE: str = (
-        "\n\nSmart DENY: owner override applies to this one operation only."
-    )
     _EA_CMD_BUDGET: int = 3000
 
     @staticmethod
@@ -3702,15 +3698,13 @@ class BasePlatformAdapter(ABC):
         self,
         command: str,
         description: str = "dangerous command",
-        smart_denied: bool = False,
     ) -> str:
         """Shared formatting core for exec-approval prompt text.
 
         Assembles ``_EA_HEADER`` + fenced command preview (truncated to
-        ``_EA_CMD_BUDGET``) + ``_EA_REASON_LABEL`` + description, plus
-        ``_EA_SMART_DENY_LINE`` when ``smart_denied``. Button construction
-        stays platform-local; adapters with additional trailing instructions
-        (e.g. reaction legends) append them to this core.
+        ``_EA_CMD_BUDGET``) + ``_EA_REASON_LABEL`` + description. Button
+        construction stays platform-local; adapters with additional trailing
+        instructions (e.g. reaction legends) append them to this core.
         """
         cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
         text = (
@@ -3718,8 +3712,6 @@ class BasePlatformAdapter(ABC):
             f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
             f"{self._EA_REASON_LABEL}{self._ea_escape(description)}"
         )
-        if smart_denied:
-            text += self._EA_SMART_DENY_LINE
         return text
 
     @staticmethod

@@ -5476,8 +5476,8 @@ def test_config_get_approval_mode_uses_manual_default_when_key_is_missing(
 
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
     # Point the canonical resolver (load_config → env HERMES_HOME) at the
-    # temp home too, so the smart default is asserted against THIS config
-    # rather than whatever the developer's real ~/.hermes happens to hold.
+    # temp home too, so the default is asserted against THIS config rather
+    # than whatever the developer's real ~/.hermes happens to hold.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump({"approvals": {"timeout": 15}})

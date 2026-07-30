@@ -28,16 +28,18 @@ hermes config set privacy.redact_pii false   # disable (default)
 
 ### Command approval prompts
 
-By default (`approvals.mode: smart`), Hermes asks an auxiliary LLM to assess shell commands flagged as destructive (`rm -rf`, `git reset --hard`, etc.). The modes are:
+By default (`approvals.mode: manual`), Hermes asks the owner to approve shell commands flagged as destructive (`rm -rf`, `git reset --hard`, etc.). The modes are:
 
-- `smart` — auto-approve a low-risk command once, deny high-risk commands, and prompt when uncertain (default)
-- `manual` — always prompt
+- `manual` — always prompt the owner (default)
 - `off` — skip all approval prompts (equivalent to `--yolo`)
 
 ```bash
-hermes config set approvals.mode smart       # recommended middle ground
+hermes config set approvals.mode manual      # owner-driven approval
 hermes config set approvals.mode off         # bypass everything (not recommended)
 ```
+
+Legacy `smart` values are migrated to `manual`; no auxiliary model can grant
+or deny authorization.
 
 Per-invocation bypass without changing config:
 - `hermes --yolo …`
@@ -64,4 +66,3 @@ Some shell-hook integrations require explicit allowlisting before they fire. Man
 ### Disabling the web/browser/image-gen tools
 
 To keep the model away from network or media tools entirely, open `hermes tools` and toggle per-platform. Takes effect on next session (`/reset`). See `references/configuration.md` for the toolset list.
-

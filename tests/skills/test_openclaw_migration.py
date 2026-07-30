@@ -122,6 +122,33 @@ def test_migrator_copies_skill_and_merges_allowlist(tmp_path: Path):
     assert report["summary"]["migrated"] >= 2
 
 
+def test_migrator_normalizes_legacy_smart_approval_mode_to_manual(
+    tmp_path: Path,
+):
+    mod = load_module()
+    source = tmp_path / ".openclaw"
+    target = tmp_path / ".hermes"
+    source.mkdir()
+    target.mkdir()
+    (target / "config.yaml").write_text("{}\n", encoding="utf-8")
+
+    migrator = mod.Migrator(
+        source_root=source,
+        target_root=target,
+        execute=True,
+        workspace_target=None,
+        overwrite=False,
+        migrate_secrets=False,
+        output_dir=None,
+    )
+    migrator.migrate_approvals_config(
+        {"approvals": {"exec": {"mode": "smart"}}}
+    )
+
+    migrated = mod.load_yaml_file(target / "config.yaml")
+    assert migrated["approvals"]["mode"] == "manual"
+
+
 def test_migrator_optionally_imports_supported_secrets_and_messaging_settings(tmp_path: Path):
     mod = load_module()
     source = tmp_path / ".openclaw"
@@ -564,7 +591,6 @@ def test_messaging_settings_handles_invalid_utf8_in_telegram_allowlist(tmp_path:
     assert items and items[0]["status"] == "migrated"
     env_text = (target / ".env").read_text(encoding="utf-8")
     assert "123456789" in env_text
-
 
 
 

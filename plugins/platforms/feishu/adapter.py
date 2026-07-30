@@ -2003,7 +2003,6 @@ class FeishuAdapter(BasePlatformAdapter):
     # header carries the title, so the text core starts at the code fence.
     _EA_HEADER = ""
     _EA_REASON_LABEL = "**Reason:** "
-    _EA_SMART_DENY_LINE = "\n\n**Smart DENY:** owner override applies to this one operation only."
     _EA_CMD_BUDGET = 3000
 
     async def send_exec_approval(
@@ -2012,7 +2011,6 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
-        smart_denied: bool = False,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2035,7 +2033,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
-            if not smart_denied and allow_session:
+            if allow_session:
                 actions.append(_btn("✅ Session", "approve_session"))
                 if allow_permanent:
                     actions.append(_btn("✅ Always", "approve_always"))
@@ -2049,7 +2047,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": self._format_exec_approval(command, description, smart_denied),
+                        "content": self._format_exec_approval(command, description),
                     },
                     {
                         "tag": "action",

@@ -231,7 +231,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   // equivalent.
   {
     name: '/approvals',
-    description: 'Show or set approval mode [manual|smart|off]',
+    description: 'Show or set approval mode [manual|off]',
     surface: exec(),
     argumentMode: 'options'
   },

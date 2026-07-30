@@ -2143,15 +2143,6 @@ Legacy `smart` values are migrated to `manual`; an auxiliary model never decides
 Setting `approvals.mode: off` disables all safety checks for terminal commands. Only use this in trusted, sandboxed environments.
 :::
 
-### Denial circuit breaker
-
-`approvals.denial_breaker_threshold` (default `3`) guards against the agent retrying variations of a command the smart-approval reviewer keeps denying — each retry burns another guardian LLM call. After that many consecutive denials in a session, the deny message escalates to a hard-stop instruction telling the agent to stop, report the blocked operation, and ask you to run it manually or `/approve`. Any approval resets the count; set `0` to disable:
-
-```yaml
-approvals:
-  denial_breaker_threshold: 3   # 0 disables the breaker
-```
-
 ### Deny rules
 
 `approvals.deny` is a list of glob patterns that block matching terminal commands unconditionally — even under `--yolo`, `/yolo`, or `mode: off`. It's the user-editable counterpart to the built-in hardline blocklist:
@@ -2164,18 +2155,6 @@ approvals:
 ```
 
 Patterns are case-insensitive fnmatch globs and must be quoted in YAML (a bare leading `*` is a parse error). See [Security — User-Defined Deny Rules](/user-guide/security#user-defined-deny-rules-approvalsdeny) for details.
-
-### Custom smart-approval policy
-
-`approvals.smart_policy` lets you append your own rules to the smart-approval reviewer's instructions. When set, the text is added to the guardian LLM's system prompt (the trusted channel — never alongside the untrusted command text), so you can tighten or relax its judgment for your environment without editing code:
-
-```yaml
-approvals:
-  smart_policy: |
-    Always ESCALATE commands that modify anything under /etc.
-    APPROVE docker compose restarts in ~/deploys — they are routine here.
-```
-
 
 ## Checkpoints
 

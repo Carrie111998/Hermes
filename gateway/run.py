@@ -908,16 +908,13 @@ def _format_exec_approval_fallback(
     *,
     allow_permanent: bool = True,
     allow_session: bool = True,
-    smart_denied: bool = False,
 ) -> str:
     """Render a mechanical owner-approval prompt from declared capabilities."""
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
     heading = "⚠️ **Dangerous command requires approval:**"
-    if smart_denied:
-        heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
-    if not smart_denied and allow_session:
+    if allow_session:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
@@ -6412,7 +6409,6 @@ class TurnRunner:
                 getattr(type(ctx._status_adapter), "send_exec_approval", None)
                 is not None
                 and approval_data.get("allow_session", True)
-                and not approval_data.get("smart_denied", False)
             ):
                 try:
                     _approval_fut = safe_schedule_threadsafe(
@@ -6453,7 +6449,6 @@ class TurnRunner:
                 _p,
                 allow_permanent=approval_data.get("allow_permanent", True),
                 allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
             )
             try:
                 _approval_send_fut = safe_schedule_threadsafe(

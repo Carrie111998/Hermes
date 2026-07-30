@@ -30,7 +30,7 @@ Hermes Agent 采用纵深防御安全模型。本页涵盖所有安全边界—�
 
 ```yaml
 approvals:
-  mode: smart     # smart | manual | off
+  mode: manual    # manual | off
   timeout: 300    # 等待用户响应的秒数（默认：300）
 ```
 

@@ -82,7 +82,7 @@ modes. There is no second permission toggle to keep in sync:
 
 | Hermes session | cua-driver mode | Human intervention | `existing_profile` |
 |---|---|---|---|
-| Manual or smart approvals (default) | `standard` | Normal Hermes approvals; Cua stops at its protected boundary | Refuses unless a certified protected host is available; Hermes does not claim one today |
+| Manual approvals (default) | `standard` | Normal Hermes approvals; Cua stops at its protected boundary | Refuses unless a certified protected host is available; Hermes does not claim one today |
 | `--yolo`, `/yolo`, or `approvals.mode: off` | private `unrestricted` daemon | One explicit Hermes risk acceptance; no runtime Cua prompts | Allowed within Cua's built-in, managed, and user policy ceilings |
 
 The unrestricted daemon is private to that Hermes session. Turning `/yolo`
@@ -90,10 +90,9 @@ off, resetting/closing the session, cancellation cleanup, or process exit ends
 the Cua session and stops that daemon. It never changes the machine-wide
 daemon's mode or grants another Hermes conversation the same authority.
 
-`smart` approval remains `standard`: an LLM classification is not protected
-human consent. Cua's `bounded` manifest mode is also not inferred from smart
-approval or a normal tool confirmation; it needs a separately trusted host
-that reviews and launches the exact manifest.
+Cua's `bounded` manifest mode is not inferred from a normal tool confirmation;
+it needs a separately trusted host that reviews and launches the exact
+manifest.
 
 <div class="alert alert--warning">
 

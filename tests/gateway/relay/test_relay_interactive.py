@@ -106,13 +106,8 @@ async def test_exec_approval_renders_full_option_set():
 
 
 @pytest.mark.asyncio
-async def test_exec_approval_smart_denied_and_flag_gating():
+async def test_exec_approval_flag_gating():
     adapter, stub = _adapter()
-    await adapter.send_exec_approval(
-        "c1", "cmd", "s", smart_denied=True, allow_permanent=True, allow_session=True
-    )
-    ids = [o["id"] for o in stub.sent[-1]["options"]]
-    assert ids == ["once", "deny"]  # smart-deny: no session/always
     await adapter.send_exec_approval(
         "c1", "cmd", "s", allow_session=True, allow_permanent=False
     )
@@ -255,5 +250,4 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
 

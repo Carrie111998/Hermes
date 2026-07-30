@@ -37,11 +37,8 @@ _TIRITH_PATCH = "tools.tirith_security.check_command_security"
 def _mode_manual(monkeypatch):
     """Pin approvals.mode to 'manual' for every test in this file.
 
-    The test conftest redirects HERMES_HOME to an empty tempdir, so the
-    approval config falls back to DEFAULT_CONFIG where mode='smart'. Smart
-    mode calls the REAL auxiliary LLM (network SSL round-trip, ~1s) from
-    inside every prompting test — slow and flaky. These tests exercise the
-    manual prompt flow, so force manual mode.
+    These tests exercise the manual prompt flow, so pin it independently of
+    any developer profile configuration.
     """
     monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
 

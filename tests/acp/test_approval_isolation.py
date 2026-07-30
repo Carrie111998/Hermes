@@ -33,11 +33,8 @@ def _isolate_approval_state(monkeypatch):
 
     monkeypatch.setattr(_approval, "_permanent_approved", set())
     monkeypatch.setattr(_approval, "_session_approved", {})
-    # These tests assert the *manual* interactive-callback path. The default
-    # config is approvals.mode=smart, whose guardian LLM can auto-approve the
-    # command before the callback is consulted (test-order dependent, since
-    # load_config() caching decides which config file is in effect). Pin the
-    # mode so the GHSA regression path is what actually runs.
+    # These tests assert the manual interactive-callback path. Pin the mode so
+    # local profile configuration cannot change the GHSA regression path.
     monkeypatch.setattr(_approval, "_get_approval_mode", lambda: "manual")
 
 
@@ -192,4 +189,3 @@ class TestAcpExecAskGate:
             "GHSA-96vc-wcxf-jjff"
         )
         assert result["approved"] is True
-

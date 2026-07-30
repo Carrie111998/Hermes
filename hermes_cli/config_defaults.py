@@ -1220,7 +1220,7 @@ DEFAULT_CONFIG = {
         # are a local debug estimate: they only count successful main-agent
         # responses with a usable ``response.usage``, and silently exclude every
         # auxiliary call (context compression, title generation, vision,
-        # session search, web extract, smart approval, MCP routing, plugin LLM
+        # session search, web extract, MCP routing, plugin LLM
         # access) plus provider-side retries, fallback attempts, and any call
         # whose usage block didn't come back.  Cache writes are also missing
         # from the API response.  On models with heavy auxiliary traffic
@@ -1918,7 +1918,6 @@ DEFAULT_CONFIG = {
 
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
-    #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
     #   off    — skip all approval prompts (equivalent to --yolo)
     #
     # cron_mode — what to do when a cron job hits a dangerous command:
@@ -1931,23 +1930,9 @@ DEFAULT_CONFIG = {
     # immediately — 60s proved too tight on Telegram/Discord (the prompt
     # expired before the user reached their phone), so the default is 300.
     "approvals": {
-        "mode": "smart",
+        "mode": "manual",
         "timeout": 300,
         "cron_mode": "deny",
-        # Operator-customizable policy text for smart approvals. When
-        # non-empty, this is appended to the smart-approval guardian's
-        # SYSTEM prompt (trusted channel) as additional rules — e.g.
-        # "Always ESCALATE commands touching /etc" or "APPROVE docker
-        # compose restarts under ~/deploys". Inspired by ChatGPT Work's
-        # customizable auto-review guardian policy.
-        "smart_policy": "",
-        # Consecutive-denial circuit breaker for smart approvals: after this
-        # many guardian DENY verdicts in a row within one session, the deny
-        # message returned to the model escalates to a hard-stop instruction
-        # (report to the user / ask for manual run or /approve) instead of a
-        # plain "Do NOT retry". Any approval resets the count. 0 disables.
-        # Inspired by ChatGPT Work's auto-review circuit breaker.
-        "denial_breaker_threshold": 3,
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable

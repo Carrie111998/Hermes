@@ -79,12 +79,6 @@ _api_request_authority: ContextVar[Optional["APIRequestScope"]] = ContextVar(
     default=None,
 )
 
-def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
-    if smart_denied:
-        return ["once", "deny"]
-    return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
-
-
 async def _await_if_needed(value: Any) -> Any:
     """Await production coroutines while preserving synchronous test seams."""
     if inspect.isawaitable(value):

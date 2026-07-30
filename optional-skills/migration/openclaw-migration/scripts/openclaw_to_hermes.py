@@ -2769,7 +2769,7 @@ class Migrator:
         exec_approvals = approvals.get("exec") or {}
         mode = (exec_approvals.get("mode") if isinstance(exec_approvals, dict) else None) or approvals.get("mode") or approvals.get("defaultMode")
         if mode:
-            mode_map = {"auto": "off", "always": "manual", "smart": "smart", "manual": "manual"}
+            mode_map = {"auto": "off", "always": "manual", "smart": "manual", "manual": "manual"}
             hermes_mode = mode_map.get(mode, "manual")
             hermes_cfg.setdefault("approvals", {})["mode"] = hermes_mode
             if self.execute:
