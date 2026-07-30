@@ -4,7 +4,13 @@ import type { SessionInfo } from '@/types/hermes'
 
 import { buildRailTasks } from './activity'
 
-const session = (id: string, title: string, lastActive: number): SessionInfo => ({
+const session = (
+  id: string,
+  title: string,
+  lastActive: number,
+  lineageRootId?: string
+): SessionInfo => ({
+  ...(lineageRootId ? { _lineage_root_id: lineageRootId } : {}),
   ended_at: null,
   id,
   input_tokens: 0,
@@ -81,6 +87,28 @@ describe('buildRailTasks', () => {
         label: 'Lint desktop',
         status: 'error',
         updatedAt: 500
+      }
+    ])
+  })
+
+  it('resolves a stored lineage root to the current compressed tip row', () => {
+    const tasks = buildRailTasks(
+      ['root-session'],
+      [],
+      [session('tip-session', 'Continue the compressed task', 3_000, 'root-session')],
+      null,
+      {},
+      9_999
+    )
+
+    expect(tasks).toEqual([
+      {
+        id: 'session:root-session',
+        kind: 'session',
+        label: 'Continue the compressed task',
+        sessionId: 'root-session',
+        status: 'running',
+        updatedAt: 3_000_000
       }
     ])
   })

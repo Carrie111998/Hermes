@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import { sessionTitle } from '@/lib/chat-runtime'
 import type { PreviewServerRestart } from '@/store/preview'
+import { sessionMatchesStoredId } from '@/store/session'
 import type { ActionStatusResponse, SessionInfo } from '@/types/hermes'
 
 const HISTORY_LIMIT = 8
@@ -39,11 +40,10 @@ export function buildRailTasks(
   actionTasks: Record<string, DesktopActionTask>,
   now: number = Date.now()
 ): RailTask[] {
-  const sessionsById = new Map(sessions.map(session => [session.id, session]))
   const working = new Set(workingSessionIds)
 
   const sessionTasks: RailTask[] = workingSessionIds.map((id, index) => {
-    const session = sessionsById.get(id)
+    const session = sessions.find(candidate => sessionMatchesStoredId(candidate, id))
 
     return {
       id: `session:${id}`,
@@ -58,7 +58,7 @@ export function buildRailTasks(
   const finishedTasks: RailTask[] = finishedSessionIds
     .filter(id => !working.has(id))
     .map((id, index) => {
-      const session = sessionsById.get(id)
+      const session = sessions.find(candidate => sessionMatchesStoredId(candidate, id))
 
       return {
         id: `session:${id}`,
