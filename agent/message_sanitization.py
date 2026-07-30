@@ -27,6 +27,15 @@ logger = logging.getLogger(__name__)
 # scrubbing.
 _SURROGATE_RE = re.compile(r'[\ud800-\udfff]')
 
+# The only characters JSON permits as whitespace between tokens (RFC 8259
+# section 2).  Python's ``str.isspace()`` / bare ``str.rstrip()`` are
+# Unicode-aware and also match U+001C-U+001F, U+0085, U+00A0, U+2028 and
+# friends -- all of which are *illegal* outside a JSON string.  Treating them
+# as skippable whitespace lets the repair passes delete them and hand back a
+# payload that parses, turning input JSON rightly rejects into an executed
+# tool call.  Every whitespace test in the repair path uses this instead.
+_JSON_WHITESPACE = " \t\n\r"
+
 
 def _sanitize_surrogates(text: str) -> str:
     """Replace lone surrogate code points with U+FFFD (replacement character).
@@ -208,7 +217,7 @@ def _strip_trailing_commas(raw: str) -> str:
                 in_string = False
             continue
         if pending is not None:
-            if ch.isspace():
+            if ch in _JSON_WHITESPACE:
                 out.append(ch)
                 continue
             if ch in "}]":
@@ -267,13 +276,15 @@ def _close_unclosed_json_structures(raw: str) -> str:
     if in_string or not stack:
         return raw
 
-    # A comma the truncation left dangling would sit right in front of the
-    # closer we are about to append ("[1, 2," -> "[1, 2,]").
-    tail = raw.rstrip()
-    while tail.endswith(","):
-        tail = tail[:-1].rstrip()
-
-    return tail + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
+    # Note: a comma the truncation left dangling is deliberately NOT trimmed.
+    # ``{"a": [1, 2,`` ends on a comma, which is the model promising another
+    # element that never arrived -- trimming it would append the closer and
+    # present a short list as a complete one.  Leaving the comma in place makes
+    # the result unparseable, so the payload falls through to ``"{}"`` and the
+    # caller's truncation path, same as before this change.  A *stray* trailing
+    # comma in otherwise-complete JSON (``{"a": [1, 2,]}``) is a different case
+    # and is still handled by ``_strip_trailing_commas``.
+    return raw + "".join("}" if ch == "{" else "]" for ch in reversed(stack))
 
 
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:

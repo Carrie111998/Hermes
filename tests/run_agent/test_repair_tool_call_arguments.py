@@ -184,9 +184,26 @@ class TestRepairToolCallArguments:
     def test_truncation_inside_nested_string_is_left_unrepairable(self):
         assert _repair_tool_call_arguments('{"a": [1, {"b": "partial', "t") == "{}"
 
-    def test_dangling_comma_before_appended_closer(self):
-        result = _repair_tool_call_arguments('{"a": [1, 2,', "t")
-        assert json.loads(result) == {"a": [1, 2]}
+    def test_truncation_after_a_comma_is_left_unrepairable(self):
+        """A dangling comma is the model promising an element that never came.
+
+        Appending the closer would present a short list as a complete one, so
+        this stays unparseable and falls through to "{}" (and the caller's
+        truncation path) rather than executing.
+        """
+        assert _repair_tool_call_arguments('{"a": [1, 2,', "t") == "{}"
+
+    def test_json_illegal_whitespace_is_not_treated_as_whitespace(self):
+        """Only space/tab/LF/CR are JSON whitespace (RFC 8259 s2).
+
+        Python's str.isspace()/rstrip() also match U+001C-U+001F, U+0085,
+        U+00A0, U+2028 -- all illegal outside a JSON string.  Skipping them
+        would delete them and hand back a payload that parses, turning input
+        JSON rightly rejects into an executed tool call.
+        """
+        for cp in (0x1C, 0x1F, 0x85, 0xA0, 0x2028, 0x0B):
+            raw = '{"command":"echo X",' + chr(cp) + "}"
+            assert _repair_tool_call_arguments(raw, "t") == "{}", f"U+{cp:04X}"
 
     def test_balanced_payload_is_left_alone(self):
         """The closing pass must be a no-op when nothing is open."""
