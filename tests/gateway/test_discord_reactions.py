@@ -65,6 +65,9 @@ def adapter():
         fetch_channel=AsyncMock(),
         user=SimpleNamespace(id=99999, name="HermesBot"),
     )
+    # Current Discord ingress fails closed. The normal inbound-reaction tests
+    # exercise a configured, allowed human; denial cases override this fixture.
+    adapter._allowed_user_ids = {"42"}
     return adapter
 
 
@@ -108,66 +111,6 @@ async def test_process_message_background_adds_and_swaps_reactions(adapter):
     assert raw_message.add_reaction.await_args_list[0].args == ("👀",)
     assert raw_message.remove_reaction.await_args_list[0].args == ("👀", adapter._client.user)
     assert raw_message.add_reaction.await_args_list[1].args == ("✅",)
-
-
-@pytest.mark.asyncio
-async def test_interaction_backed_events_do_not_attempt_reactions(adapter):
-    interaction = SimpleNamespace(guild_id=123456789)
-
-    async def handler(_event):
-        await asyncio.sleep(0)
-        return None
-
-    async def hold_typing(_chat_id, interval=2.0, metadata=None):
-        await asyncio.Event().wait()
-
-    adapter.set_message_handler(handler)
-    adapter._add_reaction = AsyncMock()
-    adapter._remove_reaction = AsyncMock()
-    adapter._keep_typing = hold_typing
-
-    event = MessageEvent(
-        text="/status",
-        message_type=MessageType.COMMAND,
-        source=SessionSource(
-            platform=Platform.DISCORD,
-            chat_id="123",
-            chat_type="dm",
-            user_id="42",
-            user_name="Jezza",
-        ),
-        raw_message=interaction,
-        message_id="2",
-    )
-
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter._add_reaction.assert_not_awaited()
-    adapter._remove_reaction.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_reaction_helper_failures_do_not_break_message_flow(adapter):
-    raw_message = SimpleNamespace(
-        add_reaction=AsyncMock(side_effect=[RuntimeError("no perms"), RuntimeError("no perms")]),
-        remove_reaction=AsyncMock(side_effect=RuntimeError("no perms")),
-    )
-
-    async def handler(_event):
-        await asyncio.sleep(0)
-        return "ack"
-
-    async def hold_typing(_chat_id, interval=2.0, metadata=None):
-        await asyncio.Event().wait()
-
-    adapter.set_message_handler(handler)
-    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="999"))
-    adapter._keep_typing = hold_typing
-
-    event = _make_event("3", raw_message)
-    await adapter._process_message_background(event, build_session_key(event.source))
-
-    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio

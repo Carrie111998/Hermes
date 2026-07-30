@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -42,6 +43,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
 )
 from gateway.platforms.helpers import redact_phone
+from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
+from tools.audio_container import CONTAINER_TO_EXT, sniff_container
 from gateway.platforms.signal_format import markdown_to_signal
 from gateway.platforms.signal_rate_limit import (
     SIGNAL_BATCH_PACING_NOTICE_THRESHOLD,
@@ -98,18 +101,15 @@ def _guess_extension(data: bytes) -> str:
         return ".webp"
     if data[:4] == b"%PDF":
         return ".pdf"
-    if len(data) >= 8 and data[4:8] == b"ftyp":
-        return ".mp4"
-    if data[:4] == b"OggS":
-        return ".ogg"
-    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
-        # ``0xFF 0xFx`` is shared by MP3 and ADTS AAC. The discriminator
-        # is bits 3-1 of byte 1: ADTS has ``ID=0`` and ``layer=00`` (mask
-        # 0xF6, target 0xF0); MP3 has ``ID=1`` and ``layer`` in {01,10,11}
-        # (mask 0xF6, target in {0xF2, 0xF4, 0xF6}).
-        if (data[1] & 0xF6) == 0xF0:
-            return ".aac"
-        return ".mp3"
+    # Audio/AV containers: delegate to the shared central sniffer
+    # (tools/audio_container.py) — ONE module owns magic-byte container
+    # detection. It handles the brand/form-type disambiguations this
+    # function used to carry locally: RIFF/WAVE vs WEBP (WEBP is claimed
+    # above, before delegation), ftyp audio brands ("M4A ", "M4B ") vs
+    # video brands (isom/mp42/avc1/qt), and MP3 vs ADTS AAC sync words.
+    container = sniff_container(data)
+    if container is not None:
+        return CONTAINER_TO_EXT[container]
     if data[:2] == b"PK":
         return ".zip"
     return ".bin"
@@ -123,18 +123,17 @@ def _is_audio_ext(ext: str) -> bool:
     return ext.lower() in {".mp3", ".wav", ".ogg", ".m4a", ".aac"}
 
 
-_EXT_TO_MIME = {
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-    ".gif": "image/gif", ".webp": "image/webp",
-    ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".wav": "audio/wav",
-    ".m4a": "audio/mp4", ".aac": "audio/aac",
-    ".mp4": "video/mp4", ".pdf": "application/pdf", ".zip": "application/zip",
-}
+# Historical Signal ext→mime table now lives in
+# gateway.platforms.media_cache.DEFAULT_EXT_TO_MIME (byte-identical);
+# kept as a module alias for backwards compatibility with any callers
+# that referenced the private name.
+_EXT_TO_MIME = DEFAULT_EXT_TO_MIME
 
 
 def _ext_to_mime(ext: str) -> str:
     """Map file extension to MIME type."""
-    return _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
+    # preserves historical signal mapping (shared table matches verbatim)
+    return mime_for_ext(ext, fallback="application/octet-stream")
 
 
 def _remux_aac_to_m4a(aac_data: bytes) -> Optional[Tuple[bytes, str]]:
@@ -235,8 +234,16 @@ def _looks_like_e164_number(value: str) -> bool:
 
 
 def check_signal_requirements() -> bool:
-    """Check if Signal is configured (has URL and account)."""
-    return bool(os.getenv("SIGNAL_HTTP_URL") and os.getenv("SIGNAL_ACCOUNT"))
+    """Check if Signal runtime dependencies are available."""
+    return True
+
+
+def validate_signal_config(config: PlatformConfig) -> bool:
+    """Check if Signal has enough config to connect."""
+    extra = getattr(config, "extra", {}) or {}
+    http_url = (extra.get("http_url", "") or os.getenv("SIGNAL_HTTP_URL", "")).strip()
+    account = (extra.get("account", "") or os.getenv("SIGNAL_ACCOUNT", "")).strip()
+    return bool(http_url and account)
 
 
 # ---------------------------------------------------------------------------
@@ -304,14 +311,23 @@ class SignalAdapter(BasePlatformAdapter):
         self._account_normalized = self.account.strip()
 
         # Track recently sent message timestamps to prevent echo-back loops
-        # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds).
-        self._recent_sent_timestamps: set = set()
-        self._max_recent_timestamps = 50
+        # in Note to Self / self-chat mode and linked-device group sync-sents.
+        # OrderedDict[timestamp_ms -> insertion_monotonic_seconds] gives us
+        # LRU eviction (popitem(last=False) drops oldest) plus a TTL so that
+        # under chatty groups a still-pending echo cannot be evicted just
+        # because >50 outbounds happened. With a 5-minute TTL the cap only
+        # matters for runaway producers, not normal traffic bursts.
+        self._recent_sent_timestamps: "OrderedDict[int, float]" = OrderedDict()
+        self._max_recent_timestamps = 512
+        self._recent_sent_ttl_seconds = 300.0
         # Keep a separate bounded cache of outbound Signal message timestamps.
         # Signal quote.id is the timestamp of the quoted message, so this lets
         # inbound replies identify that the user replied to a message sent by
         # this bot even after the self-sync echo was filtered above.
-        self._sent_message_timestamps: set[str] = set()
+        # OrderedDict (not set) so the cap evicts the OLDEST timestamp in FIFO
+        # order — a plain set.pop() removes an arbitrary element, which could
+        # drop a still-recent timestamp and miss a genuine reply-to-own-message.
+        self._sent_message_timestamps: "OrderedDict[str, None]" = OrderedDict()
         self._max_sent_message_timestamps = 500
         # Signal increasingly exposes ACI/PNI UUIDs as stable recipient IDs.
         # Keep a best-effort mapping so outbound sends can upgrade from a
@@ -328,7 +344,7 @@ class SignalAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to signal-cli daemon and start SSE listener."""
         if not self.http_url or not self.account:
             logger.error("Signal: SIGNAL_HTTP_URL and SIGNAL_ACCOUNT are required")
@@ -536,8 +552,7 @@ class SignalAdapter(BasePlatformAdapter):
                     sent_msg_group_id = sent_msg_group_info.get("groupId") if sent_msg_group_info else None
                     if dest == self._account_normalized or sent_msg_group_id:
                         # Check if this is an echo of our own outbound reply
-                        if sent_ts and sent_ts in self._recent_sent_timestamps:
-                            self._recent_sent_timestamps.discard(sent_ts)
+                        if self._consume_sent_timestamp(sent_ts):
                             return
                         # Genuine user Note to Self — promote to dataMessage
                         is_note_to_self = True
@@ -620,6 +635,27 @@ class SignalAdapter(BasePlatformAdapter):
                     "Signal: ignoring group message (require_mention=true, bot not mentioned)"
                 )
                 return
+
+        # Strip the bot's own @mention from any group message so the agent
+        # doesn't misinterpret "@+155****4567 say hello" as a directive to
+        # contact that phone number. _render_mentions replaces the Signal
+        # ￼ placeholder with @<number-or-uuid>, which looks like an
+        # addressee to the LLM rather than a self-reference. Applies to every
+        # group (not just require_mention groups) so the self-mention is
+        # cleaned wherever it appears.
+        if is_group and text:
+            account_norm = self._account_normalized
+            if account_norm:
+                text = text.replace(f"@{account_norm}", "")
+                # Also strip if the mention was rendered using the bot's UUID
+                bot_uuid = self._recipient_uuid_by_number.get(account_norm)
+                if bot_uuid:
+                    text = text.replace(f"@{bot_uuid}", "")
+                # Tidy the spacing the removed mention left behind: collapse the
+                # double-space at a mid-sentence removal and trim the ends.
+                # Only touches the doubled space the removal introduced, so
+                # intentional newlines in a multi-line message are preserved.
+                text = text.replace("  ", " ").strip()
 
         # Extract quote (reply-to) context from Signal dataMessage. Signal's
         # quote.id is the timestamp of the quoted message; quote.author points
@@ -780,9 +816,14 @@ class SignalAdapter(BasePlatformAdapter):
         """Keep a bounded cache of outbound Signal timestamps for quote matching."""
         if timestamp is None:
             return
-        self._sent_message_timestamps.add(str(timestamp))
-        if len(self._sent_message_timestamps) > self._max_sent_message_timestamps:
-            self._sent_message_timestamps.pop()
+        key = str(timestamp)
+        # Re-insert to mark most-recently-used so eviction drops genuinely old
+        # timestamps, not a recently re-seen one.
+        self._sent_message_timestamps.pop(key, None)
+        self._sent_message_timestamps[key] = None
+        # FIFO-evict the oldest entry once over the cap.
+        while len(self._sent_message_timestamps) > self._max_sent_message_timestamps:
+            self._sent_message_timestamps.popitem(last=False)
 
     def _extract_contact_uuid(self, contact: Any, phone_number: str) -> Optional[str]:
         """Best-effort extraction of a Signal service ID from listContacts output."""
@@ -1055,10 +1096,29 @@ class SignalAdapter(BasePlatformAdapter):
         """Record outbound message timestamp for echo-back filtering."""
         ts = rpc_result.get("timestamp") if isinstance(rpc_result, dict) else None
         if ts:
-            self._recent_sent_timestamps.add(ts)
             self._remember_sent_message_timestamp(ts)
-            if len(self._recent_sent_timestamps) > self._max_recent_timestamps:
-                self._recent_sent_timestamps.pop()
+            now = time.monotonic()
+            # Re-insert to mark as most-recently-used.
+            self._recent_sent_timestamps.pop(ts, None)
+            self._recent_sent_timestamps[ts] = now
+            # Drop entries older than TTL first (cheap O(k) where k=expired).
+            cutoff = now - self._recent_sent_ttl_seconds
+            while self._recent_sent_timestamps:
+                oldest_ts, oldest_at = next(iter(self._recent_sent_timestamps.items()))
+                if oldest_at < cutoff:
+                    self._recent_sent_timestamps.popitem(last=False)
+                else:
+                    break
+            # Hard cap as a last-resort guard against runaway producers.
+            while len(self._recent_sent_timestamps) > self._max_recent_timestamps:
+                self._recent_sent_timestamps.popitem(last=False)
+
+    def _consume_sent_timestamp(self, ts) -> bool:
+        """Pop a timestamp if it matches one we sent. Returns True on echo."""
+        if ts and ts in self._recent_sent_timestamps:
+            self._recent_sent_timestamps.pop(ts, None)
+            return True
+        return False
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Send a typing indicator.
@@ -1460,8 +1520,29 @@ class SignalAdapter(BasePlatformAdapter):
                 await task
             except asyncio.CancelledError:
                 pass
-        # Reset per-chat typing backoff state so the next agent turn starts
-        # fresh rather than inheriting a cooldown from a prior conversation.
+
+        # Send an explicit stop-typing RPC so the recipient's device drops the
+        # indicator immediately instead of waiting for Signal's ~5s built-in
+        # timeout.  Failures are best-effort — the backoff state must still be
+        # cleared so the next agent turn starts clean.
+        try:
+            params: Dict[str, Any] = {"account": self.account}
+            if chat_id.startswith("group:"):
+                params["groupId"] = chat_id[6:]
+            else:
+                params["recipient"] = [await self._resolve_recipient(chat_id)]
+            params["stop"] = True
+            await self._rpc(
+                "sendTyping",
+                params,
+                rpc_id="typing-stop",
+                log_failures=False,
+            )
+        except Exception:
+            # Best-effort: any RPC failure (or recipient-resolution failure)
+            # must not prevent backoff cleanup.
+            pass
+
         self._typing_failures.pop(chat_id, None)
         self._typing_skip_until.pop(chat_id, None)
 

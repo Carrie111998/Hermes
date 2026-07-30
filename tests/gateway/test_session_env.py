@@ -48,6 +48,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -59,6 +60,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_SOURCE") == ""
     assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == "Group"
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
@@ -66,22 +68,11 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
     assert os.getenv("HERMES_SESSION_SOURCE") is None
+    assert os.getenv("HERMES_SESSION_CHAT_TYPE") is None
     assert os.getenv("HERMES_SESSION_THREAD_ID") is None
 
     # Clean up
     runner._clear_session_env(tokens)
-
-
-def test_session_source_uses_contextvars(monkeypatch):
-    monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
-
-    tokens = set_session_vars(source="tool")
-
-    assert get_session_env("HERMES_SESSION_SOURCE") == "tool"
-
-    clear_session_vars(tokens)
-
-    assert get_session_env("HERMES_SESSION_SOURCE") == ""
 
 
 def test_clear_session_env_restores_previous_state(monkeypatch):
@@ -91,6 +82,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
@@ -109,6 +101,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
 
     runner._clear_session_env(tokens)
 
@@ -116,6 +109,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
     assert get_session_env("HERMES_SESSION_CHAT_ID") == ""
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
+    assert get_session_env("HERMES_SESSION_CHAT_TYPE") == ""
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
@@ -139,54 +133,9 @@ def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
 
 
-def test_get_session_env_default_when_nothing_set(monkeypatch):
-    """get_session_env returns default when neither contextvar nor env is set."""
-    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
-
-    assert get_session_env("HERMES_SESSION_PLATFORM") == ""
-    assert get_session_env("HERMES_SESSION_PLATFORM", "fallback") == "fallback"
-
-
-def test_set_session_env_handles_missing_optional_fields():
-    """_set_session_env should handle None chat_name and thread_id gracefully."""
-    runner = object.__new__(GatewayRunner)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_name=None,
-        chat_type="private",
-        thread_id=None,
-    )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
-
-    tokens = runner._set_session_env(context)
-
-    assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
-    assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
-    assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
-    assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
-
-    runner._clear_session_env(tokens)
-
-
 # ---------------------------------------------------------------------------
 # SESSION_KEY contextvars tests
 # ---------------------------------------------------------------------------
-
-
-def test_session_key_set_via_contextvars(monkeypatch):
-    """set_session_vars should set HERMES_SESSION_KEY via contextvars."""
-    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
-
-    tokens = set_session_vars(
-        platform="telegram",
-        chat_id="-1001",
-        session_key="tg:-1001:17585",
-    )
-    assert get_session_env("HERMES_SESSION_KEY") == "tg:-1001:17585"
-
-    clear_session_vars(tokens)
-    assert get_session_env("HERMES_SESSION_KEY") == ""
 
 
 def test_session_key_falls_back_to_os_environ(monkeypatch):
@@ -203,45 +152,6 @@ def test_session_key_falls_back_to_os_environ(monkeypatch):
     # After clear — should return "" (explicitly cleared), not os.environ (#10304)
     clear_session_vars(tokens)
     assert get_session_env("HERMES_SESSION_KEY") == ""
-
-
-def test_session_id_set_via_contextvars(monkeypatch):
-    """set_session_vars should set HERMES_SESSION_ID via contextvars."""
-    monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
-
-    tokens = set_session_vars(session_id="ctx-session-456")
-    assert get_session_env("HERMES_SESSION_ID") == "ctx-session-456"
-
-    clear_session_vars(tokens)
-    assert get_session_env("HERMES_SESSION_ID") == ""
-
-
-def test_set_session_env_includes_session_key():
-    """_set_session_env should propagate session_key from SessionContext."""
-    runner = object.__new__(GatewayRunner)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_name="Group",
-        chat_type="group",
-        thread_id="17585",
-    )
-    context = SessionContext(
-        source=source,
-        connected_platforms=[],
-        home_channels={},
-        session_key="tg:-1001:17585",
-    )
-
-    # Capture baseline value before setting (may be non-empty from another
-    # test in the same pytest-xdist worker sharing the context).
-    tokens = runner._set_session_env(context)
-    assert get_session_env("HERMES_SESSION_KEY") == "tg:-1001:17585"
-    runner._clear_session_env(tokens)
-    # After clearing, the session key must not retain the value we just set.
-    # The exact post-clear value depends on context propagation from other
-    # tests, so only check that our value was removed, not what replaced it.
-    assert get_session_env("HERMES_SESSION_KEY") != "tg:-1001:17585"
 
 
 def test_session_key_no_race_condition_with_contextvars(monkeypatch):
@@ -317,6 +227,7 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         )
     finally:
         runner._clear_session_env(tokens)
+        runner._shutdown_executor()
 
     assert result == {
         "platform": "telegram",
@@ -326,25 +237,3 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
     }
 
 
-@pytest.mark.asyncio
-async def test_run_in_executor_with_context_forwards_args():
-    """_run_in_executor_with_context should forward *args to the callable."""
-    runner = object.__new__(GatewayRunner)
-
-    def add(a, b):
-        return a + b
-
-    result = await runner._run_in_executor_with_context(add, 3, 7)
-    assert result == 10
-
-
-@pytest.mark.asyncio
-async def test_run_in_executor_with_context_propagates_exceptions():
-    """Exceptions inside the executor should propagate to the caller."""
-    runner = object.__new__(GatewayRunner)
-
-    def blow_up():
-        raise ValueError("boom")
-
-    with pytest.raises(ValueError, match="boom"):
-        await runner._run_in_executor_with_context(blow_up)

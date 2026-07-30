@@ -17,6 +17,7 @@ Config via environment variables:
   HINDSIGHT_MODE                   — cloud or local (default: cloud)
   HINDSIGHT_TIMEOUT                — API request timeout in seconds (default: 120)
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
+  HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
@@ -36,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import sys
 import threading
 
 from datetime import datetime, timezone
@@ -64,7 +66,7 @@ _VALID_BUDGETS = {"low", "mid", "high"}
 _PROVIDER_DEFAULT_MODELS = {
     "openai": "gpt-4o-mini",
     "anthropic": "claude-haiku-4-5",
-    "gemini": "gemini-2.5-flash",
+    "gemini": "gemini-3.6-flash",
     "groq": "openai/gpt-oss-120b",
     "openrouter": "qwen/qwen3.5-9b",
     "minimax": "MiniMax-M2.7",
@@ -85,6 +87,43 @@ def _parse_int_setting(value: Any, default: int) -> int:
         return default
 
 
+# Env var the embedded daemon manager reads (at import time, as a module-level
+# constant) to size the grace window it waits for a slow /health before
+# declaring a daemon stale and killing it. Default upstream is 30s; on
+# resource-contended hosts a busy daemon can exceed a single 2s health check
+# and get needlessly killed + restarted (issue #13125 comment thread). We
+# surface it as plugin config so users can raise it without hand-setting an
+# env var, consistent with "config.json, not raw env vars".
+_PORT_HEALTH_GRACE_ENV = "HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT"
+
+
+def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
+    """Export the embedded-daemon health grace timeout to the process env.
+
+    Must run BEFORE ``hindsight_embed.daemon_embed_manager`` is imported,
+    because the package reads the env var into a module-level constant at
+    import time. We only set it when the user configured a value AND the
+    env var isn't already set, so an explicit env override always wins.
+    """
+    raw = config.get("port_health_grace_timeout")
+    if raw is None or raw == "":
+        return
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid Hindsight port_health_grace_timeout %r; ignoring.", raw
+        )
+        return
+    if seconds < 0:
+        logger.warning(
+            "Negative Hindsight port_health_grace_timeout %r; ignoring.", raw
+        )
+        return
+    # setdefault: an explicit env var the operator set wins over config.
+    os.environ.setdefault(_PORT_HEALTH_GRACE_ENV, repr(seconds))
+
+
 def _check_local_runtime() -> tuple[bool, str | None]:
     """Return whether local embedded Hindsight imports cleanly.
 
@@ -92,10 +131,19 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     error from NumPy before the daemon starts. Treat that as "unavailable"
     so Hermes can degrade gracefully instead of repeatedly trying to start
     a broken local memory backend.
+
+    The embedded daemon computes embeddings via ``sentence_transformers``
+    (transformers + huggingface-hub). Importing ``hindsight`` /
+    ``hindsight_embed`` alone succeeds even when that stack is broken, so
+    without importing it here the probe would falsely report the backend
+    healthy and ``hermes memory status`` would stay green while the daemon
+    aborts at startup on every retain/recall. Import it too so the probe (and
+    status) reports the real ImportError.
     """
     try:
         importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
+        importlib.import_module("sentence_transformers")
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -457,7 +505,9 @@ def _load_simple_env(path) -> dict[str, str]:
         return {}
 
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig, not plain utf-8: this is also used on the Hermes .env during
+    # post_setup, and a Notepad BOM would otherwise stick to the first key.
+    for line in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -582,6 +632,16 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
+    def backup_paths(self) -> List[str]:
+        """Hindsight's legacy shared config and embedded-mode profile env
+        files live under ~/.hindsight (see _load_config / line ~509)."""
+        try:
+            from pathlib import Path
+            legacy_dir = Path.home() / ".hindsight"
+            return [str(legacy_dir)]
+        except Exception:
+            return []
+
     def __init__(self):
         self._config = None
         self._api_key = None
@@ -697,7 +757,7 @@ class HindsightMemoryProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text())
+                existing = json.loads(config_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
         existing.update(values)
@@ -773,21 +833,18 @@ class HindsightMemoryProvider(MemoryProvider):
             provider_config["llm_provider"] = llm_provider
 
         print("\n  Checking dependencies...")
-        uv_path = shutil.which("uv")
-        if not uv_path:
-            print("  ⚠ uv not found — install it: curl -LsSf https://astral.sh/uv/install.sh | sh")
-            print(f"  Then run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
+        # Environment-aware install: sealed hosted venvs redirect to the durable
+        # data-volume target instead of writing to /opt/hermes (NS-605).
+        from tools.lazy_deps import install_specs
+
+        outcome = install_specs(deps_to_install, timeout=120)
+        if outcome.ok:
+            print("  ✓ Dependencies up to date")
+        elif outcome.blocked:
+            print(f"  ⚠ Cannot install dependencies: {outcome.reason}")
         else:
-            try:
-                subprocess.run(
-                    [uv_path, "pip", "install", "--python", sys.executable, "--quiet", "--upgrade"] + deps_to_install,
-                    check=True, timeout=120, capture_output=True,
-                    stdin=subprocess.DEVNULL,
-                )
-                print("  ✓ Dependencies up to date")
-            except Exception as e:
-                print(f"  ⚠ Install failed: {e}")
-                print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
+            print(f"  ⚠ Install failed:\n{(outcome.stderr or '').strip()}")
+            print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
 
         # Step 3: Mode-specific config
         if mode == "cloud":
@@ -846,7 +903,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 env_path = Path(hermes_home) / ".env"
                 existing_llm_key = ""
                 if env_path.exists():
-                    for line in env_path.read_text().splitlines():
+                    # utf-8-sig: a Notepad BOM must not hide the first key.
+                    for line in env_path.read_text(encoding="utf-8-sig").splitlines():
                         if line.startswith("HINDSIGHT_LLM_API_KEY="):
                             existing_llm_key = line.split("=", 1)[1]
                             break
@@ -876,7 +934,10 @@ class HindsightMemoryProvider(MemoryProvider):
             env_path.parent.mkdir(parents=True, exist_ok=True)
             existing_lines = []
             if env_path.exists():
-                existing_lines = env_path.read_text().splitlines()
+                # utf-8-sig: a Notepad BOM would glue U+FEFF onto the first
+                # key, defeating the in-place update below and appending a
+                # duplicate line instead.
+                existing_lines = env_path.read_text(encoding="utf-8-sig").splitlines()
             updated_keys = set()
             new_lines = []
             for line in existing_lines:
@@ -889,7 +950,7 @@ class HindsightMemoryProvider(MemoryProvider):
             for k, v in env_writes.items():
                 if k not in updated_keys:
                     new_lines.append(f"{k}={v}")
-            env_path.write_text("\n".join(new_lines) + "\n")
+            env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
         if mode == "local_embedded":
             materialized_config = dict(provider_config)
@@ -957,6 +1018,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
+            {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
         ]
 
     def _get_client(self):
@@ -1169,24 +1231,18 @@ class HindsightMemoryProvider(MemoryProvider):
             if Version(installed) < Version(_MIN_CLIENT_VERSION):
                 logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
                                installed, _MIN_CLIENT_VERSION)
-                import shutil
-                import subprocess
-                import sys
-                uv_path = shutil.which("uv")
-                if uv_path:
-                    try:
-                        subprocess.run(
-                            [uv_path, "pip", "install", "--python", sys.executable,
-                             "--quiet", "--upgrade", f"hindsight-client>={_MIN_CLIENT_VERSION}"],
-                            check=True, timeout=120, capture_output=True,
-                            stdin=subprocess.DEVNULL,
-                        )
-                        logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
-                    except Exception as e:
-                        logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                       e, _MIN_CLIENT_VERSION)
+                # Environment-aware install: sealed hosted venvs redirect to the
+                # durable data-volume target instead of /opt/hermes (NS-605).
+                from tools.lazy_deps import install_specs
+                outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
+                if outcome.ok:
+                    logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
+                elif outcome.blocked:
+                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
+                                   outcome.reason, _MIN_CLIENT_VERSION)
                 else:
-                    logger.warning("uv not found. Run: pip install 'hindsight-client>=%s'", _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
+                                   (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
@@ -1217,6 +1273,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._mode == "local":
             self._mode = "local_embedded"
         if self._mode == "local_embedded":
+            # Export the daemon health grace timeout BEFORE importing
+            # daemon_embed_manager (which reads it at import time).
+            _export_port_health_grace_timeout(self._config)
             available, reason = _check_local_runtime()
             if not available:
                 logger.warning(
@@ -1322,6 +1381,30 @@ class HindsightMemoryProvider(MemoryProvider):
         # doesn't block the chat. Redirect stdout/stderr to a log file to
         # prevent rich startup output from spamming the terminal.
         if self._mode == "local_embedded":
+            # PostgreSQL's initdb refuses to run as root by design, so the
+            # embedded daemon can never initialize its data directory under
+            # root. Without this guard the daemon-start thread would fail,
+            # retry, and loop forever — each cycle reloading embedding models
+            # (~958MB RAM, ~33% CPU) with no user-visible error. Detect root
+            # up front and skip daemon startup with a clear message instead.
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                msg = (
+                    "Hindsight local_embedded mode cannot run as root "
+                    "(PostgreSQL initdb refuses root). Skipping the embedded "
+                    "memory daemon. Run Hermes as a non-root user, or switch "
+                    "to cloud / local_external mode via 'hermes memory setup'."
+                )
+                logger.warning(msg)
+                # Surface to the terminal too — a daemon that never starts
+                # would otherwise fail silently and the user would only see
+                # Hermes get sluggish. (issue #13125)
+                try:
+                    print(f"  ⚠ {msg}", file=sys.stderr, flush=True)
+                except Exception:
+                    pass
+                self._mode = "disabled"
+                return
+
             def _start_daemon():
                 import traceback
                 log_dir = get_hermes_home() / "logs"
