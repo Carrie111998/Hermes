@@ -26,6 +26,7 @@ CLI:
   hermes harness kanban create /path/to/intake.md --triage
   hermes harness evidence <task-id> --output evidence.md
   hermes harness gc-template --output weekly-harness-gc.md
+  hermes harness migration-pack --output-dir /path/to/repo
 
 Helper resolution:
   bundled skill script first, then ~/.hermes/bin/hermes-harness
@@ -160,6 +161,11 @@ def _setup_harness_cli(parser) -> None:
     gc_p.add_argument("--output", "-o", default="", help="Write template to this file instead of stdout")
     gc_p.add_argument("--board", default="hermes-engineering-loop", help="Target board slug to mention in the template")
 
+    migration_p = sub.add_parser("migration-pack", help="Generate cross-agent Harness migration files")
+    migration_p.add_argument("--output-dir", "-o", default=".", help="Repository/directory where pack files should be written")
+    migration_p.add_argument("--force", action="store_true", help="Overwrite existing migration-pack files")
+    migration_p.add_argument("--json", action="store_true", help="Print written file paths as JSON")
+
     parser.set_defaults(func=_handle_harness_cli)
 
 
@@ -175,6 +181,8 @@ def _handle_harness_cli(args) -> None:
         raise SystemExit(_handle_harness_evidence_cli(args))
     if action == "gc-template":
         raise SystemExit(_handle_harness_gc_template_cli(args))
+    if action == "migration-pack":
+        raise SystemExit(_handle_harness_migration_pack_cli(args))
 
     argv: list[str] = [action]
     if action == "classify":
@@ -459,6 +467,119 @@ For each drift finding, create a triage card with evidence, affected paths, risk
         print(target)
     else:
         print(content)
+    return 0
+
+
+MIGRATION_PACK_FILES = {
+    "CODEX.md": """# Codex Harness Rules
+
+Use the repository `AGENTS.md` plus this Harness migration pack before non-trivial coding tasks.
+
+## Required Loop
+
+1. Classify the task with `hermes harness classify --text \"<request>\" --format json` when Hermes CLI is available.
+2. For high-risk, multi-agent, scheduled, filesystem, auth, secret, approval, or cross-module work, create/fill an intake with `hermes harness new` and validate it with `hermes harness check`.
+3. Read applicable contracts before editing: `AGENTS.md`, `CONTRIBUTING.md`, `docs/CONTRACTS.md`, subsystem RFC/docs, and tests for the touched area.
+4. Keep implementation and review separate. Use `hermes harness kanban decompose <task-id>` for worker/reviewer child-card commands when Kanban is available.
+5. Attach evidence with commands run, failures, manual checks, risk/rollback notes, and retention decisions before claiming done.
+
+## Safety Defaults
+
+- Do not bypass user approval for destructive shell, filesystem, credential, cron, gateway, release, or force-push operations.
+- Do not treat upstream PR/CI state as the local completion gate when a local Harness manifest/gate exists.
+- Prefer focused tests and local deterministic gates over broad claims.
+""",
+    "CLAUDE.md": """# Claude Harness Rules
+
+This repository uses Hermes Harness Engineering constraints. Follow them as project memory.
+
+## Context
+
+- `AGENTS.md` and `docs/CONTRACTS.md` are authoritative local entry points.
+- `hermes harness classify` routes tasks into direct answer, research, bounded engineering, advisory, or intake-required modes.
+- `hermes harness evidence` records completion proof.
+
+## Work Policy
+
+Before code changes, identify scope, acceptance criteria, non-goals, risk surface, rollback/recovery, and verification commands. For multi-agent work, keep implementer and reviewer responsibilities separate.
+
+Do not mutate secrets, cron jobs, credentials, memory, profile config, or destructive filesystem state without explicit human approval.
+""",
+    "OPENCODE.md": """# OpenCode Harness Rules
+
+Use this file as the OpenCode-compatible entry rule for Harness Engineering.
+
+- Load `AGENTS.md`, `CONTRIBUTING.md`, and `docs/CONTRACTS.md` before repository edits.
+- Run `hermes harness classify --text \"<task>\" --format json` for non-trivial work when available.
+- Use `hermes harness new/check/prompt` for high-risk or cross-module tasks.
+- Produce Harness Evidence before done: spec compliance, automated checks, manual/negative checks, rollback, retention.
+- Keep publication PRs separate from local completion gates.
+""",
+    ".cursor/rules/harness.mdc": """---
+description: Harness Engineering local constraints
+globs:
+  - \"**/*\"
+alwaysApply: true
+---
+
+Use AGENTS.md, docs/CONTRACTS.md, and Hermes Harness commands before non-trivial edits.
+
+For risky/cross-module work, require intake, explicit risk surface, verification evidence, and rollback notes. Do not perform destructive state changes without human approval.
+""",
+    ".windsurfrules": """# Harness Engineering Rules
+
+Read AGENTS.md and docs/CONTRACTS.md before editing. Use `hermes harness classify` for non-trivial work and `hermes harness evidence` before claiming done.
+
+High-risk changes require explicit scope, acceptance criteria, risk surface, negative checks, rollback/recovery, and human approval for destructive state.
+""",
+    "prompts/task-intake.md": """# Harness Task Intake Prompt
+
+Fill this before delegating non-trivial AI engineering work.
+
+- Problem:
+- Acceptance criteria:
+- Non-goals:
+- Workspace / affected paths:
+- Applicable contracts/docs:
+- Risk surface:
+- Rollback or recovery:
+- Required automated checks:
+- Required manual/negative checks:
+- Retention decision:
+
+After filling, run:
+
+```bash
+hermes harness check /path/to/intake.md
+hermes harness prompt /path/to/intake.md
+```
+""",
+}
+
+
+def _handle_harness_migration_pack_cli(args) -> int:
+    output_dir = Path(getattr(args, "output_dir", ".") or ".").expanduser().resolve()
+    force = bool(getattr(args, "force", False))
+    written: list[str] = []
+    skipped: list[str] = []
+    for rel, content in MIGRATION_PACK_FILES.items():
+        target = output_dir / rel
+        if target.exists() and not force:
+            skipped.append(str(target))
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        written.append(str(target))
+    payload = {"output_dir": str(output_dir), "written": written, "skipped_existing": skipped}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        for path in written:
+            print(path)
+        for path in skipped:
+            print(f"SKIP existing: {path}")
+        if skipped:
+            print("Use --force to overwrite existing migration-pack files.")
     return 0
 
 ENGINEERING_KEYWORDS = re.compile(

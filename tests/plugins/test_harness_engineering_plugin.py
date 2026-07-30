@@ -270,3 +270,42 @@ def test_harness_gc_template_documents_non_mutating_boundary(tmp_path):
     assert "Weekly Harness GC" in content
     assert "Do not auto-repair" in content
     assert "hermes-engineering-loop" in content
+
+
+def test_harness_migration_pack_generates_cross_agent_files(tmp_path, capsys):
+    plugin = _load_plugin()
+
+    code = plugin._handle_harness_migration_pack_cli(
+        SimpleNamespace(output_dir=str(tmp_path), force=False, json=False)
+    )
+
+    assert code == 0
+    out = capsys.readouterr().out
+    expected = [
+        "CODEX.md",
+        "CLAUDE.md",
+        "OPENCODE.md",
+        ".cursor/rules/harness.mdc",
+        ".windsurfrules",
+        "prompts/task-intake.md",
+    ]
+    for rel in expected:
+        target = tmp_path / rel
+        assert target.exists()
+        assert str(target.resolve()) in out
+    assert "hermes harness classify" in (tmp_path / "CODEX.md").read_text(encoding="utf-8")
+    assert "docs/CONTRACTS.md" in (tmp_path / ".cursor/rules/harness.mdc").read_text(encoding="utf-8")
+
+
+def test_harness_migration_pack_skips_existing_without_force(tmp_path, capsys):
+    plugin = _load_plugin()
+    target = tmp_path / "CODEX.md"
+    target.write_text("custom", encoding="utf-8")
+
+    code = plugin._handle_harness_migration_pack_cli(
+        SimpleNamespace(output_dir=str(tmp_path), force=False, json=False)
+    )
+
+    assert code == 0
+    assert target.read_text(encoding="utf-8") == "custom"
+    assert "SKIP existing" in capsys.readouterr().out

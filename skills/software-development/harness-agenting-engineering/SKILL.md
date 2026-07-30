@@ -312,6 +312,7 @@ hermes harness kanban decompose <task-id> --workspace worktree --branch wt/<task
 hermes harness kanban decompose <task-id> --execute  # explicit only; default is dry-run
 hermes harness evidence <task-id> --workspace /path/to/repo --output /path/to/evidence.md
 hermes harness gc-template --output /path/to/weekly-harness-gc.md
+hermes harness migration-pack --output-dir /path/to/repo --json
 ```
 
 Lifecycle command safety boundaries:
