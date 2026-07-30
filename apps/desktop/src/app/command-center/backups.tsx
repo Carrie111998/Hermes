@@ -5,8 +5,8 @@ import { Button } from '@/components/ui/button'
 import {
   type ActionStatusResponse,
   type BackupArchive,
+  downloadBackup,
   getActionStatus,
-  getBackupDownloadUrl,
   listBackups,
   runBackup
 } from '@/hermes'
@@ -41,6 +41,7 @@ export function BackupsPanel() {
   const [error, setError] = useState('')
   const [actionName, setActionName] = useState<null | string>(null)
   const [actionStatus, setActionStatus] = useState<ActionStatusResponse | null>(null)
+  const [downloadingPath, setDownloadingPath] = useState<null | string>(null)
 
   const refresh = useCallback(async () => {
     setLoading(true)
@@ -115,6 +116,28 @@ export function BackupsPanel() {
     }
   }, [bb])
 
+  const downloadArchive = useCallback(
+    async (archive: BackupArchive) => {
+      setDownloadingPath(archive.path)
+      setError('')
+
+      try {
+        const result = await downloadBackup(archive.path)
+
+        if (!result.ok && result.error) {
+          setError(result.error)
+          notifyError(new Error(result.error), bb.download)
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+        notifyError(err, bb.download)
+      } finally {
+        setDownloadingPath(null)
+      }
+    },
+    [bb]
+  )
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
       <div className="flex items-start justify-between gap-3">
@@ -156,14 +179,17 @@ export function BackupsPanel() {
                 <span className="shrink-0 text-[0.65rem] text-(--ui-text-tertiary)">
                   {formatFileSize(archive.size)}
                 </span>
-                <a
-                  className="shrink-0 text-(--ui-accent) hover:underline"
-                  download={archive.name}
-                  href={getBackupDownloadUrl(archive.path)}
+                <Button
+                  aria-label={bb.download}
+                  className="shrink-0 text-(--ui-text-tertiary) hover:text-foreground"
+                  disabled={downloadingPath === archive.path}
+                  onClick={() => void downloadArchive(archive)}
+                  size="icon-xs"
                   title={bb.download}
+                  variant="ghost"
                 >
                   <Download className="size-3" />
-                </a>
+                </Button>
               </li>
             ))}
           </ul>

@@ -1794,10 +1794,14 @@ export function listBackups(): Promise<BackupListResponse> {
   })
 }
 
-export function getBackupDownloadUrl(archivePath: string): string {
-  const params = new URLSearchParams({ archive: archivePath })
-
-  return `/api/ops/backup/download?${params.toString()}`
+// Packaged Desktop loads the renderer from file://, so a plain <a href> to a
+// relative /api path can't reach the backend — and unlike window.hermesDesktop.api,
+// a download needs the raw response bytes, not JSON. Route it through a
+// dedicated IPC bridge call so main can resolve the same profile-aware backend
+// connection + auth (token or OAuth bearer) the generic api() bridge uses, then
+// hand the bytes to a native "Save As" dialog.
+export function downloadBackup(archivePath: string): Promise<{ error?: string; ok: boolean; path?: string }> {
+  return window.hermesDesktop.downloadBackup(archivePath, _apiProfile)
 }
 
 export function runDebugShare(): Promise<DebugShareResponse> {
