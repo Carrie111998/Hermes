@@ -33,6 +33,42 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_release_mode_rejects_legacy_modeless_branch_cache(tmp_path, monkeypatch):
+    """Release Track must not reuse pre-feature branch commit counts."""
+    import hermes_cli.banner as banner
+    import hermes_cli.stable_update as stable_update
+    from hermes_cli import __version__
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(
+        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(banner, "_load_update_check_settings", lambda: ("release", {}))
+    monkeypatch.setattr(banner, "_resolve_repo_dir", lambda: repo_dir)
+    status = {
+        "mode": "official-releases",
+        "latest_tag": "v2026.7.20",
+        "target_tag": "v2026.7.20",
+        "up_to_date": False,
+        "error": None,
+    }
+    official_status = MagicMock(return_value=status)
+    monkeypatch.setattr(stable_update, "official_release_status", official_status)
+
+    banner._update_context = {}
+    result = banner.check_for_updates()
+
+    assert result == banner.UPDATE_AVAILABLE_NO_COUNT
+    official_status.assert_called_once_with(repo_dir)
+    assert banner.get_update_context()["mode"] == "official-releases"
+
+
 
 
 

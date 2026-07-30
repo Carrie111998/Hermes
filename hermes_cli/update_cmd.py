@@ -2058,7 +2058,7 @@ def _mutate_checkout_to_update_target(
 
 
 def _cmd_update_check_release(release_request: str):
-    """Fetch release tags and report whether the selected release is installed."""
+    """Resolve an official published release and report whether it is installed."""
     from hermes_cli.config import (
         detect_install_method,
         format_docker_update_message,
@@ -2079,57 +2079,27 @@ def _cmd_update_check_release(release_request: str):
         print("✗ Not a git repository — cannot check for updates.")
         sys.exit(1)
 
-    git_cmd = ["git"]
-    if sys.platform == "win32":
-        git_cmd = ["git", "-c", "windows.appendAtomically=false"]
+    from hermes_cli.stable_update import resolve_commit, resolve_official_release
 
-    print("→ Fetching release tags...")
-    fetch_result = subprocess.run(
-        git_cmd + ["fetch", "origin", "--tags"],
-        cwd=_m().PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    if fetch_result.returncode != 0:
-        stderr = fetch_result.stderr.strip()
-        if "Could not resolve host" in stderr or "unable to access" in stderr:
-            print("✗ Network error — cannot reach the remote repository.")
-        elif "Authentication failed" in stderr or "could not read Username" in stderr:
-            print("✗ Authentication failed — check your git credentials or SSH key.")
-        else:
-            print("✗ Failed to fetch release tags.")
-            if stderr:
-                print(f"  {stderr.splitlines()[0]}")
+    print("→ Checking official GitHub Releases...")
+    requested_tag = None if release_request == RELEASE_LATEST else release_request
+    release = resolve_official_release(_m().PROJECT_ROOT, requested_tag=requested_tag)
+    target_tag = release.get("tag")
+    target_commit = release.get("commit")
+    error = release.get("error")
+    if error or not target_tag or not target_commit:
+        print(f"✗ {error or 'Could not resolve an official published release.'}")
         sys.exit(1)
 
-    target_tag = (
-        _latest_release_tag(git_cmd, _m().PROJECT_ROOT)
-        if release_request == RELEASE_LATEST
-        else release_request
-    )
-    if not target_tag or not _tag_exists(git_cmd, _m().PROJECT_ROOT, target_tag):
-        label = target_tag or release_request
-        print(f"✗ Release tag '{label}' not found.")
+    head = resolve_commit(_m().PROJECT_ROOT, "HEAD")
+    if not head:
+        print("✗ Could not resolve the installed Hermes commit.")
         sys.exit(1)
-
-    from hermes_cli.stable_update import stable_update_status
-
-    status = stable_update_status(
-        _m().PROJECT_ROOT,
-        target_tag=target_tag,
-        fetch=False,
-    )
-    if status.get("up_to_date"):
+    if head == target_commit:
         print(f"✓ Already on release {target_tag}.")
         return
 
     print(f"⚕ Release update available: {target_tag}.")
-    behind = status.get("releases_behind")
-    if isinstance(behind, int) and behind > 0:
-        noun = "release" if behind == 1 else "releases"
-        print(f"  This install is {behind} {noun} behind.")
     print(f"  Run '{recommended_update_command()} --release {target_tag}' to install.")
 
 
@@ -3502,41 +3472,70 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
-        # thousands of auto-generated branches — an unscoped fetch can stall for
-        # minutes on a non-single-branch checkout. Fetch only what we update
-        # against.
+        # Resolve the branch up front for Fast Track. Release Track never trusts
+        # the checkout's origin: it resolves and fetches the exact tag from the
+        # official Nous repository, then verifies the peeled commit.
         branch = _m()._resolve_update_branch(args)
-        fetch_args = (
-            git_cmd + ["fetch", "origin", "--tags"]
-            if release_request is not None
-            else git_cmd + ["fetch", "origin", branch]
-        )
+        target_tag = None
+        target_commit = None
 
-        print("→ Fetching release tags..." if release_request is not None else "→ Fetching updates...")
-        fetch_result = subprocess.run(
-            fetch_args,
-            cwd=_m().PROJECT_ROOT,
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-        )
-        if fetch_result.returncode != 0:
-            stderr = fetch_result.stderr.strip()
-            if "Could not resolve host" in stderr or "unable to access" in stderr:
-                print("✗ Network error — cannot reach the remote repository.")
-                print(f"  {stderr.splitlines()[0]}" if stderr else "")
-            elif (
-                "Authentication failed" in stderr or "could not read Username" in stderr
+        if release_request is not None:
+            from hermes_cli.stable_update import resolve_official_release
+
+            expected_commit = str(getattr(args, "release_commit", "") or "").strip().lower()
+            if expected_commit and (
+                len(expected_commit) != 40
+                or any(char not in "0123456789abcdef" for char in expected_commit)
             ):
-                print(
-                    "✗ Authentication failed — check your git credentials or SSH key."
-                )
-            else:
-                print("✗ Failed to fetch updates from origin.")
-                if stderr:
-                    print(f"  {stderr.splitlines()[0]}")
-            sys.exit(1)
+                print("✗ --release-commit must be a full 40-character Git commit SHA.")
+                sys.exit(1)
+
+            requested_tag = None if release_request == RELEASE_LATEST else release_request
+            print("→ Resolving official release...")
+            resolved_release = resolve_official_release(
+                _m().PROJECT_ROOT,
+                requested_tag=requested_tag,
+            )
+            target_tag = resolved_release.get("tag")
+            target_commit = resolved_release.get("commit")
+            if resolved_release.get("error") or not target_tag or not target_commit:
+                print(f"✗ {resolved_release.get('error') or 'Could not resolve the official release.'}")
+                sys.exit(1)
+
+            if expected_commit:
+                if target_commit.lower() != expected_commit:
+                    print(f"✗ Release {target_tag} no longer resolves to the checked commit.")
+                    print(f"  Expected: {expected_commit}")
+                    print(f"  Current:  {target_commit}")
+                    print("  Check for updates again before applying.")
+                    sys.exit(1)
+        else:
+            # A bare `git fetch origin` pulls every ref, and this repo carries
+            # thousands of auto-generated branches. Scope the fetch to the
+            # selected Fast Track branch.
+            print("→ Fetching updates...")
+            fetch_result = subprocess.run(
+                git_cmd + ["fetch", "origin", branch],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+            )
+            if fetch_result.returncode != 0:
+                stderr = fetch_result.stderr.strip()
+                if "Could not resolve host" in stderr or "unable to access" in stderr:
+                    print("✗ Network error — cannot reach the remote repository.")
+                    print(f"  {stderr.splitlines()[0]}" if stderr else "")
+                elif (
+                    "Authentication failed" in stderr or "could not read Username" in stderr
+                ):
+                    print(
+                        "✗ Authentication failed — check your git credentials or SSH key."
+                    )
+                else:
+                    print("✗ Failed to fetch updates from origin.")
+                    if stderr:
+                        print(f"  {stderr.splitlines()[0]}")
+                sys.exit(1)
 
         # Get current branch (returns literal "HEAD" when detached)
         result = subprocess.run(
@@ -3547,32 +3546,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
             check=True,
         )
         current_branch = result.stdout.strip()
-
-        target_tag = None
-        target_commit = None
-        release_status = None
-        if release_request is not None:
-            target_tag = (
-                _latest_release_tag(git_cmd, _m().PROJECT_ROOT)
-                if release_request == RELEASE_LATEST
-                else release_request
-            )
-            if not target_tag or not _tag_exists(git_cmd, _m().PROJECT_ROOT, target_tag):
-                label = target_tag or release_request
-                print(f"✗ Release tag '{label}' not found.")
-                sys.exit(1)
-
-            from hermes_cli.stable_update import stable_update_status
-
-            release_status = stable_update_status(
-                _m().PROJECT_ROOT,
-                target_tag=target_tag,
-                fetch=False,
-            )
-            target_commit = release_status.get("target_commit")
-            if release_status.get("error") or not target_commit:
-                print(f"✗ Could not resolve release {target_tag} to a commit.")
-                sys.exit(1)
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -3636,7 +3609,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Release mode compares exact peeled commit identity; branch mode keeps
         # the historical commit-distance check.
         if target_commit is not None:
-            commit_count = 0 if release_status and release_status.get("up_to_date") else 1
+            current_head = subprocess.run(
+                git_cmd + ["rev-parse", "HEAD^{commit}"],
+                cwd=_m().PROJECT_ROOT,
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=True,
+            ).stdout.strip()
+            commit_count = 0 if current_head == target_commit else 1
         else:
             result = subprocess.run(
                 git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],

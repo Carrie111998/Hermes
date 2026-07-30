@@ -277,10 +277,18 @@ def _load_update_check_settings() -> tuple[str, dict]:
     """Return the configured update-check mode and stable-tag settings."""
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.stable_update import stable_update_config, stable_updates_enabled
+        from hermes_cli.stable_update import (
+            STABLE_TAG_STRATEGIES,
+            configured_update_channel,
+            stable_update_config,
+        )
 
         config = load_config()
-        if stable_updates_enabled(config):
+        if configured_update_channel(config) == "release":
+            return "release", {}
+        updates = config.get("updates", {}) if isinstance(config, dict) else {}
+        legacy_strategy = str(updates.get("check_strategy") or "").strip().lower()
+        if bool(updates.get("stable_tags")) or legacy_strategy in STABLE_TAG_STRATEGIES:
             return "stable-tags", stable_update_config(config)
     except Exception:
         pass
@@ -291,7 +299,8 @@ def check_for_updates() -> Optional[int]:
     """Check whether a Hermes update is available.
 
     By default this compares the current checkout against ``origin/main``.
-    Stable-tag mode instead compares it with the newest configured release tag.
+    Release mode compares it with official Nous GitHub release tags. The legacy
+    stable-tag mode retains explicitly configured custom remotes and patterns.
 
     Returns the number of commits behind, ``UPDATE_AVAILABLE_NO_COUNT`` (-1)
     if behind but the count is unknown, ``0`` if up-to-date, or ``None`` if
@@ -324,7 +333,12 @@ def check_for_updates() -> Optional[int]:
     try:
         if cache_file.exists():
             cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            cache_mode_matches = cached.get("mode") in {None, mode}
+            cached_mode = cached.get("mode")
+            # Mode-less caches predate update tracks and contain branch commit
+            # counts. They remain valid for branch users only; reusing one in
+            # Release Track would restore branch terminology and skip the
+            # official release lookup for up to six hours.
+            cache_mode_matches = cached_mode == mode or (cached_mode is None and mode == "branch")
             if mode == "stable-tags":
                 stable_cfg = cached.get("stable", {}) if isinstance(cached, dict) else {}
                 cache_mode_matches = cache_mode_matches and (
@@ -343,7 +357,7 @@ def check_for_updates() -> Optional[int]:
         pass
 
     context: dict = {"mode": mode}
-    if embedded_rev and mode != "stable-tags":
+    if embedded_rev and mode not in {"release", "stable-tags"}:
         behind = _check_via_rev(embedded_rev)
     else:
         repo_dir = _resolve_repo_dir()
@@ -352,6 +366,17 @@ def check_for_updates() -> Optional[int]:
             # update status. This is the Docker path (already short-circuited
             # above) or an unsupported install without a source tree.
             behind = None
+        elif mode == "release":
+            try:
+                from hermes_cli.stable_update import official_release_status
+
+                status = official_release_status(repo_dir)
+                context = status
+                behind = None if status.get("error") else (
+                    0 if status.get("up_to_date") else UPDATE_AVAILABLE_NO_COUNT
+                )
+            except Exception:
+                behind = None
         elif mode == "stable-tags":
             try:
                 from hermes_cli.stable_update import stable_update_status
@@ -455,6 +480,19 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
         return None
 
     mode, update_settings = _load_update_check_settings()
+    if mode == "release":
+        local = _git_short_hash(repo_dir, "HEAD")
+        context = get_update_context()
+        if context.get("mode") != "official-releases":
+            context = {}
+        return {
+            "mode": "release",
+            "latest_tag": context.get("latest_tag"),
+            "current_tag": context.get("current_release_tag"),
+            "local": local,
+            "up_to_date": context.get("up_to_date"),
+            "error": context.get("error"),
+        }
     if mode == "stable-tags":
         try:
             from hermes_cli.stable_update import stable_update_status
@@ -577,6 +615,16 @@ def format_banner_version_label() -> str:
             return f"{base} · stable {stable_tag} · local {local}"
         return base
 
+    if state.get("mode") == "release":
+        latest_tag = state.get("latest_tag")
+        current_tag = state.get("current_tag")
+        local = state.get("local")
+        if latest_tag and current_tag == latest_tag:
+            return f"{base} · Release Track {latest_tag}"
+        if latest_tag and local:
+            return f"{base} · Release Track {latest_tag} · local {local}"
+        return f"{base} · Release Track"
+
     upstream = state["upstream"]
     local = state["local"]
     ahead = int(state.get("ahead") or 0)
@@ -600,6 +648,16 @@ _update_check_done = threading.Event()
 def get_update_context() -> dict:
     """Return metadata from the most recent update check."""
     return dict(_update_context or {})
+
+
+def _format_official_release_notice(update_context: dict, update_command: str) -> str:
+    """Render official-release status without branch or commit terminology."""
+    target_tag = update_context.get("target_tag") or update_context.get("latest_tag")
+    line = "[bold yellow]⚠ Release Track update available[/]"
+    if target_tag:
+        line = f"[bold yellow]⚠ Release Track update {target_tag} available[/]"
+        line += f"[dim yellow] — run [bold]{update_command} --release {target_tag}[/bold] to update[/]"
+    return line
 
 
 def prefetch_update_check():
@@ -944,7 +1002,9 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
         if behind is not None and behind != 0:
             from hermes_cli.config import get_managed_update_command, recommended_update_command
             update_context = get_update_context()
-            if update_context.get("mode") == "stable-tags":
+            if update_context.get("mode") == "official-releases":
+                right_lines.append(_format_official_release_notice(update_context, recommended_update_command()))
+            elif update_context.get("mode") == "stable-tags":
                 target_tag = update_context.get("target_tag") or update_context.get("latest_tag")
                 current_tag = update_context.get("current_tag")
                 line = "[bold yellow]⚠ stable release available[/]"
