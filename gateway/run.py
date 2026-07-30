@@ -8571,6 +8571,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            _set_pending_queue = getattr(
+                adapter, "set_pending_event_queue_handler", None
+            )
+            if callable(_set_pending_queue):
+                _set_pending_queue(
+                    lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                        session_key, event, _adapter
+                    )
+                )
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
                 _set_reaction(self._handle_reaction_event)
@@ -9672,6 +9681,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_pending_queue = getattr(
+                        adapter, "set_pending_event_queue_handler", None
+                    )
+                    if callable(_set_pending_queue):
+                        _set_pending_queue(
+                            lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                                session_key, event, _adapter
+                            )
+                        )
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
                         _set_reaction(self._handle_reaction_event)
@@ -10610,6 +10628,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        _set_pending_queue = getattr(adapter, "set_pending_event_queue_handler", None)
+        if callable(_set_pending_queue):
+            _set_pending_queue(
+                lambda session_key, event, _adapter=adapter: self._enqueue_fifo(
+                    session_key, event, _adapter
+                )
+            )
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
             _set_reaction(self._handle_reaction_event)
@@ -11964,7 +11989,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if adapter:
                     if not merge_pending_message_event(adapter._pending_messages, _quick_key, event):
                         # Cross-sender: never splice into another sender's album.
-                        adapter._defer_refused_pending_event(_quick_key, event)
+                        # Transfer ownership to the canonical runner FIFO.
+                        self._enqueue_fifo(_quick_key, event, adapter)
                 return None
 
             _telegram_followup_grace = float(
@@ -11995,7 +12021,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event,
                             merge_text=True,
                         ):
-                            adapter._defer_refused_pending_event(_quick_key, event)
+                            self._enqueue_fifo(_quick_key, event, adapter)
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -12017,7 +12043,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event,
                         merge_text=True,
                     ):
-                        adapter._defer_refused_pending_event(_quick_key, event)
+                        self._enqueue_fifo(_quick_key, event, adapter)
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -24128,7 +24154,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
                         if not merge_pending_message_event(adapter._pending_messages, session_key, pending_event):
-                            adapter._defer_refused_pending_event(session_key, pending_event)
+                            self._enqueue_fifo(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

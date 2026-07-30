@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -392,6 +394,30 @@ def test_merge_pending_matches_sender_on_user_id_alt():
     )
 
 
+def test_merge_pending_matches_same_raw_sender_when_alt_is_asymmetric():
+    """A conditionally populated alternate ID must not split one person's album."""
+    pending = {
+        "shared": _photo_event(
+            _group_source(user_id="raw-9", user_id_alt="stable-9", user_name="Alice"),
+            "/tmp/a-1.jpg",
+            message_id="a1",
+        )
+    }
+
+    absorbed = merge_pending_message_event(
+        pending,
+        "shared",
+        _photo_event(
+            _group_source(user_id="raw-9", user_name="Alice"),
+            "/tmp/a-2.jpg",
+            message_id="a2",
+        ),
+    )
+
+    assert absorbed is True
+    assert pending["shared"].media_urls == ["/tmp/a-1.jpg", "/tmp/a-2.jpg"]
+
+
 def test_merge_pending_returns_false_only_on_sender_conflict():
     """The return value is the caller's ownership signal: True = absorbed."""
     same_sender_pending = {"k": _text_event("head", _alice_source(), message_id="a1")}
@@ -452,6 +478,9 @@ def _runner_with_adapter():
     runner._queued_events = {}
     adapter = _PendingStubAdapter()
     runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_pending_event_queue_handler(
+        lambda session_key, event: runner._enqueue_fifo(session_key, event, adapter)
+    )
     return runner, adapter
 
 
@@ -520,23 +549,85 @@ def test_busy_photo_followup_from_other_sender_does_not_join_album():
 
 
 @pytest.mark.asyncio
-async def test_cross_sender_refusal_without_runner_falls_back_to_merge():
-    """At adapter-level sites with no FIFO to fall back on, a refusal must
-    still never cost a message: the media has to remain reachable."""
-    adapter = _PendingStubAdapter()
-    session_key = "telegram:group:noqueue"
+async def test_adapter_busy_refusal_reaches_runner_fifo_and_drains_separately():
+    """The adapter busy path must hand a refused event to the real FIFO."""
+    runner, adapter = _runner_with_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
 
+    async def _unused_handler(event):
+        return None
+
+    adapter.set_message_handler(_unused_handler)
     alice = _photo_event(_alice_source(), "/tmp/a-1.jpg", message_id="a1")
     bob = _photo_event(_bob_source(), "/tmp/b-1.jpg", message_id="b1")
+    session_key = build_session_key(bob.source, group_sessions_per_user=False)
 
     adapter._pending_messages[session_key] = alice
-    absorbed = merge_pending_message_event(adapter._pending_messages, session_key, bob)
+    adapter._active_sessions[session_key] = asyncio.Event()
+    await adapter.handle_message(bob)
 
-    slot = adapter._pending_messages[session_key]
-    reachable = set(_all_media(slot)) | (set() if absorbed else set(_all_media(bob)))
-    assert reachable == {"/tmp/a-1.jpg", "/tmp/b-1.jpg"}, (
-        "a refused merge must leave the incoming event owned by the caller, never dropped"
+    drained = adapter._pending_messages.pop(session_key)
+    next_turn = runner._promote_queued_event(session_key, adapter, None)
+
+    assert drained is alice
+    assert next_turn is not None
+    assert next_turn is bob
+    assert _sender_identity(drained.source) == "alice-1"
+    assert _sender_identity(next_turn.source) == "bob-2"
+    assert _all_media(drained) == ["/tmp/a-1.jpg"]
+    assert _all_media(next_turn) == ["/tmp/b-1.jpg"]
+
+
+def test_cross_sender_refusal_fifo_does_not_drop_after_legacy_cap():
+    """Refusal routing must not create a new silent-drop cap."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:overflow"
+    adapter._pending_messages[session_key] = _photo_event(
+        _alice_source(), "/tmp/a.jpg", message_id="a"
     )
+
+    events = [
+        _photo_event(_bob_source(), f"/tmp/b-{i}.jpg", message_id=f"b-{i}")
+        for i in range(37)
+    ]
+    for event in events:
+        absorbed = merge_pending_message_event(
+            adapter._pending_messages, session_key, event
+        )
+        assert absorbed is False
+        adapter._queue_refused_pending_event(session_key, event)
+
+    queued = runner._session_state(session_key).conversation.queued_events
+    assert queued == events
+
+
+def test_get_pending_message_only_consumes_and_never_promotes_fifo():
+    """Interrupt/reset discard callers must not refill the adapter slot."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:discard"
+    alice = _photo_event(_alice_source(), "/tmp/a.jpg", message_id="a")
+    bob = _photo_event(_bob_source(), "/tmp/b.jpg", message_id="b")
+    adapter._pending_messages[session_key] = alice
+    adapter._queue_refused_pending_event(session_key, bob)
+
+    assert adapter.get_pending_message(session_key) is alice
+    assert session_key not in adapter._pending_messages
+    assert runner._session_state(session_key).conversation.queued_events == [bob]
+
+
+@pytest.mark.asyncio
+async def test_refused_events_live_only_in_runner_fifo_not_adapter_reset_state():
+    """Adapter discard paths must not leave refusal work that can resurrect."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:reset"
+    bob = _photo_event(_bob_source(), "/tmp/b.jpg", message_id="b")
+
+    adapter._queue_refused_pending_event(session_key, bob)
+    await adapter.cancel_session_processing(session_key)
+
+    assert not hasattr(adapter, "_refused_pending_events")
+    assert runner._session_state(session_key).conversation.queued_events == []
+    assert session_key not in adapter._pending_messages
 
 
 # --- end-to-end security property -----------------------------------------

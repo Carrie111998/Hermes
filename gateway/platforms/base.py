@@ -2463,23 +2463,32 @@ def pending_merge_sender_conflict(
     under a single ``[Verified sender: ...]`` envelope — the turn claims an
     author it does not have.
 
-    The guard is deliberately conservative: a conflict is only reported when
-    BOTH sides resolve to an identity and those identities differ.  Missing
-    identity on either side means "unknown", so the merge proceeds exactly as
-    it did before.  A refusal must never cost a message, and an unknown sender
-    must never be mistaken for a foreign one.
+    The guard is deliberately conservative: directly comparable alternate and
+    raw IDs are checked independently, and a match on either proves the same
+    sender. A conflict is reported only when at least one comparable pair
+    exists and all comparable pairs differ. Missing identity means "unknown",
+    so the merge proceeds exactly as it did before.
 
     In per-user/DM sessions the guard is unreachable by construction:
     ``build_session_key`` appends ``user_id_alt or user_id`` when ``isolate_user``
     is in effect, so two distinct senders cannot share a ``session_key``.
     """
-    existing_sender = _pending_merge_sender_identity(existing)
-    if existing_sender is None:
+    existing_source = getattr(existing, "source", None)
+    incoming_source = getattr(event, "source", None)
+    if existing_source is None or incoming_source is None:
         return False
-    incoming_sender = _pending_merge_sender_identity(event)
-    if incoming_sender is None:
-        return False
-    return existing_sender != incoming_sender
+
+    comparisons = []
+    for field in ("user_id_alt", "user_id"):
+        existing_value = getattr(existing_source, field, None)
+        incoming_value = getattr(incoming_source, field, None)
+        if existing_value and incoming_value:
+            comparisons.append(str(existing_value) == str(incoming_value))
+
+    # Conditional alternate IDs are common. A match on either directly
+    # comparable field proves these are the same sender; report a conflict only
+    # when at least one comparable pair exists and every such pair differs.
+    return bool(comparisons) and not any(comparisons)
 
 
 def merge_pending_message_event(
@@ -2698,11 +2707,6 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
 
-    # Hard cap on cross-sender pending-merge refusals parked per session by
-    # ``_defer_refused_pending_event``.  Mirrors the intent of
-    # ``GatewayRunner._BUSY_QUEUE_MAX_PENDING``: far beyond any realistic
-    # conversational backlog, small enough to never threaten memory.
-    _REFUSED_PENDING_MAX = 32
 
     # Whether this platform renders triple-backtick fenced code blocks (i.e.
     # ``format_message`` translates/preserves markdown fences into a real code
@@ -2877,9 +2881,7 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
-        # Cross-sender pending-merge refusals parked until the pending slot is
-        # drained (see ``_defer_refused_pending_event``). Keyed by session_key.
-        self._refused_pending_events: Dict[str, List[MessageEvent]] = {}
+        self._pending_event_queue_handler: Optional[Callable[[str, MessageEvent], None]] = None
         # Optional authorization check, registered by GatewayRunner. Used by
         # adapters that fetch external context (e.g. Slack thread history) to
         # mark senders not on the allowlist as unverified in LLM context,
@@ -3399,6 +3401,22 @@ class BasePlatformAdapter(ABC):
     def set_busy_session_handler(self, handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]]) -> None:
         """Set an optional handler for messages arriving during active sessions."""
         self._busy_session_handler = handler
+
+    def set_pending_event_queue_handler(
+        self,
+        handler: Optional[Callable[[str, MessageEvent], None]],
+    ) -> None:
+        """Set the runner-owned FIFO used when a pending merge is refused."""
+        self._pending_event_queue_handler = handler
+
+    def _queue_refused_pending_event(self, session_key: str, event: MessageEvent) -> None:
+        """Transfer a refused event to the runner's canonical per-session FIFO."""
+        handler = getattr(self, "_pending_event_queue_handler", None)
+        if handler is None:
+            raise RuntimeError(
+                "Cross-sender pending merge refused without a runner FIFO handler"
+            )
+        handler(session_key, event)
 
     def set_reaction_handler(
         self, handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]]
@@ -5254,12 +5272,14 @@ class BasePlatformAdapter(ABC):
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     # Same-sender by the check above, so the cross-sender guard
                     # in merge_pending_message_event cannot refuse here.
-                    merge_pending_message_event(
+                    absorbed = merge_pending_message_event(
                         self._pending_messages,
                         session_key,
                         event,
                         merge_text=True,
                     )
+                    if not absorbed:
+                        self._queue_refused_pending_event(session_key, event)
                 return
 
         now = time.monotonic()
@@ -5327,14 +5347,16 @@ class BasePlatformAdapter(ABC):
         state = store.pop(session_key, None)
         if state is None:
             return False
-        # Guarded above: the pending slot is either empty or same-sender, so the
-        # cross-sender refusal path in merge_pending_message_event is unreachable.
-        merge_pending_message_event(
+        # Guarded above: the pending slot is either empty or same-sender. Keep a
+        # defensive FIFO handoff so future guard changes cannot drop the event.
+        absorbed = merge_pending_message_event(
             self._pending_messages,
             session_key,
             state.event,
             merge_text=True,
         )
+        if not absorbed:
+            self._queue_refused_pending_event(session_key, state.event)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -5758,12 +5780,9 @@ class BasePlatformAdapter(ABC):
             if event.message_type == MessageType.PHOTO:
                 logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
                 if not merge_pending_message_event(self._pending_messages, session_key, event):
-                    # Cross-sender refusal at an adapter-level site with no FIFO
-                    # to fall back on. Keep the pending turn's attribution intact
-                    # and re-dispatch this event as its own turn once the active
-                    # run finishes, so the refusal costs attribution accuracy but
-                    # never the message itself.
-                    self._defer_refused_pending_event(session_key, event)
+                    # Keep the pending turn's attribution intact and transfer
+                    # the refused event to the runner's canonical FIFO.
+                    self._queue_refused_pending_event(session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
             if self._is_queue_text_debounce_candidate(event):
@@ -5788,7 +5807,7 @@ class BasePlatformAdapter(ABC):
                     event,
                     merge_text=event.message_type == MessageType.TEXT,
                 ):
-                    self._defer_refused_pending_event(session_key, event)
+                    self._queue_refused_pending_event(session_key, event)
             return  # Don't process now - will be handled after current task finishes
         
         # Mark session as active BEFORE spawning background task to close
@@ -6609,61 +6628,9 @@ class BasePlatformAdapter(ABC):
         """Check if there's a pending interrupt for a session."""
         return session_key in self._active_sessions and self._active_sessions[session_key].is_set()
 
-    def _refused_pending_store(self) -> Dict[str, List[MessageEvent]]:
-        store = getattr(self, "_refused_pending_events", None)
-        if store is None:
-            store = {}
-            self._refused_pending_events = store
-        return store
-
-    def _defer_refused_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        """Hold a cross-sender-refused event until the pending slot frees up.
-
-        ``merge_pending_message_event`` returns False when the pending turn
-        belongs to a different sender.  At adapter-level sites there is no FIFO
-        to append to, so the event is parked here and promoted into the slot by
-        :meth:`get_pending_message` once the current pending turn is consumed.
-        This keeps sender attribution 1:1 with content WITHOUT ever dropping a
-        message — the refusal only costs ordering within the session, not the
-        user's words.
-
-        Bounded by ``_REFUSED_PENDING_MAX`` so a stuck run plus rapid-fire
-        cross-sender traffic cannot grow this unboundedly.
-        """
-        queue = self._refused_pending_store().setdefault(session_key, [])
-        if len(queue) >= self._REFUSED_PENDING_MAX:
-            logger.warning(
-                "[%s] Dropping cross-sender follow-up for session %s — "
-                "deferred queue at cap (%d).",
-                self.name,
-                session_key,
-                self._REFUSED_PENDING_MAX,
-            )
-            return
-        queue.append(event)
-        logger.debug(
-            "[%s] Deferred cross-sender follow-up for session %s (depth=%d) — "
-            "pending turn belongs to another sender",
-            self.name,
-            session_key,
-            len(queue),
-        )
-
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        event = self._pending_messages.pop(session_key, None)
-        store = self._refused_pending_store()
-        queue = store.get(session_key)
-        if queue:
-            # A cross-sender event was refused earlier. Now that the slot is
-            # free it becomes its own turn, under its own sender's envelope.
-            if event is None:
-                event = queue.pop(0)
-            else:
-                self._pending_messages[session_key] = queue.pop(0)
-            if not queue:
-                store.pop(session_key, None)
-        return event
+        return self._pending_messages.pop(session_key, None)
     
     def build_source(
         self,
