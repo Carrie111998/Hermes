@@ -422,6 +422,144 @@ class TestBuzzAdapterSend:
         assert args[args.index("--file") + 1] == str(img)
 
 
+# ── Outbound mention resolution ───────────────────────────────────────────
+
+
+HONEY_PUBKEY = "b" * 64
+FIZZ_PUBKEY = "c" * 64
+TWIN_ONE_PUBKEY = "d" * 64
+TWIN_TWO_PUBKEY = "e" * 64
+
+_MEMBER_NAMES = {
+    HONEY_PUBKEY: "Honey",
+    FIZZ_PUBKEY: "Fizz",
+    TWIN_ONE_PUBKEY: "Twin",
+    TWIN_TWO_PUBKEY: "Twin",
+    SELF_PUBKEY: "Chip",
+}
+
+
+def _members_cli(*pubkeys):
+    """Scripted CLI whose `channels members` returns the given pubkeys.
+
+    Mirrors the real relay: `channels members` yields only {pubkey, role},
+    so display names must come from the `users get` profile lookup.
+    """
+    cli = _ScriptedCli()
+    cli.script(
+        "channels",
+        "members",
+        [{"pubkey": p, "role": "member"} for p in pubkeys],
+    )
+    cli.script("messages", "send", {"accepted": True, "event_id": "evt-m", "message": ""})
+    return cli
+
+
+def _adapter_with_members(*pubkeys):
+    adapter = _make_adapter()
+    adapter._run_cli = _members_cli(*pubkeys)
+
+    async def _name_of(pubkey):
+        return _MEMBER_NAMES.get(pubkey, "")
+
+    adapter._resolve_user_name = _name_of
+    return adapter
+
+
+def _mentions_in(cli):
+    """Extract the --mention values from the recorded `messages send` call."""
+    args = next(a for a, _ in cli.calls if a[:2] == ["messages", "send"])
+    return [args[i + 1] for i, tok in enumerate(args) if tok == "--mention"]
+
+
+class TestOutboundMentionResolution:
+    """buzz-cli rejects a send whose @Name matches no channel member, so the
+    adapter resolves names to pubkeys and passes them as --mention."""
+
+    @pytest.mark.asyncio
+    async def test_display_name_resolved_to_pubkey(self):
+        adapter = _adapter_with_members(HONEY_PUBKEY, FIZZ_PUBKEY)
+        result = await adapter.send(CHANNEL, "@Honey please review the draft")
+        assert result.success is True
+        assert _mentions_in(adapter._run_cli) == [HONEY_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_multiple_names_all_resolved(self):
+        adapter = _adapter_with_members(HONEY_PUBKEY, FIZZ_PUBKEY)
+        await adapter.send(CHANNEL, "@Honey and @Fizz please coordinate")
+        assert sorted(_mentions_in(adapter._run_cli)) == sorted([HONEY_PUBKEY, FIZZ_PUBKEY])
+
+    @pytest.mark.asyncio
+    async def test_unknown_name_sends_without_mention(self):
+        """Unresolved names stay presentation-only rather than failing the send."""
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        result = await adapter.send(CHANNEL, "@Ghost is not a member here")
+        assert result.success is True
+        assert _mentions_in(adapter._run_cli) == []
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_name_not_resolved(self):
+        """Two members sharing a display name must not notify either one."""
+        adapter = _adapter_with_members(TWIN_ONE_PUBKEY, TWIN_TWO_PUBKEY)
+        await adapter.send(CHANNEL, "@Twin which of you is it?")
+        assert _mentions_in(adapter._run_cli) == []
+
+    @pytest.mark.asyncio
+    async def test_self_mention_excluded(self):
+        adapter = _adapter_with_members(SELF_PUBKEY, HONEY_PUBKEY)
+        await adapter.send(CHANNEL, "@Chip talking to myself, and @Honey")
+        assert _mentions_in(adapter._run_cli) == [HONEY_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_raw_hex_pubkey_passed_through(self):
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        await adapter.send(CHANNEL, f"@{FIZZ_PUBKEY} direct hex mention")
+        assert _mentions_in(adapter._run_cli) == [FIZZ_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_npub_mention_normalized_to_hex(self):
+        """An npub in the text resolves to its hex form without a roster hit."""
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        honey_npub = hex_to_npub(HONEY_PUBKEY)
+        await adapter.send(CHANNEL, f"@{honey_npub} hello")
+        assert _mentions_in(adapter._run_cli) == [HONEY_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_email_address_not_treated_as_mention(self):
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        await adapter.send(CHANNEL, "ping bob@example.com about it")
+        assert _mentions_in(adapter._run_cli) == []
+
+    @pytest.mark.asyncio
+    async def test_plain_text_skips_member_lookup(self):
+        """No '@' means no roster round-trip on every ordinary message."""
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        await adapter.send(CHANNEL, "no mentions at all here")
+        assert not any(a[:2] == ["channels", "members"] for a, _ in adapter._run_cli.calls)
+
+    @pytest.mark.asyncio
+    async def test_member_lookup_failure_does_not_block_send(self):
+        """A roster lookup failure degrades to an unmentioned send, never a crash."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("channels", "members", "", code=2, stderr="network error")
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-x", "message": ""})
+        adapter._run_cli = cli
+        result = await adapter.send(CHANNEL, "@Honey are you there?")
+        assert result.success is True
+        assert _mentions_in(cli) == []
+
+    @pytest.mark.asyncio
+    async def test_image_caption_mentions_resolved(self, tmp_path):
+        """Captions travel the same contract — an unresolved @Name fails the upload too."""
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _adapter_with_members(HONEY_PUBKEY)
+        result = await adapter.send_image(CHANNEL, str(img), caption="@Honey see this")
+        assert result.success is True
+        assert _mentions_in(adapter._run_cli) == [HONEY_PUBKEY]
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
 

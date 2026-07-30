@@ -205,6 +205,86 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
 # buzz-cli invocation helpers
 # ---------------------------------------------------------------------------
 
+_MENTION_RE = re.compile(r"(?<!\w)@([A-Za-z0-9_\-.]{1,64})")
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+async def _resolve_mention_pubkeys(
+    text: str,
+    channel_id: str,
+    run_cli,
+    name_of=None,
+    self_pubkey: str = "",
+) -> List[str]:
+    """Map ``@Name`` tokens in *text* to channel-member pubkeys.
+
+    buzz-cli rejects a send outright when ``@Name`` text matches no current
+    channel member, so an agent addressing another agent (``@Honey do X``)
+    fails unless we pass explicit ``--mention`` identities. Supplying any
+    explicit identity also downgrades unresolved or ambiguous names to
+    presentation-only, so partial resolution still averts a hard failure.
+
+    ``run_cli(args) -> (code, stdout, stderr)``; optional async ``name_of``
+    resolves a pubkey to a display name. Best-effort throughout: any CLI or
+    parse failure yields ``[]`` and leaves the send exactly as it was.
+    """
+    tokens = {t.lower() for t in _MENTION_RE.findall(text or "")}
+    if not tokens:
+        return []
+
+    resolved: List[str] = []
+    names = set()
+    for token in tokens:
+        if _HEX64_RE.match(token):
+            resolved.append(token)
+        elif token.startswith("npub1"):
+            as_hex = npub_to_hex(token)
+            if as_hex:
+                resolved.append(as_hex.lower())
+        else:
+            names.add(token)
+
+    if names:
+        try:
+            code, out, _err = await run_cli(
+                ["channels", "members", "--channel", channel_id]
+            )
+            members = _parse_json_list(out) if code == 0 else []
+        except Exception:  # never block a send on mention resolution
+            members = []
+
+        by_label: Dict[str, List[str]] = {}
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            pubkey = str(member.get("pubkey") or "").strip().lower()
+            if not pubkey:
+                continue
+            # `channels members` returns only {pubkey, role}; fall back to the
+            # profile lookup when the CLI omits display names.
+            labels = [
+                str(member.get(key) or "").strip().lower()
+                for key in ("display_name", "name", "username")
+            ]
+            if not any(labels) and name_of is not None:
+                try:
+                    labels = [(await name_of(pubkey)).strip().lower()]
+                except Exception:
+                    labels = []
+            for label in filter(None, labels):
+                by_label.setdefault(label, []).append(pubkey)
+
+        for token in names:
+            # Ambiguous labels stay presentation-only rather than ping the
+            # wrong member.
+            match = by_label.get(token) or []
+            if len(match) == 1:
+                resolved.append(match[0])
+
+    self_key = (self_pubkey or "").lower()
+    return list(dict.fromkeys(p for p in resolved if p and p != self_key))
+
+
 def _resolve_cli_path(configured: str = "") -> str:
     """Resolve the buzz CLI binary path portably.
 
@@ -585,6 +665,8 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
+        for mention_pubkey in await self._resolve_mentions(str(chat_id), content):
+            args += ["--mention", mention_pubkey]
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
@@ -659,6 +741,8 @@ class BuzzAdapter(BasePlatformAdapter):
             ]
             if reply_to:
                 args += ["--reply-to", str(reply_to)]
+            for mention_pubkey in await self._resolve_mentions(str(chat_id), caption or ""):
+                args += ["--mention", mention_pubkey]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1152,6 +1236,16 @@ class BuzzAdapter(BasePlatformAdapter):
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 
+    async def _resolve_mentions(self, chat_id: str, content: str) -> List[str]:
+        """Channel-member pubkeys for the ``@Name`` tokens in outbound text."""
+        return await _resolve_mention_pubkeys(
+            content,
+            str(chat_id),
+            self._run_cli,
+            name_of=self._resolve_user_name,
+            self_pubkey=self._self_pubkey,
+        )
+
     async def _resolve_user_name(self, pubkey: str) -> str:
         """Resolve a pubkey to a display name (cached; falls back to npub prefix).
 
@@ -1366,6 +1460,13 @@ async def _standalone_send(
         args += ["--reply-to", str(thread_id)]
     for path in media_files or []:
         args += ["--file", str(path)]
+    async def _members_cli(cli_args):
+        return await _exec_buzz(
+            cli_path, cli_args, relay_url=relay, private_key=private_key
+        )
+
+    for pubkey in await _resolve_mention_pubkeys(message, target, _members_cli):
+        args += ["--mention", pubkey]
     try:
         code, out, err = await _exec_buzz(
             cli_path, args, relay_url=relay, private_key=private_key, input_text=message
