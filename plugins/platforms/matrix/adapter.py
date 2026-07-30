@@ -382,6 +382,13 @@ _MATRIX_MSGTYPE_LABELS = {
 }
 
 
+# Bound on each network hop while resolving quoted context. The room-message
+# callback is registered with ``wait_sync=True``, so an unbounded await here
+# stalls all Matrix sync-event processing; on timeout the quote degrades to
+# empty rather than delaying the message.
+_QUOTED_FETCH_TIMEOUT = 15.0
+
+
 def _matrix_content_dict(event: Any) -> dict:
     """Best-effort extraction of an event's ``content`` as a plain dict.
 
@@ -5047,7 +5054,10 @@ class MatrixAdapter(BasePlatformAdapter):
             if not hasattr(self._client, "get_event"):
                 logger.debug("Matrix: client has no get_event method")
                 return empty
-            event = await self._client.get_event(RoomID(room_id), EventID(event_id))
+            event = await asyncio.wait_for(
+                self._client.get_event(RoomID(room_id), EventID(event_id)),
+                timeout=_QUOTED_FETCH_TIMEOUT,
+            )
         except Exception as exc:
             logger.debug(
                 "Matrix: could not fetch quoted event %s in %s: %s",
@@ -5114,9 +5124,16 @@ class MatrixAdapter(BasePlatformAdapter):
         """
         caption = "" if _looks_like_matrix_image_filename(body) else body
 
-        payload = await self._extract_media_payload(
-            content, event_id, "m.image", body
-        )
+        try:
+            payload = await asyncio.wait_for(
+                self._extract_media_payload(content, event_id, "m.image", body),
+                timeout=_QUOTED_FETCH_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.debug(
+                "Matrix: quoted image %s download timed out", event_id
+            )
+            payload = None
         if payload is None or not payload.cached_path:
             logger.debug(
                 "Matrix: quoted image %s unavailable; sending marker only", event_id

@@ -3498,6 +3498,31 @@ class TestMatrixQuotedEventFetch:
         assert (await self.adapter._fetch_quoted_event("!r:x", "$e")).text is None
 
     @pytest.mark.asyncio
+    async def test_hung_homeserver_lookup_times_out(self, monkeypatch):
+        """The lookup runs inside ``wait_sync`` dispatch, so it must be bounded.
+
+        A homeserver that accepts the request and never answers would
+        otherwise stall all Matrix sync-event processing.
+        """
+        import plugins.platforms.matrix.adapter as matrix_adapter
+
+        monkeypatch.setattr(matrix_adapter, "_QUOTED_FETCH_TIMEOUT", 0.01)
+
+        async def _hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        client = MagicMock()
+        client.get_event = _hang
+        self.adapter._client = client
+
+        quoted = await asyncio.wait_for(
+            self.adapter._fetch_quoted_event("!r:x", "$e"), timeout=5
+        )
+
+        assert quoted.text is None
+        assert quoted.media_path is None
+
+    @pytest.mark.asyncio
     async def test_no_client_or_no_anchor_is_a_noop(self):
         self.adapter._client = None
         assert (await self.adapter._fetch_quoted_event("!r:x", "$e")).text is None
@@ -3803,6 +3828,26 @@ class TestMatrixQuotedImage:
 
         assert quoted.media_path == "/cache/img.jpg"
         assert quoted.media_type == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_hung_media_download_degrades_to_marker(self, monkeypatch):
+        """A stalled image download must not block sync dispatch either."""
+        import plugins.platforms.matrix.adapter as matrix_adapter
+
+        monkeypatch.setattr(matrix_adapter, "_QUOTED_FETCH_TIMEOUT", 0.01)
+        self._install_client()
+
+        async def _hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        self.adapter._extract_media_payload = _hang
+
+        quoted = await asyncio.wait_for(
+            self.adapter._fetch_quoted_event("!r:x", "$root"), timeout=5
+        )
+
+        assert quoted.media_path is None
+        assert quoted.text == "[image]"
 
     @pytest.mark.asyncio
     async def test_bare_filename_is_not_echoed_into_the_prompt(self):
