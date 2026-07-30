@@ -230,8 +230,18 @@ def _enforce_summary_openrouter_zdr(agent, api_kwargs: dict) -> None:
             (agent.provider or "").strip().lower() == "openrouter"
             or agent._is_openrouter_url()
         )
-    except Exception:
-        is_openrouter = False
+    except Exception as exc:
+        # Preserve enforcement when the canonical OpenRouter host is still
+        # identifiable even if the agent-specific detector fails.
+        is_openrouter = base_url_host_matches(
+            str(getattr(agent, "base_url", None) or ""), "openrouter.ai"
+        )
+        logger.warning(
+            "OpenRouter detection failed for a summary request; "
+            "host fallback selected is_openrouter=%s: %s",
+            is_openrouter,
+            exc,
+        )
     enforce_openrouter_zdr(
         api_kwargs,
         is_openrouter=is_openrouter,

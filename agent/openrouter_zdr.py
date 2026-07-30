@@ -1,6 +1,10 @@
 """Shared request-time Zero Data Retention enforcement for OpenRouter."""
 
+import logging
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 def enforce_openrouter_zdr(
@@ -31,8 +35,14 @@ def enforce_openrouter_zdr(
 
         if not openrouter_zdr_enabled():
             return
-    except Exception:
-        return
+    except Exception as exc:
+        # The request is already known to target OpenRouter. If config state
+        # cannot be read, prefer the privacy-preserving restriction over a
+        # silent fail-open request.
+        logger.warning(
+            "Unable to read the OpenRouter ZDR setting; enforcing ZDR fail closed: %s",
+            exc,
+        )
 
     raw_extra = api_kwargs.get("extra_body")
     extra_body = dict(raw_extra) if isinstance(raw_extra, dict) else {}

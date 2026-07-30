@@ -47,6 +47,25 @@ def test_shared_enforcement_overrides_false(monkeypatch):
     }
 
 
+def test_shared_enforcement_fails_closed_when_config_read_raises(monkeypatch, caplog):
+    def raise_config_error():
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.config.openrouter_zdr_enabled", raise_config_error
+    )
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    enforce_openrouter_zdr(
+        kwargs,
+        is_openrouter=True,
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "enforcing ZDR fail closed" in caplog.text
+
+
 def test_shared_enforcement_skips_native_gemini(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
     kwargs = {}
@@ -95,6 +114,52 @@ def test_summary_direct_call_enforces_zdr(monkeypatch):
     kwargs = {"extra_body": {"provider": {"zdr": False}}}
     _enforce_summary_openrouter_zdr(agent, kwargs)
     assert kwargs["extra_body"]["provider"]["zdr"] is True
+
+
+def test_summary_detection_failure_uses_strict_host_fallback(monkeypatch, caplog):
+    monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
+
+    def raise_detection_error(self):
+        raise RuntimeError("detection unavailable")
+
+    agent = type(
+        "Agent",
+        (),
+        {
+            "provider": "fallback",
+            "base_url": "https://openrouter.ai/api/v1",
+            "_is_openrouter_url": raise_detection_error,
+        },
+    )()
+    kwargs = {"extra_body": {"provider": {"zdr": False}}}
+
+    _enforce_summary_openrouter_zdr(agent, kwargs)
+
+    assert kwargs["extra_body"]["provider"]["zdr"] is True
+    assert "host fallback selected is_openrouter=True" in caplog.text
+
+
+def test_summary_detection_failure_does_not_modify_other_hosts(monkeypatch, caplog):
+    monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
+
+    def raise_detection_error(self):
+        raise RuntimeError("detection unavailable")
+
+    agent = type(
+        "Agent",
+        (),
+        {
+            "provider": "custom",
+            "base_url": "https://example.com/v1",
+            "_is_openrouter_url": raise_detection_error,
+        },
+    )()
+    kwargs = {}
+
+    _enforce_summary_openrouter_zdr(agent, kwargs)
+
+    assert kwargs == {}
+    assert "host fallback selected is_openrouter=False" in caplog.text
 
 
 def test_disabled_zdr_preserves_caller_policy(monkeypatch):
