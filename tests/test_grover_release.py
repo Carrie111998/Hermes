@@ -78,9 +78,12 @@ def test_release_manifest_pins_every_required_hash_and_excludes_mutable_data(
 
     manifest = json.loads(result.manifest.read_text(encoding="utf-8"))
     evidence = json.loads(result.evidence.read_text(encoding="utf-8"))
+    assert result.patch == result.manifest.parent / "candidate.patch"
+    assert result.patch.read_bytes() == (tmp_path / "candidate.patch").read_bytes()
     assert manifest["upstream_commit"] == UPSTREAM
     assert manifest["rollback_target"] == ROLLBACK
     assert manifest["patch_sha256"] == _sha256(tmp_path / "candidate.patch")
+    assert manifest["patch"]["sha256"] == _sha256(result.patch)
     assert manifest["dependency_lock"]["path"] == "uv.lock"
     assert manifest["dependency_lock"]["sha256"] == _sha256(source / "uv.lock")
     assert manifest["artifact_sha256"] == _sha256(result.artifact)
@@ -122,6 +125,8 @@ def test_release_is_deterministic_exclusive_and_read_only(tmp_path: Path):
     assert not first.artifact.stat().st_mode & stat.S_IWUSR
     assert not first.manifest.stat().st_mode & stat.S_IWUSR
     assert not first.evidence.stat().st_mode & stat.S_IWUSR
+    assert not first.patch.stat().st_mode & stat.S_IWUSR
+    assert _sha256(first.patch) == _sha256(second.patch)
 
     with pytest.raises(FileExistsError):
         create_release(_spec(tmp_path, source, "out-1"))
@@ -140,6 +145,16 @@ def test_release_refuses_missing_runtime_modules_and_bad_commit_pins(tmp_path: P
     bad = ReleaseSpec(**{**spec.__dict__, "upstream_commit": "main"})
     with pytest.raises(ValueError, match="40-character commit"):
         create_release(bad)
+
+    reserved_patch = tmp_path / "manifest.json"
+    reserved_patch.write_text("review patch\n", encoding="utf-8")
+    collision = ReleaseSpec(**{
+        **_spec(tmp_path, source, "reserved-output").__dict__,
+        "patch_file": reserved_patch,
+    })
+    with pytest.raises(ValueError, match="collides with a reserved artifact"):
+        create_release(collision)
+    assert not collision.output_dir.exists()
 
 
 def test_wheel_verification_requires_every_runtime_module(tmp_path: Path):

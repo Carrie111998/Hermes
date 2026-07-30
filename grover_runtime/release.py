@@ -56,6 +56,7 @@ class ReleaseResult:
     artifact: Path
     manifest: Path
     evidence: Path
+    patch: Path
 
 
 def create_release(spec: ReleaseSpec) -> ReleaseResult:
@@ -84,6 +85,9 @@ def create_release(spec: ReleaseSpec) -> ReleaseResult:
         raise ValueError("release patch file is missing or not a regular file")
     if output_dir.exists():
         raise FileExistsError(str(output_dir))
+    patch_name = _normalize_relative_path(patch_file.name, "release patch name")
+    if patch_name in {"artifact.tar", "manifest.json", "evidence.json"}:
+        raise ValueError("release patch name collides with a reserved artifact")
 
     required_paths = _normalize_required_paths(spec.required_paths)
     lock_path = _normalize_relative_path(spec.dependency_lock, "dependency lock")
@@ -135,7 +139,7 @@ def create_release(spec: ReleaseSpec) -> ReleaseResult:
         },
         "files": files_manifest,
         "patch": {
-            "path": patch_file.name,
+            "path": patch_name,
             "sha256": patch_sha256,
             "size_bytes": len(patch_bytes),
         },
@@ -165,16 +169,18 @@ def create_release(spec: ReleaseSpec) -> ReleaseResult:
     artifact_path = output_dir / "artifact.tar"
     manifest_path = output_dir / "manifest.json"
     evidence_path = output_dir / "evidence.json"
+    patch_path = output_dir / patch_name
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
         _exclusive_write(artifact_path, artifact_bytes)
+        _exclusive_write(patch_path, patch_bytes)
         _exclusive_write(manifest_path, manifest_bytes)
         _exclusive_write(evidence_path, evidence_bytes)
-        for path in (artifact_path, manifest_path, evidence_path):
+        for path in (artifact_path, manifest_path, evidence_path, patch_path):
             os.chmod(path, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
     except BaseException:
         if output_dir.exists():
-            for path in (artifact_path, manifest_path, evidence_path):
+            for path in (artifact_path, manifest_path, evidence_path, patch_path):
                 try:
                     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
                 except OSError:
@@ -186,6 +192,7 @@ def create_release(spec: ReleaseSpec) -> ReleaseResult:
         artifact=artifact_path,
         manifest=manifest_path,
         evidence=evidence_path,
+        patch=patch_path,
     )
 
 
