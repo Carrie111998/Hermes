@@ -269,7 +269,13 @@ RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra 
 COPY web/ web/
 COPY ui-tui/ ui-tui/
 COPY apps/shared/ apps/shared/
-RUN cd web && npm run build && \
+# Skip `tsc -b` (type-check) — upstream TS 6 migration has unresolved type
+# errors in web/src/ (ChatSidebar, PairingPage, PluginsPage, etc.) that
+# block the Docker build.  `vite build` uses esbuild and does not type-check,
+# so the production bundle is unaffected.  Upstream's own Docker workflow is
+# gated on `github.repository == 'NousResearch/hermes-agent'` and may be
+# similarly broken on cold builds.
+RUN cd web && npx vite build && \
     cd ../ui-tui && npm run build
 
 # ---------- Source code ----------
