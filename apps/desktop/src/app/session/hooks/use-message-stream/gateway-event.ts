@@ -45,6 +45,7 @@ import {
   $currentCwd,
   $currentModel,
   $currentProvider,
+  $localDeviceName,
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
@@ -53,6 +54,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setLocalDeviceName,
   setSessions,
   setTurnStartedAt,
   setYoloActive
@@ -287,6 +289,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // Backends with the change watcher broadcast pet/cron/sessions change
         // events; consumers demote their legacy polls to slow backstops.
         setChangeEventsAvailable(Boolean((payload as { change_events?: boolean } | undefined)?.change_events))
+
+        {
+          // The gateway names the host it runs on; seed it once so locally
+          // submitted prompts can be attributed to this device.
+          const rawDeviceName = (payload as { device_name?: unknown } | undefined)?.device_name
+          const deviceName = typeof rawDeviceName === 'string' ? rawDeviceName.trim() : ''
+
+          if (deviceName && !$localDeviceName.get()) {
+            setLocalDeviceName(deviceName)
+          }
+        }
 
         return
       } else if (event.type === 'skin.changed') {

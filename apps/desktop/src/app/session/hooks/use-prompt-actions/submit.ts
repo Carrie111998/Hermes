@@ -21,6 +21,7 @@ import {
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import {
+  $localDeviceName,
   $sessions,
   resolveComposerSessionKey,
   setAwaitingResponse,
@@ -46,6 +47,12 @@ import {
   type SubmitTextOptions,
   withSessionBusyRetry
 } from './utils'
+
+function localSenderDevice(): string | undefined {
+  const deviceName = $localDeviceName.get().trim()
+
+  return deviceName || undefined
+}
 
 interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
@@ -308,6 +315,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const optimisticSenderDevice = localSenderDevice()
 
       // What the bubble shows. A `/skill` send carries the whole expanded
       // skill body as its text — model-facing scaffolding — so the dispatcher
@@ -319,7 +327,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         id: optimisticId,
         role: 'user',
         parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
-        attachmentRefs
+        attachmentRefs,
+        ...(optimisticSenderDevice ? { senderDevice: optimisticSenderDevice } : {})
       })
 
       const releaseBusy = () => {
