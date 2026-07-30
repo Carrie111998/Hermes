@@ -431,6 +431,31 @@ class TestPluginLlmFacade:
         assert api_key == "sk-active"
         assert base_url is None
 
+    def test_resolve_profile_credentials_canonicalizes_codex_alias(
+        self, monkeypatch
+    ):
+        """provider='codex' must load the openai-codex credential pool."""
+        entry = SimpleNamespace(
+            runtime_api_key="tok-codex-work",
+            runtime_base_url="https://chatgpt.com/backend-api/codex",
+            access_token="tok-codex-work",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        seen: dict = {}
+
+        def fake_load_pool(provider):
+            seen["provider"] = provider
+            return SimpleNamespace(
+                resolve_target=lambda _t: (1, entry, None),
+            )
+
+        monkeypatch.setattr("agent.credential_pool.load_pool", fake_load_pool)
+        provider, api_key, base_url = _resolve_profile_credentials("codex", "work")
+        assert seen["provider"] == "openai-codex"
+        assert provider == "openai-codex"
+        assert api_key == "tok-codex-work"
+        assert base_url == "https://chatgpt.com/backend-api/codex"
+
     def test_complete_structured_returns_parsed_json(self):
         def fake_caller(**_kwargs):
             return "openai", "gpt-4o", _fake_response(

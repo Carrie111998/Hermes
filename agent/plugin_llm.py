@@ -337,17 +337,29 @@ def _pool_provider_for_profile(provider_override: Optional[str]) -> str:
     Prefer an explicit trusted ``provider=`` override. Otherwise use the
     host's configured / auto-detected active provider — the same identity
     ``call_llm`` would pick when no provider is passed.
+
+    Aliases are canonicalized through ``_normalize_aux_provider`` so
+    ``provider="codex"`` loads the ``openai-codex`` pool (same as
+    ``resolve_provider_client``).
     """
+    from agent.auxiliary_client import _normalize_aux_provider
+
+    def _canonical(name: str) -> str:
+        normalized = _normalize_aux_provider(name)
+        if normalized and normalized not in {"", "auto"}:
+            return normalized
+        return (name or "").strip().lower()
+
     explicit = (provider_override or "").strip().lower()
     if explicit and explicit != "auto":
-        return explicit
+        return _canonical(explicit)
 
     try:
         from hermes_cli.runtime_provider import resolve_requested_provider
 
         requested = resolve_requested_provider(None)
         if isinstance(requested, str) and requested.strip():
-            requested = requested.strip().lower()
+            requested = _canonical(requested)
             if requested and requested != "auto":
                 return requested
     except Exception:
@@ -359,7 +371,7 @@ def _pool_provider_for_profile(provider_override: Optional[str]) -> str:
         resolved, *_rest = _resolve_task_provider_model(
             None, None, None, None, None
         )
-        resolved_name = str(resolved or "").strip().lower()
+        resolved_name = _canonical(str(resolved or ""))
         if resolved_name and resolved_name != "auto":
             return resolved_name
     except Exception:

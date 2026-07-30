@@ -3756,6 +3756,57 @@ class TestOauthExplicitApiKeyPinning:
         assert client is not None
         assert mock_openai.call_args.kwargs["api_key"] == "jwt-profile-work"
 
+    def test_resolve_xai_oauth_sync_uses_explicit_key_not_pool(self):
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_xai_oauth_for_aux",
+                side_effect=AssertionError("must not re-resolve default oauth"),
+            ),
+            patch(
+                "tools.xai_http.hermes_xai_default_headers",
+                return_value={},
+            ),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock(api_key="tok-xai-work")
+            client, model = resolve_provider_client(
+                provider="xai-oauth",
+                model="grok-4",
+                explicit_api_key="tok-xai-work",
+                explicit_base_url="https://api.x.ai/v1",
+            )
+
+        assert client is not None
+        assert model == "grok-4"
+        assert mock_openai.call_args.kwargs["api_key"] == "tok-xai-work"
+        assert mock_openai.call_args.kwargs["base_url"] == "https://api.x.ai/v1"
+
+    def test_resolve_xai_oauth_async_uses_explicit_key_not_pool(self):
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_xai_oauth_for_aux",
+                side_effect=AssertionError("must not re-resolve default oauth"),
+            ),
+            patch(
+                "tools.xai_http.hermes_xai_default_headers",
+                return_value={},
+            ),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_openai.return_value = MagicMock(api_key="tok-xai-work")
+            client, model = resolve_provider_client(
+                provider="xai-oauth",
+                model="grok-4",
+                explicit_api_key="tok-xai-work",
+                explicit_base_url="https://api.x.ai/v1",
+                async_mode=True,
+            )
+
+        assert client is not None
+        assert model == "grok-4"
+        assert mock_openai.call_args.kwargs["api_key"] == "tok-xai-work"
+        assert getattr(client, "api_key", None) == "tok-xai-work"
+
 
 def test_pool_runtime_base_url_uses_nous_env_override(monkeypatch):
     entry = SimpleNamespace(
