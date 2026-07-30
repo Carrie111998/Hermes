@@ -321,6 +321,44 @@ class TestDmClassification:
         assert adapter._channel_state[DM_CHANNEL]["chat_type"] == "dm"
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
         assert adapter._dispatched[0]["chat_type"] == "dm"
+        assert adapter._dispatched[0]["thread_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_dm_reply_propagates_nip10_root(self, adapter):
+        """Nested replies share the explicit root rather than their parent."""
+        adapter._channel_state[DM_CHANNEL]["chat_type"] = "dm"
+        event = _tagged_event(
+            "e2",
+            DM_CHANNEL,
+            content="reply in a thread",
+            p=SELF_PUBKEY,
+            reply_to="immediate-parent",
+        )
+        event["tags"].insert(1, ["e", "thread-root", "", "root"])
+
+        await self._poll_with(adapter, DM_CHANNEL, event)
+
+        assert len(adapter._dispatched) == 1
+        assert adapter._dispatched[0]["thread_id"] == "thread-root"
+
+    @pytest.mark.asyncio
+    async def test_direct_dm_reply_uses_nip10_reply_as_root(self, adapter):
+        """A direct reply with no separate root still forms a real thread."""
+        adapter._channel_state[DM_CHANNEL]["chat_type"] = "dm"
+
+        await self._poll_with(
+            adapter,
+            DM_CHANNEL,
+            _tagged_event(
+                "e3",
+                DM_CHANNEL,
+                content="first threaded reply",
+                p=SELF_PUBKEY,
+                reply_to="top-level-message",
+            ),
+        )
+
+        assert adapter._dispatched[0]["thread_id"] == "top-level-message"
 
 
     @pytest.mark.asyncio
@@ -432,6 +470,24 @@ class TestBuzzAdapterSend:
         assert "--reply-to" not in args
 
     @pytest.mark.asyncio
+    async def test_send_threaded_dm_preserves_explicit_root(self):
+        adapter = _make_adapter()
+        adapter._channel_state[DM_CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-dm-thread", "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send(
+            DM_CHANNEL,
+            "threaded reply",
+            reply_to="triggering-message",
+            metadata={"thread_id": "thread-root"},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "thread-root"
+
+    @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
         img = tmp_path / "shot.png"
         img.write_bytes(b"\x89PNG fake")
@@ -458,6 +514,64 @@ class TestBuzzAdapterSend:
 
         args, _stdin = cli.calls[0]
         assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_send_image_in_threaded_dm_preserves_explicit_root(self, tmp_path):
+        img = tmp_path / "threaded-shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter()
+        adapter._channel_state[DM_CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-dm-thread-image", "message": ""})
+        adapter._run_cli = cli
+
+        await adapter.send_image(
+            DM_CHANNEL,
+            str(img),
+            reply_to="triggering-message",
+            metadata={"thread_id": "thread-root"},
+        )
+
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "thread-root"
+
+
+# ── Inbound thread source ─────────────────────────────────────────────────
+
+
+class TestBuzzAdapterDispatch:
+
+    @pytest.mark.asyncio
+    async def test_inbound_thread_stamps_threaded_dm_session_source(self):
+        from gateway.session import build_session_key
+
+        adapter = _make_adapter()
+        adapter._message_handler = AsyncMock()
+        adapter.handle_message = AsyncMock()
+        adapter.send_reaction = AsyncMock(return_value=True)
+        adapter._channel_state[DM_CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+        inbound = _tagged_event(
+            "reply-event",
+            DM_CHANNEL,
+            content="inside thread",
+            p=SELF_PUBKEY,
+            reply_to="immediate-parent",
+        )
+        inbound["tags"].insert(1, ["e", "thread-root", "", "root"])
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [inbound])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(DM_CHANNEL)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.message_id == "reply-event"
+        assert event.source.message_id == "reply-event"
+        assert event.source.thread_id == "thread-root"
+        assert event.source.parent_chat_id == DM_CHANNEL
+        assert build_session_key(event.source) == (
+            f"agent:main:buzz:dm:{DM_CHANNEL}:thread-root"
+        )
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -574,4 +688,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
