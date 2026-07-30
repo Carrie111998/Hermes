@@ -195,6 +195,7 @@ export interface Translations {
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
+      sayStopToEnd: (phrase: string) => string
       transcriptionFailed: string
       transcriptionUnavailable: string
       tryRecordingAgain: string
@@ -350,6 +351,8 @@ export interface Translations {
       translucencyDesc: string
       backdropTitle: string
       backdropDesc: string
+      reactionsTitle: string
+      reactionsDesc: string
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string
@@ -703,7 +706,7 @@ export interface Translations {
       disableServer: (name: string) => string
       serverEnabled: (name: string) => string
       serverDisabled: (name: string) => string
-      toggleFailed: (name: string) => string
+      toggleFailed: (name: string, enabled: boolean) => string
       tabServers: string
       tabCatalog: string
       catalogLoading: string
@@ -912,7 +915,7 @@ export interface Translations {
     visionModelLink: string
     toolsetsEnabled: (enabled: number, total: number) => string
     configureToolset: (label: string) => string
-    toggleToolset: (label: string) => string
+    toggleToolset: (label: string, enabled: boolean) => string
     skillsLoadFailed: string
     toolsetsRefreshFailed: string
     skillEnabled: string
@@ -1052,6 +1055,10 @@ export interface Translations {
     goTo: string
     goToSession: string
     branches: string
+    projects: string
+    openFolder: string
+    openFolderAt: (path: string) => string
+    newSessionInProject: (project: string) => string
     commands: string
     startInBranch: (branch: string) => string
     commandCenter: string
@@ -1071,7 +1078,7 @@ export interface Translations {
       installed: string
       generatedTag: string
       adoptFailed: string
-      toggleFailed: string
+      toggleFailed: (enabled: boolean) => string
       noneAvailable: string
     }
     generatePet: {
@@ -1250,6 +1257,23 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
+    pendingRequests: (count: number) => string
+    pendingAria: (count: number) => string
+    approvedUsers: (count: number) => string
+    approve: string
+    approving: string
+    revoke: string
+    revoking: string
+    revokeAria: (name: string) => string
+    revokeTitle: string
+    revokeDesc: (name: string) => string
+    approvedUser: (name: string) => string
+    approvedHint: string
+    revokedUser: (name: string) => string
+    failedApprove: (name: string) => string
+    failedRevoke: (name: string) => string
+    pairingLockedOut: string
+    waitingSince: (minutes: number) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }
@@ -1276,7 +1300,7 @@ export interface Translations {
     deleteDescPrefix: string
     deleteDescSuffix: string
     deleteFailed: (name: string) => string
-    toggleFailed: (name: string) => string
+    toggleFailed: (name: string, enabled: boolean) => string
     newSubscription: string
     restarting: string
     restartNeeded: string
@@ -1619,7 +1643,7 @@ export interface Translations {
       forceRemove: string
       enter: (label: string) => string
       reorder: (label: string) => string
-      toggle: (label: string) => string
+      toggle: (label: string, open: boolean) => string
       back: string
     }
     newSessionIn: (label: string) => string
@@ -2280,12 +2304,6 @@ export interface Translations {
     closeToRight: string
     closeAll: string
     newSessionTab: string
-    split: (dir: string) => string
-    move: (dir: string) => string
-    dirUp: string
-    dirDown: string
-    dirLeft: string
-    dirRight: string
     pluginDisabled: (pluginId: string) => string
     pluginDisabledBody: string
     missingPane: (paneId: string) => string
@@ -2330,7 +2348,10 @@ export interface Translations {
       refresh: string
       moreActions: string
       branchNewChat: string
+      react: string
       dismissError: string
+      filesChanged: (count: number) => string
+      reviewChanges: string
       readAloudFailed: string
       preparingAudio: string
       stopReading: string
@@ -2400,6 +2421,8 @@ export interface Translations {
       statusError: string
       statusRecovered: string
       statusDone: string
+      /** Over-budget / rejected memory write title — not "Saved to memory". */
+      memoryWriteNoted: string
       actions: {
         read: string
         reading: string
@@ -2533,7 +2556,7 @@ export interface Translations {
     sidebar: {
       title: string
       description: string
-      toggle: string
+      toggle: (open: boolean) => string
     }
   }
 }
