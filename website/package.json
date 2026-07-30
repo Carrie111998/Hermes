@@ -33,9 +33,10 @@
     "@docusaurus/module-type-aliases": "3.9.2",
     "@docusaurus/tsconfig": "3.9.2",
     "@docusaurus/types": "3.9.2",
-    "typescript": "^6.0.3"
+    "typescript": "5.9.3"
   },
   "overrides": {
+    "brace-expansion": "5.0.8",
     "serialize-javascript": "^7.0.5",
     "uuid": "^14.0.0"
   },
