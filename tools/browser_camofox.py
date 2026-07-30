@@ -894,6 +894,10 @@ def camofox_vision(question: str, annotate: bool = False,
                 image_data_url=data_url,
                 image_size_bytes=len(resp.content),
             )
+            # Preserve annotation context (element refs) in the native
+            # envelope so the model can still interact with annotated elements.
+            if annotation_context:
+                native_result["content"][0]["text"] += annotation_context
             meta = native_result.setdefault("meta", {})
             meta["screenshot_path"] = screenshot_path
             native_result["text_summary"] = (

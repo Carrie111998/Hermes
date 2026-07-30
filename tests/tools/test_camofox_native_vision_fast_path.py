@@ -65,6 +65,35 @@ class TestCamofoxVisionFastPath:
         assert "screenshot_path" in result.get("meta", {})
         assert "Screenshot path:" in result.get("text_summary", "")
 
+    def test_native_fast_path_preserves_annotation_context(self):
+        """annotate=True → element refs appear in the native envelope text."""
+        fake_snapshot = {"snapshot": "[@e1] button 'Submit'\n[@e2] link 'Home'"}
+        with (
+            patch.object(browser_camofox, "_get_session", return_value=_fake_session()),
+            patch.object(
+                browser_camofox, "_camofox_private_page_block", return_value=None
+            ),
+            patch.object(
+                browser_camofox, "_get_raw", return_value=_fake_response(_TINY_PNG)
+            ),
+            patch.object(browser_camofox, "_get", return_value=fake_snapshot),
+            patch(
+                "tools.vision_tools._should_use_native_vision_fast_path",
+                return_value=True,
+            ),
+        ):
+            result = camofox_vision("what buttons are there?", annotate=True)
+
+        assert isinstance(result, dict)
+        assert result.get("_multimodal") is True
+        text_part = next(
+            p["text"] for p in result["content"] if p.get("type") == "text"
+        )
+        # Annotation context must be present for element interaction.
+        assert "Accessibility tree" in text_part
+        assert "[@e1]" in text_part
+        assert "button 'Submit'" in text_part
+
     def test_text_only_model_falls_back_to_aux_llm(self):
         """No native vision → delegates to the auxiliary vision LLM."""
         fake_llm_response = SimpleNamespace(
