@@ -4811,7 +4811,10 @@ class TurnRunner:
             # is active.  The approval message send auto-clears the Slack
             # status; pausing prevents _keep_typing from re-setting it.
             # Typing resumes in _handle_approve_command/_handle_deny_command.
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            try:
+                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            except Exception:
+                pass
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
