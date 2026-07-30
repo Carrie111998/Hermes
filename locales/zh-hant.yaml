@@ -108,6 +108,8 @@ gateway:
     status_retry_messages: "🗜️ 已壓縮 {before} → {after} 則訊息，正在重試…"
     status_retry_tokens:   "🗜️ 已壓縮約 {before} → 約 {after} tokens，正在重試…"
     status_retry_reduced:  "🗜️ 上下文已縮減至 {new_ctx} tokens（原為 {old_ctx}），正在重試…"
+    status_retry_payload_too_large: "⚠️ 請求負載過大（413）— 壓縮嘗試 {attempt}/{cap}…"
+    status_retry_retained_vision: "📐 壓縮已無法進一步縮小請求 — 已移除保留的視覺內容，正在重試…"
 
   debug:
     upload_failed:         "✗ 無法上傳除錯報告：{error}"

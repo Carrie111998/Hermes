@@ -4,6 +4,8 @@ from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_PAYLOAD_TOO_LARGE_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_RETAINED_VISION_STATUS,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -35,6 +37,10 @@ def test_english_runtime_statuses_preserve_legacy_output():
         COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
             new_ctx=120000, old_ctx=250000
         ),
+        COMPRESSION_RETRY_PAYLOAD_TOO_LARGE_STATUS_TEMPLATE.format(
+            attempt=1, cap=3
+        ),
+        COMPRESSION_RETRY_RETAINED_VISION_STATUS,
     )
     assert compaction_done_status(lang="en") == COMPACTION_DONE_STATUS
 
@@ -50,6 +56,8 @@ def test_simplified_chinese_runtime_statuses_are_localized():
     assert "30 → 12 条消息" in statuses[5]
     assert "250,000 → 约 120,000 tokens" in statuses[6]
     assert "缩减至 120,000 tokens" in statuses[7]
+    assert "请求负载过大" in statuses[8]
+    assert "已移除保留的视觉载荷" in statuses[9]
     assert all("Compacting context" not in status for status in statuses)
     assert compaction_done_status(lang="zh").startswith("✓ 上下文压缩完成")
 

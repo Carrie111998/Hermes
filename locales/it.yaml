@@ -109,6 +109,8 @@ gateway:
     status_retry_messages: "🗜️ Compressed {before} → {after} messages, retrying..."
     status_retry_tokens:   "🗜️ Compressed ~{before} → ~{after} tokens, retrying..."
     status_retry_reduced:  "🗜️ Context reduced to {new_ctx} tokens (was {old_ctx}), retrying..."
+    status_retry_payload_too_large: "⚠️  Request payload too large (413) — compression attempt {attempt}/{cap}..."
+    status_retry_retained_vision: "📐 Compression could not reduce the request further — removed retained vision payloads and retrying..."
 
   debug:
     upload_failed:         "✗ Caricamento del report di debug non riuscito: {error}"
