@@ -1,4 +1,4 @@
-<title>Checkout — MMM Investment General Store</title>
+<title>Checkout Preview — MMM Investment General Store</title>
 
 <!--
   MOCKUP — checkout.html deliberately stops short of a real payment field.
@@ -6,7 +6,7 @@
   page has no business collecting raw card numbers (not PCI-compliant),
   so this shows the full checkout LAYOUT — address, shipping, order
   summary, tax line — and mocks only the payment step, clearly labelled.
-  "Place order" shows a client-side confirmation and charges nothing.
+  "Preview confirmation" shows a client-side sample state and charges nothing.
 -->
 
 <style>
@@ -23,30 +23,28 @@ __STORE_SHARED_CSS__
 
 <div class="page">
 <a class="skip" href="#main">Skip to content</a>
-<div class="gs-flag">General Store &mdash; real checkout, paid by card &mdash; prototype, not the live site</div>
+<div class="gs-flag">General Store Preview &mdash; browsing only &mdash; no orders or payments</div>
 
 <header class="topbar">
   <div class="wrap topbar-in">
     <a class="brand" href="MAIN_SITE_URL">
       <span class="brand-mark">MMM Investment</span>
-      <span class="brand-sub mono">General store</span>
+      <span class="brand-sub mono">General Store Preview</span>
     </a>
     <nav class="nav" aria-label="Primary">
       <a href="shop.html">Shop</a>
       <a href="ESA_SHOP_URL">ESA / TEFA store</a>
       <a href="MAIN_SITE_URL">Main site</a>
     </nav>
-    <a class="btn btn-ghost btn-sm" href="checkout.html" aria-current="page">Cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
+    <a class="btn btn-ghost btn-sm" href="checkout.html" aria-current="page">Preview cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
   </div>
 </header>
 
 <main id="main">
   <div class="wrap band" id="checkout-body">
-    <div class="opener"><span class="mono" style="color:var(--clay)">Checkout</span></div>
-    <h1 class="h-lg" style="padding-bottom:.5rem">Review, ship, and pay.</h1>
-    <p class="prose" style="padding-bottom:2rem">This is a retail purchase, paid now by card &mdash;
-      not a TEFA/ESA invoice. You'll get an order confirmation by email once this connects to a
-      real payment processor.</p>
+    <div class="opener"><span class="mono" style="color:var(--clay)">Checkout preview</span></div>
+    <h1 class="h-lg" style="padding-bottom:.5rem">Review a sample order flow.</h1>
+    <p class="prose" style="padding-bottom:2rem">This is a preview of a future retail checkout, kept separate from ESA / TEFA. It does not accept payments, create orders, send email, or calculate real tax or shipping.</p>
 
     <div class="checkout-grid">
       <form id="checkout-form">
@@ -73,18 +71,18 @@ __STORE_SHARED_CSS__
           <h2 class="h-sm">Shipping method</h2>
           <div class="stack g-12">
             <label class="ship-opt">
-              <span class="so-label"><input type="radio" name="ship" value="standard" checked> Standard &mdash; 5&ndash;7 business days</span>
-              <span class="so-price">$4.95</span>
+              <span class="so-label"><input type="radio" name="ship" value="standard" checked> Sample standard shipping</span>
+              <span class="so-price">$4.95 example</span>
             </label>
             <label class="ship-opt">
-              <span class="so-label"><input type="radio" name="ship" value="expedited"> Expedited &mdash; 2&ndash;3 business days</span>
-              <span class="so-price">$12.95</span>
+              <span class="so-label"><input type="radio" name="ship" value="expedited"> Sample expedited shipping</span>
+              <span class="so-price">$12.95 example</span>
             </label>
           </div>
         </div>
 
         <div class="form-section" style="border-bottom:0">
-          <h2 class="h-sm">Payment</h2>
+          <h2 class="h-sm">Payment preview</h2>
           <div class="pay-mock">
             <span class="mono">Not wired up yet, on purpose</span>
             <p>This mockup does not collect or transmit any real payment or card information. A
@@ -124,17 +122,15 @@ __STORE_SHARED_CSS__
         <p style="font-size:.82rem; color:var(--muted); padding-top:.85rem; line-height:1.5">
           Tax shown is a placeholder rate, not your real obligation &mdash; connect a tax
           calculation step (or your own resale-permit filing process) before this goes live.</p>
-        <button type="button" class="btn btn-solid btn-block" id="place-order" style="margin-top:1rem">Place order</button>
+        <button type="button" class="btn btn-solid btn-block" id="place-order" style="margin-top:1rem">Preview confirmation</button>
       </aside>
     </div>
   </div>
 
   <div class="wrap band confirm" id="checkout-confirm" hidden>
-    <span class="mono">Order received &mdash; mockup only</span>
-    <h1 class="h-lg" style="padding-bottom:.75rem">Thank you. No payment was actually collected.</h1>
-    <p class="prose" style="margin-inline:auto">This confirmation is a client-side prototype state.
-      Nothing was charged, no order was created, and no email was sent &mdash; this screen exists to
-      show what a completed checkout looks like once a real payment processor is connected.</p>
+    <span class="mono">Preview complete &mdash; no order placed</span>
+    <h1 class="h-lg" style="padding-bottom:.75rem">No payment was collected and no order was created.</h1>
+    <p class="prose" style="margin-inline:auto">This is only a client-side sample state. No information was submitted, nothing was charged, no order was created, and no email was sent.</p>
     <div class="hero-cta" style="justify-content:center; padding-top:1.5rem">
       <a class="btn btn-ghost" href="shop.html">Back to the shop</a>
     </div>
@@ -147,7 +143,7 @@ __STORE_SHARED_CSS__
       <span class="foot-brand">MMM Investment</span>
       <nav class="foot-nav" aria-label="Footer">
         <a href="shop.html">Shop</a>
-        <a href="checkout.html">Cart</a>
+        <a href="checkout.html">Preview cart</a>
         <a href="ESA_SHOP_URL">ESA / TEFA store</a>
         <a href="mailto:Mmminvestment25@gmail.com">Email</a>
       </nav>

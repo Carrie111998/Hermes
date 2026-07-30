@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>The Vulturian — MMM Investment General Store</title>
+<title>The Vulturian Preview — MMM Investment General Store</title>
 <meta name="description" content="General Store mockup: family titles and activity books sold at retail, kept separate from the TEFA/ESA-funded storefront.">
 <meta name="color-scheme" content="light dark">
 <meta property="og:title" content="The Vulturian — MMM Investment General Store">
@@ -335,20 +335,20 @@ a.product{text-decoration:none; color:inherit}
 
 <div class="page">
 <a class="skip" href="#main">Skip to content</a>
-<div class="gs-flag">General Store &mdash; real checkout, paid by card &mdash; prototype, not the live site</div>
+<div class="gs-flag">General Store Preview &mdash; browsing only &mdash; no orders or payments</div>
 
 <header class="topbar">
   <div class="wrap topbar-in">
     <a class="brand" href="../index.html">
       <span class="brand-mark">MMM Investment</span>
-      <span class="brand-sub mono">General store</span>
+      <span class="brand-sub mono">General Store Preview</span>
     </a>
     <nav class="nav" aria-label="Primary">
       <a href="shop.html">Shop</a>
       <a href="../store/shop.html">ESA / TEFA store</a>
       <a href="../index.html">Main site</a>
     </nav>
-    <a class="btn btn-ghost btn-sm" href="checkout.html">Cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
+    <a class="btn btn-ghost btn-sm" href="checkout.html">Preview cart <span data-cart-badge hidden style="margin-left:.35rem">0</span></a>
   </div>
 </header>
 
@@ -389,10 +389,9 @@ a.product{text-decoration:none; color:inherit}
               <input type="text" id="pd-qty" value="1" inputmode="numeric" data-qty-for="GEN-BK-001" aria-label="Quantity">
               <button type="button" onclick="var i=document.getElementById('pd-qty'); i.value=(parseInt(i.value,10)||1)+1" aria-label="Increase quantity">+</button>
             </span>
-            <button type="button" class="btn btn-solid" data-add-to-cart="GEN-BK-001">Add to cart</button>
+            <button type="button" class="btn btn-solid" data-add-to-cart="GEN-BK-001">Add to preview cart</button>
           </div>
-          <p style="font-size:.86rem; color:var(--muted); max-width:48ch">Paid at checkout by card &mdash;
-            this is a retail sale, not a TEFA/ESA-funded purchase.</p>
+          <p style="font-size:.86rem; color:var(--muted); max-width:48ch">Preview interaction only &mdash; no payment is collected and no order is created.</p>
         </div>
       </div>
     </section>
@@ -405,13 +404,12 @@ a.product{text-decoration:none; color:inherit}
       <span class="foot-brand">MMM Investment</span>
       <nav class="foot-nav" aria-label="Footer">
         <a href="shop.html">Shop</a>
-        <a href="checkout.html">Cart</a>
+        <a href="checkout.html">Preview cart</a>
         <a href="../store/shop.html">ESA / TEFA store</a>
         <a href="mailto:Mmminvestment25@gmail.com">Email</a>
       </nav>
     </div>
-    <p class="disclaim">General Store purchases are paid at retail and are not TEFA/ESA-funded
-      purchases. Price, page count, and cover shown are placeholders pending real details.</p>
+    <p class="disclaim">General Store is a development preview only. Price, author credit, page count, ISBN, description, and cover remain unfinished; no order or payment is available.</p>
   </div>
 </footer>
 </div>
