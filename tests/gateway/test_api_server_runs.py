@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -25,6 +26,7 @@ from gateway.platforms.api_server import (
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+from tools.registry import registry
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +332,93 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_projected_tool_start_event_flows_through_runs_sse(self, adapter):
+        """The HTTP run path must wire projected events without generic duplicates."""
+        tool_name = "test_runs_projected_start_event"
+        registry.register(
+            name=tool_name,
+            toolset="test",
+            schema={
+                "name": tool_name,
+                "description": "Report client intent",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "ok",
+            run_start_event={
+                "event": "client.intent",
+                "fields": ("text", "speech"),
+            },
+        )
+        try:
+            app = _create_runs_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch.object(adapter, "_create_agent") as mock_create:
+
+                    def _create_agent(**kwargs):
+                        callback = kwargs["tool_progress_callback"]
+                        mock_agent = MagicMock()
+
+                        def _run_conversation(*_args, **_kwargs):
+                            callback(
+                                "tool.started",
+                                tool_name,
+                                "generic preview",
+                                {
+                                    "text": "Prepare the requested action",
+                                    "speech": "brief",
+                                    "private": "not projected",
+                                },
+                            )
+                            callback(
+                                "tool.completed",
+                                tool_name,
+                                result="private result",
+                                duration=0.1,
+                            )
+                            return {"final_response": "done"}
+
+                        mock_agent.run_conversation.side_effect = _run_conversation
+                        mock_agent.session_prompt_tokens = 0
+                        mock_agent.session_completion_tokens = 0
+                        mock_agent.session_total_tokens = 0
+                        return mock_agent
+
+                    mock_create.side_effect = _create_agent
+
+                    start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                    assert start_resp.status == 202
+                    run_id = (await start_resp.json())["run_id"]
+
+                    events_resp = await cli.get(f"/v1/runs/{run_id}/events")
+                    assert events_resp.status == 200
+                    body = await events_resp.text()
+        finally:
+            registry.deregister(tool_name)
+
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in body.splitlines()
+            if line.startswith("data: ")
+        ]
+        projected = [event for event in events if event["event"] == "client.intent"]
+        assert len(projected) == 1
+        projected_event = projected[0]
+        assert projected_event == {
+            "event": "client.intent",
+            "run_id": run_id,
+            "sequence": 1,
+            "timestamp": projected_event["timestamp"],
+            "text": "Prepare the requested action",
+            "speech": "brief",
+        }
+        assert not any(
+            event["event"] in {"tool.started", "tool.completed"}
+            and event.get("tool") == tool_name
+            for event in events
+        )
+        assert events[-1]["event"] == "run.completed"
 
 
     @pytest.mark.asyncio
