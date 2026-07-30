@@ -56,7 +56,7 @@ def _playwright_browser_args() -> list[str]:
     extra: list[str] = []
 
     # Root/AppArmor safety flag (Linux-only).
-    if sys.platform == "linux" and os.geteuid() == 0:
+    if sys.platform == "linux" and hasattr(os, "geteuid") and os.geteuid() == 0:
         extra.append("--no-sandbox")
 
     # Browser availability: if we cannot find a system browser, tell Playwright
