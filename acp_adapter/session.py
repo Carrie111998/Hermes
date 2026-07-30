@@ -620,12 +620,18 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        agent_cfg = config.get("agent") or {}
+        disabled_toolsets = (
+            agent_cfg.get("disabled_toolsets") if isinstance(agent_cfg, dict) else None
+        ) or None
+
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
                 ["hermes-acp"],
                 mcp_server_names=configured_mcp_servers,
             ),
+            "disabled_toolsets": disabled_toolsets,
             "quiet_mode": True,
             "session_id": session_id,
             "session_db": self._get_db(),
