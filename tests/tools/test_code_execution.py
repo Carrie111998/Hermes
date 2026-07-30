@@ -293,6 +293,17 @@ print(result.get("output", ""))
         self.assertIn("mock output for: echo hello", result["output"])
         self.assertEqual(result["tool_calls_made"], 1)
 
+    def test_unimported_tool_call(self):
+        """Enabled tools are available without importing hermes_tools."""
+        code = """
+result = terminal("echo hello")
+print(result.get("output", ""))
+"""
+        result = self._run(code, enabled_tools=["terminal"])
+        self.assertEqual(result["status"], "success")
+        self.assertIn("mock output for: echo hello", result["output"])
+        self.assertEqual(result["tool_calls_made"], 1)
+
 
     def test_concurrent_tool_calls_match_responses(self):
         """Regression for the UDS RPC race: multiple threads inside the
