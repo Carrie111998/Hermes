@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import intent_router as ir
+from manifest_contract import load_manifest
 
 PY = sys.executable
 
@@ -34,6 +35,18 @@ EXPECTED_LEGACY = {
 
 def test_intent_count_and_names():
     assert set(ir.INTENT_REGISTRY) == EXPECTED_INTENTS
+
+
+def test_router_is_derived_from_canonical_manifest():
+    manifest = load_manifest()
+    assert set(ir.INTENT_REGISTRY) == set(manifest["intents"])
+    assert set(ir.ALIAS_TABLE) == set(manifest["legacy_aliases"])
+    assert ir.RECIPES == manifest["recipes"]
+    for name, spec in ir.INTENT_REGISTRY.items():
+        declared = manifest["intents"][name]
+        assert spec.description == declared["description"]
+        assert spec.actions == declared["actions"]
+        assert spec.default_action == declared["default_action"]
 
 
 def test_every_legacy_maps_exactly_once():
@@ -170,6 +183,7 @@ def test_mcp_kubrick_do_call_unknown_intent_fails_closed():
 
 def main():
     test_intent_count_and_names()
+    test_router_is_derived_from_canonical_manifest()
     test_every_legacy_maps_exactly_once()
     test_resolve_do_adapt_provider()
     test_resolve_alias_adapt_flux()
@@ -188,4 +202,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

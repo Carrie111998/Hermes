@@ -11,6 +11,8 @@ Kubrick is a **standalone Hermes skill** on branch **`main`** (v0.13.0). Continu
 # or: cp -R . ~/.hermes/skills/kubrick
 ```
 
+The installer validates a staged copy before activation. Use `./install.sh --dry-run` to preview, `./install.sh --version` to inspect the source version, and `./install.sh --rollback` to restore the most recent external backup.
+
 Install runtime validation dependencies when working from the repository:
 
 ```bash

@@ -12,6 +12,8 @@ Kubrick may assume:
 - A Python 3 interpreter may be available for deterministic helpers.
 - The skill directory may be read-only after installation.
 
+The Bash installer must validate a staged copy before activation, keep backups outside `skills/`, atomically swap the validated directory, restore the prior installation if activation fails, and write an install receipt. Dry-run performs no writes; rollback preserves the displaced installation as a backup.
+
 Kubrick must not assume:
 
 - the Git repository is present,
@@ -34,6 +36,8 @@ User inputs and outputs must accept explicit paths. Runtime artifacts should def
 
 ## Dependency tiers
 
+The canonical manifest names four runtime profiles: `prose`, `stdlib`, `validation`, and `dev`. The tiers below define their guarantees. Kubrick remains a Hermes skill directory in every profile and is never required to install as a Python package.
+
 ### Tier 0 — Hermes prose runtime
 
 No external dependencies. All creative routing, diagnosis, drafting, revision, and symbolic translation must remain possible through `SKILL.md` and bundled references.
@@ -55,6 +59,10 @@ Examples: PyYAML or jsonschema. A helper that needs one must:
 
 Continuity Forge, MCP servers, model APIs, and rendering providers are optional extensions. Their absence cannot block local creative work.
 
+### Development profile
+
+The `dev` profile adds test and static-analysis tools. It exists for repository maintenance only and is not an installed-skill runtime requirement.
+
 ## Operator surface (intent router)
 
 The unified CLI (`scripts/kubrick.py`) is the authoritative local operator surface.
@@ -72,6 +80,7 @@ python scripts/kubrick.py do <intent> [--action <action>] [flags]
 **Legacy aliases** (soft cutover): flat names such as `forge-signals`, `closed-loop-qa`, `adapt-flux`, `validate-skill`, `mcp-server`, `design-build` still resolve through the router.
 
 Registry and resolve logic: `scripts/intent_router.py`.  
+Canonical registry: `kubrick.manifest.yaml`. The router loads this file with the Python standard library, so routing does not depend on PyYAML.
 Design: `docs/superpowers/specs/2026-07-30-operator-intent-router-design.md`.
 
 See root `README.md`, `QUICKSTART.md`, and `docs/README.md` for workflows and the docs index.
@@ -93,6 +102,10 @@ This contract describes the **Hermes** skill on `main`. An OpenClaw Agent Skill 
 | Forge receipt | authoritative according to returned status | project continuity store |
 
 References, schemas, pattern sidecars, and eval fixtures are immutable during ordinary use.
+
+Every compile receipt records deterministic runtime identity fields: `kubrick_version`, `corpus_version`, `corpus_digest`, `schema_bundle_version`, `provider_adapter_version`, `command`, `command_digest`, and `normalized_input_digest`. Digests use relative paths and canonical semantic inputs. They exclude timestamps, absolute paths, file metadata, and environment details.
+
+Every provider packet includes a `preservation_report` conforming to `schemas/provider-preservation-report.schema.json`. Graph identity, required observable content, ownership, geometry, state change, residue, continuity, and negative constraints are critical invariants. Any loss marks the adapter output `INVALID`; provider syntax may change, semantic requirements may not.
 
 ## Canon policy
 
@@ -130,6 +143,8 @@ Return `NOT_COMPUTABLE` when:
 - production constraints make the encoding nonviable.
 
 A failure result must include a reason vector and the minimum missing information needed to proceed.
+
+The unified CLI uses stable exit codes from `kubrick.manifest.yaml`: `1` execution or validation failure, `2` invalid command or arguments, `3` unavailable optional dependency with no degraded operation, and `4` domain-level `NOT_COMPUTABLE`. Set `KUBRICK_DIAGNOSTICS=json` for diagnostics conforming to `schemas/diagnostic.schema.json`; the default remains concise human-readable stderr.
 
 ## Maintenance policy
 

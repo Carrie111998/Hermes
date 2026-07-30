@@ -82,6 +82,21 @@ hermes chat --toolsets skills -q \
   "Calculate the SHA-256 checksum of README.md."
 ```
 
+## Community layout note
+
+Hermes GitHub taps default to listing skill directories under `skills/`.
+This repository ships a hub-discoverable copy at:
+
+```text
+skills/kubrick/SKILL.md
+```
+
+Root-level files remain the development workspace. After editing root, refresh:
+
+```bash
+./scripts/sync_hub_skill.sh
+```
+
 ## 4. Community publish (no upstream wait)
 
 ```bash

@@ -7,6 +7,8 @@ import json
 import re
 from pathlib import Path
 
+from manifest_contract import load_manifest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 TARGETS = {
@@ -32,6 +34,33 @@ def main() -> None:
     expected = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     declarations: dict[str, str | None] = {}
     mismatches: list[dict[str, object]] = []
+
+    manifest_version = load_manifest()["version"]
+    declarations["kubrick.manifest.yaml"] = manifest_version
+    if manifest_version != expected:
+        mismatches.append(
+            {
+                "file": "kubrick.manifest.yaml",
+                "expected": expected,
+                "observed": manifest_version,
+                "reason": "version mismatch",
+            }
+        )
+
+    pyproject_text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project_section = pyproject_text.split("[project]", 1)[1].split("[", 1)[0]
+    pyproject_match = re.search(r'^version\s*=\s*"([^"]+)"', project_section, re.MULTILINE)
+    pyproject_version = pyproject_match.group(1) if pyproject_match else None
+    declarations["pyproject.toml"] = pyproject_version
+    if pyproject_version != expected:
+        mismatches.append(
+            {
+                "file": "pyproject.toml",
+                "expected": expected,
+                "observed": pyproject_version,
+                "reason": "version mismatch",
+            }
+        )
 
     for relative, pattern in TARGETS.items():
         path = ROOT / relative

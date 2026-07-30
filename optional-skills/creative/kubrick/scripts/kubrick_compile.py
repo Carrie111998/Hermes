@@ -4,12 +4,15 @@ from __future__ import annotations
 import argparse, hashlib, json, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
+from diagnostics import abort, diagnostic
+from runtime_identity import compile_identity
 try:
     import yaml
 except ImportError:
-    raise SystemExit("pyyaml required")
+    abort(diagnostic(status="DEPENDENCY_UNAVAILABLE",code="PY_YAML_REQUIRED",exit_code=3,message="PyYAML is required for compile; install the validation runtime profile",context={"package":"PyYAML","profile":"validation"}))
 ROOT=Path(__file__).resolve().parent.parent
 PY=sys.executable
+RUN_IDENTITY={}
 
 def read(path):
     p=Path(path); return json.loads(p.read_text(encoding="utf-8")) if p.suffix==".json" else yaml.safe_load(p.read_text(encoding="utf-8")) or {}
@@ -19,10 +22,10 @@ def write(path,data):
 
 def run(cmd): return subprocess.run(cmd,cwd=ROOT,text=True,capture_output=True)
 
-def fail(out,stage,reasons,diagnostic=None):
-    final={"status":"NOT_COMPUTABLE","compiler_version":"0.3.0","stage":stage,"reason_vector":reasons}
-    if diagnostic: final["diagnostic"]=diagnostic[-2000:]
-    (out/"compile-receipt.json").write_text(json.dumps(final,indent=2),encoding="utf-8"); print(json.dumps(final,indent=2)); raise SystemExit(1)
+def fail(out,stage,reasons,diagnostic_output=None):
+    payload=diagnostic(status="NOT_COMPUTABLE",code="COMPILE_NOT_COMPUTABLE",exit_code=4,message=f"compile stopped at {stage}",reason_vector=reasons,context={"stage":stage,"implementation_output":diagnostic_output[-2000:] if diagnostic_output else ""})
+    final={"status":"NOT_COMPUTABLE","compiler_version":"0.3.0",**RUN_IDENTITY,"stage":stage,"reason_vector":reasons,"diagnostic":payload}
+    (out/"compile-receipt.json").write_text(json.dumps(final,indent=2),encoding="utf-8"); print(json.dumps(final,indent=2)); raise SystemExit(4)
 
 def validate(out,artifact,schema,label):
     report=out/f"schema-{label}.json"; result=run([PY,str(ROOT/"scripts/validate_artifact.py"),"--artifact",str(artifact),"--schema",str(ROOT/schema),"--output",str(report)])
@@ -52,9 +55,12 @@ def build_structured_packet(brief,graph,selected):
     return {"dramatic_function":brief.get("dramatic_problem","transform pressure"),"causal_actions":brief.get("causal_actions") or [e.get("transformation","") for e in graph.get("edges",[]) if e.get("transformation")],"motifs":motifs,"channels":channels,"convergence_sites":[{"site_id":s.get("site_id"),"functions":s.get("functions") or [s.get("observable_effect",""),brief.get("desired_state_change","transformed")]} for s in graph.get("convergence_sites",[])],"cultural_sources":cultural,"interpretation_claims":brief.get("interpretation_claims",[]),"production_constraints":brief.get("production_constraints",[])}
 
 def main():
+    global RUN_IDENTITY
     p=argparse.ArgumentParser(); p.add_argument("--brief",required=True); p.add_argument("--ledger"); p.add_argument("--mode",choices=["single-frame","scene","storyboard","diagnostic"],default="single-frame"); p.add_argument("--storyboard-plan"); p.add_argument("--provider",choices=["none","generic","grok-imagine","flux","sd3","midjourney"],default="none"); p.add_argument("--out",required=True); a=p.parse_args()
     out=Path(a.out); out.mkdir(parents=True,exist_ok=True); brief=read(a.brief)
     if a.ledger: brief["symbolic_ledger"]=read(a.ledger)
+    identity_input={"brief":brief,"storyboard_plan":read(a.storyboard_plan) if a.storyboard_plan else None}
+    RUN_IDENTITY=compile_identity(identity_input,mode=a.mode,provider=a.provider)
     normalized=out/"brief.normalized.yaml"; write(normalized,brief)
     retrieval=run([PY,str(ROOT/"scripts/retrieve_symbolic_patterns_registry.py"),"--brief",str(normalized),"--no-cache"])
     try: receipt=yaml.safe_load(retrieval.stdout) or {}
@@ -103,7 +109,7 @@ def main():
                 provider=run([PY,str(ROOT/"scripts/adapt_provider.py"),"--packet",str(adapter_path),"--provider",a.provider,"--output",str(provider_path)])
             if provider.returncode!=0: fail(out,"adapter",[f"{a.provider.upper().replace('-','_')}_ADAPTER_FAILED"],provider.stdout or provider.stderr)
             artifacts["provider_packet"]=provider_path.name
-    final={"status":"COMPILED","compiler_version":"0.3.0","timestamp":datetime.now(timezone.utc).isoformat(),"mode":a.mode,"provider":a.provider,"selected_primary":selected,"artifacts":artifacts,"schema_reports":schema_reports,"reason_vector":[]}
+    final={"status":"COMPILED","compiler_version":"0.3.0",**RUN_IDENTITY,"timestamp":datetime.now(timezone.utc).isoformat(),"mode":a.mode,"provider":a.provider,"selected_primary":selected,"artifacts":artifacts,"schema_reports":schema_reports,"reason_vector":[]}
     (out/"compile-receipt.json").write_text(json.dumps(final,indent=2),encoding="utf-8"); print(json.dumps(final,indent=2))
 
 if __name__=="__main__": main()

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from manifest_contract import load_manifest
+
 SCRIPTS = Path(__file__).resolve().parent
 
 
@@ -34,146 +36,26 @@ class IntentSpec:
     # Optional specialized argv builder name keys later
 
 
-INTENT_REGISTRY: dict[str, IntentSpec] = {
-    "compile": IntentSpec(
-        "Full brief-to-packet compile",
-        {"run": "kubrick_compile.py"},
-        "run",
-    ),
-    "retrieve": IntentSpec(
-        "Registry-aware pattern retrieval",
-        {"retrieve": "retrieve_symbolic_patterns_registry.py"},
-        "retrieve",
-    ),
-    "ledger": IntentSpec(
-        "Project symbolic ledger",
-        {
-            "init": "symbolic_ledger.py",
-            "audit": "symbolic_ledger.py",
-            "mutate": "symbolic_ledger.py",
-            "rehydrate": "symbolic_ledger.py",
-            "apply-forge": "symbolic_ledger.py",
-            "export-retrieval": "symbolic_ledger.py",
-            "record-pattern": "symbolic_ledger.py",
-        },
-        None,
-    ),
-    "design": IntentSpec(
-        "Design-specification compilation",
-        {"build": "generate_design_spec.py"},
-        "build",
-    ),
-    "storyboard": IntentSpec(
-        "Multi-frame state",
-        {
-            "propagate": "propagate_graph_state.py",
-            "compare": "compare_frame_state.py",
-        },
-        None,
-    ),
-    "adapt": IntentSpec(
-        "Neutral packet and provider adaptation",
-        {
-            "build": "build_model_adapter_packet.py",
-            "provider": "adapt_provider.py",
-        },
-        "build",
-    ),
-    "visual": IntentSpec(
-        "Visual QA loop",
-        {
-            "normalize": "normalize_visual_observation.py",
-            "compare": "compare_visual_observation.py",
-            "correct": "build_visual_correction_packet.py",
-            "govern": "govern_correction_iteration.py",
-            "closed-loop": "closed_loop_visual_qa.py",
-        },
-        None,
-    ),
-    "learn": IntentSpec(
-        "Outcomes and multi-signal evolution",
-        {
-            "outcome": "record_pattern_outcome.py",
-            "evolve": "propose_pattern_evolution.py",
-            "forge-signals": "extract_forge_signals.py",
-        },
-        None,
-    ),
-    "check": IntentSpec(
-        "Validation and regression",
-        {
-            "skill": "validate_hermes_skill.py",
-            "corpus": "validate_pattern_corpus.py",
-            "coverage": "audit_corpus_coverage.py",
-            "artifact": "validate_artifact.py",
-            "repeatability": "check_repeatability.py",
-            "eval": "run_hermes_evals.py",
-            # smoke is composite (skill + corpus); script is primary entry for registry
-            "smoke": "validate_hermes_skill.py",
-        },
-        "smoke",
-    ),
-    "operate": IntentSpec(
-        "Graph/ledger operators",
-        {
-            "saturation-score": "graph_operators.py",
-            "counterpoint": "graph_operators.py",
-            "convergence-lock": "graph_operators.py",
-            "surface-occult-audit": "graph_operators.py",
-            "symbolic-architecture-export": "graph_operators.py",
-            "motif-mutation": "graph_operators.py",
-        },
-        None,
-    ),
-    "mcp": IntentSpec(
-        "Optional MCP server",
-        {"serve": "mcp_kubrick_server.py"},
-        "serve",
-    ),
-    "bundle": IntentSpec(
-        "Grok review bundle",
-        {"build": "build_grok_review_bundle.py"},
-        "build",
-    ),
-}
+MANIFEST = load_manifest()
 
+INTENT_REGISTRY: dict[str, IntentSpec] = {
+    name: IntentSpec(
+        description=spec["description"],
+        actions=dict(spec["actions"]),
+        default_action=spec.get("default_action"),
+    )
+    for name, spec in MANIFEST["intents"].items()
+}
 
 ALIAS_TABLE: dict[str, AliasSpec] = {
-    "compile": AliasSpec("compile", "run"),
-    "retrieve": AliasSpec("retrieve", "retrieve"),
-    "ledger": AliasSpec("ledger", "init", passthrough_action=True),
-    "design-build": AliasSpec("design", "build"),
-    "storyboard-propagate": AliasSpec("storyboard", "propagate"),
-    "storyboard-compare": AliasSpec("storyboard", "compare"),
-    "adapter-build": AliasSpec("adapt", "build"),
-    "adapt-provider": AliasSpec("adapt", "provider"),
-    "adapt-grok": AliasSpec(
-        "adapt", "provider", fixed_flags=("--provider", "grok-imagine")
-    ),
-    "adapt-flux": AliasSpec("adapt", "provider", fixed_flags=("--provider", "flux")),
-    "adapt-sd3": AliasSpec("adapt", "provider", fixed_flags=("--provider", "sd3")),
-    "adapt-midjourney": AliasSpec(
-        "adapt", "provider", fixed_flags=("--provider", "midjourney")
-    ),
-    "visual-normalize": AliasSpec("visual", "normalize"),
-    "visual-compare": AliasSpec("visual", "compare"),
-    "visual-correct": AliasSpec("visual", "correct"),
-    "correction-govern": AliasSpec("visual", "govern"),
-    "closed-loop-qa": AliasSpec("visual", "closed-loop"),
-    "outcome-record": AliasSpec("learn", "outcome"),
-    "evolution-propose": AliasSpec("learn", "evolve"),
-    "forge-signals": AliasSpec("learn", "forge-signals"),
-    "validate-skill": AliasSpec("check", "skill"),
-    "validate-corpus": AliasSpec("check", "corpus"),
-    "coverage": AliasSpec("check", "coverage"),
-    "artifact-validate": AliasSpec("check", "artifact"),
-    "repeatability": AliasSpec("check", "repeatability"),
-    "eval": AliasSpec("check", "eval"),
-    "operator": AliasSpec("operate", "saturation-score", passthrough_action=True),
-    "mcp-server": AliasSpec("mcp", "serve"),
-    "grok-review-bundle": AliasSpec("bundle", "build"),
+    name: AliasSpec(
+        intent=spec["intent"],
+        action=spec["action"],
+        passthrough_action=bool(spec.get("passthrough_action", False)),
+        fixed_flags=tuple(spec.get("fixed_flags", ())),
+    )
+    for name, spec in MANIFEST["legacy_aliases"].items()
 }
-
 
 def all_legacy_commands() -> set[str]:
     """Return the set of legacy top-level command names."""
@@ -182,23 +64,7 @@ def all_legacy_commands() -> set[str]:
 
 # Human sugar: expand to full ``do …`` argv for resolve() (not shell).
 RECIPES: dict[str, list[str]] = {
-    "storyboard-example": [
-        "do",
-        "compile",
-        "--brief",
-        "examples/authority-transfer-storyboard/brief.yaml",
-        "--ledger",
-        "examples/authority-transfer-storyboard/symbolic-ledger.yaml",
-        "--mode",
-        "storyboard",
-        "--storyboard-plan",
-        "examples/authority-transfer-storyboard/storyboard-plan.yaml",
-        "--provider",
-        "grok-imagine",
-        "--out",
-        "out/kubrick/authority-transfer",
-    ],
-    "verify": ["do", "check", "--action", "smoke"],
+    name: list(argv) for name, argv in MANIFEST["recipes"].items()
 }
 
 
@@ -251,8 +117,7 @@ def format_intent_help(intent: str) -> str:
         lines.append(f"  {action:28} → {script}{default_mark}")
     if intent == "check":
         lines.append(
-            "  note: action 'smoke' runs validate_hermes_skill.py then "
-            "validate_pattern_corpus.py"
+            "  note: action 'smoke' runs manifest, skill, and pattern-corpus validation"
         )
     if intent in {"ledger", "operate"}:
         lines += [
@@ -261,7 +126,7 @@ def format_intent_help(intent: str) -> str:
             "as the first argv token to the implementation script.",
             f"  example: kubrick do {intent} <action> [flags]",
         ]
-    elif spec.default_action:
+    elif spec.default_action and intent != "check":
         lines += [
             "",
             f"Default action: {spec.default_action}",
@@ -281,7 +146,7 @@ def format_intent_help(intent: str) -> str:
     if intent == "check":
         lines += [
             "",
-            "Default action: smoke (skill + corpus).",
+            "Default action: smoke (manifest + skill + corpus).",
         ]
     lines += [
         "",

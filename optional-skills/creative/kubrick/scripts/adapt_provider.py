@@ -132,6 +132,98 @@ ADAPTERS = {
 }
 
 
+PRESERVATION_FIELDS = (
+    "identity_preserved",
+    "required_objects_preserved",
+    "ownership_preserved",
+    "geometry_preserved",
+    "state_change_preserved",
+    "residue_preserved",
+    "continuity_preserved",
+    "negative_constraints_preserved",
+)
+
+
+def preservation_report(packet: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    source_frames = packet.get("frames", [])
+    rendered_frames = result.get("frames", [])
+    paired = list(zip(source_frames, rendered_frames))
+    same_frame_count = len(source_frames) == len(rendered_frames) and bool(source_frames)
+
+    def prompts_contain(needles: list[str], rendered: dict[str, Any]) -> bool:
+        rendered_text = json.dumps(rendered, ensure_ascii=False)
+        return all(str(item) in rendered_text for item in needles)
+
+    identity = (
+        bool(packet.get("source_graph_id"))
+        and result.get("source_graph_id") == packet.get("source_graph_id")
+        and same_frame_count
+        and all(source.get("frame_id") == rendered.get("frame_id") for source, rendered in paired)
+    )
+    required_objects = same_frame_count and all(
+        prompts_contain([source.get("prompt", "")], rendered) for source, rendered in paired
+    )
+    ownership = same_frame_count and all(
+        prompts_contain(
+            [part for part in str(source.get("prompt", "")).split("; ") if "motif ownership" in part],
+            rendered,
+        )
+        for source, rendered in paired
+    )
+    visual_identity = list(packet.get("shared_constraints", {}).get("visual_identity", []))
+    geometry = same_frame_count and all(prompts_contain(visual_identity, rendered) for _, rendered in paired)
+    state_change = same_frame_count and all(
+        rendered.get("state_constraints") == source.get("state_constraints", [])
+        and prompts_contain(list(source.get("state_constraints", [])), rendered)
+        for source, rendered in paired
+    )
+    residue = same_frame_count and all(
+        prompts_contain(
+            [part for part in str(source.get("prompt", "")).split("; ") if "residue persists:" in part],
+            rendered,
+        )
+        for source, rendered in paired
+    )
+    continuity = same_frame_count and all(
+        rendered.get("continuity_lock") == source.get("continuity_from_previous", [])
+        and prompts_contain(list(source.get("continuity_from_previous", [])), rendered)
+        for source, rendered in paired
+    )
+    negative = list(packet.get("shared_constraints", {}).get("negative_constraints", []))
+    negative_preserved = same_frame_count and all(
+        rendered.get("negative_constraints") == negative and prompts_contain(negative, rendered)
+        for _, rendered in paired
+    )
+    checks = {
+        "identity_preserved": identity,
+        "required_objects_preserved": required_objects,
+        "ownership_preserved": ownership,
+        "geometry_preserved": geometry,
+        "state_change_preserved": state_change,
+        "residue_preserved": residue,
+        "continuity_preserved": continuity,
+        "negative_constraints_preserved": negative_preserved,
+    }
+    losses = [name.removesuffix("_preserved").upper() for name, preserved in checks.items() if not preserved]
+    return {
+        "schema_version": "1.0.0",
+        "provider": result.get("provider"),
+        **checks,
+        "critical_invariants_preserved": not losses,
+        "losses": losses,
+    }
+
+
+def apply_preservation_policy(packet: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    report = preservation_report(packet, result)
+    result["preservation_report"] = report
+    if not report["critical_invariants_preserved"]:
+        errors = list(result.get("validation", {}).get("errors", []))
+        errors.extend(f"PROVIDER_LOSS:{loss}" for loss in report["losses"])
+        result["validation"] = {"status": "INVALID", "errors": sorted(set(errors))}
+    return result
+
+
 def adapt(packet: dict[str, Any], provider: str) -> dict[str, Any]:
     errors: list[str] = list(packet.get("validation", {}).get("errors", []))
     if packet.get("validation", {}).get("status") != "VALID":
@@ -192,7 +284,7 @@ def adapt(packet: dict[str, Any], provider: str) -> dict[str, Any]:
             "errors": errors or ([] if frames else ["no frames available"]),
         },
     }
-    return result
+    return apply_preservation_policy(packet, result)
 
 
 def main() -> None:

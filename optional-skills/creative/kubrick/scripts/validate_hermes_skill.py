@@ -19,6 +19,7 @@ SKILL_FILE = SKILL_ROOT / "SKILL.md"
 REQUIRED_FRONTMATTER = {"name", "description", "version", "author", "license"}
 REQUIRED_PATHS = [
     "SKILL.md",
+    "kubrick.manifest.yaml",
     "QUICKSTART.md",
     "LICENSE",
     "references/hermes-runtime-contract.md",
@@ -26,6 +27,14 @@ REQUIRED_PATHS = [
     "references/patterns",
     "schemas/motif-structure-graph.schema.yaml",
     "scripts/retrieve_symbolic_patterns.py",
+    "scripts/manifest_contract.py",
+    "scripts/diagnostics.py",
+    "scripts/runtime_identity.py",
+    "scripts/validate_manifest.py",
+    "scripts/test_receipt_identity.py",
+    "scripts/test_diagnostics.py",
+    "scripts/test_adapter_preservation.py",
+    "scripts/test_installer.py",
     "scripts/build_motif_graph.py",
     "scripts/evolve_from_use.py",
     "evals",

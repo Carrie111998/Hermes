@@ -23,6 +23,19 @@ PY = sys.executable
 
 sys.path.insert(0, str(SCRIPTS))
 import intent_router as ir  # noqa: E402
+from diagnostics import abort, diagnostic  # noqa: E402
+
+
+def _abort_router(error: ir.RouterError) -> None:
+    abort(
+        diagnostic(
+            status="INVALID_COMMAND",
+            code="ROUTER_ERROR",
+            exit_code=error.exit_code,
+            message=error.message,
+            context={"surface": "kubrick"},
+        )
+    )
 
 
 def _is_agent() -> bool:
@@ -31,8 +44,12 @@ def _is_agent() -> bool:
 
 
 def _dispatch_smoke(call: ir.IntentCall) -> None:
-    """check smoke: validate skill then pattern corpus (composite)."""
-    for script in ("validate_hermes_skill.py", "validate_pattern_corpus.py"):
+    """check smoke: validate manifest, skill, then pattern corpus (composite)."""
+    for script in (
+        "validate_manifest.py",
+        "validate_hermes_skill.py",
+        "validate_pattern_corpus.py",
+    ):
         r = subprocess.run([PY, str(SCRIPTS / script), *call.argv], cwd=ROOT)
         if r.returncode != 0:
             raise SystemExit(r.returncode)
@@ -52,8 +69,7 @@ def main() -> None:
         try:
             sys.stdout.write(ir.format_intent_help(argv[1]))
         except ir.RouterError as e:
-            print(e.message, file=sys.stderr)
-            raise SystemExit(e.exit_code)
+            _abort_router(e)
         raise SystemExit(0)
 
     if argv[0] == "aliases":
@@ -62,12 +78,11 @@ def main() -> None:
 
     if argv[0] == "recipe":
         if len(argv) < 2:
-            raise SystemExit("usage: kubrick recipe <name>")
+            _abort_router(ir.RouterError("usage: kubrick recipe <name>"))
         try:
             argv = ir.resolve_recipe(argv[1])
         except ir.RouterError as e:
-            print(e.message, file=sys.stderr)
-            raise SystemExit(e.exit_code)
+            _abort_router(e)
 
     # do <intent> --help / -h → intent help (do not pass --help into scripts)
     if (
@@ -78,8 +93,7 @@ def main() -> None:
         try:
             sys.stdout.write(ir.format_intent_help(argv[1]))
         except ir.RouterError as e:
-            print(e.message, file=sys.stderr)
-            raise SystemExit(e.exit_code)
+            _abort_router(e)
         raise SystemExit(0)
 
     try:
@@ -88,8 +102,7 @@ def main() -> None:
         if e.message == "HELP":
             sys.stdout.write(ir.format_top_level_help())
             raise SystemExit(0)
-        print(e.message, file=sys.stderr)
-        raise SystemExit(e.exit_code)
+        _abort_router(e)
 
     if (
         call.legacy_name

@@ -27,7 +27,7 @@ def digest(path:Path)->str:
 
 def main():
     p=argparse.ArgumentParser(); p.add_argument("--output"); a=p.parse_args()
-    artifacts=["motif-graph.private.yaml","structured-symbolic-packet.yaml","storyboard-symbolic-state.yaml","storyboard-transition-report.json","model-adapter-packet.yaml","grok-imagine-prompt-packet.yaml"]
+    artifacts=["compile-receipt.json","motif-graph.private.yaml","structured-symbolic-packet.yaml","storyboard-symbolic-state.yaml","storyboard-transition-report.json","model-adapter-packet.yaml","grok-imagine-prompt-packet.yaml"]
     with tempfile.TemporaryDirectory() as d:
         root=Path(d); runs=[]
         for i in (1,2):

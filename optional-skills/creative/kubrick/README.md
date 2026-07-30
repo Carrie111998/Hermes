@@ -191,6 +191,16 @@ cd Kubrick
 ./install.sh
 ```
 
+The installer copies to staging, validates the manifest, Hermes skill, and pattern corpus, then atomically activates the new directory. Existing installs are backed up outside the discoverable skills tree and can be restored:
+
+```bash
+./install.sh --dry-run
+./install.sh --version
+./install.sh --rollback
+```
+
+Install and rollback operations write JSON receipts beneath `~/.hermes/receipts/`.
+
 Default destination:
 
 ```text
