@@ -443,4 +443,4 @@ gateway:
 
 cron:
   delivery:
-    wrapper: "Cronjob Response: {task_name}\n(job_id: {job_id})\n-------------\n\n{content}\n\nTo stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    wrapper: "استجابة المهمة المجدولة: {task_name}\n(job_id: {job_id})\n-------------\n\n{content}\n\nلإيقاف هذه المهمة أو إدارتها، أرسل لي رسالة جديدة (مثال: \"أوقف التذكير {task_name}\")."
