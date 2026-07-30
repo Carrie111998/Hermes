@@ -1761,6 +1761,37 @@ class PluginManager:
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
         try:
+            # Warn when a declared required env var is missing, BEFORE
+            # loading the module at all. Some plugins read the variable
+            # directly at module scope (not just inside register()) and
+            # raise (e.g. KeyError / a provider SDK's own validation) --
+            # if this check ran only after the module import (or only
+            # after register_fn(ctx) succeeded), that raise would
+            # propagate straight to the generic "Failed to load plugin"
+            # handler below and the specific missing-variable diagnostic
+            # would never be reported (issue #2768). Uses manifest.requires_env
+            # directly since it's available before the module is ever
+            # imported. Normalize requires_env entries (str or dict) before
+            # checking the process environment, mirroring
+            # hermes_cli/plugins_cmd.py:307-314.
+            _missing_env: list[str] = []
+            for _entry in manifest.requires_env or []:
+                if isinstance(_entry, str):
+                    _var_name = _entry
+                elif isinstance(_entry, dict):
+                    _var_name = _entry.get("name", "")
+                else:
+                    _var_name = ""
+                if _var_name and not os.environ.get(_var_name):
+                    _missing_env.append(_var_name)
+
+            if _missing_env:
+                logger.warning(
+                    "Plugin '%s': required env var(s) not set: %s "
+                    "-- plugin may be non-functional or fail to load",
+                    manifest.name, ", ".join(_missing_env),
+                )
+
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
             else:
@@ -1775,35 +1806,6 @@ class PluginManager:
                 logger.warning("Plugin '%s' has no register() function", manifest.name)
             else:
                 ctx = PluginContext(manifest, self)
-
-                # Warn when a declared required env var is missing, BEFORE
-                # calling register(). Some plugins read the variable
-                # directly during registration and raise (e.g. KeyError /
-                # a provider SDK's own validation) -- if this check ran
-                # only after register_fn(ctx) succeeded, that raise would
-                # propagate straight to the generic "Failed to load
-                # plugin" handler below and the specific missing-variable
-                # diagnostic would never be reported (issue #2768).
-                # Normalize requires_env entries (str or dict) before
-                # checking the process environment, mirroring
-                # hermes_cli/plugins_cmd.py:307-314.
-                _missing_env: list[str] = []
-                for _entry in manifest.requires_env or []:
-                    if isinstance(_entry, str):
-                        _var_name = _entry
-                    elif isinstance(_entry, dict):
-                        _var_name = _entry.get("name", "")
-                    else:
-                        _var_name = ""
-                    if _var_name and not os.environ.get(_var_name):
-                        _missing_env.append(_var_name)
-
-                if _missing_env:
-                    logger.warning(
-                        "Plugin '%s': required env var(s) not set: %s "
-                        "-- plugin may be non-functional or fail to load",
-                        manifest.name, ", ".join(_missing_env),
-                    )
 
                 # Snapshot registry state BEFORE register() so each registry's
                 # attribution counts only what THIS plugin actually added.

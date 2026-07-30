@@ -2496,6 +2496,56 @@ class TestRequiresEnvWarning:
         loaded = mgr._plugins.get("envtest_raises")
         assert loaded is not None and loaded.error, "Plugin load must still be marked failed"
 
+    def test_requires_env_warning_fires_even_when_module_import_raises(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Regression (review of #68703): a plugin that reads the missing
+        variable at MODULE scope -- during import itself, before
+        register() is even reachable as an attribute -- must still produce
+        the specific missing-env WARNING. The prior fix moved the check
+        before register_fn(ctx) but still after
+        _load_directory_module()/_load_entrypoint_module(), so a raise
+        during the import itself still bypassed the diagnostic. The check
+        must run before module loading, using manifest.requires_env
+        directly rather than anything read off the imported module."""
+        import logging
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("_TEST_IMPORT_RAISING_VAR_2768", raising=False)
+
+        plugin_dir = tmp_path / "plugins" / "envtest_import_raises"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "import os\n"
+            "# Accessed at MODULE scope -- raises during the import itself,\n"
+            "# before register() is even an attribute on the module yet.\n"
+            "_REQUIRED = os.environ['_TEST_IMPORT_RAISING_VAR_2768']\n"
+            "def register(ctx):\n"
+            "    pass\n"
+        )
+
+        mgr = PluginManager()
+        manifest = PluginManifest(
+            name="envtest_import_raises",
+            source="user",
+            path=str(plugin_dir),
+            requires_env=["_TEST_IMPORT_RAISING_VAR_2768"],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            mgr._load_plugin(manifest)  # must not raise -- outer handler catches it
+
+        assert any(
+            "_TEST_IMPORT_RAISING_VAR_2768" in r.message
+            for r in caplog.records
+            if r.levelno == logging.WARNING
+        ), (
+            "The specific missing-env-var WARNING must fire even though "
+            "the module import itself raised: "
+            + str([r.message for r in caplog.records])
+        )
+        loaded = mgr._plugins.get("envtest_import_raises")
+        assert loaded is not None and loaded.error, "Plugin load must still be marked failed"
+
     def test_provider_only_plugin_no_false_positive(self, tmp_path, monkeypatch, caplog):
         """A plugin that registers a REAL image_gen provider (no tools/hooks/
         commands) must not produce a spurious empty-registration warning --
@@ -2542,6 +2592,14 @@ class TestRequiresEnvWarning:
             assert loaded is not None and loaded.enabled, (
                 f"Real provider registration must succeed, not error: "
                 f"{loaded.error if loaded else 'not loaded'}"
+            )
+            from agent.image_gen_registry import get_provider as _get_img_provider
+            registered = _get_img_provider("test-provider-2768")
+            assert registered is not None, (
+                "The provider must actually be retrievable from "
+                "agent.image_gen_registry -- loaded.enabled alone only "
+                "proves register() returned without raising, not that "
+                "the registration call inside it actually took effect"
             )
         finally:
             from agent.image_gen_registry import _providers as _img_providers
