@@ -609,7 +609,7 @@ class OpenAIStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
 class FiniteFishStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
     """Finite Fish S2 Pro streaming WAV, exposed as canonical raw PCM."""
 
-    sample_rate = 44100
+    sample_rate = 24000
     upstream_cancellable = True
 
     @staticmethod
@@ -638,11 +638,14 @@ class FiniteFishStreamer(_ResponseCancellationMixin, StreamingTTSProvider):
         if not re.match(r"^https?://[^/\s]+", base_url, flags=re.IGNORECASE):
             raise RuntimeError("Finite Fish streaming TTS base_url must be http(s)")
         payload = {
-            "model": str(self.section.get("model") or "fishaudio-s2-pro-tts"),
+            "model": str(self.section.get("model") or "kokoro-82m-tts"),
             "voice": str(self.section.get("voice") or "default"),
             "input": text,
             "response_format": "wav",
-            "stream": True,
+            # The provider still relays the HTTP body incrementally. Keeping the
+            # OpenAI payload non-streaming selects the artifact-capacity lane at
+            # front doors that distinguish model streams from chunked audio.
+            "stream": bool(self.section.get("request_stream", False)),
             "stream_format": "audio",
         }
         with requests.post(
@@ -702,7 +705,7 @@ def _streaming_wav_pcm(chunks: Iterator[bytes]) -> Iterator[bytes]:
             if (
                 audio_format != 1
                 or channels != 1
-                or sample_rate != 44100
+                or sample_rate != 24000
                 or bits != 16
                 or byte_rate != sample_rate * 2
                 or block_align != 2

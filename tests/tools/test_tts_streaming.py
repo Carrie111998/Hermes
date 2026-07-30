@@ -77,7 +77,7 @@ def test_finite_fish_wav_header_can_arrive_split_across_http_chunks():
     header[8:12] = b"WAVE"
     header[12:16] = b"fmt "
     struct.pack_into("<I", header, 16, 16)
-    struct.pack_into("<HHIIHH", header, 20, 1, 1, 44100, 88200, 2, 16)
+    struct.pack_into("<HHIIHH", header, 20, 1, 1, 24000, 48000, 2, 16)
     header[36:40] = b"data"
     struct.pack_into("<I", header, 40, 6)
     pcm = b"\x01\x00\x02\x00\x03\x00"
@@ -92,7 +92,7 @@ def test_finite_fish_rejects_incompatible_wav_format():
     header[8:12] = b"WAVE"
     header[12:16] = b"fmt "
     struct.pack_into("<I", header, 16, 16)
-    struct.pack_into("<HHIIHH", header, 20, 1, 2, 44100, 176400, 4, 16)
+    struct.pack_into("<HHIIHH", header, 20, 1, 2, 24000, 96000, 4, 16)
     header[36:40] = b"data"
     struct.pack_into("<I", header, 40, 0)
     with pytest.raises(RuntimeError, match="incompatible"):
