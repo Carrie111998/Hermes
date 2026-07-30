@@ -250,8 +250,8 @@ class TestPruneSaveConcurrencySafety:
         sibling_entry = _make_entry(sibling_key, "sid_sibling")
         store._entries = {stale_key: stale_entry, sibling_key: sibling_entry}
         store._persisted_routing_payloads = {
-            stale_key: json.dumps(stale_entry.to_dict(), sort_keys=True),
-            sibling_key: json.dumps(sibling_entry.to_dict(), sort_keys=True),
+            stale_key: store._routing_payload_signature(stale_entry.to_dict()),
+            sibling_key: store._routing_payload_signature(sibling_entry.to_dict()),
         }
 
         # A sibling connection UPDATES the loaded sibling row after our snapshot.
