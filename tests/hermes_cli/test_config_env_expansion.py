@@ -308,3 +308,87 @@ class TestGatewayConfigExpandsEnvVars:
             "An admin list consisting only of an unresolved ${VAR} must "
             "not silently enable gating with an admin nothing can match"
         )
+
+    def test_multiplex_scope_wins_over_process_global_env(self, monkeypatch, tmp_path):
+        """Regression (review of #72096): in multiplex mode,
+        _profile_runtime_scope() installs each profile's own .env into a
+        current_secret_scope() WITHOUT mutating os.environ, so multiple
+        profiles' secrets never collide in the shared process environment.
+        The expansion in load_gateway_config() must resolve ${VAR} through
+        that active scope (via _getenv()), not read os.environ directly --
+        otherwise a profile-scoped admin ID gets silently ignored in favor
+        of whatever a DIFFERENT profile (or no profile at all) left in the
+        process-global environment.
+        """
+        from gateway.config import load_gateway_config, Platform
+        from gateway.slash_access import policy_from_extra
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token: xxx\n"
+            "    extra:\n"
+            "      group_allow_admin_from:\n"
+            "        - '${TELEGRAM_ADMIN_ID}'\n"
+            "      group_user_allowed_commands:\n"
+            "        - status\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        # Deliberately conflicting values: a process-global one (as if some
+        # OTHER profile, or a pre-multiplex single-profile run, left it in
+        # os.environ) and a different one scoped to THIS profile.
+        monkeypatch.setenv("TELEGRAM_ADMIN_ID", "555000000")
+        token = set_secret_scope({"TELEGRAM_ADMIN_ID": "555999999"})
+        try:
+            config = load_gateway_config()
+        finally:
+            reset_secret_scope(token)
+
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["group_allow_admin_from"] == ["555999999"], (
+            "Must resolve against the active profile's scoped secret "
+            "(555999999), not the conflicting process-global os.environ "
+            "value (555000000): " + str(extra["group_allow_admin_from"])
+        )
+
+        policy = policy_from_extra(extra, "group")
+        assert policy.is_admin("555999999") is True
+        assert policy.is_admin("555000000") is False, (
+            "The process-global value must NOT leak into the resolved "
+            "policy when a conflicting profile-scoped value is active"
+        )
+
+    def test_no_active_scope_falls_back_to_process_global_env(self, monkeypatch, tmp_path):
+        """Sanity: outside multiplex mode (no secret scope installed,
+        single-profile CLI/gateway startup), resolution must still fall
+        back to os.environ exactly as before -- this fix must not break
+        the common, unscoped case."""
+        from gateway.config import load_gateway_config, Platform
+        from agent.secret_scope import current_secret_scope
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    token: xxx\n"
+            "    extra:\n"
+            "      group_allow_admin_from:\n"
+            "        - '${TELEGRAM_ADMIN_ID}'\n"
+            "      group_user_allowed_commands:\n"
+            "        - status\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TELEGRAM_ADMIN_ID", "555000000")
+        assert current_secret_scope() is None  # sanity: no scope active
+
+        config = load_gateway_config()
+        extra = config.platforms[Platform.TELEGRAM].extra
+        assert extra["group_allow_admin_from"] == ["555000000"]

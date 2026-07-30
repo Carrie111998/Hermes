@@ -11,12 +11,13 @@ Handles loading and validating configuration for:
 import logging
 import os
 import json
+import re
 from pathlib import Path
 from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Dict, List, Optional, Any, Callable
 from enum import Enum
 
-from hermes_cli.config import get_hermes_home, _expand_env_vars
+from hermes_cli.config import get_hermes_home
 from agent.secret_scope import current_secret_scope, get_secret as _get_secret
 from utils import is_truthy_value
 
@@ -252,6 +253,83 @@ def _getenv(name: str, default: Optional[str] = None) -> Optional[str]:
 def _getenv_str(name: str, default: str = "") -> str:
     val = _getenv(name, default)
     return val if val is not None else default
+
+
+_ENV_REF_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def _env_ref_var_name(ref: str) -> Optional[str]:
+    """Normalize a ``${...}`` body to the env-var name it reads, or None
+    when the ref uses a non-env source and never touches the environment.
+    Mirrors hermes_cli.config._env_ref_var_name for the same ${VAR} /
+    ${env:VAR} shapes."""
+    ref = ref.strip()
+    if ref.startswith("env:"):
+        name = ref[len("env:"):].strip()
+        return name or None
+    if ":" in ref and re.match(r"^[a-z][a-z0-9_-]*:", ref):
+        return None
+    return ref
+
+
+def _env_expand_match_scoped(m: "re.Match") -> str:
+    """Expand one ``${...}`` config reference through ``_getenv()`` rather
+    than ``os.environ`` directly, so an active profile secret scope
+    (multiplex mode -- see ``_getenv``'s own docstring) is honored instead
+    of always reading the process-global environment. Mirrors
+    hermes_cli.config._env_expand_match's shape handling exactly (bare
+    ${VAR}, ${env:VAR}, and other SecretRef sources left verbatim with a
+    warning), only swapping the lookup mechanism.
+    """
+    raw = m.group(0)
+    name = _env_ref_var_name(m.group(1))
+    if name is None:
+        # Non-env SecretRef source (bitwarden:, vault:, file:, ...) -- not
+        # resolvable here, same as the process-global expander.
+        inner = m.group(1).strip()
+        logger.warning(
+            "Config ref %r uses source %r which is not resolvable in "
+            "config.yaml — external secret sources inject env vars at "
+            "startup, so reference the variable as ${env:NAME} instead",
+            raw, inner.split(":", 1)[0],
+        )
+        return raw
+    val = _getenv(name)
+    if val is not None:
+        return val
+    if m.group(1).strip().startswith("env:"):
+        logger.warning(
+            "Config ref %r: %s is not set in the active secret scope "
+            "(check ~/.hermes/.env or the profile's own .env); keeping "
+            "the literal placeholder", raw, name,
+        )
+    return raw
+
+
+def _expand_env_vars_scoped(obj):
+    """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
+    values, resolving each name through ``_getenv()`` instead of
+    ``os.environ`` directly.
+
+    This is a scope-aware counterpart to hermes_cli.config._expand_env_vars:
+    that function is correct for hermes_cli.config.load_config()'s
+    single-profile CLI callers, but load_gateway_config() also runs during
+    multiplexed profile startup, where _profile_runtime_scope()
+    (gateway/run.py) installs each profile's own .env into a
+    current_secret_scope() rather than mutating os.environ (so multiple
+    profiles' secrets never collide in the shared process environment).
+    Reading os.environ directly here would resolve a ${VAR} reference
+    against the wrong profile's value (or the process-global one) instead
+    of the active profile's, or leave a profile-local-only reference
+    unresolved entirely (issue #72096, keep_open review).
+    """
+    if isinstance(obj, str):
+        return _ENV_REF_RE.sub(_env_expand_match_scoped, obj)
+    if isinstance(obj, dict):
+        return {k: _expand_env_vars_scoped(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars_scoped(item) for item in obj]
+    return obj
 
 
 def _getenv_int(name: str, default: int) -> int:
@@ -1289,18 +1367,28 @@ def load_gateway_config() -> GatewayConfig:
             from hermes_cli import managed_scope
             yaml_cfg = managed_scope.apply_managed_overlay(yaml_cfg)
 
-            # Expand ${VAR} / ${env:VAR} references against os.environ, for
-            # consistency with hermes_cli.config.load_config() (which this
-            # loader otherwise bypasses entirely, per the comment above) and
-            # the existing expansion call sites in gateway/run.py. Without
-            # this, e.g. platforms.telegram.extra.group_allow_admin_from:
+            # Expand ${VAR} / ${env:VAR} references, for consistency with
+            # hermes_cli.config.load_config() (which this loader otherwise
+            # bypasses entirely, per the comment above) and the existing
+            # expansion call sites in gateway/run.py. Without this, e.g.
+            # platforms.telegram.extra.group_allow_admin_from:
             # ['${TELEGRAM_ADMIN_ID}'] kept the literal string, which
             # gateway/slash_access.py's policy_from_extra() then treated as
             # a real (unmatchable) admin id -- silently locking every user
             # out of every tiered slash command with no error or log line
             # (issue #72096). Applied after the managed overlay so an
             # admin-pinned value can reference an env var too.
-            yaml_cfg = _expand_env_vars(yaml_cfg)
+            #
+            # Uses _expand_env_vars_scoped() (backed by _getenv()), NOT
+            # hermes_cli.config's process-global _expand_env_vars(): this
+            # loader runs during multiplexed profile startup too, where
+            # _profile_runtime_scope() (gateway/run.py) installs each
+            # profile's own .env into a current_secret_scope() without
+            # mutating os.environ, so reading os.environ directly here
+            # could resolve ${VAR} against the wrong profile (or leave a
+            # profile-local-only reference unresolved) instead of the
+            # active profile's value (keep_open review on #72096).
+            yaml_cfg = _expand_env_vars_scoped(yaml_cfg)
 
             # Shared nested-fallback source: settings meant to be top-level
             # keys are also accepted when a user nests them under `gateway:`
