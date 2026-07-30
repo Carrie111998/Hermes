@@ -99,6 +99,13 @@ let
       }
     else
       { };
+    } // {
+      # Build-time dependency — declared in pyproject.toml build-system.requires.
+      # uv2nix resolves build-system deps from the Python package set, but
+      # more-itertools isn't provided by the pyproject-build-systems overlay,
+      # so we bridge it from nixpkgs.
+      more-itertools = python312.pkgs.more-itertools;
+    };
 
   pythonSet =
     (callPackage pyproject-nix.build.packages {

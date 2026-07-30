@@ -688,11 +688,6 @@ class TestNodeRuntimeNpmResolution:
     """Regression tests for #30271 — WSL must not run Windows npm against the
     Linux checkout, and a failed Node refresh must not report success."""
 
-
-
-
-
-
     def test_node_failure_returns_failed_labels_and_warns(
         self, tmp_path, monkeypatch, capsys
     ):
@@ -711,8 +706,6 @@ class TestNodeRuntimeNpmResolution:
         assert failed == ["repo root"]
         out = capsys.readouterr().out
         assert "mixed state" in out
-
-
 
     def test_wsl_update_skips_windows_npm_build_paths(self, mock_args, monkeypatch):
         """A Windows-only npm on WSL must not reach web or desktop builds."""
@@ -734,13 +727,7 @@ class TestNodeRuntimeNpmResolution:
         )
         monkeypatch.setenv("PATH", "/mnt/c/Program Files/nodejs")
 
-        with patch("subprocess.run") as mock_run, \
-             patch.object(hm, "_web_ui_build_needed", return_value=True), \
-             patch.object(hm, "_desktop_packaged_executable", return_value=None), \
-             patch.object(hm, "_desktop_dist_exists", return_value=True), \
-             patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install, \
-             patch.object(hm, "_run_with_idle_timeout") as mock_idle_build, \
-             patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
+        with patch("subprocess.run") as mock_run,              patch.object(hm, "_web_ui_build_needed", return_value=True),              patch.object(hm, "_desktop_packaged_executable", return_value=None),              patch.object(hm, "_desktop_dist_exists", return_value=True),              patch.object(hm, "_run_npm_install_deterministic") as mock_npm_install,              patch.object(hm, "_run_with_idle_timeout") as mock_idle_build,              patch.object(hm, "_run_logged_subprocess") as mock_desktop_build:
             mock_run.side_effect = _make_run_side_effect(
                 branch="main", verify_ok=True, commit_count="1"
             )
@@ -753,3 +740,183 @@ class TestNodeRuntimeNpmResolution:
             not call.args or not call.args[0] or call.args[0][0] != windows_npm
             for call in mock_run.call_args_list
         )
+
+# === Tests for Termux/PRoot update fixes (#40328) ===
+
+
+def test_is_proot_env_true_for_proot_envvar(monkeypatch):
+    """PROOT env var indicates a PRoot session."""
+    from hermes_cli import main as hm
+
+    assert hm._is_proot_env({"PROOT": "/usr/bin/proot"}) is True
+
+
+def test_is_proot_env_true_for_proot_tmp_dir_envvar(monkeypatch):
+    """PROOT_TMP_DIR env var (set by some Termux + PRoot combos)."""
+    from hermes_cli import main as hm
+
+    assert hm._is_proot_env({"PROOT_TMP_DIR": "/data/data/com.termux/files"}) is True
+
+
+def test_is_proot_env_false_for_normal_env(monkeypatch):
+    """Empty env on a normal Linux system → not PRoot."""
+    from hermes_cli import main as hm
+
+    monkeypatch.delenv("PROOT", raising=False)
+    monkeypatch.delenv("PROOT_TMP_DIR", raising=False)
+    assert hm._is_proot_env({}) is False
+    assert hm._is_proot_env() is False
+
+
+def test_install_deps_autosets_uv_link_mode_on_termux(monkeypatch):
+    """On Termux, _install_python_dependencies_with_optional_fallback should
+    inject UV_LINK_MODE=copy into env if caller hasn't already set it."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: False)
+    captured = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(hm, "_run_install_with_heartbeat", fake_run)
+
+    env = {"PATH": "/usr/bin"}
+    with pytest.raises(subprocess.CalledProcessError):
+        hm._install_python_dependencies_with_optional_fallback(
+            ["uv", "pip"], env=env
+        )
+
+    assert env.get("UV_LINK_MODE") == "copy"
+
+
+def test_install_deps_preserves_user_uv_link_mode(monkeypatch):
+    """If caller already set UV_LINK_MODE, do not override it."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: True)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: False)
+
+    def fake_run(cmd, env=None, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(hm, "_run_install_with_heartbeat", fake_run)
+
+    env = {"UV_LINK_MODE": "symlink"}
+    with pytest.raises(subprocess.CalledProcessError):
+        hm._install_python_dependencies_with_optional_fallback(
+            ["uv", "pip"], env=env
+        )
+
+    assert env["UV_LINK_MODE"] == "symlink"
+
+
+def test_install_deps_passes_no_build_isolation_flag(monkeypatch):
+    """no_build_isolation=True should add --no-build-isolation to the install cmd."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: False)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: False)
+
+    captured = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured["cmd"] = cmd
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(hm, "_run_install_with_heartbeat", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        hm._install_python_dependencies_with_optional_fallback(
+            ["uv", "pip"], no_build_isolation=True
+        )
+
+    assert "--no-build-isolation" in captured["cmd"]
+
+
+def test_install_deps_no_build_isolation_off_by_default(monkeypatch):
+    """no_build_isolation=False should NOT add --no-build-isolation to the install cmd."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: False)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: False)
+
+    captured = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured["cmd"] = cmd
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(hm, "_run_install_with_heartbeat", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        hm._install_python_dependencies_with_optional_fallback(["uv", "pip"])
+
+    assert "--no-build-isolation" not in captured["cmd"]
+
+
+def test_cmd_update_impl_sets_no_build_isolation_on_proot(monkeypatch):
+    """_cmd_update_impl should set no_build_isolation=True when PRoot is detected."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "ensure_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(hm, "_ensure_uv_for_termux", lambda pip_cmd: None)
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: False)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: True)
+    monkeypatch.setattr(hm, "_is_android_python", lambda: False)
+
+    captured = {}
+
+    def fake_install(cmd_prefix, *, env=None, group="all", no_build_isolation=False):
+        captured["no_build_isolation"] = no_build_isolation
+        captured["group"] = group
+        captured["env"] = env
+
+    monkeypatch.setattr(
+        hm, "_install_python_dependencies_with_optional_fallback", fake_install
+    )
+    monkeypatch.setattr(hm, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_update_node_dependencies", lambda: None)
+    monkeypatch.setattr(hm, "_build_web_ui", lambda path: None)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm, "_recover_from_interrupted_install", lambda: None)
+
+    args = SimpleNamespace()
+    hm._cmd_update_impl(args, gateway_mode=False)
+
+    assert captured.get("no_build_isolation") is True
+
+
+def test_cmd_update_impl_no_build_isolation_off_for_normal_env(monkeypatch):
+    """_cmd_update_impl should NOT set no_build_isolation on a normal env."""
+    from hermes_cli import main as hm
+
+    monkeypatch.setattr(hm, "ensure_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(hm, "_ensure_uv_for_termux", lambda pip_cmd: None)
+    monkeypatch.setattr(hm, "_is_termux_env", lambda env=None: False)
+    monkeypatch.setattr(hm, "_is_proot_env", lambda env=None: False)
+    monkeypatch.setattr(hm, "_is_android_python", lambda: False)
+
+    captured = {}
+
+    def fake_install(cmd_prefix, *, env=None, group="all", no_build_isolation=False):
+        captured["no_build_isolation"] = no_build_isolation
+
+    monkeypatch.setattr(
+        hm, "_install_python_dependencies_with_optional_fallback", fake_install
+    )
+    monkeypatch.setattr(hm, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_clear_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(hm, "_update_node_dependencies", lambda: None)
+    monkeypatch.setattr(hm, "_build_web_ui", lambda path: None)
+    monkeypatch.setattr(hm, "_refresh_active_lazy_features", lambda: None)
+    monkeypatch.setattr(hm, "_recover_from_interrupted_install", lambda: None)
+
+    args = SimpleNamespace()
+    hm._cmd_update_impl(args, gateway_mode=False)
+
+    assert captured.get("no_build_isolation") is False

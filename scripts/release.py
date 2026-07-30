@@ -38,12 +38,8 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # Git email → GitHub username mapping
 # ──────────────────────────────────────────────────────────────────────
 
-# FROZEN legacy mappings — do NOT add new entries here. New contributor
-# mappings live as one-file-per-email entries under contributors/emails/
-# (see contributors/README.md), which merge-conflict-free by construction.
-# This dict is kept only so existing history keeps resolving; the effective
-# AUTHOR_MAP below merges it with the directory (directory wins).
-LEGACY_AUTHOR_MAP = {
+# Auto-extracted from noreply emails + manual overrides
+AUTHOR_MAP = {
     "declanbatesmith@outlook.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
     "drbs2004@me.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
     "122438640+ragingbulld@users.noreply.github.com": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)
@@ -339,6 +335,7 @@ LEGACY_AUTHOR_MAP = {
     "t.chen@aftership.com": "cypctlinux",  # PR #52403 salvage (Slack bot/workflow auth before no-user-id guard)
     "30854794+YLChen-007@users.noreply.github.com": "YLChen-007",  # PR #26965 (approval remote command substitution)
     "1078345+egilewski@users.noreply.github.com": "egilewski",  # co-author, PR #40663
+    "patrisius.wr@gmail.com": "PatrickNoFilter",
     "peterhao@Peters-MacBook-Air.local": "pinguarmy",
     "joe.rinaldijohnson@shopify.com": "joerj123",
     "adalsteinnhelgason@Aalsteinns-MacBook-Pro-3.local": "AIalliAI",
