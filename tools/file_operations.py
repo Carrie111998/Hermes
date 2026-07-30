@@ -2141,9 +2141,18 @@ class ShellFileOperations(FileOperations):
                       "https://github.com/BurntSushi/ripgrep#installation"
             )
 
-        # Exclude hidden directories (matching ripgrep's default behavior).
-        hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
-        hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+        # Exclude hidden directories while allowing .hermes/cache/ (where
+        # user-sent files are cached).  Uses find's -prune to skip entire
+        # subtrees.  Preserves the #1558 security fix (.hub/index-cache
+        # adversarial content).
+        if not has_hidden_path_ancestor:
+            hidden_exclude = (
+                "\\( -not -name '.' -name '.*' -not -name '.hermes' "
+                "-type d -prune \\) -o "
+            )
+        else:
+            hidden_exclude = ""
+        hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else " "
 
         # Use shell pagination for standard roots. For hidden roots, gather full
         # output so we can re-apply hidden-descendant filtering while allowing
@@ -2152,7 +2161,7 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr}-type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2160,7 +2169,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr}-type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2202,10 +2211,16 @@ class ShellFileOperations(FileOperations):
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
-        rg --files respects .gitignore and excludes hidden directories by
-        default, and uses parallel directory traversal for ~200x speedup
-        over find on wide trees.  Results are sorted by modification time
-        (most recently edited first) when rg >= 13.0 supports --sortr.
+        rg --files excludes hidden directories by default.  We add
+        ``.hermes/cache/`` (where user-sent files are cached) as an
+        additional explicit search path so that trusted hidden content
+        is searchable while dangerous directories (``.git/``, ``.hub/``)
+        remain excluded by default.  This preserves the #1558 security
+        fix without over-broadening access to all hidden directories.
+
+        Uses parallel directory traversal for ~200x speedup over find
+        on wide trees.  Results are sorted by modification time (most
+        recently edited first) when rg >= 13.0 supports --sortr.
         """
         # rg --files -g uses glob patterns; wrap bare names so they match
         # at any depth (equivalent to find -name).
@@ -2215,11 +2230,19 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        # Add .hermes/cache/ as an additional search path if it exists
+        # under the given path.  rg traverses explicit paths even when
+        # they are hidden directories, giving us a narrow, path-aware
+        # allowlist without --hidden.
+        hermes_cache_path = str(Path(path) / ".hermes" / "cache")
+        extra_path = ""
+        if Path(hermes_cache_path).is_dir():
+            extra_path = f" {self._escape_shell_arg(hermes_cache_path)}"
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
-            f"| head -n {fetch_limit}"
+            f"{self._escape_shell_arg(path)}{extra_path} 2>/dev/null "
+            f"| sort -u | head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2229,8 +2252,8 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
-                f"| head -n {fetch_limit}"
+                f"{self._escape_shell_arg(path)}{extra_path} 2>/dev/null "
+                f"| sort -u | head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)

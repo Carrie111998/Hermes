@@ -11,6 +11,10 @@ on which backend was available.
 
 Fix: _search_files (find) and _search_with_grep both now exclude hidden
 directories, matching ripgrep's default behavior.
+
+Additionally, .hermes/cache/ (where user-sent files are cached) is
+explicitly allowed so that it remains searchable while dangerous
+directories (.git, .hub) stay excluded.
 """
 
 import subprocess
@@ -38,29 +42,76 @@ def searchable_tree(tmp_path):
     git_dir.mkdir(parents=True)
     (git_dir / "pack-abc.idx").write_text("git internal data")
 
+    # Trusted hidden directory (.hermes/cache) with user content
+    hermes_cache_dir = tmp_path / "skills" / ".hermes" / "cache"
+    hermes_cache_dir.mkdir(parents=True)
+    (hermes_cache_dir / "user-file.txt").write_text("user uploaded file content")
+
+    # Unrelated hidden directory (should remain excluded)
+    secret_dir = tmp_path / "skills" / ".secretstuff"
+    secret_dir.mkdir(parents=True)
+    (secret_dir / "secret.txt").write_text("should not be found")
+
     return tmp_path / "skills"
 
 
 class TestFindExcludesHiddenDirs:
-    """_search_files uses find, which should exclude hidden directories."""
+    """_search_files uses find with -prune to exclude dangerous hidden dirs."""
+
+    # Common find prune expression: exclude all hidden dirs except .hermes
+    PRUNE_EXPR = (
+        "\\( -not -name '.' -name '.*' -not -name '.hermes' "
+        "-type d -prune \\) -o "
+    )
 
     def test_find_skips_hub_cache_files(self, searchable_tree):
         """find should not return files from .hub/ directory."""
         cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.json'"
+            f"find {searchable_tree} {self.PRUNE_EXPR}"
+            f"-type f -name '*.json' -print"
         )
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         assert "catalog.json" not in result.stdout
         assert ".hub" not in result.stdout
 
+    def test_find_skips_git_internals(self, searchable_tree):
+        """find should not return files from .git/ directory."""
+        cmd = (
+            f"find {searchable_tree} {self.PRUNE_EXPR}"
+            f"-type f -name '*.idx' -print"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        assert "pack-abc.idx" not in result.stdout
+        assert ".git" not in result.stdout
 
     def test_find_still_returns_visible_files(self, searchable_tree):
         """find should still return files from visible directories."""
         cmd = (
-            f"find {searchable_tree} -not -path '*/.*' -type f -name '*.md'"
+            f"find {searchable_tree} {self.PRUNE_EXPR}"
+            f"-type f -name '*.md' -print"
         )
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         assert "SKILL.md" in result.stdout
+
+    def test_find_includes_hermes_cache_files(self, searchable_tree):
+        """find should return files from .hermes/cache/ directory."""
+        cmd = (
+            f"find {searchable_tree} {self.PRUNE_EXPR}"
+            f"-type f -name '*.txt' -print"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        assert "user-file.txt" in result.stdout
+        assert ".hermes" in result.stdout
+
+    def test_find_excludes_unrelated_hidden_dirs(self, searchable_tree):
+        """find should NOT return files from .secretstuff/ (unrelated hidden dir)."""
+        cmd = (
+            f"find {searchable_tree} {self.PRUNE_EXPR}"
+            f"-type f -name '*.txt' -print"
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        assert "secret.txt" not in result.stdout
+        assert ".secretstuff" not in result.stdout
 
 
 class TestGrepExcludesHiddenDirs:
@@ -85,15 +136,15 @@ class TestGrepExcludesHiddenDirs:
         assert "SKILL.md" in result.stdout
 
 
-class TestRipgrepAlreadyExcludesHidden:
-    """Verify ripgrep's default behavior is to skip hidden directories."""
+class TestRipgrepHiddenWithExclusions:
+    """Verify rg with .hermes/cache explicit path finds trusted hidden content."""
 
     @pytest.mark.skipif(
         subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
         reason="ripgrep not installed",
     )
-    def test_rg_skips_hub_by_default(self, searchable_tree):
-        """rg should skip .hub/ by default (no --hidden flag)."""
+    def test_rg_default_skips_hub_by_default(self, searchable_tree):
+        """rg without --hidden should still skip .hub/ (baseline behavior)."""
         result = subprocess.run(
             ["rg", "--no-heading", "ignore", str(searchable_tree)],
             capture_output=True, text=True,
@@ -112,6 +163,47 @@ class TestRipgrepAlreadyExcludesHidden:
             capture_output=True, text=True,
         )
         assert "SKILL.md" in result.stdout
+
+    @pytest.mark.skipif(
+        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        reason="ripgrep not installed",
+    )
+    def test_rg_includes_hermes_cache(self, searchable_tree):
+        """rg with .hermes/cache as explicit path should find files there."""
+        hermes_cache = str(searchable_tree / ".hermes" / "cache")
+        result = subprocess.run(
+            ["rg", "--files", str(searchable_tree), hermes_cache],
+            capture_output=True, text=True,
+        )
+        assert "user-file.txt" in result.stdout
+
+    @pytest.mark.skipif(
+        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        reason="ripgrep not installed",
+    )
+    def test_rg_still_excludes_hub(self, searchable_tree):
+        """rg with .hermes/cache path should NOT expose .hub/ files."""
+        hermes_cache = str(searchable_tree / ".hermes" / "cache")
+        result = subprocess.run(
+            ["rg", "--files", str(searchable_tree), hermes_cache],
+            capture_output=True, text=True,
+        )
+        assert "catalog.json" not in result.stdout
+        assert ".hub" not in result.stdout
+
+    @pytest.mark.skipif(
+        subprocess.run(["which", "rg"], capture_output=True).returncode != 0,
+        reason="ripgrep not installed",
+    )
+    def test_rg_still_excludes_unrelated_hidden(self, searchable_tree):
+        """rg should NOT expose .secretstuff/ (unrelated hidden dir)."""
+        hermes_cache = str(searchable_tree / ".hermes" / "cache")
+        result = subprocess.run(
+            ["rg", "--files", str(searchable_tree), hermes_cache],
+            capture_output=True, text=True,
+        )
+        assert "secret.txt" not in result.stdout
+        assert ".secretstuff" not in result.stdout
 
 
 class TestIgnoreFileWritten:
