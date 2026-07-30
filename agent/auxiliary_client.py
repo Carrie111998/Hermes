@@ -5255,6 +5255,30 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    if provider == "claude-cli":
+        from agent.claude_cli_client import AsyncClaudeCLIClient, ClaudeCLIClient
+
+        runtime = main_runtime or {}
+        base_session_id = str(
+            runtime.get("session_id")
+            or os.environ.get("HERMES_SESSION_ID", "")
+            or "auxiliary"
+        )
+        task_suffix = str(task or "general").strip().replace(":", "-")
+        final_model = _normalize_resolved_model(model or "opus", provider)
+        client = ClaudeCLIClient(
+            model=final_model or "opus",
+            session_db=runtime.get("session_db"),
+            session_id=f"{base_session_id}:aux:{task_suffix}",
+            executable=str(runtime.get("command") or "claude"),
+            executable_args=list(runtime.get("args") or []),
+        )
+        return (
+            (AsyncClaudeCLIClient(client), final_model)
+            if async_mode
+            else (client, final_model)
+        )
+
     if pconfig.auth_type == "external_process":
         creds = resolve_external_process_provider_credentials(provider)
         final_model = _normalize_resolved_model(

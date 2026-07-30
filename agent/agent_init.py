@@ -789,7 +789,27 @@ def init_agent(
     # Claude uses its own timeout path and is not covered here.
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
 
-    if agent.api_mode == "anthropic_messages":
+    if agent.provider == "claude-cli":
+        from agent.claude_cli_client import ClaudeCLIClient
+
+        agent.api_mode = "chat_completions"
+        agent.api_key = "claude-cli-process"
+        agent.base_url = "claude-cli://local"
+        agent.client = ClaudeCLIClient(
+            model=agent.model or "opus",
+            session_db=session_db,
+            session_id=session_id,
+            executable=agent.acp_command or "claude",
+            executable_args=agent.acp_args,
+            timeout_seconds=_provider_timeout or 600,
+        )
+        agent._client_kwargs = {}
+        if not agent.quiet_mode:
+            print(
+                f"🤖 AI Agent initialized with model: {agent.model} "
+                "(Claude Code subscription)"
+            )
+    elif agent.api_mode == "anthropic_messages":
         from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).

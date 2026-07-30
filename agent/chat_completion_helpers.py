@@ -420,7 +420,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
                 invalidate_runtime_client(region)
             raise
         return normalize_converse_response(raw_response)
-    if agent.provider == "moa":
+    if agent.provider in {"moa", "claude-cli"}:
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
@@ -2237,6 +2237,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             return agent._interruptible_api_call(api_kwargs)
         finally:
             agent._codex_on_first_delta = None
+
+    if agent.provider == "claude-cli":
+        # Claude CLI produces one bounded structured object. Keep Hermes's
+        # interrupt worker and cancellation path, but skip HTTP streaming.
+        return agent._interruptible_api_call(api_kwargs)
 
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.

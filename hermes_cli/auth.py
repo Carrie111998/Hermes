@@ -189,6 +189,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
+    "claude-cli": ProviderConfig(
+        id="claude-cli",
+        name="Claude Code (subscription)",
+        auth_type="external_process",
+        inference_base_url="claude-cli://local",
+    ),
     "openai-api": ProviderConfig(
         id="openai-api",
         name="OpenAI API",
@@ -6406,6 +6412,40 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def get_claude_cli_provider_status() -> Dict[str, Any]:
+    """Verify the official Claude executable owns a first-party login."""
+
+    from agent.claude_cli_process import ClaudeCLIError, ClaudeCLIProcessRunner
+
+    command = (
+        os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+        or os.getenv("CLAUDE_CLI_PATH", "").strip()
+        or "claude"
+    )
+    runner = ClaudeCLIProcessRunner(executable=command)
+    try:
+        status = runner.auth_status()
+        version = runner.version()
+    except ClaudeCLIError as exc:
+        return {
+            "configured": False,
+            "logged_in": False,
+            "provider": "claude-cli",
+            "name": "Claude Code (subscription)",
+            "error": str(exc),
+        }
+    return {
+        "configured": True,
+        "logged_in": True,
+        "provider": "claude-cli",
+        "name": "Claude Code (subscription)",
+        "auth_method": status.get("authMethod", ""),
+        "api_provider": status.get("apiProvider", ""),
+        "subscription_type": status.get("subscriptionType", ""),
+        "version": version,
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = (provider_id or get_active_provider() or "").strip().lower()
@@ -6417,6 +6457,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_nous_auth_status()
     if target == "openai-codex":
         return get_codex_auth_status()
+    if target == "claude-cli":
+        return get_claude_cli_provider_status()
     if target == "xai-oauth":
         return get_xai_oauth_auth_status()
     if target == "qwen-oauth":
@@ -6601,6 +6643,29 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+
+    if provider_id == "claude-cli":
+        command = (
+            os.getenv("HERMES_CLAUDE_CLI_COMMAND", "").strip()
+            or os.getenv("CLAUDE_CLI_PATH", "").strip()
+            or "claude"
+        )
+        resolved_command = shutil.which(command) if command else None
+        if not resolved_command:
+            raise AuthError(
+                f"Could not find the Claude CLI command '{command}'. "
+                "Install Claude Code or set HERMES_CLAUDE_CLI_COMMAND/CLAUDE_CLI_PATH.",
+                provider=provider_id,
+                code="missing_claude_cli",
+            )
+        return {
+            "provider": provider_id,
+            "api_key": "claude-cli-process",
+            "base_url": "claude-cli://local",
+            "command": resolved_command,
+            "args": [],
+            "source": "process",
+        }
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:

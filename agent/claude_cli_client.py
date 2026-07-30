@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
 import json
 import os
 import time
@@ -254,3 +255,31 @@ class ClaudeCLIClient:
             model=requested_model,
             model_reported=result.model_reported,
         )
+
+
+class _AsyncClaudeCLICompletions:
+    def __init__(self, owner: "AsyncClaudeCLIClient"):
+        self._owner = owner
+
+    async def create(self, **request_kwargs):
+        return await asyncio.to_thread(
+            self._owner._sync_client.chat.completions.create,
+            **request_kwargs,
+        )
+
+
+class AsyncClaudeCLIClient:
+    """Thread-backed async view over a cancellation-aware Claude CLI client."""
+
+    def __init__(self, sync_client: ClaudeCLIClient):
+        self._sync_client = sync_client
+        self._real_client = sync_client
+        self.api_key = sync_client.api_key
+        self.base_url = sync_client.base_url
+        self.chat = SimpleNamespace(completions=_AsyncClaudeCLICompletions(self))
+
+    async def close(self) -> None:
+        await asyncio.to_thread(self._sync_client.close)
+
+    def is_closed(self) -> bool:
+        return self._sync_client.is_closed()

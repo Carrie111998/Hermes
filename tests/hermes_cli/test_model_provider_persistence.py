@@ -314,6 +314,39 @@ class TestProviderPersistsAfterModelSave:
         assert model.get("default") == "gpt-5.4"
         assert model.get("api_mode") == "chat_completions"
 
+    def test_claude_cli_provider_saved_when_selected(self, config_home):
+        from hermes_cli.config import load_config
+        from hermes_cli.model_setup_flows import _model_flow_claude_cli
+
+        with patch(
+            "hermes_cli.auth.get_claude_cli_provider_status",
+            return_value={
+                "configured": True,
+                "logged_in": True,
+                "subscription_type": "max",
+                "version": "2.1.220 (Claude Code)",
+            },
+        ), patch(
+            "hermes_cli.auth._prompt_model_selection",
+            return_value="opus",
+        ), patch(
+            "hermes_cli.auth._save_model_choice",
+        ), patch(
+            "hermes_cli.auth.deactivate_provider",
+        ):
+            _model_flow_claude_cli(load_config(), "sonnet")
+
+        import yaml
+
+        config = yaml.safe_load((config_home / "config.yaml").read_text()) or {}
+        model = config.get("model")
+        assert model == {
+            "provider": "claude-cli",
+            "default": "opus",
+            "base_url": "claude-cli://local",
+            "api_mode": "chat_completions",
+        }
+
     def test_opencode_go_models_are_selectable_and_persist_normalized(self, config_home, monkeypatch):
         from hermes_cli.main import _model_flow_api_key_provider
         from hermes_cli.config import load_config

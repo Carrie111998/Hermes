@@ -1851,6 +1851,19 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
+    if provider == "claude-cli":
+        creds = resolve_external_process_provider_credentials(provider)
+        return {
+            "provider": "claude-cli",
+            "api_mode": "chat_completions",
+            "base_url": creds.get("base_url", "claude-cli://local"),
+            "api_key": creds.get("api_key", "claude-cli-process"),
+            "command": creds.get("command", "claude"),
+            "args": list(creds.get("args") or []),
+            "source": creds.get("source", "process"),
+            "requested_provider": requested_provider,
+        }
+
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
         return {

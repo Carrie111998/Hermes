@@ -1925,6 +1925,58 @@ def _model_flow_copilot_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+
+def _model_flow_claude_cli(config, current_model=""):
+    """Select a Claude subscription alias after verifying Claude Code login."""
+
+    from hermes_cli.auth import (
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_claude_cli_provider_status,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import _PROVIDER_MODELS
+
+    del config
+    status = get_claude_cli_provider_status()
+    if not status.get("logged_in"):
+        print(
+            "  Claude Code is not available with a first-party login. "
+            "Run `claude auth login`, then try again."
+        )
+        return
+
+    print(
+        "  Hermes will use the official Claude Code executable and your "
+        f"{status.get('subscription_type') or 'Claude'} subscription."
+    )
+    print(f"  Claude Code version: {status.get('version') or 'unknown'}")
+    model_list = list(_PROVIDER_MODELS["claude-cli"])
+    selected = _prompt_model_selection(
+        model_list,
+        current_model=current_model if current_model in model_list else "opus",
+        confirm_provider="claude-cli",
+        confirm_base_url="claude-cli://local",
+        confirm_api_key="claude-cli-process",
+    )
+    if not selected:
+        print("No change.")
+        return
+
+    _save_model_choice(selected)
+    cfg = load_config()
+    cfg["model"] = {
+        "provider": "claude-cli",
+        "default": selected,
+        "base_url": "claude-cli://local",
+        "api_mode": "chat_completions",
+    }
+    save_config(cfg)
+    deactivate_provider()
+    print(f"Default model set to: {selected} (via Claude Code subscription)")
+
+
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.
 
