@@ -4748,14 +4748,21 @@ class _WorktreeWriterScan:
 
 
 def _worktree_writer_pids(worktree: Path) -> _WorktreeWriterScan:
-    """Inspect process writers; never report an empty result without proof."""
+    """Inspect process writers; never report an empty result without proof.
+
+    This is intentionally fail-closed. A process that cannot be completely
+    inspected is not silently treated as irrelevant: its cwd, descriptors,
+    and mappings are all part of the proof that the worktree is quiescent.
+    """
     if sys.platform != "linux":
         return _WorktreeWriterScan((), False, True, (f"unsupported platform: {sys.platform}",))
     proc = Path("/proc")
     try:
         entries = list(proc.iterdir())
-    except OSError as exc:
-        return _WorktreeWriterScan((), False, False, (f"cannot enumerate /proc: {exc}",))
+    except FileNotFoundError:
+        return _WorktreeWriterScan((), False, False, ("proc unavailable",))
+    except OSError:
+        return _WorktreeWriterScan((), False, False, ("proc enumeration denied",))
     target = worktree.resolve()
     found: set[int] = set()
     errors: list[str] = []
@@ -4773,14 +4780,21 @@ def _worktree_writer_pids(worktree: Path) -> _WorktreeWriterScan:
                 if resolved != target and target not in resolved.parents:
                     continue
                 flags_line = next(
-                    (line for line in (base / "fdinfo" / fd.name).read_text().splitlines()
-                     if line.startswith("flags:")), ""
+                    (line for line in (base / "fdinfo" / fd.name).read_text(
+                        encoding="utf-8", errors="replace"
+                    ).splitlines() if line.startswith("flags:")), ""
                 )
-                if flags_line and int(flags_line.split()[1], 8) & (os.O_WRONLY | os.O_RDWR):
+                if not flags_line:
+                    raise OSError("fd access mode unavailable")
+                if int(flags_line.split()[1], 8) & (os.O_WRONLY | os.O_RDWR):
                     found.add(pid)
-            for line in (base / "maps").read_text().splitlines():
+            for line in (base / "maps").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
                 fields = line.split()
-                if len(fields) < 6 or "w" not in fields[1] or "s" not in fields[1]:
+                # Shared writable mappings can modify the worktree. Private
+                # writable mappings are copy-on-write and are not writers.
+                if len(fields) < 6 or fields[1] != "rw-s":
                     continue
                 mapped_name = fields[5]
                 if not mapped_name.startswith("/"):
@@ -4790,16 +4804,13 @@ def _worktree_writer_pids(worktree: Path) -> _WorktreeWriterScan:
                     found.add(pid)
         except FileNotFoundError:
             continue
-        except PermissionError as exc:
-            # hidepid/procfs policy can hide unrelated processes. Keep the
-            # diagnostic in the scan result; the proc mount remains usable.
-            errors.append(f"pid {pid}: {exc}")
-        except (OSError, ValueError, RuntimeError) as exc:
-            errors.append(f"pid {pid}: {exc}")
-    # Per-process permission diagnostics are retained, but the proc mount is
-    # still usable; only inability to enumerate or inspect the target process
-    # itself makes the scan incomplete.
-    return _WorktreeWriterScan(tuple(sorted(found)), True, False, tuple(errors))
+        except PermissionError:
+            errors.append(f"pid {pid}: permission denied")
+        except (OSError, ValueError, RuntimeError):
+            errors.append(f"pid {pid}: inspection failed")
+    return _WorktreeWriterScan(
+        tuple(sorted(found)), not errors, False, tuple(errors[:32])
+    )
 
 
 def _git_worktree_snapshot(path: Path) -> tuple[str, str, str]:
@@ -4861,9 +4872,11 @@ def submit_frozen_head_for_review(
     evidence = dict(evidence)
     if evidence.get("head_sha") != head_sha:
         reject("evidence head_sha must exactly match head_sha")
-    submitted_tree_sha = evidence.get("tree_sha", evidence.get("tree_hash"))
-    if submitted_tree_sha is not None and not isinstance(submitted_tree_sha, str):
-        reject("evidence tree_sha must be a string when supplied")
+    submitted_tree_sha = evidence.get("tree_sha")
+    if not isinstance(submitted_tree_sha, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", submitted_tree_sha
+    ):
+        reject("evidence tree_sha must be a full 40-character tree id")
     if evidence.get("worktree_path"):
         try:
             evidence_path = Path(evidence["worktree_path"]).expanduser().resolve(strict=True)
@@ -4887,16 +4900,27 @@ def submit_frozen_head_for_review(
         reject(f"unable to verify git worktree: {exc}")
     if verified_head.lower() != head_sha.lower():
         reject("worktree HEAD does not match exact head_sha")
-    if submitted_tree_sha is not None and tree_sha.lower() != submitted_tree_sha.lower():
+    if tree_sha.lower() != submitted_tree_sha.lower():
         reject("worktree tree_sha does not match exact tree_sha")
     if dirty:
         reject("worktree is dirty")
 
     if row is None:
         reject(f"task {task_id} not found")
-    if row["status"] in {"triage", "running", "archived"}:
+    if row["status"] in {"triage", "running", "review", "archived"}:
         reject(f"frozen head cannot be submitted from status {row['status']!r}")
-    if row["status"] not in {"scheduled", "ready", "todo", "done"}:
+    if row["status"] == "blocked":
+        legacy = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        try:
+            blocked_payload = json.loads(legacy["payload"] or "{}") if legacy else {}
+        except (TypeError, ValueError):
+            blocked_payload = {}
+        if not str(blocked_payload.get("reason") or "").startswith("review-required:"):
+            reject("frozen head cannot be submitted from unrelated blocked state")
+    if row["status"] not in {"scheduled", "ready", "todo", "blocked", "done"}:
         reject(f"frozen head cannot be submitted from status {row['status']!r}")
     if not row["workspace_path"]:
         reject("task has no canonical workspace")
@@ -4911,10 +4935,10 @@ def submit_frozen_head_for_review(
         reject("task has a live claim or current writer")
     first_snapshot = (verified_head.lower(), tree_sha.lower(), dirty)
     writer_scan = _worktree_writer_pids(submitted_path)
-    if not writer_scan.complete or writer_scan.unsupported:
-        reject(f"OS writer inspection incomplete or unsupported: {list(writer_scan.errors)}")
     if writer_scan.writers:
         reject(f"worktree has active OS writers: {list(writer_scan.writers)}")
+    if not writer_scan.complete or writer_scan.unsupported:
+        reject(f"OS writer inspection incomplete or unsupported: {list(writer_scan.errors)}")
     try:
         second_head, second_tree_sha, second_dirty = _git_worktree_snapshot(submitted_path)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -4939,8 +4963,12 @@ def submit_frozen_head_for_review(
         reject("completed implementation evidence requires changed_files and tests_run")
     if run_metadata.get("head_sha") and str(run_metadata["head_sha"]).lower() != head_sha.lower():
         reject("completed implementation evidence head_sha does not match exact head_sha")
-    run_tree_sha = run_metadata.get("tree_sha", run_metadata.get("tree_hash"))
-    if run_tree_sha is not None and str(run_tree_sha).lower() != second_tree_sha.lower():
+    run_tree_sha = run_metadata.get("tree_sha")
+    if not isinstance(run_tree_sha, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{40}", run_tree_sha
+    ):
+        reject("completed implementation evidence requires a full 40-character tree_sha")
+    if run_tree_sha.lower() != second_tree_sha.lower():
         reject("completed implementation evidence tree_sha does not match exact tree_sha")
 
     original_identity = {
@@ -4951,6 +4979,15 @@ def submit_frozen_head_for_review(
 
     try:
         with write_txn(conn):
+            latest_run = conn.execute(
+                "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+                "AND outcome = 'completed' AND ended_at IS NOT NULL "
+                "ORDER BY ended_at DESC, id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            if latest_run is None or int(latest_run["id"]) != int(run["id"]):
+                raise FrozenHeadReviewError("completed implementation evidence changed while submitting")
+            if latest_run["metadata"] != run["metadata"]:
+                raise FrozenHeadReviewError("completed implementation metadata changed while submitting")
             cur = conn.execute(
                 "UPDATE tasks SET status = 'review' WHERE id = ? AND status = ? "
                 "AND workspace_path IS ? AND current_run_id IS ? "

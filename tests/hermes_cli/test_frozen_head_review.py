@@ -13,11 +13,19 @@ from hermes_cli import kanban_db as kb
 
 
 @pytest.fixture
-def kanban_home(tmp_path, monkeypatch):
+def kanban_home(tmp_path, monkeypatch, request):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     kb.init_db()
+    # The hermetic test runner may expose host processes through a restricted
+    # /proc mount. Scanner behavior is exercised by the real helper test below;
+    # admission tests isolate that unrelated host state.
+    if "os_writer_freeze" not in request.node.name:
+        monkeypatch.setattr(
+            kb, "_worktree_writer_pids",
+            lambda _path: kb._WorktreeWriterScan((), True, False, ()),
+        )
     return home
 
 
@@ -48,14 +56,15 @@ def make_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, git_head(repo)
 
 
-def complete_with_evidence(conn, task_id: str) -> None:
+def complete_with_evidence(conn, task_id: str, repo: Path) -> None:
     assert kb.complete_task(
         conn, task_id, summary="implementation complete",
-        metadata={"changed_files": ["implemented.txt"], "tests_run": 3},
+        metadata={"changed_files": ["implemented.txt"], "tests_run": 3,
+                  "head_sha": git_head(repo), "tree_sha": git_tree(repo)},
     )
 
 
-def evidence(head: str, repo: Path, *, include_tree: bool = False) -> dict:
+def evidence(head: str, repo: Path, *, include_tree: bool = True) -> dict:
     result = {
         "head_sha": head,
         "worktree_path": str(repo),
@@ -72,7 +81,7 @@ def test_db_accepts_completed_clean_exact_head_without_claim(kanban_home, tmp_pa
     repo, head = make_repo(tmp_path)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="frozen", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, task_id)
+        complete_with_evidence(conn, task_id, repo)
         assert kb.submit_frozen_head_for_review(
             conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
         )
@@ -96,7 +105,8 @@ def test_scheduled_ready_submit_directly_without_transition_dance(kanban_home, t
         kb._synthesize_ended_run(
             conn, task_id, outcome="completed",
             summary="implementation complete",
-            metadata={"changed_files": ["implemented.txt"], "tests_run": 3},
+            metadata={"changed_files": ["implemented.txt"], "tests_run": 3,
+                       "head_sha": head, "tree_sha": git_tree(repo)},
         )
         assert kb.submit_frozen_head_for_review(
             conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
@@ -109,13 +119,14 @@ def test_every_accepted_dormant_state_is_explicitly_supported(kanban_home, tmp_p
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title=f"accepted {status}", workspace_kind="dir", workspace_path=str(repo))
         if status == "done":
-            complete_with_evidence(conn, task_id)
+            complete_with_evidence(conn, task_id, repo)
         else:
             conn.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
             conn.commit()
             kb._synthesize_ended_run(
                 conn, task_id, outcome="completed", summary="implementation complete",
-                metadata={"changed_files": ["implemented.txt"], "tests_run": 3},
+                metadata={"changed_files": ["implemented.txt"], "tests_run": 3,
+                       "head_sha": head, "tree_sha": git_tree(repo)},
             )
         assert kb.submit_frozen_head_for_review(
             conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
@@ -135,6 +146,37 @@ def test_non_dormant_states_are_rejected(kanban_home, tmp_path, status):
             )
 
 
+def test_legacy_review_required_blocked_state_is_accepted(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="blocked frozen head", workspace_kind="dir",
+                                 workspace_path=str(repo), assignee="programmer")
+        kb.claim_task(conn, task_id, claimer="programmer")
+        run_id = kb.get_task(conn, task_id).current_run_id
+        assert kb.block_task(conn, task_id, reason="review-required: inspect", expected_run_id=run_id)
+        kb._synthesize_ended_run(
+            conn, task_id, outcome="completed", summary="implementation complete",
+            metadata={"changed_files": ["implemented.txt"], "tests_run": 3,
+                      "head_sha": head, "tree_sha": git_tree(repo)},
+        )
+        assert kb.submit_frozen_head_for_review(
+            conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
+        )
+
+
+def test_review_state_is_rejected(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="already review", workspace_kind="dir",
+                                 workspace_path=str(repo))
+        conn.execute("UPDATE tasks SET status='review' WHERE id=?", (task_id,))
+        conn.commit()
+        with pytest.raises(kb.FrozenHeadReviewError, match="status 'review'"):
+            kb.submit_frozen_head_for_review(
+                conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
+            )
+
+
 @pytest.mark.parametrize(
     "mutator, expected",
     [
@@ -147,7 +189,7 @@ def test_db_rejects_malformed_or_mismatched_evidence(kanban_home, tmp_path, muta
     repo, head = make_repo(tmp_path)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="reject", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, task_id)
+        complete_with_evidence(conn, task_id, repo)
         with pytest.raises(kb.FrozenHeadReviewError, match=expected):
             kb.submit_frozen_head_for_review(
                 conn, task_id, head_sha=head, worktree_path=str(repo), evidence=mutator(evidence(head, repo), repo)
@@ -160,7 +202,7 @@ def test_db_rejects_missing_or_malformed_head_and_unrelated_state(kanban_home, t
     repo, head = make_repo(tmp_path)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="head validation", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, task_id)
+        complete_with_evidence(conn, task_id, repo)
         valid = evidence(head, repo)
         with pytest.raises(kb.FrozenHeadReviewError, match="full 40-character"):
             kb.submit_frozen_head_for_review(conn, task_id, head_sha="", worktree_path=str(repo), evidence=valid)
@@ -176,14 +218,14 @@ def test_db_rejects_dirty_head_live_claim_and_missing_implementation_evidence(ka
     repo, head = make_repo(tmp_path)
     with kb.connect_closing() as conn:
         dirty_id = kb.create_task(conn, title="dirty", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, dirty_id)
+        complete_with_evidence(conn, dirty_id, repo)
         (repo / "dirty.txt").write_text("uncommitted\n")
         with pytest.raises(kb.FrozenHeadReviewError, match="dirty"):
             kb.submit_frozen_head_for_review(conn, dirty_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo))
         (repo / "dirty.txt").unlink()
 
         live_id = kb.create_task(conn, title="live", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, live_id)
+        complete_with_evidence(conn, live_id, repo)
         conn.execute("UPDATE tasks SET claim_lock='live', worker_pid=1234 WHERE id=?", (live_id,))
         conn.commit()
         with pytest.raises(kb.FrozenHeadReviewError, match="live claim"):
@@ -199,7 +241,7 @@ def test_cli_submit_review_uses_same_fail_closed_route(kanban_home, tmp_path, ca
     repo, head = make_repo(tmp_path)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="cli", workspace_kind="dir", workspace_path=str(repo))
-        complete_with_evidence(conn, task_id)
+        complete_with_evidence(conn, task_id, repo)
     parser = __import__("argparse").ArgumentParser()
     sub = parser.add_subparsers(dest="command")
     kc.build_parser(sub)
@@ -234,7 +276,7 @@ def test_os_writer_freeze_rejects_helper_with_cwd_and_writable_fd(kanban_home, t
         time.sleep(0.1)
         with kb.connect_closing() as conn:
             task_id = kb.create_task(conn, title="writer", workspace_kind="dir", workspace_path=str(repo))
-            complete_with_evidence(conn, task_id)
+            complete_with_evidence(conn, task_id, repo)
             with pytest.raises(kb.FrozenHeadReviewError, match="active OS writers"):
                 kb.submit_frozen_head_for_review(
                     conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
