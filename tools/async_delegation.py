@@ -43,7 +43,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -385,7 +385,7 @@ def count_orphaned_pending_completions() -> int:
         return 0
     try:
         uri = f"file:{path.as_posix()}?mode=ro"
-        with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as conn:
             rows = conn.execute(
                 """SELECT owner_pid, owner_started_at
                    FROM async_delegations
