@@ -77,7 +77,9 @@ class PlatformBackend(Mem0Backend):
         if run_id is not None:
             try:
                 return self._client.add(messages, run_id=run_id, **kwargs)
-            except TypeError:
+            except TypeError as exc:
+                if "run_id" not in str(exc):
+                    raise
                 # Older mem0ai versions don't support run_id — fold it into metadata.
                 merged = {**(kwargs.get("metadata") or {}), "run_id": run_id}
                 kwargs["metadata"] = merged
