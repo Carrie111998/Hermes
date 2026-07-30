@@ -293,6 +293,7 @@ export interface OverlayState {
   widget: ActiveWidget | null
   journey: boolean
   modelPicker: boolean | { refresh?: boolean }
+  modelPickerSessionOnly: boolean
   pager: null | PagerState
   petPicker: boolean
   pluginsHub: boolean
