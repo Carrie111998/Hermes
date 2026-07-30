@@ -58,7 +58,7 @@ terminal.resize         clipboard.paste         image.attach
 
 ### Events streamed back
 
-`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Expiry events carry the original `{ request_id }`; external hosts should clear only the matching pending prompt.
+`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Approval events carry a stable `request_id`; send it back with `approval.respond` so parallel approvals cannot be answered out of order. Older gateways may omit the field, in which case omitting it from the response retains the legacy FIFO behavior. Expiry events carry the original `{ request_id }`; external hosts should clear only the matching pending prompt.
 
 ### Pi-style RPC mapping
 
@@ -99,6 +99,13 @@ GET  /v1/models                  Lists hermes-agent
 GET  /api/model/options          Provider-aware picker inventory
 GET  /health, /health/detailed
 ```
+
+An `approval.request` run event includes a stable `request_id` and a fixed,
+server-owned `preview`. Send that ID back to
+`POST /v1/runs/{id}/approval` with the selected `choice`. Clients can
+feature-detect this contract through
+`features.run_approval_request_binding` and
+`features.run_approval_structured_preview`.
 
 Setup, headers (`X-Hermes-Session-Id`, `X-Hermes-Session-Key`), and frontend wiring: [API Server](../user-guide/features/api-server).
 

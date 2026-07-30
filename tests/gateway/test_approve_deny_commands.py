@@ -156,6 +156,64 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_specific_request_id_leaves_older_entry_pending(self):
+        """A displayed approval must resolve its own queue entry, not FIFO."""
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            pending_approval_count,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-targeted"
+        first = _ApprovalEntry({"command": "first", "request_id": "req-first"})
+        second = _ApprovalEntry({"command": "second", "request_id": "req-second"})
+        _gateway_queues[session_key] = [first, second]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "deny",
+            request_id="req-second",
+        )
+
+        assert count == 1
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert second.result == "deny"
+        assert pending_approval_count(session_key) == 1
+
+    def test_unknown_request_id_fails_closed(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            resolve_gateway_approval,
+        )
+
+        session_key = "test-stale-target"
+        pending = _ApprovalEntry({"command": "pending", "request_id": "req-live"})
+        _gateway_queues[session_key] = [pending]
+
+        count = resolve_gateway_approval(
+            session_key,
+            "once",
+            request_id="req-stale",
+        )
+
+        assert count == 0
+        assert not pending.event.is_set()
+        assert _gateway_queues[session_key] == [pending]
+
+    def test_invalid_supplied_request_id_is_replaced_with_transport_safe_id(self):
+        from tools.approval import _ApprovalEntry, is_valid_approval_request_id
+
+        entry = _ApprovalEntry(
+            {"command": "pending", "request_id": "bad:id with spaces"}
+        )
+
+        assert entry.request_id != "bad:id with spaces"
+        assert entry.data["request_id"] == entry.request_id
+        assert is_valid_approval_request_id(entry.request_id)
+
 
 # ------------------------------------------------------------------
 # /approve command
@@ -375,7 +433,7 @@ class TestBlockingApprovalE2E:
         from tools.approval import (
             register_gateway_notify, unregister_gateway_notify,
             resolve_gateway_approval, check_all_command_guards,
-            _gateway_queues,
+            _gateway_queues, is_valid_approval_request_id,
         )
 
         session_key = "e2e-parallel"
@@ -415,6 +473,9 @@ class TestBlockingApprovalE2E:
 
         assert len(notified) == 3
         assert len(_gateway_queues.get(session_key, [])) == 3
+        request_ids = [item.get("request_id") for item in notified]
+        assert all(is_valid_approval_request_id(value) for value in request_ids)
+        assert len(set(request_ids)) == 3
 
         # Approve all at once
         count = resolve_gateway_approval(session_key, "session", resolve_all=True)

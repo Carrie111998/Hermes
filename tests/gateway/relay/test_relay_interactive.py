@@ -8,8 +8,8 @@ Covers:
     triggers run.py's text fallback);
   - the pending-prompt registry: mint → consume-once → expiry;
   - _consume_prompt_response routes answers to the approval / slash-confirm /
-    clarify resolvers and CONSUMES the event; unknown/expired ids fall
-    through to normal dispatch;
+    clarify resolvers and CONSUMES the event; unknown/expired structured ids
+    fail closed without falling through to typed FIFO commands;
   - the Discord type-3 hp1 decode (structured prompt_response replacing the
     bare-custom_id stub; foreign custom_ids keep the legacy text shape);
   - on_processing_start/complete drive react ops (👀 → ✅/❌), op-gated and
@@ -87,7 +87,11 @@ def _event(
 async def test_exec_approval_renders_full_option_set():
     adapter, stub = _adapter()
     result = await adapter.send_exec_approval(
-        "c1", "rm -rf /tmp/x", "sess:1", description="deletes files"
+        "c1",
+        "rm -rf /tmp/x",
+        "sess:1",
+        description="deletes files",
+        metadata={"approval_request_id": "req-relay"},
     )
     assert result.success is True
     assert result.message_id == "pm1"
@@ -103,6 +107,103 @@ async def test_exec_approval_renders_full_option_set():
     state = adapter._pending_prompts[action["prompt_id"]]
     assert state["kind"] == "exec_approval"
     assert state["session_key"] == "sess:1"
+    assert state["request_id"] == "req-relay"
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_response_resolves_the_displayed_pending_request():
+    """Relay must not let a later prompt resolve the oldest queue entry."""
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    adapter, stub = _adapter()
+    session_key = "sess:relay-targeted"
+    first = _ApprovalEntry({"command": "first", "request_id": "req-first"})
+    second = _ApprovalEntry({"command": "second", "request_id": "req-second"})
+    _gateway_queues[session_key] = [first, second]
+
+    try:
+        result = await adapter.send_exec_approval(
+            "c1",
+            "second",
+            session_key,
+            metadata={"approval_request_id": "req-second"},
+        )
+        assert result.success is True
+        prompt_id = stub.sent[-1]["prompt_id"]
+
+        consumed = await adapter._consume_prompt_response(
+            _event({"prompt_id": prompt_id, "option_id": "deny"})
+        )
+
+        assert consumed is True
+        assert not first.event.is_set()
+        assert second.event.is_set()
+        assert second.result == "deny"
+        assert _gateway_queues[session_key] == [first]
+    finally:
+        _gateway_queues.pop(session_key, None)
+
+
+@pytest.mark.asyncio
+async def test_exec_approval_stale_request_does_not_fall_back_to_fifo():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    adapter, stub = _adapter()
+    session_key = "sess:relay-stale"
+    pending = _ApprovalEntry({"command": "live", "request_id": "req-live"})
+    _gateway_queues[session_key] = [pending]
+
+    try:
+        result = await adapter.send_exec_approval(
+            "c1",
+            "stale",
+            session_key,
+            metadata={"approval_request_id": "req-stale"},
+        )
+        prompt_id = stub.sent[-1]["prompt_id"]
+
+        consumed = await adapter._consume_prompt_response(
+            _event({"prompt_id": prompt_id, "option_id": "once"})
+        )
+
+        assert consumed is True
+        assert not pending.event.is_set()
+        assert _gateway_queues[session_key] == [pending]
+    finally:
+        _gateway_queues.pop(session_key, None)
+
+
+@pytest.mark.asyncio
+async def test_replayed_prompt_response_is_consumed_without_resolving_sibling():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    adapter, stub = _adapter()
+    session_key = "sess:relay-replay"
+    target = _ApprovalEntry({"command": "target", "request_id": "req-target"})
+    sibling = _ApprovalEntry({"command": "sibling", "request_id": "req-sibling"})
+    _gateway_queues[session_key] = [target, sibling]
+
+    try:
+        await adapter.send_exec_approval(
+            "c1",
+            "target",
+            session_key,
+            metadata={"approval_request_id": "req-target"},
+        )
+        prompt_id = stub.sent[-1]["prompt_id"]
+        event = _event({"prompt_id": prompt_id, "option_id": "deny"})
+
+        assert await adapter._consume_prompt_response(event) is True
+        assert target.event.is_set()
+        assert not sibling.event.is_set()
+
+        # The consumed prompt ID is now stale. Its command-shaped event text
+        # must not fall through to typed /deny and resolve the sibling.
+        assert await adapter._consume_prompt_response(event) is True
+        assert not sibling.event.is_set()
+        assert _gateway_queues[session_key] == [sibling]
+    finally:
+        _gateway_queues.pop(session_key, None)
 
 
 @pytest.mark.asyncio
@@ -255,5 +356,3 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
-

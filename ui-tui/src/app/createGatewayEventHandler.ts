@@ -1177,6 +1177,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             choices: ev.payload.choices,
             command: String(ev.payload.command ?? ''),
             description,
+            requestId: ev.payload.request_id,
             smartDenied: ev.payload.smart_denied === true
           }
         })

@@ -867,18 +867,31 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     try:
-        from tools.approval import resolve_gateway_approval
-
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+        from tools.approval import (
+            is_valid_approval_request_id,
+            resolve_gateway_approval,
         )
+
+        request_id = params.get("request_id") if "request_id" in params else None
+        resolve_all = bool(params.get("all", False))
+        if request_id is not None and not is_valid_approval_request_id(request_id):
+            return _err(rid, 4004, "invalid approval request_id")
+        if request_id is not None and resolve_all:
+            return _err(
+                rid,
+                4004,
+                "exact approval request binding cannot be combined with all",
+            )
+
+        resolved = resolve_gateway_approval(
+            session["session_key"],
+            params.get("choice", "deny"),
+            resolve_all=resolve_all,
+            request_id=request_id,
+        )
+        if request_id is not None and resolved == 0:
+            return _err(rid, 4009, "approval request is no longer pending")
+        return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
 

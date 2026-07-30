@@ -30,11 +30,17 @@ afterEach(() => {
 
 describe('approval prompt store', () => {
   it('holds the active session-keyed approval request', () => {
-    setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'recursive delete', sessionId: 's1' })
+    setApprovalRequest({
+      command: 'rm -rf /tmp/x',
+      description: 'recursive delete',
+      requestId: 'approval-one',
+      sessionId: 's1'
+    })
 
     expect($approvalRequest.get()).toEqual({
       command: 'rm -rf /tmp/x',
       description: 'recursive delete',
+      requestId: 'approval-one',
       sessionId: 's1'
     })
   })

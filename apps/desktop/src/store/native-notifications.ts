@@ -143,6 +143,7 @@ export interface NativeNotificationInput {
   kind: NativeNotificationKind
   title: string
   body?: string
+  requestId?: string
   sessionId?: null | string
   /**
    * Not tied to a chat session (e.g. pet generation). Fires whenever the user
@@ -169,7 +170,12 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}`, Date.now())) {
+  if (
+    throttled(
+      `${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}:${input.requestId ?? ''}`,
+      Date.now()
+    )
+  ) {
     return
   }
 
@@ -177,15 +183,21 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     actions: input.actions,
     body: input.body,
     kind: input.kind,
+    requestId: input.requestId,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     title: input.title
   })
 }
 
-// Resolve a pending approval from a notification button, mirroring the in-app
-// Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// Resolve the exact approval represented by this notification. The request ID
+// is captured when the notification is created; looking up the current
+// per-session prompt here could authorize a newer command than the one shown.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  requestId?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -199,8 +211,12 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    await gateway.request('approval.respond', {
+      choice,
+      ...(requestId ? { request_id: requestId } : {}),
+      session_id: sessionId ?? undefined
+    })
+    clearApprovalRequest(sessionId, requestId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

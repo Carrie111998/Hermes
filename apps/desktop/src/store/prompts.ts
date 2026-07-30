@@ -67,15 +67,16 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend (one in-flight approval per session,
-// resolved via approval.respond {choice, session_id}). It carries no request_id,
-// unlike sudo/secret which are _block()-style request/response.
+// Approval prompts remain parked per session in the UI, while requestId binds
+// each response to the exact backend queue entry that produced the prompt.
+// It is optional so newer clients remain compatible with older gateways.
 export interface ApprovalRequest extends KeyedPrompt {
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
   description: string
+  requestId?: string
   smartDenied?: boolean
 }
 

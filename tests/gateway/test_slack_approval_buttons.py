@@ -95,6 +95,7 @@ class TestSlackExecApproval:
             command="rm -rf /important",
             session_key="agent:main:slack:group:C1:1111",
             description="dangerous deletion",
+            metadata={"approval_request_id": "approval-slack"},
         )
 
         assert result.success is True
@@ -117,9 +118,12 @@ class TestSlackExecApproval:
         assert "hermes_approve_session" in action_ids
         assert "hermes_approve_always" in action_ids
         assert "hermes_deny" in action_ids
-        # Each button carries the session key as value
+        # Each button carries the exact approval request ID, not only the session.
         for e in elements:
-            assert e["value"] == "agent:main:slack:group:C1:1111"
+            assert e["value"] == "approval-slack"
+        assert adapter._approval_request_state["approval-slack"] == (
+            "agent:main:slack:group:C1:1111"
+        )
 
     @pytest.mark.asyncio
     async def test_smart_deny_owner_override_hides_persistent_buttons(self):
@@ -137,6 +141,7 @@ class TestSlackExecApproval:
         assert [element["action_id"] for element in elements] == [
             "hermes_approve_once", "hermes_deny",
         ]
+        assert {element["value"] for element in elements} == {"s"}
         assert "one operation" in kwargs["blocks"][0]["text"]["text"].lower()
 
 
@@ -178,6 +183,31 @@ class TestSlackApprovalAction:
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]
         assert len(section_text) <= 3000
+
+    @pytest.mark.asyncio
+    async def test_resolves_the_exact_approval_request(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1.2"] = False
+        adapter._approval_request_state["approval-second"] = "session-key"
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1.2", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U_ALICE"},
+        }
+        action = {"action_id": "hermes_approve_once", "value": "approval-second"}
+        adapter._team_clients["T1"].chat_update = AsyncMock()
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once_with(
+            "session-key",
+            "once",
+            request_id="approval-second",
+        )
 
     @pytest.mark.asyncio
     async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
@@ -840,4 +870,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

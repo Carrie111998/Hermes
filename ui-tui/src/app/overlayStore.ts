@@ -70,6 +70,23 @@ export const getOverlayState = () => $overlayState.get()
 export const patchOverlayState = (next: Partial<OverlayState> | ((state: OverlayState) => OverlayState)) =>
   $overlayState.set(typeof next === 'function' ? next($overlayState.get()) : { ...$overlayState.get(), ...next })
 
+/** Clear only the approval that produced a completed response. */
+export const clearApprovalIfCurrent = (requestId?: string): boolean => {
+  let cleared = false
+
+  patchOverlayState(state => {
+    if (!state.approval || state.approval.requestId !== requestId) {
+      return state
+    }
+
+    cleared = true
+
+    return { ...state, approval: null }
+  })
+
+  return cleared
+}
+
 /** Full reset — used by session/turn teardown and tests. */
 export const resetOverlayState = () => $overlayState.set(buildOverlayState())
 

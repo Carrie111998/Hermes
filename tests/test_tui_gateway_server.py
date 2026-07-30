@@ -14,6 +14,7 @@ import pytest
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
+from tools import approval as approval_mod
 from tui_gateway import server
 
 
@@ -9616,6 +9617,100 @@ def test_respond_unpacks_sid_tuple_correctly():
     finally:
         server._pending.pop("rid-x", None)
         server._answers.pop("rid-x", None)
+
+
+def test_approval_respond_targets_exact_request_and_preserves_fifo_fallback():
+    """TUI/Desktop responses must not approve a sibling parallel request."""
+    sid = "approval-rpc"
+    session_key = "approval-rpc-key"
+    first = approval_mod._ApprovalEntry(
+        {
+            "command": "rm -rf /tmp/first",
+            "description": "first approval",
+            "request_id": "approval-first",
+        }
+    )
+    second = approval_mod._ApprovalEntry(
+        {
+            "command": "rm -rf /tmp/second",
+            "description": "second approval",
+            "request_id": "approval-second",
+        }
+    )
+    server._sessions[sid] = _session(session_key=session_key)
+    with approval_mod._lock:
+        approval_mod._gateway_queues[session_key] = [first, second]
+
+    try:
+        exact = server.handle_request(
+            {
+                "id": "approval-1",
+                "method": "approval.respond",
+                "params": {
+                    "choice": "once",
+                    "request_id": "approval-second",
+                    "session_id": sid,
+                },
+            }
+        )
+
+        assert exact["result"]["resolved"] == 1
+        assert second.result == "once"
+        assert second.event.is_set()
+        assert first.result is None
+        assert not first.event.is_set()
+        with approval_mod._lock:
+            assert approval_mod._gateway_queues[session_key] == [first]
+
+        stale = server.handle_request(
+            {
+                "id": "approval-2",
+                "method": "approval.respond",
+                "params": {
+                    "choice": "deny",
+                    "request_id": "approval-second",
+                    "session_id": sid,
+                },
+            }
+        )
+        assert stale["error"]["code"] == 4009
+        assert first.result is None
+
+        legacy = server.handle_request(
+            {
+                "id": "approval-3",
+                "method": "approval.respond",
+                "params": {"choice": "deny", "session_id": sid},
+            }
+        )
+        assert legacy["result"]["resolved"] == 1
+        assert first.result == "deny"
+        assert first.event.is_set()
+    finally:
+        server._sessions.pop(sid, None)
+        with approval_mod._lock:
+            approval_mod._gateway_queues.pop(session_key, None)
+
+
+def test_approval_respond_rejects_exact_request_with_all():
+    sid = "approval-rpc-invalid"
+    server._sessions[sid] = _session(session_key="approval-rpc-invalid-key")
+    try:
+        response = server.handle_request(
+            {
+                "id": "approval-invalid",
+                "method": "approval.respond",
+                "params": {
+                    "all": True,
+                    "choice": "deny",
+                    "request_id": "approval-one",
+                    "session_id": sid,
+                },
+            }
+        )
+        assert response["error"]["code"] == 4004
+    finally:
+        server._sessions.pop(sid, None)
 
 
 # ---------------------------------------------------------------------------

@@ -853,11 +853,15 @@ class TestDefaultInteractionDispatch:
     async def test_approval_click_once_maps_to_once(self):
         """'allow-once' button → resolve_gateway_approval(session, 'once')."""
         adapter = self._make_adapter()
+        adapter._exec_approval_state["approval-second"] = {
+            "request_id": "approval-second",
+            "session_key": "agent:main:qqbot:c2c:u-42",
+        }
 
         resolve_calls = []
 
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
+        def fake_resolve(session_key, choice, resolve_all=False, request_id=None):
+            resolve_calls.append((session_key, choice, resolve_all, request_id))
             return 1
 
         # Patch the *module-level* function that _default_interaction_dispatch
@@ -871,13 +875,20 @@ class TestDefaultInteractionDispatch:
                 "id": "i",
                 "chat_type": 2,
                 "user_openid": "u-42",
-                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u-42:allow-once"}},
+                "data": {"resolved": {"button_data": "approve:approval-second:allow-once"}},
             })
             await adapter._default_interaction_dispatch(event)
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("agent:main:qqbot:c2c:u-42", "once", False)]
+        assert resolve_calls == [
+            (
+                "agent:main:qqbot:c2c:u-42",
+                "once",
+                False,
+                "approval-second",
+            )
+        ]
 
 
     @pytest.mark.asyncio
@@ -956,14 +967,41 @@ class TestSendExecApproval:
             command="rm -rf /tmp/demo",
             session_key="sess:abc",
             description="delete temp dir",
+            metadata={"approval_request_id": "approval-qq"},
         )
         assert result.success
         assert len(calls) == 1
         req = calls[0]["req"]
-        assert req.session_key == "sess:abc"
+        assert req.session_key == "approval-qq"
+        assert adapter._exec_approval_state["approval-qq"] == {
+            "request_id": "approval-qq",
+            "session_key": "sess:abc",
+        }
         assert req.command_preview == "rm -rf /tmp/demo"
         assert req.description == "delete temp dir"
         assert calls[0]["reply_to"] == "inbound-42"
+
+    @pytest.mark.asyncio
+    async def test_without_request_metadata_marks_fifo_fallback(self):
+        adapter = self._make_adapter()
+        captured = {}
+
+        async def fake_send_approval(chat_id, req, reply_to=None):
+            from gateway.platforms.base import SendResult
+            captured["approval_id"] = req.session_key
+            return SendResult(success=True, message_id="m-1")
+
+        adapter.send_approval_request = fake_send_approval  # type: ignore[assignment]
+        await adapter.send_exec_approval(
+            chat_id="user-1",
+            command="rm -rf /tmp/demo",
+            session_key="sess:abc",
+        )
+
+        assert adapter._exec_approval_state[captured["approval_id"]] == {
+            "request_id": "",
+            "session_key": "sess:abc",
+        }
 
 
 class TestSendUpdatePrompt:
@@ -1221,4 +1259,3 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = SimpleNamespace(closed=True)
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
-

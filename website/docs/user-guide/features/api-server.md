@@ -250,7 +250,10 @@ Returns a machine-readable description of the API server's stable surface for ex
     "run_submission": true,
     "run_status": true,
     "run_events_sse": true,
-    "run_stop": true
+    "run_stop": true,
+    "run_approval_request_binding": true,
+    "run_approval_structured_preview": true,
+    "run_approval_preview_version": 1
   }
 }
 ```
@@ -401,7 +404,51 @@ running.
 
 ### POST /v1/runs/\{run_id\}/approval
 
-Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy).
+
+Each `approval.request` SSE event includes a stable `request_id`, the available
+`choices`, and a fixed `preview` object:
+
+```json
+{
+  "event": "approval.request",
+  "request_id": "9a06e485e35d41f2a6896c146d63a53a",
+  "choices": ["once", "session", "always", "deny"],
+  "preview": {
+    "version": 1,
+    "category": "terminal_command",
+    "title": "Terminal command approval",
+    "summary": "Hermes stopped a terminal command that matched a protected action.",
+    "risk_labels": ["recursive delete"]
+  }
+}
+```
+
+The preview uses Hermes-owned text and allowlisted risk labels, so clients do
+not need to build UI copy from raw command or plugin text. Existing redacted
+event fields remain available for compatibility.
+
+Send the displayed request ID back with the decision:
+
+```json
+{
+  "choice": "once",
+  "request_id": "9a06e485e35d41f2a6896c146d63a53a"
+}
+```
+
+Hermes resolves only that queue entry. A stale or unknown ID returns `409`
+without resolving another pending request, and the run remains
+`waiting_for_approval` while sibling approvals are still pending. Do not
+combine `request_id` with `all` or `resolve_all`.
+
+Clients that support older Hermes versions may omit `request_id`; this keeps
+the legacy FIFO behavior. Do not retry a failed exact response without its ID,
+because that would target a different pending request.
+
+The endpoint and binding contract are advertised in `/v1/capabilities` through
+`run_approval_response`, `run_approval_request_binding`,
+`run_approval_structured_preview`, and `run_approval_preview_version`.
 
 ## Jobs API (background scheduled work)
 
