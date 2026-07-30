@@ -4299,3 +4299,57 @@ class TestNamedCustomProviderHostDerivedKey:
             )
 
         assert captured.get("api_key") == "no-key-required"
+
+    def test_integration_providers_api_shape_uses_host_derived_key(
+        self, tmp_path, monkeypatch
+    ):
+        """Integration: ``providers:`` yaml uses ``api`` field (not ``base_url``)\n        and relies on _host_derived_api_key via NVIDIA_API_KEY.
+
+        Writes a real config.yaml into a temp HERMES_HOME so that
+        ``_get_named_custom_provider`` scans the actual user-facing path:
+        ``providers.nvidia-nim.api → base_url`` inside
+        ``hermes_cli/runtime_provider.py:700``.
+
+        The existing unit tests above mock that entry — this test exercises
+        the end-to-end yaml → parse → resolve_provider_client chain referenced
+        in the PR description.
+        """
+        import agent.auxiliary_client as ac
+
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir(parents=True)
+        # config.yaml for new-style ``providers:`` map using the ``api`` field
+        # reported in the issue (api + name + models, no explicit key_env).
+        cfg_text = (
+            "providers:\n"
+            "  nvidia-nim:\n"
+            "    api: https://integrate.api.nvidia.com/v1\n"
+            "    name: NVIDIA NIM\n"
+            "    models: [z-ai/glm-5.2]\n"
+        )
+        (hermes_home / "config.yaml").write_text(cfg_text, encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("NVIDIA_API_KEY", "nvapi-test-key-from-host-derived")
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        # Also ensure raw NVIDIA env does not leak through leftover env trials
+        # except via the host-derived branch.
+        monkeypatch.setenv("OPENAI_ENV_FILE", "/dev/null")
+
+        captured: dict = {}
+
+        def _capture_create(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        with patch.object(ac, "_create_openai_client", side_effect=_capture_create):
+            client, model = resolve_provider_client(
+                "nvidia-nim",
+                model="z-ai/glm-5.2",
+            )
+
+        assert captured.get("api_key") == "nvapi-test-key-from-host-derived"
+        # Base URL should be the reported api field, not placeholder.
+        assert captured.get("base_url", "").startswith(
+            "https://integrate.api.nvidia.com"
+        )
