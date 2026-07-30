@@ -2045,6 +2045,80 @@ def _service_scope_label(system: bool = False) -> str:
     return "system" if system else "user"
 
 
+def _gateway_hygiene_unit_names() -> tuple[str, str, str, str]:
+    base = f"{get_service_name()}-hygiene"
+    return (
+        f"{base}.timer",
+        f"{base}.service",
+        f"{base}-restart.timer",
+        f"{base}-restart.service",
+    )
+
+
+def _gateway_hygiene_paths(system: bool = False) -> tuple[Path, Path, Path]:
+    service_name = _gateway_hygiene_unit_names()[1]
+    unit_root = (
+        Path("/etc/systemd/system")
+        if system
+        else Path.home() / ".config" / "systemd" / "user"
+    )
+    hermes_home = Path(get_hermes_home())
+    unit_path = unit_root / service_name
+    script_path = hermes_home / "scripts" / "gateway-hygiene-watchdog.py"
+    from hermes_cli.gateway_hygiene import default_hygiene_backup_root
+
+    return unit_path, script_path, default_hygiene_backup_root(hermes_home)
+
+
+def _migrate_gateway_hygiene_hold_support(system: bool = False):
+    """Make the optional legacy hygiene watchdog honor an owner stop."""
+
+    from hermes_cli.gateway_hygiene import migrate_gateway_hygiene_hold_support
+
+    unit_path, script_path, backup_root = _gateway_hygiene_paths(system)
+    return migrate_gateway_hygiene_hold_support(
+        unit_path=unit_path,
+        script_path=script_path,
+        backup_root=backup_root,
+        gateway_service=f"{get_service_name()}.service",
+        daemon_reload=lambda: _run_systemctl(
+            ["daemon-reload"],
+            system=system,
+            check=True,
+            timeout=30,
+        ),
+    )
+
+
+def _stop_gateway_hygiene_units(system: bool = False) -> None:
+    """Stop every known hygiene trigger before stopping the gateway itself."""
+
+    for unit_name in _gateway_hygiene_unit_names():
+        _run_systemctl(
+            ["stop", unit_name],
+            system=system,
+            check=False,
+            timeout=30,
+        )
+
+
+def _start_gateway_hygiene_timer_if_installed(system: bool = False) -> None:
+    timer_name = _gateway_hygiene_unit_names()[0]
+    timer_root = (
+        Path("/etc/systemd/system")
+        if system
+        else Path.home() / ".config" / "systemd" / "user"
+    )
+    if not (timer_root / timer_name).exists():
+        return
+    _run_systemctl(
+        ["start", timer_name],
+        system=system,
+        check=True,
+        timeout=30,
+    )
+
+
 def get_installed_systemd_scopes() -> list[str]:
     scopes = []
     seen_paths: set[Path] = set()
@@ -3323,7 +3397,14 @@ def systemd_start(system: bool = False):
     # systemd_unit_is_current gate (the single chokepoint), and the unit is
     # guaranteed to exist here by _require_service_installed, so the gate runs.
     refresh_systemd_unit_if_needed(system=system)
+    _migrate_gateway_hygiene_hold_support(system=system)
+    from gateway.status import clear_gateway_owner_hold
+
+    # This explicit owner command is the only path that releases a durable
+    # stop. Dependency starts and watchdog retries cannot clear the hold.
+    clear_gateway_owner_hold()
     _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
+    _start_gateway_hygiene_timer_if_installed(system=system)
     print(f"✓ {_service_scope_label(system).capitalize()} service started")
 
 
@@ -3333,10 +3414,27 @@ def systemd_stop(system: bool = False):
         _require_root_for_system_service("stop")
     _require_service_installed("stop", system=system)
     _sync_hermes_home_from_systemd_unit(system=system)
-    try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
+    from gateway.status import (
+        get_running_pid,
+        write_gateway_owner_hold,
+        write_planned_stop_marker,
+    )
 
-        pid = get_running_pid(cleanup_stale=False)
+    pid = get_running_pid(cleanup_stale=False)
+    # The durable hold is the first side effect. If anything crashes after this
+    # point, dependency starts and delayed watchdog restarts still fail closed
+    # until an explicit ``hermes gateway start`` releases the hold.
+    write_gateway_owner_hold(target_pid=pid)
+
+    try:
+        _migrate_gateway_hygiene_hold_support(system=system)
+    except Exception as exc:
+        # A stop must not be held hostage by migration trouble. The owner marker
+        # plus stopping every known trigger still contains this run.
+        logger.warning("Gateway hygiene hold migration failed during stop: %s", exc)
+    _stop_gateway_hygiene_units(system=system)
+
+    try:
         if pid is not None:
             write_planned_stop_marker(pid)
     except Exception:
@@ -3368,6 +3466,10 @@ def systemd_restart(system: bool = False):
     # mutation persists for the get_running_pid / drain-timeout reads below —
     # no separate pre-sync needed.
     refresh_systemd_unit_if_needed(system=system)
+    _migrate_gateway_hygiene_hold_support(system=system)
+    from gateway.status import clear_gateway_owner_hold
+
+    clear_gateway_owner_hold()
     from gateway.status import get_running_pid
 
     pid = get_running_pid() or _systemd_main_pid(system=system)
@@ -4828,6 +4930,14 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         force: Skip the supervised-gateway conflict guard and start even when a
                systemd/launchd service is already supervising this profile.
     """
+    from gateway.status import gateway_owner_hold_active
+
+    if gateway_owner_hold_active():
+        print_error(
+            "Gateway owner hold is active; refusing an implicit or supervisor start."
+        )
+        print("  Run `hermes gateway start` to release the hold explicitly.")
+        raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE)
     _guard_official_docker_root_gateway()
     _guard_named_profile_under_multiplexer(force=force)
     _guard_supervised_gateway_conflict(force=force)

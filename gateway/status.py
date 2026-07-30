@@ -1579,6 +1579,7 @@ _TAKEOVER_MARKER_FILENAME = ".gateway-takeover.json"
 _TAKEOVER_MARKER_TTL_S = 60  # Marker older than this is treated as stale
 _PLANNED_STOP_MARKER_FILENAME = ".gateway-planned-stop.json"
 _PLANNED_STOP_MARKER_TTL_S = 60
+_OWNER_HOLD_FILENAME = ".gateway-owner-hold.json"
 
 
 def _get_takeover_marker_path(hermes_home: Optional[Path] = None) -> Path:
@@ -1595,6 +1596,86 @@ def _get_planned_stop_marker_path() -> Path:
     """Return the path to the intentional gateway stop marker file."""
     home = _get_process_hermes_home()
     return home / _PLANNED_STOP_MARKER_FILENAME
+
+
+def get_gateway_owner_hold_path(hermes_home: Optional[Path] = None) -> Path:
+    """Return the durable owner-stop marker used by supervisors and watchdogs."""
+
+    home = hermes_home or _get_process_hermes_home()
+    return _canonical_hermes_home(home) / _OWNER_HOLD_FILENAME
+
+
+def read_gateway_owner_hold(
+    hermes_home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Read a valid durable owner hold without consuming it."""
+
+    record = _read_json_file(get_gateway_owner_hold_path(hermes_home))
+    if not isinstance(record, dict):
+        return None
+    if record.get("schema_version") != 1 or record.get("state") != "held":
+        return None
+    return record
+
+
+def gateway_owner_hold_active(hermes_home: Optional[Path] = None) -> bool:
+    """Return whether an owner explicitly placed this gateway on hold."""
+
+    path = get_gateway_owner_hold_path(hermes_home)
+    return path.exists()
+
+
+def gateway_owner_hold_targets_self() -> bool:
+    """Return whether the active owner hold names this gateway process."""
+
+    record = read_gateway_owner_hold()
+    if record is None:
+        # A malformed marker must not silently reopen the write/start path.
+        return get_gateway_owner_hold_path().exists()
+    target_pid = record.get("target_pid")
+    if target_pid is None:
+        return True
+    try:
+        return int(target_pid) == os.getpid()
+    except (TypeError, ValueError):
+        return False
+
+
+def write_gateway_owner_hold(
+    *,
+    target_pid: Optional[int],
+    owner: str = "hermes gateway stop",
+    reason: str = "explicit owner stop",
+    hermes_home: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Persist and read back an owner hold before any stop-side effects."""
+
+    path = get_gateway_owner_hold_path(hermes_home)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "state": "held",
+        "owner": owner,
+        "reason": reason,
+        "target_pid": int(target_pid) if target_pid is not None else None,
+        "written_at": _utc_now_iso(),
+        "writer_pid": os.getpid(),
+    }
+    _write_json_file(path, record)
+    readback = _read_json_file(path)
+    if readback != record:
+        raise RuntimeError(f"Gateway owner hold readback failed: {path}")
+    return record
+
+
+def clear_gateway_owner_hold(hermes_home: Optional[Path] = None) -> bool:
+    """Remove an owner hold only at an explicit start/restart boundary."""
+
+    path = get_gateway_owner_hold_path(hermes_home)
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    if path.exists():
+        raise RuntimeError(f"Gateway owner hold removal readback failed: {path}")
+    return existed
 
 
 def _marker_is_stale(written_at: str, ttl_s: int) -> bool:

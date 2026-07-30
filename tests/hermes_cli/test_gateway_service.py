@@ -19,6 +19,17 @@ from gateway.restart import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_hygiene_migration(monkeypatch):
+    """Service-control unit tests must never migrate unmanaged live files."""
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "_migrate_gateway_hygiene_hold_support",
+        lambda **_kwargs: None,
+    )
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
