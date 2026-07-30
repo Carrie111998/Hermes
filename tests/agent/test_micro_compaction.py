@@ -95,7 +95,22 @@ def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
 
 
 def _conversation(exchanges: int = 6) -> list:
-    msgs = [{"role": "system", "content": "system prompt"}]
+    """A transcript shaped the way micro-compaction actually receives one.
+
+    No ``role="system"`` row. ``_micro_compact`` is only ever called from
+    ``finalize_turn`` on ``agent.messages``, and the system prompt is prepended
+    to the wire copy at request-build time (``conversation_loop.py:1550``) --
+    it is never a member of the stored list. Only the gateway ``/compress``
+    path passes a system-bearing list, and that path is batch compaction, not
+    this one.
+
+    These fixtures used to open with a system row, which quietly kept
+    ``_protect_head_size`` >= 1 and ``compress_start`` >= 1 in every test. The
+    decayed-head shape (``compress_start == 0``, no predecessor before the
+    absorbed span) was therefore never exercised, which is exactly where the
+    marker-role and zero-user bugs live.
+    """
+    msgs = []
     for i in range(exchanges):
         msgs.append({"role": "user", "content": f"question {i}"})
         msgs.append({"role": "assistant", "content": f"answer {i} " + "z" * 400})
@@ -255,7 +270,7 @@ class TestMicroCompaction:
         nothing shifts.
         """
         cc = _compressor()
-        msgs = [{"role": "system", "content": "sys"}]
+        msgs = []  # no system row: see _conversation's docstring
         for i in range(8):
             msgs.append({"role": "user", "content": f"q{i}"})
             msgs.append({
@@ -332,7 +347,6 @@ class TestMicroCompaction:
     def test_short_conversation_is_untouched(self):
         cc = _compressor()
         messages = [
-            {"role": "system", "content": "sys"},
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
         ]
@@ -595,6 +609,35 @@ class TestMicroCompaction:
         # The summary must still be discoverable after all that repairing --
         # supersede, cursor resolution and resume rehydration key off it.
         assert len(_summary_markers(messages)) == 1
+
+    def test_decayed_protected_head_still_compacts_safely(self):
+        """Once batch compaction has run, the protected head decays to zero.
+
+        ``_effective_protect_first_n`` drops to 0 after the first compression,
+        so ``_protect_head_size`` returns 0 and ``compress_start`` becomes 0 --
+        the marker can then land at the very front of the transcript with no
+        predecessor at all. Every fixture here used to open with a system row,
+        which held ``compress_start`` at >= 1 and hid this shape entirely.
+        """
+        cc = _compressor()
+        cc.compression_count = 1  # batch has run: head protection decays
+        messages = _conversation(exchanges=8)
+
+        assert cc._effective_protect_first_n() == 0
+        assert cc._protect_head_size(messages) == 0
+
+        result = cc._micro_compact(list(messages))
+
+        markers = _summary_markers(result)
+        assert len(markers) == 1
+        idx = result.index(markers[0])
+        if idx > 0:
+            assert result[idx - 1]["role"] != markers[0]["role"]
+        # A real user turn must still survive for strict backends.
+        assert any(
+            m.get("role") == "user" and not m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+            for m in result
+        )
 
     def test_supersede_never_deletes_a_foreign_summary_marker(self):
         """A batch marker must survive micro-compaction passes.
