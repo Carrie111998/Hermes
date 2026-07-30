@@ -2832,6 +2832,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if self._conn:
                 # Let plugins override the checkpoint mode (e.g. force PASSIVE
                 # to avoid page-tear under a SIGTERM race — see #45383).
+                # Let plugins override the checkpoint mode (e.g. force PASSIVE
+                # to avoid page-tear under a SIGTERM race — see #45383).
                 if not self.read_only:
                     _ckpt_mode = "TRUNCATE"
                     try:
@@ -2842,7 +2844,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             default_mode="TRUNCATE",
                         ):
                             if isinstance(_result, dict) and "mode" in _result:
-                                _ckpt_mode = str(_result["mode"]).upper()
+                                _candidate = str(_result["mode"]).upper()
+                                if _candidate in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+                                    _ckpt_mode = _candidate
                     except Exception:
                         pass  # plugins unavailable — keep default
                     try:
@@ -9346,7 +9350,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     default_mode="TRUNCATE",
                 ):
                     if isinstance(_result, dict) and "mode" in _result:
-                        _ckpt_mode = str(_result["mode"]).upper()
+                        _candidate = str(_result["mode"]).upper()
+                        if _candidate in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+                            _ckpt_mode = _candidate
             except Exception:
                 pass  # plugins unavailable — keep default
             try:

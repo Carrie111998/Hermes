@@ -145,7 +145,7 @@ class TestPreDbCheckpointHook:
         assert captured_kwargs["default_mode"] == "TRUNCATE"
 
     def test_vacuum_path_hook_receives_correct_kwargs(self, tmp_path):
-        """The pre-VACUUM path passes context='vacuum'."""
+        """The pre-VACUUM path passes context='vacuum' — deterministic via vacuum()."""
         db = _make_session_db(tmp_path)
         captured_kwargs = {}
 
@@ -154,19 +154,18 @@ class TestPreDbCheckpointHook:
             captured_kwargs["_hook_name"] = hook_name
             return []
 
-        # optimize_fts_storage triggers the pre-VACUUM checkpoint
+        # vacuum() always reaches the pre-VACUUM checkpoint path.
         with patch("hermes_cli.plugins.invoke_hook", side_effect=capture_hook):
-            try:
-                db.optimize_fts_storage()
-            except Exception:
-                pass  # may fail on fresh DB — we only care about the hook call
+            db.vacuum()
 
-        if captured_kwargs.get("_hook_name") == "pre_db_checkpoint":
-            assert captured_kwargs["context"] == "vacuum"
-            assert captured_kwargs["default_mode"] == "TRUNCATE"
+        assert captured_kwargs.get("_hook_name") == "pre_db_checkpoint", (
+            "Hook was never called — vacuum() must reach the checkpoint path"
+        )
+        assert captured_kwargs["context"] == "vacuum"
+        assert captured_kwargs["default_mode"] == "TRUNCATE"
 
     def test_vacuum_plugin_overrides_to_passive(self, tmp_path):
-        """A plugin can force PASSIVE on the pre-VACUUM path too."""
+        """A plugin can force PASSIVE on the pre-VACUUM path via vacuum()."""
         db = _make_session_db(tmp_path)
         execute_calls = []
         real_conn = db._conn
@@ -177,24 +176,44 @@ class TestPreDbCheckpointHook:
 
         mock_conn = MagicMock()
         mock_conn.execute.side_effect = tracking_execute
-        mock_conn.fetchone.return_value = None
         db._conn = mock_conn
 
         with patch(
             "hermes_cli.plugins.invoke_hook",
             return_value=[{"mode": "PASSIVE"}],
         ):
-            try:
-                db.optimize_fts_storage()
-            except Exception:
-                pass
+            db.vacuum()
 
         ckpt = [c for c in execute_calls if "wal_checkpoint" in c]
-        # optimize_fts_storage may or may not reach the checkpoint path
-        # depending on DB state; if it does, verify the override took effect.
+        assert ckpt, "vacuum() must issue a WAL checkpoint"
         for c in ckpt:
             assert "PASSIVE" in c, f"Expected PASSIVE, got: {c}"
             assert "TRUNCATE" not in c, f"TRUNCATE should be overridden: {c}"
+
+    def test_invalid_mode_rejected_keeps_truncate(self, tmp_path):
+        """An invalid checkpoint mode from a plugin is rejected; TRUNCATE is kept."""
+        db = _make_session_db(tmp_path)
+        execute_calls = []
+        real_conn = db._conn
+
+        def tracking_execute(sql, *args, **kwargs):
+            execute_calls.append(sql)
+            return real_conn.execute(sql, *args, **kwargs)
+
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = tracking_execute
+        db._conn = mock_conn
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"mode": "DROP TABLE users; --"}],
+        ):
+            db.close()
+
+        ckpt = [c for c in execute_calls if "wal_checkpoint" in c]
+        assert any("TRUNCATE" in c for c in ckpt), (
+            f"Invalid mode must fall back to TRUNCATE, got {ckpt}"
+        )
 
 
 # ===========================================================================
@@ -446,59 +465,97 @@ class TestPreCompressionHook:
         assert "pre_delegation_credentials" in VALID_HOOKS
         assert "pre_compression" in VALID_HOOKS
 
+    def _make_compress_agent(self):
+        """Build a minimal mock agent that reaches the pre_compression hook."""
+        agent = MagicMock()
+        agent.session_id = "test-session-1"
+        agent.model = "test-model"
+        agent.api_mode = None  # not codex
+        agent._compression_feasibility_checked = True
+        agent._session_db = None  # skip lock subsystem
+        agent._cached_system_prompt = "cached-prompt"
+        agent.compression_in_place = True
+        agent._compression_skipped_due_to_lock = None
+        agent._compression_lock_ttl_seconds = 300.0
+        agent._compression_lock_refresh_interval = None
+        agent._last_compression_lock_error_sid = None
+        agent.context_compressor = MagicMock()
+        return agent
+
+    def test_compression_vetoed_by_plugin_path_level(self):
+        """A plugin returning {'skip': True} vetoes compression at the
+        compress_context() level: messages are returned unchanged and the
+        compressor is never invoked."""
+        from agent.conversation_compression import compress_context
+
+        agent = self._make_compress_agent()
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"skip": True, "reason": "engine rebind failed"}],
+        ):
+            result_msgs, result_prompt = compress_context(
+                agent, messages, "system prompt", force=True,
+            )
+
+        # Messages must be returned unchanged (veto = no compression).
+        assert result_msgs is messages
+        assert result_prompt == "cached-prompt"
+        # The compressor must NOT have been called for actual summarization.
+        agent.context_compressor.compress.assert_not_called()
+
     def test_compression_proceeds_without_plugins(self):
-        """Without plugins, compression is not vetoed."""
-        # We test the hook contract at the invoke_hook level since
-        # compress_context requires a full agent setup.
-        from hermes_cli.plugins import invoke_hook
+        """Without plugins (empty hook results), compression is not vetoed
+        and the compressor is invoked."""
+        from agent.conversation_compression import compress_context
+
+        agent = self._make_compress_agent()
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        # With no plugins the hook returns []; compress_context should
+        # proceed past the hook and reach the compressor.  The compressor
+        # mock returns a MagicMock which the pipeline will try to process;
+        # we only care that it was called (not vetoed by the hook).
+        with patch(
+            "hermes_cli.plugins.invoke_hook", return_value=[],
+        ), patch(
+            "agent.conversation_compression._CompressionActivityHeartbeat",
+        ):
+            try:
+                compress_context(agent, messages, "system prompt", force=True)
+            except Exception:
+                pass  # deep pipeline may fail on mock objects — that's fine
+
+        # The compressor was reached (not vetoed by the hook).
+        agent.context_compressor.compress.assert_called()
+
+    def test_compression_hook_error_proceeds(self):
+        """If invoke_hook raises, compression proceeds (fail-open)."""
+        from agent.conversation_compression import compress_context
+
+        agent = self._make_compress_agent()
+        messages = [{"role": "user", "content": "hello"}]
 
         with patch(
-            "hermes_cli.plugins.get_plugin_manager",
-        ) as mock_mgr:
-            mock_mgr.return_value.invoke_hook.return_value = []
-            results = invoke_hook(
-                "pre_compression",
-                agent=MagicMock(),
-                session_id="s1",
-                message_count=10,
-            )
-        assert results == []
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=RuntimeError("plugin exploded"),
+        ), patch(
+            "agent.conversation_compression._CompressionActivityHeartbeat",
+        ):
+            try:
+                compress_context(agent, messages, "system prompt", force=True)
+            except Exception:
+                pass  # deep pipeline may fail on mock objects — that's fine
 
-    def test_compression_vetoed_by_plugin(self):
-        """A plugin returning {'skip': True} vetoes compression."""
-        from hermes_cli.plugins import invoke_hook
-
-        with patch(
-            "hermes_cli.plugins.get_plugin_manager",
-        ) as mock_mgr:
-            mock_mgr.return_value.invoke_hook.return_value = [
-                {"skip": True, "reason": "engine rebind failed"}
-            ]
-            results = invoke_hook(
-                "pre_compression",
-                agent=MagicMock(),
-                session_id="s1",
-                message_count=10,
-            )
-        assert len(results) == 1
-        assert results[0]["skip"] is True
-
-    def test_compression_side_effect_hook_no_return(self):
-        """A plugin doing side effects (rebind) without returning doesn't veto."""
-        from hermes_cli.plugins import invoke_hook
-
-        with patch(
-            "hermes_cli.plugins.get_plugin_manager",
-        ) as mock_mgr:
-            # Real invoke_hook filters None returns; simulate that.
-            mock_mgr.return_value.invoke_hook.return_value = []
-            results = invoke_hook(
-                "pre_compression",
-                agent=MagicMock(),
-                session_id="s1",
-                message_count=10,
-            )
-        assert results == []
+        # Hook error must not block compression.
+        agent.context_compressor.compress.assert_called()
 
 
 # ===========================================================================

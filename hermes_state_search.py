@@ -850,7 +850,9 @@ class SessionSearchMixin:
                             default_mode="TRUNCATE",
                         ):
                             if isinstance(_result, dict) and "mode" in _result:
-                                _ckpt_mode = str(_result["mode"]).upper()
+                                _candidate = str(_result["mode"]).upper()
+                                if _candidate in ("PASSIVE", "FULL", "RESTART", "TRUNCATE"):
+                                    _ckpt_mode = _candidate
                     except Exception:
                         pass  # plugins unavailable — keep default
                     self._conn.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
