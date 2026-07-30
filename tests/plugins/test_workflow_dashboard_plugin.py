@@ -110,6 +110,19 @@ def test_board_is_collection_bound_and_excludes_archived(workflow_env, monkeypat
     assert sum("SELECT i.task_id" in statement for statement in traces) == 1
 
 
+def test_board_defaults_to_the_dashboard_process_board(workflow_env, monkeypatch):
+    client, conn, module = workflow_env
+    template_id, _ = wf_engine.register_template(conn, _spec())
+    _instance(conn, template_id, "configured-board")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "p4-demo")
+    monkeypatch.setattr(module.kanban_db, "board_exists", lambda board: board == "p4-demo")
+
+    response = client.get("/api/plugins/workflow/board")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["board"] == "p4-demo"
+
+
 def test_timeline_is_ordered_and_does_not_expose_event_payload(workflow_env):
     client, conn, _module = workflow_env
     template_id, _ = wf_engine.register_template(conn, _spec())

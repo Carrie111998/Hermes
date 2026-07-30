@@ -13,6 +13,7 @@ after applying its normal session-token middleware.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from typing import Any
@@ -41,7 +42,10 @@ def _resolve_board(board: str | None) -> str:
     """Return the workflow board, rejecting an unknown override."""
 
     if board is None or not board.strip():
-        return DEFAULT_WORKFLOW_BOARD
+        configured = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if not configured:
+            return DEFAULT_WORKFLOW_BOARD
+        board = configured
     try:
         normalized = kanban_db._normalize_board_slug(board)
     except ValueError as exc:
