@@ -760,24 +760,95 @@ _DASHBOARD_UPDATE_WATCHERS: set[asyncio.Task] = set()
 _DASHBOARD_UPDATE_STATUS_PATH = "/api/actions/hermes-update/status"
 
 
-@contextmanager
-def _dashboard_background_work_scope():
-    """Admit one background operation and track it through completion."""
+def _try_begin_dashboard_background_work() -> bool:
+    """Reserve one background-work slot unless update quiesce has begun."""
     global _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
 
     with _DASHBOARD_UPDATE_QUIESCE_LOCK:
-        admitted = not _DASHBOARD_UPDATE_QUIESCE_ACTIVE
-        if admitted:
-            _DASHBOARD_UPDATE_ACTIVE_BACKGROUND += 1
+        if _DASHBOARD_UPDATE_QUIESCE_ACTIVE:
+            return False
+        _DASHBOARD_UPDATE_ACTIVE_BACKGROUND += 1
+    return True
+
+
+def _finish_dashboard_background_work() -> None:
+    global _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        _DASHBOARD_UPDATE_ACTIVE_BACKGROUND = max(
+            _DASHBOARD_UPDATE_ACTIVE_BACKGROUND - 1,
+            0,
+        )
+
+
+@contextmanager
+def _dashboard_background_work_scope():
+    """Admit one background operation and track it through completion."""
+    admitted = _try_begin_dashboard_background_work()
     try:
         yield admitted
     finally:
         if admitted:
-            with _DASHBOARD_UPDATE_QUIESCE_LOCK:
-                _DASHBOARD_UPDATE_ACTIVE_BACKGROUND = max(
-                    _DASHBOARD_UPDATE_ACTIVE_BACKGROUND - 1,
-                    0,
-                )
+            _finish_dashboard_background_work()
+
+
+def _start_dashboard_background_thread(
+    *,
+    target,
+    args: tuple = (),
+    kwargs: Optional[dict] = None,
+    daemon: bool = True,
+    name: Optional[str] = None,
+) -> Optional[threading.Thread]:
+    """Start and track a detached dashboard worker.
+
+    Admission is reserved in the calling thread before ``Thread.start()``, so
+    update quiesce cannot slip between an endpoint returning and its worker
+    becoming visible to the boundary.
+    """
+    if not _try_begin_dashboard_background_work():
+        return None
+
+    def _run() -> None:
+        try:
+            target(*args, **(kwargs or {}))
+        finally:
+            _finish_dashboard_background_work()
+
+    worker = threading.Thread(target=_run, daemon=daemon, name=name)
+    try:
+        worker.start()
+    except Exception:
+        _finish_dashboard_background_work()
+        raise
+    return worker
+
+
+def _run_dashboard_background_call(target, *args, **kwargs):
+    """Run executor work inside the same update-quiesce admission boundary."""
+    with _dashboard_background_work_scope() as admitted:
+        if not admitted:
+            raise RuntimeError("Dashboard is quiesced while Hermes updates")
+        return target(*args, **kwargs)
+
+
+def _dashboard_action_is_running(name: str, proc: Any) -> bool:
+    """Return whether one tracked detached action still owns live work."""
+    if name == "hermes-update":
+        return False
+    poll = getattr(proc, "poll", None)
+    if not callable(poll):
+        # Production entries are subprocess.Popen instances. Some embedders
+        # and unit stubs expose only wait()/pid; they cannot provide a
+        # trustworthy liveness snapshot, so the other admission counters own
+        # their boundary.
+        return False
+    try:
+        return poll() is None
+    except Exception:
+        # Fail safe toward refusing an update if a real process cannot report
+        # whether it has exited.
+        return True
 
 
 @app.middleware("http")
@@ -859,7 +930,24 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
                 for task in _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS
                 if task is not current and not task.done()
             ]
-        if active_http == 0 and active_background == 0 and not active_ws:
+        try:
+            from cron.scheduler import get_running_job_ids
+
+            active_cron_jobs = get_running_job_ids()
+        except Exception:
+            active_cron_jobs = frozenset()
+        active_actions = [
+            name
+            for name, proc in tuple(_ACTION_PROCS.items())
+            if _dashboard_action_is_running(name, proc)
+        ]
+        if (
+            active_http == 0
+            and active_background == 0
+            and not active_ws
+            and not active_cron_jobs
+            and not active_actions
+        ):
             return
         await asyncio.sleep(0.01)
 
@@ -4736,7 +4824,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         return streamer, cap
 
     try:
-        streamer, cap = await loop.run_in_executor(None, _resolve)
+        streamer, cap = await loop.run_in_executor(
+            None,
+            functools.partial(_run_dashboard_background_call, _resolve),
+        )
     except Exception:
         _log.exception("speak-stream provider resolution failed")
         streamer, cap = None, 0
@@ -4805,7 +4896,15 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         finally:
             loop.call_soon_threadsafe(chunks.put_nowait, None)
 
-    threading.Thread(target=_produce, daemon=True).start()
+    producer = _start_dashboard_background_thread(
+        target=_produce,
+        daemon=True,
+        name="dashboard-speak-stream",
+    )
+    if producer is None:
+        with contextlib.suppress(Exception):
+            await ws.close(code=1012, reason="Hermes update in progress")
+        return
 
     async def _pump_client():
         # Text frames feed synthesis; done ends the text; stop/disconnect
@@ -8871,11 +8970,20 @@ async def start_whatsapp_onboarding(body: WhatsAppOnboardingStart):
         _supersede_whatsapp_onboarding_sessions(session_path)
         _whatsapp_onboarding_sessions[pairing_id] = record
 
-    threading.Thread(
+    worker = _start_dashboard_background_thread(
         target=_run_whatsapp_pairing,
         args=(pairing_id, session_path, mode),
         daemon=True,
-    ).start()
+        name=f"whatsapp-pair-{pairing_id[:6]}",
+    )
+    if worker is None:
+        with _whatsapp_onboarding_lock:
+            record.status = "error"
+            record.error = "Hermes update started before WhatsApp setup could begin."
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard is quiesced while Hermes updates",
+        )
 
     return _whatsapp_onboarding_payload(pairing_id, record)
 
@@ -10403,9 +10511,19 @@ async def _start_device_code_flow(
         sess["portal_base_url"] = portal_base_url
         sess["client_id"] = client_id
         sess["scope"] = effective_scope
-        threading.Thread(
-            target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
-        ).start()
+        worker = _start_dashboard_background_thread(
+            target=_nous_poller,
+            args=(sid,),
+            daemon=True,
+            name=f"oauth-poll-{sid[:6]}",
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10423,10 +10541,19 @@ async def _start_device_code_flow(
         # so we run the full helper in a worker and proxy the user_code +
         # verification_url back via the session dict. The helper prints
         # to stdout — we capture nothing here, just status.
-        threading.Thread(
-            target=_codex_full_login_worker, args=(sid,), daemon=True,
+        worker = _start_dashboard_background_thread(
+            target=_codex_full_login_worker,
+            args=(sid,),
+            daemon=True,
             name=f"oauth-codex-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         # Block briefly until the worker has populated the user_code, OR error.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -10511,12 +10638,19 @@ async def _start_device_code_flow(
             expires_at_ts = time.time() + expired_in_raw
             expires_in_seconds = expired_in_raw
         sess["expires_at"] = expires_at_ts
-        threading.Thread(
+        worker = _start_dashboard_background_thread(
             target=_minimax_poller,
             args=(sid,),
             daemon=True,
             name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10544,12 +10678,19 @@ async def _start_device_code_flow(
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
-        threading.Thread(
+        worker = _start_dashboard_background_thread(
             target=_xai_device_poller,
             args=(sid,),
             daemon=True,
             name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        )
+        if worker is None:
+            with _oauth_sessions_lock:
+                _oauth_sessions.pop(sid, None)
+            raise HTTPException(
+                status_code=503,
+                detail="Dashboard is quiesced while Hermes updates",
+            )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -15353,6 +15494,7 @@ async def console_ws(ws: WebSocket) -> None:
                 loop.run_in_executor(
                     _get_console_executor(),
                     functools.partial(
+                        _run_dashboard_background_call,
                         _execute_console_line,
                         engine,
                         line,
@@ -17253,7 +17395,11 @@ def _maybe_open_browser(
         except Exception:
             pass
 
-    threading.Thread(target=_open, daemon=True).start()
+    _start_dashboard_background_thread(
+        target=_open,
+        daemon=True,
+        name="dashboard-open-browser",
+    )
 
 
 def start_server(
