@@ -5954,6 +5954,9 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
+    if not path.exists():
+        _log.debug("_git_toplevel(%s): path does not exist", path)
+        return None
     try:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
@@ -5962,12 +5965,30 @@ def _git_toplevel(path: Path) -> Optional[Path]:
             timeout=30,
             check=False,
         )
-    except Exception:
+    except FileNotFoundError:
+        _log.warning(
+            "git executable not found on PATH when checking toplevel for %s; "
+            "is Git installed and on PATH?",
+            path,
+        )
+        return None
+    except OSError as exc:
+        _log.warning("_git_toplevel(%s) OSError: %s", path, exc)
+        return None
+    except Exception as exc:
+        _log.warning("_git_toplevel(%s) unexpected %s: %s", path, type(exc).__name__, exc)
         return None
     if result.returncode != 0:
+        _log.warning(
+            "git rev-parse --show-toplevel for %s failed (rc=%d): %s",
+            path,
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
         return None
     out = (result.stdout or "").strip()
     if not out:
+        _log.warning("git rev-parse --show-toplevel for %s returned empty output", path)
         return None
     try:
         return Path(out).expanduser().resolve()
@@ -5990,6 +6011,9 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
 
 
 def _git_common_dir(path: Path) -> Optional[Path]:
+    if not path.exists():
+        _log.debug("_git_common_dir(%s): path does not exist", path)
+        return None
     try:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -5998,9 +6022,17 @@ def _git_common_dir(path: Path) -> Optional[Path]:
             timeout=30,
             check=False,
         )
-    except Exception:
+    except FileNotFoundError:
+        _log.warning("git not found on PATH when checking common-dir for %s", path)
+        return None
+    except OSError as exc:
+        _log.warning("_git_common_dir(%s) OSError: %s", path, exc)
+        return None
+    except Exception as exc:
+        _log.warning("_git_common_dir(%s) unexpected %s: %s", path, type(exc).__name__, exc)
         return None
     if result.returncode != 0:
+        _log.debug("git rev-parse --git-common-dir for %s rc=%d: %s", path, result.returncode, (result.stderr or "").strip())
         return None
     out = (result.stdout or "").strip()
     if not out:
@@ -6009,6 +6041,9 @@ def _git_common_dir(path: Path) -> Optional[Path]:
 
 
 def _git_dir(path: Path) -> Optional[Path]:
+    if not path.exists():
+        _log.debug("_git_dir(%s): path does not exist", path)
+        return None
     try:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
@@ -6017,9 +6052,17 @@ def _git_dir(path: Path) -> Optional[Path]:
             timeout=30,
             check=False,
         )
-    except Exception:
+    except FileNotFoundError:
+        _log.warning("git not found on PATH when checking git-dir for %s", path)
+        return None
+    except OSError as exc:
+        _log.warning("_git_dir(%s) OSError: %s", path, exc)
+        return None
+    except Exception as exc:
+        _log.warning("_git_dir(%s) unexpected %s: %s", path, type(exc).__name__, exc)
         return None
     if result.returncode != 0:
+        _log.debug("git rev-parse --git-dir for %s rc=%d: %s", path, result.returncode, (result.stderr or "").strip())
         return None
     out = (result.stdout or "").strip()
     if not out:
@@ -6137,7 +6180,8 @@ def _resolve_worktree_workspace(
         if repo_root is None:
             raise ValueError(
                 f"task {task.id} has workspace_kind=worktree but board "
-                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
+                f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo. "
+                f"Checked path: {anchor}"
             )
         target = repo_root / ".worktrees" / task.id
         _ensure_git_worktree(repo_root, target, branch_name)
@@ -6165,7 +6209,8 @@ def _resolve_worktree_workspace(
     if repo_root is None:
         raise ValueError(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
-            "and does not point at a git repo root"
+            f"and does not point at a git repo root. "
+            f"Resolved path: {requested_resolved}"
         )
     _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
