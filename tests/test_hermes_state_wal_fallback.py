@@ -14,6 +14,7 @@ filesystem".
 """
 
 import sqlite3
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -149,6 +150,28 @@ class TestApplyWalWithFallback:
 
 
 class TestGetLastInitError:
+    def test_waits_for_concurrent_writer_lock(self):
+        """Readers wait until the shared last-error lock is released."""
+        hermes_state._set_last_init_error("OperationalError: locking protocol")
+        started = threading.Event()
+        finished = threading.Event()
+        result = []
+
+        def read_error():
+            started.set()
+            result.append(get_last_init_error())
+            finished.set()
+
+        reader = threading.Thread(target=read_error, daemon=True)
+        with hermes_state._last_init_error_lock:
+            reader.start()
+            assert started.wait(timeout=1)
+            finished_while_locked = finished.wait(timeout=0.1)
+
+        reader.join(timeout=1)
+        assert not reader.is_alive()
+        assert finished_while_locked is False
+        assert result == ["OperationalError: locking protocol"]
 
 
     def test_captures_cause_on_failed_init(self, tmp_path):
