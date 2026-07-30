@@ -8,6 +8,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@nous-research/ui/ui/c
 import { Switch } from "@nous-research/ui/ui/components/switch";
 
 import { useI18n } from "@/i18n";
+import type { Translations } from "@/i18n";
 import { api, type ChannelCapability, type ChannelMcpPolicy } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -27,8 +28,38 @@ const HIGH_IMPACT = new Set([
   "cronjob",
 ]);
 
+const CHANNEL_COPY = {
+  abilitiesEnabled: "Enabled abilities",
+  channelCapabilitiesDescription:
+    "Choose the exact toolsets and MCP access available to messages from this channel.",
+  channelCapabilitiesFailed: "Failed to save channel abilities.",
+  channelCapabilitiesSaved: "Channel abilities saved.",
+  channels: "Channel abilities",
+  changesNewSessions: "Changes apply to new Agent sessions.",
+  customBoundary: "Custom boundary",
+  highImpact: "High impact",
+  inheritedDefaults: "Inherited defaults",
+  mcpAccess: "MCP access",
+  mcpAll: "All enabled MCP servers",
+  mcpNone: "No MCP servers",
+  mcpSelected: "Selected MCP servers",
+  noMcpServers: "No enabled MCP servers are available.",
+  requiredAbilities: "Required channel abilities",
+  requiredAbilitiesDescription:
+    "These platform-native abilities are always available on this channel.",
+  saveCapabilities: "Save abilities",
+  savingCapabilities: "Saving…",
+} as const;
+
+type ChannelCopyKey = keyof typeof CHANNEL_COPY;
+
+function channelText(skills: Translations["skills"], key: ChannelCopyKey): string {
+  return skills[key] ?? CHANNEL_COPY[key];
+}
+
 export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: Props) {
   const { t } = useI18n();
+  const loadFailed = channelText(t.skills, "channelCapabilitiesFailed");
   const [channels, setChannels] = useState<ChannelCapability[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -47,12 +78,12 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
         setChannels(rows);
         setSelected(rows[0]?.platform ?? null);
       })
-      .catch(() => !cancelled && onError(t.skills.channelCapabilitiesFailed))
+      .catch(() => !cancelled && onError(loadFailed))
       .finally(() => !cancelled && setLoading(false));
     return () => {
       cancelled = true;
     };
-  }, [onError, profile, t.skills.channelCapabilitiesFailed]);
+  }, [loadFailed, onError, profile]);
 
   const channel = useMemo(
     () => channels.find((row) => row.platform === selected) ?? null,
@@ -114,9 +145,9 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
           row.platform === result.channel.platform ? result.channel : row,
         ),
       );
-      onSaved(t.skills.channelCapabilitiesSaved);
+      onSaved(channelText(t.skills, "channelCapabilitiesSaved"));
     } catch {
-      onError(t.skills.channelCapabilitiesFailed);
+      onError(loadFailed);
     } finally {
       setSaving(false);
     }
@@ -138,7 +169,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
         <CardHeader className="px-3 py-3">
           <CardTitle className="flex items-center gap-2 text-sm">
             <Network className="h-4 w-4" />
-            {t.skills.channels}
+            {channelText(t.skills, "channels")}
           </CardTitle>
         </CardHeader>
         <CardContent className="grid gap-1 px-2 pb-3">
@@ -170,20 +201,20 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                   {channel.label}
                 </CardTitle>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {t.skills.channelCapabilitiesDescription}
+                  {channelText(t.skills, "channelCapabilitiesDescription")}
                 </p>
               </div>
               <Badge tone="secondary">
                 {channel.explicit
-                  ? t.skills.customBoundary
-                  : t.skills.inheritedDefaults}
+                  ? channelText(t.skills, "customBoundary")
+                  : channelText(t.skills, "inheritedDefaults")}
               </Badge>
             </div>
           </CardHeader>
           <CardContent className="grid gap-6 px-4 pb-5">
             <section>
               <div className="mb-2 flex items-center justify-between">
-                <h3 className="text-sm font-medium">{t.skills.abilitiesEnabled}</h3>
+                <h3 className="text-sm font-medium">{channelText(t.skills, "abilitiesEnabled")}</h3>
                 <span className="text-xs text-muted-foreground">
                   {toolsets.size}/{channel.toolsets.length}
                 </span>
@@ -203,7 +234,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                         {HIGH_IMPACT.has(item.name) && (
                           <Badge tone="warning" className="text-[10px]">
                             <AlertTriangle className="mr-1 h-3 w-3" />
-                            {t.skills.highImpact}
+                            {channelText(t.skills, "highImpact")}
                           </Badge>
                         )}
                       </div>
@@ -224,10 +255,10 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
             {channel.implicit_toolsets.length > 0 && (
               <section>
                 <h3 className="mb-2 text-sm font-medium">
-                  {t.skills.requiredAbilities}
+                  {channelText(t.skills, "requiredAbilities")}
                 </h3>
                 <p className="mb-2 text-xs text-muted-foreground">
-                  {t.skills.requiredAbilitiesDescription}
+                  {channelText(t.skills, "requiredAbilitiesDescription")}
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {channel.implicit_toolsets.map((item) => (
@@ -240,7 +271,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
             )}
 
             <section>
-              <h3 className="mb-2 text-sm font-medium">{t.skills.mcpAccess}</h3>
+              <h3 className="mb-2 text-sm font-medium">{channelText(t.skills, "mcpAccess")}</h3>
               <div className="flex flex-wrap gap-2">
                 {(["all", "none", "allowlist"] as const).map((mode) => (
                   <Button
@@ -250,10 +281,10 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                     onClick={() => setMcpMode(mode)}
                   >
                     {mode === "all"
-                      ? t.skills.mcpAll
+                      ? channelText(t.skills, "mcpAll")
                       : mode === "none"
-                        ? t.skills.mcpNone
-                        : t.skills.mcpSelected}
+                        ? channelText(t.skills, "mcpNone")
+                        : channelText(t.skills, "mcpSelected")}
                   </Button>
                 ))}
               </div>
@@ -261,7 +292,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                 <div className="mt-3 grid gap-2 sm:grid-cols-2">
                   {channel.mcp.available.length === 0 ? (
                     <p className="text-xs text-muted-foreground">
-                      {t.skills.noMcpServers}
+                      {channelText(t.skills, "noMcpServers")}
                     </p>
                   ) : (
                     channel.mcp.available.map((server) => (
@@ -282,10 +313,12 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
 
             <div className="flex items-center justify-between gap-3 border-t border-border pt-4">
               <p className="text-xs text-muted-foreground">
-                {t.skills.changesNewSessions}
+                {channelText(t.skills, "changesNewSessions")}
               </p>
               <Button onClick={() => void save()} disabled={saving}>
-                {saving ? t.skills.savingCapabilities : t.skills.saveCapabilities}
+                {saving
+                  ? channelText(t.skills, "savingCapabilities")
+                  : channelText(t.skills, "saveCapabilities")}
               </Button>
             </div>
           </CardContent>
