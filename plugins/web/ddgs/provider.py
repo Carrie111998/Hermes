@@ -105,29 +105,6 @@ def _plugins_path_entry() -> str:
     )
 
 
-def _durable_lazy_target_entry() -> str:
-    """Return the durable lazy-install dir, or "" when not in that mode.
-
-    Sealed-venv deployments (the Docker image sets
-    ``HERMES_DISABLE_LAZY_INSTALLS=1`` + ``HERMES_LAZY_INSTALL_TARGET``)
-    install ``ddgs`` into a writable directory outside the venv. The gateway
-    imports from it because ``activate_durable_lazy_target()`` puts it on
-    ``sys.path`` at startup — but the worker is spawned as a bare script and
-    never runs that bootstrap, so it must be told on ``PYTHONPATH`` instead.
-    Relying on an inherited ``PYTHONPATH`` is not enough: the value reaches
-    ``os.environ`` from ``.env`` too late to be guaranteed here (#75025).
-    """
-    try:
-        from tools.lazy_deps import _lazy_install_target
-
-        target = _lazy_install_target()
-        if target is not None and target.exists():
-            return str(target)
-    except Exception:  # noqa: BLE001 — never block a search on this
-        pass
-    return ""
-
-
 def _terminate_and_reap(
     proc: Optional[subprocess.Popen],
     *,
@@ -187,17 +164,13 @@ def _run_ddgs_search_bounded(query: str, safe_limit: int) -> list[dict[str, Any]
 
     # Running the worker as a script puts ``plugins/web/ddgs/`` on ``sys.path[0]``,
     # which breaks ``import plugins...``. Prepend the path entry that makes the
-    # live ``plugins`` package importable (source tree or site-packages), plus
-    # the durable lazy-install target holding ``ddgs`` itself on sealed-venv
-    # deployments.
-    for path_entry in (_plugins_path_entry(), _durable_lazy_target_entry()):
-        child_pythonpath = env.get("PYTHONPATH", "")
-        if path_entry and path_entry not in child_pythonpath.split(os.pathsep):
-            env["PYTHONPATH"] = (
-                path_entry + os.pathsep + child_pythonpath
-                if child_pythonpath
-                else path_entry
-            )
+    # live ``plugins`` package importable (source tree or site-packages).
+    child_pythonpath = env.get("PYTHONPATH", "")
+    path_entry = _plugins_path_entry()
+    if path_entry and path_entry not in child_pythonpath.split(os.pathsep):
+        env["PYTHONPATH"] = (
+            path_entry + os.pathsep + child_pythonpath if child_pythonpath else path_entry
+        )
 
     worker_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_search_worker.py")
     # Platform-only spawn knobs — stdin/stdout/stderr must stay as explicit
