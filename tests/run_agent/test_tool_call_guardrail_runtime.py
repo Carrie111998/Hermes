@@ -248,9 +248,9 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
 
     original_before_call = agent._tool_guardrails.before_call
 
-    def observe_guardrail(name, args):
+    def observe_guardrail(name, args, **kwargs):
         observed["guardrail"].append((name, dict(args)))
-        return original_before_call(name, args)
+        return original_before_call(name, args, **kwargs)
 
     def relay_execute(name, args, callback, **kwargs):
         del name, args, kwargs
