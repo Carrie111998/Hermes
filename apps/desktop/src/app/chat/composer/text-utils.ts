@@ -1,10 +1,13 @@
 import { DATA_IMAGE_URL_RE, dataUrlToBlob } from '@/lib/embedded-images'
+import { $reactionsEnabled } from '@/store/reactions-enabled'
+
+import { serializeTextBefore } from './rich-editor'
 
 export interface TriggerState {
   /** True for a `/` typed mid-message — an inline skill/command reference in
    *  prose rather than a command invocation. Arg completion doesn't apply. */
   inline?: boolean
-  kind: '@' | '/'
+  kind: '@' | '/' | ':'
   query: string
   tokenLength: number
 }
@@ -36,9 +39,18 @@ export interface TriggerState {
 // The inline shape is what makes skills reachable anywhere in a prompt. Both
 // shapes need the trailing `$`: detection runs against the text BEFORE the
 // caret, so the match must end where the user is typing.
-const AT_TRIGGER_RE = /(?:^|[\s])(@)([^\s@]*)$/
+//
+// U+FFFC is the placeholder textBeforeCaret emits for a committed chip. A chip
+// edge is a token boundary just like whitespace (upstream assistant-ui's
+// Lexical DirectivePlugin gets the same semantics from node boundaries), so
+// `@` or `/` typed immediately after a pill still opens the popover.
+const AT_TRIGGER_RE = /(?:^|[\s\uFFFC])(@)([^\s@\uFFFC]*)$/
 const SLASH_COMMAND_TRIGGER_RE = /^(\/)((?:[a-zA-Z][\w-]*(?:\s+\S*)*)?)$/
-const SLASH_INLINE_TRIGGER_RE = /[\s](\/)([a-zA-Z][\w-]*)?$/
+const SLASH_INLINE_TRIGGER_RE = /[\s\uFFFC](\/)([a-zA-Z][\w-]*)?$/
+// `:joy` → emoji completions, Slack-style. Boundary-anchored so a mid-word
+// colon (`localhost:8080`, `note:`) never fires; two chars minimum so a bare
+// `:` or `:D` smiley doesn't open a popover the user didn't ask for.
+const EMOJI_TRIGGER_RE = /(?:^|[\s\uFFFC])(:)([a-zA-Z0-9_+-]{2,})$/
 
 /** Stable key for paste dedupe — `items` and `files` often mirror the same image as different objects. */
 export function blobDedupeKey(blob: Blob): string {
@@ -112,7 +124,17 @@ export function extractClipboardImageBlobs(clipboard: DataTransfer): Blob[] {
   return blobs
 }
 
-/** Caret-anchored text before the cursor, or null if the selection isn't a collapsed caret inside `editor`. */
+/** Caret-anchored text before the cursor, or null if the selection isn't a
+ *  collapsed caret inside `editor`.
+ *
+ *  Chips are ATOMIC to trigger detection: a committed pill must not leak its
+ *  label text into the string the trigger regexes see. A `/work` pill whose
+ *  label serialized into this text made the `^`-anchored command regex treat
+ *  everything after it as that command's argument — which silenced the `@`
+ *  popover for the rest of the message (`/work @Desk` → no trigger → the
+ *  typed path never chips and submits as plain text). Each chip contributes
+ *  an object-replacement placeholder instead, and <br> contributes a newline
+ *  so a trigger at the start of a wrapped line still detects. */
 export function textBeforeCaret(editor: HTMLDivElement): string | null {
   const sel = window.getSelection()
   const range = sel?.rangeCount ? sel.getRangeAt(0) : null
@@ -121,11 +143,7 @@ export function textBeforeCaret(editor: HTMLDivElement): string | null {
     return null
   }
 
-  const before = range.cloneRange()
-  before.selectNodeContents(editor)
-  before.setEnd(range.startContainer, range.startOffset)
-
-  return before.toString()
+  return serializeTextBefore(editor, range.startContainer, range.startOffset)
 }
 
 export function detectTrigger(textBefore: string): TriggerState | null {
@@ -151,6 +169,15 @@ export function detectTrigger(textBefore: string): TriggerState | null {
 
   if (at) {
     return { kind: '@', query: at[2], tokenLength: 1 + at[2].length }
+  }
+
+  // After `@` so a directive starter's colon (`@file:`) stays an `@` query.
+  // Rides the reactions opt-in (Settings → Appearance) — both are one
+  // "emoji features" surface, off by default.
+  const emoji = $reactionsEnabled.get() ? EMOJI_TRIGGER_RE.exec(textBefore) : null
+
+  if (emoji) {
+    return { kind: ':', query: emoji[2], tokenLength: 1 + emoji[2].length }
   }
 
   return null
