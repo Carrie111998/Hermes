@@ -85,6 +85,29 @@ class TestCollectKanbanNotifications:
         # respawned task's next terminal event still reaches the user.
         assert len(_sub_rows(tid)) == 1
 
+    def test_delivers_dependency_wait_reason_and_keeps_subscription(self):
+        tid = _create_subscribed_task()
+        conn = kb.connect()
+        try:
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            assert kb.block_task(
+                conn,
+                tid,
+                reason="upstream lane is unfinished",
+                kind="dependency",
+                expected_run_id=claimed.current_run_id,
+            )
+        finally:
+            conn.close()
+
+        texts = _collect_kanban_notifications(_session())
+
+        assert len(texts) == 1
+        assert "dependency wait" in texts[0]
+        assert "upstream lane is unfinished" in texts[0]
+        assert len(_sub_rows(tid)) == 1
+
     def test_ignores_other_sessions_and_platforms(self):
         tid_other_session = _create_subscribed_task(chat_id="some-other-session")
         tid_gateway = _create_subscribed_task(platform="telegram", chat_id="chat-1")
@@ -168,6 +191,16 @@ class TestFormatKanbanEventText:
         assert "needs creds" in text
         assert "[main]" in text
         assert "@worker" in text
+
+    def test_dependency_wait_includes_reason(self):
+        ev = SimpleNamespace(
+            kind="dependency_wait", payload={"reason": "awaiting upstream lane"}
+        )
+        text = _format_kanban_event_text(self.SUB, self.TASK, ev, "main")
+        assert text is not None
+        assert "dependency wait" in text
+        assert "awaiting upstream lane" in text
+        assert "t_abc123" in text
 
     def test_completed_prefers_payload_summary(self):
         ev = SimpleNamespace(kind="completed", payload={"summary": "first line\nsecond"})

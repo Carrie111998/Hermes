@@ -160,6 +160,51 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_kanban_notifier_delivers_dependency_wait_reason(tmp_path, monkeypatch):
+    """A terminal dependency wait is actionable, not a silent generic block."""
+    db_path = tmp_path / "dependency-wait.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="wait for upstream", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="upstream lane is unfinished",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "dependency wait" in adapter.sent[0]["text"]
+    assert "upstream lane is unfinished" in adapter.sent[0]["text"]
+
+
+def test_kanban_db_path_is_test_isolated_from_real_home():
+    hermes_home = Path(kb.kanban_home())
+    production_db = Path.home() / ".hermes" / "kanban.db"
+    assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
+    assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+
 class FailingAdapter:
     """Adapter whose send() always raises, simulating a transient send error."""
 

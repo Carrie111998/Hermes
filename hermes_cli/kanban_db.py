@@ -102,16 +102,13 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
-# Typed block reasons. Distinguishes the two fundamentally different things a
-# worker (or human) means by "blocked", so each can be routed differently
-# instead of all landing in one undifferentiated ``blocked`` bucket that a cron
+# Typed block reasons distinguish why work stopped so routing stays explicit
+# instead of all failures landing in one undifferentiated bucket that a cron
 # unblocks → worker re-blocks → cron unblocks … forever.
 #
-#   * ``dependency``   — can't proceed until another task finishes. Routed to
-#                        ``todo`` (NOT ``blocked``) so the existing
-#                        parent-gating / ``recompute_ready`` machinery promotes
-#                        it automatically once parents are done. No human, no
-#                        cron, no retry storm.
+#   * ``dependency``   — an external/cyclic/local dependency is unresolved.
+#                        This is a terminal ``blocked`` outcome and requires an
+#                        explicit ``unblock`` after the dependency is cleared.
 #   * ``needs_input``  — needs a human decision/answer it cannot derive.
 #   * ``capability``   — hit a hard wall (no access, missing creds, an action no
 #                        AI agent can perform). Genuinely human-only.
@@ -5511,26 +5508,12 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    recurrences = 0
-    with write_txn(conn):
-        cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if cur_row is None:
-            return False
-        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
-        prev_recurrences = (
-            int(cur_row["block_recurrences"])
-            if "block_recurrences" in cur_row.keys()
-            and cur_row["block_recurrences"] is not None
-            else 0
-        )
-
-        # A dependency wait is a terminal worker outcome, not a dispatcher
-        # retry request. Keep it sticky even when no local parent edge exists;
-        # an explicit unblock is the only safe retry authorization.
-        if kind == "dependency":
+    # Handle dependency waits in their own transaction so the lifecycle hook
+    # below runs only after COMMIT. A plugin may open a second connection to
+    # inspect or mutate the terminal task; invoking it while this connection
+    # owns the write lock would expose stale state and can deadlock its write.
+    if kind == "dependency":
+        with write_txn(conn):
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5560,16 +5543,33 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
             )
-            _blocked_task = get_task(conn, task_id)
-            _fire_kanban_lifecycle_hook(
-                "kanban_task_blocked",
-                task_id,
-                board=get_current_board(),
-                assignee=_blocked_task.assignee if _blocked_task else None,
-                run_id=run_id,
-                reason=reason,
-            )
-            return True
+            blocked_task = get_task(conn, task_id)
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=blocked_task.assignee if blocked_task else None,
+            run_id=run_id,
+            reason=reason,
+        )
+        return True
+
+    routed_to = "blocked"
+    recurrences = 0
+    with write_txn(conn):
+        cur_row = conn.execute(
+            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if cur_row is None:
+            return False
+        prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
+        prev_recurrences = (
+            int(cur_row["block_recurrences"])
+            if "block_recurrences" in cur_row.keys()
+            and cur_row["block_recurrences"] is not None
+            else 0
+        )
 
         # Truly-blocked kinds. Increment the unblock-loop counter when this is a
         # re-block for the SAME reason after a prior unblock. block_task only
@@ -5693,18 +5693,20 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo` or recoverable `blocked` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
     entry. Refuses to promote if any parent dep is not in a terminal
-    state (`done`/`archived`) unless ``force=True``. Does NOT change
-    assignee or claim state. Returns ``(True, None)`` on success and
-    ``(False, reason)`` if refused. ``dry_run=True`` validates the
-    promotion would succeed without mutating state.
+    state (`done`/`archived`) unless ``force=True``. A terminal
+    ``dependency_wait`` is fail-closed even with ``force=True``: only
+    ``unblock_task`` may authorize its retry. Does NOT change assignee or
+    claim state. Returns ``(True, None)`` on success and ``(False, reason)``
+    if refused. ``dry_run=True`` validates the promotion would succeed
+    without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
@@ -5714,6 +5716,16 @@ def promote_task(
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
             f"'todo' or 'blocked'"
+        )
+
+    if (
+        cur_status == "blocked"
+        and row["block_kind"] == "dependency"
+        and _has_sticky_block(conn, task_id)
+    ):
+        return False, (
+            f"task {task_id} is waiting on a terminal dependency_wait; "
+            "use unblock after the dependency is resolved"
         )
 
     if not force:

@@ -65,6 +65,100 @@ def test_claim_fires_hook(kanban_home, captured_hooks):
     assert kw["run_id"] is not None
 
 
+def test_complete_fires_hook_with_summary(kanban_home, captured_hooks):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.complete_task(conn, tid, summary="all done")
+    finally:
+        conn.close()
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_completed"]
+    assert len(fired) == 1
+    kw = fired[0][1]
+    assert kw["task_id"] == tid
+    assert kw["summary"] == "all done"
+    assert kw["assignee"] == "worker"
+
+
+def test_block_fires_hook_with_reason(kanban_home, captured_hooks):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="t", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="needs human")
+    finally:
+        conn.close()
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_blocked"]
+    assert len(fired) == 1
+    kw = fired[0][1]
+    assert kw["task_id"] == tid
+    assert kw["reason"] == "needs human"
+
+
+def test_dependency_block_hook_runs_after_commit_and_can_mutate_from_second_connection(
+    kanban_home,
+):
+    """The dependency-wait hook sees committed state and never inherits its lock.
+
+    A plugin commonly opens its own connection to inspect the terminal task and
+    append a follow-up comment.  This is only safe after the originating write
+    transaction has committed: while it is still open the observer sees stale
+    state and its mutation contends on SQLite's write lock.
+    """
+    mgr = get_plugin_manager()
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    observed = {}
+
+    def observe_and_comment(**kw):
+        with kb.connect() as observer:
+            task = kb.get_task(observer, kw["task_id"])
+            run = kb.get_run(observer, kw["run_id"])
+            observed.update(
+                status=task.status if task else None,
+                block_kind=task.block_kind if task else None,
+                run_ended=run.ended_at is not None if run else False,
+                event_kinds=[event.kind for event in kb.list_events(observer, kw["task_id"])],
+            )
+            kb.add_comment(observer, kw["task_id"], "hook", "post-commit observer")
+
+    mgr._hooks.setdefault("kanban_task_blocked", []).append(observe_and_comment)
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="wait for dependency", assignee="worker")
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None
+            assert kb.block_task(
+                conn,
+                tid,
+                reason="upstream lane is unfinished",
+                kind="dependency",
+                expected_run_id=claimed.current_run_id,
+            )
+    finally:
+        mgr._hooks = saved
+
+    assert observed == {
+        "status": "blocked",
+        "block_kind": "dependency",
+        "run_ended": True,
+        "event_kinds": ["created", "claimed", "dependency_wait"],
+    }
+    with kb.connect() as verify:
+        assert [comment.body for comment in kb.list_comments(verify, tid)] == [
+            "post-commit observer"
+        ]
+
+
+def test_no_hook_on_failed_transition(kanban_home, captured_hooks):
+    """complete_task on an unclaimed/nonexistent task fires no hook."""
+    conn = kb.connect()
+    try:
+        # Completing a task that doesn't exist returns False without firing.
+        assert kb.complete_task(conn, "t_doesnotexist", summary="x") is False
+    finally:
+        conn.close()
+    assert [e for e in captured_hooks if e[0] == "kanban_task_completed"] == []
 
 
 def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):

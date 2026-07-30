@@ -8459,7 +8459,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 # the cursor advances past them and they can't wedge a later completed/blocked
 # event behind an unclaimed row.
 _KANBAN_NOTIFY_KINDS = (
-    "completed", "blocked", "gave_up", "crashed", "timed_out",
+    "completed", "blocked", "dependency_wait", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
@@ -8495,6 +8495,9 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"⏸ {board_tag}{tag}Kanban {task_id} blocked{reason}"
+    if kind == "dependency_wait":
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        return f"⏳ {board_tag}{tag}Kanban {task_id} dependency wait{reason}"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"

@@ -69,6 +69,31 @@ def test_promote_stuck_todo_succeeds(conn):
 
 
 
+def test_promote_refuses_sticky_dependency_wait_even_with_force(conn):
+    """Only unblock may authorize retrying a terminal dependency wait."""
+    tid = kb.create_task(conn, title="external dependency")
+    claimed = kb.claim_task(conn, tid)
+    assert claimed is not None
+    assert kb.block_task(
+        conn,
+        tid,
+        reason="upstream lane is unfinished",
+        kind="dependency",
+        expected_run_id=claimed.current_run_id,
+    )
+
+    ok, err = kb.promote_task(conn, tid, actor="tester", force=True)
+
+    assert ok is False
+    assert err is not None and "dependency_wait" in err and "unblock" in err
+    assert kb.get_task(conn, tid).status == "blocked"  # type: ignore[union-attr]
+
+    assert kb.unblock_task(conn, tid)
+    ok, err = kb.promote_task(conn, tid, actor="tester")
+    assert ok is False
+    assert err is not None and "'ready'" in err
+
+
 # ---------------------------------------------------------------------------
 # CLI `_cmd_promote` — bulk via `--ids` (the issue's anti-respawn use case:
 # promote all children of a closed parent in one command).
@@ -105,3 +130,82 @@ def test_cli_promote_bulk_ids_promotes_all(kanban_home, capsys):
             assert kb.get_task(conn, c).status == "ready"
 
 
+def test_cli_promote_refuses_terminal_dependency_wait(kanban_home, capsys):
+    """The CLI cannot bypass the explicit-unblock gate, even with --force."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="wait on upstream")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="upstream lane is unfinished",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+
+    rc = kb_cli._cmd_promote(_promote_ns(tid, force=True))
+
+    assert rc == 1
+    assert "dependency_wait" in capsys.readouterr().err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"  # type: ignore[union-attr]
+
+
+def test_cli_promote_bulk_partial_failure_exits_1(kanban_home, capsys):
+    """Bulk with one bad id: good ones still promote, exit code reflects failure."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        good = kb.create_task(conn, title="good", parents=[parent])
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(good, ids=["t_nope"]))
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert good in captured.out  # good one promoted
+    assert "t_nope" in captured.err and "not found" in captured.err
+    with kb.connect() as conn:
+        assert kb.get_task(conn, good).status == "ready"
+
+
+def test_cli_promote_bulk_json_emits_list(kanban_home, capsys):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        a = kb.create_task(conn, title="a", parents=[parent])
+        b = kb.create_task(conn, title="b", parents=[parent])
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(a, ids=[b], as_json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, list) and len(payload) == 2
+    assert {r["task_id"] for r in payload} == {a, b}
+    assert all(r["promoted"] for r in payload)
+
+
+def test_cli_promote_single_json_stays_flat_object(kanban_home, capsys):
+    """Back-compat: single-id JSON is still a flat object, not a list."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="c", parents=[parent])
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(child, as_json=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert isinstance(payload, dict)
+    assert payload["task_id"] == child and payload["promoted"] is True
+
+
+def test_cli_promote_dedupes_duplicate_ids(kanban_home, capsys):
+    """Same id in positional + --ids must only attempt the promotion once."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="c", parents=[parent])
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
+    rc = kb_cli._cmd_promote(_promote_ns(child, ids=[child, child]))
+    assert rc == 0
+    with kb.connect() as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) AS n FROM task_events "
+            "WHERE task_id = ? AND kind = 'promoted_manual'",
+            (child,),
+        ).fetchone()["n"]
+    assert n == 1

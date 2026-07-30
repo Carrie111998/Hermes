@@ -657,7 +657,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_promote = sub.add_parser(
         "promote",
-        help="Manually move one or more todo/blocked tasks to ready (recovery path)",
+        help="Manually move todo/blocked tasks to ready (not terminal dependency waits)",
     )
     p_promote.add_argument("task_id")
     p_promote.add_argument(
@@ -2275,14 +2275,12 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                # Report where the task actually landed — dependency blocks go
-                # to todo, and a tripped unblock-loop breaker routes to triage.
+                # Report where the task actually landed. Dependency waits stay
+                # blocked; only a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
                 where = landed.status if landed else "blocked"
                 suffix = f": {reason}" if reason else ""
-                if where == "todo":
-                    print(f"{tid} → todo (dependency wait){suffix}")
-                elif where == "triage":
+                if where == "triage":
                     print(
                         f"{tid} → triage (unblock loop detected — needs a "
                         f"human decision){suffix}"
