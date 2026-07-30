@@ -6803,7 +6803,7 @@ function readDesktopConnectionConfig() {
   // Check if file changed on disk since last read (e.g. modified by another
   // process or an external tool).  Our own writes update the cache inline
   // via writeDesktopConnectionConfig, but external changes would be missed.
-  let mtime = null
+  let mtime: null | number
 
   try {
     mtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
@@ -7768,7 +7768,7 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // for local we fall back to the resolved/started backend.
   let baseUrl
   let token = null
-  let authMode = 'token'
+  let authMode: string
 
   if (wantRemote && block?.url) {
     baseUrl = normalizeRemoteBaseUrl(block.url)
@@ -10669,7 +10669,9 @@ ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
     try {
       fs.mkdirSync(next, { recursive: true })
     } catch (error) {
-      throw new Error(`Could not create directory: ${error.message}`)
+      throw new Error(`Could not create directory: ${error.message}`, {
+        cause: error
+      })
     }
   }
 
