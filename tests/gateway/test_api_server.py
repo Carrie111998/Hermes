@@ -266,11 +266,13 @@ class TestAuth:
             return " ".join(r.getMessage() for r in caplog.records)
 
         missing = reject({})
+        assert "no Authorization header" in missing
         assert "invalid API key" not in missing, (
             f"no credentials were sent, so this must not blame the key: {missing}"
         )
 
         scheme = reject({"Authorization": "Basic dXNlcjpwYXNz"})
+        assert "unsupported Authorization scheme (expected Bearer)" in scheme
         assert "invalid API key" not in scheme, (
             f"a non-Bearer scheme is not a bad key: {scheme}"
         )
@@ -284,15 +286,20 @@ class TestAuth:
         """Classifying the failure must not leak what the client sent."""
         config = PlatformConfig(enabled=True, extra={"key": "sk-test123"})
         adapter = APIServerAdapter(config)
-        request = MagicMock()
-        request.headers = {"Authorization": "Bearer super-secret-wrong-token"}
 
-        with caplog.at_level("WARNING"):
-            adapter._check_auth(request)
+        for authorization in (
+            "Bearer super-secret-wrong-token",
+            "Basic dXNlcjpwYXNz",
+        ):
+            request = MagicMock()
+            request.headers = {"Authorization": authorization}
 
-        logged = " ".join(r.getMessage() for r in caplog.records)
-        assert "super-secret-wrong-token" not in logged
-        assert "dXNlcjpwYXNz" not in logged
+            with caplog.at_level("WARNING"):
+                caplog.clear()
+                adapter._check_auth(request)
+
+            logged = " ".join(r.getMessage() for r in caplog.records)
+            assert authorization.split(" ", 1)[1] not in logged
 
     def test_non_ascii_bearer_token_returns_401_not_500(self):
         """A non-ASCII byte in the bearer token must be rejected with 401, not
@@ -2669,5 +2676,4 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
 
