@@ -557,8 +557,15 @@ def _copy_dist_payload(
     ``preserve_config`` is False (fresh install or ``--force-config`` update).
     ``.env.template`` is renamed to ``.env.EXAMPLE`` in the target to avoid
     shadowing a real ``.env``.
+
+    When the manifest declares ``distribution_owned``, only those paths (plus
+    always-distributed infra like ``.env.template``) are copied.  When the
+    field is unset the entire staged tree (minus user-owned exclusions) is
+    copied — matching the legacy behaviour for manifests that predate the
+    field.
     """
     target.mkdir(parents=True, exist_ok=True)
+    owned = set(manifest.owned_paths()) if manifest.distribution_owned else None
 
     for entry in staged.iterdir():
         name = entry.name
@@ -567,6 +574,8 @@ def _copy_dist_payload(
             continue
         if name == ENV_TEMPLATE_FILENAME:
             shutil.copy2(entry, target / ENV_EXAMPLE_FILENAME)
+            continue
+        if owned is not None and name not in owned:
             continue
         if name == "config.yaml" and preserve_config and (target / "config.yaml").exists():
             # Leave user's config.yaml alone on update
