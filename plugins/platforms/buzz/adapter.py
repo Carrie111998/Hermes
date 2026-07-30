@@ -504,7 +504,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._channel_meta[str(ch["channel_id"])] = ch
         watch = self.channels or list(self._channel_names)
         if not watch:
-            logger.error("Buzz: no channels to watch (configure BUZZ_CHANNELS or join a channel)")
+            logger.error("%s", format_no_channels_error())
             self._set_fatal_error("config_missing", "no Buzz channels to watch", retryable=False)
             return False
 
@@ -1383,11 +1383,60 @@ async def _standalone_send(
     return {"success": True, "message_id": str(data.get("event_id") or "")}
 
 
+def normalize_buzz_auth_tag(raw: str) -> str:
+    """Normalize a pasted NIP-OA auth tag for ``BUZZ_AUTH_TAG``.
+
+    Accepts pretty-printed JSON or compact JSON. Returns compact JSON suitable
+    for ``save_env_value`` (which will quote the line). Empty / whitespace
+    input returns empty string.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return text
+    return json.dumps(parsed, separators=(",", ":"))
+
+
+def buzz_recommended_setup_steps() -> list[str]:
+    """Human-facing recommended path for native Hermes Buzz (path 3).
+
+    Pure strings so docs and the interactive wizard stay in lockstep.
+    """
+    return [
+        "Recommended path for full Hermes (native gateway, not Desktop ACP):",
+        "1. In Buzz Desktop: Create the agent so the community mints identity + NIP-OA auth tag.",
+        "2. Stop the Desktop worker immediately and turn off start-on-launch.",
+        "3. Paste that nsec + auth tag into Hermes (this wizard). Do not leave Desktop ACP running on the same key.",
+        "4. Join the channels you care about and publish a profile so humans can DM / @mention the agent.",
+        "5. Reload the Hermes gateway process and smoke-test: untagged DM replies, channels need a mention.",
+        "Desktop ACP (paths 1/2) is easier for a quick try. Path 3 keeps Hermes memory, skills, cron, and approvals.",
+    ]
+
+
+def format_no_channels_error() -> str:
+    """Actionable error when the agent can auth but watches zero channels."""
+    return (
+        "Buzz: authenticated but watching 0 channels. The agent is not a channel "
+        "member yet, so humans cannot DM or @mention it. Fix: "
+        "`buzz channels join --channel <uuid>` for each channel (or re-run "
+        "`hermes gateway setup` and accept the join-all prompt), then "
+        "`buzz users set-profile --name <AgentName>`. Keep Desktop ACP stopped "
+        "on this key so Hermes owns the identity."
+    )
+
+
 def interactive_setup() -> None:
     """Interactive ``hermes gateway setup`` flow for the Buzz platform.
 
     Lazy-imports ``hermes_cli.setup`` helpers so the plugin stays importable
     in non-CLI contexts (gateway runtime, tests).
+
+    Walks the practical native-gateway path discovered in the field:
+    Desktop mints membership + auth tag, Hermes owns the runtime, channels
+    must be joined after auth or the agent is invisible in DM/@ search.
     """
     from hermes_cli.setup import (
         prompt,
@@ -1408,8 +1457,29 @@ def interactive_setup() -> None:
             return
 
     print_info("Connect Hermes to a Buzz community (Block's Nostr-based human+agent platform).")
-    print_info("   Requires the buzz CLI binary and a Nostr key that is a community member.")
     print()
+    for line in buzz_recommended_setup_steps():
+        print_info(line)
+    print()
+    print_warning(
+        "Do not run Buzz Desktop ACP and the Hermes gateway on the same agent key at once."
+    )
+    print()
+
+    # CLI presence
+    cli_default = get_env_value("BUZZ_CLI_PATH") or ""
+    resolved_cli = _find_buzz_cli(cli_default or None)
+    if resolved_cli:
+        print_info(f"Found buzz CLI: {resolved_cli}")
+    else:
+        print_warning(
+            "buzz CLI not found on PATH. Install from https://github.com/block/buzz "
+            "(cargo build --release -p buzz-cli) or set BUZZ_CLI_PATH."
+        )
+        custom_cli = prompt("Path to buzz binary (or empty to continue anyway)", default="")
+        if custom_cli.strip():
+            save_env_value("BUZZ_CLI_PATH", custom_cli.strip())
+            resolved_cli = custom_cli.strip()
 
     relay = prompt(
         "Relay URL (e.g. https://mycommunity.communities.buzz.xyz)",
@@ -1420,11 +1490,32 @@ def interactive_setup() -> None:
         return
     save_env_value("BUZZ_RELAY_URL", relay.strip())
 
-    key = prompt("Nostr private key (nsec or hex; leave blank to keep current)", password=True)
+    key = prompt(
+        "Agent Nostr private key from Desktop create (nsec or hex; blank keeps current)",
+        password=True,
+    )
     if key:
         save_env_value("BUZZ_PRIVATE_KEY", key.strip())
     elif not _resolve_private_key():
-        print_warning("No private key configured — set BUZZ_PRIVATE_KEY before starting the gateway")
+        print_warning(
+            "No private key configured — set BUZZ_PRIVATE_KEY before starting the gateway"
+        )
+
+    print()
+    print_info(
+        "NIP-OA auth tag (Desktop agent create shows this; required on many community relays)."
+    )
+    print_info('Paste the full JSON array, e.g. ["auth","<owner>","<agent>","<sig>"].')
+    auth_raw = prompt("BUZZ_AUTH_TAG JSON (blank keeps current / none)", default="")
+    if auth_raw.strip():
+        save_env_value("BUZZ_AUTH_TAG", normalize_buzz_auth_tag(auth_raw))
+        print_success("Auth tag saved")
+
+    # Mentions: recommended default for multi-agent channels
+    print()
+    print_info("Mention gating: channels need @mention; DMs always dispatch.")
+    require_mention = prompt_yes_no("Require @mention in channels? (recommended)", True)
+    save_env_value("BUZZ_REQUIRE_MENTION", "true" if require_mention else "false")
 
     channels = prompt(
         "Channel UUIDs to watch (comma-separated, empty = all joined channels)",
@@ -1441,12 +1532,12 @@ def interactive_setup() -> None:
         save_env_value("BUZZ_HOME_CHANNEL", home.strip())
 
     print()
-    print_info("🔒 Access control: restrict who can talk to the agent")
+    print_info("Access control: restrict who can talk to the agent")
     allow_all = prompt_yes_no("Allow all community members to talk to the agent?", False)
     if allow_all:
         save_env_value("BUZZ_ALLOW_ALL_USERS", "true")
         save_env_value("BUZZ_ALLOWED_USERS", "")
-        print_warning("⚠️  Open access — anyone in the community can command the agent.")
+        print_warning("Open access — anyone in the community can command the agent.")
     else:
         save_env_value("BUZZ_ALLOW_ALL_USERS", "false")
         allowed = prompt(
@@ -1455,9 +1546,118 @@ def interactive_setup() -> None:
         )
         save_env_value("BUZZ_ALLOWED_USERS", allowed.replace(" ", "") if allowed else "")
 
+    # Live membership / join assist when CLI + key are present
+    private_key = _resolve_private_key()
+    cli_bin = resolved_cli or _find_buzz_cli(get_env_value("BUZZ_CLI_PATH") or None)
+    if private_key and cli_bin:
+        print()
+        print_info("Probing relay membership with buzz CLI…")
+        env = os.environ.copy()
+        env["BUZZ_RELAY_URL"] = relay.strip()
+        env["BUZZ_PRIVATE_KEY"] = private_key
+        auth_tag = get_env_value("BUZZ_AUTH_TAG") or os.getenv("BUZZ_AUTH_TAG", "")
+        if auth_tag:
+            env["BUZZ_AUTH_TAG"] = auth_tag
+        try:
+            import subprocess
+
+            listed = subprocess.run(
+                [cli_bin, "channels", "list"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+            if listed.returncode != 0:
+                err = (listed.stderr or listed.stdout or "").strip()
+                print_warning(f"Could not list channels yet: {err[:240]}")
+                print_info(
+                    "If you see membership/auth errors, finish Desktop create, copy the "
+                    "auth tag, stop Desktop ACP, then re-run this setup."
+                )
+            else:
+                try:
+                    channels_data = json.loads(listed.stdout or "[]")
+                except ValueError:
+                    channels_data = []
+                if not isinstance(channels_data, list):
+                    channels_data = []
+                print_success(
+                    f"Relay OK — {len(channels_data)} channel(s) visible to this identity"
+                )
+                for ch in channels_data[:12]:
+                    if isinstance(ch, dict):
+                        print_info(
+                            f"  - {ch.get('name') or '(unnamed)'}  {ch.get('channel_id') or ''}"
+                        )
+                # Profile so DM search can find the agent by name
+                display = prompt(
+                    "Agent display name for Buzz profile (blank skips)", default=""
+                )
+                if display.strip():
+                    prof = subprocess.run(
+                        [cli_bin, "users", "set-profile", "--name", display.strip()],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        env=env,
+                    )
+                    if prof.returncode == 0:
+                        print_success(f"Profile name set to {display.strip()}")
+                    else:
+                        print_warning(
+                            f"set-profile failed: {(prof.stderr or prof.stdout or '')[:200]}"
+                        )
+                # Join assist — the field failure mode is "connected but unfindable"
+                if channels_data and prompt_yes_no(
+                    "Join all visible channels now so humans can DM/@mention this agent?",
+                    True,
+                ):
+                    joined = 0
+                    for ch in channels_data:
+                        if not isinstance(ch, dict):
+                            continue
+                        cid = str(ch.get("channel_id") or "").strip()
+                        if not cid:
+                            continue
+                        j = subprocess.run(
+                            [cli_bin, "channels", "join", "--channel", cid],
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=env,
+                        )
+                        if j.returncode == 0:
+                            joined += 1
+                        else:
+                            print_warning(
+                                f"join {cid[:8]}… failed: {(j.stderr or j.stdout or '')[:160]}"
+                            )
+                    print_success(f"Joined {joined}/{len(channels_data)} channel(s)")
+                subprocess.run(
+                    [cli_bin, "users", "set-presence", "--status", "online"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                )
+        except Exception as exc:
+            print_warning(f"Live probe skipped: {exc}")
+    else:
+        print_info("Skipping live probe (need buzz CLI + private key).")
+
     print()
     print_success("Buzz configuration saved to ~/.hermes/.env")
-    print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+    print_info("Smoke checklist after you reload the gateway process:")
+    print_info("  1. Reload Hermes gateway (separate terminal / service supervisor)")
+    print_info("  2. Confirm Desktop ACP is STOPPED for this agent key")
+    print_info("  3. Untagged DM → agent replies")
+    print_info("  4. Channel without mention → silence (if require_mention=true)")
+    print_info("  5. @Agent in channel → reply")
+    print_info(
+        "If DM search cannot find the agent, it is usually not a channel member yet."
+    )
+
 
 
 def register(ctx):

@@ -24,6 +24,9 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_normalize_buzz_auth_tag = _buzz_mod.normalize_buzz_auth_tag
+_buzz_recommended_setup_steps = _buzz_mod.buzz_recommended_setup_steps
+_format_no_channels_error = _buzz_mod.format_no_channels_error
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -45,6 +48,8 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_REQUIRE_MENTION",
 )
 
 
@@ -538,3 +543,25 @@ class TestStandaloneSend:
         assert all("nsec1x" not in str(a) for a in captured["args"])
 
 
+
+
+def test_normalize_buzz_auth_tag_compacts_json():
+    raw = """[\n  \"auth\",\n  \"ownerhex\",\n  \"agenthex\",\n  \"sig\"\n]"""
+    assert _normalize_buzz_auth_tag(raw) == '["auth","ownerhex","agenthex","sig"]'
+    assert _normalize_buzz_auth_tag("   ") == ""
+    assert _normalize_buzz_auth_tag("not-json") == "not-json"
+
+
+def test_buzz_recommended_setup_steps_cover_field_path():
+    steps = "\n".join(_buzz_recommended_setup_steps())
+    assert "Desktop" in steps
+    assert "auth tag" in steps.lower() or "NIP-OA" in steps
+    assert "channel" in steps.lower()
+    assert "ACP" in steps
+
+
+def test_format_no_channels_error_is_actionable():
+    msg = _format_no_channels_error()
+    assert "0 channels" in msg
+    assert "join" in msg.lower()
+    assert "set-profile" in msg or "profile" in msg.lower()
