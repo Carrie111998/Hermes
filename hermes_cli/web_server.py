@@ -161,11 +161,21 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     real gateway on the same HERMES_HOME — whichever process grabs the lock
     first wins the tick.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
     provider = resolve_cron_scheduler()
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    if isinstance(provider, InProcessCronScheduler):
+        provider.start(
+            stop_event,
+            interval=interval,
+            dispatch_scope=_dashboard_background_work_scope,
+        )
+    else:
+        # External providers register their work outside this process; only
+        # the built-in provider can launch an agent inside the dashboard
+        # process while its installation is being updated.
+        provider.start(stop_event, interval=interval)
 
 
 def _warm_gateway_module() -> None:
@@ -219,7 +229,7 @@ async def _lifespan(app: "FastAPI"):
         cron_thread.start()
 
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
-    pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+    pty_reaper_task = asyncio.create_task(_dashboard_pty_reaper_loop())
 
     # Periodic authenticated self-test (feeds the ``dashboard`` component on
     # /api/status).  The loop exits immediately when httpx is unavailable.
@@ -744,9 +754,30 @@ async def _dashboard_health_middleware(request: Request, call_next):
 _DASHBOARD_UPDATE_QUIESCE_LOCK = threading.Lock()
 _DASHBOARD_UPDATE_QUIESCE_ACTIVE = False
 _DASHBOARD_UPDATE_ACTIVE_HTTP = 0
+_DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
 _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS: Dict[asyncio.Task, Any] = {}
 _DASHBOARD_UPDATE_WATCHERS: set[asyncio.Task] = set()
 _DASHBOARD_UPDATE_STATUS_PATH = "/api/actions/hermes-update/status"
+
+
+@contextmanager
+def _dashboard_background_work_scope():
+    """Admit one background operation and track it through completion."""
+    global _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
+
+    with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+        admitted = not _DASHBOARD_UPDATE_QUIESCE_ACTIVE
+        if admitted:
+            _DASHBOARD_UPDATE_ACTIVE_BACKGROUND += 1
+    try:
+        yield admitted
+    finally:
+        if admitted:
+            with _DASHBOARD_UPDATE_QUIESCE_LOCK:
+                _DASHBOARD_UPDATE_ACTIVE_BACKGROUND = max(
+                    _DASHBOARD_UPDATE_ACTIVE_BACKGROUND - 1,
+                    0,
+                )
 
 
 @app.middleware("http")
@@ -822,12 +853,13 @@ async def _begin_dashboard_update_quiesce(timeout: float = 5.0) -> None:
     while time.monotonic() < deadline:
         with _DASHBOARD_UPDATE_QUIESCE_LOCK:
             active_http = _DASHBOARD_UPDATE_ACTIVE_HTTP
+            active_background = _DASHBOARD_UPDATE_ACTIVE_BACKGROUND
             active_ws = [
                 task
                 for task in _DASHBOARD_UPDATE_ACTIVE_WEBSOCKETS
                 if task is not current and not task.done()
             ]
-        if active_http == 0 and not active_ws:
+        if active_http == 0 and active_background == 0 and not active_ws:
             return
         await asyncio.sleep(0.01)
 
@@ -896,7 +928,9 @@ async def _dashboard_selftest_loop() -> None:
         # the probe would false-alarm 401 — skip until the gate is off.
         if getattr(app.state, "auth_required", False):
             continue
-        await _dashboard_selftest_once()
+        with _dashboard_background_work_scope() as admitted:
+            if admitted:
+                await _dashboard_selftest_once()
 
 
 # ---------------------------------------------------------------------------
@@ -4068,7 +4102,7 @@ async def gateway_drain(request: Request):
     from gateway.drain_control import (
         cancel_drain_request,
         drain_requested,
-        write_drain_request,
+        write_operator_drain_request,
     )
 
     try:
@@ -4114,10 +4148,22 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(
+    outcome, payload = write_operator_drain_request(
         principal=str(principal),
         suppress_notification=bool((body or {}).get("suppress_notification", False)),
     )
+    if outcome == "protected":
+        _log.warning(
+            "Gateway drain BEGIN refused for %s: live update owns marker",
+            principal,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Gateway drain is owned by a live Hermes update and "
+                "cannot be replaced until that update finishes"
+            ),
+        )
     _log.info(
         "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
         principal,
@@ -11217,10 +11263,12 @@ async def _auto_archive_ticker_loop(
 
     await asyncio.sleep(initial_delay_s)
     while True:
-        try:
-            await asyncio.to_thread(_sweep)
-        except Exception as exc:
-            _log.debug("auto-archive tick skipped: %s", exc)
+        with _dashboard_background_work_scope() as admitted:
+            if admitted:
+                try:
+                    await asyncio.to_thread(_sweep)
+                except Exception as exc:
+                    _log.debug("auto-archive tick skipped: %s", exc)
         await asyncio.sleep(interval_s)
 
 
@@ -14325,7 +14373,7 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+from hermes_cli.pty_session import PtySessionRegistry, RegistryFull  # noqa: E402
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -14333,6 +14381,19 @@ PTY_REGISTRY = PtySessionRegistry(
     buffer_cap=1 * 1024 * 1024,
     read_timeout=_PTY_READ_CHUNK_TIMEOUT,
 )
+
+
+async def _dashboard_pty_reaper_loop(interval: float = 60.0) -> None:
+    """Reap idle PTYs without crossing a dashboard update boundary."""
+    while True:
+        await asyncio.sleep(interval)
+        with _dashboard_background_work_scope() as admitted:
+            if not admitted:
+                continue
+            try:
+                await PTY_REGISTRY.reap_idle()
+            except Exception:
+                pass
 
 
 async def _legacy_pump(ws: "WebSocket", bridge) -> None:

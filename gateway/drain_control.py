@@ -299,29 +299,59 @@ def cancel_drain_request(
         current = _read_drain_request_unlocked(home=home)
         if current is None:
             return "absent"
-        if current.get("principal") == "hermes-update":
-            try:
-                owner_pid = int(current.get("owner_pid", 0) or 0)
-                owner_start_time = int(
-                    current.get("owner_start_time", 0) or 0
-                )
-            except (TypeError, ValueError):
-                owner_pid = 0
-                owner_start_time = 0
-            if owner_pid > 0 and owner_start_time > 0:
-                try:
-                    from gateway.status import get_process_start_time
-
-                    live_start_time = get_process_start_time(owner_pid)
-                except Exception:
-                    live_start_time = None
-                if live_start_time == owner_start_time:
-                    return "protected"
+        if _live_updater_owns_marker(current):
+            return "protected"
         return (
             "cleared"
             if _clear_drain_request_unlocked(home=home)
             else "absent"
         )
+
+
+def write_operator_drain_request(
+    *,
+    principal: str = "drain-control",
+    suppress_notification: bool = False,
+    home: Optional[Path] = None,
+) -> tuple[str, dict[str, Any]]:
+    """Write an operator drain unless a live updater owns the marker.
+
+    The ownership check and write share the marker transaction, so a dashboard
+    request cannot replace an updater marker after observing it. Returns
+    ``("written", payload)`` or ``("protected", current_marker)``.
+    """
+    payload = _drain_request_payload(
+        principal=principal,
+        suppress_notification=suppress_notification,
+        request_id=None,
+        owner_pid=None,
+        owner_start_time=None,
+    )
+    with _drain_request_transaction(home):
+        current = _read_drain_request_unlocked(home=home)
+        if current is not None and _live_updater_owns_marker(current):
+            return "protected", current
+        atomic_json_write(drain_request_path(home), payload)
+    return "written", payload
+
+
+def _live_updater_owns_marker(marker: dict[str, Any]) -> bool:
+    if marker.get("principal") != "hermes-update":
+        return False
+    try:
+        owner_pid = int(marker.get("owner_pid", 0) or 0)
+        owner_start_time = int(marker.get("owner_start_time", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if owner_pid <= 0 or owner_start_time <= 0:
+        return False
+    try:
+        from gateway.status import get_process_start_time
+
+        live_start_time = get_process_start_time(owner_pid)
+    except Exception:
+        live_start_time = None
+    return live_start_time == owner_start_time
 
 
 def _clear_drain_request_unlocked(*, home: Optional[Path] = None) -> bool:

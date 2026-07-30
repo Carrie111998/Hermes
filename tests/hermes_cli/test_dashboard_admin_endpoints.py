@@ -8,6 +8,7 @@ visible to the CLI data layer), not specific catalog values.
 """
 
 import asyncio
+import contextlib
 import os
 import threading
 from unittest.mock import MagicMock
@@ -1028,6 +1029,60 @@ def test_dashboard_quiesce_allows_only_update_status(monkeypatch):
         client.get("/api/actions/hermes-update/status").status_code
         == 200
     )
+
+
+@pytest.mark.asyncio
+async def test_dashboard_quiesce_waits_for_background_work_and_rejects_new():
+    import hermes_cli.web_server as ws
+
+    ws._end_dashboard_update_quiesce()
+    ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+    quiesce_task = None
+    try:
+        with ws._dashboard_background_work_scope() as admitted:
+            assert admitted is True
+            quiesce_task = asyncio.create_task(
+                ws._begin_dashboard_update_quiesce(timeout=0.5)
+            )
+            await asyncio.sleep(0.05)
+            assert quiesce_task.done() is False
+
+        await quiesce_task
+        assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        assert ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND == 0
+        with ws._dashboard_background_work_scope() as admitted:
+            assert admitted is False
+    finally:
+        if quiesce_task is not None and not quiesce_task.done():
+            quiesce_task.cancel()
+        ws._end_dashboard_update_quiesce()
+        ws._DASHBOARD_UPDATE_ACTIVE_BACKGROUND = 0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_pty_reaper_pauses_during_update(monkeypatch):
+    import hermes_cli.web_server as ws
+
+    calls = 0
+
+    async def _reap_idle():
+        nonlocal calls
+        calls += 1
+
+    monkeypatch.setattr(ws.PTY_REGISTRY, "reap_idle", _reap_idle)
+    monkeypatch.setattr(ws, "_DASHBOARD_UPDATE_QUIESCE_ACTIVE", True)
+    task = asyncio.create_task(ws._dashboard_pty_reaper_loop(interval=0.001))
+    try:
+        await asyncio.sleep(0.01)
+        assert calls == 0
+        ws._end_dashboard_update_quiesce()
+        await asyncio.sleep(0.01)
+        assert calls > 0
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        ws._end_dashboard_update_quiesce()
 
 
 @pytest.mark.asyncio
