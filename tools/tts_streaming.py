@@ -271,17 +271,22 @@ class OpenAIStreamer(StreamingTTSProvider):
         super().__init__(tts_config, section)
         configured_rate = section.get("pcm_sample_rate", self.sample_rate)
         try:
-            self.sample_rate = int(configured_rate)
+            parsed_rate = int(configured_rate)
         except (TypeError, ValueError):
-            raise ValueError(
-                "tts.openai.pcm_sample_rate must be a positive integer"
-            ) from None
+            parsed_rate = None
         if (
             isinstance(configured_rate, bool)
             or (isinstance(configured_rate, float) and not configured_rate.is_integer())
-            or self.sample_rate <= 0
+            or parsed_rate is None
+            or parsed_rate <= 0
         ):
-            raise ValueError("tts.openai.pcm_sample_rate must be a positive integer")
+            logger.warning(
+                "Invalid tts.openai.pcm_sample_rate %r; falling back to %d Hz",
+                configured_rate,
+                self.sample_rate,
+            )
+            return
+        self.sample_rate = parsed_rate
 
     @staticmethod
     def available() -> bool:

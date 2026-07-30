@@ -147,7 +147,7 @@ The rewrite uses `auxiliary.tts_audio_tags` and defaults to your main chat model
 
 **Language (OpenAI-compatible endpoints)**: `tts.openai.language` is forwarded to the endpoint as a `lang_code` request parameter. It is intended for OpenAI-compatible TTS servers that support `lang_code` — for example [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI), where `language: "es"` selects the Spanish phonemizer instead of the English default. Leave it unset when using the official OpenAI API, which does not accept this parameter. When unset, nothing extra is sent.
 
-**PCM playback rate (OpenAI-compatible endpoints)**: `tts.openai.pcm_sample_rate` tells Hermes how to play the headerless raw PCM returned by the endpoint. The official OpenAI API uses `24000`, while compatible servers may use a model-native rate—for example, [openedai-speech](https://github.com/matatonic/openedai-speech) emits `22050` Hz PCM for its Piper-backed `tts-1` model. Set this value to the endpoint's output rate or speech will play at the wrong speed and pitch.
+**PCM playback rate (OpenAI-compatible endpoints)**: `tts.openai.pcm_sample_rate` tells Hermes how to play the headerless raw PCM returned by the endpoint. The official OpenAI API uses `24000`, while compatible servers may use a model-native rate—for example, [openedai-speech](https://github.com/matatonic/openedai-speech) emits `22050` Hz PCM for its Piper-backed `tts-1` model. Set this value to the endpoint's output rate or speech will play at the wrong speed and pitch. The value must be a positive integer; invalid values emit a warning and fall back to `24000` Hz without disabling streaming.
 
 
 ### Input length limits
