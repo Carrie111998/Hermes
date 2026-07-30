@@ -4,6 +4,7 @@ import { act, cleanup, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
+import { TRANSLATIONS } from '@/i18n/catalog'
 import type { WebhookRoute, WebhooksResponse } from '@/types/hermes'
 
 const getWebhooks = vi.fn()
@@ -113,5 +114,27 @@ describe('WebhooksView subscription status pill', () => {
     const header = await detailHeader('payload-only')
     expect(within(header).getByText('Enabled')).toBeTruthy()
     expect(within(header).getByText('deliver only')).toBeTruthy()
+  })
+})
+
+describe('webhook status labels across locale catalogs', () => {
+  it('keeps distinct non-empty status labels in every desktop locale', () => {
+    const expected: Record<string, { disabled: string; enabled: string }> = {
+      ar: { disabled: 'معطّل', enabled: 'مفعّل' },
+      en: { disabled: 'Disabled', enabled: 'Enabled' },
+      ja: { disabled: '無効', enabled: '有効' },
+      zh: { disabled: '已禁用', enabled: '已启用' },
+      'zh-hant': { disabled: '已停用', enabled: '已啟用' }
+    }
+
+    for (const [locale, t] of Object.entries(TRANSLATIONS)) {
+      const labels = expected[locale]
+      expect(labels, `missing expectation for ${locale}`).toBeTruthy()
+      expect(t.webhooks.statusEnabled).toBe(labels.enabled)
+      expect(t.webhooks.statusDisabled).toBe(labels.disabled)
+      // Keep the old dead-key trap closed: messaging platform states must not
+      // grow an `enabled` entry that webhooks no longer consume.
+      expect(Object.hasOwn(t.messaging.states, 'enabled')).toBe(false)
+    }
   })
 })
