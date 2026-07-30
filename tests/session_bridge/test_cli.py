@@ -13,13 +13,13 @@ from typing import Any, Mapping
 
 import pytest
 
-import session_bridge.cli as cli_module
-from agent.transports.codex_app_server import CodexAppServerError
-
 # The canonical runner uses ``env -i``. Windows' stdlib ignores HOME and needs
 # USERPROFILE for ``Path.home()`` during imported-module initialization.
 if os.name == "nt" and "USERPROFILE" not in os.environ:
     os.environ["USERPROFILE"] = os.environ["HOME"]
+
+import session_bridge.cli as cli_module
+from agent.transports.codex_app_server import CodexAppServerError
 
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
@@ -77,6 +77,7 @@ from session_bridge.sidebar_executor import (
     SidebarExecutionResult,
     SidebarExecutor,
 )
+from session_bridge.sidebar_placement import SidebarPlacementError
 from session_bridge.sidebar_hydration_executor import (
     SidebarHydrationExecutor,
     SidebarHydrationExecutionResult,
@@ -3086,8 +3087,16 @@ class _SidebarStatusStore:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.payload = payload
 
-    def sidebar_delivery_status(self, *, now: float) -> dict[str, Any]:
+    def sidebar_delivery_status(
+        self,
+        *,
+        now: float,
+        inbox_cwd: str | None,
+        placement_generation: int,
+    ) -> dict[str, Any]:
         assert now == 1_000.0
+        assert inbox_cwd is None
+        assert placement_generation == 1
         return dict(self.payload)
 
 
@@ -3151,6 +3160,72 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
         "delivery_latency_seconds": {},
     })
     assert fresh_pending.sidebar_status()["healthy"] is True
+
+
+def test_sidebar_status_exposes_only_sanitized_placement_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "counts": {},
+        "placement": {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 12,
+            "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": 1234.0},
+        },
+    })
+
+    assert backend.sidebar_status()["placement"] == {
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+        "generation": 1,
+        "verified_visible": 12,
+        "mismatch_count": 0,
+        "canary": {"status": "passed", "verified_at": 1234.0},
+    }
+
+
+@pytest.mark.parametrize(
+    "placement",
+    (
+        {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": float("nan"),
+            "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": 1234.0},
+        },
+        {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 1,
+            "mismatch_count": 0,
+            "source_cwd": "C:\\secret\\source",
+            "canary": {"status": "passed", "verified_at": 1234.0},
+        },
+        {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 1,
+            "mismatch_count": 0,
+            "canary": {
+                "status": "passed",
+                "verified_at": 1234.0,
+                "canary_identity_digest": "a" * 64,
+            },
+        },
+    ),
+)
+def test_sidebar_status_rejects_unsanitized_placement_health(
+    placement: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({"counts": {}, "placement": placement})
+
+    with pytest.raises(ConfigurationFailure, match="invalid_sidebar_status"):
+        backend.sidebar_status()
 
 
 def test_sidebar_status_preserves_raw_failures_but_waives_exact_terminal_resolution(
@@ -6378,6 +6453,176 @@ def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
     assert isinstance(captured["native"], CodexAppServerSidebarDelivery)
     assert captured["marker_secret"] == marker_key
     assert client.closed is True
+
+
+def test_production_sidebar_executor_composes_profile_safe_candidate_placement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox = tmp_path / "profile-home"
+    source = tmp_path / "source-worktree"
+    inbox.mkdir()
+    source.mkdir()
+    db = SessionDB(tmp_path / "state.db")
+    store = SessionBridgeStore(db)
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            sidebar=replace(
+                SidebarConfig(),
+                enabled=True,
+                continuous=False,
+                inbox_cwd=str(inbox),
+                placement_generation=1,
+            ),
+        )
+    )
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    captured: dict[str, Any] = {}
+
+    class ProtocolCodexClient:
+        _initialized = False
+
+        def initialize(self, **_kwargs: object) -> dict[str, object]:
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            assert method == "config/read"
+            return {"config": {"mcp_servers": {}}}
+
+        def close(self) -> None:
+            return None
+
+    class OneCycleExecutor:
+        def run_once(self) -> SidebarExecutionResult:
+            return SidebarExecutionResult(status="idle")
+
+    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
+        captured.update(kwargs)
+        return OneCycleExecutor()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: ProtocolCodexClient(),
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+    monkeypatch.setattr("session_bridge.cli.get_hermes_home", lambda: inbox)
+    candidate = SidebarCandidate(
+        source_session_id="claude:placement-composition",
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id("claude:placement-composition"),
+        title="[Claude] placement composition",
+        cwd=str(source),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+
+    try:
+        backend._require_sidebar_executor()
+        resolver = captured["placement_resolver"]
+        placement = resolver(candidate)
+    finally:
+        backend.close()
+
+    assert placement.inbox_cwd == str(inbox)
+    assert placement.runtime_workspace_roots == (str(inbox), str(source))
+    assert placement.placement_generation == 1
+    assert candidate.cwd == str(source)
+
+
+def test_production_sidebar_placement_fails_closed_before_native_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured_inbox = tmp_path / "configured-inbox"
+    active_profile = tmp_path / "active-profile"
+    source = tmp_path / "source"
+    configured_inbox.mkdir()
+    active_profile.mkdir()
+    source.mkdir()
+    backend = ProductionBackend(
+        replace(
+            BridgeConfig(),
+            sidebar=replace(
+                SidebarConfig(),
+                inbox_cwd=str(configured_inbox),
+                placement_generation=1,
+            ),
+        )
+    )
+    captured: dict[str, Any] = {}
+
+    class ProtocolCodexClient:
+        _initialized = False
+
+        def initialize(self, **_kwargs: object) -> dict[str, object]:
+            self._initialized = True
+            return {}
+
+        def request(
+            self,
+            method: str,
+            params: dict[str, object],
+            *,
+            timeout: float,
+        ) -> dict[str, object]:
+            assert method == "config/read"
+            return {"config": {"mcp_servers": {}}}
+
+        def close(self) -> None:
+            return None
+
+    def executor_factory(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_cli_executable",
+        lambda name: (name,),
+    )
+    monkeypatch.setattr(
+        "session_bridge.cli.CodexAppServerClient",
+        lambda **_kwargs: ProtocolCodexClient(),
+    )
+    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
+    monkeypatch.setattr("session_bridge.cli.get_hermes_home", lambda: active_profile)
+    candidate = SidebarCandidate(
+        source_session_id="claude:placement-mismatch",
+        provider=Provider.CLAUDE,
+        bridge_id=sidebar_bridge_id("claude:placement-mismatch"),
+        title="[Claude] placement mismatch",
+        cwd=str(source),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=100.0,
+    )
+
+    try:
+        backend._require_sidebar_executor()
+        with pytest.raises(SidebarPlacementError, match="inbox_unavailable"):
+            captured["placement_resolver"](candidate)
+    finally:
+        backend.close()
 
 
 @pytest.mark.parametrize(

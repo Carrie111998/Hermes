@@ -1359,6 +1359,7 @@ class SidebarExecutor:
             thread_id=thread_id,
             source_session_id=source_session_id,
             bridge_id=bridge_id,
+            placement_generation=placement.placement_generation,
             operation_deadline=operation_deadline,
             lease_expires_at=lease_expires_at,
         )
@@ -1382,6 +1383,7 @@ class SidebarExecutor:
         thread_id: str,
         source_session_id: str,
         bridge_id: str,
+        placement_generation: int,
         operation_deadline: float,
         lease_expires_at: float,
     ) -> str | None:
@@ -1398,6 +1400,7 @@ class SidebarExecutor:
                     codex_thread_id=thread_id,
                     source_session_id=source_session_id,
                     bridge_id=bridge_id,
+                    placement_generation=placement_generation,
                     now=_finite_time(self._clock()),
                 )
             except (KeyboardInterrupt, SystemExit):

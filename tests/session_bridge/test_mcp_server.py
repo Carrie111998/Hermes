@@ -2105,6 +2105,7 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "stage_latency_seconds",
         "scheduler",
         "recovery",
+        "placement",
         "hydration",
     }
     assert sidebar["eligible_by_provider"] == {"claude": 1, "hermes": 0}
@@ -2140,6 +2141,13 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
     assert sidebar["scheduler"] == {
         "fresh_claims_since_oldest": 0,
         "next_lane": "fresh",
+    }
+    assert sidebar["placement"]["generation"] == 1
+    assert sidebar["placement"]["verified_visible"] == 0
+    assert sidebar["placement"]["mismatch_count"] == 0
+    assert sidebar["placement"]["canary"] == {
+        "status": "not_run",
+        "verified_at": None,
     }
     assert sidebar["recovery"] == {
         "lane": None,
@@ -2315,7 +2323,7 @@ def test_session_status_task_id_is_validated_then_opaque(
     store, candidate = _seed_sidebar_source(db)
     original_status = store.sidebar_delivery_status
 
-    def sidebar_status():
+    def sidebar_status(**_kwargs: object):
         return {**original_status(), "last_visible_task_id": task_id}
 
     monkeypatch.setattr(store, "sidebar_delivery_status", sidebar_status)
@@ -2331,6 +2339,44 @@ def test_session_status_task_id_is_validated_then_opaque(
     assert status["sidebar"]["last_visible_task_id"] == expected
     if len(task_id) > 8:
         assert task_id not in json.dumps(status)
+
+
+def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> None:
+    status = _sidebar_status({
+        "counts": {},
+        "placement": {
+            "inbox_cwd": "C:\\Users\\diego\\.hermes",
+            "generation": 1,
+            "verified_visible": 12,
+            "mismatch_count": 0,
+            "source_cwd": "C:\\private\\source",
+            "marker": "HERMES_SESSION_BRIDGE_V1:secret",
+            "lease_token": "secret-token",
+            "task_id": "secret-task",
+            "canary": {
+                "status": "passed",
+                "verified_at": 1234.0,
+                "canary_identity_digest": "a" * 64,
+            },
+        },
+    })
+
+    assert status["placement"] == {
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+        "generation": 1,
+        "verified_visible": 12,
+        "mismatch_count": 0,
+        "canary": {"status": "passed", "verified_at": 1234.0},
+    }
+    encoded = json.dumps(status)
+    for secret in (
+        "private",
+        "HERMES_SESSION_BRIDGE_V1",
+        "secret-token",
+        "secret-task",
+        "a" * 64,
+    ):
+        assert secret not in encoded
 
 
 def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(

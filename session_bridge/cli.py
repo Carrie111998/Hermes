@@ -21,6 +21,7 @@ import time
 from typing import Any, Protocol, cast
 
 from agent.transports.codex_app_server import CodexAppServerClient
+from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 
 from .catalog import UnifiedCatalog
@@ -102,6 +103,7 @@ from .sidebar_executor import (
     SidebarExecutor,
 )
 from .sidebar_hydration_executor import SidebarHydrationExecutor
+from .sidebar_placement import SidebarPlacement, resolve_sidebar_placement
 from .sidebar_runtime import (
     configured_mcp_server_names,
     sidebar_registration_app_server_args,
@@ -930,7 +932,11 @@ class ProductionBackend:
 
     def sidebar_status(self) -> Mapping[str, Any]:
         status_time = time.time()
-        raw = self._require_store().sidebar_delivery_status(now=status_time)
+        raw = self._require_store().sidebar_delivery_status(
+            now=status_time,
+            inbox_cwd=self.config.sidebar.inbox_cwd,
+            placement_generation=self.config.sidebar.placement_generation,
+        )
         return _public_sidebar_status(
             raw,
             now=status_time,
@@ -3117,6 +3123,15 @@ class ProductionBackend:
                 marker_secret=marker_key,
                 reconciliation_interval=self.config.service.reconcile_seconds,
             )
+
+            def resolve(candidate: SidebarCandidate) -> SidebarPlacement:
+                return resolve_sidebar_placement(
+                    configured_inbox_cwd=cast(str, self.config.sidebar.inbox_cwd),
+                    hermes_home=get_hermes_home(),
+                    placement_generation=self.config.sidebar.placement_generation,
+                    source_cwd=candidate.cwd,
+                )
+
             self._sidebar_executor = SidebarExecutor(
                 store=self._require_store(),
                 verifier=verifier,
@@ -3127,6 +3142,7 @@ class ProductionBackend:
                         CodexAppServerClient(codex_bin=codex_command[0]),
                     ),
                 ),
+                placement_resolver=resolve,
                 marker_secret=marker_key,
                 readable_preview_enabled=(
                     self.config.sidebar.readable_preview_enabled
@@ -4520,7 +4536,12 @@ def _public_sidebar_status(
     ):
         raise ConfigurationFailure("invalid_sidebar_status")
     task_id = raw.get("last_visible_task_id")
-    return {
+    placement = (
+        _public_sidebar_placement_status(raw.get("placement"))
+        if "placement" in raw
+        else None
+    )
+    result = {
         "healthy": not degraded_reasons,
         "degraded_reasons": degraded_reasons,
         "eligible_by_provider": eligible_by_provider,
@@ -4561,6 +4582,54 @@ def _public_sidebar_status(
             "lane": recovery_lane,
             "status": recovery_status,
             "last_cycle_at": recovery_at,
+        },
+    }
+    if placement is not None:
+        result["placement"] = placement
+    return result
+
+
+def _public_sidebar_placement_status(value: object) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "inbox_cwd",
+        "generation",
+        "verified_visible",
+        "mismatch_count",
+        "canary",
+    }:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    inbox_cwd = value.get("inbox_cwd")
+    if (
+        type(inbox_cwd) is not str
+        or not inbox_cwd
+        or inbox_cwd != inbox_cwd.strip()
+        or "\n" in inbox_cwd
+        or "\r" in inbox_cwd
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    generation = _status_count(value.get("generation"))
+    if generation < 1:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    canary = value.get("canary")
+    if not isinstance(canary, Mapping) or set(canary) != {
+        "status",
+        "verified_at",
+    }:
+        raise ConfigurationFailure("invalid_sidebar_status")
+    canary_status = canary.get("status")
+    verified_at = _optional_status_number(canary.get("verified_at"))
+    if canary_status not in {"not_run", "passed", "failed"} or (
+        (canary_status == "not_run") != (verified_at is None)
+    ):
+        raise ConfigurationFailure("invalid_sidebar_status")
+    return {
+        "inbox_cwd": inbox_cwd,
+        "generation": generation,
+        "verified_visible": _status_count(value.get("verified_visible")),
+        "mismatch_count": _status_count(value.get("mismatch_count")),
+        "canary": {
+            "status": canary_status,
+            "verified_at": verified_at,
         },
     }
 

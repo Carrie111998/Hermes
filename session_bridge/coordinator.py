@@ -1861,6 +1861,7 @@ class SessionBridgeCoordinator:
                 codex_thread_id=thread_id,
                 source_session_id=source_session_id,
                 bridge_id=bridge_id,
+                placement_generation=self._config.sidebar.placement_generation,
                 now=_finite_number(self._clock(), "now"),
             )
         else:

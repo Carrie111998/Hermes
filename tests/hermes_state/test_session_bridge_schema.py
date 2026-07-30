@@ -866,6 +866,50 @@ def test_reopening_current_database_repairs_missing_sidebar_indexes_without_data
         reopened.close()
 
 
+def test_sidebar_placement_columns_are_additive_and_legacy_visibility_stays_unverified(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "legacy-sidebar-placement.db"
+    db = hermes_state.SessionDB(db_path)
+    try:
+        _seed_sessions(db._conn, "source")
+        _insert_sidebar_job(
+            db._conn,
+            state="sidebar_visible",
+            completion_digest="completion-digest",
+            codex_thread_id="codex-thread",
+            visible_at=200.0,
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("ALTER TABLE session_sidebar_jobs DROP COLUMN placement_generation")
+        conn.execute("ALTER TABLE session_sidebar_jobs DROP COLUMN placement_verified_at")
+        conn.execute(
+            "UPDATE schema_version SET version = ?",
+            (hermes_state.SCHEMA_VERSION - 1,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        row = reopened._conn.execute(
+            """SELECT placement_generation, placement_verified_at
+               FROM session_sidebar_jobs WHERE id = 'sidebar-job-1'"""
+        ).fetchone()
+        assert tuple(row) == (None, None)
+        assert reopened._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == hermes_state.SCHEMA_VERSION
+    finally:
+        reopened.close()
+
+
 def test_bridge_foreign_keys_exist_and_foreign_key_check_is_clean(tmp_path):
     db = hermes_state.SessionDB(tmp_path / "foreign-keys.db")
     try:

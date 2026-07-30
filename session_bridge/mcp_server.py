@@ -385,7 +385,11 @@ def create_app(
         health_method = getattr(coordinator, "health", None)
         health = health_method() if callable(health_method) else {"running": False}
         catalog_status = await asyncio.to_thread(catalog.status)
-        sidebar_status = await asyncio.to_thread(store.sidebar_delivery_status)
+        sidebar_status = await asyncio.to_thread(
+            store.sidebar_delivery_status,
+            inbox_cwd=config.sidebar.inbox_cwd,
+            placement_generation=config.sidebar.placement_generation,
+        )
         hydration_status = await asyncio.to_thread(
             store.sidebar_hydration_status,
             time.time(),
@@ -1523,7 +1527,8 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         recovery_lane = None
         recovery_status = None
         recovery_at = None
-    return {
+    placement = _sidebar_placement_status(source.get("placement"))
+    result = {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
             for provider in (Provider.CLAUDE.value, Provider.HERMES.value)
@@ -1586,6 +1591,50 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             "lane": recovery_lane,
             "status": recovery_status,
             "last_cycle_at": recovery_at,
+        },
+    }
+    if placement is not None:
+        result["placement"] = placement
+    return result
+
+
+def _sidebar_placement_status(value: object) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    inbox_cwd = value.get("inbox_cwd")
+    if (
+        type(inbox_cwd) is not str
+        or not inbox_cwd
+        or inbox_cwd != inbox_cwd.strip()
+        or "\n" in inbox_cwd
+        or "\r" in inbox_cwd
+    ):
+        return None
+    generation = _nonnegative_status_int(value.get("generation"), 0)
+    if generation < 1:
+        return None
+    canary_source = _status_mapping(value.get("canary"))
+    canary_status = canary_source.get("status")
+    verified_at = _finite_status_number(canary_source.get("verified_at"))
+    if canary_status == "not_run" and canary_source.get("verified_at") is None:
+        verified_at = None
+    elif canary_status not in {"passed", "failed"} or verified_at is None:
+        canary_status = "not_run"
+        verified_at = None
+    return {
+        "inbox_cwd": inbox_cwd,
+        "generation": generation,
+        "verified_visible": _nonnegative_status_int(
+            value.get("verified_visible"),
+            0,
+        ),
+        "mismatch_count": _nonnegative_status_int(
+            value.get("mismatch_count"),
+            0,
+        ),
+        "canary": {
+            "status": canary_status,
+            "verified_at": verified_at,
         },
     }
 

@@ -26,6 +26,7 @@ else:
     import fcntl
 
 from hermes_state import SCHEMA_VERSION, SessionDB
+from hermes_constants import get_hermes_home
 
 from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
@@ -77,6 +78,19 @@ _SIDEBAR_BROKER_HEARTBEAT_STATE_KEY = "session-bridge:sidebar:broker-heartbeat"
 _SIDEBAR_PENDING_LANE_STATE_KEY = "session-bridge:sidebar:pending-lane:v1"
 _SIDEBAR_RECOVERY_PROGRESS_STATE_KEY = (
     "session-bridge:sidebar:recovery-progress:v1"
+)
+_SIDEBAR_PLACEMENT_CANARY_STATE_KEY = (
+    "session-bridge:sidebar:placement-canary:v1"
+)
+_SIDEBAR_PLACEMENT_CANARY_STATE_FIELDS = frozenset({
+    "version",
+    "status",
+    "placement_generation",
+    "verified_at",
+    "canary_identity_digest",
+})
+_SIDEBAR_PLACEMENT_CANARY_DIGEST_DOMAIN = (
+    b"session-bridge:sidebar:placement-canary:v1\0"
 )
 _SIDEBAR_FRESH_BURST = 3
 _SIDEBAR_HYDRATION_LEASE_SECONDS = 300
@@ -6234,6 +6248,7 @@ class SessionBridgeStore:
         codex_thread_id: str,
         source_session_id: str,
         bridge_id: str,
+        placement_generation: int,
         now: float,
     ) -> dict[str, Any]:
         """Atomically bind verified lineage and commit one sidebar lease."""
@@ -6242,6 +6257,8 @@ class SessionBridgeStore:
         thread_id = _exact_nonempty_text(codex_thread_id, "Codex thread ID")
         source_id = _exact_nonempty_text(source_session_id, "sidebar source session ID")
         normalized_bridge_id = _exact_nonempty_text(bridge_id, "sidebar bridge ID")
+        if type(placement_generation) is not int or placement_generation < 1:
+            raise ValueError("sidebar placement generation must be a positive integer")
         commit_time = _finite_number(now, "now")
 
         def _write(conn):
@@ -6261,6 +6278,8 @@ class SessionBridgeStore:
                 if (
                     job["state"] != SidebarJobState.VISIBLE.value
                     or job["codex_thread_id"] != thread_id
+                    or job["placement_generation"] != placement_generation
+                    or job["placement_verified_at"] is None
                 ):
                     raise ValueError("conflicting sidebar completion replay")
                 _ensure_sidebar_lineage_row(
@@ -6295,12 +6314,15 @@ class SessionBridgeStore:
                    SET state = ?, completion_digest = lease_digest,
                        lease_digest = NULL, lease_expires_at = NULL,
                        codex_thread_id = ?, error_code = NULL,
-                       visible_at = ?, updated_at = ?
+                       visible_at = ?, updated_at = ?,
+                       placement_generation = ?, placement_verified_at = ?
                    WHERE id = ? AND state = ?""",
                 (
                     SidebarJobState.VISIBLE.value,
                     thread_id,
                     commit_time,
+                    commit_time,
+                    placement_generation,
                     commit_time,
                     job["id"],
                     SidebarJobState.LEASED.value,
@@ -6322,6 +6344,39 @@ class SessionBridgeStore:
         if expired:
             raise ValueError("sidebar lease has expired")
         return result
+
+    def record_sidebar_placement_canary(
+        self,
+        *,
+        status: str,
+        placement_generation: int,
+        verified_at: float,
+        canary_identity: str,
+    ) -> dict[str, Any]:
+        if status not in {"passed", "failed"}:
+            raise ValueError("sidebar placement canary status is invalid")
+        if type(placement_generation) is not int or placement_generation < 1:
+            raise ValueError("sidebar placement generation must be a positive integer")
+        timestamp = _finite_number(
+            verified_at,
+            "sidebar placement canary verified_at",
+        )
+        identity = _exact_nonempty_text(
+            canary_identity,
+            "sidebar placement canary identity",
+        )
+        digest = hashlib.sha256(
+            _SIDEBAR_PLACEMENT_CANARY_DIGEST_DOMAIN + identity.encode("utf-8")
+        ).hexdigest()
+        state = {
+            "version": 1,
+            "status": status,
+            "placement_generation": placement_generation,
+            "verified_at": timestamp,
+            "canary_identity_digest": digest,
+        }
+        self.set_state(_SIDEBAR_PLACEMENT_CANARY_STATE_KEY, state)
+        return dict(state)
 
     def lookup_sidebar_job_by_lease(self, lease_token: str) -> dict[str, Any]:
         token_digest = _sidebar_lease_digest(lease_token)
@@ -7854,8 +7909,21 @@ class SessionBridgeStore:
 
         self.db._execute_write(_write)
 
-    def sidebar_delivery_status(self, *, now: float | None = None) -> dict[str, Any]:
+    def sidebar_delivery_status(
+        self,
+        *,
+        now: float | None = None,
+        inbox_cwd: str | None = None,
+        placement_generation: int = 1,
+    ) -> dict[str, Any]:
         status_time = _finite_number(self._clock() if now is None else now, "now")
+        effective_inbox_cwd = (
+            str(get_hermes_home())
+            if inbox_cwd is None
+            else _exact_nonempty_text(inbox_cwd, "sidebar inbox cwd")
+        )
+        if type(placement_generation) is not int or placement_generation < 1:
+            raise ValueError("sidebar placement generation must be a positive integer")
         counts = self.sidebar_job_counts()
         counts["sidebar_excluded"] = self.sidebar_exclusion_counts()["total"]
         with self.db._lock:
@@ -7934,6 +8002,26 @@ class SessionBridgeStore:
             execution_blockers = self._sidebar_execution_blockers_in_connection(
                 conn, resolution_stats
             )
+            placement_row = conn.execute(
+                """SELECT
+                       SUM(CASE
+                               WHEN state = ?
+                                AND placement_generation = ?
+                                AND placement_verified_at IS NOT NULL
+                               THEN 1 ELSE 0
+                           END) AS verified_visible,
+                       SUM(CASE
+                               WHEN state = ? AND error_code = ?
+                               THEN 1 ELSE 0
+                           END) AS mismatch_count
+                   FROM session_sidebar_jobs""",
+                (
+                    SidebarJobState.VISIBLE.value,
+                    placement_generation,
+                    SidebarJobState.FAILED.value,
+                    "placement_mismatch",
+                ),
+            ).fetchone()
 
         expired_leases = int(expired_row["job_count"])
         counts[SidebarJobState.LEASED.value] -= expired_leases
@@ -8020,6 +8108,10 @@ class SessionBridgeStore:
             )
         for values in stage_latencies.values():
             values.sort()
+        canary = _sidebar_placement_canary_public_status(
+            self.get_state(_SIDEBAR_PLACEMENT_CANARY_STATE_KEY),
+            placement_generation=placement_generation,
+        )
         return {
             "eligible_by_provider": eligible_by_provider,
             "counts": counts,
@@ -8070,6 +8162,13 @@ class SessionBridgeStore:
                 "lane": recovery_lane,
                 "status": recovery_status,
                 "last_cycle_at": recovery_at,
+            },
+            "placement": {
+                "inbox_cwd": effective_inbox_cwd,
+                "generation": placement_generation,
+                "verified_visible": int(placement_row["verified_visible"] or 0),
+                "mismatch_count": int(placement_row["mismatch_count"] or 0),
+                "canary": canary,
             },
         }
 
@@ -11800,6 +11899,34 @@ def _nearest_rank_percentile(
         return None
     rank = max(1, math.ceil(percentile * len(values)))
     return float(values[rank - 1])
+
+
+def _sidebar_placement_canary_public_status(
+    state: Mapping[str, Any] | None,
+    *,
+    placement_generation: int,
+) -> dict[str, Any]:
+    if state is None:
+        return {"status": "not_run", "verified_at": None}
+    if (
+        not isinstance(state, Mapping)
+        or set(state) != _SIDEBAR_PLACEMENT_CANARY_STATE_FIELDS
+        or state.get("version") != 1
+        or isinstance(state.get("version"), bool)
+        or state.get("status") not in {"passed", "failed"}
+        or type(state.get("placement_generation")) is not int
+        or state["placement_generation"] < 1
+        or type(state.get("canary_identity_digest")) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", state["canary_identity_digest"]) is None
+    ):
+        raise ValueError("invalid sidebar placement canary state")
+    verified_at = _finite_number(
+        state.get("verified_at"),
+        "sidebar placement canary verified_at",
+    )
+    if state["placement_generation"] != placement_generation:
+        return {"status": "not_run", "verified_at": None}
+    return {"status": state["status"], "verified_at": verified_at}
 
 
 def _provider_from_canonical_session_id(session_id: object) -> Provider:

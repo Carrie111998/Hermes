@@ -9703,6 +9703,7 @@ def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> No
         codex_thread_id=thread_id,
         source_session_id=candidate.source_session_id,
         bridge_id=candidate.bridge_id,
+        placement_generation=1,
         now=200.0,
     )
     replay = store.commit_sidebar_job_with_lineage(
@@ -9710,11 +9711,14 @@ def test_sidebar_atomic_lineage_commit_and_exact_replay_are_idempotent(db) -> No
         codex_thread_id=thread_id,
         source_session_id=candidate.source_session_id,
         bridge_id=candidate.bridge_id,
+        placement_generation=1,
         now=201.0,
     )
 
     assert replay == committed
     assert committed["state"] == SidebarJobState.VISIBLE.value
+    assert committed["placement_generation"] == 1
+    assert committed["placement_verified_at"] == 200.0
     links = _rows(
         db, "SELECT * FROM session_links WHERE bridge_id = ?", (candidate.bridge_id,)
     )
@@ -9753,6 +9757,7 @@ def test_sidebar_atomic_lineage_commit_has_no_partial_state_on_validation_failur
             codex_thread_id=thread_id,
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
+            placement_generation=1,
             now=400.0 if failure == "expired" else 200.0,
         )
 
@@ -9815,6 +9820,7 @@ def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
             codex_thread_id=thread_id,
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
+            placement_generation=1,
             now=200.0,
         )
 
@@ -9830,6 +9836,132 @@ def test_sidebar_atomic_lineage_write_fault_rolls_back_job_and_link(db) -> None:
     assert job is not None
     assert job["state"] == SidebarJobState.LEASED.value
     assert job["codex_thread_id"] is None
+
+
+def test_sidebar_completion_replay_requires_the_exact_placement_generation(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("placement-replay-token"),
+    )
+    candidate = _sidebar_candidate(db, native_id="placement-replay")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    thread_id = "placement-replay-thread"
+    _seed_sidebar_codex_target(store, candidate, thread_id)
+    store.commit_sidebar_job_with_lineage(
+        lease_token=lease["lease_token"],
+        codex_thread_id=thread_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=candidate.bridge_id,
+        placement_generation=1,
+        now=200.0,
+    )
+
+    with pytest.raises(ValueError, match="conflicting sidebar completion replay"):
+        store.commit_sidebar_job_with_lineage(
+            lease_token=lease["lease_token"],
+            codex_thread_id=thread_id,
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            placement_generation=2,
+            now=201.0,
+        )
+
+
+def test_sidebar_delivery_status_counts_only_verified_current_generation(
+    db,
+    tmp_path: Path,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("placement-status-token"),
+    )
+    verified = _sidebar_candidate(db, native_id="placement-verified")
+    store.enqueue_sidebar_job(verified)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    _seed_sidebar_codex_target(store, verified, "placement-verified-thread")
+    store.commit_sidebar_job_with_lineage(
+        lease_token=lease["lease_token"],
+        codex_thread_id="placement-verified-thread",
+        source_session_id=verified.source_session_id,
+        bridge_id=verified.bridge_id,
+        placement_generation=1,
+        now=200.0,
+    )
+
+    legacy = _sidebar_candidate(db, native_id="placement-legacy")
+    legacy_job = store.enqueue_sidebar_job(legacy)
+    mismatch = _sidebar_candidate(db, native_id="placement-mismatch")
+    mismatch_job = store.enqueue_sidebar_job(mismatch)
+    with db._lock:
+        assert db._conn is not None
+        db._conn.execute(
+            """UPDATE session_sidebar_jobs
+               SET state = 'sidebar_visible', completion_digest = ?,
+                   codex_thread_id = ?, visible_at = ?, updated_at = ?
+               WHERE id = ?""",
+            ("c" * 64, "placement-legacy-thread", 210.0, 210.0, legacy_job["id"]),
+        )
+        db._conn.execute(
+            """UPDATE session_sidebar_jobs
+               SET state = 'sidebar_failed', error_code = 'placement_mismatch',
+                   updated_at = ? WHERE id = ?""",
+            (220.0, mismatch_job["id"]),
+        )
+        db._conn.commit()
+    store.record_sidebar_placement_canary(
+        status="passed",
+        placement_generation=1,
+        verified_at=230.0,
+        canary_identity="codex:private-canary-task",
+    )
+
+    status = store.sidebar_delivery_status(
+        now=240.0,
+        inbox_cwd=str(tmp_path),
+        placement_generation=1,
+    )
+
+    assert status["placement"] == {
+        "inbox_cwd": str(tmp_path),
+        "generation": 1,
+        "verified_visible": 1,
+        "mismatch_count": 1,
+        "canary": {"status": "passed", "verified_at": 230.0},
+    }
+    raw_state = store.get_state("session-bridge:sidebar:placement-canary:v1")
+    assert raw_state is not None
+    assert set(raw_state) == {
+        "version",
+        "status",
+        "placement_generation",
+        "verified_at",
+        "canary_identity_digest",
+    }
+    assert raw_state["canary_identity_digest"] != "codex:private-canary-task"
+    assert "private-canary-task" not in json.dumps(status)
+
+
+def test_sidebar_placement_canary_rejects_unknown_persisted_fields(db) -> None:
+    store = SessionBridgeStore(db)
+    store.set_state(
+        "session-bridge:sidebar:placement-canary:v1",
+        {
+            "version": 1,
+            "status": "passed",
+            "placement_generation": 1,
+            "verified_at": 200.0,
+            "canary_identity_digest": "a" * 64,
+            "task_id": "must-not-leak",
+        },
+    )
+
+    with pytest.raises(ValueError, match="invalid sidebar placement canary state"):
+        store.sidebar_delivery_status(
+            now=240.0,
+            inbox_cwd="C:\\Users\\diego\\.hermes",
+            placement_generation=1,
+        )
 
 
 def test_sidebar_delivery_latency_uses_fixed_recent_indexed_sample(db) -> None:

@@ -1604,9 +1604,10 @@ class FakeStore:
         codex_thread_id: str,
         source_session_id: str,
         bridge_id: str,
+        placement_generation: int,
         now: float,
     ) -> dict[str, Any]:
-        self.events.append(("commit", codex_thread_id))
+        self.events.append(("commit", codex_thread_id, placement_generation))
         if self.commit_error is not None:
             raise self.commit_error
         return {
@@ -1614,6 +1615,7 @@ class FakeStore:
             "codex_thread_id": codex_thread_id,
             "source_session_id": source_session_id,
             "bridge_id": bridge_id,
+            "placement_generation": placement_generation,
             "lease_token": lease_token,
             "updated_at": now,
         }
@@ -2888,6 +2890,7 @@ def test_commit_waits_for_fresh_thread_lineage_index_without_releasing_lease() -
             codex_thread_id: str,
             source_session_id: str,
             bridge_id: str,
+            placement_generation: int,
             now: float,
         ) -> dict[str, Any]:
             self.commit_attempts += 1
@@ -2899,6 +2902,7 @@ def test_commit_waits_for_fresh_thread_lineage_index_without_releasing_lease() -
                 codex_thread_id=codex_thread_id,
                 source_session_id=source_session_id,
                 bridge_id=bridge_id,
+                placement_generation=placement_generation,
                 now=now,
             )
 
@@ -2933,9 +2937,16 @@ def test_commit_index_wait_timeout_retains_exact_thread_without_recreating() -> 
             codex_thread_id: str,
             source_session_id: str,
             bridge_id: str,
+            placement_generation: int,
             now: float,
         ) -> dict[str, Any]:
-            del lease_token, source_session_id, bridge_id, now
+            del (
+                lease_token,
+                source_session_id,
+                bridge_id,
+                placement_generation,
+                now,
+            )
             self.commit_attempts += 1
             self.events.append(("commit", codex_thread_id))
             raise SidebarNativeTaskNotIndexed()

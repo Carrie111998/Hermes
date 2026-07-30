@@ -229,13 +229,16 @@ def _default_db_path() -> Path:
     return get_hermes_home() / "state.db"
 
 
+# 30 = additive sidebar placement verification columns. Existing visible rows
+# intentionally remain NULL so recovery can distinguish them from verified
+# generation-1 placement.
 # 29 = merge of two divergent numbering lines: upstream 0.19.0 used 20-22
 # (session_model_usage seeding + task-PK rebuild) while the fork's
 # session-bridge line used 20-28 (bridge tables; data migrations are
 # name-gated in session_bridge_migrations, not version-gated). Live DBs sit
 # at 28 without the upstream migrations, so those are re-gated on < 29
 # below (both are idempotent/self-gating).
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1149,6 +1152,8 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     visible_at REAL,
+    placement_generation INTEGER,
+    placement_verified_at REAL,
     CHECK (
         (state = 'sidebar_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
         OR (state != 'sidebar_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)

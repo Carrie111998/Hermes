@@ -30,6 +30,21 @@ class _NoFtsCursor(sqlite3.Cursor):
         return super().executescript(sql_script)
 
 
+def test_sidebar_placement_schema_declares_nullable_verification_columns(tmp_path):
+    db = SessionDB(tmp_path / "placement-schema.db")
+    try:
+        columns = {
+            row["name"]: row
+            for row in db._conn.execute(
+                'PRAGMA table_info("session_sidebar_jobs")'
+            ).fetchall()
+        }
+        assert columns["placement_generation"]["notnull"] == 0
+        assert columns["placement_verified_at"]["notnull"] == 0
+    finally:
+        db.close()
+
+
 class _NoFtsConnection(sqlite3.Connection):
     def cursor(self, factory=None):
         return super().cursor(factory or _NoFtsCursor)
