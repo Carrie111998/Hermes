@@ -308,8 +308,15 @@ def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
 
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_live_sessions": 2})
     evicted: list[str] = []
+
+    def _record_close(sid, end_reason=None):
+        evicted.append(sid)
+        server._sessions.pop(sid, None)
+
     monkeypatch.setattr(
-        server, "_close_session_by_id", lambda sid, end_reason=None: evicted.append(sid)
+        server,
+        "_close_session_by_id",
+        _record_close,
     )
 
     def _ready() -> threading.Event:
@@ -532,6 +539,9 @@ def test_active_tui_work_includes_running_detached_session(server):
     assert server.has_active_tui_work() is True
 
     server._sessions["detached-running"]["running"] = False
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert server.has_active_tui_work() is False
 
 
@@ -546,6 +556,9 @@ def test_active_tui_work_includes_live_agent_build(server):
     assert server.has_active_tui_work() is True
 
     ready.set()
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert server.has_active_tui_work() is False
 
 
@@ -594,6 +607,26 @@ def test_active_tui_work_includes_auto_continue_handoff(server):
     assert server.has_active_tui_work() is True
 
     release.set()
+    deadline = time.monotonic() + 0.5
+    while server.has_active_tui_work() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert server.has_active_tui_work() is False
+
+
+def test_update_quiesce_rejects_tui_maintenance(server):
+    server.begin_update_quiesce()
+    try:
+        with server._tui_maintenance_scope() as admitted:
+            assert admitted is False
+    finally:
+        server.end_update_quiesce()
+
+
+def test_active_tui_work_includes_tui_maintenance(server):
+    with server._tui_maintenance_scope() as admitted:
+        assert admitted is True
+        assert server.has_active_tui_work() is True
+
     deadline = time.monotonic() + 0.5
     while server.has_active_tui_work() and time.monotonic() < deadline:
         time.sleep(0.01)
