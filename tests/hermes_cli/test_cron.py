@@ -283,3 +283,42 @@ def test_json_create_and_edit_emit_canonical_job(tmp_cron_dir, capsys):
     assert updated["thread"] == "4" and updated["no_agent"] is True
     assert updated["prompt"] == "" and updated["skills"] == []
     assert updated["model"] is None and updated["provider"] is None and updated["workdir"] is None
+
+
+def test_json_mutations_fail_closed_when_canonical_readback_is_missing(monkeypatch, capsys):
+    monkeypatch.setattr(cron_cli, "_cron_api", lambda **kwargs: {
+        "success": True, "job_id": "job-1", "name": "x", "schedule": "every 1m",
+        "next_run_at": None, "job": {"job_id": "job-1", "name": "x", "schedule": "every 1m"},
+    })
+    monkeypatch.setattr("cron.jobs.get_job", lambda job_id: None)
+    args = SimpleNamespace(schedule="every 1m", prompt="", name="x", deliver=None,
+                           repeat=None, skill=None, skills=None, script="x.py", workdir=None,
+                           no_agent=True, json=True)
+    assert cron_cli.cron_create(args) == 1
+    assert "canonical readback missing" in capsys.readouterr().err
+
+
+def test_json_delivery_normalizes_legacy_and_multi_target_shapes():
+    single = cron_cli._canonical_job({"id": "1", "deliver": ["telegram:chat:7"]})
+    assert single["delivery"] == "telegram:chat:7"
+    assert single["platform"] == "telegram" and single["thread"] == "7"
+    multi = cron_cli._canonical_job({"id": "2", "deliver": "telegram:chat:7, discord:room"})
+    assert multi["delivery"] == ["telegram:chat:7", "discord:room"]
+    assert multi["platform"] is None and multi["recipient"] is None and multi["thread"] is None
+
+
+def test_edit_by_name_uses_canonical_id_for_mutation_and_readback(tmp_cron_dir, capsys):
+    job = create_job(prompt="old", schedule="every 1m", name="Recovery")
+    args = SimpleNamespace(cron_command="edit", job_id="Recovery", schedule=None, prompt="new",
+                           name=None, deliver=None, repeat=None, skill=None, skills=None,
+                           clear_skills=False, add_skills=None, remove_skills=None, script=None,
+                           workdir=None, no_agent=None, model=None, model_provider=None, json=True)
+    assert cron_cli.cron_edit(args) == 0
+    value = json.loads(capsys.readouterr().out)
+    assert value["id"] == job["id"] and value["prompt"] == "new"
+
+
+def test_top_level_cmd_cron_propagates_handler_return_code(monkeypatch):
+    from hermes_cli import main
+    monkeypatch.setattr("hermes_cli.cron.cron_command", lambda args: 7)
+    assert main.cmd_cron(SimpleNamespace(cron_command="list")) == 7

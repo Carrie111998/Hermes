@@ -100,10 +100,23 @@ def _canonical_job(job: dict) -> dict:
     """Return the stable persisted-job shape used by automation clients."""
     repeat = job.get("repeat") or {}
     schedule = job.get("schedule") or {}
-    deliver = job.get("deliver") or "local"
+    raw_deliver = job.get("deliver") or job.get("delivery") or "local"
+    if isinstance(raw_deliver, str):
+        delivery_targets = [part.strip() for part in raw_deliver.split(",") if part.strip()]
+    elif isinstance(raw_deliver, (list, tuple)):
+        delivery_targets = []
+        for value in raw_deliver:
+            delivery_targets.extend(
+                part.strip() for part in str(value).split(",") if part.strip()
+            )
+    else:
+        delivery_targets = [str(raw_deliver).strip()] if raw_deliver else ["local"]
+    if not delivery_targets:
+        delivery_targets = ["local"]
+    deliver = delivery_targets[0] if len(delivery_targets) == 1 else delivery_targets
     platform = recipient = thread = None
-    if isinstance(deliver, str):
-        parts = deliver.split(":", 2)
+    if len(delivery_targets) == 1:
+        parts = delivery_targets[0].split(":", 2)
         if len(parts) >= 2 and parts[0] in {"telegram", "discord", "signal"}:
             platform, recipient = parts[0], parts[1]
             thread = parts[2] if len(parts) == 3 else None
@@ -387,7 +400,11 @@ def cron_create(args):
         return 1
     if getattr(args, "json", False):
         from cron.jobs import get_job
-        print(json.dumps(_canonical_job(get_job(result["job_id"]) or {}), ensure_ascii=False, sort_keys=True))
+        job = get_job(result["job_id"])
+        if not job:
+            print("Failed to create job: canonical readback missing", file=sys.stderr)
+            return 1
+        print(json.dumps(_canonical_job(job), ensure_ascii=False, sort_keys=True))
         return 0
     print(color(f"Created job: {result['job_id']}", Colors.GREEN))
     print(f"  Name: {result['name']}")
@@ -436,9 +453,10 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    job_id = job["id"]
     result = _cron_api(
         action="update",
-        job_id=args.job_id,
+        job_id=job_id,
         schedule=getattr(args, "schedule", None),
         prompt=getattr(args, "prompt", None),
         name=getattr(args, "name", None),
@@ -457,7 +475,11 @@ def cron_edit(args):
 
     if getattr(args, "json", False):
         from cron.jobs import get_job
-        print(json.dumps(_canonical_job(get_job(args.job_id) or {}), ensure_ascii=False, sort_keys=True))
+        updated_job = get_job(job_id)
+        if not updated_job:
+            print("Failed to update job: canonical readback missing", file=sys.stderr)
+            return 1
+        print(json.dumps(_canonical_job(updated_job), ensure_ascii=False, sort_keys=True))
         return 0
 
     updated = result["job"]
