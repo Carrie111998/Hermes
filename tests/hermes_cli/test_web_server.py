@@ -2755,6 +2755,7 @@ class TestThemeBootstrapCSS:
         from starlette.testclient import TestClient
         import hermes_cli.web_server as ws
 
+        monkeypatch.delenv("HERMES_SERVE_HEADLESS", raising=False)
         dist = tmp_path / "web_dist"
         (dist / "assets").mkdir(parents=True)
         (dist / "index.html").write_text(
