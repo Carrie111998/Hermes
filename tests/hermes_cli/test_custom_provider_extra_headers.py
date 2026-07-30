@@ -47,7 +47,7 @@ def test_session_affinity_requires_explicit_matching_provider_opt_in():
     ]
 
     assert get_custom_provider_session_affinity(
-        "https://proxy.example.com/anthropic/v1",
+        "https://proxy.example.com/anthropic",
         custom_providers=providers,
     ) is True
     assert get_custom_provider_session_affinity(

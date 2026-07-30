@@ -4877,9 +4877,13 @@ class AIAgent:
         try:
             from hermes_cli.config import (
                 get_custom_provider_session_affinity,
+                load_config_readonly,
             )
 
-            session_affinity = get_custom_provider_session_affinity(base_url)
+            session_affinity = get_custom_provider_session_affinity(
+                base_url,
+                config=load_config_readonly(),
+            )
         except Exception:
             logger.debug(
                 "custom-provider session affinity resolution skipped",

@@ -570,8 +570,9 @@ def init_agent(
     _install_safe_stdio()
 
     # Assign the durable session identity before constructing provider clients.
-    # Anthropic-compatible proxies use it to keep client-driven tool loops on
-    # one upstream session; assigning it later made the first client anonymous.
+    # Opted-in Anthropic-compatible proxies use it to keep client-driven tool
+    # loops on one upstream session; assigning it later made the first client
+    # anonymous.
     agent.session_start = datetime.now()
     if session_id:
         agent.session_id = session_id
