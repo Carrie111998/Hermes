@@ -4619,6 +4619,10 @@ class GatewayRunner:
         # simply don't use kanban; this loop becomes a no-op.
         asyncio.create_task(self._kanban_dispatcher_watcher())
 
+        # Start the single workflow watcher. It owns due timers, tenant
+        # read-only state probes, and intake recovery across every board.
+        asyncio.create_task(self._wf_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -5821,6 +5825,125 @@ class GatewayRunner:
 
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
+            slept = 0.0
+            while slept < interval and self._running:
+                await asyncio.sleep(min(1.0, interval - slept))
+                slept += 1.0
+
+    async def _wf_watcher(self, interval: float | None = None) -> None:
+        """Run workflow timers, state probes, and intake recovery.
+
+        One gateway task fans out across board databases.  Each board tick is
+        synchronous inside ``to_thread`` so SQLite work never blocks the event
+        loop; a failure on one board or one cycle is logged and retried on the
+        next cycle.  Due scans use ``timer_at <= now``, making the first tick
+        after a gateway restart the catch-up path.
+        """
+
+        try:
+            from hermes_cli.config import load_config as _load_config
+            from hermes_cli import kanban_db as _kb
+            from hermes_cli import wf_watcher as _watcher
+        except Exception:
+            logger.warning("workflow watcher: dependencies unavailable; disabled")
+            return
+        env_override = os.environ.get(
+            "HERMES_WORKFLOW_WATCH_IN_GATEWAY", ""
+        ).strip().lower()
+        if env_override in {"0", "false", "no", "off"}:
+            logger.info(
+                "workflow watcher: disabled via HERMES_WORKFLOW_WATCH_IN_GATEWAY"
+            )
+            return
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("workflow watcher: cannot load config (%s); disabled", exc)
+            return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not kanban_cfg.get("workflow_watch_in_gateway", True):
+            logger.info(
+                "workflow watcher: disabled via "
+                "kanban.workflow_watch_in_gateway=false"
+            )
+            return
+        if interval is None:
+            interval = float(
+                kanban_cfg.get("workflow_watch_interval_seconds", 60) or 60
+            )
+        interval = max(float(interval), 1.0)
+
+        await asyncio.sleep(5)
+
+        def _tick_all() -> list[tuple[str, object]]:
+            try:
+                boards = _kb.list_boards(include_archived=False)
+            except Exception:
+                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            seen_db_paths: set[str] = set()
+            results: list[tuple[str, object]] = []
+            for board_meta in boards:
+                slug = board_meta.get("slug") or _kb.DEFAULT_BOARD
+                db_path = board_meta.get("db_path")
+                try:
+                    resolved = (
+                        str(Path(db_path).expanduser().resolve())
+                        if db_path
+                        else str(_kb.kanban_db_path(slug).resolve())
+                    )
+                except Exception:
+                    resolved = f"slug:{slug}"
+                if resolved in seen_db_paths:
+                    continue
+                seen_db_paths.add(resolved)
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    results.append(
+                        (slug, _watcher.run_tick(conn, int(time.time())))
+                    )
+                except Exception:
+                    logger.exception(
+                        "workflow watcher: tick failed on board %s", slug
+                    )
+                finally:
+                    if conn is not None:
+                        conn.close()
+            return results
+
+        logger.info(
+            "workflow watcher: embedded in gateway (interval=%.1fs)", interval
+        )
+        while self._running:
+            try:
+                results = await asyncio.to_thread(_tick_all)
+                for slug, result in results:
+                    if (
+                        result.timers_fired
+                        or result.poll_events
+                        or result.probe_errors
+                        or result.timer_errors
+                        or result.sweep_processed
+                    ):
+                        logger.info(
+                            "workflow watcher [%s]: timers=%d polls=%d "
+                            "poll_duplicates=%d probe_errors=%d "
+                            "timer_errors=%d swept=%d applied=%d",
+                            slug,
+                            len(result.timers_fired),
+                            len(result.poll_events),
+                            result.poll_duplicates,
+                            result.probe_errors,
+                            result.timer_errors,
+                            result.sweep_processed,
+                            len(result.applied_events),
+                        )
+            except asyncio.CancelledError:
+                logger.debug("workflow watcher: cancelled")
+                raise
+            except Exception:
+                logger.exception("workflow watcher: unexpected watcher error")
+
             slept = 0.0
             while slept < interval and self._running:
                 await asyncio.sleep(min(1.0, interval - slept))

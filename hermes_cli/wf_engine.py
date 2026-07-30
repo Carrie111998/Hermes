@@ -327,6 +327,21 @@ def register_template(conn: sqlite3.Connection, spec: dict) -> tuple[str, int]:
     if not isinstance(slug, str) or not slug.strip():
         raise ValueError("template spec id is required")
 
+    # Validate wait contracts before persisting the immutable template.  A
+    # malformed timer must fail at registration, not much later inside the
+    # gateway watcher after an instance has parked on it.
+    workflow = _workflow_spec(spec)
+    for step in _steps(spec) if workflow.get("steps") is not None else ():
+        waits = step.get("waits") or []
+        if not isinstance(waits, list):
+            raise ValueError("workflow step waits must be a list")
+        for wait in waits:
+            if not isinstance(wait, dict):
+                raise ValueError("workflow waits must be objects")
+            kind, _types, _schema, after, _action = _wait_fields(wait)
+            if kind == "timer":
+                _timer_at(after, 0)
+
     canonical_spec = json.dumps(
         spec,
         sort_keys=True,
@@ -550,6 +565,15 @@ def _wait_fields(wait: dict) -> tuple[str, list[str] | None, str | None, int | N
     action = wait.get("action")
     if action is not None and not isinstance(action, str):
         raise ValueError("workflow timer action must be a string")
+    if kind == "timer" and wait.get("max_fires") is not None:
+        try:
+            max_fires = int(wait["max_fires"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("workflow timer max_fires must be an integer") from exc
+        if max_fires < 1:
+            raise ValueError("workflow timer max_fires must be at least one")
+        if action != "chase" and max_fires > 1:
+            raise ValueError("repeating workflow timers must use action='chase'")
     return kind, types, schema, wait.get("after"), action
 
 
@@ -1834,11 +1858,6 @@ def fire_due_timers(conn, now: int) -> list[int]:
             if limit < 1 or int(wait["fires_used"] or 0) >= limit:
                 continue
 
-            # A timer row has one due point. A successful prior insertion is
-            # the idempotency marker even when the wait allows more than one
-            # fire; a later fire requires the template to re-arm a new row.
-            if int(wait["fires_used"] or 0) > 0:
-                continue
             next_fire = int(wait["fires_used"] or 0) + 1
             external_id = f"wf:{wait['task_id']}:{wait['step_key']}:{wait['id']}:{next_fire}"
             existing = conn.execute(
@@ -1851,24 +1870,240 @@ def fire_due_timers(conn, now: int) -> list[int]:
                 conn,
                 source="timer",
                 external_id=external_id,
-                payload={"wait_id": int(wait["id"]), "fire": next_fire},
+                payload={
+                    "wait_id": int(wait["id"]),
+                    "fire": next_fire,
+                    "action": wait["timer_action"],
+                    "task_id": wait["task_id"],
+                    "step_key": wait["step_key"],
+                },
                 corr={"task_id": wait["task_id"], "step_key": wait["step_key"]},
                 event_type=wait["timer_action"],
             )
             if event_id is None:
                 continue
+            next_timer_at = wait["timer_at"]
+            if wait["timer_action"] == "chase" and next_fire < limit:
+                # Chase timers are the one repeating timer class.  Re-arm the
+                # same engine-owned row after each fire; the external id's
+                # monotonically increasing fire number is the durable dedupe
+                # key across gateway restarts.
+                cadence = max(1, _duration(timer_spec["after"]))
+                next_timer_at = int(now) + cadence
             updated = conn.execute(
                 """
                 UPDATE wf_wait
-                   SET fires_used = fires_used + 1
+                   SET fires_used = fires_used + 1,
+                       timer_at = ?
                  WHERE id = ? AND status = 'armed' AND fires_used = ?
                 """,
-                (int(wait["id"]), int(wait["fires_used"] or 0)),
+                (
+                    next_timer_at,
+                    int(wait["id"]),
+                    int(wait["fires_used"] or 0),
+                ),
             )
             if updated.rowcount != 1:
-                continue
+                # Keep the inserted event and wait counter atomic.  A caller
+                # must never observe a durable received event whose fire
+                # number was not claimed by the wait row.
+                raise WorkflowConflictError(
+                    f"workflow timer fire CAS lost for wait {wait['id']}"
+                )
             created.append(int(event_id))
     return created
+
+
+def process_timer_event(conn, event_id: int) -> ApplyResult:
+    """Apply one watcher-created timer event.
+
+    Ordinary timer waits take the same CAS-protected transition path as any
+    structured event.  Chase timers instead enqueue a tenant-neutral chase
+    action while leaving the instance parked; reaching ``max_fires`` moves
+    the instance to the resumable exception path and emits a kanban blocked
+    event so existing notify subscriptions can surface the escalation.
+    """
+
+    with kanban_db.write_txn(conn):
+        event = conn.execute(
+            "SELECT * FROM wf_event WHERE id = ?", (int(event_id),)
+        ).fetchone()
+        if event is None:
+            raise KeyError(f"unknown workflow event: {event_id}")
+        if event["source"] != "timer":
+            raise ValueError(f"workflow event {event_id} is not a timer event")
+        if event["status"] in _TERMINAL_EVENT_STATUSES:
+            return ApplyResult(
+                kind="duplicate",
+                task_id=event["matched_task_id"],
+                event_id=int(event_id),
+            )
+        payload = _load_json(event["payload"], {}) or {}
+        if not isinstance(payload, dict) or payload.get("wait_id") is None:
+            raise ValueError(f"timer event {event_id} has no wait_id")
+        wait = conn.execute(
+            """
+            SELECT w.*, i.template_id
+              FROM wf_wait w
+              JOIN wf_instance i ON i.task_id = w.task_id
+             WHERE w.id = ?
+            """,
+            (int(payload["wait_id"]),),
+        ).fetchone()
+        if wait is None:
+            _record_match(
+                conn,
+                int(event_id),
+                "superseded",
+                reason="timer wait no longer exists",
+            )
+            return ApplyResult(kind="superseded", event_id=int(event_id))
+        task = _task(conn, wait["task_id"])
+        if wait["status"] != "armed" or task["current_step_key"] != wait["step_key"]:
+            _record_match(
+                conn,
+                int(event_id),
+                "superseded",
+                wait["task_id"],
+                reason="timer lost the event/advance race",
+            )
+            return ApplyResult(
+                kind="superseded",
+                task_id=wait["task_id"],
+                event_id=int(event_id),
+            )
+
+        spec = _load_template(conn, wait["template_id"])
+        timer_specs = [
+            item
+            for item in (_step(spec, wait["step_key"]).get("waits") or [])
+            if isinstance(item, dict) and item.get("kind") == "timer"
+        ]
+        timer_spec = next(
+            (
+                item
+                for item in timer_specs
+                if item.get("action") == wait["timer_action"]
+            ),
+            timer_specs[0] if timer_specs else {},
+        )
+        action = str(wait["timer_action"] or "")
+        if action != "chase":
+            if action in {"escalate", "deadline"}:
+                reason = f"workflow {action} timer fired at {wait['step_key']}"
+                conn.execute(
+                    "UPDATE wf_wait SET status = 'satisfied', resume_token = NULL WHERE id = ?",
+                    (int(wait["id"]),),
+                )
+                conn.execute(
+                    """
+                    UPDATE wf_event
+                       SET status = 'applied', matched_task_id = ?,
+                           match_method = 'deterministic:timer', applied_at = ?
+                     WHERE id = ?
+                    """,
+                    (wait["task_id"], _now(), int(event_id)),
+                )
+                conn.execute(
+                    "UPDATE wf_instance SET state = 'exception', parked_since = ? WHERE task_id = ?",
+                    (_now(), wait["task_id"]),
+                )
+                # The task is already blocked while parked, so block_task()
+                # cannot emit a second visible event.  Record the escalation
+                # explicitly for the existing notifier cursor.
+                kanban_db._append_event(
+                    conn,
+                    wait["task_id"],
+                    "blocked",
+                    {"reason": reason, "source": "workflow_timer"},
+                )
+                _assert_invariant(conn, wait["task_id"])
+                return ApplyResult(
+                    kind="exception",
+                    task_id=wait["task_id"],
+                    event_id=int(event_id),
+                    reason=reason,
+                )
+            # Transition timers use the same atomic apply path.  The nested
+            # transaction is a savepoint under the outer write transaction.
+            return apply_event(
+                conn,
+                int(event_id),
+                wait["task_id"],
+                expected_step=wait["step_key"],
+            )
+
+        try:
+            limit = max(1, int(timer_spec.get("max_fires", 1)))
+        except (TypeError, ValueError):
+            limit = 1
+        fire_number = int(payload.get("fire") or wait["fires_used"] or 0)
+        conn.execute(
+            """
+            INSERT INTO wf_outbox (task_id, action, payload, status, attempts, created_at)
+            SELECT ?, 'chase', ?, 'pending', 0, ?
+             WHERE NOT EXISTS (
+                SELECT 1 FROM wf_outbox
+                 WHERE task_id = ? AND action = 'chase'
+                   AND json_extract(payload, '$.event_id') = ?
+             )
+            """,
+            (
+                wait["task_id"],
+                _json(
+                    {
+                        "event_id": int(event_id),
+                        "wait_id": int(wait["id"]),
+                        "step_key": wait["step_key"],
+                        "fire": fire_number,
+                    }
+                ),
+                _now(),
+                wait["task_id"],
+                int(event_id),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE wf_event
+               SET status = 'applied', matched_task_id = ?,
+                   match_method = 'deterministic:timer', applied_at = ?
+             WHERE id = ?
+            """,
+            (wait["task_id"], _now(), int(event_id)),
+        )
+        if fire_number >= limit and timer_spec.get("then", "escalate") == "escalate":
+            reason = (
+                f"workflow chase cap reached at {wait['step_key']} "
+                f"({fire_number}/{limit})"
+            )
+            conn.execute(
+                "UPDATE wf_wait SET status = 'satisfied', resume_token = NULL WHERE id = ?",
+                (int(wait["id"]),),
+            )
+            conn.execute(
+                "UPDATE wf_instance SET state = 'exception', parked_since = ? WHERE task_id = ?",
+                (_now(), wait["task_id"]),
+            )
+            kanban_db._append_event(
+                conn,
+                wait["task_id"],
+                "blocked",
+                {"reason": reason, "source": "workflow_chase_cap"},
+            )
+            _assert_invariant(conn, wait["task_id"])
+            return ApplyResult(
+                kind="exception",
+                task_id=wait["task_id"],
+                event_id=int(event_id),
+                reason=reason,
+            )
+        _assert_invariant(conn, wait["task_id"])
+        return ApplyResult(
+            kind="chase",
+            task_id=wait["task_id"],
+            event_id=int(event_id),
+        )
 
 
 def sweep(conn, now: int) -> SweepResult:
@@ -1882,6 +2117,7 @@ def sweep(conn, now: int) -> SweepResult:
             SELECT id
               FROM wf_event
              WHERE created_at >= ?
+               AND source != 'timer'
                AND status IN ('received', 'classified', 'unmatched', 'buffered')
              ORDER BY id
             """,
@@ -1964,6 +2200,7 @@ __all__ = [
     "ingest_event",
     "match_event",
     "park",
+    "process_timer_event",
     "propose",
     "register_template",
     "review",

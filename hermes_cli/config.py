@@ -1472,6 +1472,12 @@ DEFAULT_CONFIG = {
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
+        # Run the workflow timer/state-poll/intake-recovery watcher in this
+        # gateway. It is idle when no wf_instance rows or state probes exist.
+        "workflow_watch_in_gateway": True,
+        # Due timers use <= now, so the first tick after a restart catches
+        # every missed deadline without an external scheduler.
+        "workflow_watch_interval_seconds": 60,
         # Auto-block after this many consecutive non-success attempts for the
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
