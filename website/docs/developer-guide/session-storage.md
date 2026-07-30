@@ -14,13 +14,13 @@ Source file: `hermes_state.py`
 ├── sessions              — Session metadata, token counts, billing
 ├── messages              — Full message history per session
 ├── session_model_usage   — Per-model and per-task token/cost attribution
-├── gateway_routing       — Canonical gateway conversation routing index
-├── compression_locks     — Cross-process compression leases
-├── async_delegations     — Durable asynchronous delegation state
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
 ├── messages_fts_cjk      — Optional CJK-bigram FTS5 index when the native tokenizer is available
 ├── state_meta            — Key/value metadata table
+├── gateway_routing       — Canonical gateway conversation routing index
+├── compression_locks     — Cross-process compression leases
+├── async_delegations     — Durable asynchronous delegation state
 └── schema_version        — Single-row table tracking migration state
 ```
 
@@ -35,6 +35,13 @@ Key design decisions:
 ## SQLite Schema
 
 ### Sessions Table
+
+Abridged — see `SCHEMA_SQL` in `hermes_state.py` for the full current column list
+(which also includes gateway routing metadata such as `session_key`, `chat_id`,
+`chat_type`, `thread_id`, `display_name`, `origin_json`, `expiry_finalized`,
+workspace fields `cwd` / `git_branch` / `git_repo_root`, handoff and
+compression-failure fields, `profile_name`, `rewind_count`, `archived`, and
+`pinned`):
 
 ```sql
 CREATE TABLE IF NOT EXISTS sessions (
@@ -75,16 +82,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
-    handoff_state TEXT,
-    handoff_platform TEXT,
-    handoff_error TEXT,
-    compression_failure_cooldown_until REAL,
-    compression_failure_error TEXT,
-    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
-    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
-    profile_name TEXT,
-    rewind_count INTEGER NOT NULL DEFAULT 0,
-    archived INTEGER NOT NULL DEFAULT 0,
+    -- ... additional gateway/workspace/handoff/compression columns ...
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -104,6 +102,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
 
 ### Messages Table
 
+Abridged — the full schema also includes `effect_disposition`,
+`platform_message_id`, `observed`, `active`, `compacted`, `api_content`,
+`display_kind`, and `display_metadata`:
+
 ```sql
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,14 +123,8 @@ CREATE TABLE IF NOT EXISTS messages (
     reasoning_content TEXT,
     reasoning_details TEXT,
     codex_reasoning_items TEXT,
-    codex_message_items TEXT,
-    platform_message_id TEXT,
-    observed INTEGER DEFAULT 0,
-    active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0,
-    api_content TEXT,
-    display_kind TEXT,
-    display_metadata TEXT
+    codex_message_items TEXT
+    -- ... additional display/compaction columns ...
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
@@ -142,6 +138,7 @@ Notes:
 - `tool_calls` is stored as a JSON string (serialized list of tool call objects)
 - `reasoning_details`, `codex_reasoning_items`, and `codex_message_items` are stored as JSON strings
 - `reasoning` stores the raw reasoning text for providers that expose it
+- `api_content` is a byte-fidelity sidecar: the exact content string sent to the API for this message when it differs from `content` (ephemeral memory/plugin injections, persist overrides). It preserves the wire bytes for prompt-cache-stable replay — stored as sent, except lone surrogates, which sqlite3 cannot bind and which the conversation loop scrubs from every outgoing payload anyway. `NULL` means `content` was sent verbatim.
 - Timestamps are Unix epoch floats (`time.time()`)
 
 ### Supporting Tables
