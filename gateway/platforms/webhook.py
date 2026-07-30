@@ -227,7 +227,14 @@ class WebhookAdapter(BasePlatformAdapter):
             # via _coerce_bool so a quoted YAML "false" does NOT enable the HMAC
             # bypass (bool("false") is truthy).
             _allow_insecure_cfg = _coerce_bool(route.get("allow_insecure"), default=False)
-            if _allow_insecure_cfg and not secret:
+            if _allow_insecure_cfg:
+                # Explicit override, not just a fallback for a missing secret:
+                # `secret` above may have already inherited a non-empty
+                # self._global_secret, in which case the old `and not secret`
+                # guard here left the route silently still requiring HMAC
+                # auth despite allow_insecure: true -- the flag must mean
+                # what the docs say ("an alternative to secret:
+                # INSECURE_NO_AUTH"), not just "fill in an empty secret."
                 secret = _INSECURE_NO_AUTH
                 # Persist the resolved secret back into the route dict (route
                 # IS the same dict object stored in self._routes[name], so
@@ -235,8 +242,9 @@ class WebhookAdapter(BasePlatformAdapter):
                 # variable knows about the sentinel mapping -- _handle_webhook
                 # re-reads route_config.get("secret", ...) directly from
                 # self._routes at request time and would see the original
-                # (still-missing) secret, silently rejecting every request
-                # with 403 regardless of allow_insecure: true (issue #47329).
+                # (still-inherited-global or still-missing) secret, silently
+                # rejecting every request with 403 regardless of
+                # allow_insecure: true (issue #66369).
                 route["secret"] = secret
             if not secret:
                 raise ValueError(

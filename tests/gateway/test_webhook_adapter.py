@@ -1690,7 +1690,7 @@ class TestDualStackBind:
 
 
 class TestAllowInsecureConfig:
-    """Regression tests for allow_insecure: true config key (issue #47329)."""
+    """Regression tests for allow_insecure: true config key (issue #66369)."""
 
     @pytest.mark.asyncio
     async def test_allow_insecure_true_on_loopback_allowed(self):
@@ -1763,4 +1763,72 @@ class TestAllowInsecureConfig:
             assert resp.status == 202, (
                 f"Unsigned request to an allow_insecure: true route must be "
                 f"accepted, got {resp.status}: {await resp.text()}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_allow_insecure_true_overrides_inherited_global_secret(self):
+        """Regression (review of #66369): allow_insecure: true must be an
+        explicit override, not just a fallback for a missing secret. When a
+        route has no secret of its own, `secret = route.get("secret",
+        self._global_secret)` already inherits the GLOBAL secret before the
+        allow_insecure check runs -- a prior `if _allow_insecure_cfg and not
+        secret:` guard therefore never fired whenever a global secret was
+        configured (the common case for a gateway with multiple routes),
+        leaving the route silently still requiring HMAC auth despite
+        allow_insecure: true, contradicting the documented "alternative to
+        secret: INSECURE_NO_AUTH" contract. POSTs through the real handler
+        with NO signature, while a real global secret is configured, to
+        prove the override actually reaches live request auth."""
+        routes = {"r1": {"allow_insecure": True, "prompt": "test: {x}"}}
+        adapter = _make_adapter(
+            routes=routes, host="127.0.0.1", port=0, secret="global-hmac-secret-value",
+        )
+        adapter.handle_message = AsyncMock()
+        try:
+            with patch.object(adapter, "_reload_dynamic_routes"):
+                connected = await adapter.connect()
+            assert connected is True
+        finally:
+            await adapter.disconnect()
+
+        assert adapter._routes["r1"]["secret"] == _INSECURE_NO_AUTH, (
+            "allow_insecure: true must override the inherited global "
+            "secret, not just fill in a missing one"
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            # No X-Hub-Signature-256 header at all -- if the global secret
+            # were still in effect, this would be rejected with 403.
+            resp = await cli.post("/webhooks/r1", json={"x": "hello"})
+            assert resp.status == 202, (
+                f"allow_insecure: true must bypass HMAC validation even "
+                f"when a global secret is configured, got {resp.status}: "
+                f"{await resp.text()}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_route_without_allow_insecure_still_requires_global_secret(self):
+        """Sanity: this fix must not accidentally weaken auth for routes
+        that do NOT set allow_insecure -- they must still require a valid
+        signature against the inherited global secret."""
+        routes = {"r1": {"prompt": "test: {x}"}, "r2": {"allow_insecure": True, "prompt": "x"}}
+        adapter = _make_adapter(
+            routes=routes, host="127.0.0.1", port=0, secret="global-hmac-secret-value",
+        )
+        adapter.handle_message = AsyncMock()
+        try:
+            with patch.object(adapter, "_reload_dynamic_routes"):
+                connected = await adapter.connect()
+            assert connected is True
+        finally:
+            await adapter.disconnect()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/webhooks/r1", json={"x": "hello"})
+            assert resp.status == 401, (
+                f"A route without allow_insecure must still require a "
+                f"valid signature against the global secret, got "
+                f"{resp.status}"
             )
