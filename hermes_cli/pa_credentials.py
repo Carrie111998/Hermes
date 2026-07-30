@@ -300,6 +300,10 @@ class CredentialRecord:
     last_transition_at: datetime | None = None
     last_probe_at: datetime | None = None
     last_probe_status: str | None = None
+    lifecycle_state: str = "active"
+    superseded_by_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
     _state_machine: ReauthStateMachine = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -311,6 +315,14 @@ class CredentialRecord:
             raise CredentialContractError("driver_key is required")
         if self.timeout_after_seconds <= 0:
             raise CredentialContractError("timeout_after_seconds must be positive")
+        if self.lifecycle_state != "active":
+            raise CredentialContractError(
+                "runtime credential export may contain only active rows"
+            )
+        if self.superseded_by_id is not None:
+            raise CredentialContractError(
+                "active runtime credential cannot name a successor"
+            )
 
     @classmethod
     def from_row(
@@ -382,6 +394,18 @@ class CredentialRecord:
                 if row.get("last_probe_status") is not None
                 else None
             ),
+            lifecycle_state=str(row.get("lifecycle_state", "active")),
+            superseded_by_id=(
+                str(row["superseded_by_id"])
+                if row.get("superseded_by_id") is not None
+                else None
+            ),
+            created_at=_parse_datetime(
+                row.get("created_at"), field_name="created_at"
+            ),
+            updated_at=_parse_datetime(
+                row.get("updated_at"), field_name="updated_at"
+            ),
         )
 
     def transition(
@@ -405,6 +429,9 @@ class CredentialRecord:
         """Return metadata safe for logs, receipts, and status surfaces."""
         public: dict[str, Any] = {
             "id": self.credential_id,
+            "tenant_slug": self.tenant_slug,
+            "agent_slug": self.agent_slug,
+            "credential_slug": self.credential_slug,
             "driver_key": self.driver_key,
             "expires_at": self.expires_at.isoformat() if self.expires_at else None,
             "reauth_state": self.reauth_state.value,
@@ -433,6 +460,10 @@ class CredentialRecord:
                 self.last_probe_at.isoformat() if self.last_probe_at else None
             ),
             "last_probe_status": self.last_probe_status,
+            "lifecycle_state": self.lifecycle_state,
+            "superseded_by_id": self.superseded_by_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
         public.update(self.material.public_metadata())
         return public

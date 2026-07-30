@@ -758,6 +758,10 @@ def test_exact_runtime_export_envelope_preserves_metadata_and_watches(
                         },
                         "last_probe_at": "2026-10-29T00:00:00Z",
                         "last_probe_status": "stale",
+                        "lifecycle_state": "active",
+                        "superseded_by_id": None,
+                        "created_at": "2026-07-30T01:00:00Z",
+                        "updated_at": "2026-07-30T02:00:00Z",
                     }
                 ],
                 "meta": {"source": "synthetic-export"},
@@ -776,12 +780,19 @@ def test_exact_runtime_export_envelope_preserves_metadata_and_watches(
     assert record.last_transition_at == datetime(2026, 10, 28, 23, 55, 1, tzinfo=UTC)
     assert record.last_probe_at == datetime(2026, 10, 29, tzinfo=UTC)
     assert record.last_probe_status == "stale"
+    assert record.lifecycle_state == "active"
+    assert record.superseded_by_id is None
+    assert record.created_at == datetime(2026, 7, 30, 1, tzinfo=UTC)
+    assert record.updated_at == datetime(2026, 7, 30, 2, tzinfo=UTC)
     assert record.escalation_policy == {"channel": "operator", "priority": "high"}
     assert record.timeout_policy == {"seconds": 17}
     assert record.timeout_after_seconds == 17
     public = record.public_dict()
     assert public["last_probe_status"] == "stale"
     assert public["timeout_policy"] == {"seconds": 17}
+    assert public["tenant_slug"] == "tenant-a"
+    assert public["credential_slug"] == "primary"
+    assert public["created_at"] == "2026-07-30T01:00:00+00:00"
     assert token not in json.dumps(public)
 
     asyncio.run(watcher.run_once())
