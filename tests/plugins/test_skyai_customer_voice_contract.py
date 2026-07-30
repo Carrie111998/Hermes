@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from plugins.skyai_customer import voice_audio, voice_contract
 from scripts import skyai_voice_contract_smoke
 from scripts import skyai_voice_openai_audio_preflight
@@ -113,6 +115,54 @@ def test_voice_audio_preflight_blocks_without_audio_key() -> None:
     assert result["status"] == "blocked"
     assert result["api_key"]["configured"] is False
     assert result["api_key"]["env"] == "VOICE_TOOLS_OPENAI_KEY"
+
+
+def test_voice_audio_settings_preserve_opaque_identifiers_byte_for_byte() -> None:
+    settings = voice_audio.load_voice_audio_settings(
+        {
+            "SKYAI_VOICE_STT_MODEL": " \tOpaque-Model/Exact\n",
+            "SKYAI_VOICE_TTS_VOICE": " Voice-With-Spaces ",
+            "SKYAI_VOICE_REALTIME_BACKEND_TARGET": " route/exact ",
+        }
+    )
+
+    assert settings.stt_primary_model == " \tOpaque-Model/Exact\n"
+    assert settings.tts_voice == " Voice-With-Spaces "
+    assert settings.realtime_backend_target == " route/exact "
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    [
+        (
+            "SKYAI_VOICE_STT_MODEL",
+            "",
+            "SKYAI_VOICE_STT_MODEL must be a nonempty string",
+        ),
+        (
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS",
+            "not-a-number",
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS must be a decimal number",
+        ),
+        (
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS",
+            "0.5",
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS must be between 1 and 120 seconds",
+        ),
+        (
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS",
+            "nan",
+            "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS must be finite",
+        ),
+    ],
+)
+def test_voice_audio_settings_reject_invalid_config_without_repair(
+    name: str,
+    value: str,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        voice_audio.load_voice_audio_settings({name: value})
 
 
 def test_voice_audio_preflight_declares_hybrid_models_and_gateway_latency_masking() -> None:

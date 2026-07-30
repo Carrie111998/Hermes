@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
-import re
-import time
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
@@ -29,157 +25,13 @@ PUBLIC_EVENTS_BASE_URL = os.getenv(
 ).rstrip("/")
 BGN_PER_EUR = Decimal("1.95583")
 DEFAULT_HTTP_TIMEOUT_SECONDS = 8.0
-MAX_CATALOG_SIZE = 3000
 MAX_RETURN_ITEMS = 12
 MAX_EVENT_PROPERTY_VALUE_LENGTH = 500
 MAX_TEXT_FIELD_LENGTH = 900
 MAX_DETAIL_LIST_ITEMS = 8
 MAX_CONFIGURATOR_OPTIONS = 10
 PUBLIC_SITE_BASE_URL = "https://skyvision.bg"
-CATALOG_INDEX_TTL_SECONDS = int(os.getenv("SKYAI_CATALOG_INDEX_TTL_SECONDS", "21600"))
-VALUE_VOUCHER_PUBLIC_URL = f"{PUBLIC_SITE_BASE_URL}/подарък/ваучер-за-подарък-на-стойност/"
-VALUE_VOUCHER_OPTION = {
-    "title": "Ваучер за подарък на стойност",
-    "public_url": VALUE_VOUCHER_PUBLIC_URL,
-    "price_text": "стойност по избор",
-    "location": "валиден за SkyVision каталога",
-    "category_key": "voucher-value",
-    "summary": (
-        "Универсален, стилен подарък, който оставя избора на преживяване на получателя "
-        "сред 1000+ SkyVision преживявания."
-    ),
-    "important_note": (
-        "Не казвай, че само този ваучер дава свобода: всеки SkyVision ваучер работи като "
-        "стойност/депозит. Разликата е, че ваучерът на стойност не изписва конкретна услуга "
-        "и изглежда като съзнателно оставен избор за получателя."
-    ),
-}
-
-_CATALOG_INDEX_CACHE: dict[str, Any] = {"expires_at": 0.0, "items": None}
-
-_QUERY_STOPWORDS = frozenset(
-    {
-        "аз",
-        "ако",
-        "без",
-        "бих",
-        "във",
-        "вече",
-        "дали",
-        "дайте",
-        "добре",
-        "ден",
-        "до",
-        "eur",
-        "euro",
-        "евро",
-        "за",
-        "има",
-        "имате",
-        "искам",
-        "какво",
-        "като",
-        "към",
-        "ли",
-        "ми",
-        "може",
-        "мога",
-        "моля",
-        "помощ",
-        "повод",
-        "рожден",
-        "на",
-        "не",
-        "нещо",
-        "някакъв",
-        "около",
-        "от",
-        "по",
-        "предложиш",
-        "препоръчаш",
-        "със",
-        "това",
-        "трябва",
-        "търся",
-        "уникален",
-        "уникална",
-        "уникално",
-        "въздействащ",
-        "въздействаща",
-        "въздействащо",
-        "ще",
-    }
-)
-_TOKEN_EXPANSIONS = {
-    "двама": ("двойка", "двойки", "двоен"),
-    "двойка": ("двама", "двойки"),
-    "двойки": ("двама", "двойка"),
-    "спа": ("spa", "уелнес", "релакс"),
-    "spa": ("спа", "уелнес", "релакс"),
-    "уелнес": ("спа", "spa", "релакс"),
-}
-
-_KNOWN_LOCATION_COORDS = {
-    "сливен": (42.6817, 26.3229),
-    "ямбол": (42.4842, 26.5035),
-    "бургас": (42.5048, 27.4626),
-    "стара загора": (42.4258, 25.6345),
-    "казанлък": (42.6194, 25.3930),
-    "павел баня": (42.5942, 25.2089),
-    "могилово": (42.4250, 25.6270),
-    "приморско": (42.2679, 27.7561),
-    "созопол": (42.4173, 27.6962),
-    "несебър": (42.6601, 27.7206),
-    "балчик": (43.4217, 28.1585),
-    "сопот": (42.6520, 24.7545),
-    "пловдив": (42.1354, 24.7453),
-    "житница": (42.3540, 24.7250),
-    "пазарджик": (42.1928, 24.3336),
-    "сърница": (41.7386, 24.0249),
-    "софия": (42.6977, 23.3219),
-    "варна": (43.2141, 27.9147),
-    "велико търново": (43.0757, 25.6172),
-    "русе": (43.8356, 25.9657),
-    "велинград": (42.0275, 23.9916),
-}
-_LOCATION_ALIASES = {
-    "sliven": "сливен",
-    "yambol": "ямбол",
-    "burgas": "бургас",
-    "stara zagora": "стара загора",
-    "stara zagora province": "стара загора",
-    "plovdiv": "пловдив",
-    "plovdiv province": "пловдив",
-    "sofia": "софия",
-    "sofia city province": "софия",
-    "sofia province": "софия",
-    "varna": "варна",
-    "varna province": "варна",
-    "dobrich province": "варна",
-    "pazardzhik": "пазарджик",
-    "pazardzhik province": "пазарджик",
-    "sarnitsa": "сърница",
-    "blagoevgrad province": "благоевград",
-    "smoljan": "смолян",
-    "montana province": "монтана",
-    "район бургас": "бургас",
-    "обл бургас": "бургас",
-    "област бургас": "бургас",
-    "район сливен": "сливен",
-    "обл сливен": "сливен",
-    "област сливен": "сливен",
-    "район стара загора": "стара загора",
-    "обл стара загора": "стара загора",
-    "област стара загора": "стара загора",
-}
-
-
-@dataclass(frozen=True)
-class QueryEvidence:
-    tokens: list[str]
-    normalized: str
-    requested_location: str | None = None
-    requested_coordinates: tuple[float, float] | None = None
+_MISSING = object()
 
 ALLOWED_EVENT_TYPES = frozenset(
     {
@@ -197,51 +49,69 @@ ALLOWED_EVENT_TYPES = frozenset(
         "qa_feedback",
     }
 )
-SENSITIVE_PROPERTY_KEYS = frozenset(
-    {
-        "email",
-        "phone",
-        "telephone",
-        "mobile",
-        "voucher",
-        "voucher_code",
-        "order_id",
-        "payment_id",
-        "card",
-        "card_number",
-        "name",
-        "full_name",
-        "address",
-        "ip",
-        "raw_message",
-        "message",
-        "secret",
-        "token",
-        "password",
-        "api_key",
-    }
-)
-SENSITIVE_VALUE_RE = re.compile(
-    r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|(?:\+?\d[\d\s().-]{7,}\d)|\b(?:sk-|ghp_|xox[baprs]-)[A-Za-z0-9_-]+)",
-    re.IGNORECASE,
+EVENT_PROPERTY_SCHEMA: dict[str, dict[str, Any]] = {
+    "product_id": {"type": "integer", "minimum": 1},
+    "product_slug": {"type": "string", "maxLength": 300},
+    "product_url": {"type": "string", "maxLength": 500},
+    "surface": {"type": "string", "maxLength": 120},
+    "position": {"type": "integer", "minimum": 0},
+    "quantity": {"type": "integer", "minimum": 1},
+    "value_eur": {"type": "number", "minimum": 0},
+    "currency": {"type": "string", "enum": ["EUR"]},
+    "campaign_id": {"type": "string", "maxLength": 120},
+    "experiment_id": {"type": "string", "maxLength": 120},
+    "variant_id": {"type": "string", "maxLength": 120},
+    "reason_code": {"type": "string", "maxLength": 120},
+    "feedback_code": {"type": "string", "maxLength": 120},
+    "result_code": {"type": "string", "maxLength": 120},
+    "success": {"type": "boolean"},
+}
+REGISTERED_EVENT_SECRET_ENV_NAMES = (
+    "SKYAI_V2_CANARY_TOKEN",
+    "SKYAI_DISCORD_BOT_TOKEN",
+    "SKYAI_DISCORD_MIRROR_DATABASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_CODEX_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "OPENROUTER_API_KEY",
 )
 
 
 SKYAI_CATALOG_SEARCH_SCHEMA = {
     "name": "skyai_catalog_search",
     "description": (
-        "Search SkyVision's public catalog cache for customer-safe product candidates. "
-        "Use for sales discovery and recommendations. Prices are accepted in EUR and "
-        "converted to the public cache BGN filters internally."
+        "Query SkyVision's public catalog cache with the model-authored query and explicit "
+        "EUR price filters. The tool converts explicit prices to the cache's BGN protocol, "
+        "preserves backend order, and returns public product facts without interpreting or "
+        "reranking the query."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Customer search phrase."},
-            "min_price_eur": {"type": "number", "description": "Optional lower budget in EUR."},
-            "max_price_eur": {"type": "number", "description": "Optional upper budget in EUR."},
-            "limit": {"type": "integer", "description": "Maximum returned products, default 8, max 12."},
+            "query": {
+                "type": "string",
+                "maxLength": MAX_TEXT_FIELD_LENGTH,
+                "description": "Exact search query to send to the public catalog API.",
+            },
+            "min_price_eur": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional explicit lower budget in EUR.",
+            },
+            "max_price_eur": {
+                "type": "number",
+                "minimum": 0,
+                "description": "Optional explicit upper budget in EUR.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_RETURN_ITEMS,
+                "default": 8,
+                "description": "Maximum returned products.",
+            },
         },
+        "additionalProperties": False,
     },
 }
 
@@ -257,6 +127,7 @@ SKYAI_PRODUCT_DETAIL_SCHEMA = {
             "product_url": {"type": "string", "description": "Full public product URL."},
             "product_path": {"type": "string", "description": "Path after skyvision.bg, with or without /подарък/."},
         },
+        "additionalProperties": False,
     },
 }
 
@@ -274,6 +145,7 @@ SKYAI_PRODUCT_SLOTS_SCHEMA = {
             "end_date": {"type": "string", "description": "Optional YYYY-MM-DD end."},
         },
         "required": ["product_id"],
+        "additionalProperties": False,
     },
 }
 
@@ -297,6 +169,7 @@ SKYAI_CAMPAIGN_KNOWLEDGE_SCHEMA = {
                 "description": "Whether the customer explicitly needs campaign terms or eligibility details.",
             },
         },
+        "additionalProperties": False,
     },
 }
 
@@ -320,6 +193,7 @@ SKYAI_SUPPORT_KNOWLEDGE_SCHEMA = {
                 "description": "Whether to include official SkyVision contact details in the answer.",
             },
         },
+        "additionalProperties": False,
     },
 }
 
@@ -334,11 +208,25 @@ SKYAI_EVENT_LOG_APPEND_SCHEMA = {
         "type": "object",
         "properties": {
             "event_type": {"type": "string", "enum": sorted(ALLOWED_EVENT_TYPES)},
-            "anonymous_id": {"type": "string", "description": "Opaque anonymous id, if already safe."},
-            "conversation_id": {"type": "string", "description": "Opaque conversation id."},
-            "properties": {"type": "object", "description": "Sanitized metadata only."},
+            "anonymous_id": {
+                "type": "string",
+                "maxLength": MAX_EVENT_PROPERTY_VALUE_LENGTH,
+                "description": "Opaque anonymous id, if already safe.",
+            },
+            "conversation_id": {
+                "type": "string",
+                "maxLength": MAX_EVENT_PROPERTY_VALUE_LENGTH,
+                "description": "Opaque conversation id.",
+            },
+            "properties": {
+                "type": "object",
+                "properties": EVENT_PROPERTY_SCHEMA,
+                "additionalProperties": False,
+                "description": "Exact structured analytics metadata only; no free-form chat content.",
+            },
         },
         "required": ["event_type"],
+        "additionalProperties": False,
     },
 }
 
@@ -355,16 +243,20 @@ SKYAI_VOICE_TRANSFER_TO_HUMAN_SCHEMA = {
         "properties": {
             "reason": {
                 "type": "string",
+                "maxLength": 120,
                 "description": "Short customer-safe reason for the handoff decision.",
             },
             "spoken_reply": {
                 "type": "string",
+                "maxLength": 220,
                 "description": (
                     "Short Bulgarian phrase to say before transfer. Keep it natural for TTS; "
                     "do not include phone numbers, email addresses, URLs, or markdown."
                 ),
             },
         },
+        "required": ["reason", "spoken_reply"],
+        "additionalProperties": False,
     },
 }
 
@@ -410,12 +302,26 @@ def _int_or_none(value: Any) -> int | None:
         return None
 
 
+def _first_present(
+    mapping: dict[str, Any],
+    *keys: str,
+    default: Any = None,
+) -> Any:
+    """Return the first structurally present field without truthiness repair."""
+
+    for key in keys:
+        if key in mapping:
+            return mapping[key]
+    return default
+
+
 def _rating_value(item: dict[str, Any]) -> str | None:
-    value = (
-        item.get("rating")
-        or item.get("averageRating")
-        or item.get("avgRating")
-        or item.get("ratingValue")
+    value = _first_present(
+        item,
+        "rating",
+        "averageRating",
+        "avgRating",
+        "ratingValue",
     )
     if value is None or value == "":
         return None
@@ -425,453 +331,40 @@ def _rating_value(item: dict[str, Any]) -> str | None:
         return str(value)
 
 
-def _is_on_offer(item: dict[str, Any], old_price_bgn: Any) -> bool | None:
-    explicit = _boolish(
-        item.get("isOnOffer")
-        or item.get("is_on_offer")
-        or item.get("hasDiscount")
-    )
-    if explicit is not None:
-        return explicit
-    return old_price_bgn is not None and old_price_bgn != ""
+def _exact_optional_bool_field(
+    item: dict[str, Any],
+    *keys: str,
+) -> bool | None:
+    value = _first_present(item, *keys, default=_MISSING)
+    if value is _MISSING or value is None:
+        return None
+    if type(value) is not bool:
+        rendered = "/".join(keys)
+        raise ValueError(f"{rendered} must be an exact boolean")
+    return value
 
 
 def _safe_limit(limit: int | None) -> int:
-    if not limit:
+    if limit is None:
         return 8
-    return max(1, min(MAX_RETURN_ITEMS, int(limit)))
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError("limit_must_be_an_integer")
+    if not 1 <= limit <= MAX_RETURN_ITEMS:
+        raise ValueError("limit_out_of_range")
+    return limit
 
 
-def _infer_price_bounds_from_query(
-    query: str,
-    *,
-    min_price_eur: float | None,
-    max_price_eur: float | None,
-) -> tuple[float | None, float | None]:
-    text = _normalize_search_text(query)
-    inferred_min = min_price_eur
-    inferred_max = max_price_eur
-    if inferred_max is None:
-        eur_match = re.search(r"(?:до|под|около|към)?\s*(\d+(?:[.,]\d+)?)\s*(?:евро|eur|euro|€)", text)
-        if eur_match:
-            inferred_max = _float_or_none(eur_match.group(1))
-    if inferred_max is None:
-        bgn_match = re.search(r"(?:до|под|около|към)?\s*(\d+(?:[.,]\d+)?)\s*(?:лв|лева|bgn)", text)
-        bgn_value = _float_or_none(bgn_match.group(1)) if bgn_match else None
-        if bgn_value is not None:
-            inferred_max = float(Decimal(str(bgn_value)) / BGN_PER_EUR)
-    return inferred_min, inferred_max
-
-
-def _float_or_none(value: str | None) -> float | None:
-    if not value:
+def _validate_catalog_price(name: str, value: float | int | None) -> str | None:
+    if value is None:
         return None
-    try:
-        return float(value.replace(",", "."))
-    except ValueError:
-        return None
-
-
-def _catalog_search_candidates(
-    *,
-    query: str,
-    direct_items: list[dict[str, Any]],
-    min_price_eur: float | None,
-    max_price_eur: float | None,
-    limit: int,
-) -> list[dict[str, Any]]:
-    evidence = _query_evidence(query)
-    candidate_limit = min(MAX_RETURN_ITEMS, limit)
-    merged = _dedupe_products(direct_items)
-    if query.strip():
-        try:
-            merged = _dedupe_products([*merged, *_catalog_index_items()])
-        except Exception:
-            pass
-    filtered = _filter_products_by_budget(merged, min_price_eur, max_price_eur)
-    if not query.strip():
-        return _annotate_catalog_evidence(filtered[:candidate_limit], evidence)
-    ordered = _order_products_by_catalog_evidence(
-        filtered,
-        evidence=evidence,
-        max_price_eur=max_price_eur,
-    )
-    return ordered[:candidate_limit]
-
-
-def _catalog_location_context(items: list[dict[str, Any]], evidence: QueryEvidence) -> dict[str, Any] | None:
-    if not evidence.requested_location:
-        return None
-    nearest_items = sorted(
-        (
-            _sanitize_product_summary(item)
-            for item in items
-            if isinstance(item.get("_skyai_distance_km"), int)
-        ),
-        key=lambda item: int(item.get("distance_from_requested_location_km") or 9999),
-    )[:5]
-    distances = sorted(
-        {
-            int(distance)
-            for item in items
-            if isinstance((distance := item.get("_skyai_distance_km")), int)
-        }
-    )
-    if not distances:
-        return {
-            "requested_location": evidence.requested_location,
-            "distance_metadata_available": False,
-            "reasoning_owner": "hermes",
-        }
-    return {
-        "requested_location": evidence.requested_location,
-        "nearest_returned_distance_km": distances[0],
-        "farthest_returned_distance_km": distances[-1],
-        "returned_distance_km_values": distances[:12],
-        "nearest_returned_items": nearest_items,
-        "distance_metadata_available": True,
-        "reasoning_owner": "hermes",
-    }
-
-
-def _catalog_selection_context(items: list[dict[str, Any]]) -> dict[str, Any]:
-    category_order: list[str] = []
-    category_counts: dict[str, int] = {}
-    category_examples: dict[str, list[str]] = {}
-    for item in items:
-        category_key = str(item.get("_skyai_category_key") or _product_family_key(item) or "uncategorized")
-        if category_key not in category_counts:
-            category_order.append(category_key)
-            category_counts[category_key] = 0
-            category_examples[category_key] = []
-        category_counts[category_key] += 1
-        title = str(item.get("title") or item.get("name") or "").strip()
-        if title and len(category_examples[category_key]) < 3:
-            category_examples[category_key].append(title)
-    repeated_categories = [
-        {"category_key": key, "count": category_counts[key], "examples": category_examples[key]}
-        for key in category_order
-        if category_counts[key] > 1
-    ]
-    return {
-        "reasoning_owner": "hermes",
-        "ranked_items_contract": (
-            "items are relevance-ranked evidence; they are not a mandatory final-answer order."
-        ),
-        "diverse_items_contract": (
-            "diverse_items keeps the same public evidence but interleaves activity families so Hermes can "
-            "avoid accidental same-family clusters when the customer's request is exploratory."
-        ),
-        "evidence_interpretation_contract": (
-            "category_mix and diverse_items describe the retrieved evidence; they do not select the final "
-            "customer-facing answer. Hermes remains the reasoning owner."
-        ),
-        "category_mix": [
-            {"category_key": key, "count": category_counts[key]}
-            for key in category_order
-        ],
-        "repeated_categories": repeated_categories,
-        "diverse_items": [_sanitize_product_summary(item) for item in _diverse_catalog_items(items)],
-    }
-
-
-def _diverse_catalog_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    buckets: dict[str, list[dict[str, Any]]] = {}
-    category_order: list[str] = []
-    for item in items:
-        category_key = str(item.get("_skyai_category_key") or _product_family_key(item) or "uncategorized")
-        if category_key not in buckets:
-            category_order.append(category_key)
-            buckets[category_key] = []
-        buckets[category_key].append(item)
-    diverse: list[dict[str, Any]] = []
-    while any(buckets[key] for key in category_order):
-        for key in category_order:
-            if buckets[key]:
-                diverse.append(buckets[key].pop(0))
-    return diverse
-
-
-def _catalog_query_evidence(evidence: QueryEvidence) -> dict[str, Any]:
-    return {
-        "tokens": evidence.tokens[:20],
-        "requested_location": evidence.requested_location,
-        "requested_coordinates_available": evidence.requested_coordinates is not None,
-        "reasoning_owner": "hermes",
-    }
-
-
-def _catalog_value_voucher_option() -> dict[str, Any]:
-    return {
-        **VALUE_VOUCHER_OPTION,
-        "availability": "public_universal_gift_option",
-        "reasoning_owner": "hermes",
-    }
-
-
-def _catalog_index_items() -> list[dict[str, Any]]:
-    now = time.monotonic()
-    cached = _CATALOG_INDEX_CACHE.get("items")
-    if isinstance(cached, list) and now < float(_CATALOG_INDEX_CACHE.get("expires_at") or 0):
-        return [item for item in cached if isinstance(item, dict)]
-    url = f"{PUBLIC_CATALOG_BASE_URL}/products?page=1&size={MAX_CATALOG_SIZE}&sort=&minPrice=0&maxPrice=4000&search="
-    items = _extract_products(_http_json(url))
-    _CATALOG_INDEX_CACHE["items"] = items
-    _CATALOG_INDEX_CACHE["expires_at"] = now + max(60, CATALOG_INDEX_TTL_SECONDS)
-    return items
-
-
-def _dedupe_products(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    deduped: list[dict[str, Any]] = []
-    for item in items:
-        key = str(item.get("id") or item.get("product_id") or item.get("slug") or item.get("name") or "")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped
-
-
-def _order_products_by_catalog_evidence(
-    items: list[dict[str, Any]],
-    *,
-    evidence: QueryEvidence,
-    max_price_eur: float | None,
-) -> list[dict[str, Any]]:
-    scored: list[tuple[float, dict[str, Any]]] = []
-    for index, item in enumerate(items):
-        annotated = _annotate_product_evidence(item, evidence)
-        score = _catalog_evidence_score(annotated, evidence=evidence, max_price_eur=max_price_eur)
-        scored.append((score - (index * 0.0001), annotated))
-    scored.sort(key=lambda pair: pair[0], reverse=True)
-    return [item for _score, item in scored]
-
-
-def _product_family_key(item: dict[str, Any]) -> str:
-    category = item.get("category_slug") or item.get("categorySlug")
-    if category:
-        return _normalize_search_text(category)
-    slug = str(item.get("slug") or "").strip("/")
-    if slug:
-        return _normalize_search_text(slug.split("/", 1)[0])
-    title = _normalize_search_text(item.get("title") or item.get("name"))
-    return " ".join(title.split()[:3])
-
-
-def _query_evidence(query: str) -> QueryEvidence:
-    normalized = _normalize_search_text(query)
-    tokens = _query_tokens(query)
-    requested_location = _find_known_location(normalized)
-    requested_coordinates = _KNOWN_LOCATION_COORDS.get(requested_location or "")
-    return QueryEvidence(
-        tokens=tokens,
-        normalized=normalized,
-        requested_location=requested_location,
-        requested_coordinates=requested_coordinates,
-    )
-
-
-def _find_known_location(text: str) -> str | None:
-    normalized = _normalize_search_text(text)
-    for alias, canonical in sorted(_LOCATION_ALIASES.items(), key=lambda pair: len(pair[0]), reverse=True):
-        if alias in normalized and canonical in _KNOWN_LOCATION_COORDS:
-            return canonical
-    for location in sorted(_KNOWN_LOCATION_COORDS, key=len, reverse=True):
-        if location in normalized:
-            return location
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"{name}_must_be_a_number"
+    decimal = Decimal(str(value))
+    if not decimal.is_finite():
+        return f"{name}_must_be_finite"
+    if decimal < 0:
+        return f"{name}_must_be_non_negative"
     return None
-
-
-def _product_location_text(item: dict[str, Any]) -> str:
-    return _normalize_search_text(
-        " ".join(
-            str(value or "")
-            for value in (
-                item.get("location"),
-                item.get("locationName"),
-                item.get("locationArea"),
-                item.get("city"),
-                item.get("region"),
-            )
-        )
-    )
-
-
-def _product_known_location(item: dict[str, Any]) -> str | None:
-    for key in ("locationName", "location", "city"):
-        location = _find_known_location(str(item.get(key) or ""))
-        if location:
-            return location
-    for key in ("locationArea", "region"):
-        location = _find_known_location(str(item.get(key) or ""))
-        if location:
-            return location
-    return _find_known_location(_product_location_text(item))
-
-
-def _product_distance_km(item: dict[str, Any], evidence: QueryEvidence) -> float | None:
-    if not evidence.requested_coordinates:
-        return None
-    product_location = _product_known_location(item)
-    coordinates = _KNOWN_LOCATION_COORDS.get(product_location or "")
-    if not coordinates:
-        return None
-    return _haversine_km(evidence.requested_coordinates, coordinates)
-
-
-def _haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-    lat1, lon1 = map(math.radians, a)
-    lat2, lon2 = map(math.radians, b)
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    hav = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-    return 6371.0 * 2 * math.asin(math.sqrt(hav))
-
-
-def _filter_products_by_budget(
-    items: list[dict[str, Any]],
-    min_price_eur: float | None,
-    max_price_eur: float | None,
-) -> list[dict[str, Any]]:
-    if min_price_eur is None and max_price_eur is None:
-        return items
-    filtered: list[dict[str, Any]] = []
-    max_with_tolerance = max_price_eur * 1.08 if max_price_eur is not None else None
-    for item in items:
-        price_eur = _product_price_eur(item)
-        if price_eur is None:
-            filtered.append(item)
-            continue
-        if min_price_eur is not None and price_eur < min_price_eur * 0.92:
-            continue
-        if max_with_tolerance is not None and price_eur > max_with_tolerance:
-            continue
-        filtered.append(item)
-    return filtered
-
-
-def _annotate_catalog_evidence(items: list[dict[str, Any]], evidence: QueryEvidence) -> list[dict[str, Any]]:
-    return [_annotate_product_evidence(item, evidence) for item in items]
-
-
-def _annotate_product_evidence(item: dict[str, Any], evidence: QueryEvidence) -> dict[str, Any]:
-    annotated = {**item}
-    if evidence.requested_location:
-        annotated["_skyai_requested_location"] = evidence.requested_location
-    distance_km = _product_distance_km(annotated, evidence)
-    if distance_km is not None:
-        annotated["_skyai_distance_km"] = round(distance_km)
-    annotated["_skyai_category_key"] = _product_family_key(annotated)
-    return annotated
-
-
-def _catalog_evidence_score(
-    item: dict[str, Any],
-    *,
-    evidence: QueryEvidence,
-    max_price_eur: float | None,
-) -> float:
-    tokens = evidence.tokens
-    if not tokens:
-        return 1.0
-    title = _normalize_search_text(item.get("title") or item.get("name"))
-    slug = _normalize_search_text(item.get("slug"))
-    location = _product_location_text(item)
-    provider = _normalize_search_text(_provider_name(item.get("provider")))
-    restrictions = item.get("restrictions") if isinstance(item.get("restrictions"), dict) else {}
-    detail = _normalize_search_text(
-        " ".join(
-            str(value or "")
-            for value in (
-                restrictions.get("duration"),
-                restrictions.get("serviceForWho"),
-                restrictions.get("forKids"),
-                item.get("duration"),
-                item.get("participants"),
-            )
-        )
-    )
-    combined = f"{title} {slug} {location} {provider} {detail}"
-    score = 0.0
-    for token in tokens:
-        if token in title:
-            score += 8.0
-        if token in slug:
-            score += 5.0
-        if token in location:
-            score += 6.0
-        if token in detail:
-            score += 3.0
-        if token in provider:
-            score += 1.0
-        if token in combined:
-            score += 1.0
-    if evidence.requested_location:
-        product_location = _product_known_location(item)
-        if product_location == evidence.requested_location:
-            score += 6.0
-        distance = item.get("_skyai_distance_km")
-        if isinstance(distance, (int, float)):
-            score += max(0.0, 5.0 - min(float(distance), 250.0) / 50.0)
-    if max_price_eur is not None:
-        price_eur = _product_price_eur(item)
-        if price_eur is not None:
-            closeness = max(0.0, 1.0 - min(abs(price_eur - max_price_eur) / max(max_price_eur, 1.0), 1.0))
-            score += closeness * 3.0
-    orders_count = item.get("ordersCount")
-    if isinstance(orders_count, int) and orders_count > 0:
-        score += min(2.0, orders_count / 100.0)
-    rating_count = item.get("ratingCount")
-    if isinstance(rating_count, int) and rating_count > 0:
-        score += min(1.0, rating_count / 50.0)
-    return score
-
-
-def _query_tokens(query: str) -> list[str]:
-    normalized = _normalize_search_text(query)
-    raw_tokens = re.findall(r"[a-zа-я0-9]+", normalized, flags=re.IGNORECASE)
-    tokens: list[str] = []
-    for token in raw_tokens:
-        if token.isdigit() or token in _QUERY_STOPWORDS:
-            continue
-        if len(token) <= 2 and token not in {"atv", "спа", "spa"}:
-            continue
-        tokens.append(token)
-        tokens.extend(_TOKEN_EXPANSIONS.get(token, ()))
-    return _dedupe_strings(tokens)
-
-
-def _dedupe_strings(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for value in values:
-        if not value or value in seen:
-            continue
-        seen.add(value)
-        deduped.append(value)
-    return deduped
-
-
-def _normalize_search_text(value: Any) -> str:
-    text = str(value or "").casefold()
-    text = text.replace("ё", "е")
-    text = re.sub(r"[_/\\-]+", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def _product_price_eur(item: dict[str, Any]) -> float | None:
-    price_eur = item.get("price_eur") or item.get("priceEur")
-    if price_eur not in (None, ""):
-        return _float_or_none(str(price_eur))
-    price_bgn = item.get("price") or item.get("price_bgn") or item.get("priceBgn")
-    if price_bgn in (None, ""):
-        return None
-    try:
-        return float(Decimal(str(price_bgn)) / BGN_PER_EUR)
-    except Exception:
-        return None
 
 
 def handle_skyai_catalog_search(
@@ -880,48 +373,47 @@ def handle_skyai_catalog_search(
     max_price_eur: float | None = None,
     limit: int | None = None,
 ) -> dict[str, Any]:
-    inferred_min_price_eur, inferred_max_price_eur = _infer_price_bounds_from_query(
-        query,
-        min_price_eur=min_price_eur,
-        max_price_eur=max_price_eur,
-    )
-    size = MAX_CATALOG_SIZE
-    safe_limit = _safe_limit(limit)
-    min_price_bgn = _money_eur_to_bgn(inferred_min_price_eur)
-    max_price_bgn = _money_eur_to_bgn(inferred_max_price_eur) if inferred_max_price_eur is not None else 4000
+    if not isinstance(query, str):
+        return {"status": "error", "error": "query_must_be_a_string"}
+    if len(query) > MAX_TEXT_FIELD_LENGTH:
+        return {"status": "error", "error": "query_too_long"}
+    for name, value in (
+        ("min_price_eur", min_price_eur),
+        ("max_price_eur", max_price_eur),
+    ):
+        validation_error = _validate_catalog_price(name, value)
+        if validation_error:
+            return {"status": "error", "error": validation_error}
+    if (
+        min_price_eur is not None
+        and max_price_eur is not None
+        and Decimal(str(min_price_eur)) > Decimal(str(max_price_eur))
+    ):
+        return {"status": "error", "error": "min_price_eur_exceeds_max_price_eur"}
+    try:
+        safe_limit = _safe_limit(limit)
+    except (TypeError, ValueError) as exc:
+        return {"status": "error", "error": str(exc)}
+
+    min_price_bgn = _money_eur_to_bgn(min_price_eur)
+    max_price_bgn = _money_eur_to_bgn(max_price_eur) if max_price_eur is not None else 4000
     url = (
         f"{PUBLIC_CATALOG_BASE_URL}/products"
-        f"?page=1&size={size}&sort=&minPrice={min_price_bgn}&maxPrice={max_price_bgn}"
-        f"&search={quote(query or '')}"
+        f"?page=1&size={safe_limit}&sort=&minPrice={min_price_bgn}&maxPrice={max_price_bgn}"
+        f"&search={quote(query, safe='')}"
     )
-    direct_items = _extract_products(_http_json(url))
-    items = _catalog_search_candidates(
-        query=query,
-        direct_items=direct_items,
-        min_price_eur=inferred_min_price_eur,
-        max_price_eur=inferred_max_price_eur,
-        limit=safe_limit,
-    )
-    evidence = _query_evidence(query)
+    items = _extract_products(_http_json(url))[:safe_limit]
     return {
         "status": "ok",
         "source": "skyvision_public_cache",
-        "query": query or "",
+        "query": query,
         "filters": {
-            "min_price_eur": inferred_min_price_eur,
-            "max_price_eur": inferred_max_price_eur,
+            "min_price_eur": min_price_eur,
+            "max_price_eur": max_price_eur,
             "min_price_bgn": min_price_bgn,
             "max_price_bgn": max_price_bgn,
-            "inferred_from_query": {
-                "min_price_eur": min_price_eur is None and inferred_min_price_eur is not None,
-                "max_price_eur": max_price_eur is None and inferred_max_price_eur is not None,
-            },
         },
         "count": len(items),
-        "query_evidence": _catalog_query_evidence(evidence),
-        "location_context": _catalog_location_context(items, evidence),
-        "selection_context": _catalog_selection_context(items),
-        "value_voucher_option": _catalog_value_voucher_option(),
         "items": [_sanitize_product_summary(item) for item in items],
     }
 
@@ -945,55 +437,38 @@ def handle_skyai_product_slots(
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
-    if int(product_id) <= 0:
-        return {"status": "error", "error": "invalid_product_id"}
-    if not start_date and not end_date:
+    if type(product_id) is not int or product_id <= 0:
+        raise ValueError("product_id must be a positive integer")
+    if start_date is None and end_date is None:
         today = date.today()
         start_date = today.isoformat()
         end_date = (today + timedelta(days=14)).isoformat()
-    query = ""
-    if start_date and end_date:
-        _validate_iso_date(start_date)
-        _validate_iso_date(end_date)
-        query = f"?startDate={quote(start_date)}&endDate={quote(end_date)}"
-    url = f"{PUBLIC_EVENTS_BASE_URL}/{int(product_id)}{query}"
+    elif start_date is None or end_date is None:
+        raise ValueError("start_date and end_date must be provided together")
+    if type(start_date) is not str or not start_date:
+        raise ValueError("start_date must be a nonempty string")
+    if type(end_date) is not str or not end_date:
+        raise ValueError("end_date must be a nonempty string")
+    _validate_iso_date(start_date)
+    _validate_iso_date(end_date)
+    query = f"?startDate={quote(start_date)}&endDate={quote(end_date)}"
+    url = f"{PUBLIC_EVENTS_BASE_URL}/{product_id}{query}"
     payload = _http_json(url)
-    fixed = payload.get("fixedSlots") or []
-    request_slots = payload.get("requestSlots") or []
-    working_periods = payload.get("workingPeriods") or []
-    fixed_count = len(fixed) if isinstance(fixed, list) else 0
-    request_count = len(request_slots) if isinstance(request_slots, list) else 0
-    working_count = len(working_periods) if isinstance(working_periods, list) else 0
-    if fixed_count:
-        availability_mode = "fixed_slots_available_direct_booking"
-        visible_request_slots: list[dict[str, Any]] = []
-    elif request_count:
-        availability_mode = "request_slots_possible_no_fixed_slots_in_range"
-        visible_request_slots = _compact_request_slots(request_slots, 12)
-    elif working_count:
-        availability_mode = "working_periods_only"
-        visible_request_slots = []
-    else:
-        availability_mode = "no_public_slots_in_range"
-        visible_request_slots = []
+    if type(payload) is not dict:
+        raise ValueError("public events response must be an object")
+    fixed = _exact_list_field(payload, "fixedSlots")
+    request_slots = _exact_list_field(payload, "requestSlots")
+    working_periods = _exact_list_field(payload, "workingPeriods")
     return {
         "status": "ok",
         "source": "skyvision_public_events",
-        "product_id": int(product_id),
+        "product_id": product_id,
         "range": {"start_date": start_date, "end_date": end_date},
-        "availability_mode": availability_mode,
-        "mode_facts": {
-            "fixed_slots": "Фиксираните слотове са публични часове за директна резервация.",
-            "request_slots": (
-                "Запитванията се използват само когато няма фиксирани слотове в разглеждания период; "
-                "изпълнителят може да потвърди, откаже или предложи друг час."
-            ),
-        },
-        "fixed_slots_count": fixed_count,
-        "request_slots_count": request_count,
-        "working_periods_count": working_count,
+        "fixed_slots_count": len(fixed),
+        "request_slots_count": len(request_slots),
+        "working_periods_count": len(working_periods),
         "fixed_slots": _compact_fixed_slots(fixed, 12),
-        "request_slots": visible_request_slots,
+        "request_slots": _compact_request_slots(request_slots, 12),
         "working_periods": _first_items(working_periods, 6),
     }
 
@@ -1003,10 +478,16 @@ def handle_skyai_campaign_knowledge(
     include_terms: bool = False,
 ) -> dict[str, Any]:
     """Return curated public campaign facts without exposing internal state."""
+    if type(topic) is not str:
+        return {"status": "error", "error": "topic_must_be_a_string"}
+    if len(topic) > 300:
+        return {"status": "error", "error": "topic_too_long"}
+    if type(include_terms) is not bool:
+        return {"status": "error", "error": "include_terms_must_be_a_boolean"}
     return {
         "status": "ok",
         "source": "skyvision_curated_public_campaign_knowledge",
-        "topic": _truncate_text(topic, 300),
+        "topic": topic,
         "tool_contract": {
             "purpose": "public_facts_only",
             "reasoning_owner": "hermes",
@@ -1152,7 +633,7 @@ def handle_skyai_campaign_knowledge(
             "public_founder_contact": "+359 886 417 142",
         },
         "terms": {
-            "include_terms_requested": bool(include_terms),
+            "include_terms_requested": include_terms,
             "terms_url": "https://panel.skyvision.bg/kampaniya-bezplaten-polet-nad-moreto",
             "general_terms_url": "https://skyvision.bg/общи-условия/",
             "privacy_notice_url": "https://skyvision.bg/уведомление-за-обработване-на-лични-д/",
@@ -1165,6 +646,12 @@ def handle_skyai_support_knowledge(
     include_contacts: bool = False,
 ) -> dict[str, Any]:
     """Return curated public commerce/support facts without exposing internal state."""
+    if type(topic) is not str:
+        return {"status": "error", "error": "topic_must_be_a_string"}
+    if len(topic) > 300:
+        return {"status": "error", "error": "topic_too_long"}
+    if type(include_contacts) is not bool:
+        return {"status": "error", "error": "include_contacts_must_be_a_boolean"}
     contacts = {
         "contacts_page": "https://skyvision.bg/контакти/",
         "phones": ["+359 (0) 700 20 200", "+359 (0) 2 425 9795"],
@@ -1493,18 +980,30 @@ def handle_skyai_event_log_append(
 ) -> dict[str, Any]:
     if event_type not in ALLOWED_EVENT_TYPES:
         return {"status": "error", "error": "unsupported_event_type"}
-    properties = properties or {}
-    sensitive_reason = _sensitive_payload_reason(properties)
-    if sensitive_reason:
-        return {"status": "blocked", "reason": sensitive_reason, "written": False}
+    if not isinstance(anonymous_id, str):
+        return {"status": "error", "error": "anonymous_id_must_be_a_string"}
+    if not isinstance(conversation_id, str):
+        return {"status": "error", "error": "conversation_id_must_be_a_string"}
+    if len(anonymous_id) > MAX_EVENT_PROPERTY_VALUE_LENGTH:
+        return {"status": "error", "error": "anonymous_id_too_long"}
+    if len(conversation_id) > MAX_EVENT_PROPERTY_VALUE_LENGTH:
+        return {"status": "error", "error": "conversation_id_too_long"}
+    if properties is None:
+        properties = {}
+    if not isinstance(properties, dict):
+        return {"status": "error", "error": "properties_must_be_an_object"}
+    properties_error = _validate_event_properties(properties)
+    if properties_error:
+        return {"status": "error", "error": properties_error, "written": False}
+    sanitized_properties = _redact_registered_event_secrets(properties)
 
     event = {
-        "schema": "skyai_ci.events.local_jsonl.v1",
+        "schema": "skyai_ci.events.local_jsonl.v2",
         "event_type": event_type,
         "occurred_at": datetime.now(timezone.utc).isoformat(),
         "anonymous_id_hash": _hash_optional(anonymous_id),
         "conversation_id_hash": _hash_optional(conversation_id),
-        "properties": properties,
+        "properties": sanitized_properties,
     }
     path = _event_log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1520,29 +1019,28 @@ def handle_skyai_event_log_append(
 
 
 def handle_skyai_voice_transfer_to_human(
-    reason: str = "",
-    spoken_reply: str = "",
+    reason: str,
+    spoken_reply: str,
 ) -> dict[str, Any]:
-    reason_text = _voice_tool_text(reason, max_length=120) or "hermes_requested_handoff"
-    spoken_text = _voice_tool_text(spoken_reply, max_length=220) or (
-        "Разбира се, ще Ви прехвърля към човек от екипа."
-    )
+    if not isinstance(reason, str):
+        return {"status": "error", "error": "reason_must_be_a_string"}
+    if not isinstance(spoken_reply, str):
+        return {"status": "error", "error": "spoken_reply_must_be_a_string"}
+    if len(reason) > 120:
+        return {"status": "error", "error": "reason_exceeds_120_characters"}
+    if len(spoken_reply) > 220:
+        return {"status": "error", "error": "spoken_reply_exceeds_220_characters"}
+    if not reason:
+        return {"status": "error", "error": "reason_must_be_nonempty"}
+    if not spoken_reply:
+        return {"status": "error", "error": "spoken_reply_must_be_nonempty"}
     return {
         "status": "ok",
         "voice_action": "transfer_to_human",
-        "transfer": {"target": "operator_queue", "reason": reason_text},
-        "spoken_reply": spoken_text,
-        "display_reply": "Hermes requested human handoff through a structured voice action.",
+        "transfer": {"target": "operator_queue", "reason": reason},
+        "spoken_reply": spoken_reply,
+        "display_reply": spoken_reply,
     }
-
-
-def _voice_tool_text(value: Any, *, max_length: int) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
-    text = SENSITIVE_VALUE_RE.sub("[redacted]", text)
-    text = re.sub(r"https?://\S+", "", text).strip()
-    if len(text) <= max_length:
-        return text
-    return text[:max_length].rsplit(" ", 1)[0].strip()
 
 
 def normalize_product_path(*, product_url: str = "", product_path: str = "") -> str:
@@ -1576,32 +1074,73 @@ def _extract_products(payload: Any) -> list[dict[str, Any]]:
 
 
 def _sanitize_product_summary(item: dict[str, Any]) -> dict[str, Any]:
-    slug = str(item.get("slug") or "").strip("/")
-    price_bgn = item.get("price") or item.get("price_bgn") or item.get("priceBgn")
-    price_eur = item.get("price_eur") or item.get("priceEur") or _money_bgn_to_eur(price_bgn)
-    old_price_bgn = item.get("oldPrice") or item.get("old_price") or item.get("regularPrice")
-    old_price_eur = item.get("oldPriceEur") or item.get("old_price_eur") or _money_bgn_to_eur(old_price_bgn)
+    raw_slug = _first_present(item, "slug", default="")
+    if type(raw_slug) is not str:
+        raise ValueError("slug must be a string")
+    slug = raw_slug.strip("/")
+    price_bgn = _first_present(item, "price", "price_bgn", "priceBgn")
+    price_eur = _first_present(
+        item,
+        "price_eur",
+        "priceEur",
+        default=_MISSING,
+    )
+    if price_eur is _MISSING:
+        price_eur = _money_bgn_to_eur(price_bgn)
+    old_price_bgn = _first_present(
+        item,
+        "oldPrice",
+        "old_price",
+        "regularPrice",
+    )
+    old_price_eur = _first_present(
+        item,
+        "oldPriceEur",
+        "old_price_eur",
+        default=_MISSING,
+    )
+    if old_price_eur is _MISSING:
+        old_price_eur = _money_bgn_to_eur(old_price_bgn)
+    explicit_url = _first_present(item, "url", default=_MISSING)
     return {
-        "id": item.get("id") or item.get("product_id"),
-        "title": item.get("title") or item.get("name"),
+        "id": _first_present(item, "id", "product_id"),
+        "title": _first_present(item, "title", "name"),
         "slug": slug or None,
-        "category_slug": item.get("category_slug") or item.get("categorySlug"),
-        "category_key": item.get("_skyai_category_key") or _product_family_key(item),
-        "public_url": item.get("url") or _public_product_url(slug),
-        "location": item.get("location") or item.get("locationName") or item.get("city") or item.get("region"),
+        "category_slug": _first_present(item, "category_slug", "categorySlug"),
+        "public_url": (
+            _public_product_url(slug)
+            if explicit_url is _MISSING
+            else explicit_url
+        ),
+        "location": _first_present(
+            item,
+            "location",
+            "locationName",
+            "city",
+            "region",
+        ),
         "location_area": item.get("locationArea"),
-        "distance_from_requested_location_km": item.get("_skyai_distance_km"),
-        "requested_location": item.get("_skyai_requested_location"),
         "price_bgn": _money_decimal_string(price_bgn),
         "price_eur": _money_decimal_string(price_eur),
         "old_price_bgn": _money_decimal_string(old_price_bgn),
         "old_price_eur": _money_decimal_string(old_price_eur),
         "rating": _rating_value(item),
-        "rating_count": _int_or_none(item.get("ratingCount") or item.get("reviewsCount")),
+        "rating_count": _int_or_none(
+            _first_present(item, "ratingCount", "reviewsCount")
+        ),
         "orders_count": _int_or_none(item.get("ordersCount")),
-        "is_on_offer": _is_on_offer(item, old_price_bgn),
+        "is_on_offer": _exact_optional_bool_field(
+            item,
+            "isOnOffer",
+            "is_on_offer",
+            "hasDiscount",
+        ),
         "duration": item.get("duration"),
-        "participants": item.get("participants") or item.get("participant_count"),
+        "participants": _first_present(
+            item,
+            "participants",
+            "participant_count",
+        ),
         "provider": _provider_name(item.get("provider")),
         "image": _first_image(item),
     }
@@ -1611,48 +1150,119 @@ def _sanitize_product_detail(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict):
         return {"raw_type": type(payload).__name__}
     source = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    slug = str(source.get("slug") or "").strip("/")
+    raw_slug = _first_present(source, "slug", default="")
+    if type(raw_slug) is not str:
+        raise ValueError("slug must be a string")
+    slug = raw_slug.strip("/")
     metadata = source.get("metadata") if isinstance(source.get("metadata"), dict) else {}
-    price_bgn = source.get("price") or source.get("price_bgn") or source.get("priceBgn")
-    price_eur = source.get("price_eur") or source.get("priceEur") or _money_bgn_to_eur(price_bgn)
-    old_price_bgn = source.get("oldPrice") or source.get("old_price") or source.get("regularPrice")
-    old_price_eur = source.get("oldPriceEur") or source.get("old_price_eur") or _money_bgn_to_eur(old_price_bgn)
+    price_bgn = _first_present(source, "price", "price_bgn", "priceBgn")
+    price_eur = _first_present(
+        source,
+        "price_eur",
+        "priceEur",
+        default=_MISSING,
+    )
+    if price_eur is _MISSING:
+        price_eur = _money_bgn_to_eur(price_bgn)
+    old_price_bgn = _first_present(
+        source,
+        "oldPrice",
+        "old_price",
+        "regularPrice",
+    )
+    old_price_eur = _first_present(
+        source,
+        "oldPriceEur",
+        "old_price_eur",
+        default=_MISSING,
+    )
+    if old_price_eur is _MISSING:
+        old_price_eur = _money_bgn_to_eur(old_price_bgn)
+    canonical = _first_present(metadata, "canonical", default=_MISSING)
+    source_url = _first_present(source, "url", default=_MISSING)
+    if canonical is not _MISSING:
+        public_url = canonical
+    elif source_url is not _MISSING:
+        public_url = source_url
+    else:
+        public_url = _public_product_url(slug)
     return {
-        "id": source.get("id") or source.get("product_id"),
-        "title": source.get("title") or source.get("name"),
+        "id": _first_present(source, "id", "product_id"),
+        "title": _first_present(source, "title", "name"),
         "slug": slug or None,
-        "public_url": metadata.get("canonical") or source.get("url") or _public_product_url(slug),
-        "location": source.get("location") or source.get("locationName") or source.get("city"),
-        "location_area": source.get("locationArea") or source.get("region"),
+        "public_url": public_url,
+        "location": _first_present(
+            source,
+            "location",
+            "locationName",
+            "city",
+        ),
+        "location_area": _first_present(
+            source,
+            "locationArea",
+            "region",
+        ),
         "price_bgn": _money_decimal_string(price_bgn),
         "price_eur": _money_decimal_string(price_eur),
         "old_price_bgn": _money_decimal_string(old_price_bgn),
         "old_price_eur": _money_decimal_string(old_price_eur),
         "rating": _rating_value(source),
-        "rating_count": _int_or_none(source.get("ratingCount") or source.get("reviewsCount")),
+        "rating_count": _int_or_none(
+            _first_present(source, "ratingCount", "reviewsCount")
+        ),
         "orders_count": _int_or_none(source.get("ordersCount")),
-        "is_on_offer": _is_on_offer(source, old_price_bgn),
+        "is_on_offer": _exact_optional_bool_field(
+            source,
+            "isOnOffer",
+            "is_on_offer",
+            "hasDiscount",
+        ),
         "duration": source.get("duration"),
-        "minimum_age": source.get("minimumAge") or source.get("min_age"),
-        "maximum_weight": source.get("maximumWeight") or source.get("maxWeight"),
-        "for_kids": source.get("forKids") or source.get("children") or source.get("isForChildren"),
+        "minimum_age": _first_present(source, "minimumAge", "min_age"),
+        "maximum_weight": _first_present(source, "maximumWeight", "maxWeight"),
+        "for_kids": _first_present(
+            source,
+            "forKids",
+            "children",
+            "isForChildren",
+        ),
         "weather": source.get("weather"),
         "service_for_who": source.get("serviceForWho"),
         "schedule": _truncate_text(source.get("schedule")),
         "cancellation_policy": source.get("cancellationPolicy"),
-        "can_book": _boolish(source.get("canBook")),
-        "can_buy_voucher": _boolish(source.get("canBuyVoucher")),
-        "includes_bonus": _boolish(source.get("includesBonus") or source.get("canReceiveBonusProduct")),
+        "can_book": _exact_optional_bool_field(source, "canBook"),
+        "can_buy_voucher": _exact_optional_bool_field(
+            source,
+            "canBuyVoucher",
+        ),
+        "includes_bonus": _exact_optional_bool_field(
+            source,
+            "includesBonus",
+            "canReceiveBonusProduct",
+        ),
         "provider": _provider_name(source.get("provider")),
-        "description": _truncate_text(source.get("description") or source.get("aboutDescription")),
+        "description": _truncate_text(
+            _first_present(source, "description", "aboutDescription")
+        ),
         "included": _compact_text_list(source.get("included")),
         "needed": _compact_text_list(source.get("needed")),
         "important": _truncate_text(source.get("important")),
         "restrictions": _truncate_text(source.get("otherRestrictions")),
         "locations": _compact_locations(source.get("locations")),
         "configurator": _compact_configurator(source.get("configurator")),
-        "images": _compact_gallery(source.get("gallery") or source.get("images")),
+        "images": _compact_gallery(
+            _first_present(source, "gallery", "images")
+        ),
     }
+
+
+def _exact_list_field(mapping: dict[str, Any], key: str) -> list[Any]:
+    if key not in mapping or mapping[key] is None:
+        return []
+    value = mapping[key]
+    if type(value) is not list:
+        raise ValueError(f"{key} must be a list")
+    return value
 
 
 def _first_items(value: Any, limit: int) -> list[Any]:
@@ -1709,7 +1319,10 @@ def _public_product_url(slug: str) -> str | None:
 
 def _provider_name(value: Any) -> str | None:
     if isinstance(value, dict):
-        return value.get("name") or value.get("title")
+        result = _first_present(value, "name", "title")
+        if result is not None and type(result) is not str:
+            raise ValueError("provider name/title must be a string")
+        return result
     if isinstance(value, str):
         return value
     return None
@@ -1720,11 +1333,14 @@ def _first_image(item: dict[str, Any]) -> str | None:
         value = item.get(key)
         if isinstance(value, str) and value:
             return value
-    gallery = item.get("gallery") or item.get("images")
+    gallery = _first_present(item, "gallery", "images")
     if isinstance(gallery, list) and gallery:
         first = gallery[0]
         if isinstance(first, dict):
-            return first.get("src") or first.get("url")
+            result = _first_present(first, "src", "url")
+            if result is not None and type(result) is not str:
+                raise ValueError("gallery src/url must be a string")
+            return result
         if isinstance(first, str):
             return first
     return None
@@ -1736,9 +1352,15 @@ def _compact_gallery(value: Any) -> list[dict[str, str]]:
     gallery: list[dict[str, str]] = []
     for item in value[:4]:
         if isinstance(item, dict):
-            src = item.get("src") or item.get("url")
-            if src:
-                gallery.append({"src": str(src), "alt": str(item.get("alt") or "")[:160]})
+            src = _first_present(item, "src", "url")
+            if src is None:
+                continue
+            if type(src) is not str:
+                raise ValueError("gallery src/url must be a string")
+            alt = item.get("alt", "")
+            if type(alt) is not str:
+                raise ValueError("gallery alt must be a string")
+            gallery.append({"src": src, "alt": alt[:160]})
         elif isinstance(item, str):
             gallery.append({"src": item, "alt": ""})
     return gallery
@@ -1747,7 +1369,12 @@ def _compact_gallery(value: Any) -> list[dict[str, str]]:
 def _compact_text_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [_truncate_text(item, 260) for item in value[:MAX_DETAIL_LIST_ITEMS] if item]
+    result: list[str] = []
+    for index, item in enumerate(value[:MAX_DETAIL_LIST_ITEMS]):
+        if type(item) is not str:
+            raise ValueError(f"text list item {index} must be a string")
+        result.append(_truncate_text(item, 260) or "")
+    return result
 
 
 def _compact_locations(value: Any) -> list[dict[str, Any]]:
@@ -1776,13 +1403,19 @@ def _compact_configurator(value: Any) -> dict[str, Any]:
     for addition in additions:
         if not isinstance(addition, dict):
             continue
-        for option in addition.get("options") or []:
+        raw_options = addition.get("options", [])
+        if type(raw_options) is not list:
+            raise ValueError("configurator options must be a list")
+        for option in raw_options:
             if not isinstance(option, dict):
                 continue
             price_bgn = option.get("price")
             options.append(
                 {
-                    "label": _truncate_text(option.get("label") or option.get("labelVoucher"), 220),
+                    "label": _truncate_text(
+                        _first_present(option, "label", "labelVoucher"),
+                        220,
+                    ),
                     "price_bgn": _money_decimal_string(price_bgn),
                     "price_eur": _money_bgn_to_eur(price_bgn),
                 }
@@ -1804,22 +1437,11 @@ def _compact_configurator(value: Any) -> dict[str, Any]:
 def _truncate_text(value: Any, limit: int = MAX_TEXT_FIELD_LENGTH) -> str | None:
     if value is None:
         return None
-    text = " ".join(str(value).split())
-    if len(text) <= limit:
-        return text
-    return text[: limit - 1].rstrip() + "…"
-
-
-def _boolish(value: Any) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
+    if type(value) is not str:
+        raise ValueError("text value must be a string")
+    if len(value) <= limit:
         return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "да"}
-    return bool(value)
+    return value[:limit]
 
 
 def _validate_iso_date(value: str) -> None:
@@ -1834,19 +1456,69 @@ def _event_log_path() -> Path:
 
 
 def _hash_optional(value: str) -> str:
-    value = (value or "").strip()
-    if not value:
+    if value == "":
         return ""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _sensitive_payload_reason(properties: dict[str, Any]) -> str | None:
+def _validate_event_properties(properties: dict[str, Any]) -> str | None:
     for key, value in properties.items():
-        normalized = str(key).strip().lower()
-        if normalized in SENSITIVE_PROPERTY_KEYS:
-            return f"sensitive_property_key:{normalized}"
-        if len(json.dumps(value, ensure_ascii=False, default=str)) > MAX_EVENT_PROPERTY_VALUE_LENGTH:
-            return f"property_value_too_large:{normalized}"
-        if isinstance(value, str) and SENSITIVE_VALUE_RE.search(value):
-            return f"sensitive_property_value:{normalized}"
+        if not isinstance(key, str) or key not in EVENT_PROPERTY_SCHEMA:
+            return "unsupported_event_property"
+        rule = EVENT_PROPERTY_SCHEMA[key]
+        expected_type = rule["type"]
+        if expected_type == "string":
+            if not isinstance(value, str):
+                return f"{key}_must_be_a_string"
+            if len(value) > int(rule.get("maxLength", MAX_EVENT_PROPERTY_VALUE_LENGTH)):
+                return f"{key}_too_long"
+            allowed_values = rule.get("enum")
+            if allowed_values is not None and value not in allowed_values:
+                return f"{key}_unsupported_value"
+        elif expected_type == "integer":
+            if isinstance(value, bool) or not isinstance(value, int):
+                return f"{key}_must_be_an_integer"
+            if "minimum" in rule and value < int(rule["minimum"]):
+                return f"{key}_below_minimum"
+        elif expected_type == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return f"{key}_must_be_a_number"
+            decimal = Decimal(str(value))
+            if not decimal.is_finite():
+                return f"{key}_must_be_finite"
+            if "minimum" in rule and decimal < Decimal(str(rule["minimum"])):
+                return f"{key}_below_minimum"
+        elif expected_type == "boolean":
+            if not isinstance(value, bool):
+                return f"{key}_must_be_a_boolean"
+        else:
+            return "invalid_event_property_schema"
     return None
+
+
+def _registered_event_secret_values() -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for name in REGISTERED_EVENT_SECRET_ENV_NAMES:
+        value = os.environ.get(name)
+        if not value or len(value) < 8 or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return tuple(values)
+
+
+def _redact_registered_event_secrets(properties: dict[str, Any]) -> dict[str, Any]:
+    secrets = _registered_event_secret_values()
+    if not secrets:
+        return dict(properties)
+    redacted: dict[str, Any] = {}
+    for key, value in properties.items():
+        if not isinstance(value, str):
+            redacted[key] = value
+            continue
+        redacted_value = value
+        for secret in secrets:
+            redacted_value = redacted_value.replace(secret, "[redacted-secret]")
+        redacted[key] = redacted_value
+    return redacted

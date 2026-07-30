@@ -72,6 +72,13 @@ contact knowledge, not a response template.
   boundary and consent rules.
 - Provide Discord mirror/admin diagnostics as sanitized operational evidence.
 
+The Discord mirror has its own operational persistence boundary:
+`skyai_discord_mirror`. It must never use Canonical Brain, the `skyai_ci`
+event store, or a generic `DATABASE_URL`. Its durable outbox may make only
+mechanical exact-delivery decisions: schema validation, configured destination,
+leases, retries, idempotency, exact thread recovery, and delivered-payload
+retention. It may not interpret the conversation or change authored content.
+
 ## What The Backend Must Not Do
 
 - Decide the customer's intent through keyword matching.
@@ -110,9 +117,9 @@ Required direction:
 
 - Keep public data retrieval and normalization.
 - Keep deterministic safety checks and data sanitization.
-- Move catalog search toward evidence-first candidate retrieval. Ranking may be
-  used for recall ordering, but it must expose candidates/evidence to Hermes
-  rather than deciding the answer.
+- Keep catalog retrieval in backend order with only exact numeric windows.
+  Free-text ranking, scoring, query rewriting, and relevance classification
+  are semantic decisions and belong exclusively to Hermes.
 - Remove or quarantine semantic/taste logic based on token sets such as calm,
   extreme, mature recipient, single recipient, narrow query, and similar
   customer-visible judgment.
@@ -125,7 +132,9 @@ Current role: v2 vs v1 comparison prompts.
 Required direction:
 
 - Keep as evaluation data, not runtime policy.
-- Add the real QA failures as scenarios and scoring expectations.
+- Add the real QA failures as raw comparison scenarios. Any qualitative score
+  or issue judgment must be an explicit structured LLM-authored result, never
+  a keyword or phrase classifier in the comparison script.
 - Do not turn scenarios into if/then backend logic.
 
 ## Refactor Plan

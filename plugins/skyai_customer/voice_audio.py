@@ -9,6 +9,7 @@ STT/TTS calls around the SkyAI `/voice/*` text contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import os
 from typing import Mapping
 
@@ -60,19 +61,37 @@ class VoiceAudioSettings:
     request_timeout_seconds: float
 
 
-def _env_value(env: Mapping[str, str], name: str, default: str = "") -> str:
-    return str(env.get(name, default) or "").strip()
+def _env_value(
+    env: Mapping[str, str],
+    name: str,
+    default: str = "",
+    *,
+    allow_empty: bool = True,
+) -> str:
+    if name not in env:
+        value = default
+    else:
+        value = env[name]
+    if type(value) is not str:
+        raise ValueError(f"{name} must be an exact string")
+    if not allow_empty and not value:
+        raise ValueError(f"{name} must be a nonempty string")
+    return value
 
 
 def _env_float(env: Mapping[str, str], name: str, default: float) -> float:
-    value = _env_value(env, name)
-    if not value:
+    if name not in env:
         return default
+    value = _env_value(env, name, allow_empty=False)
     try:
         parsed = float(value)
-    except ValueError:
-        return default
-    return max(1.0, min(parsed, 120.0))
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a decimal number") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if not 1.0 <= parsed <= 120.0:
+        raise ValueError(f"{name} must be between 1 and 120 seconds")
+    return parsed
 
 
 def load_voice_audio_settings(
@@ -85,56 +104,114 @@ def load_voice_audio_settings(
     OAuth lane; this key is only for STT/TTS audio calls.
     """
 
-    env = env or os.environ
+    if env is None:
+        env = os.environ
     return VoiceAudioSettings(
         provider_lane=VOICE_AUDIO_PROVIDER_LANE,
         api_key_env=OPENAI_AUDIO_KEY_ENV,
         api_key_configured=bool(_env_value(env, OPENAI_AUDIO_KEY_ENV)),
-        base_url=_env_value(env, "SKYAI_VOICE_OPENAI_BASE_URL", OPENAI_AUDIO_BASE_URL),
-        stt_primary_model=_env_value(env, "SKYAI_VOICE_STT_MODEL", OPENAI_STT_PRIMARY_MODEL),
-        stt_fast_model=_env_value(env, "SKYAI_VOICE_STT_FAST_MODEL", OPENAI_STT_FAST_MODEL),
-        tts_model=_env_value(env, "SKYAI_VOICE_TTS_MODEL", OPENAI_TTS_MODEL),
-        tts_voice=_env_value(env, "SKYAI_VOICE_TTS_VOICE", OPENAI_TTS_VOICE),
-        tts_fallback_voice=_env_value(env, "SKYAI_VOICE_TTS_FALLBACK_VOICE", OPENAI_TTS_FALLBACK_VOICE),
-        realtime_api_url=_env_value(env, "SKYAI_VOICE_REALTIME_API_URL", OPENAI_REALTIME_API_URL),
-        realtime_model=_env_value(env, "SKYAI_VOICE_REALTIME_MODEL", OPENAI_REALTIME_MODEL),
+        base_url=_env_value(
+            env,
+            "SKYAI_VOICE_OPENAI_BASE_URL",
+            OPENAI_AUDIO_BASE_URL,
+            allow_empty=False,
+        ),
+        stt_primary_model=_env_value(
+            env,
+            "SKYAI_VOICE_STT_MODEL",
+            OPENAI_STT_PRIMARY_MODEL,
+            allow_empty=False,
+        ),
+        stt_fast_model=_env_value(
+            env,
+            "SKYAI_VOICE_STT_FAST_MODEL",
+            OPENAI_STT_FAST_MODEL,
+            allow_empty=False,
+        ),
+        tts_model=_env_value(
+            env,
+            "SKYAI_VOICE_TTS_MODEL",
+            OPENAI_TTS_MODEL,
+            allow_empty=False,
+        ),
+        tts_voice=_env_value(
+            env,
+            "SKYAI_VOICE_TTS_VOICE",
+            OPENAI_TTS_VOICE,
+            allow_empty=False,
+        ),
+        tts_fallback_voice=_env_value(
+            env,
+            "SKYAI_VOICE_TTS_FALLBACK_VOICE",
+            OPENAI_TTS_FALLBACK_VOICE,
+            allow_empty=False,
+        ),
+        realtime_api_url=_env_value(
+            env,
+            "SKYAI_VOICE_REALTIME_API_URL",
+            OPENAI_REALTIME_API_URL,
+            allow_empty=False,
+        ),
+        realtime_model=_env_value(
+            env,
+            "SKYAI_VOICE_REALTIME_MODEL",
+            OPENAI_REALTIME_MODEL,
+            allow_empty=False,
+        ),
         realtime_fallback_model=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_FALLBACK_MODEL",
             OPENAI_REALTIME_FALLBACK_MODEL,
+            allow_empty=False,
         ),
         realtime_transcription_model=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_TRANSCRIPTION_MODEL",
             OPENAI_REALTIME_TRANSCRIPTION_MODEL,
+            allow_empty=False,
         ),
-        realtime_voice=_env_value(env, "SKYAI_VOICE_REALTIME_VOICE", OPENAI_REALTIME_VOICE),
+        realtime_voice=_env_value(
+            env,
+            "SKYAI_VOICE_REALTIME_VOICE",
+            OPENAI_REALTIME_VOICE,
+            allow_empty=False,
+        ),
         realtime_fallback_voice=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_FALLBACK_VOICE",
             OPENAI_REALTIME_FALLBACK_VOICE,
+            allow_empty=False,
         ),
         realtime_input_audio_format=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_INPUT_AUDIO_FORMAT",
             OPENAI_REALTIME_AUDIO_FORMAT,
+            allow_empty=False,
         ),
         realtime_output_audio_format=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_OUTPUT_AUDIO_FORMAT",
             OPENAI_REALTIME_AUDIO_FORMAT,
+            allow_empty=False,
         ),
         realtime_turn_detection=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_TURN_DETECTION",
             OPENAI_REALTIME_TURN_DETECTION,
+            allow_empty=False,
         ),
         realtime_reasoning_effort=_env_value(
             env,
             "SKYAI_VOICE_REALTIME_REASONING_EFFORT",
             OPENAI_REALTIME_REASONING_EFFORT,
+            allow_empty=False,
         ),
-        realtime_backend_target=_env_value(env, "SKYAI_VOICE_REALTIME_BACKEND_TARGET", "skyai_v2_chatkit"),
+        realtime_backend_target=_env_value(
+            env,
+            "SKYAI_VOICE_REALTIME_BACKEND_TARGET",
+            "skyai_v2_chatkit",
+            allow_empty=False,
+        ),
         request_timeout_seconds=_env_float(env, "SKYAI_VOICE_OPENAI_TIMEOUT_SECONDS", 30.0),
     )
 

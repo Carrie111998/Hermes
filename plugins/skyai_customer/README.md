@@ -204,9 +204,96 @@ allowed in this lane; any short spoken bridge while tools run must be
 contextual and model-owned.
 
 Voice calls are mirrored by the same DEV Discord sidecar when
-`SKYAI_DISCORD_MIRROR_ENABLED=true` and
-`SKYAI_DISCORD_MIRROR_CHANNEL_ID=1510888721614901358` are configured. The
-voice mirror is an operational side effect of `/voice/start`, `/voice/turn`,
-`/voice/event`, and `/voice/end`; it is not a model tool. DEV voice threads are
-marked with `🎙️` and `🧪 TEST` unless the gateway explicitly marks a future
-production call as real/customer.
+`SKYAI_DISCORD_MIRROR_ENABLED=1`,
+`SKYAI_DISCORD_MIRROR_CREATE_THREADS=1`, and
+`SKYAI_DISCORD_MIRROR_CHANNEL_ID=1510888721614901358` are configured, with the
+bot secret supplied only through `SKYAI_DISCORD_BOT_TOKEN`. The voice mirror is
+an operational side effect of `/voice/start`, `/voice/turn`, `/voice/event`,
+and `/voice/end`; it is not a model tool. Each exact conversation id maps to
+its own structural voice thread. Request content or provenance never assigns
+test/customer meaning or changes the destination.
+
+## Durable Discord Mirror Deployment Boundary
+
+Production mirroring is a dedicated SkyAI operational outbox. It never uses
+Canonical Brain, the `skyai_ci` event credential, or a generic
+`DATABASE_URL`. The only accepted database secret is:
+
+```text
+SKYAI_DISCORD_MIRROR_DATABASE_URL
+```
+
+The current PROD application runs on the VM-owned
+`skyai-v2-hermes-prod.service`; `skyai-prod-ingress` is only its Cloud Run
+proxy. The immutable VM release must install the exact plugin-edge driver from
+the `skyai-discord-mirror` package extra (or the equivalent exact requirements
+file) into the service's candidate environment. For a local DEV runtime,
+install the same exact requirement manually. Apply the mirror-only schema
+before enabling the production gate:
+
+```bash
+python -m pip install -r plugins/skyai_customer/requirements-discord-mirror.txt
+psql "$SKYAI_DISCORD_MIRROR_DATABASE_URL" \
+  -f plugins/skyai_customer/schema/discord_mirror_delivery_v1.sql
+```
+
+Use a login such as `skyai_discord_mirror_runtime` with only `USAGE` on the
+`skyai_discord_mirror` schema and `SELECT`, `INSERT`, and `UPDATE` on its
+`threads` and `deliveries` tables. The migration revokes public access and
+contains the exact recommended grants as comments, but deliberately does not
+create a login or embed a password. The runtime role must not inherit any
+Canonical Brain, `skyai_ci`, or general application role.
+
+Production must run
+`python -m plugins.skyai_customer.production_gateway`, using the fail-closed VM
+release contract under `deploy/`. That entrypoint accepts no `--dev` escape
+hatch and requires the dedicated DSN, Discord token, exact mirror channel,
+immutable build identity, and pinned driver before it listens. The separate
+`dev_gateway --dev` path remains available for local DEV only. The request
+handler writes the exact chat/voice mirror envelope and its lossless Discord
+chunks before any Discord network call. If that insert fails, the HTTP request
+returns 503; if the insert succeeds but Discord is unavailable, the customer
+response may complete while the persisted delivery remains queued for
+bounded-lease retries.
+
+Each durable request must carry a caller-created top-level string
+`delivery_id`. The widget creates it before the HTTP request and the caller
+must reuse it only for an exact replay of that same turn. The same stored
+envelope is idempotent while two legitimately identical turns remain distinct
+when they have different ids. This does **not** make model execution
+exactly-once: a repeated HTTP request can run the model again, and a changed
+response under an existing id is rejected as a conflicting exact envelope.
+
+The worker contract is truthfully at-least-once. Before posting a starter or
+content chunk, it scans retrievable Discord message history for the exact
+deterministic nonce; zero matches posts, one match resumes from that message,
+and multiple matches fail as ambiguous. New posts also use
+`enforce_nonce=true`, but no permanent remote exactly-once claim is made.
+Deliveries are claimed one at a time, and an owned lease is renewed during
+bounded Discord I/O. Thread creation is serialized by a Postgres advisory lock
+over the exact surface/channel/conversation identity. The recovery name is
+hash-only and contains the full SHA-256 digest, so no raw conversation id is
+placed in the thread name or starter. Multiple exact matches are treated as an
+error rather than guessed.
+
+The outbox stores a SHA-256 conversation identity and restricted transient raw
+content/chunks. Successful deliveries retain that raw payload for seven days
+by default (`604800` seconds); the worker then redacts only `delivered` rows in
+bounded batches. `pending`, `leased`, and `retry` payloads are never eligible
+for redaction, so retention cleanup cannot destroy an undelivered mirror.
+`/ready` remains false until the worker completes its first successful database
+poll. `/health` and `/ready` expose raw backlog counts, oldest-undelivered time,
+retry facts, the at-least-once contract, and typed worker posture without
+returning the DSN or bot secret.
+
+The disposable Postgres integration harness is gated by
+`SKYAI_TEST_POSTGRES_DSN`:
+
+```bash
+SKYAI_TEST_POSTGRES_DSN='postgresql://...' \
+  pytest -q tests/plugins/test_skyai_customer_discord_delivery_postgres.py
+```
+
+The JSON thread map remains only as an explicit local/DEV compatibility path.
+It is not the production persistence boundary and does not provide
+cross-instance recovery.

@@ -72,8 +72,8 @@ def _tool_handler(handler: Callable[..., dict[str, Any]]) -> Callable[..., str]:
     """Adapt fact helpers to Hermes' string-based tool-result contract."""
 
     def wrapped(args: dict[str, Any] | None = None, **_context: Any) -> str:
-        if not isinstance(args, dict):
-            args = {}
+        if type(args) is not dict:
+            raise ValueError("tool arguments must be an exact object")
         return json.dumps(handler(**args), ensure_ascii=False, sort_keys=True)
 
     return wrapped

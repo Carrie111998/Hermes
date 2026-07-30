@@ -89,20 +89,20 @@ public or wildcard binds also require an explicit token gate.
 
 Optional DEV-only environment gates:
 
-- `SKYAI_DISCORD_MIRROR_ENABLED=true`
-- `SKYAI_DISCORD_BOT_TOKEN=...` or `DISCORD_BOT_TOKEN=...`
+- `SKYAI_DISCORD_MIRROR_ENABLED=1`
+- `SKYAI_DISCORD_BOT_TOKEN=...`
 - `SKYAI_DISCORD_MIRROR_CHANNEL_ID=1510888721614901358`
-- `SKYAI_DISCORD_MIRROR_CREATE_THREADS=true`
+- `SKYAI_DISCORD_MIRROR_CREATE_THREADS=1`
 - `SKYAI_COMPARE_PROD_BASE_URL=https://<current-prod-skyai>`
 
 The Discord mirror and comparison endpoint are gateway sidecars, not model
 tools. The customer-facing Hermes model cannot call Discord, mutate PROD, or
 read internal reports.
 
-Voice sessions use the same Discord mirror sidecar and channel while the PBX
-MVP is in DEV. Voice threads are intentionally marked separately, for example
-`🧪 TEST · 🎙️ Voice SkyAI · <conversation_id>`, so web/FAB and voice evidence
-can live in `1510888721614901358` without being confused.
+Every enabled chat and voice conversation gets its own thread under channel
+`1510888721614901358`. Chat and voice are distinguished only by the exact
+structural surface; request text, headers, URLs, IPs, and test/customer labels
+never classify or route a mirror.
 
 ## Three-Hour Upstream Sync Policy
 

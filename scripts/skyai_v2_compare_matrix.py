@@ -37,31 +37,53 @@ def load_scenarios(path: Path) -> list[dict[str, Any]]:
         raise ValueError("compare_scenarios_must_be_list")
     scenarios: list[dict[str, Any]] = []
     for item in data:
-        if not isinstance(item, dict):
+        if type(item) is not dict:
             raise ValueError("compare_scenario_must_be_object")
-        scenario_id = str(item.get("id") or "").strip()
-        message = str(item.get("message") or "").strip()
-        if not scenario_id or not message:
+        scenario_id = item.get("id")
+        message = item.get("message")
+        if type(scenario_id) is not str or not scenario_id:
             raise ValueError("compare_scenario_requires_id_and_message")
+        if type(message) is not str or not message:
+            raise ValueError("compare_scenario_requires_id_and_message")
+        focus = item.get("focus", "")
+        if type(focus) is not str:
+            raise ValueError("compare_scenario_focus_must_be_string")
+        history = item.get("history", [])
+        if type(history) is not list:
+            raise ValueError("compare_scenario_history_must_be_list")
         scenarios.append(
             {
                 "id": scenario_id,
                 "message": message,
-                "focus": str(item.get("focus") or "").strip(),
-                "history": item.get("history") if isinstance(item.get("history"), list) else [],
+                "focus": focus,
+                "history": history,
             }
         )
     return scenarios
 
 
 def build_compare_payload(scenario: dict[str, Any], *, run_id: str) -> dict[str, Any]:
+    if type(run_id) is not str or not run_id:
+        raise ValueError("run_id_must_be_nonempty_string")
+    scenario_id = scenario.get("id")
+    message = scenario.get("message")
+    history = scenario.get("history", [])
+    if type(scenario_id) is not str or not scenario_id:
+        raise ValueError("scenario_id_must_be_nonempty_string")
+    if type(message) is not str or not message:
+        raise ValueError("scenario_message_must_be_nonempty_string")
+    if type(history) is not list:
+        raise ValueError("scenario_history_must_be_list")
+    conversation_id = f"skyai-v2-compare-{run_id}-{scenario_id}"
+    if len(conversation_id.encode("utf-8", errors="surrogatepass")) > 256:
+        raise ValueError("compare_conversation_id_exceeds_256_bytes")
     payload = {
-        "conversation_id": f"skyai-v2-compare-{run_id}-{scenario['id']}"[:128],
-        "message": scenario["message"],
+        "conversation_id": conversation_id,
+        "message": message,
         "surface": "skyai_v2_compare_matrix",
     }
-    if scenario.get("history"):
-        payload["history"] = scenario["history"]
+    if history:
+        payload["history"] = history
     return payload
 
 
@@ -70,7 +92,6 @@ def call_compare(base_url: str, payload: dict[str, Any], timeout: float, bearer_
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "SkyAI-v2-Compare-Matrix/0.1",
-        "X-SkyAI-Test-Signal": "compare_matrix",
     }
     if bearer_token:
         headers["Authorization"] = f"Bearer {bearer_token}"
@@ -98,18 +119,12 @@ def summarize_compare_response(scenario: dict[str, Any], response: dict[str, Any
     dev = response.get("dev_v2") if isinstance(response.get("dev_v2"), dict) else {}
     prod = response.get("prod_current") if isinstance(response.get("prod_current"), dict) else {}
     cards = response.get("cards_compare") if isinstance(response.get("cards_compare"), dict) else {}
-    dev_eval = evaluate_side(scenario, dev)
-    prod_eval = evaluate_side(scenario, prod)
     return {
         "id": scenario["id"],
         "focus": scenario.get("focus", ""),
         "status": response.get("status"),
         "dev_status": dev.get("status"),
         "prod_status": prod.get("status"),
-        "dev_quality_score": dev_eval["score"],
-        "prod_quality_score": prod_eval["score"],
-        "dev_quality_issues": dev_eval["issues"],
-        "prod_quality_issues": prod_eval["issues"],
         "dev_cards": dev.get("cards_count", 0),
         "prod_cards": prod.get("cards_count", 0),
         "shared_urls": cards.get("shared_urls", []),
@@ -122,135 +137,6 @@ def summarize_compare_response(scenario: dict[str, Any], response: dict[str, Any
         "dev_reply_preview": _preview(dev.get("reply")),
         "prod_reply_preview": _preview(prod.get("reply")),
     }
-
-
-def evaluate_side(scenario: dict[str, Any], side: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate QA regressions for comparison reports only.
-
-    These checks intentionally live in the DEV-only matrix script, not in the
-    SkyAI runtime. They are a review aid for real answers; they must not become
-    customer-facing guards or routing logic.
-    """
-
-    scenario_id = str(scenario.get("id") or "")
-    reply = _norm(side.get("reply"))
-    cards = side.get("cards") if isinstance(side.get("cards"), list) else []
-    issues: list[str] = []
-
-    if side.get("status") != "ok":
-        issues.append("side_status_not_ok")
-
-    if scenario_id == "bonus_transfer_customer":
-        if _starts_with_direct_yes(reply):
-            issues.append("starts_with_direct_yes_on_exception_case")
-        if not _has_any(reply, ("купувач", "човекът, който купува", "който купува", "резервиращ")):
-            issues.append("missing_default_bonus_owner")
-        if _has_any(reply, ("автоматично за получателя", "бонусът е за получателя", "идеята е бонусът да може да зарадва")):
-            issues.append("implies_automatic_recipient_bonus")
-    elif scenario_id == "booknow_bonus_use_timing":
-        if not _has_any(reply, ("ще бъде възстанов", "ще бъдат възстанов", "ще се възстанов")):
-            issues.append("weak_or_missing_booknow_refund_language")
-        if _has_any(
-            reply,
-            (
-                "може да бъде възстанов",
-                "може да бъдат възстанов",
-                "могат да бъдат възстанов",
-                "сумата може",
-                "парите могат",
-            ),
-        ):
-            issues.append("weak_booknow_refund_may_language")
-    elif scenario_id == "payment_methods":
-        for required in ("карта", "easypay", "наложен"):
-            if required not in reply:
-                issues.append(f"missing_payment_method:{required}")
-        if "банков" in reply and not _has_any(reply, ("не е", "няма")):
-            issues.append("unclear_bank_transfer_unavailable")
-    elif scenario_id == "voucher_merge":
-        if not _has_any(reply, ("ръчно", "екип", "поддръжк")):
-            issues.append("missing_manual_merge_escalation")
-        if _has_any(
-            reply,
-            (
-                "добави двата ваучера",
-                "добавите двата ваучера",
-                "добавете двата ваучера",
-                "използваш два ваучера",
-                "използвате два ваучера",
-                "използвате стойността на двата ваучера",
-                "плащане с ваучер/„имам ваучер“",
-                "плащане с ваучер/имам ваучер",
-            ),
-        ):
-            issues.append("suggests_self_service_merge_flow")
-    elif scenario_id == "voucher_extend":
-        if _has_any(reply, ("ако системата я показва", "ако е налична", "ако я има")):
-            issues.append("weak_or_conditional_extension_availability")
-        if not _has_any(reply, ("удължав", "моя ваучер", "моят ваучер", "ваучери")):
-            issues.append("missing_profile_extension_flow")
-    elif scenario_id == "external_voucher_issuer_boundary":
-        if not _has_any(reply, ("не може да се добав", "не е съвместим", "не важи в skyvision")):
-            issues.append("missing_external_voucher_boundary")
-        if not _has_any(reply, ("издател", "платформ", "продавач", "доставчик")):
-            issues.append("missing_external_issuer_next_step")
-    elif scenario_id == "unspecified_voucher_skyvision_context":
-        if _has_any(
-            reply,
-            (
-                "издаден ли е от skyvision",
-                "от skyvision ли е",
-                "ваучерът от skyvision ли е",
-                "или е закупен от друга платформа",
-                "кой е издал ваучера",
-            ),
-        ):
-            issues.append("asks_routine_issuer_question")
-        if not _has_any(reply, ("профил", "използвай", "замени", "друго преживяване")):
-            issues.append("missing_direct_skyvision_voucher_help")
-    elif scenario_id == "reservation_reply_contact":
-        if "info@skyvision.bg" not in reply:
-            issues.append("missing_customer_reply_email")
-        if "reservations@skyvision.bg" in reply:
-            issues.append("presents_automated_address_to_customer")
-    elif scenario_id == "gift_packaging":
-        if not _has_any(reply, ("син плик", "лукс")):
-            issues.append("missing_signature_blue_lux_envelope")
-        if "физическа опаковка" in reply:
-            issues.append("unnatural_physical_packaging_phrase")
-    elif scenario_id == "gift_wish_text":
-        if "поздрав" not in reply:
-            issues.append("missing_greeting_field")
-        if "редактирай поздрава" not in reply:
-            issues.append("missing_preview_update_action")
-        if _has_any(reply, ("само да не го объркаш", "име на ползвател")):
-            issues.append("unnecessary_recipient_name_field_warning")
-    elif scenario_id == "repeat_specific_parachute":
-        if _cards_contain(cards, "балон") or ("балон" in reply and "не балон" not in reply):
-            issues.append("keeps_pushing_rejected_balloon_alternative")
-        if not (_cards_contain(cards, "парашут") or "парашут" in reply):
-            issues.append("missing_requested_parachute_focus")
-    elif scenario_id == "broad_gift_diverse":
-        if _largest_card_category_count(cards) >= 3 and len(cards) >= 3:
-            issues.append("low_card_category_diversity")
-    elif scenario_id == "calm_friend_50_sliven":
-        if _cards_contain(cards, "софия") or _cards_contain(cards, "сърница") or "софия" in reply or "сърница" in reply:
-            issues.append("jumps_far_from_sliven_before_nearby_options")
-        if _cards_contain(cards, "парапланер") and _largest_card_category_count(cards) >= 2:
-            issues.append("duplicate_extreme_flight_direction_for_calm_profile")
-        if _largest_card_category_count(cards) >= 2 and len(cards) >= 3:
-            issues.append("low_card_category_diversity_for_broad_profile")
-    elif scenario_id == "model_identity_probe":
-        if _has_any(reply, ("gpt", "codex", "openai", "render", "gcp", "cloud run", "хост", "модел")):
-            issues.append("technical_implementation_disclosure")
-    elif scenario_id == "off_topic_chemistry":
-        if not _has_any(reply, ("skyvision", "прежив", "ваучер", "подар")):
-            issues.append("does_not_return_to_skyvision_scope")
-        if _has_any(reply, ("nacl", "hcl", "na₂co₃", "уравнение")):
-            issues.append("answers_off_topic_chemistry")
-
-    score = max(0, 100 - (len(issues) * 20))
-    return {"score": score, "issues": issues}
 
 
 def run_matrix(
@@ -312,13 +198,8 @@ def render_console_summary(report: dict[str, Any]) -> str:
         lines.append(
             f"- {summary['id']}: status={summary['status']} "
             f"dev_cards={summary['dev_cards']} prod_cards={summary['prod_cards']} "
-            f"shared_urls={len(summary['shared_urls'])} "
-            f"dev_score={summary['dev_quality_score']} prod_score={summary['prod_quality_score']}"
+            f"shared_urls={len(summary['shared_urls'])}"
         )
-        if summary["dev_quality_issues"]:
-            lines.append(f"  dev issues: {', '.join(summary['dev_quality_issues'])}")
-        if summary["prod_quality_issues"]:
-            lines.append(f"  prod issues: {', '.join(summary['prod_quality_issues'])}")
         if summary["focus"]:
             lines.append(f"  focus: {summary['focus']}")
         if summary["dev_reply_preview"]:
@@ -329,55 +210,13 @@ def render_console_summary(report: dict[str, Any]) -> str:
 
 
 def _preview(value: Any, limit: int = 180) -> str:
-    text = " ".join(str(value or "").split())
-    return text[: limit - 1].rstrip() + "…" if len(text) > limit else text
-
-
-def _norm(value: Any) -> str:
-    return " ".join(str(value or "").casefold().split())
-
-
-def _has_any(text: str, needles: tuple[str, ...]) -> bool:
-    return any(needle.casefold() in text for needle in needles)
-
-
-def _starts_with_direct_yes(text: str) -> bool:
-    stripped = text.lstrip(" \n\t—–-")
-    return stripped.startswith(("да,", "да -", "да –", "да."))
-
-
-def _cards_contain(cards: list[Any], needle: str) -> bool:
-    needle = needle.casefold()
-    for card in cards:
-        if not isinstance(card, dict):
-            continue
-        haystack = _norm(
-            " ".join(
-                str(card.get(key) or "")
-                for key in ("title", "public_url", "url", "location", "location_area")
-            )
-        )
-        if needle in haystack:
-            return True
-    return False
-
-
-def _largest_card_category_count(cards: list[Any]) -> int:
-    counts: dict[str, int] = {}
-    for card in cards:
-        if not isinstance(card, dict):
-            continue
-        url = str(card.get("public_url") or card.get("url") or "").strip("/")
-        category = ""
-        if "/подарък/" in url:
-            tail = url.split("/подарък/", 1)[1]
-            category = tail.split("/", 1)[0]
-        if not category:
-            title = _norm(card.get("title"))
-            category = title.split(" ", 1)[0] if title else ""
-        if category:
-            counts[category] = counts.get(category, 0) + 1
-    return max(counts.values(), default=0)
+    if value is None:
+        return ""
+    if type(value) is not str:
+        raise ValueError("reply preview source must be a string")
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("preview limit must be a positive integer")
+    return value[:limit]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -401,7 +240,7 @@ def main(argv: list[str]) -> int:
     scenarios = load_scenarios(args.scenarios)
     if args.limit > 0:
         scenarios = scenarios[: args.limit]
-    token = os.getenv(args.token_env, "").strip()
+    token = os.getenv(args.token_env, "")
     report = run_matrix(
         scenarios,
         base_url=args.base_url,

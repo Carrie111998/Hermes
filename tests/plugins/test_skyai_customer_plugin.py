@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
+import pytest
 import yaml
 
 from plugins.skyai_customer import register
@@ -36,6 +39,19 @@ def test_registers_public_safe_skyai_tools() -> None:
     names = {tool["name"] for tool in ctx.tools}
     assert names == SKYAI_TOOL_NAMES
     assert {tool["toolset"] for tool in ctx.tools} == {"skyai_customer"}
+
+
+def test_registered_tool_rejects_non_object_arguments_without_repair() -> None:
+    ctx = FakeContext()
+    register(ctx)
+    handler = next(
+        tool["handler"]
+        for tool in ctx.tools
+        if tool["name"] == "skyai_campaign_knowledge"
+    )
+
+    with pytest.raises(ValueError, match="exact object"):
+        handler(None)
 
 
 def test_manifest_is_standalone_opt_in_plugin() -> None:
@@ -109,18 +125,59 @@ def test_registered_tool_handlers_accept_hermes_dispatch_context(monkeypatch, tm
 
 
 def test_voice_transfer_tool_returns_structured_action() -> None:
+    reason = " \tcaller prefers a teammate\n"
+    spoken_reply = " \tРазбира се, ще Ви прехвърля към колега.\n"
     result = public_tools.handle_skyai_voice_transfer_to_human(
-        reason="caller prefers a teammate",
-        spoken_reply="Разбира се, ще Ви прехвърля към колега.",
+        reason=reason,
+        spoken_reply=spoken_reply,
     )
 
     assert result["status"] == "ok"
     assert result["voice_action"] == "transfer_to_human"
     assert result["transfer"] == {
         "target": "operator_queue",
-        "reason": "caller prefers a teammate",
+        "reason": reason,
     }
-    assert result["spoken_reply"] == "Разбира се, ще Ви прехвърля към колега."
+    assert result["spoken_reply"] == spoken_reply
+    assert result["display_reply"] == spoken_reply
+
+
+def test_voice_transfer_tool_rejects_wrong_types_and_oversized_fields() -> None:
+    assert public_tools.handle_skyai_voice_transfer_to_human(
+        reason=7,  # type: ignore[arg-type]
+        spoken_reply="Ще Ви прехвърля.",
+    ) == {
+        "status": "error",
+        "error": "reason_must_be_a_string",
+    }
+    assert public_tools.handle_skyai_voice_transfer_to_human(
+        reason="model-authored reason",
+        spoken_reply="x" * 221,
+    ) == {
+        "status": "error",
+        "error": "spoken_reply_exceeds_220_characters",
+    }
+    assert public_tools.handle_skyai_voice_transfer_to_human(
+        reason="",
+        spoken_reply="Ще Ви прехвърля.",
+    ) == {
+        "status": "error",
+        "error": "reason_must_be_nonempty",
+    }
+    assert public_tools.handle_skyai_voice_transfer_to_human(
+        reason="model-authored reason",
+        spoken_reply="",
+    ) == {
+        "status": "error",
+        "error": "spoken_reply_must_be_nonempty",
+    }
+
+
+def test_voice_transfer_schema_requires_model_authored_fields() -> None:
+    parameters = public_tools.SKYAI_VOICE_TRANSFER_TO_HUMAN_SCHEMA["parameters"]
+
+    assert parameters["required"] == ["reason", "spoken_reply"]
+    assert parameters["additionalProperties"] is False
 
 
 def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
@@ -175,41 +232,46 @@ def test_product_detail_normalizes_public_gift_path(monkeypatch) -> None:
 
 def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> None:
     calls: list[str] = []
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
     def fake_http_json(url: str, *, timeout: float = 8.0):
         calls.append(url)
         return {
             "data": [
-                {"id": 1, "title": "Масаж", "price": "100", "location": "София"},
-                {
-                    "id": 2,
-                    "title": "SPA",
-                    "price": "186",
-                    "oldPrice": "220",
-                    "rating": "4.9",
+                    {
+                        "id": 2,
+                        "title": "SPA",
+                        "price": "186",
+                        "oldPrice": "220",
+                        "isOnOffer": True,
+                        "rating": "4.9",
                     "ratingCount": "27",
                     "ordersCount": "105",
                     "location": "София",
                 },
+                {"id": 1, "title": "Масаж", "price": "100", "location": "София"},
             ]
         }
 
     monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
 
+    query = " \tмасаж / София до 100 евро?\n"
     result = public_tools.handle_skyai_catalog_search(
-        query="масаж София",
+        query=query,
         min_price_eur=80,
         max_price_eur=100,
-        limit=1,
+        limit=2,
     )
 
     assert result["status"] == "ok"
-    assert result["count"] == 1
-    assert "search=%D0%BC%D0%B0%D1%81%D0%B0%D0%B6%20%D0%A1%D0%BE%D1%84%D0%B8%D1%8F" in calls[0]
-    assert "minPrice=156" in calls[0]
-    assert "maxPrice=196" in calls[0]
+    assert result["count"] == 2
+    assert result["query"] == query
+    parsed = urlsplit(calls[0])
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    assert params["search"] == [query]
+    assert params["size"] == ["2"]
+    assert params["minPrice"] == ["156"]
+    assert params["maxPrice"] == ["196"]
+    assert [item["title"] for item in result["items"]] == ["SPA", "Масаж"]
     assert result["items"][0]["title"] == "SPA"
     assert result["items"][0]["price_eur"] == "95.10"
     assert result["items"][0]["old_price_eur"] == "112.48"
@@ -219,54 +281,17 @@ def test_catalog_search_converts_eur_budget_to_public_cache_bgn(monkeypatch) -> 
     assert result["items"][0]["is_on_offer"] is True
 
 
-def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> None:
+def test_catalog_search_does_not_infer_budget_or_fetch_a_second_catalog(monkeypatch) -> None:
     calls: list[str] = []
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
 
     def fake_http_json(url: str, *, timeout: float = 8.0):
         calls.append(url)
-        if url.endswith("search="):
-            return {
-                "data": [
-                    {
-                        "id": 1,
-                        "name": "Йога клас с малки кученца в София",
-                        "price": "45",
-                        "slug": "приключения-с-домашни-любимци/йога-клас-с-малки-кученца-софия",
-                        "locationName": "София",
-                    },
-                    {
-                        "id": 2,
-                        "name": "Уелнес ритуал за двама: Сауна и масаж",
-                        "price": "195.583",
-                        "slug": "релакс-зона/сауна-и-масаж-за-двама",
-                        "locationName": "София",
-                    },
-                    {
-                        "id": 3,
-                        "name": "Кралски синхронен масаж за двойки или приятели",
-                        "price": "130",
-                        "slug": "масажи/кралски-синхронен-масаж-за-двойки-или-приятели",
-                        "locationName": "София",
-                    },
-                    {
-                        "id": 4,
-                        "name": "Какаов синхронен масаж за двама – гръб или цяло тяло",
-                        "price": "120",
-                        "slug": "масажи/какаов-синхронен-масаж-за-двама-цяло-тяло",
-                        "locationName": "София",
-                    },
-                    {
-                        "id": 5,
-                        "name": "Сладкарски курс за Италиански десерти",
-                        "price": "115.39",
-                        "slug": "сладкарски-курс/италиански-десерти",
-                        "locationName": "София-град",
-                    },
-                ]
-            }
-        return {"data": []}
+        return {
+            "data": [
+                {"id": 1, "name": "Backend first", "price": "500"},
+                {"id": 2, "name": "Backend second", "price": "50"},
+            ]
+        }
 
     monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
 
@@ -276,303 +301,122 @@ def test_catalog_search_falls_back_to_daily_index_and_reranks(monkeypatch) -> No
     )
 
     assert result["status"] == "ok"
-    assert result["filters"]["max_price_eur"] == 100.0
-    assert result["filters"]["inferred_from_query"]["max_price_eur"] is True
-    assert len(calls) == 2
-    assert calls[1].endswith("search=")
+    assert result["filters"]["max_price_eur"] is None
+    assert "inferred_from_query" not in result["filters"]
+    assert len(calls) == 1
+    assert parse_qs(urlsplit(calls[0]).query)["maxPrice"] == ["4000"]
     assert [item["title"] for item in result["items"]] == [
-        "Уелнес ритуал за двама: Сауна и масаж",
-        "Кралски синхронен масаж за двойки или приятели",
-        "Какаов синхронен масаж за двама – гръб или цяло тяло",
+        "Backend first",
+        "Backend second",
     ]
-    assert all("/подарък/" in item["public_url"] for item in result["items"])
 
 
-def test_catalog_search_keeps_negated_terms_as_evidence_for_hermes(monkeypatch) -> None:
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
-
-    def fake_http_json(url: str, *, timeout: float = 8.0):
-        if "скок" in url or url.endswith("search="):
-            return {
-                "data": [
-                    {
-                        "id": 10,
-                        "name": "Самостоятелен бънджи скок от балон - Проходна",
-                        "price": "136.91",
-                        "slug": "скок-с-бънджи/от-балон-за-един-проходна",
-                        "locationName": "Проходна",
-                    },
-                    {
-                        "id": 11,
-                        "name": "Тандемен бънджи скок от балон - Проходна",
-                        "price": "234.70",
-                        "slug": "скок-с-бънджи/на-проходна-от-балон-в-тандем",
-                        "locationName": "Проходна",
-                    },
-                    {
-                        "id": 1,
-                        "name": "Тандемен скок с парашут от 3000 м – София",
-                        "price": "389.21",
-                        "slug": "тандем-скок-с-парашут/тандемен-скок-с-парашут-софия",
-                        "locationName": "Сапарева баня",
-                    },
-                    {
-                        "id": 2,
-                        "name": "Тандемен скок с парашут - София",
-                        "price": "449",
-                        "slug": "тандем-скок-с-парашут/скок-с-парашут-софия",
-                        "locationName": "Сапарева баня",
-                    },
-                    {
-                        "id": 3,
-                        "name": "Любов на висота: 2 тандемни скока с парашут - София",
-                        "price": "760.75",
-                        "slug": "тандем-скок-с-парашут/любов-на-висота-2-скока-с-парашут",
-                        "locationName": "Сапарева баня",
-                    },
-                ]
-            }
-        return {"data": []}
-
-    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
-
-    result = public_tools.handle_skyai_catalog_search(
-        query="Не, държа да е точно скок с парашут, не балон или друго летене.",
-        limit=3,
+def test_catalog_search_rejects_malformed_structured_arguments_without_repair(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not call API")),
     )
 
-    assert result["count"] == 3
-    assert "балон" in public_tools._query_evidence(
-        "Не, държа да е точно скок с парашут, не балон или друго летене."
-    ).tokens
-    assert result["query_evidence"]["reasoning_owner"] == "hermes"
+    assert public_tools.handle_skyai_catalog_search(
+        query=7,  # type: ignore[arg-type]
+    ) == {"status": "error", "error": "query_must_be_a_string"}
+    assert public_tools.handle_skyai_catalog_search(
+        min_price_eur="80",  # type: ignore[arg-type]
+    ) == {"status": "error", "error": "min_price_eur_must_be_a_number"}
+    assert public_tools.handle_skyai_catalog_search(
+        min_price_eur=100,
+        max_price_eur=80,
+    ) == {"status": "error", "error": "min_price_eur_exceeds_max_price_eur"}
+    assert public_tools.handle_skyai_catalog_search(
+        limit=13,
+    ) == {"status": "error", "error": "limit_out_of_range"}
 
 
-def test_catalog_search_returns_evidence_metadata_without_recipient_policy(monkeypatch) -> None:
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
-
-    def fake_http_json(url: str, *, timeout: float = 8.0):
-        if url.endswith("search="):
-            return {
-                "data": [
-                    {
-                        "id": 9,
-                        "name": "Вино и СПА пакет Стандарт за двама",
-                        "price": "255",
-                        "slug": "винен-туризъм/вино-и-спа-пакет-стандарт-за-двама",
-                        "locationName": "Могилово",
-                        "locationArea": "Stara Zagora",
-                    },
-                    {
-                        "id": 10,
-                        "name": "Флотация и релаксиращ масаж",
-                        "price": "225",
-                        "slug": "флотация/флотация-масаж-бургас",
-                        "locationName": "Бургас",
-                        "locationArea": "Burgas",
-                    },
-                    {
-                        "id": 11,
-                        "name": "Петзвезден делничен СПА релакс за двама",
-                        "price": "289.50",
-                        "slug": "спа-и-релакс/petzvezden-spa-relaks-za-dvama-v-dianamar",
-                        "locationName": "Павел баня",
-                        "locationArea": "Stara Zagora",
-                    },
-                    {
-                        "id": 12,
-                        "name": "Квилинг брънч: хартиено изкуство, създадено от Вашите ръце",
-                        "price": "140",
-                        "slug": "творчески-подаръци/квилинг-брънч",
-                        "locationName": "София",
-                        "locationArea": "Sofia City Province",
-                    },
-                    {
-                        "id": 13,
-                        "name": "Романтика за двама: делнична почивка с вино и плодове",
-                        "price": "166",
-                        "slug": "романтика-за-двама/делнична-почивка-с-вино-и-плодове",
-                        "locationName": "Сърница",
-                        "locationArea": "Pazardzhik Province",
-                    },
-                ]
-            }
-        return {
+def test_catalog_search_returns_public_facts_without_semantic_context(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda *_args, **_kwargs: {
             "data": [
                 {
-                    "id": 1,
-                    "name": "Панорамен полет с парапланер в Сопот",
-                    "price": "127.13",
-                    "slug": "полет-с-парапланер/панорамен-полет-с-парапланер-на-сопот-с-пещана",
-                    "locationName": "Сопот",
-                    "locationArea": "Plovdiv Province",
-                },
-                {
-                    "id": 2,
-                    "name": "Панорамен полет с парапланер – Сопот или София",
-                    "price": "127.13",
-                    "slug": "полет-с-парапланер/сопот-полет-с-парапланер-с-пилот-гущера",
-                    "locationName": "Сопот",
-                    "locationArea": "Plovdiv Province",
-                },
-                {
-                    "id": 3,
-                    "name": "Нощувка и преживяване за двама в района на Пловдив",
-                    "price": "262.08",
-                    "slug": "приключенска-почивка/нощувка-и-преживяване-за-двама-2",
-                    "locationName": "Пловдив",
-                    "locationArea": "Plovdiv Province",
-                },
+                    "id": 9,
+                    "name": "Вино и СПА пакет Стандарт за двама",
+                    "price": "255",
+                    "slug": "винен-туризъм/вино-и-спа-пакет-стандарт-за-двама",
+                    "categorySlug": "винен-туризъм",
+                    "locationName": "Могилово",
+                    "locationArea": "Stara Zagora",
+                }
             ]
-        }
-
-    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+        },
+    )
 
     result = public_tools.handle_skyai_catalog_search(
-        query=(
-            "Подаръкът е за близка приятелка от Сливен. "
-            "Тя е спокоен и позитивен човек, 50+."
-        ),
+        query="Подарък за близка приятелка от Сливен.",
         limit=5,
     )
 
-    assert "recipient_context" not in result
-    assert result["query_evidence"]["requested_location"] == "сливен"
-    assert result["query_evidence"]["reasoning_owner"] == "hermes"
-    assert result["location_context"]["requested_location"] == "сливен"
-    assert result["location_context"]["reasoning_owner"] == "hermes"
-    assert result["location_context"]["nearest_returned_items"]
-    assert result["location_context"]["nearest_returned_items"][0]["distance_from_requested_location_km"] is not None
-    assert result["value_voucher_option"]["public_url"] == (
-        "https://skyvision.bg/подарък/ваучер-за-подарък-на-стойност/"
+    assert set(result) == {"status", "source", "query", "filters", "count", "items"}
+    assert "query_evidence" not in result
+    assert "location_context" not in result
+    assert "selection_context" not in result
+    assert "value_voucher_option" not in result
+    assert result["items"][0]["category_slug"] == "винен-туризъм"
+    assert result["items"][0]["location"] == "Могилово"
+    assert result["items"][0]["location_area"] == "Stara Zagora"
+    assert "category_key" not in result["items"][0]
+    assert "distance_from_requested_location_km" not in result["items"][0]
+    assert "requested_location" not in result["items"][0]
+
+
+def test_catalog_search_preserves_backend_order_and_duplicate_records(monkeypatch) -> None:
+    backend_items = [
+        {"id": 3, "name": "Third-ranked by backend", "price": "300"},
+        {"id": 1, "name": "First duplicate", "price": "10"},
+        {"id": 1, "name": "Second duplicate", "price": "10"},
+        {"id": 2, "name": "Outside requested result window", "price": "20"},
+    ]
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda *_args, **_kwargs: {"data": backend_items},
     )
-    assert "не изписва конкретна услуга" in result["value_voucher_option"]["important_note"]
-    assert result["value_voucher_option"]["availability"] == "public_universal_gift_option"
-    assert "answer_guidance" not in result["value_voucher_option"]
-    assert all(item["category_key"] for item in result["items"])
-    assert any(item["distance_from_requested_location_km"] is not None for item in result["items"])
-
-
-def test_catalog_search_exposes_diverse_items_without_pruning_ranked_evidence(monkeypatch) -> None:
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
-
-    def fake_http_json(url: str, *, timeout: float = 8.0):
-        if url.endswith("search="):
-            return {"data": []}
-        return {
-            "data": [
-                {
-                    "id": 1,
-                    "name": "Два дни с каяк на яз. Александър Стамболийски",
-                    "price": "176",
-                    "slug": "каяк/два-дни-с-каяк-яз-александър-стамболийски",
-                    "locationName": "с. Горско Косово",
-                },
-                {
-                    "id": 2,
-                    "name": "Два дни с каяк по Дунав от Никопол до Свищов",
-                    "price": "176",
-                    "slug": "каяк/два-дни-с-каяк-дунав-никопол-свищов",
-                    "locationName": "Свищов",
-                },
-                {
-                    "id": 3,
-                    "name": "Два дни с каяк по Дунав и Янтра",
-                    "price": "176",
-                    "slug": "каяк/два-дни-с-каяк-дунав-янтра",
-                    "locationName": "с. Вардим",
-                },
-                {
-                    "id": 4,
-                    "name": "Два дни ледено катерене на водопад",
-                    "price": "285",
-                    "slug": "ледено-катерене/два-дни-ледено-катерене",
-                    "locationName": "гара Бов",
-                },
-                {
-                    "id": 5,
-                    "name": "Два дни СПА почивка за двама",
-                    "price": "260",
-                    "slug": "спа-и-релакс/два-дни-спа-почивка-за-двама",
-                    "locationName": "Велинград",
-                },
-            ]
-        }
-
-    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
 
     result = public_tools.handle_skyai_catalog_search(
         query="Искам да поръчаме един билет за два дни",
-        limit=5,
+        limit=3,
     )
 
-    assert result["count"] == 5
-    assert [item["category_key"] for item in result["items"][:3]] == ["каяк", "каяк", "каяк"]
-    selection_context = result["selection_context"]
-    assert selection_context["reasoning_owner"] == "hermes"
-    assert "not a mandatory final-answer order" in selection_context["ranked_items_contract"]
-    assert selection_context["repeated_categories"][0]["category_key"] == "каяк"
-    assert selection_context["repeated_categories"][0]["count"] == 3
-    diverse_items = selection_context["diverse_items"]
-    assert [item["category_key"] for item in diverse_items[:3]] == [
-        "каяк",
-        "ледено катерене",
-        "спа и релакс",
+    assert [item["id"] for item in result["items"]] == [3, 1, 1]
+    assert [item["title"] for item in result["items"]] == [
+        "Third-ranked by backend",
+        "First duplicate",
+        "Second duplicate",
     ]
-    assert {item["title"] for item in diverse_items} == {item["title"] for item in result["items"]}
 
 
 def test_catalog_search_does_not_prune_far_or_childlike_options_in_backend(monkeypatch) -> None:
-    public_tools._CATALOG_INDEX_CACHE["items"] = None
-    public_tools._CATALOG_INDEX_CACHE["expires_at"] = 0
-
-    def fake_http_json(url: str, *, timeout: float = 8.0):
-        if url.endswith("search="):
-            return {
-                "data": [
-                    {
-                        "id": 1,
-                        "name": "СПА уикенд край Сливен",
-                        "price": "260",
-                        "slug": "спа-и-релакс/spa-uikend-sliven",
-                        "locationName": "Сливен",
-                    },
-                    {
-                        "id": 2,
-                        "name": "Винен релакс в Стара Загора",
-                        "price": "180",
-                        "slug": "винени-турове-дегустации/vinen-relaks-stara-zagora",
-                        "locationName": "Стара Загора",
-                    },
-                    {
-                        "id": 3,
-                        "name": "Флотация и релаксиращ масаж в Бургас",
-                        "price": "190",
-                        "slug": "флотация/flotacia-masaj-burgas",
-                        "locationName": "Бургас",
-                    },
-                    {
-                        "id": 4,
-                        "name": "Луксозен СПА ритуал в Сърница",
-                        "price": "160",
-                        "slug": "спа-и-релакс/luksozen-spa-ritual-sarnitsa",
-                        "locationName": "Сърница",
-                    },
-                    {
-                        "id": 5,
-                        "name": "Детско-юношеско офроуд училище край Сливен",
-                        "price": "90",
-                        "slug": "шофиране-за-деца/detsko-yunoshesko-ofroud-uchilishte",
-                        "locationName": "Сливен",
-                    },
-                ]
-            }
-        return {"data": []}
-
-    monkeypatch.setattr(public_tools, "_http_json", fake_http_json)
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda *_args, **_kwargs: {
+            "data": [
+                {
+                    "id": 1,
+                    "name": "Луксозен СПА ритуал в Сърница",
+                    "price": "160",
+                    "locationName": "Сърница",
+                },
+                {
+                    "id": 2,
+                    "name": "Детско-юношеско офроуд училище край Сливен",
+                    "price": "90",
+                    "locationName": "Сливен",
+                },
+            ]
+        },
+    )
 
     result = public_tools.handle_skyai_catalog_search(
         query=(
@@ -585,8 +429,7 @@ def test_catalog_search_does_not_prune_far_or_childlike_options_in_backend(monke
     titles = [item["title"] for item in result["items"]]
     assert "Луксозен СПА ритуал в Сърница" in titles
     assert "Детско-юношеско офроуд училище край Сливен" in titles
-    assert "recipient_context" not in result
-    assert result["location_context"]["returned_distance_km_values"]
+    assert "location_context" not in result
 
 
 def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
@@ -795,7 +638,9 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert "+359 (0) 700 20 200" in result["official_contacts"]["phones"]
 
 
-def test_product_slots_compacts_fixed_slots_and_marks_fixed_mode(monkeypatch) -> None:
+def test_product_slots_returns_all_exact_slot_facts_without_mode_classification(
+    monkeypatch,
+) -> None:
     def fake_http_json(url: str, *, timeout: float = 8.0):
         return {
             "fixedSlots": [
@@ -826,12 +671,84 @@ def test_product_slots_compacts_fixed_slots_and_marks_fixed_mode(monkeypatch) ->
     )
 
     assert result["status"] == "ok"
-    assert result["availability_mode"] == "fixed_slots_available_direct_booking"
+    assert "availability_mode" not in result
+    assert "mode_facts" not in result
     assert result["fixed_slots"][0]["free_slots_count"] == 1
     assert result["fixed_slots"][0]["first_free_slot"]["id"] == 10
+    assert result["request_slots"] == [
+        {
+            "start": "2026-07-06T08:00:00",
+            "end": "2026-07-06T08:40:00",
+        }
+    ]
 
 
-def test_event_log_append_rejects_sensitive_payload(monkeypatch, tmp_path: Path) -> None:
+def test_product_slots_rejects_type_repairs_and_partial_date_range() -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        public_tools.handle_skyai_product_slots(product_id="10536")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="provided together"):
+        public_tools.handle_skyai_product_slots(
+            product_id=10536,
+            start_date="2026-07-03",
+        )
+
+
+def test_product_facts_preserve_false_and_do_not_infer_offer(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": [
+                {
+                    "id": 1,
+                    "title": "Exact facts",
+                    "price": "100",
+                    "oldPrice": "120",
+                    "isOnOffer": False,
+                }
+            ]
+        },
+    )
+
+    result = public_tools.handle_skyai_catalog_search(query="", limit=1)
+
+    assert result["items"][0]["is_on_offer"] is False
+
+
+def test_product_detail_uses_field_presence_not_truthy_aliases(monkeypatch) -> None:
+    monkeypatch.setattr(
+        public_tools,
+        "_http_json",
+        lambda _url, timeout=8.0: {
+            "data": {
+                "id": 0,
+                "product_id": 999,
+                "title": "",
+                "name": "must not replace exact empty title",
+                "slug": "exact",
+                "forKids": False,
+                "children": True,
+                "includesBonus": False,
+                "canReceiveBonusProduct": True,
+                "canBook": False,
+                "canBuyVoucher": False,
+            }
+        },
+    )
+
+    detail = public_tools.handle_skyai_product_detail(
+        product_path="exact",
+    )["detail"]
+
+    assert detail["id"] == 0
+    assert detail["title"] == ""
+    assert detail["for_kids"] is False
+    assert detail["includes_bonus"] is False
+    assert detail["can_book"] is False
+    assert detail["can_buy_voucher"] is False
+
+
+def test_event_log_append_rejects_properties_outside_positive_schema(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SKYAI_V2_EVENT_LOG_PATH", str(tmp_path / "events.jsonl"))
 
     result = public_tools.handle_skyai_event_log_append(
@@ -839,9 +756,42 @@ def test_event_log_append_rejects_sensitive_payload(monkeypatch, tmp_path: Path)
         properties={"email": "client@example.com"},
     )
 
-    assert result["status"] == "blocked"
+    assert result["status"] == "error"
+    assert result["error"] == "unsupported_event_property"
     assert result["written"] is False
     assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_event_log_preserves_unregistered_lookalikes_and_redacts_registered_secret(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    registered_secret = "registered-secret-value-123456"
+    lookalikes = "client@example.com | +359 888 123 456 | sk-lookalike-only"
+    anonymous_id = " \tanon-1\n"
+    conversation_id = " conversation-1 "
+    monkeypatch.setenv("SKYAI_V2_EVENT_LOG_PATH", str(path))
+    monkeypatch.setenv("SKYAI_V2_CANARY_TOKEN", registered_secret)
+
+    result = public_tools.handle_skyai_event_log_append(
+        event_type="product_recommended",
+        anonymous_id=anonymous_id,
+        conversation_id=conversation_id,
+        properties={
+            "product_id": 10536,
+            "surface": lookalikes,
+            "reason_code": f"before:{registered_secret}:after",
+        },
+    )
+
+    assert result["status"] == "ok"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["schema"] == "skyai_ci.events.local_jsonl.v2"
+    assert record["properties"]["surface"] == lookalikes
+    assert record["properties"]["reason_code"] == "before:[redacted-secret]:after"
+    assert record["anonymous_id_hash"] == hashlib.sha256(anonymous_id.encode("utf-8")).hexdigest()
+    assert record["conversation_id_hash"] == hashlib.sha256(conversation_id.encode("utf-8")).hexdigest()
 
 
 def test_event_log_append_writes_sanitized_append_only_record(monkeypatch, tmp_path: Path) -> None:
