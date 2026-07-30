@@ -451,6 +451,76 @@ describe("ProfilesPage reasoning effort selector", () => {
     ]);
   });
 
+  it("loads model options for the profile being edited", async () => {
+    mockedApi.getProfiles.mockResolvedValue({
+      profiles: [
+        {
+          name: "default",
+          path: "/tmp/default",
+          is_default: true,
+          model: "model-a",
+          provider: "provider-a",
+          reasoning_effort: "",
+          has_env: false,
+          skill_count: 0,
+          gateway_running: false,
+          description: "",
+          description_auto: false,
+          distribution_name: null,
+          distribution_version: null,
+          distribution_source: null,
+          has_alias: false,
+        },
+        {
+          name: "other",
+          path: "/tmp/other",
+          is_default: false,
+          model: "other-model",
+          provider: "other-provider",
+          reasoning_effort: "",
+          has_env: false,
+          skill_count: 0,
+          gateway_running: false,
+          description: "",
+          description_auto: false,
+          distribution_name: null,
+          distribution_version: null,
+          distribution_source: null,
+          has_alias: false,
+        },
+      ],
+    });
+    mockedApi.getModelOptions.mockImplementation(async (profile) => ({
+      providers: [
+        profile === "other"
+          ? { slug: "other-provider", name: "Other Provider", models: ["other-model"] }
+          : { slug: "provider-a", name: "Provider A", models: ["model-a"] },
+      ],
+    }));
+
+    await renderPage(<ProfilesPage />);
+    const menus = [...container.querySelectorAll<HTMLElement>("[data-profile-actions]")];
+    expect(menus).toHaveLength(2);
+    const actions = menus[1].querySelector<HTMLButtonElement>(
+      "button[aria-label='Actions']",
+    );
+    expect(actions).not.toBeNull();
+    await act(async () => actions!.click());
+    const changeModel = [...menus[1].querySelectorAll<HTMLButtonElement>("[role=menuitem]")].find(
+      (button) => button.textContent?.includes("Change model"),
+    );
+    expect(changeModel).toBeDefined();
+    await act(async () => changeModel!.click());
+    await settle();
+
+    expect(mockedApi.getModelOptions).toHaveBeenCalledWith("other");
+    const modelSelect = container.querySelector<HTMLButtonElement>("button[role=combobox]");
+    expect(modelSelect).not.toBeNull();
+    expect(openOptions(modelSelect!).map((option) => option.textContent?.trim())).toContain(
+      "Other Provider · other-model",
+    );
+  });
+
   it("sends a changed model and reasoning effort in one settings update", async () => {
     mockedApi.getModelOptions.mockResolvedValue({
       providers: [
