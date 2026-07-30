@@ -322,8 +322,9 @@ class RelayAdapter(BasePlatformAdapter):
         self._stamp_slack_session_thread(event)
         # Phase 3: a structured prompt answer resolves its waiting primitive
         # (approval/confirm/clarify) and is CONSUMED — it must not also
-        # dispatch as a chat message. Unknown/expired prompt ids fall through
-        # (the command-shaped text then behaves like a typed reply).
+        # dispatch as a chat message. Unknown/expired prompt ids are consumed
+        # too: their command-shaped fallback text must never reach FIFO
+        # approval handling and affect a different pending request.
         if await self._consume_prompt_response(event):
             return
         await self._localize_inbound_media(event)
@@ -1714,9 +1715,14 @@ class RelayAdapter(BasePlatformAdapter):
                 "\n\n**Smart DENY:** owner override applies to this one operation only."
             )
 
+        request_id = str((metadata or {}).get("approval_request_id") or "")
         prompt_id = self._mint_prompt(
             "exec_approval",
-            {"session_key": session_key, "chat_id": str(chat_id)},
+            {
+                "session_key": session_key,
+                "chat_id": str(chat_id),
+                "request_id": request_id,
+            },
         )
         result = await self._send_prompt(
             chat_id,
@@ -1829,12 +1835,9 @@ class RelayAdapter(BasePlatformAdapter):
     async def _consume_prompt_response(self, event) -> bool:
         """Route an inbound prompt_response to its waiting primitive.
 
-        Returns True when the event was a prompt answer (consumed — do NOT
-        dispatch it as a chat message), False otherwise. Unknown/expired
-        prompt ids fall through to normal dispatch: the command-shaped text
-        ("/once", "/deny", …) then behaves like a typed reply, which the
-        approval/confirm text lanes already understand — the same stale-tap
-        degradation the native adapters implement with an "expired" edit.
+        Returns True when the event was a structured prompt answer (consumed —
+        do NOT dispatch it as a chat message), False for ordinary messages.
+        Unknown, malformed, and expired structured responses fail closed.
         """
         pr = getattr(event, "prompt_response", None)
         if not isinstance(pr, dict):
@@ -1842,20 +1845,32 @@ class RelayAdapter(BasePlatformAdapter):
         prompt_id = str(pr.get("prompt_id") or "")
         option_id = str(pr.get("option_id") or "")
         if not prompt_id or not option_id:
-            return False
+            logger.info("relay received malformed structured prompt_response")
+            return True
         state = self._pop_prompt(prompt_id)
         if state is None:
             logger.info(
                 "relay prompt_response for unknown/expired prompt %s (option=%s) — "
-                "falling through to text dispatch",
+                "consuming without text fallback",
                 prompt_id,
                 option_id,
             )
-            return False
+            chat_id = str(getattr(event.source, "chat_id", ""))
+            if chat_id:
+                try:
+                    await self.send(
+                        chat_id,
+                        "⌛ That prompt has already expired or was resolved.",
+                        metadata=self._prompt_reply_metadata(event),
+                    )
+                except Exception:
+                    logger.debug("relay expired-prompt notice failed", exc_info=True)
+            return True
 
         kind = state.get("kind")
         chat_id = str(state.get("chat_id") or getattr(event.source, "chat_id", ""))
         session_key = str(state.get("session_key") or "")
+        request_id = str(state.get("request_id") or "")
         try:
             if kind == "exec_approval":
                 from tools.approval import resolve_gateway_approval
@@ -1865,7 +1880,14 @@ class RelayAdapter(BasePlatformAdapter):
                     if option_id in {"once", "session", "always", "deny"}
                     else "deny"
                 )
-                count = resolve_gateway_approval(session_key, choice)
+                if request_id:
+                    count = resolve_gateway_approval(
+                        session_key,
+                        choice,
+                        request_id=request_id,
+                    )
+                else:
+                    count = resolve_gateway_approval(session_key, choice)
                 label = {
                     "once": "✅ Approved once",
                     "session": "✅ Approved for session",

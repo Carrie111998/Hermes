@@ -134,9 +134,21 @@ describe('dispatchNativeNotification preferences', () => {
 
   it('forwards kind and sessionId to the bridge', () => {
     setActiveSessionId('abc')
-    dispatchNativeNotification({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+    dispatchNativeNotification({
+      body: 'hi',
+      kind: 'turnError',
+      requestId: 'approval-one',
+      sessionId: 'abc',
+      title: 'boom'
+    })
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+      expect.objectContaining({
+        body: 'hi',
+        kind: 'turnError',
+        requestId: 'approval-one',
+        sessionId: 'abc',
+        title: 'boom'
+      })
     )
   })
 })
@@ -210,17 +222,45 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({
+      command: 'rm -rf /',
+      description: 'dangerous',
+      requestId: 'approval-second',
+      sessionId: 'bg'
+    })
 
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approve', 'approval-second')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'approval-second',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
     await respondToApprovalAction('bg', 'reject')
     expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+  })
+
+  it('uses the notification request ID and does not clear a newer prompt', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      command: 'second command',
+      description: 'newer approval',
+      requestId: 'approval-second',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve', 'approval-first')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'approval-first',
+      session_id: 'bg'
+    })
+    expect($approvalRequest.get()?.requestId).toBe('approval-second')
   })
 
   it('ignores unknown action ids', async () => {

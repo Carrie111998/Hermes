@@ -893,6 +893,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : undefined
 
         setApprovalRequest({
           // false only when a tirith warning forbids it; backend omits the field otherwise.
@@ -902,6 +903,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined,
           command,
           description,
+          requestId,
           sessionId: sessionId ?? null,
           smartDenied: payload?.smart_denied === true
         })
@@ -917,6 +919,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           ],
           body: command || description,
           kind: 'approval',
+          requestId,
           sessionId,
           title: translateNow('notifications.native.approvalTitle')
         })

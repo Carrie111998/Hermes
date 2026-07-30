@@ -219,6 +219,12 @@ The Python gateway can pause the main loop and request structured input:
 
 These are stateful UI branches in `app.tsx`, not separate screens.
 
+`approval.request` carries a stable `request_id` on current gateways. The
+client returns it as `approval.respond { choice, request_id, session_id }`, so
+the selected prompt resolves its exact queue entry when multiple tools are
+waiting at once. If an older gateway omits the ID, the client omits it too and
+the gateway retains its legacy FIFO behavior.
+
 ## Commands
 
 The following commands are handled directly by the TUI client. Unrecognized commands fall through to the Python gateway via `slash.exec` and `command.dispatch`.
@@ -285,7 +291,7 @@ Primary event types the client handles today:
 | `tool.progress`            | `{ name, preview }`                                                         |
 | `tool.complete`            | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }`    |
 | `clarify.request`          | `{ question, choices?, request_id }`                                        |
-| `approval.request`         | `{ command, description, allow_permanent? }`                                |
+| `approval.request`         | `{ command, description, request_id?, allow_permanent? }`                   |
 | `sudo.request`             | `{ request_id }`                                                            |
 | `sudo.expire`              | `{ request_id }` clears a timed-out sudo prompt                             |
 | `secret.request`           | `{ prompt, env_var, request_id }`                                           |

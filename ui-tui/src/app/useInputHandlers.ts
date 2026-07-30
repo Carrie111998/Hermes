@@ -25,7 +25,7 @@ import {
   type InputHandlerResult,
   type OverlayState
 } from './interfaces.js'
-import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
+import { $isBlocked, $overlayState, clearApprovalIfCurrent, patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
 import { getUiState } from './uiStore.js'
@@ -178,9 +178,19 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (overlay.approval) {
+      const requestId = overlay.approval.requestId
+
       return gateway
-        .rpc<ApprovalRespondResponse>('approval.respond', { choice: 'deny', session_id: getUiState().sid })
-        .then(r => r && (patchOverlayState({ approval: null }), patchTurnState({ outcome: 'denied' })))
+        .rpc<ApprovalRespondResponse>('approval.respond', {
+          choice: 'deny',
+          ...(requestId ? { request_id: requestId } : {}),
+          session_id: getUiState().sid
+        })
+        .then(r => {
+          if (r && clearApprovalIfCurrent(requestId)) {
+            patchTurnState({ outcome: 'denied' })
+          }
+        })
     }
 
     if (overlay.sudo || overlay.secret) {

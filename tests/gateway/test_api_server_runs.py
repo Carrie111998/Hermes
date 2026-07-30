@@ -21,6 +21,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _safe_approval_preview,
     cors_middleware,
     security_headers_middleware,
 )
@@ -48,6 +49,25 @@ def test_approval_event_choices_follow_backend_capabilities(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
     ) == expected
+
+
+def test_safe_approval_preview_uses_fixed_copy_and_allowlisted_risk_labels():
+    preview = _safe_approval_preview(
+        {
+            "command": "rm -rf /tmp/private-token-value",
+            "description": "private-token-value",
+            "pattern_keys": ["recursive delete", "private-token-value"],
+        }
+    )
+
+    assert preview == {
+        "version": 1,
+        "category": "terminal_command",
+        "title": "Terminal command approval",
+        "summary": "Hermes stopped a terminal command that matched a protected action.",
+        "risk_labels": ["recursive delete"],
+    }
+    assert "private-token-value" not in repr(preview)
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
@@ -401,6 +421,167 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_approval_response_targets_exact_pending_request(self, adapter):
+        """Answering the second prompt must leave the first prompt pending."""
+        run_id = "run_exact_approval"
+        first = approval_mod._ApprovalEntry(
+            {
+                "command": "rm -rf /tmp/first",
+                "description": "first approval",
+                "request_id": "approval-first",
+            }
+        )
+        second = approval_mod._ApprovalEntry(
+            {
+                "command": "rm -rf /tmp/second",
+                "description": "second approval",
+                "request_id": "approval-second",
+            }
+        )
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._run_streams[run_id] = asyncio.Queue()
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [first, second]
+
+        app = _create_runs_app(adapter)
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                exact = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once", "request_id": "approval-second"},
+                )
+                exact_data = await exact.json()
+
+                assert exact.status == 200
+                assert exact_data["request_id"] == "approval-second"
+                assert exact_data["resolved"] == 1
+                assert second.result == "once"
+                assert second.event.is_set()
+                assert first.result is None
+                assert not first.event.is_set()
+                assert adapter._run_statuses[run_id]["status"] == "waiting_for_approval"
+                with approval_mod._lock:
+                    assert approval_mod._gateway_queues[run_id] == [first]
+
+                responded_event = adapter._run_streams[run_id].get_nowait()
+                assert responded_event["request_id"] == "approval-second"
+
+                stale = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "deny", "request_id": "approval-second"},
+                )
+                stale_data = await stale.json()
+                assert stale.status == 409
+                assert stale_data["error"]["code"] == "approval_request_not_pending"
+                assert first.result is None
+
+                invalid_scope = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={
+                        "choice": "deny",
+                        "request_id": "approval-first",
+                        "resolve_all": True,
+                    },
+                )
+                assert invalid_scope.status == 400
+                assert (await invalid_scope.json())["error"]["code"] == "invalid_approval_scope"
+                assert first.result is None
+
+                legacy = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "deny"},
+                )
+                assert legacy.status == 200
+                assert first.result == "deny"
+                assert first.event.is_set()
+                assert adapter._run_statuses[run_id]["status"] == "running"
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._run_approval_sessions.pop(run_id, None)
+            adapter._run_streams.pop(run_id, None)
+            adapter._run_statuses.pop(run_id, None)
+
+    def test_new_approval_notification_wins_status_race(self, adapter, monkeypatch):
+        """A newer wait must remain visible after an older response refresh."""
+        run_id = "run_approval_status_race"
+        entered_queue_sample = threading.Event()
+        release_queue_sample = threading.Event()
+
+        def no_pending_yet(_session_key):
+            entered_queue_sample.set()
+            assert release_queue_sample.wait(timeout=3)
+            return False
+
+        monkeypatch.setattr(approval_mod, "has_blocking_approval", no_pending_yet)
+        refresh = threading.Thread(
+            target=adapter._refresh_run_status_after_approval,
+            args=(run_id, run_id),
+        )
+        refresh.start()
+        assert entered_queue_sample.wait(timeout=3)
+
+        newer_wait = threading.Thread(
+            target=adapter._mark_run_waiting_for_approval,
+            args=(run_id,),
+        )
+        newer_wait.start()
+        release_queue_sample.set()
+        refresh.join(timeout=3)
+        newer_wait.join(timeout=3)
+
+        assert not refresh.is_alive()
+        assert not newer_wait.is_alive()
+        assert adapter._run_statuses[run_id]["status"] == "waiting_for_approval"
+        assert adapter._run_statuses[run_id]["last_event"] == "approval.request"
+        adapter._run_statuses.pop(run_id, None)
+
+    def test_new_approval_notification_wins_tool_progress_status_race(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        """An older progress callback must not overwrite a newer approval wait."""
+        run_id = "run_approval_progress_status_race"
+        entered_progress_write = threading.Event()
+        release_progress_write = threading.Event()
+        original_set_status = adapter._set_run_status
+
+        def blocking_set_status(run_id_arg, status, **fields):
+            if fields.get("last_event") == "tool.started":
+                entered_progress_write.set()
+                assert release_progress_write.wait(timeout=3)
+            return original_set_status(run_id_arg, status, **fields)
+
+        adapter._set_run_status(run_id, "running")
+        monkeypatch.setattr(adapter, "_set_run_status", blocking_set_status)
+        progress_callback = adapter._make_run_event_callback(run_id, MagicMock())
+
+        progress = threading.Thread(
+            target=progress_callback,
+            args=("tool.started",),
+            kwargs={"tool_name": "terminal"},
+        )
+        progress.start()
+        assert entered_progress_write.wait(timeout=3)
+
+        newer_wait = threading.Thread(
+            target=adapter._mark_run_waiting_for_approval,
+            args=(run_id,),
+        )
+        newer_wait.start()
+        release_progress_write.set()
+        progress.join(timeout=3)
+        newer_wait.join(timeout=3)
+
+        assert not progress.is_alive()
+        assert not newer_wait.is_alive()
+        assert adapter._run_statuses[run_id]["status"] == "waiting_for_approval"
+        assert adapter._run_statuses[run_id]["last_event"] == "approval.request"
+        adapter._run_statuses.pop(run_id, None)
 
 
 # ---------------------------------------------------------------------------
