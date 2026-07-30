@@ -56,10 +56,11 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from utils import env_int
 
@@ -229,6 +230,14 @@ def _index_path(store: Path, dir_hash: str) -> Path:
 # a still-running call, which is what makes reclaiming it safe.
 _MAX_GIT_CALL_SECONDS: int = _GIT_TIMEOUT * 3
 
+def _ref_name(dir_hash: str) -> str:
+    return f"{_REFS_PREFIX}/{dir_hash}"
+
+
+def _project_meta_path(store: Path, dir_hash: str) -> Path:
+    return store / _PROJECTS_DIRNAME / f"{dir_hash}.json"
+
+
 # Git names the exact lock file it could not create, in single quotes, for
 # every lock class — the index ("Unable to create '<path>/index.lock': File
 # exists") and refs ("cannot lock ref 'refs/...': Unable to create
@@ -249,6 +258,39 @@ def _index_lock_path(index_file: Optional[Path], store: Path) -> Path:
     if index_file is not None:
         return index_file.with_name(index_file.name + ".lock")
     return store / "index.lock"
+
+
+# Git subcommands that take the index lock. Anything not listed (gc, reflog,
+# for-each-ref, rev-list, log, cat-file, ...) either takes no lock or takes one
+# we do not try to predict — those heal through the stderr-driven recovery
+# path instead of a guess.
+_INDEX_LOCKING_GIT_COMMANDS = frozenset({
+    "add", "read-tree", "commit", "checkout", "reset", "rm", "mv", "apply",
+})
+
+
+def _lock_for_timed_out_command(
+    args: Sequence[str], store: Path, index_file: Optional[Path],
+) -> Optional[Path]:
+    """The lock *this* command would have been holding, or None if unknown.
+
+    The timeout handler must not guess. ``update-ref`` takes a ref lock and
+    passes no ``index_file``, so assuming the index would both miss its real
+    lock and put an unrelated root-index lock at risk. Returning None simply
+    defers to the recovery path, which reads the lock's path out of git's own
+    error on the next call.
+    """
+    if not args:
+        return None
+    command = args[0]
+    if command in _INDEX_LOCKING_GIT_COMMANDS:
+        return _index_lock_path(index_file, store)
+    if command == "update-ref":
+        for arg in args[1:]:
+            if arg.startswith("-"):
+                continue
+            return store / f"{arg}.lock" if arg.startswith("refs/") else None
+    return None
 
 
 def _reclaimable_locks_from_stderr(stderr: str, store: Path) -> List[Path]:
@@ -278,11 +320,30 @@ def _reclaimable_locks_from_stderr(stderr: str, store: Path) -> List[Path]:
     return found
 
 
+def _restore_claimed_lock(claim: Path, lock_path: Path) -> None:
+    """Put a wrongly-claimed lock back without clobbering a newer one."""
+    try:
+        os.link(claim, lock_path)
+    except FileExistsError:
+        pass  # the slot was retaken; the newer lock wins
+    except OSError:
+        try:
+            os.rename(claim, lock_path)
+            return
+        except OSError:
+            pass
+    try:
+        claim.unlink()
+    except OSError:
+        pass
+
+
 def _clear_abandoned_lock(
     lock_path: Optional[Path],
     reason: str,
     *,
     require_stale: bool = True,
+    created_after: Optional[float] = None,
 ) -> bool:
     """Reclaim a git ``.lock`` left behind by a process that is gone.
 
@@ -294,25 +355,41 @@ def _clear_abandoned_lock(
     instantly with "File exists", for the rest of the session *and every
     future session*, until a human deletes it (#74108).
 
-    ``require_stale`` keeps this safe under concurrency. Checkpoint git calls
-    are all bounded by ``_GIT_TIMEOUT`` (at most ``_MAX_GIT_CALL_SECONDS``
-    with the largest caller multiplier), so a lock whose mtime is older than
-    that window provably belongs to no live call. Callers that already know
-    the owning child is dead — the timeout handler, which has just reaped it —
-    pass ``require_stale=False``.
+    Two independent guards decide whether a lock may be taken, and the
+    caller picks which one applies:
+
+    * ``require_stale`` — the lock's mtime is older than
+      ``_MAX_GIT_CALL_SECONDS``. Every checkpoint git call is bounded by
+      ``_GIT_TIMEOUT`` times the largest caller multiplier, so nothing older
+      than that window can belong to a running call. Used by the recovery
+      path, which knows nothing about who created the lock.
+    * ``created_after`` — the lock's mtime falls inside the window of a call
+      whose child we have already reaped. Used by the timeout path: our own
+      child is dead, but a lock that predates our launch is somebody else's
+      and must not be touched.
+
+    Whichever guard applies, the removal itself is done by *claiming* the
+    lock with an atomic rename and then verifying identity. Between judging a
+    lock and unlinking it by name, another session can finish its own
+    recovery and a fresh git can create a new lock at the same pathname;
+    unlinking by name would delete that live lock. ``rename()`` moves one
+    specific directory entry in a single syscall, and comparing
+    ``(st_dev, st_ino, st_mtime_ns)`` afterwards proves we claimed the inode
+    we judged. A mismatch means we caught a replacement, which is put back.
 
     Returns True when a lock was removed.
     """
     if lock_path is None:
         return False
     try:
-        age = time.time() - lock_path.stat().st_mtime
+        judged = lock_path.stat()
     except FileNotFoundError:
         return False
     except OSError as exc:
         logger.debug("Cannot stat checkpoint lock %s: %s", lock_path, exc)
         return False
 
+    age = time.time() - judged.st_mtime
     if require_stale and age < _MAX_GIT_CALL_SECONDS:
         logger.debug(
             "Checkpoint lock %s is %.1fs old — younger than the %ds bound on "
@@ -320,14 +397,45 @@ def _clear_abandoned_lock(
             lock_path, age, _MAX_GIT_CALL_SECONDS,
         )
         return False
+    if created_after is not None and judged.st_mtime < created_after:
+        logger.debug(
+            "Checkpoint lock %s predates this call (%.1fs before it started) "
+            "— it belongs to another process; leaving it.",
+            lock_path, created_after - judged.st_mtime,
+        )
+        return False
 
+    claim = lock_path.with_name(f"{lock_path.name}.reclaim-{uuid.uuid4().hex[:8]}")
     try:
-        lock_path.unlink()
+        os.rename(lock_path, claim)
     except FileNotFoundError:
         return False
     except OSError as exc:
         logger.warning(
-            "Could not remove abandoned checkpoint lock %s: %s", lock_path, exc,
+            "Could not claim abandoned checkpoint lock %s: %s", lock_path, exc,
+        )
+        return False
+
+    try:
+        claimed = claim.stat()
+    except OSError:
+        _restore_claimed_lock(claim, lock_path)
+        return False
+    if (claimed.st_dev, claimed.st_ino, claimed.st_mtime_ns) != (
+        judged.st_dev, judged.st_ino, judged.st_mtime_ns
+    ):
+        logger.debug(
+            "Checkpoint lock %s was replaced while being reclaimed — putting "
+            "the live lock back.", lock_path,
+        )
+        _restore_claimed_lock(claim, lock_path)
+        return False
+
+    try:
+        claim.unlink()
+    except OSError as exc:
+        logger.warning(
+            "Could not remove claimed checkpoint lock %s: %s", claim, exc,
         )
         return False
 
@@ -338,18 +446,6 @@ def _clear_abandoned_lock(
     )
     return True
 
-
-def _ref_name(dir_hash: str) -> str:
-    return f"{_REFS_PREFIX}/{dir_hash}"
-
-
-def _project_meta_path(store: Path, dir_hash: str) -> Path:
-    return store / _PROJECTS_DIRNAME / f"{dir_hash}.json"
-
-
-# ---------------------------------------------------------------------------
-# Git env
-# ---------------------------------------------------------------------------
 
 def _git_env(
     store: Path,
@@ -446,6 +542,7 @@ def _run_git(
     cmd = ["git"] + list(args)
     allowed_returncodes = allowed_returncodes or set()
 
+    _started_at = time.time()
     try:
         result = subprocess.run(
             cmd,
@@ -487,12 +584,16 @@ def _run_git(
     except subprocess.TimeoutExpired:
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
         logger.error(msg, exc_info=True)
-        # subprocess.run has already killed and reaped the child, so any lock
-        # it created is abandoned by definition — no staleness check needed.
+        # subprocess.run has already killed and reaped the child, so a lock
+        # *this* command created is abandoned by definition. Only the lock
+        # this specific command takes is eligible, and only if it appeared
+        # after we launched — a lock predating the call belongs to somebody
+        # else and must survive.
         _clear_abandoned_lock(
-            _index_lock_path(index_file, store),
+            _lock_for_timed_out_command(args, store, index_file),
             f"owning git timed out after {timeout}s",
             require_stale=False,
+            created_after=_started_at,
         )
         return False, "", msg
     except FileNotFoundError as exc:
