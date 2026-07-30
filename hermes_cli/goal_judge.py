@@ -464,18 +464,9 @@ def evaluate_turn(
     trend = _detect_progress_trend(scratchpad.history)
 
     try:
-        from agent.auxiliary_client import get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:
         logger.debug("goal judge: auxiliary client import failed: %s", exc)
-        return JudgeVerdict.default_continue()
-
-    try:
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception as exc:
-        logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
-        return JudgeVerdict.default_continue()
-
-    if client is None or not model:
         return JudgeVerdict.default_continue()
 
     tools_summary = _summarize_tools(tool_calls or [])
@@ -497,8 +488,8 @@ def evaluate_turn(
         prompt += "\n\n[PRE-DETECTED: Progress trend is REGRESSING. Consider pivot_strategy.]"
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        resp = call_llm(
+            task="goal_judge",
             messages=[
                 {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},

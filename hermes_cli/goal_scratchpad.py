@@ -419,13 +419,16 @@ class GoalScratchpad:
         return artifact
 
     def verify_artifact(self, path: str) -> bool:
-        """Mark an artifact as verified. Returns True if found."""
+        """Mark an artifact as verified. Returns True if the file exists on disk."""
+        import os
+        path_expanded = os.path.abspath(os.path.expanduser(path))
+        exists = os.path.isfile(path_expanded)
         for a in self.artifacts:
             if a.path == path:
-                a.verified = True
-                a.verified_at = time.time()
+                a.verified = exists
+                a.verified_at = time.time() if exists else 0.0
                 self.touch()
-                return True
+                return exists
         return False
 
     def add_decision(self, context: str, choice: str, why: str = "", at_turn: int = 0) -> Decision:
