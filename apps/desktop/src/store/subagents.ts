@@ -48,7 +48,17 @@ const MAX_STREAM = 24
 const PREVIEW_MAX = 220
 const TOOL_PREVIEW_MAX = 96
 
+export interface ActiveSubagentResponse {
+  active?: SubagentPayload[]
+}
+
 export const $subagentsBySession = atom<Record<string, SubagentProgress[]>>({})
+
+// Rows learned from the gateway's authoritative active-registry snapshot,
+// scoped per profile. Event-stream rows remain owned by their events; tracking
+// only snapshot-owned ids prevents one profile's empty response from reaping a
+// different profile's live agents.
+const activeSnapshotRowsByProfile = new Map<string, Map<string, string>>()
 
 const isStr = (v: unknown): v is string => typeof v === 'string'
 const str = (v: unknown) => (isStr(v) ? v : '')
@@ -163,7 +173,7 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
     taskIndex: num(payload.task_index) ?? prev?.taskIndex ?? 0,
-    startedAt: prev?.startedAt ?? at,
+    startedAt: prev?.startedAt ?? ((num(payload.started_at) ?? 0) * 1000 || at),
     updatedAt: at,
     durationSeconds: num(payload.duration_seconds) ?? prev?.durationSeconds,
     costUsd: num(payload.cost_usd) ?? prev?.costUsd,
@@ -255,6 +265,69 @@ export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMi
   const nextList = idx >= 0 ? list.map(item => (item.id === id ? next : item)) : [...list, next]
 
   $subagentsBySession.set({ ...map, [sid]: nextList })
+}
+
+/**
+ * Reconcile the renderer's event cache with the gateway's active child
+ * registry. WebSocket lifecycle events are intentionally low-latency but are
+ * not replayable, so a reconnect or a subscriber race can miss the only
+ * `subagent.spawn_requested` event. The snapshot restores those rows and is
+ * authoritative about the disappearance of rows it reported previously.
+ *
+ * Older gateways omit `origin_ui_session_id`; those rows cannot be attributed
+ * safely and are ignored rather than leaking another chat's agent into the
+ * current session.
+ */
+export function reconcileActiveSubagents(response: ActiveSubagentResponse, profileKey = 'default') {
+  const previous = activeSnapshotRowsByProfile.get(profileKey) ?? new Map<string, string>()
+  const current = new Map<string, string>()
+
+  for (const payload of response.active ?? []) {
+    const sid = str(payload.origin_ui_session_id).trim()
+    const id = str(payload.subagent_id).trim()
+    const payloadProfile = str(payload.profile).trim()
+
+    if (!sid || !id || (payloadProfile && payloadProfile !== profileKey)) {
+      continue
+    }
+
+    current.set(id, sid)
+
+    const existing = ($subagentsBySession.get()[sid] ?? []).find(item => item.id === id)
+
+    if (!existing) {
+      upsertSubagent(sid, payload, true, 'subagent.snapshot')
+      pruneDelegateFallbackSubagents(sid)
+    } else if (existing.status === 'queued') {
+      // The snapshot proves the child reached its running registry, but its
+      // static record does not track the richer per-event tool counter. Promote
+      // queued -> running without clobbering event-owned timestamps/metadata.
+      upsertSubagent(
+        sid,
+        { ...payload, started_at: undefined, tool_count: undefined },
+        true,
+        'subagent.snapshot'
+      )
+    }
+  }
+
+  for (const [id, sid] of previous) {
+    if (current.has(id)) {
+      continue
+    }
+
+    const map = $subagentsBySession.get()
+    const list = map[sid]
+
+    if (!list?.some(item => item.id === id && !TERMINAL.has(item.status))) {
+      continue
+    }
+
+    const next = list.filter(item => item.id !== id || TERMINAL.has(item.status))
+    $subagentsBySession.set({ ...map, [sid]: next })
+  }
+
+  activeSnapshotRowsByProfile.set(profileKey, current)
 }
 
 export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentNode[] {

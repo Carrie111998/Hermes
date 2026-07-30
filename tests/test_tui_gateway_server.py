@@ -14253,6 +14253,70 @@ def test_get_usage_safe_when_active_count_raises(monkeypatch):
     assert usage["model"] == "x"
 
 
+def test_delegation_status_filters_active_children_to_requested_profile(tmp_path, monkeypatch):
+    from tools.delegate_tool import _register_subagent, _unregister_subagent
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    monkeypatch.setattr(
+        server,
+        "_profile_scope_home",
+        lambda profile: profile_a if profile == "profile-a" else profile_b,
+    )
+    _register_subagent(
+        {
+            "subagent_id": "sa-rpc-profile-a",
+            "goal": "profile a private goal",
+            "status": "running",
+            "_profile_home": str(profile_a),
+        }
+    )
+    _register_subagent(
+        {
+            "subagent_id": "sa-rpc-profile-b",
+            "goal": "profile b private goal",
+            "status": "running",
+            "_profile_home": str(profile_b),
+        }
+    )
+
+    try:
+        response = server.dispatch(
+            {
+                "id": "profile-a-status",
+                "jsonrpc": "2.0",
+                "method": "delegation.status",
+                "params": {"profile": "profile-a"},
+            }
+        )
+    finally:
+        _unregister_subagent("sa-rpc-profile-a")
+        _unregister_subagent("sa-rpc-profile-b")
+
+    rows = response["result"]["active"]
+    assert [row["subagent_id"] for row in rows] == ["sa-rpc-profile-a"]
+    assert rows[0]["profile"] == "profile-a"
+    assert "_profile_home" not in rows[0]
+
+
+def test_delegation_status_rejects_unknown_profile_instead_of_falling_back(monkeypatch):
+    monkeypatch.setattr(server, "_profile_scope_home", lambda _profile: None)
+
+    response = server.dispatch(
+        {
+            "id": "missing-profile-status",
+            "jsonrpc": "2.0",
+            "method": "delegation.status",
+            "params": {"profile": "does-not-exist"},
+        }
+    )
+
+    assert response["error"]["code"] == 4040
+    assert response["error"]["message"] == "profile not found"
+
+
 def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch):
     """#48305: switching models from the TUI must NOT destroy sibling keys under
     `model:` (model_slots, model_fallback, etc.). _persist_model_switch now uses

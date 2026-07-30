@@ -11,6 +11,7 @@ import {
   SESSION_WATCHDOG_TIMEOUT_MS,
   setSessionStalled
 } from '@/store/session-states'
+import { type ActiveSubagentResponse, reconcileActiveSubagents } from '@/store/subagents'
 
 import type { GatewayRequester } from '../types'
 
@@ -36,6 +37,10 @@ const LIVE_SESSION_STATUS_POLL_INTERVAL_MS = 1_500
 // the interval only covers the degraded-socket edge the stream can't replay
 // (see rehydrateLiveSessionStatuses) — 30s is plenty for that.
 const LIVE_SESSION_STATUS_BACKSTOP_INTERVAL_MS = 30_000
+// Subagent lifecycle events are low-latency but intentionally not replayed.
+// Poll the tiny active registry often enough that a reconnect/subscriber race
+// cannot leave a real background child invisible for more than a few seconds.
+const ACTIVE_SUBAGENT_STATUS_POLL_INTERVAL_MS = 3_000
 // Coalesce tick-driven sidebar list refreshes: sessions.changed fires (floored
 // to 2s server-side) on every state.db write during a streaming turn, and the
 // full list refresh is heavier than the active_list snapshot. Trailing-edge
@@ -295,6 +300,49 @@ export function useBackgroundSync({
     // sessionsChangeTick: each sessions.changed broadcast re-seeds immediately
     // via the effect re-run (already coalesced to 2s server-side).
   }, [activeGatewayProfile, changeEventsAvailable, gatewayState, requestGateway, sessionsChangeTick])
+
+  // Reconcile live subagents from backend truth. The event stream normally
+  // paints immediately; this snapshot is the recovery path for reconnects and
+  // the `hermes serve` subscriber race tracked in #72287.
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    let cancelled = false
+    let inFlight = false
+
+    const refreshActiveSubagents = async () => {
+      if (inFlight) {
+        return
+      }
+
+      inFlight = true
+
+      try {
+        const response = await requestGateway<ActiveSubagentResponse>('delegation.status', {
+          profile: activeGatewayProfile
+        })
+
+        if (!cancelled) {
+          reconcileActiveSubagents(response, activeGatewayProfile)
+        }
+      } catch {
+        // Older/incompatible gateways keep the existing event-driven behavior.
+      } finally {
+        inFlight = false
+      }
+    }
+
+    const dispose = visiblePoll(ACTIVE_SUBAGENT_STATUS_POLL_INTERVAL_MS, () => void refreshActiveSubagents())
+
+    void refreshActiveSubagents()
+
+    return () => {
+      cancelled = true
+      dispose()
+    }
+  }, [activeGatewayProfile, gatewayState, requestGateway])
 
   // sessions.changed also means the *stored* list may have new rows (a cron
   // run's session, an inbound messaging turn creating a thread). The full list

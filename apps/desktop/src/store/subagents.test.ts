@@ -9,6 +9,7 @@ import {
   failedSubagentCount,
   pruneDelegateFallbackSubagents,
   pruneFinishedSessionSubagents,
+  reconcileActiveSubagents,
   upsertSubagent
 } from './subagents'
 
@@ -189,5 +190,207 @@ describe('subagent store', () => {
         .map(item => item.id)
         .sort()
     ).toEqual(['c', 'd'])
+  })
+
+  it('rehydrates active subagents from an authoritative gateway snapshot', () => {
+    upsertSubagent('runtime-a', {
+      goal: 'stale after reconnect',
+      status: 'running',
+      subagent_id: 'stale',
+      task_index: 0
+    })
+
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'live after reconnect',
+            model: 'test/model',
+            origin_ui_session_id: 'runtime-b',
+            parent_id: null,
+            started_at: 1_800_000_000,
+            status: 'running',
+            subagent_id: 'live',
+            tool_count: 3
+          }
+        ]
+      },
+      'default'
+    )
+
+    expect(listFor('runtime-a').map(item => item.id)).toEqual(['stale'])
+    expect(listFor('runtime-b')).toEqual([
+      expect.objectContaining({
+        goal: 'live after reconnect',
+        id: 'live',
+        model: 'test/model',
+        startedAt: 1_800_000_000_000,
+        status: 'running',
+        toolCount: 3
+      })
+    ])
+  })
+
+  it('reaps snapshot-owned rows when the backend no longer reports them active', () => {
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'live',
+            origin_ui_session_id: 'runtime-a',
+            status: 'running',
+            subagent_id: 'live'
+          }
+        ]
+      },
+      'default'
+    )
+    upsertSubagent('runtime-a', { goal: 'done', status: 'completed', subagent_id: 'done', task_index: 1 })
+
+    reconcileActiveSubagents({ active: [] }, 'default')
+
+    expect(listFor('runtime-a').map(item => item.id)).toEqual(['done'])
+  })
+
+  it('ignores unscoped snapshots from older backends', () => {
+    reconcileActiveSubagents(
+      { active: [{ goal: 'ambiguous', status: 'running', subagent_id: 'old-backend' }] },
+      'default'
+    )
+
+    expect($subagentsBySession.get()).toEqual({})
+  })
+
+  it('ignores a snapshot row attributed to another profile', () => {
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'wrong profile',
+            origin_ui_session_id: 'runtime-a',
+            profile: 'profile-b',
+            status: 'running',
+            subagent_id: 'wrong-profile'
+          }
+        ]
+      },
+      'profile-a'
+    )
+
+    expect($subagentsBySession.get()).toEqual({})
+  })
+
+  it('does not clobber richer event metadata with an unchanged active snapshot', () => {
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(2_000_000)
+
+    upsertSubagent('runtime-a', {
+      goal: 'live',
+      model: 'test/model',
+      status: 'running',
+      subagent_id: 'live',
+      task_index: 0,
+      tool_count: 9
+    })
+
+    const beforeMap = $subagentsBySession.get()
+    const beforeItem = listFor('runtime-a')[0]
+
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'live',
+            model: 'test/model',
+            origin_ui_session_id: 'runtime-a',
+            started_at: 1_000,
+            status: 'running',
+            subagent_id: 'live',
+            tool_count: 0
+          }
+        ]
+      },
+      'no-clobber-test'
+    )
+
+    expect($subagentsBySession.get()).toBe(beforeMap)
+    expect(listFor('runtime-a')[0]).toBe(beforeItem)
+    expect(beforeItem?.startedAt).toBe(2_000_000)
+    expect(beforeItem?.toolCount).toBe(9)
+
+    nowSpy.mockRestore()
+  })
+
+  it('reaps only rows owned by the profile whose snapshot changed', () => {
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'profile a',
+            origin_ui_session_id: 'runtime-a',
+            status: 'running',
+            subagent_id: 'profile-a-agent'
+          }
+        ]
+      },
+      'profile-a-test'
+    )
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'profile b',
+            origin_ui_session_id: 'runtime-b',
+            status: 'running',
+            subagent_id: 'profile-b-agent'
+          }
+        ]
+      },
+      'profile-b-test'
+    )
+
+    reconcileActiveSubagents({ active: [] }, 'profile-a-test')
+
+    expect(listFor('runtime-a')).toEqual([])
+    expect(listFor('runtime-b').map(item => item.id)).toEqual(['profile-b-agent'])
+  })
+
+  it('promotes a queued event row without replacing its richer metadata', () => {
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(3_000_000)
+
+    upsertSubagent('runtime-a', {
+      goal: 'queued',
+      status: 'queued',
+      subagent_id: 'queued-agent',
+      task_index: 2,
+      tool_count: 4
+    })
+
+    reconcileActiveSubagents(
+      {
+        active: [
+          {
+            goal: 'queued',
+            origin_ui_session_id: 'runtime-a',
+            started_at: 1_000,
+            status: 'running',
+            subagent_id: 'queued-agent',
+            tool_count: 0
+          }
+        ]
+      },
+      'queued-promotion-test'
+    )
+
+    expect(listFor('runtime-a')[0]).toEqual(
+      expect.objectContaining({
+        id: 'queued-agent',
+        startedAt: 3_000_000,
+        status: 'running',
+        taskIndex: 2,
+        toolCount: 4
+      })
+    )
+
+    nowSpy.mockRestore()
   })
 })

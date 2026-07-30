@@ -2726,10 +2726,18 @@ def _(rid, params: dict) -> dict:
         _get_max_spawn_depth,
     )
 
+    requested_profile = str(params.get("profile") or "").strip()
+    profile_home = _profile_scope_home(requested_profile)
+    if profile_home is None:
+        return _err(rid, 4040, "profile not found")
+    rows = list_active_subagents(profile_home=str(profile_home))
+    for row in rows:
+        row["profile"] = requested_profile or "default"
+
     return _ok(
         rid,
         {
-            "active": list_active_subagents(),
+            "active": rows,
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),
@@ -2752,7 +2760,10 @@ def _(rid, params: dict) -> dict:
     subagent_id = str(params.get("subagent_id") or "").strip()
     if not subagent_id:
         return _err(rid, 4000, "subagent_id required")
-    ok = interrupt_subagent(subagent_id)
+    profile_home = _profile_scope_home(str(params.get("profile") or "").strip())
+    if profile_home is None:
+        return _err(rid, 4040, "profile not found")
+    ok = interrupt_subagent(subagent_id, profile_home=str(profile_home))
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 

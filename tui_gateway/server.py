@@ -1213,21 +1213,34 @@ def _db_unavailable_error(rid, *, code: int):
 # (a ContextVar override) for the duration of the call so config/skills/model and
 # message persistence all resolve to the right profile. Omitted/own profile → the
 # launch profile (unchanged for single-profile and per-profile-remote setups).
-def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
+def _profile_scope_home(profile: str | None) -> Path | None:
+    """Resolve a requested profile to its canonical home, including launch.
+
+    ``None`` means an explicitly named profile was invalid. An omitted profile
+    resolves to the launch home so profile-owned registries can always filter
+    fail-closed rather than treating an unknown name as the launch profile.
+    """
     name = (profile or "").strip()
     if not name:
-        return None
+        return Path(_hermes_home)
     try:
         from hermes_cli import profiles as profiles_mod
 
         home = Path(profiles_mod.get_profile_dir(name))
     except Exception:
         return None
-    # Already the launch profile? No override needed.
+    # The launch profile is a valid scope, but needs no HERMES_HOME override.
     if home.resolve() == Path(_hermes_home).resolve():
-        return None
+        return Path(_hermes_home)
     return home if (home / "state.db").exists() or home.exists() else None
+
+
+def _profile_home(profile: str | None) -> Path | None:
+    """Resolve a foreign profile home, or None for launch/invalid (legacy API)."""
+    home = _profile_scope_home(profile)
+    if home is None or home.resolve() == Path(_hermes_home).resolve():
+        return None
+    return home
 
 
 def _profile_scoped(handler):

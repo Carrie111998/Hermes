@@ -1,3 +1,4 @@
+import { renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -7,8 +8,9 @@ import {
   clearAllSessionStates,
   SESSION_WATCHDOG_TIMEOUT_MS
 } from '@/store/session-states'
+import { $subagentsBySession } from '@/store/subagents'
 
-import { rehydrateLiveSessionStatuses } from './use-background-sync'
+import { rehydrateLiveSessionStatuses, useBackgroundSync } from './use-background-sync'
 
 describe('rehydrateLiveSessionStatuses', () => {
   beforeEach(() => {
@@ -71,5 +73,60 @@ describe('rehydrateLiveSessionStatuses', () => {
     expect($workingSessionIds.get()).toEqual([])
     expect($attentionSessionIds.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])
+  })
+})
+
+describe('useBackgroundSync subagent reconciliation', () => {
+  afterEach(() => {
+    $subagentsBySession.set({})
+  })
+
+  it('requests and applies the active subagent snapshot when the gateway opens', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.active_list') {
+        return { sessions: [] }
+      }
+
+      if (method === 'delegation.status') {
+        return {
+          active: [
+            {
+              goal: 'visible after reconnect',
+              origin_ui_session_id: 'runtime-reconnected',
+              status: 'running',
+              subagent_id: 'sa-reconnected'
+            }
+          ]
+        }
+      }
+
+      return {}
+    })
+
+    const refresh = vi.fn(async () => undefined)
+
+    const { unmount } = renderHook(() =>
+      useBackgroundSync({
+        activeGatewayProfile: 'reconnect-test',
+        activeIsMessaging: false,
+        activeSessionId: null,
+        freshDraftReady: false,
+        gatewayState: 'open',
+        refreshActiveMessagingTranscript: refresh,
+        refreshCronJobs: refresh,
+        refreshCurrentModel: refresh,
+        refreshHermesConfig: refresh,
+        refreshMessagingSessions: refresh,
+        refreshSessions: refresh,
+        requestGateway: requestGateway as never
+      })
+    )
+
+    await waitFor(() => {
+      expect(requestGateway).toHaveBeenCalledWith('delegation.status', { profile: 'reconnect-test' })
+      expect($subagentsBySession.get()['runtime-reconnected']?.[0]?.id).toBe('sa-reconnected')
+    })
+
+    unmount()
   })
 })

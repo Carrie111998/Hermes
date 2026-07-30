@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+from pathlib import Path
 import threading
 import time
 import types
@@ -340,6 +341,183 @@ class TestToolNamePreservation(unittest.TestCase):
 
 class TestDelegateObservability(unittest.TestCase):
     """Tests for enriched metadata returned by _run_single_child."""
+
+    def test_active_registry_record_identifies_owning_ui_session(self):
+        """A reconnect snapshot must be routable back to its Desktop session."""
+        from tools.delegate_tool import _run_single_child
+
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "stored-parent"
+        child = MagicMock()
+        child._subagent_id = "sa-0-test"
+        child._delegate_depth = 1
+        child._parent_subagent_id = None
+        child._credential_pool = None
+        child._delegate_saved_tool_names = []
+        child.model = "test/model"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        with (
+            patch("gateway.session_context.get_session_env", return_value="runtime-parent"),
+            patch("hermes_constants.get_hermes_home", return_value=Path("/profiles/current")),
+            patch("tools.delegate_tool._register_subagent") as register,
+            patch("tools.delegate_tool._unregister_subagent"),
+        ):
+            _run_single_child(0, "inspect", child, parent)
+
+        record = register.call_args.args[0]
+        self.assertEqual(record["origin_ui_session_id"], "runtime-parent")
+        self.assertEqual(record["parent_session_id"], "stored-parent")
+        self.assertEqual(record["_profile_home"], "/profiles/current")
+
+    def test_live_registry_snapshot_retains_owner_across_worker_thread(self):
+        """The real async context bridge must preserve the UI return address."""
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.delegate_tool import _run_single_child, list_active_subagents
+        from tools.thread_context import propagate_context_to_thread
+
+        entered = threading.Event()
+        release = threading.Event()
+        parent = _make_mock_parent(depth=0)
+        parent.session_id = "stored-parent-live"
+        child = MagicMock()
+        child._subagent_id = "sa-live-owner-test"
+        child._delegate_depth = 1
+        child._parent_subagent_id = None
+        child._credential_pool = None
+        child._delegate_saved_tool_names = []
+        child.model = "test/model"
+        child.session_prompt_tokens = 0
+        child.session_completion_tokens = 0
+        child.session_estimated_cost_usd = 0.0
+
+        def run_child(**_kwargs):
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return {
+                "final_response": "done",
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+                "messages": [],
+            }
+
+        child.run_conversation.side_effect = run_child
+        session_tokens = set_session_vars(ui_session_id="runtime-parent-live")
+        worker = threading.Thread(
+            target=propagate_context_to_thread(
+                lambda: _run_single_child(0, "inspect live", child, parent)
+            )
+        )
+
+        try:
+            worker.start()
+            self.assertTrue(entered.wait(timeout=5))
+            from hermes_constants import get_hermes_home
+
+            rows = {
+                row["subagent_id"]: row
+                for row in list_active_subagents(
+                    profile_home=str(get_hermes_home())
+                )
+            }
+            record = rows["sa-live-owner-test"]
+            self.assertEqual(record["origin_ui_session_id"], "runtime-parent-live")
+            self.assertEqual(record["parent_session_id"], "stored-parent-live")
+        finally:
+            release.set()
+            worker.join(timeout=5)
+            clear_session_vars(session_tokens)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn(
+            "sa-live-owner-test",
+            {row["subagent_id"] for row in list_active_subagents()},
+        )
+
+    def test_active_registry_snapshot_is_profile_scoped_and_hides_internal_home(self):
+        from tools.delegate_tool import (
+            _register_subagent,
+            _unregister_subagent,
+            list_active_subagents,
+        )
+
+        _register_subagent(
+            {
+                "subagent_id": "sa-profile-a",
+                "goal": "private a",
+                "status": "running",
+                "_profile_home": "/profiles/a",
+            }
+        )
+        _register_subagent(
+            {
+                "subagent_id": "sa-profile-b",
+                "goal": "private b",
+                "status": "running",
+                "_profile_home": "/profiles/b",
+            }
+        )
+
+        try:
+            rows = list_active_subagents(profile_home="/profiles/a")
+            empty_scope_rows = list_active_subagents(profile_home="")
+        finally:
+            _unregister_subagent("sa-profile-a")
+            _unregister_subagent("sa-profile-b")
+
+        self.assertEqual([row["subagent_id"] for row in rows], ["sa-profile-a"])
+        self.assertEqual(empty_scope_rows, [])
+        self.assertNotIn("_profile_home", rows[0])
+
+    def test_interrupt_rejects_a_subagent_owned_by_another_profile(self):
+        from tools.delegate_tool import (
+            _register_subagent,
+            _unregister_subagent,
+            interrupt_subagent,
+        )
+
+        agent = MagicMock()
+        _register_subagent(
+            {
+                "subagent_id": "sa-profile-interrupt",
+                "agent": agent,
+                "_profile_home": "/profiles/a",
+            }
+        )
+
+        try:
+            self.assertFalse(
+                interrupt_subagent(
+                    "sa-profile-interrupt",
+                    profile_home="",
+                )
+            )
+            self.assertFalse(
+                interrupt_subagent(
+                    "sa-profile-interrupt",
+                    profile_home="/profiles/b",
+                )
+            )
+            agent.interrupt.assert_not_called()
+            self.assertTrue(
+                interrupt_subagent(
+                    "sa-profile-interrupt",
+                    profile_home="/profiles/a",
+                )
+            )
+            agent.interrupt.assert_called_once()
+        finally:
+            _unregister_subagent("sa-profile-interrupt")
 
     def test_observability_fields_present(self):
         """Completed child should return tool_trace, tokens, model, exit_reason."""

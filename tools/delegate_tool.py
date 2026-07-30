@@ -180,7 +180,22 @@ def _unregister_subagent(subagent_id: str) -> None:
         _active_subagents.pop(subagent_id, None)
 
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def _profile_home_key(profile_home: Any) -> Optional[str]:
+    """Canonical internal key for profile ownership comparisons."""
+    if profile_home is None:
+        return None
+    try:
+        text = os.path.expanduser(os.fspath(profile_home))
+        return os.path.normcase(os.path.realpath(text)) if text else None
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def interrupt_subagent(
+    subagent_id: str,
+    *,
+    profile_home: Optional[str] = None,
+) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
@@ -192,6 +207,12 @@ def interrupt_subagent(subagent_id: str) -> bool:
         record = _active_subagents.get(subagent_id)
     if not record:
         return False
+    requested_profile = _profile_home_key(profile_home)
+    if profile_home is not None:
+        if requested_profile is None or _profile_home_key(
+            record.get("_profile_home")
+        ) != requested_profile:
+            return False
     agent = record.get("agent")
     if agent is None:
         return False
@@ -203,16 +224,26 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
+def list_active_subagents(
+    *,
+    profile_home: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
-    Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
+    Each public record: {subagent_id, parent_id, depth, goal, model,
+    started_at, tool_count, status}. When ``profile_home`` is supplied, records
+    are fail-closed to that canonical profile. Internal ownership fields never
+    leave this function. Safe to call from any thread — returns a copy.
     """
+    requested_profile = _profile_home_key(profile_home)
+    if profile_home is not None and requested_profile is None:
+        return []
     with _active_subagents_lock:
         return [
-            {k: v for k, v in r.items() if k != "agent"}
+            {k: v for k, v in r.items() if k != "agent" and not k.startswith("_")}
             for r in _active_subagents.values()
+            if requested_profile is None
+            or _profile_home_key(r.get("_profile_home")) == requested_profile
         ]
 
 
@@ -2089,12 +2120,39 @@ def _run_single_child(
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
         _parent_sid = getattr(child, "_parent_subagent_id", None)
+        _origin_ui_session_id = ""
+        try:
+            from gateway.session_context import get_session_env
+
+            _origin_ui_session_id = str(
+                get_session_env("HERMES_UI_SESSION_ID", "") or ""
+            )
+        except Exception:
+            pass
+        _raw_parent_session_id = getattr(parent_agent, "session_id", None)
+        try:
+            from hermes_constants import get_hermes_home
+
+            _owner_profile_home = _profile_home_key(get_hermes_home())
+        except Exception:
+            _owner_profile_home = None
         _register_subagent(
             {
                 "subagent_id": _subagent_id,
                 "parent_id": _parent_sid if isinstance(_parent_sid, str) else None,
+                # The active registry is backend-authoritative, but Desktop can
+                # only replay a missed spawn after reconnect when each child is
+                # attributable to the runtime session that owns its event stream.
+                "origin_ui_session_id": _origin_ui_session_id,
+                "parent_session_id": (
+                    _raw_parent_session_id
+                    if isinstance(_raw_parent_session_id, str)
+                    else None
+                ),
+                "_profile_home": _owner_profile_home,
                 "depth": _tui_depth,
                 "goal": goal,
+                "task_index": task_index,
                 "model": (
                     getattr(child, "model", None)
                     if isinstance(getattr(child, "model", None), str)
