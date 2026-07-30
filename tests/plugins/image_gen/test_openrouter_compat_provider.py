@@ -10,7 +10,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 _RUNTIME = "hermes_cli.runtime_provider.resolve_runtime_provider"
-_PNG_DATA_URI = "data:image/png;base64,dGVzdC1pbWFnZS1kYXRh"  # "test-image-data"
+_RAW_B64 = "dGVzdC1pbWFnZS1kYXRh"  # "test-image-data" — raw base64 (no data: URI prefix)
+_PNG_DATA_URI = f"data:image/png;base64,{_RAW_B64}"
 
 
 def _runtime_ok(**over):
@@ -285,7 +286,7 @@ class TestGenerate:
 
     def test_success_data_uri(self):
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_images_api_response([_PNG_DATA_URI])), \
+             patch("requests.post", return_value=_mock_images_api_response([_RAW_B64])), \
              patch(
                  "plugins.image_gen.openrouter.save_b64_image",
                  return_value=Path("/tmp/openrouter_gen.png"),
@@ -295,7 +296,7 @@ class TestGenerate:
         assert result["success"] is True
         assert result["image"] == "/tmp/openrouter_gen.png"
         assert result["provider"] == "openrouter"
-        mock_save.assert_called_once()
+        mock_save.assert_called_once_with(_RAW_B64, prefix="openrouter_gen")
 
     def test_success_http_url(self):
         with patch(_RUNTIME, return_value=_runtime_ok()), \
@@ -325,7 +326,7 @@ class TestGenerate:
         ref.write_bytes(b"\x89PNG\r\n")
 
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_images_api_response([_PNG_DATA_URI])) as mock_post, \
+             patch("requests.post", return_value=_mock_images_api_response([_RAW_B64])) as mock_post, \
              patch("plugins.image_gen.openrouter.save_b64_image", return_value=Path("/tmp/x.png")):
             _openrouter().generate(
                 prompt="a pet", aspect_ratio="square", reference_images=[str(ref)]
@@ -342,7 +343,7 @@ class TestGenerate:
 
     def test_auth_header(self):
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_images_api_response([_PNG_DATA_URI])) as mock_post, \
+             patch("requests.post", return_value=_mock_images_api_response([_RAW_B64])) as mock_post, \
              patch("plugins.image_gen.openrouter.save_b64_image", return_value=Path("/tmp/x.png")):
             _openrouter().generate(prompt="a pet")
 
@@ -352,7 +353,7 @@ class TestGenerate:
     def test_generate_uses_model_kwarg_from_dispatch(self):
         """image_generate passes image_gen.model as a model kwarg — honor it."""
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_images_api_response([_PNG_DATA_URI])) as mock_post, \
+             patch("requests.post", return_value=_mock_images_api_response([_RAW_B64])) as mock_post, \
              patch("plugins.image_gen.openrouter.save_b64_image", return_value=Path("/tmp/x.png")):
             result = _openrouter().generate(prompt="a pet", model="openai/gpt-image-2")
 
@@ -436,7 +437,7 @@ class TestGenerate:
         gated.raise_for_status.side_effect = req_lib.HTTPError(response=gated)
 
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", side_effect=[gated, _mock_images_api_response([_PNG_DATA_URI])]) as mock_post, \
+             patch("requests.post", side_effect=[gated, _mock_images_api_response([_RAW_B64])]) as mock_post, \
              patch(
                  "plugins.image_gen.openrouter.save_b64_image",
                  return_value=Path("/tmp/openrouter_gen_fallback.png"),
@@ -461,15 +462,15 @@ class TestGenerate:
 class TestOpenRouterEndpoint:
     """Verify the dedicated images API endpoint for OpenRouter."""
 
-    def test_posts_to_images_generations(self):
-        """OpenRouter provider must use /images/generations endpoint."""
+    def test_posts_to_images_endpoint(self):
+        """OpenRouter provider must use /api/v1/images endpoint."""
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", return_value=_mock_images_api_response([_PNG_DATA_URI])) as mock_post, \
+             patch("requests.post", return_value=_mock_images_api_response([_RAW_B64])) as mock_post, \
              patch("plugins.image_gen.openrouter.save_b64_image", return_value=Path("/tmp/x.png")):
             _openrouter().generate(prompt="a pet")
 
         url = mock_post.call_args[0][0]
-        assert url == "https://openrouter.ai/api/v1/images/generations"
+        assert url == "https://openrouter.ai/api/v1/images"
 
     def test_extract_images_data_format(self):
         """_extract_images must handle data[].b64_json format."""

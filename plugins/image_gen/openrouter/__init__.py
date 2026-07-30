@@ -356,8 +356,10 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
         }
         last_error: Optional[Dict[str, Any]] = None
         # OpenRouter uses the dedicated images API; other backends (Nous Portal)
-        # use the chat-completions + modalities protocol.
-        is_openrouter = self._name == "openrouter"
+        # use the chat-completions + modalities protocol. Gate on the resolved
+        # hostname so custom OPENROUTER_BASE_URL overrides don't get the new
+        # route without a capability check.
+        is_openrouter = "openrouter.ai" in str(base_url).lower()
         for i, model_id in enumerate(model_chain):
             if is_openrouter:
                 # Dedicated images API: prompt + aspect_ratio + input_references
@@ -373,7 +375,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
                 }
                 if input_refs:
                     payload["input_references"] = input_refs
-                endpoint = "images/generations"
+                endpoint = "images"
             else:
                 # Chat-completions protocol: modalities + messages + image_config
                 content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
