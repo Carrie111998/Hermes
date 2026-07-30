@@ -68,9 +68,33 @@ def _check_kanban_mode() -> bool:
     embedded by default) and orchestrator profiles with the kanban
     toolset enabled see the Kanban lifecycle tool surface.
     """
+    if _current_worker_is_workflow():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
+
+
+def _current_worker_is_workflow() -> bool:
+    """Return whether this process is scoped to a workflow-backed task."""
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id:
+        return False
+    if os.environ.get("HERMES_WORKFLOW_TASK") == task_id:
+        return True
+    conn = None
+    try:
+        kb, conn = _connect()
+        task = kb.get_task(conn, task_id)
+        return bool(task and task.workflow_template_id)
+    except Exception:
+        # The dispatcher-set workflow marker is authoritative when the board
+        # is temporarily unavailable; otherwise fail open for legacy workers.
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _check_kanban_orchestrator_mode() -> bool:

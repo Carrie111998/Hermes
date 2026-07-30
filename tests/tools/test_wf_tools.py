@@ -89,6 +89,22 @@ def test_workflow_tools_visible_for_workflow_task(monkeypatch, workflow_worker):
     assert _definitions(monkeypatch) == TOOL_NAMES
 
 
+def test_raw_kanban_tools_hidden_for_workflow_worker(monkeypatch, workflow_worker):
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    definitions = registry.get_definitions(
+        set(resolve_toolset("kanban")), quiet=True
+    )
+    names = {
+        entry["function"]["name"]
+        for entry in definitions
+        if entry.get("function", {}).get("name", "").startswith("kanban_")
+    }
+    assert names == set()
+
+
 def test_handlers_default_to_owned_task_and_call_engine(monkeypatch, workflow_worker):
     from tools import wf_tools as wt
 

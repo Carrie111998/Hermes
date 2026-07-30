@@ -820,9 +820,18 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
                 "UPDATE wf_instance SET state = 'advancing', parked_since = NULL WHERE task_id = ?",
                 (task_id,),
             )
-            if task["status"] == "blocked":
+            if task["status"] == "running":
+                if not kanban_db.complete_stage_turn(
+                    conn,
+                    task_id,
+                    summary=f"workflow stage {current_step} advanced to {to_step}",
+                ):
+                    raise WorkflowConflictError(
+                        f"cannot close workflow stage turn: {task_id}"
+                    )
+            elif task["status"] == "blocked":
                 _unblock(conn, task_id)
-            elif task["status"] not in {"ready", "running"}:
+            elif task["status"] != "ready":
                 raise WorkflowConflictError(
                     f"cannot advance workflow task from status {task['status']!r}"
                 )
@@ -835,8 +844,47 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
     )
 
 
+def _stage_event(conn, task_id: str, step_key: str) -> sqlite3.Row | None:
+    """Return the structured event that caused the current stage turn.
+
+    A transition is the strongest link because it binds the event to the
+    stage being entered.  The first stage has no transition, so it falls back
+    to the newest event matched to the instance (normally ``create_on``).
+    """
+
+    row = conn.execute(
+        """
+        SELECT e.*
+          FROM wf_transition tr
+          JOIN wf_event e ON e.id = tr.event_id
+         WHERE tr.task_id = ? AND tr.to_step = ?
+         ORDER BY tr.applied_at DESC, e.id DESC
+         LIMIT 1
+        """,
+        (task_id, step_key),
+    ).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        """
+        SELECT *
+          FROM wf_event
+         WHERE matched_task_id = ?
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+
+
 def context(conn, task_id: str) -> dict:
-    """Return the tenant-neutral worker context for one instance."""
+    """Return the step-scoped, tenant-neutral context for one stage turn.
+
+    The worker receives only the current structural step, live posture dial,
+    accumulated structured variables, declared correlation values, and the
+    structured event that opened this turn.  The full template and raw inbound
+    bodies never enter the worker prompt.
+    """
 
     task = _task(conn, task_id)
     instance = _instance(conn, task_id)
@@ -848,6 +896,16 @@ def context(conn, task_id: str) -> dict:
         task["current_step_key"],
         step,
     )
+    event = _stage_event(conn, task_id, str(task["current_step_key"]))
+    event_context = None
+    if event is not None:
+        event_context = {
+            "id": int(event["id"]),
+            "source": event["source"],
+            "event_type": event["event_type"],
+            "payload": _load_json(event["payload"], {}),
+            "corr": _load_json(event["corr"], {}),
+        }
     return {
         "task_id": task_id,
         "template_id": instance["template_id"],
@@ -856,6 +914,7 @@ def context(conn, task_id: str) -> dict:
         "vars": _load_json(instance["vars"], {}),
         "state": instance["state"],
         "step": step,
+        "event": event_context,
     }
 
 

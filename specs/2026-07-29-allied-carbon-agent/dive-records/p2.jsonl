@@ -1,0 +1,2 @@
+{"phase":"p2","arm":"single-clone-control","actor":"worker/275d2fe7","wb":"fb359166-1cf7-4322-a5ec-b72c82631d16","ts":"2026-07-30T07:43:33.456000Z","event":"accepted","detail":"brief received; frozen contract and plan loaded"}
+{"phase":"p2","arm":"single-clone-control","actor":"worker/275d2fe7","wb":"fb359166-1cf7-4322-a5ec-b72c82631d16","ts":"2026-07-30T08:00:54.232166Z","event":"local_build_verified","detail":{"targeted_tests":"511 passed, 1 skipped","ruff":"pass","diff_check":"pass"}}

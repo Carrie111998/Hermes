@@ -3579,6 +3579,47 @@ class TestRunConversation:
         assert call[0][1]["task_id"] == "t_test_task_123"
         assert "Iteration budget exhausted" in call[0][1]["reason"]
 
+    def test_workflow_exception_called_on_iteration_exhaustion(
+        self, agent, monkeypatch,
+    ):
+        """Workflow workers settle budget exhaustion through the engine."""
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_workflow_123")
+        monkeypatch.setenv("HERMES_WORKFLOW_TASK", "t_workflow_123")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Could not finish — budget exhausted.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok") as mock_hfc,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("advance the workflow")
+
+        assert result["completed"] is False
+        exception_calls = [
+            call for call in mock_hfc.call_args_list
+            if call[0][0] == "wf_exception"
+        ]
+        assert len(exception_calls) == 1
+        assert exception_calls[0][0][1]["task_id"] == "t_workflow_123"
+        assert "Iteration budget exhausted" in exception_calls[0][0][1]["reason"]
+        assert not [
+            call for call in mock_hfc.call_args_list
+            if call[0][0] == "kanban_block"
+        ]
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """kanban_block must NOT be called when HERMES_KANBAN_TASK is unset."""
         self._setup_agent(agent)
