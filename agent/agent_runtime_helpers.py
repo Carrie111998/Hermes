@@ -2016,10 +2016,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # Clear the per-config context_length override so the new model's
         # actual context window is resolved via get_model_context_length()
         # instead of inheriting the stale value from the previous model.
-        # Preserve the global max_context_length ceiling across model switches
-        # so a configured cap (e.g. 200k) is never silently lost.
-        _global_max = getattr(agent, "_max_context_length", None)
-        agent._config_context_length = _global_max  # None means "detect from model" only if no global cap
+        # _max_context_length is the global ceiling; it is applied as
+        # min(native_context, ceiling) *after* resolution so it can only
+        # shrink the window, never inflate it (e.g. a 200K ceiling on a
+        # 128K model must not expand the window to 200K).
+        agent._config_context_length = None
 
         # ── Swap core runtime fields ──
         agent.model = new_model
@@ -2230,6 +2231,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             config_context_length=getattr(agent, "_config_context_length", None),
             custom_providers=_sm_custom_providers,
         )
+        # Apply global ceiling as min(native, ceiling) — ceiling can only
+        # shrink the window, never inflate it.
+        _global_ceiling = getattr(agent, "_max_context_length", None)
+        if _global_ceiling is not None and isinstance(_global_ceiling, int) and _global_ceiling > 0:
+            new_context_length = min(new_context_length, _global_ceiling)
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,

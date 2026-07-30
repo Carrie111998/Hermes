@@ -1709,6 +1709,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
         # the stale value from the previous model.  See #22387.
+        # The global ceiling (_max_context_length) is applied separately
+        # below via min() after the fallback context is resolved.
         agent._config_context_length = None
         agent.model = fb_model
         agent.provider = fb_provider
@@ -1833,6 +1835,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 config_context_length=getattr(agent, "_config_context_length", None),
                 custom_providers=getattr(agent, "_custom_providers", None),
             )
+            # Apply global ceiling as min(native, ceiling) — ceiling can only
+            # shrink the fallback window, never inflate it.
+            _fb_ceiling = getattr(agent, "_max_context_length", None)
+            if _fb_ceiling is not None and isinstance(_fb_ceiling, int) and _fb_ceiling > 0:
+                fb_context_length = min(fb_context_length, _fb_ceiling)
             agent.context_compressor.update_model(
                 model=agent.model,
                 context_length=fb_context_length,

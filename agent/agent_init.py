@@ -1932,6 +1932,30 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
+    # Apply the global context-length ceiling (agent.max_context_length) as
+    # min(native_resolved_context, ceiling) so it can only shrink the window,
+    # never inflate it (e.g. a 200K ceiling on a 128K model stays at 128K).
+    # This must run after both the plugin-engine and built-in ContextCompressor
+    # branches so the compressor's context_length is already resolved.
+    _init_ceiling = getattr(agent, "_max_context_length", None)
+    if (
+        _init_ceiling is not None
+        and isinstance(_init_ceiling, int)
+        and _init_ceiling > 0
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
+        _init_native = getattr(agent.context_compressor, "context_length", 0)
+        if _init_native and _init_native > _init_ceiling:
+            agent.context_compressor.update_model(
+                model=agent.model,
+                context_length=_init_ceiling,
+                base_url=agent.base_url,
+                api_key=getattr(agent, "api_key", ""),
+                provider=agent.provider,
+                api_mode=agent.api_mode,
+            )
+
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         try:
