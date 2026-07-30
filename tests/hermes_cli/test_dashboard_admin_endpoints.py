@@ -1165,10 +1165,16 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
     import hermes_cli.web_server as ws
 
     active = True
+    close_sessions = MagicMock()
     monkeypatch.setattr(
         tui_gateway.server,
         "has_active_tui_work",
         lambda: active,
+    )
+    monkeypatch.setattr(
+        tui_gateway.server,
+        "close_sessions_for_update",
+        close_sessions,
     )
     ws._end_dashboard_update_quiesce()
     try:
@@ -1180,6 +1186,7 @@ async def test_dashboard_quiesce_waits_for_embedded_tui_turn(monkeypatch):
         active = False
         await quiesce_task
         assert ws._DASHBOARD_UPDATE_QUIESCE_ACTIVE is True
+        close_sessions.assert_called_once_with()
     finally:
         ws._end_dashboard_update_quiesce()
 

@@ -314,6 +314,10 @@ def has_active_tui_work() -> bool:
         if any(
             session.get("running")
             or (
+                (run_thread := session.get("_run_thread")) is not None
+                and run_thread.is_alive()
+            )
+            or (
                 (ready := session.get("agent_ready")) is not None
                 and not ready.is_set()
                 and session.get("agent_build_started")
@@ -387,6 +391,18 @@ def _tui_maintenance_scope():
         if admitted:
             with _update_quiesce_lock:
                 _active_tui_maintenance = max(_active_tui_maintenance - 1, 0)
+
+
+def _try_claim_autonomous_turn(session: dict) -> bool:
+    """Atomically admit one poller-owned turn outside update quiescence."""
+    with _update_quiesce_lock:
+        if _tui_update_quiesced or session.get("_finalized"):
+            return False
+        with session["history_lock"]:
+            if session.get("running"):
+                return False
+            session["running"] = True
+            return True
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -1091,6 +1107,30 @@ def _shutdown_sessions() -> None:
         sids = list(_sessions)
     for sid in sids:
         _close_session_by_id(sid, end_reason="tui_shutdown")
+
+
+def close_sessions_for_update() -> None:
+    """Close idle embedded-TUI sessions before the managed venv is rewritten.
+
+    Dashboard WebSocket closure detaches resumable sessions by design, so their
+    notification pollers and slash-worker Python subprocesses otherwise survive
+    the transport task. The POSIX holder guard must then reject the update.
+    Quiesce admission is already closed when this runs; tear sessions down and
+    briefly join their pollers so no venv-backed child or lazy import crosses
+    the updater spawn.
+    """
+    with _sessions_lock:
+        sessions = list(_sessions.values())
+    _shutdown_sessions()
+    current = threading.current_thread()
+    for session in sessions:
+        poller = session.get("_notif_thread")
+        if (
+            poller is not None
+            and poller is not current
+            and getattr(poller, "is_alive", lambda: False)()
+        ):
+            poller.join(timeout=1.0)
 
 
 # Last-resort net for any disconnect path that slips past the WS finally. TTL is
@@ -8866,9 +8906,8 @@ def _notification_poller_loop(
             _pending = session.get("_kanban_pending") or []
             if _pending:
                 _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
+                if _try_claim_autonomous_turn(session):
+                    with session["history_lock"]:
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
@@ -8938,14 +8977,8 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
@@ -8987,6 +9020,9 @@ def _notification_poller_loop(
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    with _update_quiesce_lock:
+        if _tui_update_quiesced:
+            return
     deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
@@ -9024,11 +9060,9 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
+        if not _try_claim_autonomous_turn(session):
+            process_registry.completion_queue.put(evt)
+            break
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -9170,6 +9204,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         args=(stop, sid, session),
         daemon=True,
     )
+    session["_notif_thread"] = t
     t.start()
     return stop
 

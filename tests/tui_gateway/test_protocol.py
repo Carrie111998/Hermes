@@ -651,6 +651,54 @@ def test_update_quiesce_replays_missed_ws_orphan_reap(server, monkeypatch):
     assert "detached" not in server._deferred_ws_orphan_reaps
 
 
+def test_update_quiesce_rejects_autonomous_tui_turn(server):
+    session = {
+        "history_lock": threading.Lock(),
+        "running": False,
+    }
+
+    server.begin_update_quiesce()
+    try:
+        assert server._try_claim_autonomous_turn(session) is False
+        assert session["running"] is False
+    finally:
+        server.end_update_quiesce()
+
+
+def test_close_sessions_for_update_releases_workers(server, monkeypatch):
+    closed = {"agent": 0, "worker": 0, "joined": 0}
+
+    class _Closable:
+        def __init__(self, key):
+            self.key = key
+
+        def close(self):
+            closed[self.key] += 1
+
+    class _Poller:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            closed["joined"] += 1
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    server._sessions["idle"] = {
+        "session_key": "idle",
+        "agent": _Closable("agent"),
+        "slash_worker": _Closable("worker"),
+        "history": [],
+        "history_lock": threading.Lock(),
+        "_notif_stop": threading.Event(),
+        "_notif_thread": _Poller(),
+    }
+
+    server.close_sessions_for_update()
+
+    assert server._sessions == {}
+    assert closed == {"agent": 1, "worker": 1, "joined": 1}
+
+
 @pytest.mark.parametrize("completion_method", ["complete.path", "complete.slash"])
 def test_completion_handlers_are_pool_routed(completion_method, server):
     """complete.path/complete.slash must run on the pool, never the reader thread.
