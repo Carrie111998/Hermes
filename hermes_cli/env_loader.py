@@ -370,11 +370,17 @@ def _apply_managed_env() -> None:
         return
     if managed_dir is None:
         return
-    managed_env = managed_dir / ".env"
-    if not managed_env.exists():
-        return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
+    try:
+        managed_env = managed_dir / ".env"
+        if not managed_env.exists():
+            return
+        _sanitize_env_file_if_needed(managed_env)
+        _load_dotenv_with_fallback(managed_env, override=True)
+    except Exception:  # noqa: BLE001 — fail-open: PermissionError on
+        # unreadable managed dirs must not crash startup. The outer
+        # try/except above catches get_managed_dir() failures; this
+        # one covers the exists/load boundary.
+        pass
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
