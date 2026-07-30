@@ -40,6 +40,9 @@ from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_authority as host_authority
 from scripts.canary import production_database_recovery_gate as database_recovery
 from scripts.canary import production_cutover_passkey as cutover_passkey
+from scripts.canary import (
+    production_cutover_unit_input_successor as unit_successor,
+)
 from scripts.canary import production_cutover_unit_input_rotation as unit_rotation
 from scripts.canary.production_cutover_public_stager import (
     PublicStagingError,
@@ -980,7 +983,7 @@ def _decode(raw: bytes) -> Mapping[str, Any]:
     return value
 
 
-def _read_public_json(path: Path) -> Mapping[str, Any]:
+def _read_public_bytes(path: Path) -> bytes:
     try:
         state = path.lstat()
         if (
@@ -1005,7 +1008,18 @@ def _read_public_json(path: Path) -> Mapping[str, Any]:
         != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     ):
         raise OwnerCutoverError("owner_cutover_public_input_changed")
-    return _decode(raw)
+    return raw
+
+
+def _read_public_json(path: Path) -> Mapping[str, Any]:
+    return _decode(_read_public_bytes(path))
+
+
+def _read_public_json_line(path: Path) -> Mapping[str, Any]:
+    raw = _read_public_bytes(path)
+    if not raw.endswith(b"\n"):
+        raise OwnerCutoverError("owner_cutover_json_not_canonical")
+    return _decode(raw[:-1])
 
 
 def load_owner_private_key(path: Path) -> Ed25519PrivateKey:
@@ -3591,6 +3605,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     unit.add_argument("--owner-private-key", type=Path, required=True)
     unit.add_argument("--owner-subject-sha256", required=True)
     unit.add_argument("--output", type=Path, required=True)
+    derive_unit = subparsers.add_parser("derive-unit-inputs")
+    derive_unit.add_argument("--revision", required=True)
+    derive_unit.add_argument("--predecessor-plan", type=Path, required=True)
+    derive_unit.add_argument(
+        "--predecessor-approval",
+        type=Path,
+        required=True,
+    )
+    derive_unit.add_argument(
+        "--predecessor-fixed-inputs",
+        type=Path,
+        required=True,
+    )
+    derive_unit.add_argument("--output", type=Path, required=True)
     stage_unit = subparsers.add_parser("stage-unit-inputs")
     stage_unit.add_argument("--revision", required=True)
     stage_unit.add_argument("--remote-stager-revision", required=True)
@@ -3644,6 +3672,44 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_attestation = _active_owner_runtime_attestation(
             arguments.revision
         )
+        if arguments.command == "derive-unit-inputs":
+            predecessor_paths = (
+                arguments.predecessor_plan,
+                arguments.predecessor_approval,
+                arguments.predecessor_fixed_inputs,
+            )
+            if any(not path.is_absolute() for path in predecessor_paths):
+                raise OwnerCutoverError(
+                    "owner_cutover_public_input_invalid"
+                )
+            predecessor_plan = _read_public_json(
+                arguments.predecessor_plan
+            )
+            output_value = unit_successor.derive_successor_payload(
+                predecessor_plan=predecessor_plan,
+                predecessor_approval=_read_public_json(
+                    arguments.predecessor_approval
+                ),
+                predecessor_fixed_inputs=_read_public_json_line(
+                    arguments.predecessor_fixed_inputs
+                ),
+                successor_revision=arguments.revision,
+            )
+            created = _write_public_output(arguments.output, output_value)
+            print(_canonical({
+                "schema": OWNER_WORKSPACE_SCHEMA,
+                "action": arguments.command,
+                "predecessor_revision": predecessor_plan[
+                    "release_revision"
+                ],
+                "release_revision": arguments.revision,
+                "output_path": str(arguments.output),
+                "output_sha256": _sha(_canonical(output_value)),
+                "created": created,
+                "private_key_staged": False,
+                "secret_material_recorded": False,
+            }).decode("utf-8"))
+            return 0
         if arguments.command in {"stage-unit-inputs", "rotate-unit-inputs"}:
             if not arguments.publication.is_absolute():
                 raise OwnerCutoverError(

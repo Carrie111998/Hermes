@@ -63,6 +63,7 @@ REQUIRED_MODULES = (
     "scripts.canary.production_cutover_owner_launcher",
     "scripts.canary.production_cutover_public_stager",
     "scripts.canary.production_cutover_unit_input_rotation",
+    "scripts.canary.production_cutover_unit_input_successor",
     "scripts.canary.production_database_recovery_gate",
     "scripts.canary.production_database_recovery_probe",
     "scripts.canary.production_os_login_metadata_migration",
