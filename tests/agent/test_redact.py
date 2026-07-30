@@ -844,6 +844,45 @@ class TestXaiToken:
         assert result.startswith("xai-AB")
 
 
+class TestBwsToken:
+    """Bitwarden Secrets Manager access tokens: bws_<base64> (~40+ chars).
+    The key is >= 20 base64url chars after the bws_ prefix."""
+
+    def test_bws_token(self):
+        token = "bws_" + "A" * 20 + "B" * 20
+        result = redact_sensitive_text(f"BWS_TOKEN={token}", force=True)
+        assert token not in result
+        assert "BWS_TOKEN=" in result
+
+    def test_bws_bare_token(self):
+        token = "bws_" + "A" * 20 + "B" * 20
+        result = redact_sensitive_text(f"using key {token}", force=True)
+        assert token not in result
+        assert "bws_AA" in result
+        assert "..." in result
+
+    def test_bws_too_short_not_masked(self):
+        short = "bws_" + ("a" * 19)
+        assert redact_sensitive_text(f"text {short} here", force=True) == f"text {short} here"
+
+    def test_bws_env_assignment_masked(self):
+        token = "bws_" + "A" * 20 + "B" * 20
+        result = redact_sensitive_text(f"BWS_ACCESS_TOKEN={token}", force=True)
+        assert token not in result
+        assert "BWS_ACCESS_TOKEN=" in result
+
+    def test_bws_with_dashes_and_underscores(self):
+        token = "bws_" + "A" * 10 + "-_" + "B" * 10 + "_-" + "C" * 16
+        result = redact_sensitive_text(f"export BWS_ACCESS_TOKEN={token}", force=True)
+        assert token not in result
+        assert "BWS_ACCESS_TOKEN=" in result
+
+    def test_bws_prefix_visible_in_masked_output(self):
+        token = "bws_" + "A" * 20 + "B" * 20
+        result = redact_sensitive_text(token, force=True)
+        assert result.startswith("bws_AA")
+
+
 class TestDbConnstrCodeOutput:
     """Regression tests for issue #33801 — _DB_CONNSTR_RE corrupting code output.
 
