@@ -7589,8 +7589,10 @@ def run_conversation(
                         continue
 
                     # ── Empty response retry ──────────────────────
-                    # Model returned nothing usable.  Retry up to 3
-                    # times before attempting fallback.  This covers
+                    # Model returned nothing usable.  Retry up to
+                    # agent.empty_response_retries times (default 5; short
+                    # jittered backoff between attempts) before attempting
+                    # fallback.  This covers
                     # both truly empty responses (no content, no
                     # reasoning) AND reasoning-only responses after
                     # prefill exhaustion — models like mimo-v2-pro
@@ -7621,10 +7623,17 @@ def run_conversation(
                             finish_reason=finish_reason,
                             response=response,
                         )
+                    # Base ceiling is the operator-configured
+                    # agent.empty_response_retries (see empty_response_guard);
+                    # the guard can reduce it further for high-cost attempts.
                     _empty_retry_budget = (
                         _empty_guard.empty_retry_budget(agent, response)
                         if _empty_candidate
-                        else _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                        else getattr(
+                            agent,
+                            "_empty_response_retries",
+                            _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET,
+                        )
                     )
                     _deterministic_empty = _empty_candidate and (
                         _empty_guard.deterministic_empty(agent)
@@ -7648,7 +7657,11 @@ def run_conversation(
                         )
                         _budget_note = (
                             " — high-cost request, reduced retry budget"
-                            if _empty_retry_budget < _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                            if _empty_retry_budget < getattr(
+                                agent,
+                                "_empty_response_retries",
+                                _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET,
+                            )
                             else ""
                         )
                         agent._buffer_status(
@@ -7656,12 +7669,17 @@ def run_conversation(
                             f"({agent._empty_content_retries}/{_empty_retry_budget}) "
                             f"in {wait_time:.0f}s{_budget_note}"
                         )
-                        # Sleep in small increments to stay responsive to interrupts
                         sleep_end = time.time() + wait_time
-                        _backoff_touch_counter = 0
+                        _empty_redirect_preserved = False
                         while time.time() < sleep_end:
                             if agent._interrupt_requested:
-                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during empty-response retry wait, aborting.", force=True)
+                                if agent.clear_interrupt(preserve_redirect=True):
+                                    _empty_redirect_preserved = True
+                                    break
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚡ Interrupt during empty-response backoff, aborting.",
+                                    force=True,
+                                )
                                 _interrupt_text = (
                                     f"Operation interrupted: retrying empty response from model "
                                     f"(retry {agent._empty_content_retries}/{_empty_retry_budget})."
@@ -7683,6 +7701,12 @@ def run_conversation(
                                     f"empty response retry backoff ({agent._empty_content_retries}/{_empty_retry_budget}), "
                                     f"{int(sleep_end - time.time())}s remaining"
                                 )
+                        if _empty_redirect_preserved:
+                            # Refund the slot this empty retry consumed so the
+                            # loop re-enters and drains/applies the redirect
+                            # instead of exiting on an exhausted budget (mirrors
+                            # the 429 backoff's redirect-restart refund).
+                            agent.iteration_budget.refund()
                         continue
 
                     if _truly_empty and _deterministic_empty:

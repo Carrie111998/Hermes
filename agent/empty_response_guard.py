@@ -252,16 +252,20 @@ def deterministic_empty(agent: Any) -> bool:
 
 
 def empty_retry_budget(agent: Any, response: Any) -> int:
-    """Empty-retry budget for the current streak (3, or 1 when a single
-    attempt is estimated to cost more than the configured threshold)."""
+    """Empty-retry budget for the current streak: the operator-configured
+    ``agent.empty_response_retries`` (default 3), or 1 when a single attempt
+    is estimated to cost more than the configured threshold."""
+    base = getattr(agent, "_empty_response_retries", None)
+    if not isinstance(base, int) or base < 1:
+        base = DEFAULT_EMPTY_RETRY_BUDGET
     if not guard_enabled(agent):
-        return DEFAULT_EMPTY_RETRY_BUDGET
+        return base
     cost = _estimate_attempt_cost(agent, response)
     if cost is None:
-        return DEFAULT_EMPTY_RETRY_BUDGET
+        return base
     if cost >= _cost_threshold_usd(agent):
         return REDUCED_EMPTY_RETRY_BUDGET
-    return DEFAULT_EMPTY_RETRY_BUDGET
+    return base
 
 
 def streak_cost_usd(agent: Any) -> Optional[Decimal]:
