@@ -79,6 +79,38 @@ export const $artifactVersionSelection = atom<Record<string, number>>({})
 const artifactRecordCache = new Map<string, ReadableAtom<ArtifactRecord | null>>()
 const artifactVersionSelectionCache = new Map<string, ReadableAtom<number | undefined>>()
 
+function evictPrunedArtifactState(registry: ArtifactRegistry): void {
+  const retained = new Set(Object.values(registry).flatMap(records => records.map(record => record.id)))
+
+  for (const artifactId of artifactRecordCache.keys()) {
+    if (!retained.has(artifactId)) {
+      artifactRecordCache.delete(artifactId)
+    }
+  }
+
+  for (const artifactId of artifactVersionSelectionCache.keys()) {
+    if (!retained.has(artifactId)) {
+      artifactVersionSelectionCache.delete(artifactId)
+    }
+  }
+
+  const selection = $artifactVersionSelection.get()
+
+  const nextSelection = Object.fromEntries(
+    Object.entries(selection).filter(([artifactId]) => retained.has(artifactId))
+  )
+
+  if (Object.keys(nextSelection).length !== Object.keys(selection).length) {
+    $artifactVersionSelection.set(nextSelection)
+  }
+}
+
+function setPrunedRegistry(registry: ArtifactRegistry): void {
+  const pruned = pruneRegistry(registry)
+  $artifactRegistry.set(pruned)
+  evictPrunedArtifactState(pruned)
+}
+
 /** Lookup against a registry value, for components that already subscribe to
  *  the atom and need the record to change identity when it does. */
 export function findArtifact(registry: ArtifactRegistry, artifactId: string): ArtifactRecord | null {
@@ -180,12 +212,10 @@ export function upsertArtifact(
       versions
     }
 
-    $artifactRegistry.set(
-      pruneRegistry({
-        ...registry,
-        [id]: records.map(record => (record.id === existing.id ? next : record))
-      })
-    )
+    setPrunedRegistry({
+      ...registry,
+      [id]: records.map(record => (record.id === existing.id ? next : record))
+    })
 
     return { artifactId: existing.id, record: next, versionAdded: true }
   }
@@ -202,7 +232,7 @@ export function upsertArtifact(
     versions: [{ content: trimmed, createdAt: now, hash }]
   }
 
-  $artifactRegistry.set(pruneRegistry({ ...registry, [id]: [...records, record] }))
+  setPrunedRegistry({ ...registry, [id]: [...records, record] })
 
   return { artifactId: record.id, record, versionAdded: true }
 }

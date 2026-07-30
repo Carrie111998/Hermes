@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ArtifactDetection } from '@/lib/artifact-detect'
 
@@ -97,6 +97,34 @@ describe('artifacts store', () => {
     expect(changes).toHaveLength(1)
     expect(changes[0]).toBe(first.record)
     unsubscribe()
+  })
+
+  it('evicts derived stores and version pins when bounded pruning removes an artifact', () => {
+    const now = vi.spyOn(Date, 'now')
+    let timestamp = 0
+    now.mockImplementation(() => ++timestamp)
+
+    const first = upsertArtifact('session-1', HTML_DETECTION, '<html>v1</html>')!
+    upsertArtifact('session-1', HTML_DETECTION, '<html>v2</html>')
+    selectArtifactVersion(first.artifactId, 0)
+
+    const recordStore = $artifactRecord(first.artifactId)
+    const selectionStore = $artifactSelectedVersion(first.artifactId)
+
+    for (let index = 0; index < 24; index += 1) {
+      upsertArtifact(
+        'session-1',
+        { ...HTML_DETECTION, title: `Newer artifact ${index}` },
+        `<html>${index}</html>`
+      )
+    }
+
+    expect(getArtifact(first.artifactId)).toBeNull()
+    expect(first.artifactId in $artifactVersionSelection.get()).toBe(false)
+    expect($artifactRecord(first.artifactId)).not.toBe(recordStore)
+    expect($artifactSelectedVersion(first.artifactId)).not.toBe(selectionStore)
+
+    now.mockRestore()
   })
 
   it('rejects empty sessions and empty content', () => {
