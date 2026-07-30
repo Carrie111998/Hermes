@@ -3004,8 +3004,8 @@ def looks_like_codex_intermediate_ack(
             r"checking|running|writing|opening|reading|inspecting|reviewing|"
             r"testing|debugging|searching|fixing)\b"
             r"(?!\s+(?:(?:(?:has|have|had)\s+)?(?:completed|finished|"
-            r"succeeded|failed|passed)|(?:is|was|were)\s+(?:complete|finished|"
-            r"successful|done))\b)",
+            r"succeeded|failed|passed|complete|done|successful)|"
+            r"(?:is|was|were)\s+(?:complete|finished|successful|done))\b)",
             assistant_text,
         )
     )

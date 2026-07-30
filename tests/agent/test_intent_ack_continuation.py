@@ -176,6 +176,9 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Testing has completed successfully.",
         "Checking is complete.",
         "Running was successful.",
+        "Testing complete.",
+        "Checking done.",
+        "Running successful.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(
