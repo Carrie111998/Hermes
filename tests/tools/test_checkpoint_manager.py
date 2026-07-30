@@ -1088,7 +1088,7 @@ class TestAbandonedIndexLockRecovery:
         store, index_file = self._prepare_store(
             work_dir, checkpoint_base, monkeypatch,
         )
-        lock = _index_lock_path(index_file)
+        lock = _index_lock_path(index_file, store)
         lock.write_text("")
         # Age it past the widest possible git-call window so it is provably
         # owned by nobody.
@@ -1111,7 +1111,7 @@ class TestAbandonedIndexLockRecovery:
         store, index_file = self._prepare_store(
             work_dir, checkpoint_base, monkeypatch,
         )
-        lock = _index_lock_path(index_file)
+        lock = _index_lock_path(index_file, store)
         lock.write_text("")  # mtime = now
 
         ok, _out, err = _run_git(
@@ -1135,7 +1135,7 @@ class TestAbandonedIndexLockRecovery:
         store, index_file = self._prepare_store(
             work_dir, checkpoint_base, monkeypatch,
         )
-        lock = _index_lock_path(index_file)
+        lock = _index_lock_path(index_file, store)
 
         real_run = subprocess.run
 
@@ -1168,7 +1168,7 @@ class TestAbandonedIndexLockRecovery:
         store, index_file = self._prepare_store(
             work_dir, checkpoint_base, monkeypatch,
         )
-        lock = _index_lock_path(index_file)
+        lock = _index_lock_path(index_file, store)
         calls = []
         real_run = subprocess.run
 
@@ -1179,7 +1179,8 @@ class TestAbandonedIndexLockRecovery:
             old = time.time() - (_MAX_GIT_CALL_SECONDS + 60)
             os.utime(lock, (old, old))
             return subprocess.CompletedProcess(
-                cmd, 128, "", "fatal: Unable to create '...lock': File exists.",
+                cmd, 128, "",
+                f"fatal: Unable to create '{lock}': File exists.",
             )
 
         monkeypatch.setattr(subprocess, "run", fake_run)
@@ -1201,7 +1202,7 @@ class TestAbandonedIndexLockRecovery:
         store, index_file = self._prepare_store(
             work_dir, checkpoint_base, monkeypatch,
         )
-        lock = _index_lock_path(index_file)
+        lock = _index_lock_path(index_file, store)
         lock.write_text("")
         old = time.time() - (_MAX_GIT_CALL_SECONDS + 60)
         os.utime(lock, (old, old))
@@ -1214,3 +1215,136 @@ class TestAbandonedIndexLockRecovery:
 
         assert not ok
         assert lock.exists()
+
+
+class TestLockReclaimCoversEveryLockClass:
+    """The wedge is not specific to the per-project index (#74108).
+
+    Any git lock left by a killed process blocks its operation forever, and
+    the checkpoint store takes several: the per-project index for ``add``,
+    the store-root index for calls that pass no ``index_file``, and ref locks
+    for ``update-ref``/maintenance. Reclaiming the path git *itself* names
+    covers all of them with one mechanism and no guessing.
+    """
+
+    @staticmethod
+    def _prepare_store(work_dir, checkpoint_base, monkeypatch):
+        monkeypatch.setattr(
+            "tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base,
+        )
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+        return store
+
+    def test_store_root_index_lock_is_the_target_without_index_file(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """#52887 cleans this one; it is real, but it is not the add path."""
+        from tools.checkpoint_manager import _index_lock_path
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        assert _index_lock_path(None, store) == store / "index.lock"
+
+    def test_per_project_index_lock_is_the_target_for_add(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """...and this is the one `git add -A` actually takes."""
+        from tools.checkpoint_manager import _index_path, _index_lock_path
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        index_file = _index_path(store, _project_hash(str(work_dir)))
+        assert _index_lock_path(index_file, store) == index_file.with_name(
+            index_file.name + ".lock"
+        )
+        assert (store / "index.lock") != _index_lock_path(index_file, store)
+
+    def test_ref_lock_named_by_git_is_reclaimed(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """A killed update-ref wedges that ref, not the index."""
+        from tools.checkpoint_manager import (
+            _MAX_GIT_CALL_SECONDS, _reclaimable_locks_from_stderr,
+        )
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        ref_lock = store / "refs" / "heads" / "hermes-checkpoint.lock"
+        ref_lock.parent.mkdir(parents=True, exist_ok=True)
+        ref_lock.write_text("")
+        old = time.time() - (_MAX_GIT_CALL_SECONDS + 60)
+        os.utime(ref_lock, (old, old))
+
+        stderr = (
+            "error: cannot lock ref 'refs/heads/hermes-checkpoint': "
+            f"Unable to create '{ref_lock}': File exists."
+        )
+        assert _reclaimable_locks_from_stderr(stderr, store) == [ref_lock.resolve()]
+
+    def test_detection_survives_a_localized_git(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """git translates the prose but never the path.
+
+        Matching on the English "unable to create" would silently stop
+        recovering for every non-English locale.
+        """
+        from tools.checkpoint_manager import _reclaimable_locks_from_stderr
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        lock = store / "index.lock"
+        lock.write_text("")
+        turkish = f"onulmaz: '{lock}' oluşturulamıyor: File exists."
+
+        assert _reclaimable_locks_from_stderr(turkish, store) == [lock.resolve()]
+
+    def test_paths_outside_the_store_are_never_reclaimed(
+        self, work_dir, checkpoint_base, monkeypatch, tmp_path,
+    ):
+        """A message must not be able to point the cleanup at someone else."""
+        from tools.checkpoint_manager import _reclaimable_locks_from_stderr
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        outsider = tmp_path / "not-ours.lock"
+        outsider.write_text("")
+        stderr = f"fatal: Unable to create '{outsider}': File exists."
+
+        assert _reclaimable_locks_from_stderr(stderr, store) == []
+        assert outsider.exists()
+
+    def test_relative_paths_in_stderr_are_ignored(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        from tools.checkpoint_manager import _reclaimable_locks_from_stderr
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        assert _reclaimable_locks_from_stderr(
+            "fatal: Unable to create 'index.lock': File exists.", store,
+        ) == []
+
+    def test_end_to_end_ref_lock_recovery_through_run_git(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        """Real git, real ref lock: the retry clears it and the call succeeds."""
+        from tools.checkpoint_manager import _MAX_GIT_CALL_SECONDS, _index_path
+
+        store = self._prepare_store(work_dir, checkpoint_base, monkeypatch)
+        index_file = _index_path(store, _project_hash(str(work_dir)))
+        index_file.parent.mkdir(parents=True, exist_ok=True)
+        assert _run_git(["add", "-A"], store, str(work_dir), index_file=index_file)[0]
+        ok, sha, err = _run_git(
+            ["commit", "-m", "snap"], store, str(work_dir), index_file=index_file,
+        )
+        assert ok, err
+
+        ref = "refs/heads/hermes-test-ref"
+        assert _run_git(["update-ref", ref, "HEAD"], store, str(work_dir))[0]
+
+        ref_lock = store / (ref + ".lock")
+        ref_lock.parent.mkdir(parents=True, exist_ok=True)
+        ref_lock.write_text("")
+        old = time.time() - (_MAX_GIT_CALL_SECONDS + 60)
+        os.utime(ref_lock, (old, old))
+
+        ok, _out, err = _run_git(["update-ref", ref, "HEAD"], store, str(work_dir))
+
+        assert ok, f"update-ref should succeed after reclaiming the ref lock: {err}"
+        assert not ref_lock.exists()
