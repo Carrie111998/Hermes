@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { CodeEditor } from '@/components/chat/code-editor'
 import { PageLoader } from '@/components/page-loader'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
@@ -15,11 +16,9 @@ import {
 } from '@/components/ui/dialog'
 import { SanitizedInput } from '@/components/ui/sanitized-input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Textarea } from '@/components/ui/textarea'
 import {
   createProfile,
   deleteProfile,
-  getProfiles,
   getProfileSoul,
   type ProfileInfo,
   renameProfile,
@@ -29,9 +28,10 @@ import { useI18n } from '@/i18n'
 import { AlertTriangle, Save } from '@/lib/icons'
 import { profileColorSoft, resolveProfileColor } from '@/lib/profile-color'
 import { slug } from '@/lib/sanitize'
+import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $profileColors } from '@/store/profile'
+import { $profileColors, refreshProfiles } from '@/store/profile'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import {
@@ -43,9 +43,9 @@ import {
   PanelHeader,
   PanelList,
   PanelListRow,
+  type PanelMenuItem,
   PanelMeta,
   PanelPill,
-  PanelRowMenu,
   PanelSectionLabel
 } from '../overlays/panel'
 
@@ -72,7 +72,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
 
   const refresh = useCallback(async () => {
     try {
-      const { profiles: list } = await getProfiles()
+      const list = await refreshProfiles()
       setProfiles(list)
       setSelectedName(current => {
         if (current && list.some(p => p.name === current)) {
@@ -101,7 +101,7 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
   }, [profiles, selectedName])
 
   const visibleProfiles = useMemo(() => {
-    const q = query.trim().toLowerCase()
+    const q = normalize(query)
 
     if (!profiles || !q) {
       return profiles ?? []
@@ -197,22 +197,18 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
                 <ProfileRow
                   active={selected?.name === profile.name}
                   key={profile.name}
-                  menu={
-                    <PanelRowMenu
-                      items={
-                        profile.is_default
-                          ? []
-                          : [
-                              { icon: 'edit', label: p.rename, onSelect: () => setPendingRename(profile) },
-                              {
-                                icon: 'trash',
-                                label: t.common.delete,
-                                onSelect: () => setPendingDelete(profile),
-                                tone: 'danger'
-                              }
-                            ]
-                      }
-                    />
+                  menuItems={
+                    profile.is_default
+                      ? []
+                      : [
+                          { icon: 'edit', label: p.renameMenu, onSelect: () => setPendingRename(profile) },
+                          {
+                            icon: 'trash',
+                            label: t.common.delete,
+                            onSelect: () => setPendingDelete(profile),
+                            tone: 'danger'
+                          }
+                        ]
                   }
                   onSelect={() => setSelectedName(profile.name)}
                   profile={profile}
@@ -281,12 +277,12 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
 
 function ProfileRow({
   active,
-  menu,
+  menuItems,
   onSelect,
   profile
 }: {
   active: boolean
-  menu?: React.ReactNode
+  menuItems: PanelMenuItem[]
   onSelect: () => void
   profile: ProfileInfo
 }) {
@@ -302,7 +298,8 @@ function ProfileRow({
           name={profile.name}
         />
       }
-      menu={menu}
+      menuItems={menuItems}
+      menuLabel={profile.name}
       onSelect={onSelect}
       rowKey={profile.name}
       title={profile.name}
@@ -388,6 +385,7 @@ function SoulEditor({ profileName }: { profileName: string }) {
   const [error, setError] = useState<null | string>(null)
   const requestRef = useRef<string>(profileName)
 
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     requestRef.current = profileName
     setLoading(true)
@@ -416,7 +414,6 @@ function SoulEditor({ profileName }: { profileName: string }) {
   }, [p, profileName])
 
   const dirty = content !== original
-  const isEmpty = !content.trim()
 
   async function handleSave() {
     setSaving(true)
@@ -446,12 +443,16 @@ function SoulEditor({ profileName }: { profileName: string }) {
       {loading ? (
         <PageLoader className="min-h-44" label={p.loadingSoul} />
       ) : (
-        <Textarea
-          className="min-h-48 font-mono text-xs leading-5"
-          onChange={event => setContent(event.target.value)}
-          placeholder={isEmpty ? p.emptySoul : undefined}
-          value={content}
-        />
+        <div className="min-h-48">
+          <CodeEditor
+            filePath="SOUL.md"
+            framed
+            initialValue={content}
+            key={profileName}
+            onChange={setContent}
+            onSave={() => void handleSave()}
+          />
+        </div>
       )}
 
       {error && (
