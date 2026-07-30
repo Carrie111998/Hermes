@@ -17,12 +17,12 @@ install:
   ref: 6be9cebb4f1a6dba942b458604c89dc045205ff5
   bootstrap:
     - "go version"
-    - "mkdir -p bin"
-    - "go build -trimpath -ldflags='-s -w -X main.version=v0.4.0' -o bin/icloud-mcp ./cmd/icloud-mcp"
+    # A directory target makes Go create bin/ and apply the native .exe suffix.
+    - 'go build -trimpath -ldflags="-s -w -X main.version=v0.4.0" -o bin/ ./cmd/icloud-mcp'
 
 transport:
   type: stdio
-  command: "${INSTALL_DIR}/bin/icloud-mcp"
+  command: "${INSTALL_DIR}/bin/icloud-mcp${EXE_SUFFIX}"
   version: "0.4.0"
   env:
     # Recommended first deploy: Calendar only, global read-only (7 tools).
