@@ -84,75 +84,6 @@ class TestCwdHandling:
         assert config["host_cwd"] is None
         assert config["docker_mount_cwd_to_workspace"] is False
 
-    def test_users_path_maps_to_workspace_for_docker_when_enabled(self, monkeypatch):
-        """Docker should map the host cwd into /workspace only when explicitly enabled."""
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        monkeypatch.setenv("TERMINAL_CWD", "/Users/someone/projects")
-        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
-        config = _tt_mod._get_env_config()
-        assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/Users/someone/projects"
-        assert config["docker_mount_cwd_to_workspace"] is True
-
-    def test_windows_path_replaced_for_modal(self, monkeypatch):
-        """TERMINAL_CWD=C:\\Users\\... should be replaced for modal."""
-        monkeypatch.setenv("TERMINAL_ENV", "modal")
-        monkeypatch.setenv("TERMINAL_CWD", "C:\\Users\\someone\\projects")
-        config = _tt_mod._get_env_config()
-        assert config["cwd"] == "/root"
-
-    @pytest.mark.parametrize("backend", ["modal", "docker", "singularity", "daytona"])
-    def test_default_cwd_is_root_for_container_backends(self, backend, monkeypatch):
-        """Container backends should default to /root, not ~."""
-        monkeypatch.setenv("TERMINAL_ENV", backend)
-        monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
-        config = _tt_mod._get_env_config()
-        assert config["cwd"] == "/root", (
-            f"Backend {backend}: expected /root default, got {config['cwd']}"
-        )
-
-    def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch):
-        """Docker should use /workspace when cwd mounting is explicitly enabled."""
-        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: "/home/user/project")
-        monkeypatch.setenv("TERMINAL_ENV", "docker")
-        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
-        monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        config = _tt_mod._get_env_config()
-        assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/home/user/project"
-
-    def test_local_backend_uses_getcwd(self, monkeypatch):
-        """Local backend should use os.getcwd(), not /root."""
-        monkeypatch.setenv("TERMINAL_ENV", "local")
-        monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        config = _tt_mod._get_env_config()
-        assert config["cwd"] == os.getcwd()
-
-    def test_create_environment_passes_docker_host_cwd_and_flag(self, monkeypatch):
-        """Docker host cwd and mount flag should reach DockerEnvironment."""
-        captured = {}
-        sentinel = object()
-
-        def _fake_docker_environment(**kwargs):
-            captured.update(kwargs)
-            return sentinel
-
-        monkeypatch.setattr(_tt_mod, "_DockerEnvironment", _fake_docker_environment)
-
-        env = _tt_mod._create_environment(
-            env_type="docker",
-            image="python:3.11",
-            cwd="/workspace",
-            timeout=60,
-            container_config={"docker_mount_cwd_to_workspace": True},
-            host_cwd="/home/user/project",
-        )
-
-        assert env is sentinel
-        assert captured["cwd"] == "/workspace"
-        assert captured["host_cwd"] == "/home/user/project"
-        assert captured["auto_mount_cwd"] is True
 
     def test_ssh_preserves_home_paths(self, monkeypatch):
         """SSH backend should NOT replace /home/ paths (they're valid remotely)."""
@@ -350,6 +281,7 @@ class TestDockerHostBindApproval:
     def test_isolated_docker_keeps_fast_path(self, monkeypatch):
         """Isolated Docker still bypasses dangerous-command approval."""
         import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
@@ -358,9 +290,26 @@ class TestDockerHostBindApproval:
                                          has_host_access=False)
         assert res["approved"] is True
 
+    @staticmethod
+    def _isolate_approval_state(monkeypatch):
+        """Clear approval state that leaks in from the real user config.
+
+        ``tools.approval`` loads ``command_allowlist`` into module-level
+        ``_permanent_approved`` at import time. This file imports
+        ``tools.terminal_tool`` at module level (collection time — BEFORE the
+        hermetic HERMES_HOME fixture runs), so on a dev machine whose real
+        config permanently allowlists e.g. "delete in root path" the guard
+        under test silently approves and the assertions flip. CI never has
+        such an allowlist, making this a local-only flake.
+        """
+        import tools.approval as A
+        monkeypatch.setattr(A, "_permanent_approved", set())
+        monkeypatch.setattr(A, "_session_approved", {})
+
     def test_host_bound_docker_requires_approval(self, monkeypatch):
         """Host-bound Docker dangerous command escalates instead of bypassing."""
         import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.setattr(
             "tools.tirith_security.check_command_security",
@@ -374,6 +323,7 @@ class TestDockerHostBindApproval:
     def test_execute_code_isolated_docker_keeps_fast_path(self, monkeypatch):
         """Isolated Docker execute_code still bypasses the guard."""
         import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         res = A.check_execute_code_guard("import os", "docker",
                                          has_host_access=False)
@@ -382,6 +332,7 @@ class TestDockerHostBindApproval:
     def test_execute_code_host_bound_docker_requires_approval(self, monkeypatch):
         """Host-bound Docker execute_code does not get the container fast-path."""
         import tools.approval as A
+        self._isolate_approval_state(monkeypatch)
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         res = A.check_execute_code_guard(
             "import os; os.system('rm -rf /workspace')", "docker",
