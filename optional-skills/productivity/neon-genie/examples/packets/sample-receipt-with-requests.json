@@ -1,0 +1,42 @@
+{
+  "status": "PROPOSED",
+  "profiles_loaded": ["core", "product_architecture"],
+  "claims_by_label": {
+    "OBSERVED": [],
+    "INFERRED": [],
+    "SPECULATIVE": [],
+    "NOT_COMPUTABLE": ["critical_integration_access"]
+  },
+  "not_computable_fields": ["critical_integration_access"],
+  "promotion_state": "SPEC_COMPLETE",
+  "human_review_required": true,
+  "authority": "advisory_only",
+  "grants_execution": false,
+  "data_requests": [
+    {
+      "request_id": "dr-product-access",
+      "field": "critical_integration_access",
+      "why_decision_critical": "Integration feasibility cannot be OBSERVED without declared access",
+      "sensitivity": "private",
+      "suggested_source": "Operator environment credentials or access inventory",
+      "blocks_promotion": true,
+      "status": "open",
+      "attempted_queries": []
+    }
+  ],
+  "open_blocking_requests": [
+    {
+      "request_id": "dr-product-access",
+      "field": "critical_integration_access",
+      "why_decision_critical": "Integration feasibility cannot be OBSERVED without declared access",
+      "sensitivity": "private",
+      "suggested_source": "Operator environment credentials or access inventory",
+      "blocks_promotion": true,
+      "status": "open",
+      "attempted_queries": []
+    }
+  ],
+  "research_attempts": [],
+  "evidence_protocol": "find_request_not_computable",
+  "note": "Packaging receipt only. Does not authorize spend, publish, or execution. Open blocking data requests present; do not promote until satisfied or waived."
+}

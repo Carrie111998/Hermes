@@ -1,0 +1,15 @@
+{
+  "status": "PROPOSED",
+  "profiles_loaded": ["core", "product_architecture"],
+  "claims_by_label": {
+    "OBSERVED": [],
+    "INFERRED": [],
+    "SPECULATIVE": ["market timing"],
+    "NOT_COMPUTABLE": []
+  },
+  "not_computable_fields": [],
+  "promotion_state": "TESTABLE",
+  "human_review_required": true,
+  "authority": "advisory_only",
+  "grants_execution": false
+}
