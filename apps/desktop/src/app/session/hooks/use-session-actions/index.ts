@@ -150,6 +150,21 @@ function reconcileProjectedMessages(projectedMessages: ChatMessage[], previousMe
   return preserveLocalAssistantErrors(withPendingTurn, previousMessages)
 }
 
+function liveTurnStateChanged(current: ClientSessionState, snapshot: ClientSessionState): boolean {
+  return (
+    current.messages !== snapshot.messages ||
+    current.busy !== snapshot.busy ||
+    current.awaitingResponse !== snapshot.awaitingResponse ||
+    current.streamId !== snapshot.streamId ||
+    current.sawAssistantPayload !== snapshot.sawAssistantPayload ||
+    current.pendingBranchGroup !== snapshot.pendingBranchGroup ||
+    current.interrupted !== snapshot.interrupted ||
+    current.interimBoundaryPending !== snapshot.interimBoundaryPending ||
+    current.needsInput !== snapshot.needsInput ||
+    current.turnStartedAt !== snapshot.turnStartedAt
+  )
+}
+
 // `session.create` params from the current profile + sticky-UI model/effort/fast,
 // ensuring the gateway is on that profile first. Shared by the primary send path
 // and the "open in split" tile path; `cwd` is the one thing that differs (the
@@ -754,24 +769,22 @@ export function useSessionActions({
               const activatedState = updateSessionState(
                 cachedRuntimeId,
                 state => {
-                  // session.activate may have been pending while prompt.submit
-                  // appended a newer optimistic row to the live cache. Re-read
-                  // that cache at the atomic update boundary so this stale
-                  // activation projection cannot clobber accepted user intent.
-                  const messages = reconcileProjectedMessages(activatedMessages, state.messages)
-                  // The activation payload snapshots `running` before this
-                  // response is delivered. A prompt accepted during that gap
-                  // has already armed the live cache, so a stale explicit
-                  // `false` must not clear either pending-turn indicator.
-                  const busy = Boolean(activated.running || state.busy)
-                  const awaitingResponse = Boolean(activated.running || state.awaitingResponse)
+                  // session.activate snapshots its turn projection before the
+                  // response is delivered. If submit/stream/complete/interrupt
+                  // changed that projection during the await, the live cache is
+                  // newer and wins as a unit. Otherwise activation remains
+                  // authoritative and may legitimately clear a stale busy cache.
+                  const turnAdvanced = liveTurnStateChanged(state, cachedViewState)
+                  const activatedRunning = Boolean(activated.running ?? state.busy)
 
                   return {
                     ...state,
                     ...(runtimeInfo ?? {}),
-                    messages,
-                    busy,
-                    awaitingResponse
+                    messages: turnAdvanced
+                      ? state.messages
+                      : reconcileProjectedMessages(activatedMessages, state.messages),
+                    busy: turnAdvanced ? state.busy : activatedRunning,
+                    awaitingResponse: turnAdvanced ? state.awaitingResponse : activatedRunning
                   }
                 },
                 storedSessionId
