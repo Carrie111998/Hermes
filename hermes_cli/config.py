@@ -1105,7 +1105,7 @@ def _profile_safe_hermes_home_string() -> str:
     try:
         return str(get_hermes_home())
     except RuntimeError:
-        return str((Path.cwd() / ".hermes").resolve())
+        return "__HERMES_SIDEBAR_INBOX_UNAVAILABLE__"
 
 
 DEFAULT_CONFIG = {
@@ -7794,6 +7794,18 @@ def save_config(
         )
         if merge_existing and _raw_for_paths:
             config = _merge_partial_save(_raw_for_paths, config)
+        generated_inbox_path = ("session_bridge", "sidebar", "inbox_cwd")
+        static_inbox = DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"]
+        sidebar = config.get("session_bridge", {}).get("sidebar", {})
+        if (
+            generated_inbox_path not in (explicit_raw_paths or set())
+            and isinstance(sidebar, dict)
+            and sidebar.get("inbox_cwd") == static_inbox
+        ):
+            config = copy.deepcopy(config)
+            config["session_bridge"]["sidebar"]["inbox_cwd"] = (
+                _profile_safe_hermes_home_string()
+            )
         # ----------------------------------------------------------------
 
         current_normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))

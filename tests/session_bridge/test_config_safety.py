@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import os
 import re
+import subprocess
+import sys
 import tempfile
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict
@@ -247,23 +250,25 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
 
 
 def test_default_config_import_is_safe_without_a_resolvable_home(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    config_module = importlib.import_module("hermes_cli.config")
-    monkeypatch.setattr(
-        "hermes_constants._get_platform_default_hermes_home",
-        lambda: (_ for _ in ()).throw(RuntimeError("no home")),
+    environ = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"HERMES_HOME", "LOCALAPPDATA", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "HOME"}
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from hermes_cli.config import DEFAULT_CONFIG; print(DEFAULT_CONFIG['session_bridge']['sidebar']['inbox_cwd'])",
+        ],
+        capture_output=True,
+        check=True,
+        env=environ,
+        text=True,
     )
 
-    try:
-        reloaded = importlib.reload(config_module)
-        assert isinstance(reloaded.DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"], str)
-    finally:
-        default_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
-        try:
-            importlib.reload(config_module)
-        finally:
-            reset_hermes_home_override(default_token)
+    assert result.stdout.strip() == "__HERMES_SIDEBAR_INBOX_UNAVAILABLE__"
 
 
 def test_load_config_refreshes_sidebar_inbox_default_for_current_profile(
@@ -337,12 +342,14 @@ def test_cached_profile_defaults_are_not_written_when_inbox_is_omitted(
     profile_b = tmp_path / "profile-b"
     profile_a.mkdir()
     profile_b.mkdir()
+    (profile_a / "config.yaml").write_text("model: ''\n", encoding="utf-8")
     (profile_b / "config.yaml").write_text("model: ''\n", encoding="utf-8")
     config_module = importlib.import_module("hermes_cli.config")
 
     token_a = set_hermes_home_override(profile_a)
     try:
         config_module = importlib.reload(config_module)
+        assert config_module.load_config()["session_bridge"]["sidebar"]["inbox_cwd"] == str(profile_a)
     finally:
         reset_hermes_home_override(token_a)
     token_b = set_hermes_home_override(profile_b)
@@ -362,6 +369,36 @@ def test_cached_profile_defaults_are_not_written_when_inbox_is_omitted(
             reset_hermes_home_override(default_token)
 
     assert "inbox_cwd" not in raw.get("session_bridge", {}).get("sidebar", {})
+
+
+@pytest.mark.parametrize("copy_default", (False, True))
+def test_save_config_replaces_generated_static_inbox_with_current_profile(
+    tmp_path: Path,
+    copy_default: bool,
+) -> None:
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    config_module = importlib.import_module("hermes_cli.config")
+    token_a = set_hermes_home_override(profile_a)
+    try:
+        config_module = importlib.reload(config_module)
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(profile_b)
+    try:
+        value = (
+            deepcopy(config_module.DEFAULT_CONFIG)
+            if copy_default
+            else config_module.DEFAULT_CONFIG
+        )
+        assert config_module.save_config(value, strip_defaults=False)
+        raw = config_module.read_raw_config()
+    finally:
+        reset_hermes_home_override(token_b)
+
+    assert raw["session_bridge"]["sidebar"]["inbox_cwd"] == str(profile_b)
 
 
 def test_explicit_sidebar_inbox_survives_profile_default_round_trip(tmp_path: Path) -> None:
