@@ -13,6 +13,7 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+- POST /api/sessions/{session_id}/rewind — soft-delete from a user message onward (SessionDB.rewind_to_message)
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -1363,6 +1364,22 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         return active_api_runs, process_depth, active_delegations
 
+    _ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_for_approval", "stopping"})
+
+    def _session_has_active_run(self, session_id: str) -> bool:
+        """True when a /v1/runs job for *session_id* is still in flight."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return False
+        for status in self._run_statuses.values():
+            if not isinstance(status, dict):
+                continue
+            if status.get("session_id") != session_id:
+                continue
+            if status.get("status") in self._ACTIVE_RUN_STATUSES:
+                return True
+        return False
+
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
         """Normalize configured CORS origins into a stable tuple."""
@@ -1822,6 +1839,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
+            ("POST", "/api/sessions/{session_id}/rewind", self._handle_rewind_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
@@ -2878,6 +2896,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_rewind": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -2910,6 +2929,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_rewind": {"method": "POST", "path": "/api/sessions/{session_id}/rewind"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
@@ -3283,6 +3303,88 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "list",
             "session_id": resolved_id,
             "data": [self._message_response(m) for m in messages],
+        })
+
+    async def _handle_rewind_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/rewind — soft-delete from a user message onward.
+
+        Wraps ``SessionDB.rewind_to_message`` (same primitive as gateway/CLI
+        ``/undo``): the target must be a ``user`` row; it and every later
+        message become ``active=0`` (kept for audit, hidden from subsequent
+        history loads). Callers that need regenerate then issue a normal
+        ``POST /v1/runs`` with the same ``session_id`` and user input.
+
+        Body: ``{"target_message_id": <int>}`` — id from GET .../messages.
+        Rejects with 409 when a /v1/runs job for this session is still active.
+        This endpoint only mutates SessionDB; it does not sync in-memory
+        Desktop/TUI live history.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+
+        raw_target = body.get("target_message_id")
+        if raw_target is None:
+            return web.json_response(
+                _openai_error("target_message_id is required", code="invalid_target_message_id"),
+                status=400,
+            )
+        try:
+            target_message_id = int(raw_target)
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error("target_message_id must be an integer", code="invalid_target_message_id"),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        # Match GET /messages: resolve resume lineage so ids from that listing
+        # address the same transcript row set.
+        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        resolved = await asyncio.to_thread(db.get_session, resolved_id)
+        if not resolved:
+            return web.json_response(
+                _openai_error(f"Session not found: {session_id}", code="session_not_found"),
+                status=404,
+            )
+
+        if self._session_has_active_run(resolved_id) or self._session_has_active_run(session_id):
+            return web.json_response(
+                _openai_error(
+                    "Session has an active run; stop or wait before rewind",
+                    code="session_busy",
+                ),
+                status=409,
+            )
+
+        try:
+            result = await asyncio.to_thread(db.rewind_to_message, resolved_id, target_message_id)
+        except ValueError as exc:
+            return web.json_response(_openai_error(str(exc), code="invalid_rewind_target"), status=400)
+
+        target_message = result.get("target_message") or {}
+        if isinstance(target_message, dict):
+            target_message = self._message_response(target_message)
+
+        return web.json_response({
+            "object": "hermes.session.rewind",
+            "ok": True,
+            "session_id": resolved_id,
+            "rewound_count": result.get("rewound_count", 0),
+            "target_message": target_message,
+            "new_head_id": result.get("new_head_id"),
         })
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
