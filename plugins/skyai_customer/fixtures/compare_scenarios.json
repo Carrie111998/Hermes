@@ -61,8 +61,8 @@
   },
   {
     "id": "gift_wish_text",
-    "message": "Искам да напиша лично пожелание във ваучера. Къде се пише?",
-    "focus": "voucher greeting UI knowledge and edit window"
+    "message": "Стигнах до плащането, но не ми излезе меню за поздрав.",
+    "focus": "voucher greeting UI knowledge: cart edit flow before payment, and BookNow is not a gift voucher"
   },
   {
     "id": "gift_packaging",

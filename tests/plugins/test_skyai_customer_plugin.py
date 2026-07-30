@@ -510,8 +510,25 @@ def test_support_knowledge_returns_public_commerce_and_voucher_facts() -> None:
     assert result["status"] == "ok"
     assert result["source"] == "skyvision_curated_public_support_knowledge"
     assert "Честитка" in result["gift_voucher_presentation"]["voucher_blanks"]
-    assert "Редактирай поздрава" in " ".join(result["gift_voucher_presentation"]["wish_flow"])
-    assert "Име на ползвател" not in " ".join(result["gift_voucher_presentation"]["wish_flow"])
+    wish_flow_text = " ".join(result["gift_voucher_presentation"]["wish_flow"])
+    assert "Купи ваучер" in wish_flow_text
+    assert "отваря създателя на ваучер" in wish_flow_text
+    assert "Име на ползвател" in wish_flow_text
+    assert "Поздрав" in wish_flow_text
+    assert "веднага" in wish_flow_text
+    assert "Редактирай поздрава" in wish_flow_text
+    assert "размер на шрифта" in wish_flow_text
+    assert "височина на реда" in wish_flow_text
+    assert "не е необходим" in wish_flow_text
+    assert "Кошница" in wish_flow_text
+    assert "молива" in wish_flow_text
+    assert "Бланка" in wish_flow_text
+    assert "Запази" in wish_flow_text
+    assert "Резервирай" in wish_flow_text
+    assert "BookNow" in wish_flow_text
+    assert "не издава подаръчен ваучер" in wish_flow_text
+    assert "няма персонализация на поздрав" in wish_flow_text
+    assert "натиска „Редактирай поздрава“, за да се обнови preview-то" not in wish_flow_text
     assert result["gift_voucher_presentation"]["packaging_options"] == [
         {
             "name": "Безплатна опаковка",
