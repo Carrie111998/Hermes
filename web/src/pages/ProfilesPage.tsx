@@ -371,6 +371,13 @@ export default function ProfilesPage() {
   const [modelEditInitialChoice, setModelEditInitialChoice] = useState("");
   const [reasoningEditChoice, setReasoningEditChoice] = useState("");
   const [modelSaving, setModelSaving] = useState(false);
+  // Invalidates an in-flight model save when the editor changes or closes so
+  // a late response cannot affect a newer editor.
+  const activeModelRequest = useRef(0);
+  const invalidateModelSave = useCallback(() => {
+    activeModelRequest.current += 1;
+    setModelSaving(false);
+  }, []);
 
   // Per-profile "set active" in-flight name
   const [settingActive, setSettingActive] = useState<string | null>(null);
@@ -542,10 +549,11 @@ export default function ProfilesPage() {
   const closeEditor = useCallback(() => {
     activeSoulRequest.current = null;
     activeDescRequest.current = null;
+    invalidateModelSave();
     setEditingModelFor(null);
     setEditingDescFor(null);
     setEditingSoulFor(null);
-  }, []);
+  }, [invalidateModelSave]);
 
   const openSoulEditor = useCallback(
     async (name: string) => {
@@ -555,6 +563,7 @@ export default function ProfilesPage() {
         closeEditor();
         return;
       }
+      invalidateModelSave();
       setEditingDescFor(null);
       setEditingModelFor(null);
       setEditingSoulFor(name);
@@ -571,7 +580,7 @@ export default function ProfilesPage() {
         }
       }
     },
-    [closeEditor, editingSoulFor, showToast, t.status.error],
+    [closeEditor, editingSoulFor, invalidateModelSave, showToast, t.status.error],
   );
 
   const handleSaveSoul = async (name: string) => {
@@ -594,13 +603,14 @@ export default function ProfilesPage() {
         closeEditor();
         return;
       }
+      invalidateModelSave();
       activeDescRequest.current = p.name;
       setEditingSoulFor(null);
       setEditingModelFor(null);
       setEditingDescFor(p.name);
       setDescText(p.description ?? "");
     },
-    [closeEditor, editingDescFor],
+    [closeEditor, editingDescFor, invalidateModelSave],
   );
 
   const handleSaveDesc = async (name: string) => {
@@ -676,6 +686,7 @@ export default function ProfilesPage() {
         closeEditor();
         return;
       }
+      invalidateModelSave();
       setEditingSoulFor(null);
       setEditingDescFor(null);
       setEditingModelFor(p.name);
@@ -685,7 +696,7 @@ export default function ProfilesPage() {
       setReasoningEditChoice(p.reasoning_effort ?? "");
       loadModelChoices(p.name);
     },
-    [closeEditor, editingModelFor, loadModelChoices],
+    [closeEditor, editingModelFor, invalidateModelSave, loadModelChoices],
   );
 
   // Keep a persisted custom/unknown model visible in the picker even when the
@@ -711,6 +722,7 @@ export default function ProfilesPage() {
     }
     const changedModel =
       picked !== undefined && modelEditChoice !== modelEditInitialChoice ? picked : null;
+    const requestId = ++activeModelRequest.current;
     setModelSaving(true);
     try {
       const settings = await api.setProfileSettings(
@@ -719,13 +731,7 @@ export default function ProfilesPage() {
         changedModel?.model ?? null,
         reasoningEditChoice,
       );
-      if (changedModel) {
-        showToast(`${L.modelSaved}: ${changedModel.model}`, "success");
-      }
-      showToast(
-        `${L.reasoningSaved}: ${settings.reasoning_effort || L.reasoningUnset}`,
-        "success",
-      );
+      if (activeModelRequest.current !== requestId) return;
       setProfiles((prev) =>
         prev.map((p) =>
           p.name === name
@@ -739,11 +745,22 @@ export default function ProfilesPage() {
             : p,
         ),
       );
+      if (changedModel) {
+        showToast(`${L.modelSaved}: ${changedModel.model}`, "success");
+      }
+      showToast(
+        `${L.reasoningSaved}: ${settings.reasoning_effort || L.reasoningUnset}`,
+        "success",
+      );
       setEditingModelFor(null);
     } catch (e) {
-      showToast(`${t.status.error}: ${e}`, "error");
+      if (activeModelRequest.current === requestId) {
+        showToast(`${t.status.error}: ${e}`, "error");
+      }
     } finally {
-      setModelSaving(false);
+      if (activeModelRequest.current === requestId) {
+        setModelSaving(false);
+      }
     }
   };
 

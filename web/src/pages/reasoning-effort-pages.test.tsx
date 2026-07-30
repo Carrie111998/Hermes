@@ -565,6 +565,111 @@ describe("ProfilesPage reasoning effort selector", () => {
     );
   });
 
+  it("ignores a late model save after switching to another profile editor", async () => {
+    mockedApi.getProfiles.mockResolvedValue({
+      profiles: [
+        {
+          name: "default",
+          path: "/tmp/default",
+          is_default: true,
+          model: "model-a",
+          provider: "provider-a",
+          reasoning_effort: "",
+          has_env: false,
+          skill_count: 0,
+          gateway_running: false,
+          description: "",
+          description_auto: false,
+          distribution_name: null,
+          distribution_version: null,
+          distribution_source: null,
+          has_alias: false,
+        },
+        {
+          name: "other",
+          path: "/tmp/other",
+          is_default: false,
+          model: "model-b",
+          provider: "provider-b",
+          reasoning_effort: "",
+          has_env: false,
+          skill_count: 0,
+          gateway_running: false,
+          description: "",
+          description_auto: false,
+          distribution_name: null,
+          distribution_version: null,
+          distribution_source: null,
+          has_alias: false,
+        },
+      ],
+    });
+    mockedApi.getModelOptions.mockImplementation(async (profile) => ({
+      providers: [
+        profile === "other"
+          ? { slug: "provider-b", name: "Provider B", models: ["model-b"] }
+          : { slug: "provider-a", name: "Provider A", models: ["model-a"] },
+      ],
+    }));
+
+    type ProfileSettingsResponse = Awaited<ReturnType<typeof api.setProfileSettings>>;
+    let resolveFirstSave!: (value: ProfileSettingsResponse) => void;
+    const firstSave = new Promise<ProfileSettingsResponse>((resolve) => {
+      resolveFirstSave = resolve;
+    });
+    mockedApi.setProfileSettings.mockImplementationOnce(() => firstSave);
+
+    await renderPage(<ProfilesPage />);
+    let menus = [...container.querySelectorAll<HTMLElement>("[data-profile-actions]")];
+    await act(async () => menus[0].querySelector<HTMLButtonElement>("button[aria-label='Actions']")!.click());
+    const firstChangeModel = [
+      ...menus[0].querySelectorAll<HTMLButtonElement>("[role=menuitem]"),
+    ].find((button) => button.textContent?.includes("Change model"));
+    expect(firstChangeModel).toBeDefined();
+    await act(async () => firstChangeModel!.click());
+    await settle();
+
+    const selects = [...container.querySelectorAll<HTMLButtonElement>("button[role=combobox]")];
+    await chooseOption(selects[1], "High");
+    const save = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(save).toBeDefined();
+    await act(async () => {
+      save!.click();
+      await Promise.resolve();
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>("button[aria-label='Close']")!.click());
+    menus = [...container.querySelectorAll<HTMLElement>("[data-profile-actions]")];
+    await act(async () => menus[1].querySelector<HTMLButtonElement>("button[aria-label='Actions']")!.click());
+    const secondChangeModel = [
+      ...menus[1].querySelectorAll<HTMLButtonElement>("[role=menuitem]"),
+    ].find((button) => button.textContent?.includes("Change model"));
+    expect(secondChangeModel).toBeDefined();
+    await act(async () => secondChangeModel!.click());
+    await settle();
+
+    expect(container.querySelector<HTMLElement>("#profile-editor-title")?.textContent).toContain(
+      "other",
+    );
+
+    await act(async () => {
+      resolveFirstSave({
+        ok: true,
+        provider: null,
+        model: null,
+        reasoning_effort: "high",
+      });
+      await Promise.resolve();
+    });
+    await settle();
+
+    expect(container.querySelector<HTMLElement>("#profile-editor-title")?.textContent).toContain(
+      "other",
+    );
+  });
+
   it("keeps reasoning editing available when no model choices are configured", async () => {
     mockedApi.getProfiles.mockResolvedValue({
       profiles: [
