@@ -160,12 +160,10 @@ def hygiene_warn_token_threshold(
 ) -> int:
     """Token count above which a *post-compression* session is worth warning about.
 
-    Session hygiene compresses at ``compression.threshold`` of the context
-    window (default 0.5), then warns if the result is still large. Pinning
-    that warning at 0.95 of the window made it unreachable arithmetic for any
-    threshold below 0.95: the compressed size would have to be nearly twice
-    the size that triggered compression. On a 500K window compressing at
-    ~250K, the warning needed ~475K and so never fired.
+    Pre-agent session hygiene compresses at its fixed 0.85 safety threshold,
+    then warns if the result is still large. Pinning that warning at 0.95 of
+    the window made it unreachable: on a 500K window hygiene fires at ~425K
+    but the warning still needed ~475K.
 
     The reachable, actionable condition is "compression did not clear the
     trigger point": the session re-compresses on the next turn, paying LLM
