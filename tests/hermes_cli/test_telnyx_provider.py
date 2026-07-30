@@ -47,6 +47,36 @@ class TestTelnyxAuth:
         assert creds["api_key"] == "KEY_test_value"
         assert creds["base_url"] == "https://api.telnyx.com/v2/ai/openai"
 
+class TestTelnyxModelSwitchResolution:
+    """The interactive ``/model --provider telnyx`` path resolves through
+    ``resolve_provider_full`` → ``get_provider`` (models.dev + overlays),
+    which does NOT consult the plugin registry. Telnyx is not on models.dev,
+    so without a ``HERMES_OVERLAYS`` entry the switch failed with
+    "Unknown provider 'telnyx'" even though one-shot ``--provider telnyx``
+    worked through the auth registry."""
+
+    def test_hermes_overlay(self):
+        from hermes_cli.providers import HERMES_OVERLAYS
+
+        assert "telnyx" in HERMES_OVERLAYS
+        overlay = HERMES_OVERLAYS["telnyx"]
+        assert overlay.transport == "openai_chat"
+        assert overlay.base_url_override == "https://api.telnyx.com/v2/ai/openai"
+        assert "TELNYX_API_KEY" in overlay.extra_env_vars
+        assert not overlay.is_aggregator
+
+    def test_resolve_provider_full_finds_telnyx(self):
+        """Regression: the exact call the /model switch makes."""
+        from hermes_cli.providers import resolve_provider_full
+
+        pdef = resolve_provider_full("telnyx", None, None)
+        assert pdef is not None
+        assert pdef.id == "telnyx"
+        assert pdef.name == "Telnyx"
+        assert pdef.base_url == "https://api.telnyx.com/v2/ai/openai"
+        assert pdef.transport == "openai_chat"
+        assert "TELNYX_API_KEY" in pdef.api_key_env_vars
+
 
 class TestTelnyxModelMetadata:
     def test_provider_prefix_registered_and_stripped(self):
