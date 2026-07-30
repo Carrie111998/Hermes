@@ -110,9 +110,10 @@ class FactRetriever:
         # Increment retrieval_count for returned facts
         if results:
             ids = [f["fact_id"] for f in results]
-            self.store.increment_retrieval_count(ids)
+            new_counts = self.store.increment_retrieval_count(ids)
             for f in results:
-                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
+                if f["fact_id"] in new_counts:
+                    f["retrieval_count"] = new_counts[f["fact_id"]]
 
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
@@ -197,9 +198,10 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         if results:
-            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            new_counts = self.store.increment_retrieval_count([f["fact_id"] for f in results])
             for f in results:
-                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
+                if f["fact_id"] in new_counts:
+                    f["retrieval_count"] = new_counts[f["fact_id"]]
         return results
 
     def related(
@@ -270,9 +272,10 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         if results:
-            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            new_counts = self.store.increment_retrieval_count([f["fact_id"] for f in results])
             for f in results:
-                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
+                if f["fact_id"] in new_counts:
+                    f["retrieval_count"] = new_counts[f["fact_id"]]
         return results
 
     def reason(
@@ -353,9 +356,10 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         if results:
-            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            new_counts = self.store.increment_retrieval_count([f["fact_id"] for f in results])
             for f in results:
-                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
+                if f["fact_id"] in new_counts:
+                    f["retrieval_count"] = new_counts[f["fact_id"]]
         return results
 
     def contradict(
@@ -501,9 +505,10 @@ class FactRetriever:
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
         if results:
-            self.store.increment_retrieval_count([f["fact_id"] for f in results])
+            new_counts = self.store.increment_retrieval_count([f["fact_id"] for f in results])
             for f in results:
-                f["retrieval_count"] = f.get("retrieval_count", 0) + 1
+                if f["fact_id"] in new_counts:
+                    f["retrieval_count"] = new_counts[f["fact_id"]]
         return results
 
     def _fts_candidates(

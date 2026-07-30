@@ -438,23 +438,28 @@ class MemoryStore:
                 "helpful_count": row["helpful_count"] + helpful_increment,
             }
 
-    def increment_retrieval_count(self, fact_ids: list[int]) -> None:
+    def increment_retrieval_count(self, fact_ids: list[int]) -> dict[int, int]:
         """Increment retrieval_count for one or more facts under the shared lock.
 
-        Used by FactRetriever.search() after returning results. Centralizes
-        the counter SQL so it lives in one place instead of duplicating in
-        both search_facts() and FactRetriever.
+        Uses UPDATE ... RETURNING to atomically read back the post-increment
+        values, so callers always see the true DB state even under concurrent
+        access from multiple sessions.
+
+        Returns:
+            {fact_id: new_retrieval_count} for each incremented fact.
         """
         if not fact_ids:
-            return
+            return {}
         with self._lock:
             placeholders = ",".join("?" * len(fact_ids))
-            self._conn.execute(
+            rows = self._conn.execute(
                 f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
-                f"WHERE fact_id IN ({placeholders})",
+                f"WHERE fact_id IN ({placeholders}) "
+                f"RETURNING fact_id, retrieval_count",
                 fact_ids,
-            )
+            ).fetchall()
             self._conn.commit()
+            return {row["fact_id"]: row["retrieval_count"] for row in rows}
 
     # ------------------------------------------------------------------
     # Entity helpers
