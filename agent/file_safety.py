@@ -209,8 +209,13 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
         return None
     if denial == "safe_root":
         roots_display = os.pathsep.join(sorted(get_safe_write_roots()))
-        safe_tmp = get_safe_tmp_dir()
-        tmp_hint = f" Temporary files belong in '{safe_tmp}'." if safe_tmp else ""
+        tmp_hint = ""
+        if verb == "Write":
+            # Only a write denial benefits from a "put it here instead" hint —
+            # a denied delete/move isn't about finding somewhere to write.
+            safe_tmp = get_safe_tmp_dir()
+            if safe_tmp:
+                tmp_hint = f" Temporary files belong in '{safe_tmp}'."
         return (
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix.{tmp_hint}"

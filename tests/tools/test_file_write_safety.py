@@ -329,6 +329,67 @@ class TestSafeRootDenialMessageIntegration:
         assert res.error is None
         assert inside.read_text() == "content"
 
+    def test_write_file_denial_hint_path_is_writable_on_retry(
+        self, ops, tmp_path: Path, monkeypatch
+    ):
+        """The denial message's suggested temp path isn't just a string in an
+        error message -- writing there for real must actually succeed (#69962),
+        exercised through the real write_file() denial/retry path rather than
+        the get_write_denied_error() helper in isolation."""
+        from agent.file_safety import get_safe_tmp_dir
+
+        safe_root = tmp_path / "workspace"
+        safe_root.mkdir()
+        outside = tmp_path / "other" / "helper.py"
+        outside.parent.mkdir()
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+        monkeypatch.setattr("agent.file_safety._hermes_home_path", lambda: safe_root)
+
+        res = ops.write_file(str(outside), "content")
+        assert res.error is not None
+        safe_tmp = get_safe_tmp_dir()
+        assert safe_tmp is not None
+        assert f"Temporary files belong in '{safe_tmp}'" in res.error
+
+        retry_path = Path(safe_tmp) / "helper.py"
+        retry = ops.write_file(str(retry_path), "content")
+        assert retry.error is None
+        assert retry_path.read_text() == "content"
+
+    def test_delete_denial_has_no_temp_file_hint(
+        self, ops, tmp_path: Path, monkeypatch
+    ):
+        """A denied delete isn't about finding somewhere to write -- the
+        write-only 'Temporary files belong in ...' hint would be nonsensical
+        tacked onto a Delete-denied message."""
+        safe_root = tmp_path / "workspace"
+        safe_root.mkdir()
+        outside = tmp_path / "other" / "file.txt"
+        outside.parent.mkdir()
+        outside.write_text("content")
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+
+        res = ops.delete_path(str(outside))
+        assert res.error is not None
+        assert res.error.startswith("Delete denied")
+        assert "Temporary files belong in" not in res.error
+
+    def test_move_denial_has_no_temp_file_hint(
+        self, ops, tmp_path: Path, monkeypatch
+    ):
+        safe_root = tmp_path / "workspace"
+        safe_root.mkdir()
+        outside = tmp_path / "other" / "file.txt"
+        outside.parent.mkdir()
+        outside.write_text("content")
+        dst = safe_root / "file.txt"
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+
+        res = ops.move_file(str(outside), str(dst))
+        assert res.error is not None
+        assert res.error.startswith("Move denied")
+        assert "Temporary files belong in" not in res.error
+
 
 class TestCheckSensitivePathMacOSBypass:
     """Verify _check_sensitive_path blocks /private/etc paths (issue #8734)."""
