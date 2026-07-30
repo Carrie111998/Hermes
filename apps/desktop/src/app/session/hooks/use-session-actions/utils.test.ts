@@ -703,30 +703,7 @@ describe('appendLiveSessionProjection', () => {
     expect(appendLiveSessionProjection(stored, { session_id: 'runtime-1' })).toBe(stored)
   })
 
-  // The inflight row has an already-persisted guard; the queued row had none,
-  // so once the gateway persisted a drained queue entry while still reporting
-  // it as queued, the same prompt rendered twice — and again on every
-  // re-render/refocus, because the projected ids differ from the stored row's.
-  it('does not duplicate a queued prompt the gateway has already persisted', () => {
-    const stored = [
-      msg('stored-user-1', 'user', 'earlier'),
-      msg('stored-assistant-1', 'assistant', 'earlier answer'),
-      msg('stored-user-2', 'user', 'drained queue prompt')
-    ]
-
-    const restored = appendLiveSessionProjection(stored, {
-      session_id: 'runtime-1',
-      queued: { user: 'drained queue prompt' }
-    })
-
-    expect(restored.map(message => chatText(message))).toEqual([
-      'earlier',
-      'earlier answer',
-      'drained queue prompt'
-    ])
-  })
-
-  it('does not duplicate a queued prompt already covered by the inflight projection', () => {
+  it('preserves a queued turn whose text matches the inflight turn', () => {
     const stored = [msg('stored-user-1', 'user', 'earlier')]
 
     const restored = appendLiveSessionProjection(stored, {
@@ -737,7 +714,13 @@ describe('appendLiveSessionProjection', () => {
 
     const users = restored.filter(message => message.role === 'user').map(message => chatText(message))
 
-    expect(users).toEqual(['earlier', 'same prompt'])
+    expect(users).toEqual(['earlier', 'same prompt', 'same prompt'])
+    expect(restored.map(message => message.id)).toEqual([
+      'stored-user-1',
+      'user-inflight-runtime-1',
+      'assistant-stream-runtime-1',
+      'user-queued-runtime-1'
+    ])
   })
 
   // SAFETY: the guard must never swallow a genuinely new queued turn. Joel
