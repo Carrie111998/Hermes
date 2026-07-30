@@ -2432,25 +2432,6 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
-def _pending_merge_sender_identity(event: Optional[MessageEvent]) -> Optional[str]:
-    """Identity used to attribute a pending turn to a human.
-
-    Prefers ``source.user_id_alt`` — the stable per-human id on platforms where
-    ``user_id`` varies per message (Signal UUID, Feishu union_id) — and falls
-    back to ``source.user_id``.  Returns ``None`` when neither is available,
-    which callers must treat as "unknown", never as "different".
-
-    Mirrors the identity rule already used by
-    :meth:`BasePlatformAdapter._can_merge_text_debounce_events`, which gates the
-    text debounce buffer on the same ``user_id_alt or user_id`` precedence.
-    """
-    source = getattr(event, "source", None)
-    if source is None:
-        return None
-    sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-    return str(sender) if sender else None
-
-
 def pending_merge_sender_conflict(
     existing: Optional[MessageEvent],
     event: Optional[MessageEvent],
@@ -5280,7 +5261,19 @@ class BasePlatformAdapter(ABC):
                     )
                     if not absorbed:
                         self._queue_refused_pending_event(session_key, event)
-                return
+                    return
+
+                # The occupied head prevented the older sender's debounce
+                # state from flushing. Preserve arrival order by handing that
+                # older state to the runner FIFO before starting a fresh burst
+                # for the new sender below.
+                blocked_state = store.pop(session_key, None)
+                if blocked_state is not None:
+                    if blocked_state.task is not None and not blocked_state.task.done():
+                        blocked_state.task.cancel()
+                    blocked_state.task = None
+                    self._queue_refused_pending_event(session_key, blocked_state.event)
+                state = None
 
         now = time.monotonic()
         if state is None:

@@ -161,6 +161,7 @@ from gateway.session import build_session_key  # noqa: E402
 
 ALICE_MARK = "ALICE-FRAGMENT"
 BOB_MARK = "BOB-FRAGMENT"
+CAROL_MARK = "CAROL-FRAGMENT"
 
 
 def _group_source(
@@ -193,6 +194,12 @@ def _alice_source(**kw):
 def _bob_source(**kw):
     kw.setdefault("user_id", "bob-2")
     kw.setdefault("user_name", "Bob")
+    return _group_source(**kw)
+
+
+def _carol_source(**kw):
+    kw.setdefault("user_id", "carol-3")
+    kw.setdefault("user_name", "Carol")
     return _group_source(**kw)
 
 
@@ -578,27 +585,48 @@ async def test_adapter_busy_refusal_reaches_runner_fifo_and_drains_separately():
     assert _all_media(next_turn) == ["/tmp/b-1.jpg"]
 
 
-def test_cross_sender_refusal_fifo_does_not_drop_after_legacy_cap():
-    """Refusal routing must not create a new silent-drop cap."""
+def test_cross_sender_refusal_at_busy_cap_remains_reachable():
+    """A refused merge must survive even when the ordinary busy queue is full."""
     runner, adapter = _runner_with_adapter()
     session_key = "telegram:group:overflow"
     adapter._pending_messages[session_key] = _photo_event(
         _alice_source(), "/tmp/a.jpg", message_id="a"
     )
 
-    events = [
-        _photo_event(_bob_source(), f"/tmp/b-{i}.jpg", message_id=f"b-{i}")
-        for i in range(37)
-    ]
-    for event in events:
-        absorbed = merge_pending_message_event(
-            adapter._pending_messages, session_key, event
+    # Fill the canonical queue to the production cap: one head plus 31 FIFO
+    # entries. The incoming media event is then refused by Alice's head, so the
+    # refusal contract — not the ordinary busy-overflow policy — owns it.
+    for index in range(runner._BUSY_QUEUE_MAX_PENDING - 1):
+        runner._enqueue_fifo(
+            session_key,
+            _text_event(f"alice-{index}", _alice_source(), message_id=f"a-{index}"),
+            adapter,
         )
-        assert absorbed is False
-        adapter._queue_refused_pending_event(session_key, event)
 
-    queued = runner._session_state(session_key).conversation.queued_events
-    assert queued == events
+    bob = _photo_event(_bob_source(), "/tmp/b.jpg", message_id="b")
+    runner._queue_or_replace_pending_event(session_key, bob)
+
+    assert any(turn is bob for turn in _queued_turns(runner, adapter, session_key))
+
+
+@pytest.mark.asyncio
+async def test_three_sender_queue_debounce_never_loses_latest_sender():
+    """A blocked Bob flush must not make Carol disappear behind Alice's head."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:three-sender-debounce"
+    alice = _text_event(ALICE_MARK, _alice_source(), message_id="a")
+    bob = _text_event(BOB_MARK, _bob_source(), message_id="b")
+    carol = _text_event(CAROL_MARK, _carol_source(), message_id="c")
+    adapter._pending_messages[session_key] = alice
+
+    await adapter._queue_text_debounce(session_key, bob)
+    await adapter._queue_text_debounce(session_key, carol)
+
+    state = adapter._text_debounce_store().get(session_key)
+    reachable = _queued_turns(runner, adapter, session_key)
+    if state is not None:
+        reachable.append(state.event)
+    assert any(turn is carol for turn in reachable)
 
 
 def test_get_pending_message_only_consumes_and_never_promotes_fifo():

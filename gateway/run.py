@@ -6259,6 +6259,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 merge_text=event.message_type == MessageType.TEXT,
             ):
                 return
+            # Refusal transfers ownership back to this caller. It must bypass
+            # the ordinary busy-queue cap: the refusal itself must never cost
+            # the incoming sender a message.
+            self._enqueue_fifo(session_key, event, adapter)
+            return
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
