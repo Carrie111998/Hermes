@@ -166,6 +166,77 @@ async def test_polling_disconnect_webhook_reconnect_heals_webhook_send_path(monk
         await adapter.disconnect()
 
 
+# ── drop_pending_updates on the webhook start path (review of #71862) ──────
+#
+# The existing webhook test above only asserts that start_webhook() was
+# awaited, not what value it was called with -- so a cold-start or reconnect
+# queue-policy regression on the webhook path went undetected. Webhooks are
+# push-based (Telegram holds no server-side getUpdates queue for this
+# call), so drop_pending_updates is a no-op in practice here, but the
+# adapter still computes and passes the SAME drop_pending value as the
+# polling path for consistency, and that computation itself is exactly
+# what's being regression-tested.
+
+def _webhook_connect_adapter(monkeypatch, *, extra=None):
+    adapter = TelegramAdapter(
+        PlatformConfig(enabled=True, token="test-token", extra=extra or {})
+    )
+    webhook_app = _lifecycle_app()
+    _configure_lifecycle_connect(monkeypatch, adapter, [webhook_app])
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.test/telegram")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "test-secret")
+    return adapter, webhook_app
+
+
+@pytest.mark.asyncio
+async def test_webhook_cold_start_default_preserves_pending_updates(monkeypatch):
+    """Cold boot (is_reconnect=False), catchup_on_startup left at its
+    default (true): drop_pending_updates must be False."""
+    adapter, webhook_app = _webhook_connect_adapter(monkeypatch)
+    try:
+        assert await adapter.connect(is_reconnect=False) is True
+        webhook_app.updater.start_webhook.assert_awaited_once()
+        kwargs = webhook_app.updater.start_webhook.call_args.kwargs
+        assert kwargs["drop_pending_updates"] is False
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_webhook_cold_start_configured_opt_out_drops_pending_updates(monkeypatch):
+    """Cold boot with catchup_on_startup explicitly disabled:
+    drop_pending_updates must be True, matching the polling path's
+    opt-out semantics."""
+    adapter, webhook_app = _webhook_connect_adapter(
+        monkeypatch, extra={"catchup_on_startup": False}
+    )
+    try:
+        assert await adapter.connect(is_reconnect=False) is True
+        webhook_app.updater.start_webhook.assert_awaited_once()
+        kwargs = webhook_app.updater.start_webhook.call_args.kwargs
+        assert kwargs["drop_pending_updates"] is True
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_webhook_reconnect_always_preserves_pending_updates(monkeypatch):
+    """A reconnect (is_reconnect=True) must preserve the queue regardless
+    of catchup_on_startup -- that setting only governs the FIRST
+    (cold-boot) connection, matching the polling path's reconnect
+    semantics from #46621."""
+    adapter, webhook_app = _webhook_connect_adapter(
+        monkeypatch, extra={"catchup_on_startup": False}
+    )
+    try:
+        assert await adapter.connect(is_reconnect=True) is True
+        webhook_app.updater.start_webhook.assert_awaited_once()
+        kwargs = webhook_app.updater.start_webhook.call_args.kwargs
+        assert kwargs["drop_pending_updates"] is False
+    finally:
+        await adapter.disconnect()
+
+
 @pytest.mark.asyncio
 async def test_webhook_disconnect_polling_reconnect_resets_mode_and_waits_for_progress(
     monkeypatch,
