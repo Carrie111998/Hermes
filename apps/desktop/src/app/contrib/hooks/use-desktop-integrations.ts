@@ -5,10 +5,13 @@ import { openSession } from '@/app/open-session'
 import {
   clearStickySessionId,
   cwdLooksSane,
+  isChatNewDeliveryStale,
+  isInstalledProfileName,
+  nextChatNewDeliveryId,
   normalizeStickySlot,
+  pushStickyDelivery,
   readStickySessionId,
-  setStickyPending,
-  takeStickyPending,
+  takeStickyDeliveryForSession,
   writeStickySessionId
 } from '@/lib/deeplink-chat-new'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
@@ -16,8 +19,10 @@ import { respondToApprovalAction } from '@/store/native-notifications'
 import {
   $activeGatewayProfile,
   $newChatProfile,
+  $profiles,
   ensureGatewayProfile,
-  newSessionInProfile,
+  normalizeProfileKey,
+  refreshProfiles,
   requestFreshSession
 } from '@/store/profile'
 import {
@@ -131,15 +136,20 @@ export function useDesktopIntegrations({
   // lands where you were. Overlays (settings/command-center/…) aren't stored —
   // you don't want to boot into a modal.
   // Also binds deeplink sticky= slots once a real session mounts.
+  // Consume delivery-correlated pending (FIFO + profile match), not a global singleton.
   useEffect(() => {
     const routeProfile = rememberedSessionProfile($sessions.get(), routedSessionId, $activeGatewayProfile.get())
 
     if (routedSessionId) {
-      setRememberedSessionId(
+      const sessionProfile = rememberedSessionProfile(
+        $sessions.get(),
         routedSessionId,
-        rememberedSessionProfile($sessions.get(), routedSessionId, $activeGatewayProfile.get())
+        $activeGatewayProfile.get()
       )
-      const pendingSticky = takeStickyPending()
+      setRememberedSessionId(routedSessionId, sessionProfile)
+      const pendingSticky = takeStickyDeliveryForSession({
+        profile: normalizeProfileKey(sessionProfile)
+      })
       if (pendingSticky) {
         writeStickySessionId(pendingSticky, routedSessionId)
       }
@@ -221,6 +231,7 @@ export function useDesktopIntegrations({
   // hermes:// deep links:
   //  - blueprint/<name>?slots → reviewable /blueprint command in composer
   //  - chat/new?cwd=&profile=&project=&prompt=&sticky= → fresh (or sticky) session
+  // Profile allow-listed; gateway activation awaited; sticky pending is delivery-correlated.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
       if (!payload || !payload.kind) {
@@ -230,77 +241,112 @@ export function useDesktopIntegrations({
       // hermes://chat/new?cwd=…&profile=…&project=…&prompt=…&sticky=…
       // main delivers { kind: 'chat', name: 'new', params }
       if (payload.kind === 'chat' && payload.name === 'new') {
+        const deliveryId = nextChatNewDeliveryId()
         const params = payload.params || {}
-        const profile = (params.profile || '').trim()
+        const profileRaw = (params.profile || '').trim()
         const prompt = (params.prompt || '').trim()
         const projectKey = (params.project || '').trim()
         const sticky = normalizeStickySlot(params.sticky)
         let cwd = (params.cwd || '').trim()
         let projectId: null | string = null
 
-        if (!cwd && projectKey) {
-          const hit = resolveProjectCwd(projectKey)
-          if (hit) {
+        void (async () => {
+          const stale = () => isChatNewDeliveryStale(deliveryId)
+
+          // Allow-list profile against installed list (refresh first when named).
+          let profileKey: null | string = null
+          if (profileRaw) {
+            try {
+              await refreshProfiles()
+            } catch {
+              /* use cached $profiles */
+            }
+            if (stale()) return
+            const installed = $profiles.get()
+            if (!isInstalledProfileName(profileRaw, installed)) {
+              console.warn('[deeplink] chat/new refused unknown profile', profileRaw)
+              return
+            }
+            profileKey = normalizeProfileKey(profileRaw)
+          }
+
+          // project= must resolve; do not fall through to a detached new chat.
+          if (!cwd && projectKey) {
+            const hit = resolveProjectCwd(projectKey)
+            if (!hit) {
+              console.warn('[deeplink] chat/new refused unresolved project', projectKey)
+              return
+            }
             cwd = hit.cwd
             projectId = hit.projectId
           }
-        }
 
-        if (cwd && !cwdLooksSane(cwd)) {
-          console.warn('[deeplink] chat/new refused unsafe cwd', cwd)
-          return
-        }
-
-        // sticky=<slot>: resume the same session instead of minting a new one.
-        if (sticky) {
-          const existing = readStickySessionId(sticky)
-          if (existing) {
-            const known = sessionIdKnown(existing)
-            // Empty session cache (boot race) → trust id once; loaded+missing → clear.
-            if (known || $sessions.get().length === 0) {
-              navigate(sessionRoute(existing))
-              requestComposerFocus('main')
-              if (prompt) {
-                requestComposerInsert(prompt, { mode: 'block', target: 'main' })
-              }
-              return
-            }
-            clearStickySessionId(sticky)
+          if (cwd && !cwdLooksSane(cwd)) {
+            console.warn('[deeplink] chat/new refused unsafe cwd', cwd)
+            return
           }
-          // First open (or cleared): create below and bind when routedSessionId lands.
-          setStickyPending(sticky)
-        }
 
-        if (profile) {
-          $newChatProfile.set(profile)
-          void ensureGatewayProfile(profile)
-          // Prefer newSessionInProfile when we do not yet have a cwd path — it
-          // forces fresh. When cwd is set, requestStartWorkSession owns the
-          // fresh draft with workspace target (avoids double fresh race).
-          if (!cwd) {
-            newSessionInProfile(profile)
+          // sticky=<slot>: resume the same session instead of minting a new one.
+          if (sticky) {
+            const existing = readStickySessionId(sticky)
+            if (existing) {
+              const known = sessionIdKnown(existing)
+              // Empty session cache (boot race) → trust id once; loaded+missing → clear.
+              if (known || $sessions.get().length === 0) {
+                if (profileKey) {
+                  $newChatProfile.set(profileKey)
+                  await ensureGatewayProfile(profileKey)
+                  if (stale()) return
+                }
+                if (stale()) return
+                navigate(sessionRoute(existing))
+                requestComposerFocus('main')
+                if (prompt) {
+                  requestComposerInsert(prompt, { mode: 'block', target: 'main' })
+                }
+                return
+              }
+              clearStickySessionId(sticky)
+            }
+            // First open (or cleared): bind when routedSessionId lands for THIS delivery.
+            pushStickyDelivery({
+              deliveryId: String(deliveryId),
+              slot: sticky,
+              profile: profileKey
+            })
+          }
+
+          // Activate gateway before any workspace/config work that uses active gateway.
+          if (profileKey) {
+            $newChatProfile.set(profileKey)
+            await ensureGatewayProfile(profileKey)
+            if (stale()) return
+            requestFreshSession()
+          } else if (!cwd) {
+            requestFreshSession()
           } else {
             requestFreshSession()
           }
-        } else if (!cwd) {
-          requestFreshSession()
-        }
 
-        if (cwd) {
-          const matched = projectId || projectIdForCwd(cwd)
-          if (matched) {
-            enterProject(matched)
-          }
-          // Same path as sidebar "new session in worktree/project"
-          requestStartWorkSession(cwd, prompt || undefined)
-        } else {
-          navigate(NEW_CHAT_ROUTE)
-          if (prompt) {
-            requestComposerInsert(prompt, { mode: 'block', target: 'main' })
-          }
-        }
+          if (stale()) return
 
-        requestComposerFocus('main')
+          if (cwd) {
+            const matched = projectId || projectIdForCwd(cwd)
+            if (matched) {
+              enterProject(matched)
+            }
+            // Same path as sidebar "new session in worktree/project"
+            requestStartWorkSession(cwd, prompt || undefined)
+          } else {
+            navigate(NEW_CHAT_ROUTE)
+            if (prompt) {
+              requestComposerInsert(prompt, { mode: 'block', target: 'main' })
+            }
+          }
+
+          requestComposerFocus('main')
+        })()
+
         return
       }
 

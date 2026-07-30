@@ -1,12 +1,18 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, beforeEach } from 'vitest'
 
 import {
   clearStickySessionId,
   cwdLooksSane,
   deeplinkStickyStorageKey,
+  isChatNewDeliveryStale,
+  isInstalledProfileName,
+  nextChatNewDeliveryId,
   normalizeStickySlot,
+  pushStickyDelivery,
   readStickySessionId,
+  resetChatNewDeliverySeqForTests,
   setStickyPending,
+  takeStickyDeliveryForSession,
   takeStickyPending,
   writeStickySessionId
 } from './deeplink-chat-new'
@@ -71,11 +77,68 @@ describe('sticky slots', () => {
     clearStickySessionId('ceo', store)
     expect(readStickySessionId('ceo', store)).toBe(null)
   })
+})
 
-  it('pending sticky is one-shot', () => {
+describe('delivery-correlated sticky pending', () => {
+  beforeEach(() => {
+    resetChatNewDeliverySeqForTests()
+  })
+
+  it('FIFO consume preserves order across rapid deliveries', () => {
+    const store = memoryStorage()
+    pushStickyDelivery({ deliveryId: '1', slot: 'ceo', profile: 'default' }, store)
+    pushStickyDelivery({ deliveryId: '2', slot: 'work', profile: 'work' }, store)
+
+    expect(takeStickyDeliveryForSession({ profile: 'default' }, store)).toBe('ceo')
+    expect(takeStickyDeliveryForSession({ profile: 'work' }, store)).toBe('work')
+    expect(takeStickyDeliveryForSession({ profile: 'default' }, store)).toBe(null)
+  })
+
+  it('profile match skips non-matching head without dropping it', () => {
+    const store = memoryStorage()
+    pushStickyDelivery({ deliveryId: '1', slot: 'ceo', profile: 'default' }, store)
+    pushStickyDelivery({ deliveryId: '2', slot: 'lab', profile: 'work' }, store)
+
+    expect(takeStickyDeliveryForSession({ profile: 'work' }, store)).toBe('lab')
+    expect(takeStickyDeliveryForSession({ profile: 'default' }, store)).toBe('ceo')
+  })
+
+  it('null profile binding matches any session profile', () => {
+    const store = memoryStorage()
+    pushStickyDelivery({ deliveryId: '1', slot: 'ceo', profile: null }, store)
+    expect(takeStickyDeliveryForSession({ profile: 'jordan' }, store)).toBe('ceo')
+  })
+
+  it('stale delivery id detects newer chat/new', () => {
+    const a = nextChatNewDeliveryId()
+    expect(isChatNewDeliveryStale(a)).toBe(false)
+    const b = nextChatNewDeliveryId()
+    expect(isChatNewDeliveryStale(a)).toBe(true)
+    expect(isChatNewDeliveryStale(b)).toBe(false)
+  })
+
+  it('legacy setStickyPending still one-shot via takeStickyPending', () => {
     const store = memoryStorage()
     setStickyPending('work', store)
     expect(takeStickyPending(store)).toBe('work')
     expect(takeStickyPending(store)).toBe(null)
+  })
+})
+
+describe('isInstalledProfileName', () => {
+  it('allows empty profile', () => {
+    expect(isInstalledProfileName('', [{ name: 'default' }])).toBe(true)
+  })
+
+  it('allow-lists against installed names', () => {
+    const installed = [{ name: 'default', is_default: true }, { name: 'jordan' }, { name: 'work' }]
+    expect(isInstalledProfileName('jordan', installed)).toBe(true)
+    expect(isInstalledProfileName('Jordan', installed)).toBe(true)
+    expect(isInstalledProfileName('evil', installed)).toBe(false)
+  })
+
+  it('boot empty list only allows default', () => {
+    expect(isInstalledProfileName('default', [])).toBe(true)
+    expect(isInstalledProfileName('jordan', [])).toBe(false)
   })
 })

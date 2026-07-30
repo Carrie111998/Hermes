@@ -74,7 +74,7 @@ hermes://chat/new?cwd=<absolute-path>&profile=<name>&project=<id-or-slug>&prompt
 |-------|----------|----------|
 | `cwd` | one of `cwd` / `project` | Absolute workspace path (Unix, Windows drive, or UNC). Relative paths and `..` are refused. |
 | `project` | one of `cwd` / `project` | Resolve path via the desktop project store (id, slug, or name). |
-| `profile` | no | Target Hermes profile / gateway seat for the new chat. |
+| `profile` | no | Target Hermes profile / gateway seat. **Must be installed** (refreshed allow-list); unknown names are refused. |
 | `prompt` | no | Prefill composer (does not auto-send). |
 | `sticky` | no | Named slot: reopen the same session on later opens; first open creates and binds. |
 
@@ -253,3 +253,11 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\hermes\hermes-agent\venv"
 MIT — see [LICENSE](../../LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+### Safety (chat/new)
+
+- `profile` is validated against the installed profile list after refresh; untrusted names never activate a gateway.
+- Gateway activation is **awaited** before workspace/`config.get` work so requests do not hit the previous profile.
+- `sticky` pending binds are **per delivery** (FIFO queue + profile match), not one global slot — rapid links cannot steal each other's session bind.
+- `project=` that does not resolve is **fail-closed** (no detached empty chat).
+- Newer `chat/new` deliveries invalidate in-flight older handlers (stale-delivery guard).
