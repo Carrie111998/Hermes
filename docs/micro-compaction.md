@@ -59,9 +59,12 @@ absorbing one exchange at a time is worth doing at all.
 ## Your messages are never compacted
 
 An exchange deliberately starts at the *assistant* message. Micro-compaction
-walks straight past user messages to get there, so **what you typed is never
-summarized** — your prompts stay verbatim for the entire session, no matter how
-long it runs or how many times compaction fires.
+walks straight past user messages to get there, so **what you typed stays
+verbatim in the transcript** for the entire session, no matter how long it runs
+or how many times compaction fires. The one nuance is the defrag pass: it
+re-summarizes the whole un-absorbed middle in one shot, so the text handed to
+the summarizer there includes your messages as context — but the turns
+themselves are kept verbatim in the transcript, never replaced by the summary.
 
 This is the most useful property of the whole design, and it's worth being
 explicit about why. What the assistant produces is largely an account of what it
@@ -125,7 +128,11 @@ Merge into a summary often enough and it gets baggy — repetitive, and larger
 than the material justifies. When the running summary crosses a token threshold
 (2000 by default), the next pass **defrags**: it re-summarizes the summary and
 whatever middle remains in one shot, replacing it with a fresh compact version
-and advancing the cursor to the tail.
+and advancing the cursor to the tail. User turns inside that range are kept
+verbatim after the marker rather than absorbed. If the summarizer fails, the
+pass commits nothing — the transcript is left untouched and a later turn
+retries, because splicing against a summary that does not describe the removed
+range would be data loss.
 
 This is still much cheaper than full batch compaction. It only ever processes the
 summary plus the un-absorbed middle, never the whole transcript.
@@ -161,6 +168,12 @@ compaction is still there and still fires if the window fills anyway, and its
 summary markers are the same format, so the two interoperate. In practice
 micro-compaction keeps the transcript far enough below the threshold that the
 batch path fires much less often.
+
+Their markers can coexist, and micro-compaction never removes a batch marker.
+Each pass replaces its own previous marker (the rolling summary is cumulative,
+so the newest one contains everything the older ones held), but that guarantee
+covers only its own markers — a batch summary describes a different span of the
+session, so it is left in place.
 
 ## Configuration
 

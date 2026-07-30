@@ -766,6 +766,41 @@ class TestMicroCompaction:
             "zero-user transcript: 400 'No user query found' on vLLM/Qwen"
         )
 
+    def test_supersede_keeps_the_fresh_marker_not_the_highest_index(self):
+        """Supersede must keep the cumulative marker by identity.
+
+        A micro marker stranded at or past the tail boundary is invisible to
+        ``_resolve_compact_cursor``'s scan, so the cursor resets and the new
+        splice lands BEFORE it. Position-based supersede ("keep the last one")
+        then discards the fresh cumulative summary every pass and keeps the
+        stale marker -- and a crash or resume rehydrates from the stale copy,
+        losing everything absorbed since.
+        """
+        cc = _compressor(summary="FRESH CUMULATIVE SUMMARY")
+        cc._micro_compact_rolling_summary = "FRESH CUMULATIVE SUMMARY"
+        stale = {
+            "role": "user",
+            "content": (
+                f"{SUMMARY_PREFIX}\n\n{HISTORICAL_TASK_HEADING}\n"
+                f"STALE OLD SUMMARY\n\n{_SUMMARY_END_MARKER}"
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            COMPRESSED_SUMMARY_SOURCE_KEY: "micro",
+        }
+        messages = _conversation(exchanges=6)
+        messages.append(stale)  # stranded near the tail
+        messages.append({"role": "user", "content": "latest ask"})
+        messages.append({"role": "assistant", "content": "latest answer " + "z" * 400})
+        cc._micro_compact_cursor = 1  # scan blindness reset the cursor
+
+        result = cc._micro_compact(list(messages))
+
+        survivors = [str(m.get("content")) for m in _summary_markers(result)]
+        assert any("FRESH CUMULATIVE SUMMARY" in s for s in survivors), (
+            "position-based supersede discarded the fresh cumulative marker"
+        )
+        assert not any("STALE OLD SUMMARY" in s for s in survivors)
+
     def test_supersede_never_deletes_a_foreign_summary_marker(self):
         """A batch marker must survive micro-compaction passes.
 

@@ -5816,16 +5816,25 @@ This compaction should PRIORITISE preserving all information related to the focu
         # mechanism produced; anything untagged (legacy sessions) or from another
         # producer is left alone, even at the cost of a duplicate-looking
         # transcript.
+        # Supersede by IDENTITY, not by position. The cumulative marker is the
+        # one this pass just built -- ``summary_msg`` -- by construction, not
+        # whichever micro marker happens to sit at the highest index. Those can
+        # differ: a marker stranded at or past the tail boundary is invisible
+        # to ``_resolve_compact_cursor``'s scan, so the cursor resets and the
+        # new splice lands BEFORE it. Keeping "the last one" then discards the
+        # fresh cumulative summary and keeps the stale marker, every pass --
+        # and on a crash or resume everything absorbed since rehydrates from
+        # the stale copy, i.e. is lost.
         if supersede:
-            marker_idxs = [
-                i for i, m in enumerate(result)
-                if isinstance(m, dict)
-                and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                and m.get(COMPRESSED_SUMMARY_SOURCE_KEY) == _MICRO_COMPACT_SOURCE
+            result = [
+                m for m in result
+                if m is summary_msg
+                or not (
+                    isinstance(m, dict)
+                    and m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    and m.get(COMPRESSED_SUMMARY_SOURCE_KEY) == _MICRO_COMPACT_SOURCE
+                )
             ]
-            if len(marker_idxs) > 1:
-                superseded = set(marker_idxs[:-1])
-                result = [m for i, m in enumerate(result) if i not in superseded]
 
         # Zero-user backstop (#58753). Strict OpenAI-compatible backends reject
         # a request with no user-role message ("400 No user query found"), which
