@@ -2,7 +2,7 @@
 name: hermes-radicle
 description: Work with Radicle repos for peer-to-peer Git collaboration.
 version: 1.0.1
-author: Joey Stanford
+author: Joey Stanford (@rinchen)
 license: MIT
 platforms: [linux, macos]
 compatibility: "Radicle installed and `rad auth` complete; Radicle node running (`rad node start`). Optional: `gh` CLI for GitHub mirroring."
@@ -10,7 +10,6 @@ metadata:
   hermes:
     tags: [Radicle, Git, P2P, Version Control, Decentralized]
     category: devops
-    related_skills: [hermes-ngit]
     requires_toolsets: [terminal]
 ---
 
