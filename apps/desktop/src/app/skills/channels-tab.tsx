@@ -26,11 +26,13 @@ interface ChannelsTabProps {
 
 export function ChannelsTab({ query }: ChannelsTabProps) {
   const { t } = useI18n()
+
   const { data: channels, isError, isLoading } = useQuery({
     queryKey: CHANNEL_CAPABILITIES_QUERY_KEY,
     queryFn: getChannelCapabilities,
     staleTime: 0
   })
+
   const [selected, setSelected] = useState<string | null>(null)
   const [enabledToolsets, setEnabledToolsets] = useState<Set<string>>(new Set())
   const [mcpMode, setMcpMode] = useState<ChannelMcpMode>('all')
@@ -40,9 +42,11 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
   const visibleChannels = useMemo(() => {
     const needle = query.trim().toLowerCase()
     const rows = channels ?? []
+
     if (!needle) {
       return rows
     }
+
     return rows.filter(
       channel =>
         channel.label.toLowerCase().includes(needle) ||
@@ -68,6 +72,7 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
     if (!active) {
       return
     }
+
     setEnabledToolsets(new Set(active.toolsets.filter(toolset => toolset.enabled).map(toolset => toolset.name)))
     setMcpMode(active.mcp.mode)
     setMcpServers(new Set(active.mcp.selected))
@@ -80,11 +85,13 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
   ) =>
     setter(current => {
       const next = new Set(current)
+
       if (enabled) {
         next.add(name)
       } else {
         next.delete(name)
       }
+
       return next
     })
 
@@ -92,7 +99,9 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
     if (!active || saving) {
       return
     }
+
     setSaving(true)
+
     try {
       await updateChannelCapabilities(active.platform, {
         toolsets: [...enabledToolsets].sort(),
