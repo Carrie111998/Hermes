@@ -46,7 +46,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -294,6 +294,39 @@ async def _exec_buzz(
         stdout.decode("utf-8", errors="replace"),
         stderr.decode("utf-8", errors="replace"),
     )
+
+
+async def _send_retrying_unthreaded(
+    runner: Callable[[List[str]], Awaitable[Tuple[int, str, str]]],
+    args: List[str],
+    reply_target: Optional[str],
+) -> Tuple[int, str, str]:
+    """Run a buzz send, retrying once without ``--reply-to`` if the relay
+    rejects the parent event.
+
+    The reply anchor can name an event this relay has never seen: this adapter
+    never sets thread metadata on inbound, so ``metadata["thread_id"]`` arrives
+    from generic gateway machinery. buzz-cli then rejects the whole send, and
+    the caller's plain-text fallback re-sends with the same anchor and fails
+    identically — so the message is lost outright.
+
+    Threading is a presentation detail; losing the message over it is not.
+    The retry is bounded to a single attempt and to this one error, so every
+    other failure surfaces unchanged.
+
+    ``runner`` takes an argv list and returns ``(code, stdout, stderr)``,
+    which lets the adapter's ``_run_cli`` and the module-level ``_exec_buzz``
+    share this path.
+    """
+    code, out, err = await runner(args)
+    if code == 0 or not reply_target or not _PARENT_NOT_FOUND_RE.search(err or ""):
+        return code, out, err
+    logger.warning(
+        "Buzz: reply target %s not found on relay; resending unthreaded",
+        str(reply_target)[:12],
+    )
+    flat = [a for a in args if a not in ("--reply-to", str(reply_target))]
+    return await runner(flat)
 
 
 def _cli_error_message(stderr: str, returncode: int) -> str:
@@ -591,20 +624,9 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
-        code, out, err = await self._run_cli(args, input_text=content)
-        if code != 0 and reply_target and _PARENT_NOT_FOUND_RE.search(err or ""):
-            # The reply target does not exist on this relay. ``metadata["thread_id"]``
-            # is populated by generic gateway machinery — this adapter never sets
-            # thread metadata on inbound — so it can carry an id the relay has
-            # never seen. Threading is a presentation detail; losing the message
-            # over it is not, and the caller's plain-text fallback re-sends with
-            # the same reply target and fails identically. Retry flat once.
-            logger.warning(
-                "Buzz: reply target %s not found on relay; resending unthreaded",
-                str(reply_target)[:12],
-            )
-            args = [a for a in args if a not in ("--reply-to", str(reply_target))]
-            code, out, err = await self._run_cli(args, input_text=content)
+        code, out, err = await _send_retrying_unthreaded(
+            lambda a: self._run_cli(a, input_text=content), args, reply_target
+        )
         if code != 0:
             return SendResult(
                 success=False,
@@ -675,7 +697,9 @@ class BuzzAdapter(BasePlatformAdapter):
             ]
             if reply_to:
                 args += ["--reply-to", str(reply_to)]
-            code, out, err = await self._run_cli(args, input_text=caption or "")
+            code, out, err = await _send_retrying_unthreaded(
+                lambda a: self._run_cli(a, input_text=caption or ""), args, reply_to
+            )
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
             try:
@@ -1383,8 +1407,12 @@ async def _standalone_send(
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
-        code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+        code, out, err = await _send_retrying_unthreaded(
+            lambda a: _exec_buzz(
+                cli_path, a, relay_url=relay, private_key=private_key, input_text=message
+            ),
+            args,
+            thread_id,
         )
     except asyncio.CancelledError:
         raise
