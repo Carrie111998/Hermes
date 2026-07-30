@@ -202,6 +202,7 @@ export function ChatBar({
   const {
     activeQueueSessionKeyRef,
     clearDraft,
+    draftScopeRef,
     draftRef,
     editorRef,
     focusInput,
@@ -310,12 +311,12 @@ export function ChatBar({
   // the submit decision tree, the send-with-restore primitive, and steer.
   const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
     activeQueueSessionKey,
-    activeQueueSessionKeyRef,
     attachments,
     busy,
     compacting,
     clearDraft,
     disabled,
+    draftScopeRef,
     draftRef,
     drainNextQueued,
     editorRef,
