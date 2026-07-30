@@ -2484,11 +2484,28 @@ class _McpSidebarVerifier:
         return None
 
 
-def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
+def _seed_mcp_sidebar_commit_case(
     db: SessionDB,
-) -> None:
+    *,
+    root: Path,
+    projected_cwd: Path,
+) -> tuple[
+    SessionBridgeStore,
+    SessionBridgeCoordinator,
+    BridgeConfig,
+    _McpSidebarVerifier,
+    str,
+    str,
+    str,
+    str,
+]:
     token = "lineage-opaque-lease-token"
     now = 1_000.0
+    inbox = root / "profile"
+    source_cwd = root / "source"
+    inbox.mkdir(parents=True)
+    source_cwd.mkdir()
+    projected_cwd.mkdir(exist_ok=True)
     store = SessionBridgeStore(
         db,
         clock=lambda: now,
@@ -2498,7 +2515,7 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
         Provider.CLAUDE,
         "lineage-source",
         title="Lineage source",
-        cwd="C:/work/lineage",
+        cwd=str(source_cwd),
         timestamp=900.0,
     )
     store.upsert_projection(source)
@@ -2509,7 +2526,7 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
         provider=Provider.CLAUDE,
         bridge_id=bridge_id,
         title="[Claude] Lineage source",
-        cwd="C:/work/lineage",
+        cwd=str(source_cwd),
         git_root=None,
         git_branch="main",
         git_head=None,
@@ -2524,28 +2541,82 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
             Provider.CODEX,
             thread_id,
             title="Native sidebar placeholder",
-            cwd="C:/work/lineage",
+            cwd=str(projected_cwd),
             timestamp=950.0,
             origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
             origin_bridge_id=bridge_id,
         )
     )
-    verified = VerifiedSidebarThread(thread_id, source_id, bridge_id)
+    verified_projection = _projection(
+        Provider.CODEX,
+        thread_id,
+        title="Native sidebar placeholder",
+        cwd=str(projected_cwd),
+        timestamp=950.0,
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=bridge_id,
+    )
+    verified = VerifiedSidebarThread(
+        thread_id,
+        source_id,
+        bridge_id,
+        projection=verified_projection,
+    )
     verifier = _McpSidebarVerifier(verified)
+    config = BridgeConfig(
+        sidebar=SidebarConfig(
+            enabled=True,
+            inbox_cwd=str(inbox),
+            placement_generation=1,
+        )
+    )
     coordinator = SessionBridgeCoordinator(
-        config=BridgeConfig(sidebar=SidebarConfig(enabled=True)),
+        config=config,
         store=store,
         adapters={},
         sidebar_verifier=verifier,
         clock=lambda: now,
     )
+    return (
+        store,
+        coordinator,
+        config,
+        verifier,
+        token,
+        thread_id,
+        source_id,
+        bridge_id,
+    )
+
+
+def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
+    db: SessionDB,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inbox = tmp_path / "commit-success" / "profile"
+    (
+        store,
+        coordinator,
+        config,
+        verifier,
+        token,
+        thread_id,
+        source_id,
+        bridge_id,
+    ) = _seed_mcp_sidebar_commit_case(
+        db,
+        root=tmp_path / "commit-success",
+        projected_cwd=inbox,
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: inbox)
 
     with _test_client(
         create_app(
             catalog=UnifiedCatalog(db, store),
             coordinator=coordinator,
             store=store,
-            config=BridgeConfig(),
+            config=config,
             token=TOKEN,
             marker_key=MARKER_KEY,
         )
@@ -2578,6 +2649,91 @@ def test_session_sidebar_commit_binds_exact_indexed_codex_lineage_once(
         "SELECT * FROM session_links WHERE bridge_id = ?", (bridge_id,)
     ).fetchall()
     assert len(links) == 1
+    job = store.get_sidebar_job_for_source(source_id)
+    assert job is not None
+    assert job["placement_generation"] == 1
+    assert job["placement_verified_at"] == 1_000.0
+    status = store.sidebar_delivery_status(
+        inbox_cwd=str(inbox),
+        placement_generation=1,
+    )
+    assert status["placement"]["verified_visible"] == 1
+
+
+def test_session_sidebar_commit_rejects_exact_marker_in_wrong_project_without_visibility(
+    db: SessionDB,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "commit-wrong-project"
+    inbox = root / "profile"
+    wrong_project = root / "wrong-project"
+    (
+        store,
+        coordinator,
+        config,
+        verifier,
+        token,
+        thread_id,
+        source_id,
+        bridge_id,
+    ) = _seed_mcp_sidebar_commit_case(
+        db,
+        root=root,
+        projected_cwd=wrong_project,
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: inbox)
+
+    with _test_client(
+        create_app(
+            catalog=UnifiedCatalog(db, store),
+            coordinator=coordinator,
+            store=store,
+            config=config,
+            token=TOKEN,
+            marker_key=MARKER_KEY,
+        )
+    ) as client:
+        payload = _rpc(
+            client,
+            "tools/call",
+            {
+                "name": "session_sidebar_commit",
+                "arguments": {
+                    "lease_token": token,
+                    "codex_thread_id": thread_id,
+                },
+            },
+            request_id=49,
+        )
+
+    assert payload["result"]["isError"] is True
+    error_text = payload["result"]["content"][0]["text"]
+    assert error_text.endswith("placement_mismatch")
+    assert str(inbox) not in error_text
+    assert str(wrong_project) not in error_text
+    assert str(root / "source") not in error_text
+    assert verifier.verify_calls == [thread_id]
+    job = store.get_sidebar_job_for_source(source_id)
+    assert job is not None
+    assert job["state"] == "sidebar_leased"
+    assert job["codex_thread_id"] == thread_id
+    assert job["placement_generation"] is None
+    assert job["placement_verified_at"] is None
+    assert job["visible_at"] is None
+    assert job["completion_digest"] is None
+    assert (
+        db._conn.execute(
+            "SELECT 1 FROM session_links WHERE bridge_id = ?",
+            (bridge_id,),
+        ).fetchone()
+        is None
+    )
+    status = store.sidebar_delivery_status(
+        inbox_cwd=str(inbox),
+        placement_generation=1,
+    )
+    assert status["placement"]["verified_visible"] == 0
 
 
 def test_native_hermes_sidebar_lineage_resolves_for_codex_continuation(

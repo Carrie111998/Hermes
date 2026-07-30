@@ -13,6 +13,8 @@ import time
 from typing import Any, NoReturn, Protocol, cast
 import uuid
 
+import hermes_constants
+
 from .claude_adapter import AmbiguousPlaceholderCreation, PlaceholderCreationError
 from .claude_visibility import (
     CLAUDE_VISIBILITY_EXCLUSION_CODES,
@@ -61,6 +63,11 @@ from .sidebar import (
     is_sidebar_session_eligible,
     sidebar_bridge_id,
     sidebar_title,
+)
+from .sidebar_placement import (
+    SidebarPlacementError,
+    placement_paths_equivalent,
+    resolve_sidebar_placement,
 )
 from .preview import build_session_preview
 from .store import (
@@ -1853,6 +1860,38 @@ class SessionBridgeCoordinator:
         ):
             raise SidebarVerificationError("source_identity_mismatch")
         if ensure_lineage:
+            projection = verified.projection
+            if (
+                not isinstance(projection, SessionProjection)
+                or projection.provider is not Provider.CODEX
+                or projection.native_id != thread_id
+            ):
+                raise SidebarVerificationError("source_identity_mismatch")
+            try:
+                candidate = await asyncio.to_thread(
+                    _call,
+                    self._store,
+                    "get_sidebar_candidate_for_delivery",
+                    source_session_id,
+                )
+                placement = await asyncio.to_thread(
+                    resolve_sidebar_placement,
+                    cast(str, self._config.sidebar.inbox_cwd),
+                    hermes_constants.get_hermes_home(),
+                    self._config.sidebar.placement_generation,
+                    candidate.cwd,
+                )
+            except SidebarPlacementError as exc:
+                raise SidebarVerificationError(exc.code) from None
+            except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                raise SidebarVerificationError("source_identity_mismatch") from None
+            if not placement_paths_equivalent(
+                projection.cwd,
+                placement.inbox_cwd,
+            ):
+                raise SidebarVerificationError("placement_mismatch")
             result = await asyncio.to_thread(
                 _call,
                 self._store,

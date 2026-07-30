@@ -110,8 +110,10 @@ class SidebarVerificationError(RuntimeError):
         if code not in {
             "bridge_temporarily_unavailable",
             "codex_thread_conflict",
+            "inbox_unavailable",
             "marker_conflict",
             "native_task_not_indexed",
+            "placement_mismatch",
             "provider_mismatch",
             "source_identity_mismatch",
         }:

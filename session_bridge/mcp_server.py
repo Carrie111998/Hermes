@@ -25,6 +25,7 @@ from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_FATAL_CODES,
     CLAUDE_VISIBILITY_RETRY_CODES,
 )
+from .codex_adapter import SidebarVerificationError
 from .config import BridgeConfig
 from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
@@ -746,6 +747,8 @@ def create_app(
             }
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
+        except SidebarVerificationError as exc:
+            raise ValueError(exc.code) from None
         except Exception:
             raise ValueError("sidebar_commit_failed") from None
 
