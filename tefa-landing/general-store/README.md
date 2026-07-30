@@ -1,5 +1,9 @@
 # General Store (prototype)
 
+## Public path rule
+
+**Do not include this directory in the customer-facing ESA launch.** It is a development preview only. The UI labels use **Preview cart**, **Checkout preview**, and **Preview confirmation** so a reviewer cannot reasonably mistake local browser behavior for a real retail order.
+
 A separate retail line — kept apart from `../store/` on purpose. The ESA/TEFA storefront
 only ever produces an itemized invoice for a state program to approve; it never collects
 payment. Retail goods (a family book, activity books) are a different money flow entirely —
@@ -32,7 +36,7 @@ carts never mix.
   example), not your real obligation. What you actually owe depends on your nexus, the buyer's
   state, and how your resale permit is set up — connect a real tax calculation step (Stripe
   Tax, TaxJar, Avalara) or your own filing process before publishing a number to customers.
-- **"Place order" does not place an order.** It validates the form, clears the cart, and shows
+- **"Preview confirmation" does not place an order.** It validates the form, clears the cart, and shows
   a confirmation panel that says exactly that — no charge, no email, no created order. That's
   the seam where a real backend needs to go.
 
