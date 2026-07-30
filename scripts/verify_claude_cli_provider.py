@@ -4,9 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import sys
 import tempfile
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from agent.claude_cli_client import ClaudeCLIClient
 from agent.claude_cli_process import ClaudeCLIProcessRunner
@@ -44,8 +50,12 @@ def run_verification(*, model: str = "opus", executable: str = "claude") -> dict
     auth = runner.auth_status()
     version = runner.version()
 
-    with tempfile.TemporaryDirectory(prefix="hermes-claude-cli-live-") as tmp:
+    with (
+        tempfile.TemporaryDirectory(prefix="hermes-claude-cli-live-") as tmp,
+        contextlib.ExitStack() as cleanup,
+    ):
         db = SessionDB(Path(tmp) / "state.db")
+        cleanup.callback(db.close)
         hermes_session_id = "claude-cli-live-verification"
         db.create_session(hermes_session_id, "verification", model=model)
         client = ClaudeCLIClient(
@@ -54,6 +64,7 @@ def run_verification(*, model: str = "opus", executable: str = "claude") -> dict
             session_id=hermes_session_id,
             runner=runner,
         )
+        cleanup.callback(client.close)
         tools = [_ECHO_TOOL]
         messages = [
             {
@@ -137,7 +148,6 @@ def run_verification(*, model: str = "opus", executable: str = "claude") -> dict
         if not resumed:
             raise RuntimeError("Claude provider session was not resumed")
 
-        client.close()
         return {
             "exact_response": exact,
             "tool_result": tool_result,

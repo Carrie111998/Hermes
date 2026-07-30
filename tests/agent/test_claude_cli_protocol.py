@@ -103,6 +103,8 @@ def test_rejects_malformed_json_and_unknown_fields():
 def test_schema_forbids_unknown_fields():
     schema = json.loads(decision_schema_json())
     assert schema["additionalProperties"] is False
+    assert "$schema" not in schema
+    assert all(key not in schema for key in ("oneOf", "allOf", "anyOf"))
 
 
 def test_bootstrap_and_resume_prompts_have_distinct_deterministic_frames():

@@ -64,7 +64,16 @@ def _compact_json(value: Any) -> str:
 def decision_schema_json() -> str:
     """Return the schema passed to Claude's ``--json-schema`` flag."""
 
-    return _compact_json(DECISION_SCHEMA)
+    # Claude Code converts this schema to a custom tool input schema. That
+    # surface rejects the Draft 2020-12 URI and top-level combinators. Keep
+    # those stricter constraints for Hermes's local validator, which remains
+    # authoritative before any decision reaches the tool loop.
+    cli_schema = {
+        key: value
+        for key, value in DECISION_SCHEMA.items()
+        if key not in {"$schema", "oneOf", "allOf", "anyOf"}
+    }
+    return _compact_json(cli_schema)
 
 
 def _tool_schemas(tools: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
