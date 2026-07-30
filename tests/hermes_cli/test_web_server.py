@@ -910,6 +910,30 @@ class TestWebServerEndpoints:
             fields["EMAIL_REQUIRE_STRUCTURED_RESPONSE"]["current_value"] == "true"
         )
 
+    def test_email_reply_keywords_round_trip_unicode(self):
+        must_reply = "紧急+发票;请尽快回复"
+        no_reply = "推广;验证码"
+
+        saved = self.client.put(
+            "/api/messaging/platforms/email",
+            json={
+                "env": {
+                    "EMAIL_FORCE_REPLY_KEYWORDS": must_reply,
+                    "EMAIL_NO_REPLY_KEYWORDS": no_reply,
+                }
+            },
+        )
+        assert saved.status_code == 200
+
+        resp = self.client.get("/api/messaging/platforms")
+        assert resp.status_code == 200
+        platforms = {row["id"]: row for row in resp.json()["platforms"]}
+        fields = {
+            field["key"]: field for field in platforms["email"]["env_vars"]
+        }
+        assert fields["EMAIL_FORCE_REPLY_KEYWORDS"]["current_value"] == must_reply
+        assert fields["EMAIL_NO_REPLY_KEYWORDS"]["current_value"] == no_reply
+
 
 
 

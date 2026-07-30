@@ -9258,7 +9258,15 @@ async def update_messaging_platform(
                 trimmed = value.strip()
                 if trimmed:
                     _validate_messaging_env_value(platform_id, key, trimmed)
-                    save_env_value(key, trimmed)
+                    save_env_value(
+                        key,
+                        trimmed,
+                        preserve_unicode=key
+                        in {
+                            "EMAIL_FORCE_REPLY_KEYWORDS",
+                            "EMAIL_NO_REPLY_KEYWORDS",
+                        },
+                    )
 
             if body.enabled is not None:
                 _write_platform_enabled(platform_id, body.enabled)
