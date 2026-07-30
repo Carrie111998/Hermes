@@ -733,6 +733,9 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    evidence = args.get("evidence")
+    if evidence is not None:
+        evidence = redact_sensitive_text(str(evidence), force=True)
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -759,17 +762,18 @@ def _handle_block(args: dict, **kw) -> str:
         ):
             conn.close()
             return tool_error(
-                f"goal_mode tasks can only block with kind in "
+                "goal_mode tasks can only block with kind in "
                 f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). "
-                f"If the task is actually finished or cannot proceed for "
-                f"another reason, call kanban_complete instead — the "
-                f"completion judge will evaluate it."
+                "If the task is actually finished or cannot proceed for "
+                "another reason, call kanban_complete instead — the "
+                "completion judge will evaluate it."
             )
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                evidence=evidence,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -790,6 +794,15 @@ def _handle_block(args: dict, **kw) -> str:
         finally:
             conn.close()
     except ValueError as e:
+        # Verified-blocker gate failure: surface a clear, actionable error to
+        # the agent so it knows exactly what to put in the next call. The
+        # underlying kanban_db error cites Article XII P5 / XIV P2; we add a
+        # short pointer to the tool schema so the next attempt is well-formed.
+        msg = str(e)
+        if "evidence is required" in msg:
+            return tool_error(
+                "kanban_block: " + msg
+            )
         return tool_error(f"kanban_block: {e}")
     except Exception as e:
         logger.exception("kanban_block failed")
@@ -1663,6 +1676,27 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "evidence": {
+                "type": "string",
+                "description": (
+                    "Falsification record — REQUIRED when kanban."
+                    "require_block_evidence is enabled in config.yaml "
+                    "(and your block would land in 'blocked', not 'todo' "
+                    "and not 'triage'). The string MUST record: (a) the "
+                    "command/observation you ran to verify the blocking "
+                    "condition, (b) the result you observed, and (c) the "
+                    "conclusion that the blocker is real. Example: "
+                    "'ran ssh-add ~/.ssh/id_ed25519; result: key loaded, "
+                    "fingerprint sha256:abc123; subsequent ssh -o "
+                    "BatchMode=yes macbook-pro echo OK returned OK and "
+                    "exit 0; the SSH key is available, so the blocker is "
+                    "the remote account, not the key.' Without evidence, "
+                    "the runtime rejects the transition (Article XII P5: "
+                    "falsify before concluding). Dependency blocks "
+                    "(kind='dependency') and loop-detected routing to "
+                    "triage are exempt at the routing layer."
                 ),
             },
             "board": _board_schema_prop(),

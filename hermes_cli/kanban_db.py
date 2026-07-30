@@ -5474,7 +5474,9 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    evidence: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _system_observed: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5500,6 +5502,39 @@ def block_task(
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
+    ``evidence`` is the falsification record the caller supplies for the
+    blocker: the command/observation they ran to verify the blocking
+    condition, the result they observed, and the conclusion they drew.
+    When ``kanban.require_block_evidence`` is enabled in ``config.yaml``,
+    a block that would land in ``blocked`` (the human queue) MUST be
+    accompanied by a non-empty ``evidence`` — this is the runtime gate
+    against declaring a blocker without first falsifying it (Article XII
+    P5 falsify-before-concluding + Article XIV P2 blockers-create-work).
+    When supplied, the string is recorded in the ``blocked`` event
+    payload and appended to the synthesized run summary so the
+    falsification is auditable post-hoc via SQL or the dashboard.
+
+    The gate fires only when the block would land in ``blocked`` —
+    ``dependency`` blocks (route to ``todo``) and ``recurrences >=
+    BLOCK_RECURRENCE_LIMIT`` (route to ``triage``) are exempt at the
+    routing layer; their destinations are not the human queue.
+
+    ``_system_observed`` is an internal escape hatch for system-observed
+    blocks (the circuit breaker and the goal-loop budget fallback) whose
+    evidence is the system's own observation rather than a caller claim.
+    The leading underscore signals "do not pass this from caller code" —
+    it exists so the same gate can be enforced uniformly on every code
+    path that would land in ``blocked``. A caller MUST NOT use
+    ``_system_observed=True`` to bypass the gate on a claim they could
+    have falsified; the exemption is for paths where the falsification
+    is performed by the runtime itself.
+
+    When the gate is disabled (default, for backward compatibility with
+    existing code and tests), ``evidence`` is recorded when supplied but
+    is not required. Operators enable the gate in their ``config.yaml``
+    under ``kanban.require_block_evidence: true`` to opt into the
+    verified-blocker rule.
+
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
@@ -5507,6 +5542,21 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Evidence gate (verified-blocker rule). Load config defensively — the
+    # config module is itself optional at import time in some test setups, and
+    # a missing/malformed config must default the gate to OFF (existing
+    # call-site behavior) rather than break unrelated callers.
+    try:
+        from hermes_cli.config import load_config
+
+        _kanban_cfg = (load_config().get("kanban") or {})
+    except Exception:
+        _kanban_cfg = {}
+    _require_evidence = bool(_kanban_cfg.get("require_block_evidence", False))
+
+    def _evidence_valid() -> bool:
+        return isinstance(evidence, str) and bool(evidence.strip())
+
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(
@@ -5555,7 +5605,8 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "evidence": evidence},
+                run_id=run_id,
             )
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
@@ -5580,6 +5631,8 @@ def block_task(
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
+            # The destination is ``triage``, not the human queue, so the
+            # evidence gate does not fire here regardless of caller.
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -5613,10 +5666,35 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    "evidence": evidence,
                 },
                 run_id=run_id,
             )
         else:
+            # This branch lands in the human ``blocked`` queue. Enforce the
+            # verified-blocker gate here — after routing determination so we
+            # know the destination is ``blocked``, and exempt only
+            # system-observed blocks (circuit breaker, goal-loop fallback)
+            # whose evidence is the runtime's own observation.
+            if _require_evidence and not _system_observed and not _evidence_valid():
+                raise ValueError(
+                    "block_task: evidence is required for non-dependency blocks "
+                    "when kanban.require_block_evidence is enabled in "
+                    "config.yaml. The caller MUST record the falsification "
+                    "attempt (e.g. the command run, the result observed, the "
+                    "conclusion drawn) before transitioning a task to "
+                    "'blocked'. See Article XII P5 (falsify before concluding) "
+                    "and Article XIV P2 (blockers create work, not waiting). "
+                    "For dependency blocks use kind='dependency'."
+                )
+            # Compose the run summary so the falsification lives in attempt
+            # history (not just in the event log). When evidence is absent
+            # because the gate is off, the summary stays unchanged.
+            _summary = (
+                f"{reason}\n\n[evidence]\n{evidence}"
+                if (reason and _evidence_valid())
+                else reason
+            )
             if expected_run_id is None:
                 cur = conn.execute(
                     """
@@ -5653,19 +5731,27 @@ def block_task(
             run_id = _end_run(
                 conn, task_id,
                 outcome="blocked", status="blocked",
-                summary=reason,
+                summary=_summary,
             )
             # Synthesize a run when blocking a never-claimed task so the
-            # reason is preserved in attempt history.
+            # reason is preserved in attempt history. When evidence was
+            # supplied, the run summary includes it so the falsification
+            # attempt is auditable in task_runs (not just in the event log).
             if run_id is None and reason:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
-                    summary=reason,
+                    summary=_summary,
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "evidence": evidence,
+                    "system_observed": _system_observed,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)

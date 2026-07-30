@@ -17430,9 +17430,25 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _block(reason: str) -> None:
+        # System-observed block: the goal-loop fallback's "block" decision
+        # is the runtime observing that the worker (a) refused to
+        # finalize after a nudge, or (b) exhausted its turn budget. The
+        # reason string already encodes the falsification ("judge said
+        # done, worker still won't call kanban_complete" / "turns_used
+        # == max_turns"), so we plumb it through as the evidence field
+        # AND pass _system_observed=True so the verified-blocker gate
+        # (when enabled) recognises this as a system-observed transition
+        # rather than an agent claim. The block can land in 'blocked'
+        # either way; _system_observed is the structural marker, and
+        # reason-as-evidence is the auditable record.
         c = _kb.connect()
         try:
-            _kb.block_task(c, task_id, reason=reason)
+            _kb.block_task(
+                c, task_id,
+                reason=reason,
+                evidence=reason,
+                _system_observed=True,
+            )
         finally:
             try:
                 c.close()

@@ -822,6 +822,13 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    # Verified-blocker evidence: when status='blocked' and
+    # kanban.require_block_evidence is enabled in config.yaml, this is
+    # the falsification record forwarded to ``block_task``. When the
+    # gate is off the field is ignored. Dependency blocks
+    # (block_kind='dependency') and loop-detected routing to triage are
+    # exempt at the routing layer.
+    block_evidence: Optional[str] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -868,7 +875,23 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     metadata=payload.metadata,
                 )
             elif s == "blocked":
-                ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+                try:
+                    ok = kanban_db.block_task(
+                        conn, task_id,
+                        reason=payload.block_reason,
+                        evidence=payload.block_evidence,
+                    )
+                except ValueError as e:
+                    # Verified-blocker gate failure (or invalid kind).
+                    # 422: the request was well-formed but cannot be
+                    # processed as-is — the operator must supply
+                    # block_evidence. The detail message cites the
+                    # constitutional anchors so any future code that
+                    # surfaces this 422 understands the rule.
+                    raise HTTPException(
+                        status_code=422,
+                        detail=str(e),
+                    )
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -1190,6 +1213,18 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    # Block reason forwarded to ``block_task`` when status='blocked' in
+    # this bulk request. Same role as UpdateTaskBody.block_reason.
+    block_reason: Optional[str] = None
+    # Verified-blocker evidence (same semantics as UpdateTaskBody.
+    # block_evidence): applied to every task that transitions to
+    # 'blocked' in this bulk request. When
+    # kanban.require_block_evidence is enabled, every task that lands in
+    # 'blocked' must satisfy the gate using this same evidence string —
+    # useful when the operator has already verified the condition once
+    # (e.g. "ran ssh-add; key loaded") and is bulk-blocking 10 tasks
+    # against the same root cause.
+    block_evidence: Optional[str] = None
     # Bulk model/provider override — same semantics as UpdateTaskBody.
     model_override: Optional[str] = None
     provider_override: Optional[str] = None
@@ -1231,7 +1266,20 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             metadata=payload.metadata,
                         )
                     elif s == "blocked":
-                        ok = kanban_db.block_task(conn, tid)
+                        try:
+                            ok = kanban_db.block_task(
+                                conn, tid,
+                                reason=payload.block_reason,
+                                evidence=payload.block_evidence,
+                            )
+                        except ValueError as e:
+                            # Verified-blocker gate failure — surface as
+                            # a per-task error so siblings in the bulk
+                            # request can still process. The operator
+                            # can re-issue with block_evidence set.
+                            entry.update(ok=False, error=str(e))
+                            results.append(entry)
+                            continue
                     elif s == "ready":
                         cur = kanban_db.get_task(conn, tid)
                         if cur and cur.status in ("blocked", "scheduled"):

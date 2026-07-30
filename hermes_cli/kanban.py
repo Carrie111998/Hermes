@@ -637,6 +637,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--evidence", default=None,
+        help=(
+            "Falsification record — required when kanban.require_block_evidence "
+            "is enabled in config.yaml AND the block would land in 'blocked' "
+            "(not 'todo', not 'triage'). Record the command/observation that "
+            "established the blocker is real and the result you observed. "
+            "Example: 'ssh-add ~/.ssh/id_ed25519 succeeded; ssh -o BatchMode=yes "
+            "macbook-pro echo OK returned OK and exit 0; SSH key is available, "
+            "so the blocker is the account, not the key.' Without --evidence "
+            "and the gate on, the command exits non-zero with an actionable "
+            "error. Dependency blocks (--kind dependency) and loop-detected "
+            "routing to triage are exempt at the routing layer."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2258,20 +2273,45 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    evidence = getattr(args, "evidence", None)
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
+    # Pre-flight check: if the gate is on and this kind would land in
+    # 'blocked' (not 'todo', not 'triage'), refuse without --evidence
+    # BEFORE opening the connection. Loop-detected routing-to-triage
+    # depends on per-task recurrence state we don't know yet, so we can't
+    # gate that branch here — kanban_db enforces it inside the txn.
+    if reason is None and kind != "dependency":
+        print(
+            "kanban: a non-empty reason is required to block a task.",
+            file=sys.stderr,
+        )
+        return 2
     with kb.connect_closing() as conn:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    evidence=evidence,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                # Verified-blocker gate failure (or invalid kind). Surface
+                # an actionable stderr message and treat as failure for this
+                # task; the user can re-run with --evidence.
+                print(
+                    f"kanban: cannot block {tid}: {exc}",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
