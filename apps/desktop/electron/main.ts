@@ -120,6 +120,10 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import {
+  createIntentionalBackendTeardownGuard,
+  shouldSuppressBackendExitNotice
+} from './intentional-backend-teardown'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -989,10 +993,10 @@ let mainWindow = null
 const backendConnectionState = createBackendConnectionState<ReturnType<typeof spawn>, any>()
 const remoteLiveness = new RemoteLivenessTracker()
 const remoteRevalidation = new RemoteRevalidationCoordinator()
-// Nonzero while Hermes intentionally tears down its local child. This covers
-// retries, profile switches, updates, and soft connection applies; none should
-// surface a "backend stopped" error to the user.
-let intentionalBackendTeardowns = 0
+// Held only around the Windows update/uninstall lock-release kill. Retry,
+// profile-switch, and soft-apply already invalidate backendConnectionState so
+// their exits are rejected as stale before sendBackendExit.
+const intentionalBackendTeardown = createIntentionalBackendTeardownGuard()
 // True while connection-config:apply soft-rehomes the primary — suppresses the
 // backend-exit toast so an intentional kill doesn't look like a crash.
 let softRehomeInProgress = false
@@ -2639,81 +2643,95 @@ async function releaseBackendLock(updateRoot, tag) {
     return { unlocked: true }
   }
 
-  // Collect every backend PID the desktop owns: primary window backend + pool.
-  const pids = []
-  const hermesProcess = backendConnectionState.getProcess()
+  // Kill without invalidate() alone would leave the primary child's exit
+  // "current" and toast. Hold the intentional guard for this window, and
+  // invalidate after capturing PIDs so stale-owner also covers a late exit
+  // if the wait times out before the Node 'exit' event.
+  return intentionalBackendTeardown.run(async () => {
+    // Collect every backend PID the desktop owns: primary window backend + pool.
+    const pids = []
+    const hermesProcess = backendConnectionState.getProcess()
 
-  if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
-    pids.push(hermesProcess.pid)
-  }
-
-  for (const entry of backendPool.values()) {
-    if (entry.process && Number.isInteger(entry.process.pid)) {
-      pids.push(entry.process.pid)
-    }
-  }
-
-  // Graceful first (lets Python flush), then tree-kill to catch grandchildren.
-  if (hermesProcess && !hermesProcess.killed) {
-    try {
-      hermesProcess.kill('SIGTERM')
-    } catch {
-      void 0
-    }
-  }
-
-  stopAllPoolBackends()
-
-  for (const pid of pids) {
-    forceKillProcessTree(pid)
-  }
-
-  const shim = venvHermesShimPath(updateRoot)
-  const deadlineMs = Date.now() + 15000
-
-  while (Date.now() < deadlineMs) {
-    if (!isShimLocked(shim)) {
-      rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
-
-      return { unlocked: true }
-    }
-
-    // A supervised backend can respawn between kill and check (grandchildren,
-    // pool entries registered mid-teardown). Re-collect and re-kill each pass
-    // instead of trusting the initial sweep.
-    const stragglers = []
-
-    const currentHermesProcess = backendConnectionState.getProcess()
-
-    if (currentHermesProcess && Number.isInteger(currentHermesProcess.pid)) {
-      stragglers.push(currentHermesProcess.pid)
+    if (hermesProcess && Number.isInteger(hermesProcess.pid)) {
+      pids.push(hermesProcess.pid)
     }
 
     for (const entry of backendPool.values()) {
       if (entry.process && Number.isInteger(entry.process.pid)) {
-        stragglers.push(entry.process.pid)
+        pids.push(entry.process.pid)
       }
     }
 
-    for (const pid of stragglers) {
+    // Drop current-owner status before signalling so a delayed 'exit' cannot
+    // reach sendBackendExit after the suppress guard ends.
+    backendConnectionState.invalidate()
+
+    // Graceful first (lets Python flush), then tree-kill to catch grandchildren.
+    if (hermesProcess && !hermesProcess.killed) {
+      try {
+        hermesProcess.kill('SIGTERM')
+      } catch {
+        void 0
+      }
+    }
+
+    stopAllPoolBackends()
+
+    for (const pid of pids) {
       forceKillProcessTree(pid)
     }
 
-    await new Promise(r => setTimeout(r, 300))
-  }
+    // Prefer draining 'exit' while the guard is still held; invalidate above
+    // remains the backstop if this wait ends on its post-kill grace timeout.
+    await waitForBackendExit(hermesProcess)
 
-  // Do NOT proceed past a held lock: handing off to the updater while another
-  // process (a second desktop window, a user terminal, an unkillable child)
-  // still maps the venv's files guarantees a half-updated venv — the updater's
-  // dependency sync dies on access-denied partway through uninstalls, leaving
-  // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
-  // the update loudly and keeping the app running is strictly better than a
-  // bricked install that needs manual venv surgery.
-  rememberLog(
-    `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
-  )
+    const shim = venvHermesShimPath(updateRoot)
+    const deadlineMs = Date.now() + 15000
 
-  return { unlocked: false }
+    while (Date.now() < deadlineMs) {
+      if (!isShimLocked(shim)) {
+        rememberLog(`[${tag}] venv shim unlocked; safe to proceed`)
+
+        return { unlocked: true }
+      }
+
+      // A supervised backend can respawn between kill and check (grandchildren,
+      // pool entries registered mid-teardown). Re-collect and re-kill each pass
+      // instead of trusting the initial sweep.
+      const stragglers = []
+
+      const currentHermesProcess = backendConnectionState.getProcess()
+
+      if (currentHermesProcess && Number.isInteger(currentHermesProcess.pid)) {
+        stragglers.push(currentHermesProcess.pid)
+      }
+
+      for (const entry of backendPool.values()) {
+        if (entry.process && Number.isInteger(entry.process.pid)) {
+          stragglers.push(entry.process.pid)
+        }
+      }
+
+      for (const pid of stragglers) {
+        forceKillProcessTree(pid)
+      }
+
+      await new Promise(r => setTimeout(r, 300))
+    }
+
+    // Do NOT proceed past a held lock: handing off to the updater while another
+    // process (a second desktop window, a user terminal, an unkillable child)
+    // still maps the venv's files guarantees a half-updated venv — the updater's
+    // dependency sync dies on access-denied partway through uninstalls, leaving
+    // imports broken (the July 2026 brotlicffi/_sodium.pyd incidents). Failing
+    // the update loudly and keeping the app running is strictly better than a
+    // bricked install that needs manual venv surgery.
+    rememberLog(
+      `[${tag}] venv shim still locked after 15s; aborting hand-off (something outside this app holds the venv)`
+    )
+
+    return { unlocked: false }
+  })
 }
 
 // applyUpdates — hand off to the installer's --update flow, then exit.
@@ -4951,9 +4969,15 @@ function getWindowState(win = mainWindow) {
 }
 
 function sendBackendExit(payload) {
-  // Intentional soft re-home (gateway mode apply) kills the child on purpose —
+  // Soft re-home + Windows update/uninstall lock-release kills are intentional —
   // don't surface the "backend stopped" error toast / boot-failure path.
-  if (softRehomeInProgress || intentionalBackendTeardowns > 0) {
+  // Stale-owner exits (after invalidate) never reach here; see clearForCurrentProcess.
+  if (
+    shouldSuppressBackendExitNotice({
+      softRehomeInProgress,
+      intentionalTeardownDepth: intentionalBackendTeardown.depth
+    })
+  ) {
     return
   }
 
@@ -7664,21 +7688,18 @@ async function teardownPrimaryBackendAndWait({ soft = false } = {}) {
   const hermesProcess = backendConnectionState.getProcess()
   const dying = hermesProcess && !hermesProcess.killed ? hermesProcess : null
 
-  intentionalBackendTeardowns += 1
-
   if (soft) {
     softRehomeInProgress = true
   }
 
   try {
+    // invalidate() makes the dying child's exit stale before sendBackendExit.
     resetHermesConnection({ soft })
     await waitForBackendExit(dying)
   } finally {
     if (soft) {
       softRehomeInProgress = false
     }
-
-    intentionalBackendTeardowns = Math.max(0, intentionalBackendTeardowns - 1)
   }
 }
 
@@ -7706,6 +7727,24 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   }
 
   await new Promise<void>(resolve => {
+    let settled = false
+
+    const finish = () => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      clearTimeout(graceTimer)
+      clearTimeout(timer)
+      resolve()
+    }
+
+    // After the soft-wait budget, force-kill then keep waiting briefly for the
+    // real 'exit' event so callers that suppress notices for this window do not
+    // drop their guard before Node delivers the handler.
+    let graceTimer = null as ReturnType<typeof setTimeout> | null
+
     const timer = setTimeout(() => {
       try {
         if (IS_WINDOWS && Number.isInteger(child.pid)) {
@@ -7717,13 +7756,10 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
         // Already gone.
       }
 
-      resolve()
+      graceTimer = setTimeout(finish, 2000)
     }, timeoutMs)
 
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
+    child.once('exit', finish)
   })
 }
 
