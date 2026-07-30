@@ -103,6 +103,34 @@ def _block_types(messages):
     return out
 
 
+def _sent_text(messages):
+    """All visible text in the payload, regardless of content representation.
+
+    Downstream normalization may flatten a content list into a plain string
+    before the transport, so assertions about surviving *text* must not depend
+    on the blocks still being a list. Reasoning text must never appear here.
+    """
+    parts = []
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and isinstance(b.get("text"), str):
+                    parts.append(b["text"])
+    return "\n".join(parts)
+
+
+def _has_reasoning_leak(messages):
+    """True if any disallowed reasoning block survived, in either representation."""
+    if "thinking" in _block_types(messages):
+        return True
+    # If content was flattened to a string, the reasoning body would ride along
+    # as plain text — catch that too.
+    return "internal reasoning" in _sent_text(messages)
+
+
 # --------------------------------------------------------------------------
 # Main conversation loop wiring.
 # --------------------------------------------------------------------------
@@ -113,10 +141,9 @@ def test_main_loop_strips_thinking_block_for_copilot_gemini():
     sent = _run_turn(agent, _mixed_history())
 
     assert sent is not None, "provider was never called"
-    types = _block_types(sent)
-    assert "thinking" not in types, f"thinking block reached the wire: {types}"
-    # The visible half of the same message must survive.
-    assert "text" in types
+    assert not _has_reasoning_leak(sent), f"reasoning reached the wire: {sent}"
+    # The visible half of the same message must survive the strip.
+    assert "visible answer" in _sent_text(sent)
 
 
 def test_main_loop_preserves_thinking_block_for_claude():
@@ -125,7 +152,7 @@ def test_main_loop_preserves_thinking_block_for_claude():
     sent = _run_turn(agent, _mixed_history())
 
     assert sent is not None, "provider was never called"
-    assert "thinking" in _block_types(sent)
+    assert _has_reasoning_leak(sent), "reasoning was stripped for a non-Gemini model"
 
 
 def test_gate_does_not_fire_on_empty_base_url():
@@ -182,10 +209,12 @@ def test_main_loop_keeps_allowed_block_types_intact():
     sent = _run_turn(agent, history)
 
     assert sent is not None, "provider was never called"
-    types = _block_types(sent)
-    assert "redacted_thinking" not in types, f"disallowed block reached wire: {types}"
+    assert "redacted_thinking" not in _block_types(sent)
+    assert "opaque" not in _sent_text(sent), "redacted reasoning reached the wire"
     # Every allowed block survives — both user text parts and the answer.
-    assert types.count("text") == 3, types
+    text = _sent_text(sent)
+    for expected in ("part one", "part two", "answer"):
+        assert expected in text, f"{expected!r} missing from payload: {text!r}"
 
 
 # --------------------------------------------------------------------------
@@ -215,8 +244,7 @@ def test_summary_path_strips_thinking_block_for_copilot_gemini():
     sent = _run_summary(agent, _mixed_history())
 
     assert sent is not None, "summary path never reached the provider"
-    types = _block_types(sent)
-    assert "thinking" not in types, f"thinking block reached the wire: {types}"
+    assert not _has_reasoning_leak(sent), f"reasoning reached the wire: {sent}"
 
 
 def test_summary_path_preserves_thinking_block_for_claude():
@@ -224,4 +252,4 @@ def test_summary_path_preserves_thinking_block_for_claude():
     sent = _run_summary(agent, _mixed_history())
 
     assert sent is not None, "summary path never reached the provider"
-    assert "thinking" in _block_types(sent)
+    assert _has_reasoning_leak(sent), "reasoning was stripped for a non-Gemini model"
