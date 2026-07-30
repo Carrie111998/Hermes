@@ -8187,6 +8187,13 @@ def remove_env_value(key: str) -> bool:
     env_path = get_env_path()
     if not env_path.exists():
         os.environ.pop(key, None)
+        # A missing .env defines no keys, so this key is no longer
+        # .env-sourced either — drop the provenance record here too, or a
+        # value later injected by a supervisor would be deleted by
+        # reload_env() on the strength of the stale record.
+        with _CONFIG_LOCK:
+            _DOTENV_LOADED_KEYS.discard(key)
+        invalidate_env_cache()
         return False
 
     read_kw = {"encoding": "utf-8-sig", "errors": "replace"}

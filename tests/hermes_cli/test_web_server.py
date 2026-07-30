@@ -16,6 +16,7 @@ import yaml
 from hermes_cli.config import (
     invalidate_env_cache,
     reload_env,
+    remove_env_value,
     redact_key,
     OPTIONAL_ENV_VARS,
     DEFAULT_CONFIG,
@@ -244,6 +245,37 @@ class TestReloadEnv:
                 # Externally re-injected value must now survive reloads.
                 os.environ[known_key] = "reinjected_externally"
                 assert reload_env() == 0
+                assert os.environ.get(known_key) == "reinjected_externally"
+            finally:
+                os.environ.pop(known_key, None)
+
+    def test_69738_remove_env_value_on_missing_file_discards_provenance(
+        self, tmp_path
+    ):
+        """remove_env_value() must discard .env provenance even on its
+        missing-file early-return path. Otherwise: .env is deleted
+        externally, remove_env_value() runs (pops the process value, keeps
+        the stale record), a supervisor re-injects the value, and the next
+        reload_env() deletes the re-injected value on the strength of the
+        stale record — the exact boundary #69738 exists to protect."""
+        env_file = tmp_path / ".env"
+        known_key = next(iter(OPTIONAL_ENV_VARS.keys()))
+        env_file.write_text(f"{known_key}=from_dotenv\n")
+        provenance: set = set()
+        with patch.dict(
+            reload_env.__globals__,
+            {"get_env_path": lambda: env_file, "_DOTENV_LOADED_KEYS": provenance},
+        ):
+            try:
+                reload_env()  # establishes provenance + injects the value
+                assert known_key in provenance
+                env_file.unlink()  # .env removed externally
+                invalidate_env_cache()
+                assert remove_env_value(known_key) is False  # missing-file path
+                assert known_key not in provenance  # no stale record left
+                # Externally re-injected value must now survive reloads.
+                os.environ[known_key] = "reinjected_externally"
+                reload_env()
                 assert os.environ.get(known_key) == "reinjected_externally"
             finally:
                 os.environ.pop(known_key, None)
