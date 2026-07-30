@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_accepting = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
@@ -61,6 +62,23 @@ class TestSteerDrain:
         agent.steer("hello")
         assert agent._drain_pending_steer() == "hello"
         assert agent._pending_steer is None
+
+    def test_close_atomically_drains_and_rejects_late_steer(self):
+        agent = _bare_agent()
+        assert agent.steer("before close") is True
+
+        assert agent._close_steer_admission() == "before close"
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+    def test_new_turn_reopens_admission(self):
+        agent = _bare_agent()
+        agent._close_steer_admission()
+
+        agent._open_steer_admission()
+
+        assert agent.steer("new turn") is True
+        assert agent._drain_pending_steer() == "new turn"
 
 
 

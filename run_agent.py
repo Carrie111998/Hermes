@@ -3116,10 +3116,14 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if not getattr(self, "_steer_accepting", True):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if not getattr(self, "_steer_accepting", True):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
@@ -3250,6 +3254,34 @@ class AIAgent:
             self._pending_steer = None
             return text
         with _lock:
+            text = self._pending_steer
+            self._pending_steer = None
+        return text
+
+    def _open_steer_admission(self) -> None:
+        """Allow steer() calls for the current conversation turn."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = True
+            return
+        with _lock:
+            self._steer_accepting = True
+
+    def _close_steer_admission(self) -> Optional[str]:
+        """Atomically reject future steers and drain the final pending text.
+
+        The close and drain share steer()'s lock.  Once this returns, a
+        concurrent surface cannot report a steer as accepted unless it was
+        included in the returned text.
+        """
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = False
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
+        with _lock:
+            self._steer_accepting = False
             text = self._pending_steer
             self._pending_steer = None
         return text

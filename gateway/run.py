@@ -5108,6 +5108,12 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
+            # The normal finalizer closes this at its last steer drain.  Also
+            # close here so an exceptional gateway turn cannot leave a cached
+            # agent accepting steers that no running loop can consume.
+            _close_steer_admission = getattr(agent, "_close_steer_admission", None)
+            if callable(_close_steer_admission):
+                _close_steer_admission()
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -10162,7 +10168,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Empty-text internal event — the _is_resume_pending branch in
             # _handle_message_with_agent prepends the proper reason-aware
             # system note before the turn runs.
-            event = _new_gateway_session_ipc_event(
+            event = MessageEvent(
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
@@ -11888,7 +11894,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"No live adapter owns exact route {session_key!r}",
                 )
 
-            event = MessageEvent(
+            event = _new_gateway_session_ipc_event(
                 text=message.strip(),
                 message_type=MessageType.TEXT,
                 source=source,

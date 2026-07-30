@@ -19,6 +19,7 @@ import os
 import socket
 import stat
 import struct
+import sys
 import uuid
 from collections import OrderedDict
 from pathlib import Path
@@ -311,6 +312,18 @@ class GatewaySessionIPCServer:
                 return uid
             except (OSError, struct.error):
                 return None
+        if sys.platform == "darwin" and hasattr(socket, "LOCAL_PEERCRED"):
+            try:
+                # Darwin exposes xucred through LOCAL_PEERCRED at SOL_LOCAL
+                # (level 0).  xucr_uid is the second uint32 field.
+                raw = transport_socket.getsockopt(
+                    0,
+                    socket.LOCAL_PEERCRED,
+                    128,
+                )
+                return int(struct.unpack_from("=I", raw, 4)[0])
+            except (OSError, struct.error):
+                return None
         getpeereid = getattr(transport_socket, "getpeereid", None)
         if callable(getpeereid):
             try:
@@ -434,12 +447,13 @@ class GatewaySessionIPCServer:
         response: dict[str, Any]
         try:
             peer_uid = self._peer_uid(writer)
-            if peer_uid is None or not hasattr(os, "geteuid"):
+            get_euid = getattr(os, "geteuid", None)
+            if peer_uid is None or not callable(get_euid):
                 raise SessionIPCRequestError(
                     "peer_credentials_unavailable",
                     "Gateway IPC peer credentials could not be established",
                 )
-            if peer_uid != os.geteuid():
+            if peer_uid != get_euid():
                 raise SessionIPCRequestError("permission_denied", "Gateway IPC peer user mismatch")
             try:
                 raw = await asyncio.wait_for(reader.readline(), timeout=5.0)

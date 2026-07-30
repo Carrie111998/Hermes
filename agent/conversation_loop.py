@@ -1135,6 +1135,13 @@ def run_conversation(
         except Exception:
             pass
 
+    # Cached agents are reused across gateway turns.  Open /steer admission
+    # only for the lifetime of this turn; the finalizer closes it atomically
+    # with the last pending-steer drain.
+    _open_steer_admission = getattr(agent, "_open_steer_admission", None)
+    if callable(_open_steer_admission):
+        _open_steer_admission()
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.

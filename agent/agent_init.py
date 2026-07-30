@@ -780,6 +780,11 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Admission is opened by run_conversation() and atomically closed by the
+    # finalizer before its last drain.  A surface that races turn completion
+    # therefore gets False from steer() and can queue a real follow-up instead
+    # of accepting text that this turn can no longer consume.
+    agent._steer_accepting = False
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn

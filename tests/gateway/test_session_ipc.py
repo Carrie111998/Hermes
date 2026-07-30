@@ -23,6 +23,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     _new_gateway_session_ipc_event,
+    is_gateway_session_ipc_task,
 )
 from gateway.run import GatewayRunner
 from gateway.session import Platform, SessionEntry, SessionSource, build_session_key
@@ -185,6 +186,7 @@ async def test_exact_profile_local_idle_route_returns_session_proof_and_dispatch
         "Then preserve FIFO order.",
     ]
     assert all(isinstance(event, MessageEvent) for event in events)
+    assert all(is_gateway_session_ipc_task(event) for event in events)
     assert all(event.internal is True for event in events)
     assert all(event.source.profile == "jasper" for event in events)
     assert all(event.metadata["gateway_session_id"] == SESSION_ID for event in events)
@@ -203,6 +205,27 @@ async def test_active_exact_route_steers_without_platform_send_or_queue():
     agent.steer.assert_called_once_with("Use the corrected constraint.")
     adapter.accept_internal_task.assert_not_called()
     assert adapter._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_idle_exact_route_uses_real_adapter_protected_acceptance_path():
+    runner, _ = _runner(_entry())
+    adapter = _TestAdapter(
+        PlatformConfig(enabled=True, token="test"),
+        Platform.TELEGRAM,
+    )
+    adapter._start_session_processing = Mock(return_value=True)
+    runner._adapter_for_source = lambda source: adapter
+
+    proof = await _inject(runner, "/restart is task text")
+
+    assert proof["disposition"] == "queued"
+    adapter._start_session_processing.assert_called_once()
+    accepted_event, accepted_key = adapter._start_session_processing.call_args.args
+    assert accepted_key == SESSION_KEY
+    assert is_gateway_session_ipc_task(accepted_event)
+    assert accepted_event.is_command() is False
+    assert accepted_event.metadata["gateway_session_id"] == SESSION_ID
 
 
 @pytest.mark.asyncio
@@ -906,7 +929,9 @@ async def test_stop_does_not_unlink_replacement_socket(tmp_path):
             original.st_dev,
             original.st_ino,
         )
-        await server.stop()
+        with pytest.raises(SessionIPCRequestError) as exc_info:
+            await server.stop()
+        assert exc_info.value.code == "socket_replaced"
         assert server.socket_path.exists()
         current = server.socket_path.lstat()
         assert (current.st_dev, current.st_ino) == (
