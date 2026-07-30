@@ -164,6 +164,15 @@ model:
 #
 #   # Data policy: "allow" (default) or "deny" to exclude providers that may store data
 #   # data_collection: "deny"
+#
+#   # Max price caps (USD per MILLION tokens). Only route to providers under
+#   # the cap; if none qualify, OpenRouter rejects the request. Set global
+#   # caps and/or per-model overrides (matched case-insensitively, by prefix).
+#   # max_price:
+#   #   prompt: 3.0
+#   #   completion: 10.0
+#   #   per_model:
+#   #     "deepseek/deepseek-v4-pro": { prompt: 0.15, completion: 0.50 }
 
 # =============================================================================
 # OpenRouter Response Caching (only applies when using OpenRouter)

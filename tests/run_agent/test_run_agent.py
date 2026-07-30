@@ -2055,6 +2055,75 @@ class TestBuildApiKwargs:
         provider = kwargs["extra_body"].get("provider", {})
         assert "max_price" not in provider
 
+    def test_provider_max_price_malformed_scalar_ignored(self, agent):
+        """A non-mapping max_price (e.g. ``max_price: 1``) must not crash
+        request construction and must not inject a cap."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = 1  # invalid YAML shape
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)  # must not raise
+        provider = kwargs["extra_body"].get("provider", {})
+        assert "max_price" not in provider
+
+    def test_provider_max_price_malformed_per_model_entries_skipped(self, agent):
+        """per_model entries with a non-string key or non-mapping value are
+        skipped without raising; the top-level caps still apply."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "prompt": 2.0,
+            "completion": 5.0,
+            "per_model": {
+                123: {"prompt": 0.1, "completion": 0.2},  # non-string key
+                "deepseek/deepseek-v4-pro": "cheap",        # non-mapping value
+            },
+        }
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)  # must not raise
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 2.0, "completion": 5.0
+        }
+
+    def test_provider_max_price_exact_beats_prefix_regardless_of_order(self, agent):
+        """When both an exact key and a broader prefix match, the exact key
+        wins no matter the insertion order."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "per_model": {
+                # prefix listed first, exact listed second
+                "deepseek/deepseek-v4": {"prompt": 9.0, "completion": 9.0},
+                "deepseek/deepseek-v4-pro": {"prompt": 0.15, "completion": 0.50},
+            },
+        }
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 0.15, "completion": 0.50
+        }
+
+    def test_provider_max_price_longest_prefix_wins(self, agent):
+        """Among overlapping prefix matches (no exact match), the longest
+        matching prefix wins regardless of order."""
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent.provider_max_price = {
+            "per_model": {
+                "deepseek": {"prompt": 9.0, "completion": 9.0},
+                "deepseek/deepseek-v4": {"prompt": 0.15, "completion": 0.50},
+            },
+        }
+        agent.model = "deepseek/deepseek-v4-pro"
+        messages = [{"role": "user", "content": "hi"}]
+        kwargs = agent._build_api_kwargs(messages)
+        assert kwargs["extra_body"]["provider"]["max_price"] == {
+            "prompt": 0.15, "completion": 0.50
+        }
+
     def test_provider_preferences_drop_invalid_sort(self, agent):
         agent.provider = "openrouter"
         agent.base_url = "https://openrouter.ai/api/v1"

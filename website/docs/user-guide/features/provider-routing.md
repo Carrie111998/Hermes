@@ -27,6 +27,7 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  max_price: null         # Cap price per million tokens (global or per-model)
 ```
 
 :::info
@@ -101,6 +102,35 @@ Controls whether providers can use your prompts for training. Options are `"allo
 provider_routing:
   data_collection: "deny"
 ```
+
+### `max_price`
+
+Sets a spending cap (USD per **million** tokens) and only routes to providers that fit under it. If no provider meets the cap, OpenRouter rejects the request rather than overspending. Set `prompt` and/or `completion` caps globally, and optionally override them per model via a `per_model` sub-key:
+
+```yaml
+provider_routing:
+  # Global caps — apply to every model
+  max_price:
+    prompt: 1.0
+    completion: 2.0
+```
+
+```yaml
+provider_routing:
+  max_price:
+    # Default caps for models without an explicit override
+    prompt: 3.0
+    completion: 10.0
+    per_model:
+      "deepseek/deepseek-v4-pro":
+        prompt: 0.15
+        completion: 0.50
+      "anthropic/claude-sonnet-4.6":
+        prompt: 5.0
+        completion: 25.0
+```
+
+Per-model keys are matched against the active model **case-insensitively** and by **prefix**, so `"deepseek/deepseek-v4"` also matches `"deepseek/deepseek-v4-pro"`. When several keys could match, precedence is deterministic regardless of order: an **exact** match wins over any prefix, and among prefixes the **longest** wins. When a model matches a `per_model` entry, that entry's caps are used **instead of** (not merged with) the top-level caps. If only `per_model` is set, models without a match are sent with no price cap. Malformed values (e.g. `max_price: 1`) are ignored rather than applied.
 
 ## Practical Examples
 
@@ -181,6 +211,7 @@ providers_order    ← from provider_routing.order
 provider_sort      ← from provider_routing.sort
 provider_require_parameters ← from provider_routing.require_parameters
 provider_data_collection    ← from provider_routing.data_collection
+provider_max_price          ← from provider_routing.max_price
 ```
 
 :::tip

@@ -89,6 +89,7 @@ def test_make_agent_forwards_provider_routing():
             "sort": "throughput",
             "require_parameters": True,
             "data_collection": "deny",
+            "max_price": {"prompt": 1.0, "completion": 2.0},
         },
     }
 
@@ -115,6 +116,48 @@ def test_make_agent_forwards_provider_routing():
         assert kwargs["provider_sort"] == "throughput"
         assert kwargs["provider_require_parameters"] is True
         assert kwargs["provider_data_collection"] == "deny"
+        assert kwargs["provider_max_price"] == {"prompt": 1.0, "completion": 2.0}
+
+
+def test_background_agent_kwargs_forwards_max_price():
+    """Foreground/background payload parity: background agents (TUI /background
+    and preview-restart) must carry provider_max_price so their provider
+    payload matches the foreground agent instead of silently dropping the cap.
+    """
+    from types import SimpleNamespace
+
+    agent = SimpleNamespace(
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        model="openrouter/some-model",
+        provider_max_price={
+            "prompt": 3.0,
+            "completion": 10.0,
+            "per_model": {"deepseek/deepseek-v4-pro": {"prompt": 0.15, "completion": 0.50}},
+        },
+    )
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value={}),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._resolve_model", return_value="openrouter/some-model"),
+        patch("tui_gateway.server._cfg_max_turns", return_value=25),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._agent_fallback_model", return_value=None),
+    ):
+        from tui_gateway.server import (
+            _background_agent_kwargs,
+            _ephemeral_preview_agent_kwargs,
+        )
+
+        bg = _background_agent_kwargs(agent, "task-bg")
+        preview = _ephemeral_preview_agent_kwargs(agent, "task-preview")
+
+    assert bg["provider_max_price"] == agent.provider_max_price
+    # Preview-restart agents reuse the same builder, so they inherit it too.
+    assert preview["provider_max_price"] == agent.provider_max_price
 
 
 def test_make_agent_provider_routing_defaults_when_unset():

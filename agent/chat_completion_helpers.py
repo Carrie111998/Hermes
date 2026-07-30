@@ -179,17 +179,34 @@ def _resolve_per_model_max_price(agent) -> dict | None:
 
     Matching is case-insensitive and supports prefix matching, so
     ``"deepseek/deepseek-v4"`` matches ``"deepseek/deepseek-v4-pro"``.
+    Precedence is deterministic regardless of key order: an exact match wins
+    over any prefix match, and among prefixes the longest one wins.
+
+    Malformed config is ignored rather than raised: a non-mapping
+    ``max_price`` (e.g. ``max_price: 1``) yields ``None``, and ``per_model``
+    entries whose key is not a string or whose value is not a mapping are
+    skipped. This keeps a bad config from crashing request construction.
     """
     max_price = getattr(agent, "provider_max_price", None)
-    if not max_price:
+    if not isinstance(max_price, dict):
         return None
     resolved = dict(max_price)
     per_model = resolved.pop("per_model", None)
-    if per_model:
+    if isinstance(per_model, dict):
         current_model = (getattr(agent, "model", "") or "").lower()
+        best_prefix_len = -1
+        best_override = None
         for pattern, override in per_model.items():
-            if current_model == pattern.lower() or current_model.startswith(pattern.lower()):
-                return override
+            if not isinstance(pattern, str) or not isinstance(override, dict):
+                continue
+            pattern_lower = pattern.lower()
+            if current_model == pattern_lower:
+                return dict(override)  # exact match always wins
+            if current_model.startswith(pattern_lower) and len(pattern_lower) > best_prefix_len:
+                best_prefix_len = len(pattern_lower)
+                best_override = override
+        if best_override is not None:
+            return dict(best_override)
     if resolved:
         return resolved
     return None
