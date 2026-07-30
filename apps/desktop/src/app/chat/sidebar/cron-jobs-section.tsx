@@ -12,6 +12,7 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { updateCronJobs } from '@/store/cron'
+import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { CronJob } from '@/types/hermes'
@@ -27,9 +28,11 @@ const INACTIVE_STATES = new Set(['completed', 'disabled', 'error', 'paused'])
 // without turning the sidebar into the full Cron page.
 const PEEK_RUN_LIMIT = 5
 
-// Runs are written by the background scheduler tick (no UI signal), so poll the
-// open peek so a freshly-fired run shows up within a few seconds.
+// Runs are written by the background scheduler tick. cron.changed reloads the
+// open peek immediately on event-capable backends (poll drops to a backstop);
+// older backends keep the legacy cadence.
 const PEEK_POLL_INTERVAL_MS = 8000
+const PEEK_BACKSTOP_INTERVAL_MS = 60_000
 
 // Keep the section compact: show a few jobs up front, reveal more in larger
 // steps on demand (mirrors the messaging sections in the sidebar).
@@ -127,8 +130,6 @@ export function SidebarCronJobsSection({
   const cap = Math.min(visibleCount, max)
   const shown = sorted.slice(0, cap)
   const hiddenCount = Math.min(sorted.length, max) - shown.length
-  // When capped, signal "50+" rather than implying the list is complete.
-  const countLabel = jobs.length > max ? `${max}+` : String(jobs.length)
 
   return (
     <SidebarGroup className="shrink-0 p-0 pb-1">
@@ -139,7 +140,6 @@ export function SidebarCronJobsSection({
           type="button"
         >
           <SidebarPanelLabel>{label}</SidebarPanelLabel>
-          <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{countLabel}</span>
           <DisclosureCaret
             className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
             open={open}
@@ -250,7 +250,7 @@ function CronJobSidebarRow({
 
   return (
     <div>
-      <ActionsContextMenu ariaLabel={c.actionsFor(label)} contentClassName="w-44" items={items}>
+      <ActionsContextMenu ariaLabel={c.actionsTitle} contentClassName="w-44" items={items}>
         <div className="group/cron relative grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-center rounded-md hover:bg-(--chrome-action-hover)">
           {/* Lead with the dot in the same w-3.5 cell + pl-2 the session rows use
               so the cron dots line up with the sessions above; the caret sits next
@@ -325,6 +325,8 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
   const { t } = useI18n()
   const c = t.cron
   const selectedSessionId = useStore($selectedStoredSessionId)
+  const changeEventsAvailable = useStore($changeEventsAvailable)
+  const cronChangeTick = useStore($cronChangeTick)
   const [runs, setRuns] = useState<null | SessionInfo[]>(null)
 
   useEffect(() => {
@@ -345,17 +347,21 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
 
     void load()
 
-    const intervalId = window.setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void load()
-      }
-    }, PEEK_POLL_INTERVAL_MS)
+    const intervalId = window.setInterval(
+      () => {
+        if (document.visibilityState === 'visible') {
+          void load()
+        }
+      },
+      changeEventsAvailable ? PEEK_BACKSTOP_INTERVAL_MS : PEEK_POLL_INTERVAL_MS
+    )
 
     return () => {
       cancelled = true
       window.clearInterval(intervalId)
     }
-  }, [jobId])
+    // cronChangeTick: a fired run reloads the peek immediately.
+  }, [changeEventsAvailable, cronChangeTick, jobId])
 
   return (
     <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">

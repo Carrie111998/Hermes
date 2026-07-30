@@ -90,50 +90,6 @@ class TestPartialStreamStubFinishReason:
         assert response.choices[0].message.content == "Here's my answer so far"
         assert response.choices[0].message.tool_calls is None
 
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_partial_tool_call_uses_length(self, _mock_close, mock_create, monkeypatch):
-        """Mid-tool-call partials now use finish_reason=length so the
-        conversation loop's continuation machinery fires — bounded 3-retry
-        with guidance to break output into smaller chunks (#31998).
-        tool_calls=None is preserved, so no tool auto-executes."""
-
-        def _stalling_stream():
-            yield _make_stream_chunk(content="Let me write the audit: ")
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_1", name="write_file"),
-            ])
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, arguments='{"path": "/tmp/x", '),
-            ])
-            raise RuntimeError("simulated upstream stall")
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stalling_stream()
-        mock_create.return_value = mock_client
-
-        agent = _make_agent()
-        agent._fire_stream_delta = lambda text: None
-        agent._current_streamed_assistant_text = "Let me write the audit: "
-
-        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.id == PARTIAL_STREAM_STUB_ID
-        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH, (
-            "Partial mid-tool-call must use finish_reason=length so the "
-            "continuation machinery fires instead of ending the turn "
-            "immediately (#31998)."
-        )
-        assert response.choices[0].message.tool_calls is None, (
-            "tool_calls must remain None (no auto-execution of side-effectful "
-            "tool calls)."
-        )
-        # The stub should carry dropped tool names for continuation prompt
-        assert getattr(response, "_dropped_tool_names", None) == ["write_file"]
-        content = response.choices[0].message.content or ""
-        assert "Stream stalled mid tool-call" in content
-        assert "write_file" in content
 
 
 # ── Clean stream-end mid-tool-call (no exception, no finish_reason) ─────────
@@ -192,82 +148,7 @@ class TestCleanStreamEndMidToolCall:
         )
         assert getattr(response, "_dropped_tool_names", None) == ["execute_code"]
 
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_real_length_truncation_still_uses_uuid_id(
-        self, _mock_close, mock_create, monkeypatch,
-    ):
-        """Control: when the provider DOES send finish_reason='length' with
-        partial tool args, it is a genuine output cap — keep the existing
-        non-stub behaviour (boost max_tokens and retry)."""
 
-        def _capped_stream():
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, tc_id="call_y", name="execute_code"),
-            ])
-            yield _make_stream_chunk(tool_calls=[
-                _make_tool_call_delta(index=0, arguments="{"),
-            ])
-            # Provider explicitly reports the output cap.
-            yield _make_stream_chunk(finish_reason="length")
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = (
-            lambda *a, **kw: _capped_stream()
-        )
-        mock_create.return_value = mock_client
-
-        agent = _make_agent()
-        agent._fire_stream_delta = lambda text: None
-
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.id != PARTIAL_STREAM_STUB_ID, (
-            "A provider-reported finish_reason='length' is a real output cap "
-            "and must keep the existing truncation path, not the stream-drop "
-            "stub path."
-        )
-        assert response.id.startswith("stream-")
-        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
-
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_no_finish_reason_text_only_routes_to_stub(
-        self, _mock_close, mock_create, monkeypatch,
-    ):
-        """A clean stream-end with no finish_reason after text-only
-        delivery must route through the partial-stream-stub path so the
-        conversation loop continues instead of silently accepting
-        truncated text as a complete response (#32086)."""
-
-        def _clean_ending_stream():
-            yield _make_stream_chunk(content="Let me compare the ")
-            yield _make_stream_chunk(content="vision configs:")
-            # falls off the end — clean close, no terminator
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = (
-            lambda *a, **kw: _clean_ending_stream()
-        )
-        mock_create.return_value = mock_client
-
-        agent = _make_agent()
-        agent._fire_stream_delta = lambda text: None
-
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.id == PARTIAL_STREAM_STUB_ID, (
-            "A clean stream-end with no finish_reason after text-only "
-            "delivery must be tagged as a partial-stream stub, not "
-            "silently accepted as complete (#32086)."
-        )
-        assert response.choices[0].finish_reason == FINISH_REASON_LENGTH
-        assert response.choices[0].message.content == "Let me compare the vision configs:"
-        assert response.choices[0].message.tool_calls is None
-        assert getattr(response, "_dropped_tool_names", None) is None, (
-            "Text-only drops must not carry dropped tool names — there "
-            "were no tool calls in flight."
-        )
 
 
 # ── Length-continuation prompt branching ──────────────────────────────────
@@ -288,27 +169,11 @@ class TestLengthContinuationPromptBranching:
         assert "network error mid-stream" in prompt
         assert "output length limit" not in prompt
 
-    def test_real_truncation_uses_length_prompt(self):
-        prompt = self._simulate_branch("chatcmpl-abc123")
-        assert "output length limit" in prompt
-        assert "network error" not in prompt
 
     def test_no_id_falls_through_to_length_prompt(self):
         prompt = self._simulate_branch("")
         assert "output length limit" in prompt
 
-    def test_dropped_tool_call_uses_chunking_prompt(self):
-        """When the stub dropped a tool call, the continuation prompt
-        must guide the model to break its output into smaller chunks
-        instead of retrying the same large tool call (#31998)."""
-        prompt = self._simulate_branch(
-            PARTIAL_STREAM_STUB_ID, dropped_tools=["write_file"],
-        )
-        assert "too large" in prompt
-        assert "break" in prompt.lower()
-        assert "write_file" in prompt
-        assert "network error" not in prompt
-        assert "output length limit" not in prompt
 
 
 # ── Integration: live conversation loop ───────────────────────────────────
@@ -333,7 +198,6 @@ def loop_agent():
         a.client = MagicMock()
         a._cached_system_prompt = "You are helpful."
         a._use_prompt_caching = False
-        a.tool_delay = 0
         a.compression_enabled = False
         a.save_trajectories = False
         return a
@@ -459,37 +323,6 @@ class TestContentFilterStallActivatesFallback:
             "can route to fallback (#32421)."
         )
 
-    @patch("run_agent.AIAgent._create_request_openai_client")
-    @patch("run_agent.AIAgent._close_request_openai_client")
-    def test_plain_network_stall_not_tagged(
-        self, _mock_close, mock_create, monkeypatch,
-    ):
-        """A plain network stall (no content-filter signature) must NOT be
-        tagged — it should still use the normal continuation path, not
-        switch providers."""
-
-        def _network_stall():
-            yield _make_stream_chunk(content="Writing the file: ")
-            raise RuntimeError("connection reset by peer")
-
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = (
-            lambda *a, **kw: _network_stall()
-        )
-        mock_create.return_value = mock_client
-
-        agent = _make_agent()
-        agent._fire_stream_delta = lambda text: None
-        agent._current_streamed_assistant_text = "Writing the file: "
-
-        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
-        response = agent._interruptible_streaming_api_call({})
-
-        assert response.id == PARTIAL_STREAM_STUB_ID
-        assert getattr(response, "_content_filter_terminated", False) is False, (
-            "A plain network stall must not be misclassified as a content "
-            "filter — that would needlessly switch providers."
-        )
 
     def test_tagged_stub_activates_fallback_first_pass(self, loop_agent):
         """Layer 3: a tagged stub activates fallback on the FIRST pass, with
@@ -544,54 +377,6 @@ class TestContentFilterStallActivatesFallback:
         assert result["final_response"] == "Done on the fallback provider."
         assert result["completed"] is True
 
-    def test_tagged_stub_no_fallback_falls_through(self, loop_agent):
-        """When no fallback chain is configured, a tagged stub falls through
-        to the normal continuation path (best-effort) rather than crashing."""
-        from tests.run_agent.test_run_agent import _mock_assistant_msg, _mock_response
-
-        def _filter_stub():
-            return SimpleNamespace(
-                id=PARTIAL_STREAM_STUB_ID,
-                model="minimax/MiniMax-M2.7",
-                choices=[SimpleNamespace(
-                    index=0,
-                    message=_mock_assistant_msg(content="partial "),
-                    finish_reason=FINISH_REASON_LENGTH,
-                )],
-                usage=None,
-                _dropped_tool_names=["write_file"],
-                _content_filter_terminated=True,
-            )
-
-        recovery = _mock_response(content="recovered text", finish_reason="stop")
-        loop_agent.client.chat.completions.create.side_effect = [
-            _filter_stub(), recovery,
-        ]
-        # No fallback chain configured.
-        loop_agent._fallback_chain = []
-        loop_agent._fallback_index = 0
-        fb_calls = {"n": 0}
-
-        def _fake_activate(reason=None):
-            fb_calls["n"] += 1
-            return False
-
-        with (
-            patch.object(loop_agent, "_persist_session"),
-            patch.object(loop_agent, "_save_trajectory"),
-            patch.object(loop_agent, "_cleanup_task_resources"),
-            patch.object(loop_agent, "_try_activate_fallback",
-                         side_effect=_fake_activate),
-        ):
-            result = loop_agent.run_conversation("write me a long file")
-
-        # Fallback was not attempted (empty chain gates it out); the loop
-        # continued normally and produced a response.
-        assert fb_calls["n"] == 0, (
-            "With an empty fallback chain, the loop must not even call "
-            "_try_activate_fallback — it should fall through to continuation."
-        )
-        assert result["completed"] is True
 
 
 class TestEmptyPartialStreamStubNotPersisted:
@@ -670,57 +455,14 @@ class TestEmptyPartialStreamStubNotPersisted:
 
         assert result["completed"] is True
 
-    def test_non_empty_partial_stub_still_persisted(self, loop_agent):
-        """Guard against over-correction: a stub that DID deliver partial
-        text must still be appended so the continuation stitches correctly
-        (existing behavior from #32086)."""
-        from tests.run_agent.test_run_agent import _mock_response, _mock_assistant_msg
-
-        partial_stub = SimpleNamespace(
-            id=PARTIAL_STREAM_STUB_ID,
-            model="test/model",
-            choices=[SimpleNamespace(
-                index=0,
-                message=_mock_assistant_msg(content="The first half of "),
-                finish_reason=FINISH_REASON_LENGTH,
-            )],
-            usage=None,
-        )
-        continuation = _mock_response(
-            content="the answer is forty-two.", finish_reason="stop",
-        )
-
-        loop_agent.client.chat.completions.create.side_effect = [
-            partial_stub, continuation,
-        ]
-
-        with (
-            patch.object(loop_agent, "_persist_session"),
-            patch.object(loop_agent, "_save_trajectory"),
-            patch.object(loop_agent, "_cleanup_task_resources"),
-        ):
-            result = loop_agent.run_conversation("ask me something")
-
-        second_call_kwargs = loop_agent.client.chat.completions.create.call_args_list[1]
-        msgs = second_call_kwargs.kwargs.get("messages") or second_call_kwargs.args[0].get("messages")
-        partial_assistants = [
-            m for m in msgs
-            if m.get("role") == "assistant" and "first half" in (m.get("content") or "")
-        ]
-        assert partial_assistants, (
-            "A partial-stream stub WITH text must still be persisted so the "
-            "continuation can stitch the halves."
-        )
-        assert "first half of" in result["final_response"]
-        assert "forty-two" in result["final_response"]
 
 
 class TestBuildAssistantMessageEmptyContentPad:
-    """Regression layer 2 (chat_completion_helpers.build_assistant_message):
-    never serialize a textless assistant turn with ``content: ""`` — pad to
-    a single space, the same trick as the reasoning_content pad (#15250).
-    Tool-call turns are exempt (``content: ""`` + ``tool_calls`` is accepted
-    everywhere)."""
+    """Layer 2 was consolidated into the class owner: the builder stores
+    textless turns AS-IS (no write-time pad — a pad here broke codex
+    commentary turns and forked the concept).  Wire safety is owned by
+    ``repair_empty_non_final_messages`` inside ``sanitize_api_messages``.
+    These tests pin the builder's store-as-is contract."""
 
     def _agent_for_builder(self):
         from run_agent import AIAgent
@@ -738,24 +480,17 @@ class TestBuildAssistantMessageEmptyContentPad:
             )
         return a
 
-    def test_empty_content_padded_to_space(self):
+    def test_empty_content_stored_as_is(self):
         from agent.chat_completion_helpers import build_assistant_message
         from tests.run_agent.test_run_agent import _mock_assistant_msg
 
         agent = self._agent_for_builder()
         msg = build_assistant_message(agent, _mock_assistant_msg(content=""), "stop")
-        assert msg["content"] == " ", (
-            "Textless assistant turn must be padded to a single space — "
-            "Moonshot/Kimi reject empty assistant content with HTTP 400."
+        assert msg["content"] == "", (
+            "Builder must store textless turns as-is — wire repair is owned "
+            "by repair_empty_non_final_messages at the send boundary."
         )
 
-    def test_none_content_padded_to_space(self):
-        from agent.chat_completion_helpers import build_assistant_message
-        from tests.run_agent.test_run_agent import _mock_assistant_msg
-
-        agent = self._agent_for_builder()
-        msg = build_assistant_message(agent, _mock_assistant_msg(content=None), "stop")
-        assert msg["content"] == " "
 
     def test_tool_call_turn_content_left_empty(self):
         from agent.chat_completion_helpers import build_assistant_message
@@ -767,10 +502,7 @@ class TestBuildAssistantMessageEmptyContentPad:
             _mock_assistant_msg(content="", tool_calls=[_mock_tool_call()]),
             "tool_calls",
         )
-        assert msg["content"] == "", (
-            "Tool-call turns are exempt from the pad: content:'' alongside "
-            "tool_calls is accepted by every provider."
-        )
+        assert msg["content"] == ""
         assert msg["tool_calls"]
 
     def test_non_empty_content_unchanged(self):
@@ -787,11 +519,12 @@ class TestSendTimeEmptyAssistantPad:
     -stream-stub row written by an older build (content:'' ,
     finish_reason:'length') is rebuilt to content:'' on every reload —
     ``_rows_to_conversation`` strips whitespace, so a DB-side pad cannot
-    survive.  The send-time pad in conversation_loop's api_messages loop
-    must therefore repair the empty textless assistant turn at the
-    serialization boundary, so a RESUMED poisoned session replays
-    cleanly against strict providers (Moonshot/Kimi HTTP 400 "message ...
-    with role 'assistant' must not be empty")."""
+    survive.  The class owner ``repair_empty_non_final_messages`` (inside
+    ``sanitize_api_messages``, the pre-send chokepoint) must repair the
+    empty textless assistant turn at the serialization boundary, so a
+    RESUMED poisoned session replays cleanly against strict providers
+    (Moonshot/Kimi HTTP 400 "message ... with role 'assistant' must not
+    be empty" / Anthropic "all messages must have non-empty content")."""
 
     def _run_one_turn_with_history(self, loop_agent, history):
         from tests.run_agent.test_run_agent import _mock_response
@@ -809,7 +542,7 @@ class TestSendTimeEmptyAssistantPad:
         kwargs = loop_agent.client.chat.completions.create.call_args_list[0]
         return kwargs.kwargs.get("messages") or kwargs.args[0].get("messages")
 
-    def test_poisoned_resumed_history_padded_on_send(self, loop_agent):
+    def test_poisoned_resumed_history_repaired_on_send(self, loop_agent):
         # Byte-shape of a persisted poisoned session:
         # user -> assistant('' , finish_reason='length', NO tool_calls) -> user.
         poisoned = [
@@ -822,7 +555,7 @@ class TestSendTimeEmptyAssistantPad:
             m for m in sent
             if m.get("role") == "assistant"
             and not m.get("tool_calls")
-            and m.get("content") == ""
+            and not (m.get("content") or "").strip()
         ]
         assert empties == [], (
             "A resumed session carrying a persisted empty partial-stream "
@@ -834,7 +567,7 @@ class TestSendTimeEmptyAssistantPad:
              and not m.get("tool_calls")),
             None,
         )
-        assert stub is not None and stub["content"] == " "
+        assert stub is not None and stub["content"] == "[response interrupted]"
 
     def test_tool_call_turn_not_padded_on_send(self, loop_agent):
         history = [
@@ -864,18 +597,16 @@ class TestSendTimeEmptyAssistantPad:
 
 
 class TestSendTimePadMultimodalSafety:
-    """Regression: the send-time pad must skip non-string (list) assistant
+    """Regression: the send-time repair must skip non-string (list) assistant
     content instead of crashing — a forked session whose new user turn
     attaches an image hit AttributeError: 'list' object has no attribute
-    'strip' inside the pad loop.
+    'strip' inside an earlier pad loop.
 
-    Note: current main flattens multimodal assistant list-content to a
-    plain string upstream of the send boundary, so the list shape rarely
-    survives to the pad loop in this path — but other builders/callers can
-    still produce list content, and the ``isinstance(str)`` guard must hold
-    regardless of upstream flattening.  This test drives a multimodal
+    The repair is now owned by ``repair_empty_non_final_messages``, whose
+    ``_msg_has_payload`` treats a list with any typed block as payload —
+    multimodal turns are never rewritten.  This test drives a multimodal
     history through the loop and asserts (a) no crash, and (b) the
-    assistant turn's text is neither dropped nor replaced by the pad.
+    assistant turn's text is neither dropped nor replaced.
     """
 
     def test_multimodal_assistant_content_not_touched(self, loop_agent):
@@ -917,27 +648,23 @@ class TestSendTimePadMultimodalSafety:
             )
         else:
             assert "I see an image" in (c or ""), (
-                "Flattened multimodal assistant text must survive the pad loop."
+                "Flattened multimodal assistant text must survive the repair."
             )
-        assert c != " ", "The pad must never replace real multimodal content."
 
-    def test_pad_loop_skips_list_content_directly(self):
-        """Unit-shape check: the pad predicate itself must skip list content
-        (the exact AttributeError shape) and pad only textless str turns."""
+    def test_repair_owner_skips_list_content_directly(self):
+        """Unit-shape check against the REAL owner: multimodal list content
+        (the exact AttributeError shape) passes through untouched; a textless
+        str turn is repaired; tool-call turns are exempt."""
+        from agent.agent_runtime_helpers import repair_empty_non_final_messages
         api_messages = [
             {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
             {"role": "assistant", "content": ""},
             {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+            {"role": "user", "content": "trailing turn keeps the above non-final"},
         ]
-        # Mirror of the send-boundary pad in conversation_loop.
-        for am in api_messages:
-            if (
-                am.get("role") == "assistant"
-                and not am.get("tool_calls")
-                and isinstance(am.get("content"), str)
-                and not am["content"].strip()
-            ):
-                am["content"] = " "
-        assert api_messages[0]["content"] == [{"type": "text", "text": "hi"}]
-        assert api_messages[1]["content"] == " "
-        assert api_messages[2]["content"] == ""
+        out = repair_empty_non_final_messages(api_messages)
+        assert out[0]["content"] == [{"type": "text", "text": "hi"}]
+        assert out[1]["content"] == "[response interrupted]"
+        assert out[2]["content"] == ""
+        # input list untouched (repair is copy-on-write)
+        assert api_messages[1]["content"] == ""

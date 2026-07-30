@@ -195,6 +195,7 @@ export interface Translations {
       noSpeechDetected: string
       playbackFailed: string
       recordingFailed: string
+      sayStopToEnd: (phrase: string) => string
       transcriptionFailed: string
       transcriptionUnavailable: string
       tryRecordingAgain: string
@@ -236,7 +237,6 @@ export interface Translations {
     search: string
     searchTitle: string
     swapSidebarSides: string
-    swapSidebarSidesTitle: string
     hideRightSidebar: string
     showRightSidebar: string
     muteHaptics: string
@@ -446,6 +446,9 @@ export interface Translations {
       builtinOnly: string
       notSet: string
       commaSeparated: string
+      searchPlaceholder: string
+      noResults: string
+      systemDefault: string
       loading: string
       emptyTitle: string
       emptyDesc: string
@@ -455,6 +458,10 @@ export interface Translations {
       invalidJson: string
       keepAwakeTitle: string
       keepAwakeDesc: string
+      attachmentSizeTitle: string
+      attachmentSizeDesc: string
+      attachmentSizeUnit: string
+      attachmentSizeLabel: string
     }
     quickEntry: {
       enabledTitle: string
@@ -476,8 +483,7 @@ export interface Translations {
       saving: string
     }
     envActions: {
-      actionsFor: (label: string) => string
-      credentialActions: string
+      actions: string
       manageInKeys: string
       docs: string
       hideValue: string
@@ -781,6 +787,9 @@ export interface Translations {
       ready: string
       needsSignIn: string
       needsSetup: string
+      activeBackend: string
+      activeBackendHint: string
+      useBackend: string
       nousIncluded: string
       nousAuthNeededTitle: string
       nousAuthNeededMessage: (provider: string) => string
@@ -1195,6 +1204,23 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
+    pendingRequests: (count: number) => string
+    pendingAria: (count: number) => string
+    approvedUsers: (count: number) => string
+    approve: string
+    approving: string
+    revoke: string
+    revoking: string
+    revokeAria: (name: string) => string
+    revokeTitle: string
+    revokeDesc: (name: string) => string
+    approvedUser: (name: string) => string
+    approvedHint: string
+    revokedUser: (name: string) => string
+    failedApprove: (name: string) => string
+    failedRevoke: (name: string) => string
+    pairingLockedOut: string
+    waitingSince: (minutes: number) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }
@@ -1269,9 +1295,9 @@ export interface Translations {
     showAllProfiles: string
     switchToProfile: (name: string) => string
     manageProfiles: string
-    actionsFor: (name: string) => string
+    actions: string
     color: string
-    colorFor: (name: string) => string
+    colorFor: string
     setColor: (color: string) => string
     autoColor: string
     noProfiles: string
@@ -1365,7 +1391,6 @@ export interface Translations {
     showRuns: string
     hideRuns: string
     runHistory: string
-    actionsFor: (title: string) => string
     actionsTitle: string
     resume: string
     pause: string
@@ -1586,7 +1611,6 @@ export interface Translations {
       openInNewTab: string
       openInSplit: string
       copyIdFailed: string
-      actionsFor: (title: string) => string
       sessionActions: string
       sessionRunning: string
       needsInput: string
@@ -1644,6 +1668,9 @@ export interface Translations {
     voiceDictation: string
     speakReplies: string
     stopSpeakingReplies: string
+    wakeWordListening: (phrase: string) => string
+    wakeWordOff: (phrase: string) => string
+    wakeWordPausedVoice: (phrase: string) => string
     lookupLoading: string
     lookupNoMatches: string
     lookupTry: string
@@ -2053,7 +2080,6 @@ export interface Translations {
       starmap: string
       openStarmap: string
       turnRunning: string
-      currentTurnElapsed: string
       contextUsage: string
       contextUsagePanel: {
         categories: {
@@ -2072,9 +2098,7 @@ export interface Translations {
         title: string
         tokenSummary: (used: string, max: string) => string
       }
-      openContextUsage: string
       session: string
-      runtimeSessionElapsed: string
       yoloOn: string
       yoloOff: string
       modelNone: string
@@ -2347,6 +2371,8 @@ export interface Translations {
       statusError: string
       statusRecovered: string
       statusDone: string
+      /** Over-budget / rejected memory write title — not "Saved to memory". */
+      memoryWriteNoted: string
       actions: {
         read: string
         reading: string
