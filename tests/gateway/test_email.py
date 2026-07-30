@@ -637,8 +637,9 @@ class TestThreadContext(unittest.TestCase):
             "references": "<root-second@test.com>",
             "body": "Second",
         }
-        asyncio.run(adapter._dispatch_message(first))
-        asyncio.run(adapter._dispatch_message(second))
+        with patch.dict(os.environ, {"EMAIL_ALLOWED_USERS": ""}):
+            asyncio.run(adapter._dispatch_message(first))
+            asyncio.run(adapter._dispatch_message(second))
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -728,6 +729,7 @@ class TestWorkflowIngressTap(unittest.TestCase):
                 "EMAIL_PASSWORD": "secret",
                 "EMAIL_IMAP_HOST": "imap.test.com",
                 "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
             },
         ):
             adapter = self._make_adapter(callback)
@@ -786,6 +788,7 @@ class TestWorkflowIngressTap(unittest.TestCase):
                 "EMAIL_PASSWORD": "secret",
                 "EMAIL_IMAP_HOST": "imap.test.com",
                 "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
             },
         ):
             adapter = self._make_adapter(callback)
@@ -809,6 +812,7 @@ class TestWorkflowIngressTap(unittest.TestCase):
                 "EMAIL_PASSWORD": "secret",
                 "EMAIL_IMAP_HOST": "imap.test.com",
                 "EMAIL_SMTP_HOST": "smtp.test.com",
+                "EMAIL_ALLOWED_USERS": "",
             },
         ):
             adapter = self._make_adapter()
@@ -1143,10 +1147,16 @@ class TestFetchNewMessages(unittest.TestCase):
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
             results = adapter._fetch_new_messages()
 
-        # Only UID 3 should be fetched (1 and 2 already seen)
+        # Only UID 3 should be fetched (1 and 2 already seen). Fetching alone
+        # must not mark it handled; that happens only after dispatch succeeds.
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["sender_addr"], "user@test.com")
-        self.assertIn(b"3", adapter._seen_uids)
+        self.assertNotIn(b"3", adapter._seen_uids)
+        fetch_call = next(
+            call for call in mock_imap.uid.call_args_list
+            if call.args[0] == "fetch"
+        )
+        self.assertEqual(fetch_call.args[2], "(BODY.PEEK[])")
 
     def test_fetch_no_unseen_messages(self):
         """No unseen messages returns empty list."""
@@ -1223,6 +1233,20 @@ class TestFetchNewMessages(unittest.TestCase):
             results[0]["references"], "<root@test.com> <parent@test.com>"
         )
 
+    def test_mark_message_seen_uses_uid_store(self):
+        adapter = self._make_adapter()
+        mock_imap = MagicMock()
+        mock_imap.uid.return_value = ("OK", [b""])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            marked = adapter._mark_message_seen(b"42")
+
+        self.assertTrue(marked)
+        mock_imap.uid.assert_called_once_with(
+            "store", b"42", "+FLAGS", r"(\Seen)"
+        )
+        mock_imap.logout.assert_called_once()
+
 
 class TestPollLoop(unittest.TestCase):
     """Test the async polling loop."""
@@ -1272,6 +1296,32 @@ class TestPollLoop(unittest.TestCase):
 
         self.assertEqual(len(dispatched), 1)
         self.assertEqual(dispatched[0]["subject"], "Inbox Test")
+
+    def test_check_inbox_failure_leaves_message_unseen_and_continues_batch(self):
+        """One failed ledger tap must not lose or block unrelated messages."""
+        import asyncio
+        adapter = self._make_adapter()
+        messages = [
+            {"uid": b"1", "subject": "fails"},
+            {"uid": b"2", "subject": "works"},
+        ]
+        dispatched = []
+
+        async def mock_dispatch(msg_data):
+            dispatched.append(msg_data["uid"])
+            if msg_data["uid"] == b"1":
+                raise RuntimeError("ledger unavailable")
+
+        adapter._fetch_new_messages = MagicMock(return_value=messages)
+        adapter._dispatch_message = mock_dispatch
+        adapter._mark_message_seen = MagicMock(return_value=True)
+
+        asyncio.run(adapter._check_inbox())
+
+        self.assertEqual(dispatched, [b"1", b"2"])
+        adapter._mark_message_seen.assert_called_once_with(b"2")
+        self.assertNotIn(b"1", adapter._seen_uids)
+        self.assertIn(b"2", adapter._seen_uids)
 
 
 class TestSendEmailStandalone(unittest.TestCase):

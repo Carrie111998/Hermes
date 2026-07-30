@@ -317,8 +317,8 @@ class EmailAdapter(BasePlatformAdapter):
     @staticmethod
     def _stable_external_id(msg_data: Dict[str, Any]) -> str:
         """Return the RFC Message-ID or a deterministic fallback identifier."""
-        message_id = str(msg_data.get("message_id") or "").strip()
-        if message_id:
+        message_id = str(msg_data.get("message_id") or "").replace("\r", "").replace("\n", "").strip()
+        if re.fullmatch(r"<[^<>\s]+>", message_id):
             return message_id
         digest_input = "\0".join(
             str(msg_data.get(field) or "")
@@ -333,6 +333,11 @@ class EmailAdapter(BasePlatformAdapter):
         )
         digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
         return f"email-sha256:{digest}"
+
+    @staticmethod
+    def _reference_ids(value: str) -> List[str]:
+        """Extract only syntactically safe RFC message ids from a References value."""
+        return re.findall(r"<[^<>\s]+>", str(value or "").replace("\r", "").replace("\n", ""))
 
     @staticmethod
     def _persist_workflow_body(body: str) -> str:
@@ -451,22 +456,25 @@ class EmailAdapter(BasePlatformAdapter):
         else:
             explicit_id = str(
                 metadata.get("reply_to_message_id")
-                or metadata.get("message_id")
                 or ""
             )
 
         if explicit_id:
-            return self._thread_context.get(
-                explicit_id,
-                {"subject": "", "message_id": explicit_id, "references": ""},
+            context = self._thread_context.get(explicit_id)
+            if context and context.get("sender") == to_addr:
+                return context
+            safe_id = (
+                explicit_id
+                if re.fullmatch(r"<[^<>\s]+>", explicit_id)
+                else ""
             )
+            return {"subject": "", "message_id": safe_id, "references": ""}
 
         active_reply_id = _ACTIVE_EMAIL_REPLY_ID.get()
         if active_reply_id:
-            return self._thread_context.get(
-                active_reply_id,
-                {"subject": "", "message_id": active_reply_id, "references": ""},
-            )
+            context = self._thread_context.get(active_reply_id)
+            if context and context.get("sender") == to_addr:
+                return context
 
         latest_id = self._sender_latest_context.get(to_addr)
         if latest_id:
@@ -483,8 +491,9 @@ class EmailAdapter(BasePlatformAdapter):
         original_msg_id = context.get("message_id", "")
         if original_msg_id:
             msg["In-Reply-To"] = original_msg_id
-            references = context.get("references", "").strip()
-            reference_ids = references.split()
+            reference_ids = EmailAdapter._reference_ids(
+                context.get("references", "")
+            )
             if original_msg_id not in reference_ids:
                 reference_ids.append(original_msg_id)
             msg["References"] = " ".join(reference_ids)
@@ -556,7 +565,46 @@ class EmailAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
         messages = await loop.run_in_executor(None, self._fetch_new_messages)
         for msg_data in messages:
-            await self._dispatch_message(msg_data)
+            try:
+                await self._dispatch_message(msg_data)
+                marked_seen = await loop.run_in_executor(
+                    None,
+                    self._mark_message_seen,
+                    msg_data["uid"],
+                )
+                if marked_seen:
+                    self._seen_uids.add(msg_data["uid"])
+                    self._trim_seen_uids()
+            except Exception as exc:
+                logger.error(
+                    "[Email] Dispatch failed for UID %r; left unseen for retry: %s",
+                    msg_data.get("uid"),
+                    exc,
+                    exc_info=True,
+                )
+
+    def _mark_message_seen(self, uid: bytes) -> bool:
+        """Mark one successfully dispatched message seen on the IMAP server."""
+        try:
+            imap = imaplib.IMAP4_SSL(
+                self._imap_host,
+                self._imap_port,
+                timeout=30,
+            )
+            try:
+                imap.login(self._address, self._password)
+                _send_imap_id(imap)
+                imap.select("INBOX")
+                status, _ = imap.uid("store", uid, "+FLAGS", r"(\Seen)")
+                return status == "OK"
+            finally:
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.error("[Email] Failed to mark UID %r seen: %s", uid, exc)
+            return False
 
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
@@ -575,12 +623,12 @@ class EmailAdapter(BasePlatformAdapter):
                 for uid in data[0].split():
                     if uid in self._seen_uids:
                         continue
-                    self._seen_uids.add(uid)
-                    # Trim periodically to prevent unbounded memory growth
-                    if len(self._seen_uids) > self._seen_uids_max:
-                        self._trim_seen_uids()
 
-                    status, msg_data = imap.uid("fetch", uid, "(RFC822)")
+                    status, msg_data = imap.uid(
+                        "fetch",
+                        uid,
+                        "(BODY.PEEK[])",
+                    )
                     if status != "OK":
                         continue
 
@@ -719,6 +767,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an email reply to the given address."""
         try:
+            reply_to = reply_to or _ACTIVE_EMAIL_REPLY_ID.get()
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None, self._send_email, chat_id, content, reply_to, metadata
@@ -772,11 +821,12 @@ class EmailAdapter(BasePlatformAdapter):
         image_url: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image URL as part of an email body."""
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(chat_id, text.strip(), reply_to, metadata)
 
     async def send_multiple_images(
         self,
@@ -795,6 +845,7 @@ class EmailAdapter(BasePlatformAdapter):
         """
         if not images:
             return
+        reply_to = reply_to or _ACTIVE_EMAIL_REPLY_ID.get()
 
         from urllib.parse import unquote as _unquote
 
@@ -894,6 +945,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a file as an email attachment."""
         try:
+            reply_to = reply_to or _ACTIVE_EMAIL_REPLY_ID.get()
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
                 None,
