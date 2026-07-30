@@ -474,6 +474,110 @@ def test_session_resume_defaults_to_deferred_build(server, monkeypatch):
     assert server._find_live_session_by_key(target) == (sid, session)
 
 
+def test_prompt_submit_final_session_info_reports_fallback_runtime(server, monkeypatch, tmp_path):
+    """A fallback activated inside the live PTY turn path must reach session.info."""
+
+    events: list[tuple[str, str, dict]] = []
+
+    class _Worker:
+        def close(self):
+            pass
+
+    class _FallbackAgent:
+        def __init__(self):
+            self.model = "primary/model"
+            self.provider = "primary-provider"
+            self.base_url = "https://primary.example/v1"
+            self.api_key = "primary-key"
+            self.api_mode = "openai"
+            self.session_id = "stored-fallback-turn"
+            self._fallback_activated = False
+            self._primary_runtime = {
+                "model": "primary/model",
+                "provider": "primary-provider",
+            }
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, message, conversation_history=None, stream_callback=None, **_kwargs):
+            self._fallback_activated = True
+            self.model = "fallback/model"
+            self.provider = "fallback-provider"
+            if stream_callback:
+                stream_callback("ok")
+            return {
+                "final_response": "ok",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
+
+    fake_approval = types.SimpleNamespace(
+        reset_current_session_key=lambda _token: None,
+        set_current_session_key=lambda _key: object(),
+        register_gateway_notify=lambda *_args, **_kwargs: None,
+        load_permanent_allowlist=lambda: None,
+    )
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda _key, _model, **_kwargs: _Worker())
+    monkeypatch.setattr(server, "_start_notification_poller", lambda _sid, _session: threading.Event())
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: events.append((event, sid, payload or {})),
+    )
+
+    with patch.dict(sys.modules, {"tools.approval": fake_approval}):
+        agent = _FallbackAgent()
+        sid = "live-fallback-turn"
+        server._init_session(
+            sid,
+            "stored-fallback-turn",
+            agent,
+            [],
+            cols=100,
+            cwd=str(tmp_path),
+        )
+        events.clear()
+
+        response = server.handle_request(
+            {
+                "id": "turn-1",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "trigger fallback"},
+            }
+        )
+
+        assert response["result"] == {"status": "streaming"}
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and server._sessions[sid].get("running"):
+            time.sleep(0.01)
+        run_thread = server._sessions[sid].get("_run_thread")
+        if run_thread is not None:
+            run_thread.join(timeout=1)
+
+    session_infos = [payload for event, _sid, payload in events if event == "session.info"]
+    assert session_infos, events
+    final_info = session_infos[-1]
+    assert final_info["model"] == "fallback/model"
+    assert final_info["provider"] == "fallback-provider"
+    assert final_info["fallback_activated"] is True
+    assert final_info["primary_model"] == "primary/model"
+    assert final_info["primary_provider"] == "primary-provider"
+
+
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     """The LRU cap frees the least-recently-active DETACHED sessions when over
     the limit, and never a live-transport / running / mid-build one."""
