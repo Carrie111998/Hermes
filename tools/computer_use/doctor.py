@@ -33,6 +33,7 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 
 from tools.computer_use.uinput_safety import (
     detect_uinput_leak_risk,
+    parse_driver_version,
     uinput_leak_risk_check,
     uinput_leak_risk_possible,
     uinput_read_write_accessible,
@@ -709,7 +710,9 @@ def _drive_health_report_or_fallback(
         )
 
 
-def _augment_report_with_uinput_leak_risk(report: Dict[str, Any]) -> None:
+def _augment_report_with_uinput_leak_risk(
+    report: Dict[str, Any], identity: Optional[Dict[str, Any]] = None,
+) -> None:
     """Append an actionable check when this host hits the known-unsafe
     Linux/X11 + old-cua-driver + inaccessible-uinput combination
     (trycua/cua#2618, fixed by trycua/cua#2631; Hermes #74148).
@@ -725,6 +728,13 @@ def _augment_report_with_uinput_leak_risk(report: Dict[str, Any]) -> None:
     already rules the risk out, ``/dev/uinput`` is never opened at all —
     running doctor against a fixed (>=0.13.1) or non-Linux host does no
     device I/O.
+
+    Prefers the resolved binary's own ``--version`` (``identity.cli_version``,
+    the same value ``hermes_identity.version_mismatch`` is built from) over
+    health_report's self-reported ``driver_version``: a stale/wrong report
+    version could otherwise claim "fixed" for a binary that is actually still
+    vulnerable, silently dropping the check. Falls back to the report's
+    version when no identity/CLI version is available.
     """
     platform_value = report.get("platform")
     if not isinstance(platform_value, str):
@@ -732,6 +742,18 @@ def _augment_report_with_uinput_leak_risk(report: Dict[str, Any]) -> None:
     driver_version = report.get("driver_version")
     if not isinstance(driver_version, str):
         driver_version = None
+    if identity:
+        cli_version = identity.get("cli_version")
+        if isinstance(cli_version, str) and cli_version:
+            normalized_cli_version = _normalize_version_token(cli_version)
+            # Only override when the CLI token actually parses for the
+            # guard (_normalize_version_token falls back to the raw,
+            # lowercased text on no regex match, which is non-empty but
+            # unusable) — otherwise a dev/packaging banner would blank out
+            # a parseable, still-vulnerable report version and silently
+            # skip the check.
+            if parse_driver_version(normalized_cli_version) is not None:
+                driver_version = normalized_cli_version
     display = os.environ.get("DISPLAY")
 
     if not uinput_leak_risk_possible(
@@ -893,9 +915,9 @@ def run_doctor(
         print(f"cua-driver health_report failed: {e}", file=sys.stderr)
         return 2
 
-    _augment_report_with_uinput_leak_risk(report)
-
     identity = _build_identity(binary, report)
+
+    _augment_report_with_uinput_leak_risk(report, identity)
 
     if json_output:
         # Additive envelope: preserve the upstream health_report keys and

@@ -454,6 +454,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -476,6 +477,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="failed")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -510,6 +512,7 @@ class TestUinputLeakRiskGuard:
         env.pop("DISPLAY", None)
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, env, clear=True), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -526,6 +529,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.13.1", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.13.1"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -543,6 +547,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="unknown", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver unknown"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -559,6 +564,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=True), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -577,6 +583,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.13.1", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.13.1"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible") as accessible, \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -590,6 +597,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="unknown", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver unknown"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible") as accessible, \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -618,6 +626,7 @@ class TestUinputLeakRiskGuard:
         env.pop("DISPLAY", None)
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible") as accessible, \
              patch.dict(os.environ, env, clear=True), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -632,6 +641,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible",
                    return_value=False) as accessible, \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
@@ -648,6 +658,7 @@ class TestUinputLeakRiskGuard:
 
         with patch("tools.computer_use.doctor._drive_health_report",
                    return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
              patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
              patch.dict(os.environ, {"DISPLAY": ":0"}), \
              patch("shutil.which", return_value="/fake/cua-driver"), \
@@ -659,3 +670,48 @@ class TestUinputLeakRiskGuard:
         blob = json.dumps(check).lower()
         for forbidden in ("chmod", "sudo"):
             assert forbidden not in blob
+
+    def test_uses_resolved_binary_version_when_report_disagrees(self):
+        """health_report can lag/lie about driver_version (the same case
+        hermes_identity.version_mismatch already flags). The guard must
+        trust the resolved binary's own --version, not the stale report
+        value, or a fixed-looking report can mask a still-vulnerable binary."""
+        from tools.computer_use import doctor
+
+        with patch("tools.computer_use.doctor._drive_health_report",
+                   return_value=_linux_report(driver_version="0.13.1", overall="ok")), \
+             patch.object(doctor, "_read_cli_version", return_value="cua-driver 0.12.6"), \
+             patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
+             patch.dict(os.environ, {"DISPLAY": ":0"}), \
+             patch("shutil.which", return_value="/fake/cua-driver"), \
+             patch("sys.stdout", new_callable=StringIO) as out:
+            code = doctor.run_doctor(json_output=True)
+
+        report = json.loads(out.getvalue())
+        assert report["overall"] == "degraded"
+        names = [c["name"] for c in report["checks"]]
+        assert "linux_uinput_xinput_leak_risk" in names
+        assert code == 1
+
+    def test_falls_back_to_report_version_when_cli_token_is_unparseable(self):
+        """A present-but-unparseable CLI --version token (a dev/packaging
+        banner with no dotted version anywhere in it) must NOT blank out a
+        parseable, still-vulnerable health_report driver_version — that
+        would silently skip the check for a genuinely vulnerable host."""
+        from tools.computer_use import doctor
+
+        with patch("tools.computer_use.doctor._drive_health_report",
+                   return_value=_linux_report(driver_version="0.12.6", overall="ok")), \
+             patch.object(doctor, "_read_cli_version",
+                           return_value="cua-driver (dev build, no version)"), \
+             patch("tools.computer_use.doctor.uinput_read_write_accessible", return_value=False), \
+             patch.dict(os.environ, {"DISPLAY": ":0"}), \
+             patch("shutil.which", return_value="/fake/cua-driver"), \
+             patch("sys.stdout", new_callable=StringIO) as out:
+            code = doctor.run_doctor(json_output=True)
+
+        report = json.loads(out.getvalue())
+        assert report["overall"] == "degraded"
+        names = [c["name"] for c in report["checks"]]
+        assert "linux_uinput_xinput_leak_risk" in names
+        assert code == 1
