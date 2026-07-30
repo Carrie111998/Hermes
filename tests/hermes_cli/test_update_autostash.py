@@ -337,3 +337,205 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+# ---------------------------------------------------------------------------
+# Windows reserved-device-name guard
+# ---------------------------------------------------------------------------
+
+def test_is_reserved_device_name_matches_all_reserved_names():
+    """Every Windows reserved device name is detected, case-insensitive."""
+    from hermes_cli.update_cmd import _is_reserved_device_name
+
+    reserved = [
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5",
+        "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+        "LPT6", "LPT7", "LPT8", "LPT9",
+    ]
+    for name in reserved:
+        assert _is_reserved_device_name(name) is True
+        assert _is_reserved_device_name(name.lower()) is True
+        assert _is_reserved_device_name(name + ".txt") is True
+        assert _is_reserved_device_name(name + ".TXT") is True
+
+    # Non-matching names should return False
+    assert _is_reserved_device_name("README") is False
+    assert _is_reserved_device_name("convention") is False
+    assert _is_reserved_device_name("com10") is False
+    assert _is_reserved_device_name("lpt0") is False
+    assert _is_reserved_device_name("") is False
+
+
+def test_rename_reserved_untracked_renames_only_matching_files(tmp_path, monkeypatch):
+    """Only untracked files matching reserved names are renamed."""
+    from hermes_cli.update_cmd import _rename_reserved_untracked
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    # Create files
+    (tmp_path / "CON.txt").write_text("con content")
+    (tmp_path / "README.md").write_text("readme content")
+    (tmp_path / "PRN").write_text("prn content")
+
+    ls_output = "CON.txt\nREADME.md\nPRN\n"
+    renames = _rename_reserved_untracked(tmp_path, ls_output)
+
+    # CON.txt and PRN should be renamed
+    assert len(renames) == 2
+    renamed_names = [r[1].name for r in renames]
+    assert ".hermes_reserved_name_CON.txt" in renamed_names
+    assert ".hermes_reserved_name_PRN" in renamed_names
+
+    # Original files should no longer exist
+    assert not (tmp_path / "CON.txt").exists()
+    assert not (tmp_path / "PRN").exists()
+
+    # README.md should be untouched
+    assert (tmp_path / "README.md").exists()
+
+    # Renamed files should exist
+    assert (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert (tmp_path / ".hermes_reserved_name_PRN").exists()
+
+
+def test_rename_reserved_untracked_noop_on_non_windows(tmp_path, monkeypatch):
+    """On non-Windows platforms, no renaming happens."""
+    from hermes_cli.update_cmd import _rename_reserved_untracked
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    (tmp_path / "CON.txt").write_text("con content")
+    ls_output = "CON.txt\n"
+    renames = _rename_reserved_untracked(tmp_path, ls_output)
+
+    assert renames == []
+    assert (tmp_path / "CON.txt").exists()
+
+
+def test_restore_reserved_renames_restores_original_names(tmp_path, monkeypatch):
+    """Renamed files are restored to their original names."""
+    from hermes_cli.update_cmd import _restore_reserved_renames
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    # Simulate pre-stash renamed files
+    (tmp_path / ".hermes_reserved_name_CON.txt").write_text("con content")
+    (tmp_path / ".hermes_reserved_name_AUX.md").write_text("aux content")
+
+    _restore_reserved_renames(tmp_path)
+
+    assert (tmp_path / "CON.txt").exists()
+    assert (tmp_path / "AUX.md").exists()
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert not (tmp_path / ".hermes_reserved_name_AUX.md").exists()
+
+
+def test_restore_reserved_renames_noop_on_non_windows(tmp_path, monkeypatch):
+    """On non-Windows platforms, restore is a no-op."""
+    from hermes_cli.update_cmd import _restore_reserved_renames
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: False)
+
+    (tmp_path / ".hermes_reserved_name_CON.txt").write_text("con content")
+    _restore_reserved_renames(tmp_path)
+
+    # File should still be there (no rename happened)
+    assert (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+
+
+def test_stash_local_changes_renames_reserved_untracked_on_windows(
+    tmp_path, monkeypatch, capsys
+):
+    """E2E: _stash_local_changes_if_needed renames reserved files before stash."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    from hermes_cli import main as hermes_main
+    from hermes_cli.update_cmd import _stash_local_changes_if_needed
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    # Create a reserved-name untracked file
+    (tmp_path / "CON.txt").write_text("con content")
+
+    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref is not None
+
+    # The reserved file was renamed before stash, then the renamed file
+    # was stashed (as untracked) and removed from the working tree.
+    assert not (tmp_path / "CON.txt").exists()
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+
+    out = capsys.readouterr().out
+    assert "Temporarily renamed Windows reserved-device-name file" in out
+
+
+def test_restore_stashed_changes_restores_reserved_names_after_apply(
+    tmp_path, monkeypatch, capsys
+):
+    """E2E: _restore_stashed_changes restores reserved file names after stash apply."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    from hermes_cli import main as hermes_main
+    from hermes_cli.update_cmd import (
+        _stash_local_changes_if_needed,
+        _restore_stashed_changes,
+    )
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    # Create a reserved-name untracked file
+    (tmp_path / "CON.txt").write_text("con content")
+
+    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref is not None
+
+    # After restore, original name should be back
+    restored = _restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, prompt_user=False
+    )
+    assert restored is True
+
+    assert (tmp_path / "CON.txt").exists()
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert (tmp_path / "CON.txt").read_text() == "con content"
+
+    out = capsys.readouterr().out
+    assert "Restored reserved file name: CON.txt" in out
