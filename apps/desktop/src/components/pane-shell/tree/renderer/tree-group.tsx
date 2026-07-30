@@ -45,8 +45,8 @@ import {
   restoreTreePane,
   SESSION_TILE_DRAG,
   setTreeGroupHeaderHidden,
-  splitTreeZone,
-  toggleTreeGroupMinimized
+  setTreeGroupMinimized,
+  splitTreeZone
 } from '../store'
 
 import { type DoubleTapContext, startPaneDrag } from './drag-session'
@@ -110,7 +110,7 @@ function ZoneMenu({
           {headerHidden ? t.zones.showHeader : t.zones.hideHeader}
         </ContextMenuItem>
         {minimizable && (
-          <ContextMenuItem onSelect={() => toggleTreeGroupMinimized(nodeId, !minimized)}>
+          <ContextMenuItem onSelect={() => setTreeGroupMinimized(nodeId, !minimized)}>
             {minimized ? t.zones.restore : t.zones.minimize}
           </ContextMenuItem>
         )}
@@ -250,7 +250,7 @@ export function TreeGroup({
   const hideHeaderDoubleTap: DoubleTapContext = {
     key: `hide-header-${node.id}`,
     onDoubleTap: () => {
-      toggleTreeGroupMinimized(node.id, false)
+      setTreeGroupMinimized(node.id, false)
       setTreeGroupHeaderHidden(node.id, true)
     }
   }
@@ -345,7 +345,7 @@ export function TreeGroup({
 
   return (
     <div
-      className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-(--ui-bg-editor)"
+      className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-(--ui-editor-surface-background)"
       data-tree-group={node.id}
       // Advertises the visible tab strip so panes can drop their own
       // self-naming labels (see [data-pane-self-label] in styles.css).
