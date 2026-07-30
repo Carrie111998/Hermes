@@ -69,7 +69,7 @@ class ProfileGatewayProcess:
     path: Path
     pid: int
 
-def _get_service_pids() -> set:
+def _get_service_pids(all_profiles: bool = False) -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
     Used to avoid killing freshly-restarted service processes when sweeping
@@ -110,22 +110,45 @@ def _get_service_pids() -> set:
     # --- launchd (macOS) ---
     if is_macos():
         try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
+            if all_profiles:
+                # Query all active launchd jobs and match any ai.hermes.gateway service
+                result = subprocess.run(
+                    ["launchctl", "list"],
+                    capture_output=True,
+                    text=True, encoding='utf-8', errors='replace',
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[2].startswith("ai.hermes.gateway"):
+                            try:
+                                pid = int(parts[0])
+                                if pid > 0:
+                                    pids.add(pid)
+                            except ValueError:
+                                pass
+            else:
+                label = get_launchd_label()
+                result = subprocess.run(
+                    ["launchctl", "list", label],
+                    capture_output=True,
+                    text=True, encoding='utf-8', errors='replace',
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    # Output: "PID\tStatus\tLabel" header, then one data line
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[2] == label:
+                            try:
+                                pid = int(parts[0])
+                                if pid > 0:
+                                    pids.add(pid)
+                            except ValueError:
+                                pass
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
@@ -423,7 +446,7 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
 
             if not _found_via_proc:
                 result = subprocess.run(
-                    ["ps", "-A", "eww", "-o", "pid=,command="],
+                    ["ps", "-Aww", "-o", "pid=,command="],
                     capture_output=True,
                     text=True,
                     timeout=10,
@@ -529,7 +552,7 @@ def find_gateway_pids(exclude_pids: set | None = None, all_profiles: bool = Fals
             _append_unique_pid(pids, get_running_pid(), _exclude)
         except Exception:
             pass
-    for pid in _get_service_pids():
+    for pid in _get_service_pids(all_profiles=all_profiles):
         _append_unique_pid(pids, pid, _exclude)
     for pid in _scan_gateway_pids(_exclude, all_profiles=all_profiles):
         _append_unique_pid(pids, pid, _exclude)

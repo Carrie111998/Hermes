@@ -109,6 +109,7 @@ class TestProcFallback:
             pids = gateway_mod._scan_gateway_pids(set(), all_profiles=True)
 
         mock_ps.assert_called_once()
+        assert mock_ps.call_args[0][0] == ["ps", "-Aww", "-o", "pid=,command="]
         assert 12345 in pids
 
     def test_proc_permission_error_skips_pid(self):
@@ -136,3 +137,72 @@ class TestProcFallback:
         # PermissionError swallowed — empty result, no crash
         assert 12345 not in pids
         mock_ps.assert_not_called()  # /proc dir existed, so ps not called
+
+    def test_get_service_pids_all_profiles_launchd_macos(self):
+        """_get_service_pids(all_profiles=True) returns launchd PIDs for all gateway profiles."""
+        mock_launchctl = MagicMock()
+        mock_launchctl.returncode = 0
+        mock_launchctl.stdout = (
+            "PID\tStatus\tLabel\n"
+            "11111\t0\tai.hermes.gateway\n"
+            "22222\t0\tai.hermes.gateway-work\n"
+            "33333\t0\tcom.apple.finder\n"
+        )
+        with (
+            patch("hermes_cli.gateway.is_macos", return_value=True),
+            patch("hermes_cli.gateway.supports_systemd_services", return_value=False),
+            patch("subprocess.run", return_value=mock_launchctl) as mock_run,
+        ):
+            pids = gateway_mod._get_service_pids(all_profiles=True)
+
+        mock_run.assert_called_once_with(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        assert pids == {11111, 22222}
+
+    def test_find_gateway_pids_excludes_multiprofile_launchd_services(self):
+        """find_gateway_pids(all_profiles=True) excludes sibling launchd service PIDs."""
+        mock_launchctl = MagicMock()
+        mock_launchctl.returncode = 0
+        mock_launchctl.stdout = (
+            "PID\tStatus\tLabel\n"
+            "11111\t0\tai.hermes.gateway\n"
+            "22222\t0\tai.hermes.gateway-work\n"
+        )
+
+        ps_output = (
+            f"11111 {_GATEWAY_CMD}\n"
+            f"22222 {_GATEWAY_CMD} --profile work\n"
+            f"44444 {_GATEWAY_CMD} --profile manual\n"
+        )
+        mock_ps = MagicMock()
+        mock_ps.returncode = 0
+        mock_ps.stdout = ps_output
+
+        def _sub_run(cmd, **kwargs):
+            if cmd[0] == "launchctl":
+                return mock_launchctl
+            if cmd[0] == "ps":
+                return mock_ps
+            raise ValueError(f"Unexpected cmd: {cmd}")
+
+        with (
+            patch("hermes_cli.gateway.is_macos", return_value=True),
+            patch("hermes_cli.gateway.is_windows", return_value=False),
+            patch("hermes_cli.gateway.supports_systemd_services", return_value=False),
+            patch("os.path.isdir", return_value=False),
+            patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
+            patch("subprocess.run", side_effect=_sub_run),
+        ):
+            service_pids = gateway_mod._get_service_pids(all_profiles=True)
+            pids = gateway_mod.find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+
+        # 11111 and 22222 are service PIDs and must be excluded; 44444 is manual and kept.
+        assert 44444 in pids
+        assert 11111 not in pids
+        assert 22222 not in pids
