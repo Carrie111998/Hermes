@@ -2626,3 +2626,43 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
+
+def test_discover_mcp_tools_skip_env_returns_existing_tools_without_loading_config(monkeypatch):
+    """HERMES_SKIP_MCP_DISCOVERY bypasses config loading and server registration."""
+    from tools import mcp_tool
+
+    calls = {"load": 0, "register": 0}
+
+    def _load_should_not_run():
+        calls["load"] += 1
+        raise AssertionError("skip env should bypass MCP config loading")
+
+    def _register_should_not_run(_servers):
+        calls["register"] += 1
+        raise AssertionError("skip env should bypass MCP server registration")
+
+    monkeypatch.setenv("HERMES_SKIP_MCP_DISCOVERY", "1")
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_load_mcp_config", _load_should_not_run)
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", _register_should_not_run)
+    monkeypatch.setattr(mcp_tool, "_existing_tool_names", lambda: ["mcp__cached__tool"])
+
+    assert mcp_tool.discover_mcp_tools() == ["mcp__cached__tool"]
+    assert calls == {"load": 0, "register": 0}
+
+
+def test_discover_mcp_tools_skip_env_accepts_boolish_true_values(monkeypatch):
+    """Dashboard/service env gates can use common true spellings."""
+    from tools import mcp_tool
+
+    monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_existing_tool_names", lambda: ["mcp__cached__tool"])
+    monkeypatch.setattr(
+        mcp_tool,
+        "_load_mcp_config",
+        lambda: (_ for _ in ()).throw(AssertionError("skip env should bypass config")),
+    )
+
+    for value in ["1", "true", "TRUE", " yes ", "on"]:
+        monkeypatch.setenv("HERMES_SKIP_MCP_DISCOVERY", value)
+        assert mcp_tool.discover_mcp_tools() == ["mcp__cached__tool"]
