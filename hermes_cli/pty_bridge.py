@@ -60,6 +60,7 @@ __all__ = ["PtyBridge", "PtyUnavailableError"]
 _MIN_DIMENSION = 1
 _MAX_COLS = 2000
 _MAX_ROWS = 1000
+_DESCENDANT_SCAN_INTERVAL_S = 1.0
 
 
 def _clamp_dimension(value: int, maximum: int) -> int:
@@ -120,6 +121,8 @@ class PtyBridge:
         self._descendants: dict[tuple[int, float], psutil.Process] = {}
         self._descendant_scan_succeeded = False
         self._descendant_scan_failed = False
+        self._next_descendant_scan = 0.0
+        self._track_descendants()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -238,6 +241,14 @@ class PtyBridge:
             except (psutil.Error, OSError):
                 self._descendant_scan_failed = True
 
+    def _maybe_track_descendants(self) -> None:
+        """Refresh descendants periodically while the PTY leader is alive."""
+        now = time.monotonic()
+        if now < self._next_descendant_scan:
+            return
+        self._next_descendant_scan = now + _DESCENDANT_SCAN_INTERVAL_S
+        self._track_descendants()
+
     def _live_descendants(self) -> list[psutil.Process]:
         """Return tracked descendants that can still execute code."""
         live: list[psutil.Process] = []
@@ -278,6 +289,7 @@ class PtyBridge:
         """
         if self._closed:
             return None
+        self._maybe_track_descendants()
         try:
             readable, _, _ = select.select([self._fd], [], [], timeout)
         except (OSError, ValueError):
@@ -289,9 +301,11 @@ class PtyBridge:
         except OSError as exc:
             # EIO on Linux = slave side closed.  EBADF = already closed.
             if exc.errno in {errno.EIO, errno.EBADF}:
+                self._track_descendants()
                 return None
             raise
         if not data:
+            self._track_descendants()
             return None
         return data
 

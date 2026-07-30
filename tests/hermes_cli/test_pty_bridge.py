@@ -146,6 +146,42 @@ class TestClampDimension:
 
 @skip_on_windows
 class TestPtyBridgeClose:
+    def test_successful_live_snapshot_allows_clean_leader_exit(
+        self, monkeypatch
+    ):
+        scans = 0
+
+        class _RootProcess:
+            @staticmethod
+            def children(recursive=False):
+                return []
+
+        def process_for_scan(pid):
+            nonlocal scans
+            scans += 1
+            if scans == 1:
+                return _RootProcess()
+            raise psutil.NoSuchProcess(pid)
+
+        class _ExitedProc:
+            pid = 12345
+            fd = -1
+
+            @staticmethod
+            def isalive():
+                return False
+
+        monkeypatch.setattr(psutil, "Process", process_for_scan)
+        monkeypatch.setattr(os, "getpgid", lambda pid: 67890)
+        monkeypatch.setattr(os, "getpgrp", lambda: 67890)
+
+        bridge = PtyBridge(_ExitedProc())
+        bridge._track_descendants()
+
+        assert bridge._descendant_scan_succeeded is True
+        assert bridge._descendant_scan_failed is False
+        assert bridge.verify_closed() is True
+
     def test_close_is_idempotent(self):
         bridge = PtyBridge.spawn(["/bin/sh", "-c", "sleep 30"])
         bridge.close()
