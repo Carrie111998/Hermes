@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-RULE_SET_VERSION = "1.0.0"
+RULE_SET_VERSION = "1.1.0"
 REVIEW_WINDOW_SECONDS = 48 * 60 * 60
 CADENCE_SECONDS = 12 * 60 * 60
 INTAKE_DECISION_SECONDS = 30 * 60
@@ -19,6 +19,24 @@ RUNNING_INACTIVITY_SECONDS = 60 * 60
 BLOCKED_AGING_SECONDS = 12 * 60 * 60
 FINDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
 NOMINAL_BOUNDARY_MINUTE = 15
+
+# --- HEL-3113 follow-up (lifecycle-derivable holes, no HEL-3110 dependency) ---
+# A single protocol_violation is retried by the dispatcher's own bounded
+# budget (see kanban_db._PROTOCOL_VIOLATION_FAILURE_LIMIT); a SECOND one for
+# the same task/profile means the retry didn't fix it, so escalate.
+PROTOCOL_VIOLATION_REPEAT_THRESHOLD = 2
+# Two crash/timeout/spawn_failed events for the same task in-window is the
+# design's literal RETRY_THRASH trigger.
+RETRY_THRASH_FAILURE_THRESHOLD = 2
+# STALL.BLOCKED_AGED severity ladder (typed human blocks only).
+BLOCKED_AGED_MEDIUM_SECONDS = 12 * 60 * 60
+BLOCKED_AGED_HIGH_SECONDS = 24 * 60 * 60
+BLOCKED_AGED_CRITICAL_SECONDS = 48 * 60 * 60
+# Matches config default kanban.dispatch_interval_seconds; "two dispatcher
+# ticks" is the design's threshold for TODO_PROMOTABLE / READY_UNCLAIMED.
+DISPATCH_TICK_SECONDS = 60
+TODO_PROMOTABLE_THRESHOLD_SECONDS = 2 * DISPATCH_TICK_SECONDS
+READY_UNCLAIMED_THRESHOLD_SECONDS = 2 * DISPATCH_TICK_SECONDS
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "linear_scoped": ("linear_issue_key", "sub_issue_keys", "cptc_estimates"),
@@ -452,6 +470,129 @@ def run_review(
                 evidence_state="MEASURED", title="Blocked task lacks typed ownership", owner=task["assignee"] or "OWNER.UNRESOLVED",
                 recommendation="Record a typed block kind, accountable owner, and next action at the block boundary.", evidence=[{"event_ids": [], "query_id": "Q-BLOCK-01", "fact": "Blocked task has no typed block owner."}], observed_at=end,
             ))
+
+    for task_id, task in tasks.items():
+        task_events = by_task.get(task_id, [])
+        violations = [e for e in task_events if e["kind"] == "protocol_violation"]
+        if not violations:
+            continue
+        latest = violations[-1]
+        severity = (
+            "CRITICAL"
+            if len(violations) >= PROTOCOL_VIOLATION_REPEAT_THRESHOLD
+            else "HIGH"
+        )
+        holes.append(_finding(
+            "FAILURE.PROTOCOL_VIOLATION", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity=severity,
+            evidence_state="MEASURED", title="Worker exited without kanban_complete/kanban_block",
+            owner=task["assignee"] or "OWNER.UNRESOLVED",
+            recommendation="Repair the worker/session so it always ends with a terminal kanban call; investigate repeat causes for this profile.",
+            evidence=[{"event_ids": [e["id"] for e in violations], "query_id": "Q-FAILURE-01", "fact": f"{len(violations)} protocol_violation event(s) in window for this task."}],
+            observed_at=latest["created_at"], next_expected_event="kanban_complete",
+        ))
+
+    for task_id, task in tasks.items():
+        task_events = by_task.get(task_id, [])
+        thrash_kinds = {"crashed", "timed_out", "spawn_failed"}
+        thrash_events = [e for e in task_events if e["kind"] in thrash_kinds]
+        breaker_tripped = any(e["kind"] == "gave_up" for e in task_events)
+        if len(thrash_events) < RETRY_THRASH_FAILURE_THRESHOLD and not breaker_tripped:
+            continue
+        latest = (thrash_events or task_events)[-1]
+        severity = "CRITICAL" if breaker_tripped else "HIGH"
+        holes.append(_finding(
+            "FAILURE.RETRY_THRASH", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity=severity,
+            evidence_state="MEASURED", title="Task is thrashing on repeated crash/timeout/spawn failures",
+            owner=task["assignee"] or "OWNER.UNRESOLVED",
+            recommendation="Diagnose the shared failure cause (worker, environment, or task scope) before further respawns.",
+            evidence=[{"event_ids": [e["id"] for e in thrash_events], "query_id": "Q-FAILURE-02", "fact": f"{len(thrash_events)} crash/timeout/spawn_failed event(s) in window; breaker_tripped={breaker_tripped}."}],
+            observed_at=latest["created_at"],
+        ))
+
+    for task_id, task in tasks.items():
+        if task["status"] != "blocked" or not task["block_kind"]:
+            continue
+        block_events = [e for e in by_task.get(task_id, []) if e["kind"] in {"blocked", "block_loop_detected"}]
+        if not block_events:
+            continue
+        blocked_since = block_events[-1]["created_at"]
+        age = end - blocked_since
+        if age < BLOCKED_AGED_MEDIUM_SECONDS:
+            continue
+        if age >= BLOCKED_AGED_CRITICAL_SECONDS:
+            severity = "CRITICAL"
+        elif age >= BLOCKED_AGED_HIGH_SECONDS:
+            severity = "HIGH"
+        else:
+            severity = "MEDIUM"
+        holes.append(_finding(
+            "STALL.BLOCKED_AGED", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity=severity,
+            evidence_state="MEASURED", title="Typed human block has aged without a decision",
+            owner=task["assignee"] or "OWNER.UNRESOLVED",
+            recommendation="Record a decision or unblock event for this typed block.",
+            evidence=[{"event_ids": [block_events[-1]["id"]], "query_id": "Q-STALL-01", "fact": f"Blocked for {age} seconds since {_utc(blocked_since)}."}],
+            observed_at=blocked_since,
+        ))
+
+    for task_id, task in tasks.items():
+        if task["status"] != "todo":
+            continue
+        parent_rows = conn.execute(
+            "SELECT t.status, t.completed_at FROM tasks t "
+            "JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?",
+            (task_id,),
+        ).fetchall()
+        if not parent_rows or not all(p["status"] in ("done", "archived") for p in parent_rows):
+            continue
+        completions = [p["completed_at"] for p in parent_rows if p["completed_at"]]
+        eligible_since = max(completions) if completions else task["created_at"]
+        age = end - eligible_since
+        if age < TODO_PROMOTABLE_THRESHOLD_SECONDS:
+            continue
+        promoted_after = any(
+            e["kind"] == "promoted" and e["created_at"] > eligible_since
+            for e in by_task.get(task_id, [])
+        )
+        if promoted_after:
+            continue
+        holes.append(_finding(
+            "STALL.TODO_PROMOTABLE", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="HIGH",
+            evidence_state="MEASURED", title="All parents terminal but task was not promoted to ready",
+            owner="OWNER.UNRESOLVED",
+            recommendation="Repair recompute_ready so parent-terminal todo tasks promote within two dispatcher ticks.",
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-02", "fact": f"All parents terminal since {_utc(eligible_since)}; no promoted event followed within {TODO_PROMOTABLE_THRESHOLD_SECONDS}s."}],
+            observed_at=eligible_since, next_expected_event="promoted",
+        ))
+
+    _ready_predecessor_kinds = {"promoted", "created", "reclaimed", "crashed", "rate_limited", "timed_out", "spawn_failed"}
+    for task_id, task in tasks.items():
+        if task["status"] != "ready":
+            continue
+        task_events = by_task.get(task_id, [])
+        ready_candidates = [e["created_at"] for e in task_events if e["kind"] in _ready_predecessor_kinds]
+        ready_since = max(ready_candidates) if ready_candidates else task["created_at"]
+        age = end - ready_since
+        if age < READY_UNCLAIMED_THRESHOLD_SECONDS:
+            continue
+        claimed_after = any(
+            e["kind"] == "claimed" and e["created_at"] > ready_since
+            for e in task_events
+        )
+        if claimed_after:
+            continue
+        holes.append(_finding(
+            "STALL.READY_UNCLAIMED", board_slug,
+            _subject(task_ids=[task_id], profiles=[task["assignee"]]), severity="HIGH",
+            evidence_state="MEASURED", title="Ready task was not claimed within two dispatcher ticks",
+            owner="OWNER.UNRESOLVED",
+            recommendation="Verify dispatcher health and profile spawnability for this assignee; this measurement does not yet apply full idle-agent capacity safeguards.",
+            evidence=[{"event_ids": [], "query_id": "Q-STALL-03", "fact": f"Ready since {_utc(ready_since)}; no claimed event followed within {READY_UNCLAIMED_THRESHOLD_SECONDS}s."}],
+            observed_at=ready_since, next_expected_event="claimed",
+        ))
 
     holes = _apply_prior_states(conn, holes, board_slug=board_slug, observed_at=end)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}

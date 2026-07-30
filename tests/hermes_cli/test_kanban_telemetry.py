@@ -190,6 +190,114 @@ def test_missing_nominal_boundary_emits_critical_review_health_hole(board):
     assert missed[0]["owner"] == "rhea-ramos"
 
 
+def test_protocol_violation_first_is_high_repeat_is_critical(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="worker", assignee="felix-steele")
+        _insert_event(conn, task, "protocol_violation", {"pid": 1, "claimer": "host:1", "exit_code": 0}, end - 3000)
+        first = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "protocol_violation", {"pid": 2, "claimer": "host:1", "exit_code": 0}, end - 1000)
+        second = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    first_hole = next(h for h in first["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    second_hole = next(h for h in second["holes"] if h["rule_id"] == "FAILURE.PROTOCOL_VIOLATION")
+    assert first_hole["severity"] == "HIGH"
+    assert second_hole["severity"] == "CRITICAL"
+
+
+def test_retry_thrash_flags_two_failures_and_escalates_on_breaker(board):
+    end = 1_800_000_000
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="thrashing", assignee="felix-steele")
+        _insert_event(conn, task, "crashed", {"pid": 1}, end - 5000)
+        _insert_event(conn, task, "timed_out", {}, end - 3000)
+        no_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+        _insert_event(conn, task, "gave_up", {"failures": 3}, end - 1000)
+        with_breaker = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole_before = next(h for h in no_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    hole_after = next(h for h in with_breaker["holes"] if h["rule_id"] == "FAILURE.RETRY_THRASH")
+    assert hole_before["severity"] == "HIGH"
+    assert hole_after["severity"] == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "expected_severity"),
+    [
+        (telemetry.BLOCKED_AGED_MEDIUM_SECONDS, "MEDIUM"),
+        (telemetry.BLOCKED_AGED_HIGH_SECONDS, "HIGH"),
+        (telemetry.BLOCKED_AGED_CRITICAL_SECONDS, "CRITICAL"),
+    ],
+)
+def test_blocked_aged_severity_ladder(board, age_seconds, expected_severity):
+    end = 1_800_000_000
+    blocked_at = end - age_seconds
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="blocked", assignee="felix-steele", initial_status="blocked")
+        conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (task,),
+        )
+        _insert_event(conn, task, "blocked", {"reason": "needs decision", "kind": "needs_input", "recurrences": 1}, blocked_at)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.BLOCKED_AGED")
+    assert hole["severity"] == expected_severity
+
+
+def test_todo_promotable_flags_stuck_task_after_two_ticks(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+            (eligible_since, parent),
+        )
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.TODO_PROMOTABLE")
+    assert hole["severity"] == "HIGH"
+    assert child in hole["subject"]["task_ids"]
+
+
+def test_todo_promotable_suppressed_after_promotion(board):
+    end = 1_800_000_000
+    eligible_since = end - telemetry.TODO_PROMOTABLE_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="felix-steele")
+        child = kb.create_task(conn, title="child", parents=[parent], assignee="felix-steele")
+        conn.execute(
+            "UPDATE tasks SET status = 'ready', completed_at = ? WHERE id IN (?, ?)",
+            (eligible_since, parent, child),
+        )
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (parent,))
+        _insert_event(conn, child, "promoted", {"from_status": "todo", "to_status": "ready"}, eligible_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.TODO_PROMOTABLE" not in rule_ids
+
+
+def test_ready_unclaimed_flags_task_after_two_ticks(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="unclaimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    hole = next(h for h in report["holes"] if h["rule_id"] == "STALL.READY_UNCLAIMED")
+    assert hole["severity"] == "HIGH"
+    assert task in hole["subject"]["task_ids"]
+
+
+def test_ready_unclaimed_suppressed_after_claim(board):
+    end = 1_800_000_000
+    ready_since = end - telemetry.READY_UNCLAIMED_THRESHOLD_SECONDS - 10
+    with kb.connect_closing() as conn:
+        task = kb.create_task(conn, title="claimed", assignee="felix-steele")
+        _insert_event(conn, task, "created", {}, ready_since)
+        _insert_event(conn, task, "claimed", {"lock": "host:1"}, ready_since + 5)
+        report = telemetry.run_review(conn, board_slug="default", db_path=kb.kanban_db_path(), window_end=end, generated_at=end)
+    rule_ids = {h["rule_id"] for h in report["holes"]}
+    assert "STALL.READY_UNCLAIMED" not in rule_ids
+
+
 def test_persist_review_replay_preserves_dispositioned_verified_ledger(board, tmp_path):
     """AGA P1 #1: replaying a telemetry source must never reset the ledger.
 
