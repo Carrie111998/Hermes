@@ -64,6 +64,9 @@ elif mode == "quota":
 elif mode == "stale-session":
     print("No conversation found with session ID", file=sys.stderr, flush=True)
     raise SystemExit(1)
+elif mode == "stale-on-resume" and "--resume" in args:
+    print("No conversation found with session ID", file=sys.stderr, flush=True)
+    raise SystemExit(1)
 elif mode == "execution-error":
     print("unexpected child failure", file=sys.stderr, flush=True)
     raise SystemExit(7)
