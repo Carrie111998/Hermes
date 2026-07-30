@@ -50,6 +50,13 @@ class TestSendQqbot:
         resp.json.return_value = {"code": 1003, "message": "not found"}
         return resp
 
+    @staticmethod
+    def _make_group_success():
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"id": "grp_msg_001"}
+        return resp
+
     # ---------- markdown_enabled=True ----------
 
     @pytest.mark.asyncio
@@ -185,6 +192,82 @@ class TestSendQqbot:
             assert "markdown" not in c2c_body
 
             assert result["success"] is True
+
+    # ---------- group fallback (deepest chain) ----------
+
+    @pytest.mark.asyncio
+    async def test_markdown_enabled_group_fallback(self):
+        """When channel and C2C fail, group endpoint gets markdown payload."""
+        from gateway.config import PlatformConfig
+        from tools.send_message_tool import _send_qqbot
+
+        pconfig = PlatformConfig(enabled=True, extra={
+            "app_id": "app123", "client_secret": "sec456",
+            "markdown_support": True,
+        })
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+            mock_client.post.side_effect = [
+                self._mock_token_response(),   # token
+                self._make_failure(),           # channel → 404
+                self._make_failure(),           # C2C → 404
+                self._make_group_success(),     # group → 200
+            ]
+
+            result = await _send_qqbot(pconfig, "group_001", self.MARKDOWN_CONTENT)
+
+            calls = mock_client.post.call_args_list
+            assert len(calls) >= 4
+
+            group_body = calls[3].kwargs["json"]
+            assert "markdown" in group_body
+            assert group_body["markdown"]["content"] == self.MARKDOWN_CONTENT
+            assert group_body["msg_type"] == 2
+            assert 0 <= group_body["msg_seq"] <= 65535
+
+            assert result["success"] is True
+            assert result["message_id"] == "grp_msg_001"
+
+    @pytest.mark.asyncio
+    async def test_markdown_disabled_group_fallback(self):
+        """With markdown_support=False and all endpoints tried, group gets text + msg_seq."""
+        from gateway.config import PlatformConfig
+        from tools.send_message_tool import _send_qqbot
+
+        pconfig = PlatformConfig(enabled=True, extra={
+            "app_id": "app123", "client_secret": "sec456",
+            "markdown_support": False,
+        })
+
+        with patch("httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+            mock_client.post.side_effect = [
+                self._mock_token_response(),   # token
+                self._make_failure(),           # channel → 404
+                self._make_failure(),           # C2C → 404
+                self._make_group_success(),     # group → 200
+            ]
+
+            result = await _send_qqbot(pconfig, "group_001", "plain text")
+
+            calls = mock_client.post.call_args_list
+            assert len(calls) >= 4
+
+            group_body = calls[3].kwargs["json"]
+            assert group_body["content"] == "plain text"
+            assert group_body["msg_type"] == 0
+            assert 0 <= group_body["msg_seq"] <= 65535
+            assert "markdown" not in group_body
+
+            assert result["success"] is True
+            assert result["message_id"] == "grp_msg_001"
+
+    # ---------- msg_seq ----------
 
     @pytest.mark.asyncio
     async def test_msg_seq_range(self):
