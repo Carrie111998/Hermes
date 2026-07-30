@@ -1,0 +1,19 @@
+[Unit]
+Description=Hermes Agent Backend (shared serve for desktop apps)
+Documentation=https://hermes-agent.nousresearch.com/docs
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c 'mkdir -p ${HOME}/.hermes/runtime; [ -f ${HOME}/.hermes/runtime/backend-token ] || python3 -c "import secrets; print(secrets.token_hex(32))" > ${HOME}/.hermes/runtime/backend-token'
+ExecStart=/bin/bash -c 'export HERMES_DASHBOARD_SESSION_TOKEN=$(cat ${HOME}/.hermes/runtime/backend-token); exec ${HOME}/.hermes/hermes-agent/venv/bin/hermes serve --host 127.0.0.1 --port 44985 --skip-build'
+Restart=on-failure
+RestartSec=3
+
+# Security hardening
+PrivateTmp=true
+ProtectHome=read-only
+ReadWritePaths=%h/.hermes/runtime %h/.hermes/logs %h/.hermes/profiles
+
+[Install]
+WantedBy=default.target

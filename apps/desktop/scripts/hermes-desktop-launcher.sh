@@ -36,6 +36,28 @@ if [ "electron/main.ts" -nt "dist/electron-main.mjs" ] 2>/dev/null; then
   npm run build 2>&1 | tail -5
 fi
 
+# Python corruption guard — detect *** or syntax errors in backend
+PYTHON_FILES=$(find "$HERMES_AGENT/hermes_cli" -name '*.py' -not -path '*__pycache__*' 2>/dev/null)
+if [ -n "$PYTHON_FILES" ]; then
+  BAD=""
+  for f in $PYTHON_FILES; do
+    if grep -nE '\*\*\*' "$f" 2>/dev/null | grep -v 'is_password=\*\*\*\|token=\*\*\*\|secret: \*\*\*\|client_secret: \*\*\*' | grep -q .; then
+      echo "[hermes-launcher] *** corruption in $f — restoring from git"
+      git -C "$HERMES_AGENT" checkout HEAD -- "${f#$HERMES_AGENT/}" 2>/dev/null && BAD="$BAD $f"
+    fi
+    python3 -c "import py_compile; py_compile.compile('$f', doraise=True)" 2>/dev/null
+    if [ $? -ne 0 ]; then
+      echo "[hermes-launcher] SyntaxError in $f — restoring from git"
+      git -C "$HERMES_AGENT" checkout HEAD -- "${f#$HERMES_AGENT/}" 2>/dev/null
+      python3 -c "import py_compile; py_compile.compile('$f', doraise=True)" 2>/dev/null || {
+        echo "[hermes-launcher] FATAL: $f still broken after git restore — aborting"
+        exit 1
+      }
+    fi
+  done
+  [ -n "$BAD" ] && echo "[hermes-launcher] Restored corrupted Python files:$BAD"
+fi
+
 # NVIDIA guard — detect version mismatch
 if [ -f /proc/driver/nvidia/version ] && command -v modinfo >/dev/null 2>&1; then
   LOADED=$(sed -n 's/.*Kernel Module  *\([0-9.]*\) .*/\1/p' /proc/driver/nvidia/version 2>/dev/null | head -1)
@@ -64,34 +86,21 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
   exit 0
 fi
 echo $$ > "$PIDFILE"
-cleanup() { rm -f "$SENTINEL" "$PIDFILE"; kill "$SERVE_PID" 2>/dev/null; exit 0; }
+cleanup() { rm -f "$SENTINEL" "$PIDFILE"; exit 0; }
 trap cleanup EXIT INT TERM
 
-# --- Pre-start serve backend (avoids desktop spawning its own ~5s startup) ---
-# ponytail: pre-started serve means desktop skips spawn, connects via env vars instantly
-TOKEN=$(openssl rand -hex 32)
-BACKEND_LOG="$HOME/.hermes/logs/backend.log"
-mkdir -p "$HOME/.hermes/logs"
-rm -f "$BACKEND_LOG"
-"$VENV_PYTHON" -m hermes_cli.main serve --host 127.0.0.1 --port 0 >"$BACKEND_LOG" 2>&1 &
-SERVE_PID=$!
-
-PORT=""
-for i in $(seq 1 20); do
-  if grep -q 'HERMES_BACKEND_READY port=' "$BACKEND_LOG" 2>/dev/null; then
-    PORT=$(grep -oP 'port=\K\d+' "$BACKEND_LOG" | tail -1)
-    break
-  fi
-  sleep 0.5
-done
-
-if [ -z "$PORT" ]; then
-  echo "[hermes-launcher] Backend not ready after 10s — launching without pre-start."
-  kill "$SERVE_PID" 2>/dev/null
+# --- Connect to shared systemd-managed backend (hermes-serve.service) ---
+# systemd user service manages hermes-serve lifecycle on port 44985.
+# Both Electron + Tauri read the same token from ~/.hermes/runtime/backend-token.
+TOKEN_FILE="$HOME/.hermes/runtime/backend-token"
+if [ -f "$TOKEN_FILE" ]; then
+  BACKEND_TOKEN=$(cat "$TOKEN_FILE")
+  export HERMES_DESKTOP_REMOTE_URL="http://127.0.0.1:44985"
+  export HERMES_DESKTOP_REMOTE_TOKEN="$BACKEND_TOKEN"
+  echo "[hermes-launcher] Connected to shared backend on :44985"
 else
-  export HERMES_DESKTOP_REMOTE_URL="http://127.0.0.1:$PORT"
-  export HERMES_DESKTOP_REMOTE_TOKEN="${TOKEN}"
-  echo "[hermes-launcher] Backend ready on port $PORT — desktop connects directly."
+  echo "[hermes-launcher] WARNING: No backend-token found at $TOKEN_FILE"
+  echo "[hermes-launcher] Run: systemctl --user start hermes-serve"
 fi
 
 cd "$DESKTOP_DIR" && "$ELECTRON" . --no-sandbox --in-process-gpu --disable-gpu-compositing --disable-dev-shm-usage --no-zygote --disable-features=UseSystemdServiceManager --ozone-platform-hint=auto --enable-features=UseOzonePlatform
