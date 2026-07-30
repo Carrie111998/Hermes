@@ -93,7 +93,8 @@ export const en: Translations = {
       gatewaySettings: 'Gateway settings',
       back: 'Back',
       openLogs: 'Open logs',
-      repairHint: 'Repair re-runs the installer and can take a few minutes on a fresh machine.',
+      repairHint:
+        'Repair restarts the local backend. It only re-runs the installer when the install itself is broken.',
       remoteSignInHint: signInLabel =>
         `Signs out of the saved remote browser session, then opens ${signInLabel}. Use local gateway to switch to the bundled backend instead.`,
       signOutAndSignIn: 'Sign out & sign in',

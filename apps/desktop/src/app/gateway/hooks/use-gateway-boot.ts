@@ -40,6 +40,7 @@ import {
 import { $attentionSessionIds, $workingSessionIds, resetTileRuntimeBindings } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
+import { connectGatewayWithBootRetries } from './connect-gateway-with-boot-retries'
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
 
 // After this many consecutive failed reconnects (≈45s with the 1→15s backoff)
@@ -485,7 +486,13 @@ export function useGatewayBoot({
         // connecting with a dead ticket. Auth rejection asks for sign-in;
         // connectivity failures remain retryable.
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
-        await gateway.connect(wsUrl)
+        // Local (and already-spawned) backends can miss the first ready frame
+        // under a GIL stall. Retry the dial against the same live process
+        // before failing boot — a single miss used to escalate into
+        // teardown/reinstall loops (#74874).
+        await connectGatewayWithBootRetries(url => gateway.connect(url), wsUrl, {
+          isCancelled: () => cancelled
+        })
 
         if (cancelled) {
           return

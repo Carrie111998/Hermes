@@ -47,6 +47,7 @@ import {
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure, shouldLatchRemoteReauthFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
+import { decideBootstrapRecovery } from './bootstrap-recovery'
 import { runBootstrap } from './bootstrap-runner'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
@@ -8187,8 +8188,12 @@ async function spawnPoolBackend(profile, entry) {
 
   // Verify the WebSocket session token before declaring backend ready.
   // HTTP /api/status can pass while WS auth fails (separate transport, separate guards).
+  // Same 45s window as the primary spawn — pool profiles share the GIL-stall risk.
   const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-  const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+  const wsProbe = await probeGatewayWebSocket(wsUrl, {
+    WebSocketImpl: globalThis.WebSocket,
+    connectTimeoutMs: 45_000
+  })
 
   if (!wsProbe.ok) {
     throw new Error(
@@ -8522,8 +8527,14 @@ async function startHermes() {
     })
 
     // Verify the WebSocket session token before declaring backend ready.
+    // Absorb multi-tens-of-seconds GIL stalls on Windows cold start (#74874 /
+    // #72391) — the historical 10s probe window was shorter than common stalls,
+    // so a healthy backend was reported as WS-rejected and Retry tore it down.
     const wsUrl = `ws://127.0.0.1:${port}/api/ws?token=${encodeURIComponent(authToken)}`
-    const wsProbe = await probeGatewayWebSocket(wsUrl, { WebSocketImpl: globalThis.WebSocket })
+    const wsProbe = await probeGatewayWebSocket(wsUrl, {
+      WebSocketImpl: globalThis.WebSocket,
+      connectTimeoutMs: 45_000
+    })
 
     if (!wsProbe.ok) {
       throw new Error(
@@ -9594,38 +9605,62 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
   mainWindow.webContents.send('hermes:pet-overlay:control', payload)
 })
 ipcMain.handle('hermes:bootstrap:reset', async () => {
-  // Renderer's "Reload and retry" path. Clear the latched failure and
-  // reset connection state so the next startHermes() call restarts the
-  // full backend flow (including a fresh runBootstrap pass).
-  rememberLog('[bootstrap] reset requested by renderer; clearing latched failure')
-  await teardownPrimaryBackendAndWait()
+  // Renderer's "Reload and retry" path. Policy (#74874): when main already
+  // declared the backend ready and the child is still alive, the failure was a
+  // transient renderer↔WS race (GIL stall / ready-frame miss). Keep that
+  // process and let the reload re-dial — tearing it down cold-starts into the
+  // same stall and loops. Otherwise clear latches and restart the backend.
+  const hermesProcess = backendConnectionState.getProcess()
+  const plan = decideBootstrapRecovery({
+    kind: 'reset',
+    runtimeUsable: activeRuntimeState().shouldUseActiveRuntime,
+    backendAlive: Boolean(hermesProcess && hermesProcess.exitCode === null && !hermesProcess.killed),
+    connectionReady: Boolean(backendConnectionState.getPromise())
+  })
+
+  rememberLog(plan.log)
   bootstrapFailure = null
   backendStartFailure = null
   remoteReauthFailure = null
   getFirstRunSetupGate().resetForRetry()
   resetBootstrapSnapshot()
 
-  return { ok: true }
+  if (plan.teardownBackend) {
+    await teardownPrimaryBackendAndWait()
+  }
+
+  return { ok: true, reusedBackend: !plan.teardownBackend }
 })
 ipcMain.handle('hermes:bootstrap:repair', async () => {
-  // Forceful repair: force the next startHermes() through the full installer
-  // (refreshing a broken/partial venv) and clear any latched failure + live
-  // connection. The renderer reloads afterwards to re-drive the boot flow.
+  // Repair used to always force the installer. That is correct when the active
+  // runtime is actually broken, but Repair is also reachable from transient
+  // "Could not connect" failures on a healthy install (#74874 / #72166). Forcing
+  // a reinstall there tears down a still-alive backend and loops. Policy: only
+  // bypass the usable runtime when it is unusable; otherwise soft-restart.
   //
-  // We do NOT delete the bootstrap marker here. Repair is also reachable from
-  // transient backend errors on a perfectly healthy install, and deleting the
-  // marker in that case stranded the app in first-run setup with no way back
-  // (#72166). The explicit flag carries the intent instead.
-  rememberLog('[bootstrap] repair requested by renderer; forcing reinstall + clearing latched failure')
+  // We still do NOT delete the bootstrap marker (#72166).
+  const plan = decideBootstrapRecovery({
+    kind: 'repair',
+    runtimeUsable: activeRuntimeState().shouldUseActiveRuntime,
+    backendAlive: false,
+    connectionReady: false
+  })
 
-  bootstrapRepairRequested = true
+  rememberLog(plan.log)
+  bootstrapRepairRequested = plan.forceInstaller
   bootstrapFailure = null
   backendStartFailure = null
   remoteReauthFailure = null
-  getFirstRunSetupGate().resetForRepair()
-  resetHermesConnection()
 
-  return { ok: true }
+  if (plan.forceInstaller) {
+    getFirstRunSetupGate().resetForRepair()
+    resetHermesConnection()
+  } else {
+    getFirstRunSetupGate().resetForRetry()
+    await teardownPrimaryBackendAndWait()
+  }
+
+  return { ok: true, soft: !plan.forceInstaller }
 })
 ipcMain.handle('hermes:bootstrap:continue-local', async () => {
   rememberLog('[bootstrap] local install selected by renderer; continuing first-launch bootstrap')

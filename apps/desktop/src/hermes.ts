@@ -82,6 +82,13 @@ import type {
 // keep the short default so a genuinely-dead backend is still detected fast.
 export const STARTUP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
+// Local backends can stall the asyncio loop for tens of seconds under Windows
+// GIL pressure (Defender + cold imports). The shared default (15s) is shorter
+// than those stalls, so the renderer disconnects mid-handshake, the ready
+// frame fails, and Retry/Repair used to tear down a still-alive backend
+// (#74874 / #72391). A roomier connect window absorbs the stall; boot() also
+// retries a few times before surfacing the failure overlay.
+const DEFAULT_GATEWAY_CONNECT_TIMEOUT_MS = 45_000
 const SESSION_LIST_REQUEST_TIMEOUT_MS = 60_000
 // prompt.submit is effectively fire-and-forget: turn completion is signaled by
 // stream / message.complete events, NOT by the RPC return. A long turn (MoA
@@ -228,6 +235,7 @@ export class HermesGateway extends JsonRpcGatewayClient {
     super({
       closedErrorMessage: 'Hermes gateway connection closed',
       connectErrorMessage: 'Could not connect to Hermes gateway',
+      connectTimeoutMs: DEFAULT_GATEWAY_CONNECT_TIMEOUT_MS,
       createRequestId: nextId => nextId,
       notConnectedErrorMessage: 'Hermes gateway is not connected',
       requestTimeoutMs: DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS
