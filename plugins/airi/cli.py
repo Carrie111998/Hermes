@@ -23,7 +23,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         "start",
         help=(
             "Start AIRI Electron as a Hermes process worker (concurrent with Hermes Desktop). "
-            "Syncs auth, launches tamagotchi with isolated userData + CDP :9455, seeds provider."
+            "Syncs provider/TTS, launches tamagotchi with isolated userData + CDP :9455, seeds credentials."
         ),
     )
     start.add_argument("--base-url", default="")
@@ -32,7 +32,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     start.add_argument("--repo-root", default="")
     restart = subs.add_parser(
         "restart",
-        help="Restart AIRI worker only (does not stop Hermes Desktop) and re-sync auth",
+        help="Restart AIRI worker only (does not stop Hermes Desktop) and re-seed provider/TTS",
     )
     restart.add_argument("--base-url", default="")
     restart.add_argument("--model", default="")

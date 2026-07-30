@@ -52,6 +52,6 @@ def register(ctx) -> None:
         handler_fn=airi_command,
         description=(
             "Project AIRI process worker: Hermes Agent OpenAI-compatible AI core, "
-            "desktop VRM shell lifecycle, auth sync, and local VRChat OSC."
+            "desktop VRM shell lifecycle, provider/TTS sync, and local VRChat OSC."
         ),
     )

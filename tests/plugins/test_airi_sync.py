@@ -18,6 +18,25 @@ def test_default_cdp_port_avoids_desktop_perf():
     assert core.CONCURRENT_WITH_DESKTOP is True
 
 
+def test_api_key_info_uses_api_server_key_only(monkeypatch):
+    """Plugin must not invent HERMES_AIRI_API_KEY as a parallel secret path."""
+    monkeypatch.delenv("API_SERVER_KEY", raising=False)
+    monkeypatch.delenv("HERMES_AIRI_API_KEY", raising=False)
+    monkeypatch.setenv("HERMES_AIRI_API_KEY", "should-be-ignored")
+    monkeypatch.setattr(core, "_load_hermes_dotenv", lambda: None)
+
+    # Without API_SERVER_KEY, even HERMES_AIRI_API_KEY must not win.
+    info = core._api_key_info({})
+    assert info["configured"] is False
+    assert info["source"] == "placeholder"
+
+    monkeypatch.setenv("API_SERVER_KEY", "gateway-key")
+    info2 = core._api_key_info({})
+    assert info2["configured"] is True
+    assert info2["api_key"] == "gateway-key"
+    assert info2["source"] == "API_SERVER_KEY"
+
+
 def test_localstorage_seed_points_hermes_core():
     provider = core.provider_payload(
         {"hermes_base_url": "http://127.0.0.1:8642/v1", "hermes_model": "hermes-agent", "api_key": "test-key"}
@@ -151,11 +170,12 @@ def test_configure_hermes_writes_provider_file_without_secret(tmp_path: Path, mo
     assert written["config"]["baseUrl"].endswith("/")
     assert "apiKey" not in written["config"]
     assert written["config"]["apiKeyEnv"] == "API_SERVER_KEY"
-    assert payload["auth"]["api_key_configured"] is True
+    assert payload["provider"]["api_key_configured"] is True
+    assert "auth" not in payload
     assert "secret-should-not-persist" not in path.read_text(encoding="utf-8")
 
 
-def test_sync_includes_hermes_probe_and_auth(monkeypatch, tmp_path: Path):
+def test_sync_includes_hermes_probe_and_provider(monkeypatch, tmp_path: Path):
     repo = tmp_path / "airi"
     repo.mkdir()
     (repo / "package.json").write_text("{}", encoding="utf-8")
@@ -171,7 +191,6 @@ def test_sync_includes_hermes_probe_and_auth(monkeypatch, tmp_path: Path):
             "probe": {
                 "ok": True,
                 "live": True,
-                "auth_ok": True,
                 "status": 200,
                 "url": "http://127.0.0.1:8642/v1/models",
             },
@@ -195,8 +214,10 @@ def test_sync_includes_hermes_probe_and_auth(monkeypatch, tmp_path: Path):
     assert payload["ok"] is True
     assert payload["synced"] is True
     assert payload["worker_role"] == "airi-desktop-shell"
-    assert payload["hermes_probe"]["auth_ok"] is True
-    assert payload["auth"]["ready"] is True
+    assert payload["hermes_probe"]["ok"] is True
+    assert payload["provider"]["ready"] is True
+    assert payload["provider"]["api_key_source"] == "API_SERVER_KEY"
+    assert "auth" not in payload
     assert payload["hermes_base_url"].endswith("/")
 
 
@@ -234,13 +255,13 @@ def test_start_already_running_reseeds(monkeypatch):
     )
     monkeypatch.setattr(
         core,
-        "_auth_status",
+        "_provider_runtime_status",
         lambda values=None, probe=None: {
             "ready": True,
             "api_key_configured": True,
             "api_key_source": "API_SERVER_KEY",
-            "probe_live": True,
-            "probe_auth_ok": True,
+            "core_live": True,
+            "core_ok": True,
         },
     )
     monkeypatch.setattr(
@@ -254,6 +275,7 @@ def test_start_already_running_reseeds(monkeypatch):
     assert payload["cdp_seed"]["ok"] is True
     assert payload["cdp_seed"].get("reloaded") is True
     assert written["cdp_seed"]["ok"] is True
+    assert "auth" not in written
     assert payload["worker_role"] == "airi-desktop-shell"
 
 
@@ -301,7 +323,11 @@ def test_start_sets_isolated_userdata_and_cdp(monkeypatch, tmp_path: Path):
         },
     )
     monkeypatch.setattr(core, "_write_state", lambda data: captured.update({"state": data}))
-    monkeypatch.setattr(core, "_auth_status", lambda values=None, probe=None: {"ready": True, "api_key_configured": True})
+    monkeypatch.setattr(
+        core,
+        "_provider_runtime_status",
+        lambda values=None, probe=None: {"ready": True, "api_key_configured": True},
+    )
     monkeypatch.setattr(core, "_worker_health", lambda state, values=None: {"healthy": True})
     monkeypatch.setattr(core.shutil, "which", lambda name: "pnpm.cmd" if "pnpm" in name else None)
 
@@ -310,12 +336,13 @@ def test_start_sets_isolated_userdata_and_cdp(monkeypatch, tmp_path: Path):
     assert payload["concurrent_with_hermes_desktop"] is True
     assert "--remote-debugging-port=9455" in captured["command"]
     assert captured["env"]["APP_USER_DATA_PATH"] == str(home / "userdata")
-    assert captured["env"]["HERMES_AIRI_API_KEY"] == "k"
+    assert captured["env"].get("API_SERVER_KEY") == "k"
+    assert "HERMES_AIRI_API_KEY" not in captured["env"]
     # Must never target Desktop process kill paths.
     assert "Hermes.exe" not in " ".join(captured["command"])
 
 
-def test_probe_distinguishes_live_vs_auth(monkeypatch):
+def test_probe_distinguishes_live_vs_accepted(monkeypatch):
     class FakeResp:
         status = 200
 
@@ -331,11 +358,8 @@ def test_probe_distinguishes_live_vs_auth(monkeypatch):
     monkeypatch.setattr(core.urllib.request, "urlopen", lambda *a, **k: FakeResp())
     ok = core._probe_hermes("http://127.0.0.1:8642/v1/", api_key="real")
     assert ok["live"] is True
-    assert ok["auth_ok"] is True
-
-    class FakeHTTPError(core.urllib.error.HTTPError):
-        def __init__(self):
-            pass
+    assert ok["ok"] is True
+    assert "auth_ok" not in ok
 
     def raise_401(*a, **k):
         err = core.urllib.error.HTTPError(
@@ -346,5 +370,6 @@ def test_probe_distinguishes_live_vs_auth(monkeypatch):
     monkeypatch.setattr(core.urllib.request, "urlopen", raise_401)
     gated = core._probe_hermes("http://127.0.0.1:8642/v1/", api_key="bad")
     assert gated["live"] is True
-    assert gated["auth_ok"] is False
-    assert gated["auth_required"] is True
+    assert gated["ok"] is False
+    assert "auth_ok" not in gated
+    assert "auth_required" not in gated

@@ -7,7 +7,9 @@ This plugin runs [Project AIRI](https://github.com/zapabob/airi) as a **Hermes-m
 | Hermes gateway **api_server** (`:8642/v1/`) | Shared OpenAI-compatible AI core | No |
 | Hermes Desktop (`Hermes.exe`, app id `com.nousresearch.hermes`) | Chat / sessions UI | Yes |
 | AIRI stage-tamagotchi (app id `ai.moeru.airi`) | VRM / TTS / companion shell | Yes |
-| This plugin | Worker supervisor + auth sync + CDP seed + local OSC | — |
+| This plugin | Worker supervisor + provider/TTS sync + CDP seed + local OSC | — |
+
+**No plugin-owned auth.** Hermes gateway `api_server` already authenticates with `API_SERVER_KEY` in `~/.hermes/.env`. This plugin only **reads that key** to seed AIRI's openai-compatible credentials toward `:8642` — sync, not a parallel auth product.
 
 **Concurrent by design.** `hermes airi start` does **not** stop Hermes Desktop (and Desktop does not stop AIRI). Isolation:
 
@@ -29,9 +31,9 @@ Ensure the Hermes **gateway OpenAI API** is up (`API_SERVER_KEY` in `~/.hermes/.
 ## Sync + start (safe beside Desktop)
 
 ```bash
-hermes airi sync          # provider template + probe + auth readiness
+hermes airi sync          # provider template + /models probe + CDP reseed if running
 hermes airi start         # sync → start AIRI Electron worker → CDP seed+reload
-hermes airi status        # worker health + auth (no secrets echoed)
+hermes airi status        # worker health + provider/TTS sync (no secrets echoed)
 hermes airi restart       # AIRI only — Desktop stays up
 hermes airi stop          # AIRI only — never kills Hermes.exe
 ```
@@ -42,7 +44,7 @@ Equivalent agent tools: `airi_sync`, `airi_start`, `airi_restart`, `airi_status`
 
 1. Repair AIRI tray/window icon if `resources/icon.png` is an indexed (palette) PNG (Windows Electron can colour-invert those).
 2. Write `~/.hermes/airi/hermes-provider.json` (baseUrl **with trailing slash**; raw key not persisted).
-3. Probe `GET {baseUrl}models` with Bearer `API_SERVER_KEY` and report `auth.ready`.
+3. Probe `GET {baseUrl}models` with Bearer `API_SERVER_KEY` and report provider sync readiness.
 4. Launch `pnpm dev:tamagotchi` with isolated userData, `--remote-debugging-port=9455`, `--remote-allow-origins=*`.
 5. Seed AIRI renderer localStorage via CDP (**merge** credentials — do not replace —
    set consciousness + speech providers), then **Page.reload** and **readback-verify**.
@@ -55,8 +57,6 @@ Secrets in `~/.hermes/.env` only:
 
 ```text
 API_SERVER_KEY=<gateway openai bearer>
-# optional override:
-# HERMES_AIRI_API_KEY=<same or alternate token>
 ```
 
 ## VRChat

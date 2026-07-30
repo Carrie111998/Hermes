@@ -162,3 +162,14 @@ Desktop: [`apps/desktop/AGENTS.md`](apps/desktop/AGENTS.md). Tools: register in
   clear both and use local `:9119`; also check manifest drift / 401.
   `~/.hermes/state.db` is often intact — do not VACUUM/rewrite the live DB
   while other agents may use it.
+- `vendor/airi` rebuild on Windows: `ACCESS_VIOLATION` occurs with parallel `pnpm build`
+  — always rebuild sequentially (`pnpm build` without `-p` / `--parallel`) after
+  stopping all AIRI processes first (`pnpm kill` or kill the Electron process).
+- AIRI provider/TTS localStorage sync: keys are under `stage-ui:*` namespace in
+  `localStorage`. CDP merge (`Runtime.evaluate` → `localStorage.setItem`) + `Page.reload`
+  is the reliable path. TTS endpoint is `irodori-tts` at `http://localhost:8088/v1/`;
+  provider slug for OpenAI-compatible audio speech is `openai-compatible-audio-speech`.
+- Desktop sidebar unreadability (wallpaper skin): sidebar renders behind the wallpaper's
+  `skinLayer` when no explicit `z-index` is set. Fix via a `sidebar_bg` token in
+  `apps/shared/src/skin.ts` and `apps/desktop/src/themes/skin.ts`, with per-skin
+  value in `~/.hermes/skins/<skin>.yaml` (e.g. `sidebar_bg: "#16092ee8"`).

@@ -4,12 +4,14 @@ Architecture (intentionally narrow):
   AIRI  = VRM / TTS / desktop shell (Hermes-managed process worker)
   Hermes gateway `api_server` (:8642/v1) = OpenAI-compatible AI core
   Desktop `hermes serve` (:9119) = session backend (not AIRI's LLM endpoint)
-  This plugin = worker supervisor + auth sync + CDP seed + local OSC
+  This plugin = worker supervisor + provider/TTS sync + CDP seed + local OSC
 
-Worker contract (unsloth_studio / hyperframes-style):
+Worker contract:
   - State under ``~/.hermes/airi/worker-state.json`` (not TEMP)
   - start / stop / status / sync / restart via CLI + tools
-  - Auth injects ``API_SERVER_KEY`` into AIRI openai-compatible credentials
+  - Sync only: read existing ``API_SERVER_KEY`` from ``~/.hermes/.env`` and
+    seed it into AIRI openai-compatible credentials via CDP (Hermes already
+    owns api_server auth — this plugin does not invent an auth subsystem)
   - CDP seed + renderer reload so Pinia picks up localStorage
 """
 from __future__ import annotations
@@ -121,14 +123,17 @@ def _load_hermes_dotenv() -> None:
 
 
 def _api_key_info(values: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Resolve API key + source label. Never invent secrets; never return raw key in status."""
+    """Resolve gateway bearer for CDP seed only.
+
+    Prefers ephemeral ``values.api_key`` (tests/CLI), else ``API_SERVER_KEY``
+    from ``~/.hermes/.env``. No plugin-owned secret store or alternate key env.
+    Never invent secrets; never echo the raw key in status payloads.
+    """
     values = values or {}
     _load_hermes_dotenv()
     candidates = (
         ("values.api_key", values.get("api_key")),
-        ("HERMES_AIRI_API_KEY", os.environ.get("HERMES_AIRI_API_KEY")),
         ("API_SERVER_KEY", os.environ.get("API_SERVER_KEY")),
-        ("HERMES_API_TOKEN", os.environ.get("HERMES_API_TOKEN")),
     )
     for source, key in candidates:
         if key and str(key).strip():
@@ -199,11 +204,10 @@ def _json(data: dict[str, Any]) -> str:
 
 
 def _probe_hermes(base_url: str, timeout: float = 3.0, api_key: str | None = None) -> dict[str, Any]:
-    """Probe OpenAI-compatible /models.
+    """Probe OpenAI-compatible /models for sync readiness (not a plugin auth API).
 
-    ``live``  — endpoint reachable (incl. 401/403 auth gate)
-    ``auth_ok`` — Bearer accepted (2xx)
-    ``ok`` — live (used by core discovery); check ``auth_ok`` for chat readiness
+    ``live`` — endpoint reachable (incl. 401/403 when gateway is up but key wrong)
+    ``ok``   — Bearer accepted (2xx); seed can talk to Hermes core
     """
     models_url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {}
@@ -215,58 +219,29 @@ def _probe_hermes(base_url: str, timeout: float = 3.0, api_key: str | None = Non
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read(4096).decode("utf-8", errors="replace")
             status = int(resp.status)
-            auth_ok = 200 <= status < 300
+            accepted = 200 <= status < 300
             return {
-                "ok": True,
+                "ok": accepted,
                 "live": True,
-                "auth_ok": auth_ok,
                 "status": status,
                 "url": models_url,
-                "preview": body[:200] if auth_ok else "",
+                "preview": body[:200] if accepted else "",
             }
     except urllib.error.HTTPError as exc:
         gated = exc.code in {401, 403}
         return {
-            "ok": gated,  # core is up but auth failed / required
+            "ok": False,
             "live": gated or exc.code < 500,
-            "auth_ok": False,
             "status": int(exc.code),
             "url": models_url,
-            "auth_required": gated,
         }
     except Exception as exc:
         return {
             "ok": False,
             "live": False,
-            "auth_ok": False,
             "url": models_url,
             "error": str(exc),
         }
-
-
-def _auth_status(values: dict[str, Any] | None = None, probe: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Auth readiness for status/sync — never echoes the secret."""
-    values = values or {}
-    info = _api_key_info(values)
-    probe = probe or _probe_hermes(_base_url(values), api_key=info["api_key"])
-    ready = bool(info["configured"] and probe.get("auth_ok"))
-    return {
-        "ready": ready,
-        "api_key_configured": bool(info["configured"]),
-        "api_key_source": info["source"],
-        "probe_live": bool(probe.get("live") or probe.get("ok")),
-        "probe_auth_ok": bool(probe.get("auth_ok")),
-        "probe_status": probe.get("status"),
-        "hint": (
-            None
-            if ready
-            else (
-                "Set API_SERVER_KEY in ~/.hermes/.env and restart gateway"
-                if not info["configured"]
-                else "Hermes /v1/models rejected Bearer — check API_SERVER_KEY / api_server"
-            )
-        ),
-    }
 
 
 def _resolve_live_core(values: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -471,16 +446,34 @@ def _tts_status(values: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
-def _provider_runtime_status(values: dict[str, Any] | None = None) -> dict[str, Any]:
-    """AI-provider sync readiness (auth + expected consciousness keys)."""
+def _provider_runtime_status(
+    values: dict[str, Any] | None = None,
+    probe: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """AI-provider sync readiness (API_SERVER_KEY present + Hermes /models probe)."""
     values = values or {}
-    auth = _auth_status(values)
+    info = _api_key_info(values)
+    probe = probe or _probe_hermes(_base_url(values), api_key=info["api_key"])
+    ready = bool(info["configured"] and probe.get("ok"))
     return {
-        "ready": bool(auth.get("ready")),
+        "ready": ready,
         "definition_id": "openai-compatible",
         "base_url": _base_url(values),
         "model": _model(values),
-        "auth": auth,
+        "api_key_configured": bool(info["configured"]),
+        "api_key_source": info["source"],
+        "core_live": bool(probe.get("live")),
+        "core_ok": bool(probe.get("ok")),
+        "core_status": probe.get("status"),
+        "hint": (
+            None
+            if ready
+            else (
+                "Set API_SERVER_KEY in ~/.hermes/.env and restart gateway"
+                if not info["configured"]
+                else "Hermes /v1/models rejected Bearer — check API_SERVER_KEY / api_server"
+            )
+        ),
     }
 
 
@@ -531,7 +524,7 @@ def configure_hermes(values: dict[str, Any] | None = None, **_: Any) -> str:
                 "credentials_patch_keys": list((seed.get("credentials_patch") or {}).keys()),
                 "added_patch": seed.get("added_patch"),
             },
-            "auth": _auth_status(values),
+            "provider": _provider_runtime_status(values),
             "tts_status": _tts_status(values),
         }
     )
@@ -811,7 +804,7 @@ def _cdp_seed_localstorage(port: int, seed: dict[str, Any], wait_s: float = 45.0
 
     Merge credentials (do not replace). Use CDP ``Page.reload`` (not in-page
     ``location.reload`` alone) and verify keys after reload; re-seed once if
-    Pinia/auth wiped consciousness.
+    Pinia wiped consciousness.
     """
     # Accept legacy flat dicts from older callers/tests.
     if "flat" not in seed and any(str(k).startswith("settings/") for k in seed):
@@ -1026,9 +1019,8 @@ def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
     if not cfg_result.get("ok"):
         return _json(cfg_result)
     probe = resolved.get("probe") or (resolved.get("probes") or [None])[-1] or {}
-    auth = _auth_status(values, probe=probe)
+    provider_stat = _provider_runtime_status(values, probe=probe)
     tts_stat = _tts_status(values)
-    provider_stat = _provider_runtime_status(values)
     # If worker already running, push credentials + TTS again.
     reseed: dict[str, Any] | None = None
     state = _read_state()
@@ -1039,7 +1031,6 @@ def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
             **state,
             "cdp_seed": reseed,
             "hermes_base_url": values["hermes_base_url"],
-            "auth": auth,
             "tts": tts_stat,
             "provider_sync": provider_stat,
         }
@@ -1055,41 +1046,40 @@ def sync(values: dict[str, Any] | None = None, **_: Any) -> str:
             "hermes_model": _model(values),
             "hermes_probe": probe,
             "hermes_probes": resolved.get("probes"),
-            "auth": auth,
             "provider": provider_stat,
             "tts": tts_stat,
             "cdp_reseed": reseed,
             "architecture": (
                 "AIRI=Hermes process worker (VRM/TTS/UI); "
-                "Hermes api_server=AI core; plugin=supervisor+auth+TTS sync+OSC"
+                "Hermes api_server=AI core; plugin=supervisor+provider/TTS sync+OSC"
             ),
             "next": (
                 ["hermes airi start"]
-                if resolved.get("ok") and auth.get("ready")
-                else _sync_next_hints(resolved, auth)
+                if resolved.get("ok") and provider_stat.get("ready")
+                else _sync_next_hints(resolved, provider_stat)
             ),
         }
     )
 
 
-def _sync_next_hints(resolved: dict[str, Any], auth: dict[str, Any] | None = None) -> list[str]:
+def _sync_next_hints(resolved: dict[str, Any], provider: dict[str, Any] | None = None) -> list[str]:
     probes = list(resolved.get("probes") or [])
     refused = any("10061" in str((p or {}).get("error") or "") for p in probes)
-    auth = auth or {}
+    provider = provider or {}
     if refused:
         return [
             "Gateway api_server not listening — run: hermes gateway restart",
             "Confirm API_SERVER_KEY in ~/.hermes/.env (OpenAI core on :8642)",
             "hermes airi start",
         ]
-    if not auth.get("api_key_configured"):
+    if not provider.get("api_key_configured"):
         return [
             "Set API_SERVER_KEY in ~/.hermes/.env and restart gateway (OpenAI core on :8642)",
             "hermes airi start",
         ]
-    if auth.get("probe_live") and not auth.get("probe_auth_ok"):
+    if provider.get("core_live") and not provider.get("core_ok"):
         return [
-            "API_SERVER_KEY present but /v1/models auth failed — rotate key or restart gateway",
+            "API_SERVER_KEY present but /v1/models rejected Bearer — rotate key or restart gateway",
             "hermes airi sync",
         ]
     return [
@@ -1106,9 +1096,8 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
     cdp_pages = _cdp_targets(cdp_port) if running else []
     page = _cdp_pick_page(cdp_pages) if cdp_pages else None
     probe = _probe_hermes(_base_url(values), api_key=_api_key(values))
-    auth = _auth_status(values, probe=probe)
+    provider_stat = _provider_runtime_status(values, probe=probe)
     tts_stat = _tts_status(values)
-    provider_stat = _provider_runtime_status(values)
     seed = state.get("cdp_seed") if isinstance(state.get("cdp_seed"), dict) else {}
     readback = seed.get("readback") if isinstance(seed.get("readback"), dict) else {}
     provider_seeded = None
@@ -1123,7 +1112,7 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
     healthy = bool(
         running
         and page
-        and auth.get("ready")
+        and provider_stat.get("ready")
         and seed.get("ok", True)
     )
     return {
@@ -1134,12 +1123,11 @@ def _worker_health(state: dict[str, Any], values: dict[str, Any] | None = None) 
         "cdp_port": cdp_port,
         "cdp_page": (page or {}).get("url"),
         "cdp_targets": len(cdp_pages),
-        "auth": auth,
         "provider": {**provider_stat, "cdp_seeded": provider_seeded},
         "tts": {**tts_stat, "cdp_seeded": tts_seeded},
         "hermes_probe": {
-            "live": probe.get("live") or probe.get("ok"),
-            "auth_ok": probe.get("auth_ok"),
+            "live": probe.get("live"),
+            "ok": probe.get("ok"),
             "status": probe.get("status"),
             "url": probe.get("url"),
             "error": probe.get("error"),
@@ -1177,7 +1165,6 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
             "hermes_openai_base_url": _base_url(values),
             "hermes_model": _model(values),
             "hermes_probe": health.get("hermes_probe"),
-            "auth": health.get("auth"),
             "provider": health.get("provider"),
             "tts": health.get("tts"),
             "provider_file": str(HERMES_AIRI_HOME / "hermes-provider.json"),
@@ -1202,7 +1189,7 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
             },
             "architecture": (
                 "AIRI=Hermes process worker; Hermes api_server=AI core; "
-                "plugin=supervisor+auth+TTS sync+local OSC"
+                "plugin=supervisor+provider/TTS sync+local OSC"
             ),
         }
     )
@@ -1211,15 +1198,14 @@ def status(values: dict[str, Any] | None = None, **_: Any) -> str:
 def _seed_running_worker(values: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     cdp_port = int(state.get("cdp_port") or DEFAULT_CDP_PORT)
     seed = _cdp_seed_localstorage(cdp_port, _build_seed(values), wait_s=8.0)
-    auth = _auth_status(values)
+    provider_stat = _provider_runtime_status(values)
     tts_stat = _tts_status(values)
     updated = {
         **state,
         "cdp_seed": seed,
         "hermes_base_url": _base_url(values),
-        "auth": auth,
         "tts": tts_stat,
-        "provider_sync": _provider_runtime_status(values),
+        "provider_sync": provider_stat,
         "worker_role": WORKER_ROLE,
         "last_sync_at": time.time(),
     }
@@ -1276,11 +1262,11 @@ def start(values: dict[str, Any] | None = None, **_: Any) -> str:
     env["APP_USER_DATA_PATH"] = str(userdata)
     env["HERMES_AIRI_BASE_URL"] = _base_url(values)
     env["HERMES_AIRI_MODEL"] = _model(values)
-    # Pass key via env for any AIRI-side readers; CDP remains the Pinia path.
+    # Forward gateway key for any AIRI-side readers; CDP remains the Pinia path.
+    # Do not invent HERMES_AIRI_API_KEY — Hermes auth is API_SERVER_KEY only.
     key_info = _api_key_info(values)
     if key_info["configured"]:
         env.setdefault("API_SERVER_KEY", key_info["api_key"])
-        env["HERMES_AIRI_API_KEY"] = key_info["api_key"]
 
     try:
         proc = subprocess.Popen(
@@ -1302,7 +1288,7 @@ def start(values: dict[str, Any] | None = None, **_: Any) -> str:
         )
 
     seed = _cdp_seed_localstorage(cdp_port, _build_seed(values), wait_s=60.0)
-    auth = _auth_status(values)
+    provider_stat = _provider_runtime_status(values)
     tts_stat = _tts_status(values)
     state = {
         "pid": proc.pid,
@@ -1313,9 +1299,8 @@ def start(values: dict[str, Any] | None = None, **_: Any) -> str:
         "userdata": str(userdata),
         "hermes_base_url": _base_url(values),
         "cdp_seed": seed,
-        "auth": auth,
         "tts": tts_stat,
-        "provider_sync": _provider_runtime_status(values),
+        "provider_sync": provider_stat,
         "worker_role": WORKER_ROLE,
         "icon": icon_fix,
         "last_sync_at": time.time(),
@@ -1355,7 +1340,7 @@ def stop(values: dict[str, Any] | None = None, **_: Any) -> str:
 
 
 def restart(values: dict[str, Any] | None = None, **_: Any) -> str:
-    """Stop then start the AIRI process worker (re-syncs Hermes auth)."""
+    """Stop then start the AIRI process worker (re-syncs provider/TTS seed)."""
     values = values or {}
     stopped = json.loads(stop(values))
     started = json.loads(start(values))
@@ -1441,12 +1426,12 @@ def vrchat_autonomy(values: dict[str, Any] | None = None, **_: Any) -> str:
 AIRI_SCHEMAS = {
     "airi_status": {
         "name": "airi_status",
-        "description": "Show AIRI worker health, Hermes AI-core auth readiness, and OSC status.",
+        "description": "Show AIRI worker health, Hermes provider/TTS sync readiness, and OSC status.",
         "parameters": {"type": "object", "properties": {}},
     },
     "airi_sync": {
         "name": "airi_sync",
-        "description": "Sync Hermes Agent auth into AIRI (provider file + optional live CDP reseed).",
+        "description": "Sync Hermes api_server into AIRI (provider file + optional live CDP reseed).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1470,7 +1455,7 @@ AIRI_SCHEMAS = {
     },
     "airi_start": {
         "name": "airi_start",
-        "description": "Start AIRI as a Hermes process worker: sync auth, launch tamagotchi, CDP seed+reload.",
+        "description": "Start AIRI as a Hermes process worker: sync provider/TTS, launch tamagotchi, CDP seed+reload.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1488,7 +1473,7 @@ AIRI_SCHEMAS = {
     },
     "airi_restart": {
         "name": "airi_restart",
-        "description": "Restart the AIRI process worker and re-sync Hermes API_SERVER_KEY credentials.",
+        "description": "Restart the AIRI process worker and re-seed Hermes API_SERVER_KEY into AIRI credentials.",
         "parameters": {
             "type": "object",
             "properties": {
