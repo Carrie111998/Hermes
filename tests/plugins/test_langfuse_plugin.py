@@ -244,6 +244,7 @@ class TestCronTraceTagging:
         "",
         "cron_a21a08cee82d_20260730_18345",
         "cron_a21a08cee82d_20261330_183452",
+        "cron_a21a08cee82d_20260231_183452",
         "cron_A21A08CEE82D_20260730_183452",
         "cron_a21a08cee82d_extra_20260730_183452",
         "cron_job-name_20260730_183452",

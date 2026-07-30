@@ -29,6 +29,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -72,8 +73,8 @@ _READ_FILE_TAIL_LINES = 15
 # narrow: a cron-like interactive session must retain ordinary trace behavior.
 _CRON_SESSION_ID_RE = re.compile(
     r"^cron_([0-9a-f]{12})_"
-    r"(?:[12]\d{3})(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])_"
-    r"(?:[01]\d|2[0-3])[0-5]\d[0-5]\d$"
+    r"([12]\d{3}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])_"
+    r"(?:[01]\d|2[0-3])[0-5]\d[0-5]\d)$"
 )
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
@@ -119,7 +120,13 @@ def _parse_cron_session_id(session_id: str) -> Optional[str]:
     if not isinstance(session_id, str):
         return None
     match = _CRON_SESSION_ID_RE.fullmatch(session_id)
-    return match.group(1) if match else None
+    if not match:
+        return None
+    try:
+        datetime.strptime(match.group(2), "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+    return match.group(1)
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
