@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import logging
 import re
+import struct
+import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterator, List, Optional
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, Iterator, List, Optional
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
@@ -37,6 +40,191 @@ logger = logging.getLogger(__name__)
 # providers (``_read_tts_response_bytes`` in tools.tts_tool): a buggy or
 # hostile endpoint must not be able to feed us unbounded audio.
 _STREAM_SENTENCE_BYTE_CAP = 16 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Provider-neutral PCM framing
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AudioFormat:
+    """The only audio representation exchanged by streaming TTS providers.
+
+    Provider SDKs are allowed to chunk their response however they like, but
+    the gateway's hot path is deliberately narrower: mono, signed little
+    endian 16-bit PCM at a declared sample rate.  Keeping this as a value
+    object makes the validation explicit at the provider boundary and gives
+    frames a format to carry without relying on provider class attributes.
+    """
+
+    sample_rate: int = 24000
+    encoding: str = "pcm_s16le"
+    channels: int = 1
+    sample_width: int = 2
+
+    def __post_init__(self) -> None:
+        if self.encoding != "pcm_s16le":
+            raise ValueError("audio encoding must be pcm_s16le")
+        if self.channels != 1:
+            raise ValueError("canonical streaming audio must be mono")
+        if self.sample_width != 2:
+            raise ValueError("canonical streaming audio must use 16-bit samples")
+        if isinstance(self.sample_rate, bool) or self.sample_rate <= 0:
+            raise ValueError("sample_rate must be a positive integer")
+        if int(self.sample_rate) != self.sample_rate:
+            raise ValueError("sample_rate must be an integer")
+
+    @property
+    def bytes_per_sample(self) -> int:
+        return self.channels * self.sample_width
+
+    def validate_chunk(self, chunk: bytes) -> bytes:
+        """Return *chunk* as bytes, rejecting non-sample-aligned payloads."""
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("audio chunks must be bytes-like")
+        payload = bytes(chunk)
+        if len(payload) % self.bytes_per_sample:
+            raise ValueError("audio chunk is not sample-aligned")
+        return payload
+
+
+@dataclass(frozen=True)
+class AudioFrame:
+    """A contiguous, loss-detectable unit of canonical PCM audio."""
+
+    seq: int
+    start_sample: int
+    pcm: bytes
+    format: AudioFormat
+
+    def __post_init__(self) -> None:
+        if self.seq < 0 or self.start_sample < 0:
+            raise ValueError("frame sequence and start_sample must be non-negative")
+        payload = self.format.validate_chunk(self.pcm)
+        object.__setattr__(self, "pcm", payload)
+
+    @property
+    def data(self) -> bytes:
+        """Alias used by transports that call binary frame data ``data``."""
+        return self.pcm
+
+    @property
+    def payload(self) -> bytes:
+        return self.pcm
+
+    @property
+    def samples(self) -> bytes:
+        return self.pcm
+
+    @property
+    def sample_count(self) -> int:
+        return len(self.pcm) // self.format.bytes_per_sample
+
+    @property
+    def sequence(self) -> int:
+        return self.seq
+
+    @property
+    def encoding(self) -> str:
+        return self.format.encoding
+
+    @property
+    def sample_rate(self) -> int:
+        return self.format.sample_rate
+
+    @property
+    def audio_format(self) -> AudioFormat:
+        return self.format
+
+    @property
+    def duration_ms(self) -> float:
+        return self.sample_count * 1000 / self.format.sample_rate
+
+
+class AudioFramer:
+    """Turn arbitrary sample-aligned PCM chunks into fixed-duration frames."""
+
+    def __init__(self, audio_format: AudioFormat, frame_ms: int = 20):
+        if isinstance(frame_ms, bool) or frame_ms <= 0:
+            raise ValueError("frame_ms must be a positive integer")
+        if int(frame_ms) != frame_ms:
+            raise ValueError("frame_ms must be an integer")
+        frame_samples, remainder = divmod(
+            audio_format.sample_rate * int(frame_ms), 1000
+        )
+        if remainder:
+            raise ValueError("frame_ms does not map to whole samples at this rate")
+        self.audio_format = audio_format
+        self.frame_ms = int(frame_ms)
+        self.frame_samples = frame_samples
+        self._buffer = bytearray()
+        self._next_seq = 0
+        self._next_start_sample = 0
+        self._closed = False
+
+    @property
+    def next_seq(self) -> int:
+        return self._next_seq
+
+    @property
+    def next_start_sample(self) -> int:
+        return self._next_start_sample
+
+    def feed(self, chunk: bytes) -> List[AudioFrame]:
+        """Consume one provider chunk and return every complete frame ready."""
+        if self._closed:
+            raise RuntimeError("audio framer is already flushed")
+        if not isinstance(chunk, (bytes, bytearray, memoryview)):
+            raise TypeError("audio chunks must be bytes-like")
+        # HTTP/SDK chunk boundaries are transport details and may split an
+        # int16 sample. Preserve that byte until the next chunk; only the
+        # completed stream is required to be sample-aligned.
+        payload = bytes(chunk)
+        self._buffer.extend(payload)
+        frame_bytes = self.frame_samples * self.audio_format.bytes_per_sample
+        out: List[AudioFrame] = []
+        while len(self._buffer) >= frame_bytes:
+            pcm = bytes(self._buffer[:frame_bytes])
+            del self._buffer[:frame_bytes]
+            out.append(self._make_frame(pcm))
+        return out
+
+    # ``push`` is intentionally an alias: provider adapters often use that
+    # spelling while the gateway tests/readme use ``feed``.
+    push = feed
+
+    def flush(self) -> List[AudioFrame]:
+        """Emit one final partial frame, if any, and close the framer."""
+        if self._closed:
+            return []
+        self._closed = True
+        if not self._buffer:
+            return []
+        if len(self._buffer) % self.audio_format.bytes_per_sample:
+            raise ValueError("audio stream ended with a partial sample")
+        pcm = bytes(self._buffer)
+        self._buffer.clear()
+        return [self._make_frame(pcm)]
+
+    finish = flush
+
+    def frames(self, chunks: Iterable[bytes]) -> Iterator[AudioFrame]:
+        """Yield framed audio for *chunks*, including the final partial frame."""
+        for chunk in chunks:
+            yield from self.feed(chunk)
+        yield from self.flush()
+
+    def _make_frame(self, pcm: bytes) -> AudioFrame:
+        frame = AudioFrame(
+            seq=self._next_seq,
+            start_sample=self._next_start_sample,
+            pcm=pcm,
+            format=self.audio_format,
+        )
+        self._next_seq += 1
+        self._next_start_sample += frame.sample_count
+        return frame
 
 
 def _resolve_key(env_var: str, provider_id: str) -> str:
@@ -139,6 +327,19 @@ class StreamingTTSProvider(ABC):
         self.tts_config = tts_config
         self.section = section
 
+    @property
+    def audio_format(self) -> AudioFormat:
+        """Declared canonical format for this provider's raw stream."""
+        return AudioFormat(
+            sample_rate=self.sample_rate,
+            channels=self.channels,
+            sample_width=self.sample_width,
+        )
+
+    @property
+    def canonical_format(self) -> AudioFormat:
+        return self.audio_format
+
     @staticmethod
     @abstractmethod
     def available() -> bool:
@@ -147,6 +348,15 @@ class StreamingTTSProvider(ABC):
     @abstractmethod
     def stream(self, text: str) -> Iterator[bytes]:
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
+
+    def stream_frames(self, text: str, frame_ms: int = 20) -> Iterator[AudioFrame]:
+        """Adapt the legacy byte iterator to the provider-neutral frame stream."""
+        yield from AudioFramer(self.audio_format, frame_ms=frame_ms).frames(
+            self.stream(text)
+        )
+
+    def cancel(self) -> None:
+        """Best-effort interruption of an active provider stream."""
 
 
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
@@ -176,7 +386,7 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
 # latency/quality first. Deliberately hard-coded (a UX decision, not a
 # config knob); edge is absent because it has no chunked-PCM API — the
 # dispatcher's per-sentence sync path keeps it conversational instead.
-_PROVIDER_PRIORITY: List[str] = ["elevenlabs", "gemini", "openai", "xai"]
+_PROVIDER_PRIORITY: List[str] = ["elevenlabs", "gemini", "openai", "xai", "finite_fish"]
 
 
 def resolve_streaming_provider(
@@ -261,6 +471,25 @@ def _openai_config_api_key() -> str:
     return openai_cfg.get("api_key") or ""
 
 
+def _finite_fish_config_api_key() -> str:
+    """Return the explicitly configured Finite Fish streaming credential."""
+    try:
+        section = (_load_tts_config().get("finite_fish") or {})
+    except Exception:
+        return ""
+    return str(
+        section.get("api_key") or _resolve_key("FINITE_TTS_API_KEY", "finite_fish") or ""
+    ).strip()
+
+
+def _finite_fish_config_base_url() -> str:
+    try:
+        section = (_load_tts_config().get("finite_fish") or {})
+    except Exception:
+        return ""
+    return str(section.get("base_url") or get_env_value("FINITE_TTS_BASE_URL") or "").strip()
+
+
 @register("openai")
 class OpenAIStreamer(StreamingTTSProvider):
     """OpenAI speech with ``response_format=pcm`` (24 kHz mono int16)."""
@@ -291,6 +520,137 @@ class OpenAIStreamer(StreamingTTSProvider):
             response_format="pcm",
         ) as response:
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
+
+
+@register("finite_fish")
+class FiniteFishStreamer(StreamingTTSProvider):
+    """Finite Fish S2 Pro streaming WAV, exposed as canonical raw PCM."""
+
+    sample_rate = 44100
+
+    def __init__(self, tts_config: Dict, section: Dict):
+        super().__init__(tts_config, section)
+        self._response_lock = threading.Lock()
+        self._active_response = None
+
+    @staticmethod
+    def available() -> bool:
+        return bool(_finite_fish_config_api_key() and _finite_fish_config_base_url())
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        import requests
+
+        api_key = str(
+            self.section.get("api_key")
+            or _finite_fish_config_api_key()
+            or _resolve_key("FINITE_TTS_API_KEY", "finite_fish")
+            or ""
+        ).strip()
+        base_url = str(
+            self.section.get("base_url") or _finite_fish_config_base_url()
+        ).strip().rstrip("/")
+        if not api_key or not base_url:
+            raise RuntimeError(
+                "Finite Fish streaming TTS requires api_key and base_url"
+            )
+        if not re.match(r"^https?://[^/\s]+", base_url, flags=re.IGNORECASE):
+            raise RuntimeError("Finite Fish streaming TTS base_url must be http(s)")
+        payload = {
+            "model": str(self.section.get("model") or "fishaudio-s2-pro-tts"),
+            "voice": str(self.section.get("voice") or "default"),
+            "input": text,
+            "response_format": "wav",
+            "stream": True,
+            "stream_format": "audio",
+        }
+        with requests.post(
+            f"{base_url}/audio/speech",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "audio/wav",
+            },
+            json=payload,
+            stream=True,
+            timeout=(10, 600),
+        ) as response:
+            with self._response_lock:
+                self._active_response = response
+            try:
+                response.raise_for_status()
+                content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
+                if content_type.lower() != "audio/wav":
+                    raise RuntimeError(
+                        f"Finite Fish returned {content_type or 'no content type'}"
+                    )
+                chunks = (
+                    chunk
+                    for chunk in response.iter_content(chunk_size=8192)
+                    if chunk
+                )
+                yield from _capped(
+                    _streaming_wav_pcm(chunks), "Finite Fish streaming TTS"
+                )
+            finally:
+                with self._response_lock:
+                    if self._active_response is response:
+                        self._active_response = None
+
+    def cancel(self) -> None:
+        with self._response_lock:
+            response = self._active_response
+        if response is not None:
+            response.close()
+
+
+def _streaming_wav_pcm(chunks: Iterator[bytes]) -> Iterator[bytes]:
+    """Validate Fish's streamed WAV header, then yield aligned PCM payload."""
+
+    def payloads() -> Iterator[bytes]:
+        prefix = b""
+        for chunk in chunks:
+            prefix += chunk
+            if len(prefix) > 64 * 1024:
+                raise RuntimeError("Finite Fish WAV header exceeded 64 KiB")
+            if len(prefix) < 44:
+                continue
+            if (
+                prefix[:4] != b"RIFF"
+                or prefix[8:12] != b"WAVE"
+                or prefix[12:16] != b"fmt "
+            ):
+                raise RuntimeError("Finite Fish returned an invalid WAV stream")
+            audio_format, channels, sample_rate, byte_rate, block_align, bits = (
+                struct.unpack_from("<HHIIHH", prefix, 20)
+            )
+            data_at = prefix.find(b"data", 36)
+            if data_at < 0 or data_at + 8 > len(prefix):
+                continue
+            if (
+                audio_format != 1
+                or channels != 1
+                or sample_rate != 44100
+                or bits != 16
+                or byte_rate != sample_rate * 2
+                or block_align != 2
+            ):
+                raise RuntimeError("Finite Fish returned an incompatible WAV stream")
+            pcm = prefix[data_at + 8 :]
+            if pcm:
+                yield pcm
+            break
+        else:
+            raise RuntimeError("Finite Fish returned a truncated WAV stream")
+        yield from chunks
+
+    carry = b""
+    for payload in payloads():
+        payload = carry + payload
+        aligned = len(payload) - len(payload) % 2
+        if aligned:
+            yield payload[:aligned]
+        carry = payload[aligned:]
+    if carry:
+        raise RuntimeError("Finite Fish returned a partial PCM sample")
 
 
 def _capped(chunks: Iterator[bytes], label: str) -> Iterator[bytes]:

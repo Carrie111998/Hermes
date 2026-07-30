@@ -25,6 +25,7 @@ import hashlib
 import hmac
 import inspect
 import importlib.util
+import itertools
 import json
 import logging
 import math
@@ -134,6 +135,16 @@ except ImportError:
 
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
+
+# Provider-neutral speak-stream transport defaults.  The queue is deliberately
+# finite: synthesis applies backpressure while the WebSocket writer catches up
+# instead of allowing a slow desktop client to accumulate unbounded PCM.
+_SPEAK_STREAM_FRAME_MS = 20
+_SPEAK_STREAM_INITIAL_BUFFER_MS = 120
+_SPEAK_STREAM_MAX_BUFFER_MS = 1000
+_SPEAK_STREAM_QUEUE_MAX_FRAMES = 64
+_SPEAK_STREAM_QUEUE_WAIT_SECONDS = 1.0
+_SPEAK_STREAM_IDS = itertools.count(1)
 
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
@@ -4487,7 +4498,7 @@ def _split_text_for_speak_stream(text: str, cap: int) -> list:
 
 @app.websocket("/api/audio/speak-stream")
 async def speak_stream_ws(ws: "WebSocket") -> None:
-    """Streaming TTS for the desktop: text in, raw int16 PCM frames out.
+    """Streaming TTS for the desktop using the ``hermes.audio.v1`` contract.
 
     The socket is a per-reply speech *session*: the client feeds text
     incrementally as LLM deltas arrive, the server cuts sentences
@@ -4496,14 +4507,10 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
     exactly like the token→sentence→TTS pipelining the realtime-voice
     literature converges on.
 
-    Protocol:
-      client → ``{"text": "..."}`` frames (incremental; may combine with done),
-               ``{"done": true}`` when the reply is complete,
-               ``{"stop": true}`` or disconnect = barge-in
-      server → ``{"type": "start", "sample_rate": N, "channels": 1}``,
-               binary PCM frames, then ``{"type": "end"}``
-      server → ``{"type": "fallback"}`` when the configured provider has no
-               chunked API — the client uses the POST endpoint instead.
+    Every binary message is a complete 20 ms (or final partial) PCM frame and
+    is immediately preceded by a JSON ``audio`` metadata message.  A bounded
+    producer queue provides backpressure; if a client remains unable to drain
+    it, the stream terminates with a structured ``error`` frame.
     """
     if not _ws_auth_ok(ws):
         await ws.close(code=4401)
@@ -4542,13 +4549,79 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             await ws.close()
         return
 
+    try:
+        from tools.tts_streaming import AudioFormat
+
+        declared_format = getattr(streamer, "audio_format", None)
+        if declared_format is None:
+            declared_format = AudioFormat(
+                sample_rate=int(getattr(streamer, "sample_rate", 24000)),
+                channels=int(getattr(streamer, "channels", 1)),
+                sample_width=int(getattr(streamer, "sample_width", 2)),
+            )
+        sample_rate = declared_format.sample_rate
+        channels = declared_format.channels
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            await ws.send_json({"type": "error", "code": "invalid_audio_format", "message": str(exc)})
+            await ws.close()
+        return
+
+    stream_id = next(_SPEAK_STREAM_IDS)
     await ws.send_json(
-        {"type": "start", "sample_rate": streamer.sample_rate, "channels": streamer.channels}
+        {
+            "type": "start",
+            "protocol": "hermes.audio.v1",
+            "protocol_version": "hermes.audio.v1",
+            "version": 1,
+            "stream_id": stream_id,
+            "encoding": declared_format.encoding,
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "initial_buffer_ms": _SPEAK_STREAM_INITIAL_BUFFER_MS,
+            "max_buffer_ms": _SPEAK_STREAM_MAX_BUFFER_MS,
+        }
     )
 
     stop = threading.Event()
     text_q: queue.Queue = queue.Queue()  # str deltas; None = end-of-text
-    chunks: asyncio.Queue = asyncio.Queue()  # PCM out; None = synthesis done
+    # ``AudioFrame`` instances are kept in the queue until the writer has sent
+    # both their metadata and binary payload.  The terminal tuple is always
+    # enqueued after the producer has stopped, so end/error ordering is stable.
+    chunks: asyncio.Queue = asyncio.Queue(maxsize=_SPEAK_STREAM_QUEUE_MAX_FRAMES)
+    totals = {"frames": 0, "samples": 0}
+    synthesis_started = time.monotonic()
+    producer_failure: dict[str, str] = {}
+
+    def _elapsed_ms() -> float:
+        return round(max(0.0, time.monotonic() - synthesis_started) * 1000.0, 3)
+
+    def _queue_put(item: tuple[str, Any], *, ignore_stop: bool = False) -> bool:
+        """Put an item into the async queue, applying bounded backpressure."""
+        while ignore_stop or not stop.is_set():
+            future = asyncio.run_coroutine_threadsafe(chunks.put(item), loop)
+            deadline = time.monotonic() + _SPEAK_STREAM_QUEUE_WAIT_SECONDS
+            try:
+                while ignore_stop or not stop.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        future.cancel()
+                        producer_failure.update(
+                            code="buffer_overflow",
+                            message="speak-stream output buffer is full",
+                        )
+                        stop.set()
+                        return False
+                    try:
+                        future.result(timeout=min(0.1, remaining))
+                        return True
+                    except concurrent.futures.TimeoutError:
+                        continue
+                future.cancel()
+                return False
+            except Exception:
+                return False
+        return False
 
     def _produce():
         from tools.tts_streaming import SentenceChunker
@@ -4587,6 +4660,9 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 yield from chunker.feed(delta)
 
         try:
+            from tools.tts_streaming import AudioFramer
+
+            framer = AudioFramer(declared_format, frame_ms=_SPEAK_STREAM_FRAME_MS)
             for sentence in _sentences():
                 cleaned = _strip_markdown_for_tts(sentence)
                 if not cleaned:
@@ -4595,11 +4671,26 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                     for chunk in streamer.stream(piece):
                         if stop.is_set():
                             return
-                        loop.call_soon_threadsafe(chunks.put_nowait, chunk)
+                        for frame in framer.feed(chunk):
+                            totals["frames"] += 1
+                            totals["samples"] += frame.sample_count
+                            if not _queue_put(("frame", frame)):
+                                return
+            for frame in framer.flush():
+                if stop.is_set():
+                    return
+                totals["frames"] += 1
+                totals["samples"] += frame.sample_count
+                if not _queue_put(("frame", frame)):
+                    return
         except Exception as exc:
             _log.warning("speak-stream synthesis failed: %s", exc)
+            producer_failure.update(code="synthesis_failed", message=str(exc) or "Speech synthesis failed")
         finally:
-            loop.call_soon_threadsafe(chunks.put_nowait, None)
+            if producer_failure and (not stop.is_set() or producer_failure.get("code") == "buffer_overflow"):
+                _queue_put(("error", dict(producer_failure)), ignore_stop=True)
+            elif not stop.is_set():
+                _queue_put(("done", None), ignore_stop=True)
 
     threading.Thread(target=_produce, daemon=True).start()
 
@@ -4611,24 +4702,72 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                 frame = json.loads(await ws.receive_text())
                 if frame.get("text"):
                     text_q.put(str(frame["text"]))
-                if frame.get("stop"):
+                if frame.get("stop") or frame.get("type") == "stop":
                     break
                 if frame.get("done"):
                     text_q.put(None)
         except Exception:
             pass
         stop.set()
+        cancel = getattr(streamer, "cancel", None)
+        if callable(cancel):
+            with contextlib.suppress(Exception):
+                cancel()
         text_q.put(None)  # unblock the producer
+        await chunks.put(("cancelled", None))
 
     pump = asyncio.ensure_future(_pump_client())
     try:
         while True:
-            chunk = await chunks.get()
-            if chunk is None:
+            kind, item = await chunks.get()
+            if kind == "frame":
+                frame = item
+                await ws.send_json(
+                    {
+                        "type": "audio",
+                        "stream_id": stream_id,
+                        "seq": frame.seq,
+                        "start_sample": frame.start_sample,
+                        "sequence": frame.seq,
+                        "sample_offset": frame.start_sample,
+                        "sample_count": frame.sample_count,
+                        "synthesis_ms": _elapsed_ms(),
+                    }
+                )
+                await ws.send_bytes(frame.pcm)
+                continue
+            if kind == "error":
+                error = dict(item or {})
+                error.update(
+                    {
+                        "type": "error",
+                        "stream_id": stream_id,
+                        "frame_count": totals["frames"],
+                        "frames": totals["frames"],
+                        "sample_count": totals["samples"],
+                        "samples": totals["samples"],
+                        "synthesis_ms": _elapsed_ms(),
+                    }
+                )
+                await ws.send_json(error)
                 break
-            await ws.send_bytes(chunk)
-        if not stop.is_set():
-            await ws.send_json({"type": "end"})
+            if kind == "done":
+                if not stop.is_set():
+                    await ws.send_json(
+                        {
+                        "type": "end",
+                        "stream_id": stream_id,
+                        "frame_count": totals["frames"],
+                        "frames": totals["frames"],
+                        "sample_count": totals["samples"],
+                        "samples": totals["samples"],
+                        "duration_ms": round(totals["samples"] * 1000 / sample_rate, 3),
+                        "synthesis_ms": _elapsed_ms(),
+                        }
+                    )
+                break
+            if kind == "cancelled":
+                break
     except (WebSocketDisconnect, RuntimeError):
         pass
     finally:
