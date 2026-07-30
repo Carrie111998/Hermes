@@ -49,6 +49,10 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(
+        kb, "_worktree_writer_pids",
+        lambda _path: kb._WorktreeWriterScan((), True, False, ()),
+    )
     kb.init_db()
     return home
 
@@ -94,17 +98,27 @@ def test_submit_review_accepts_frozen_head_without_claim(client, kanban_home, tm
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
         capture_output=True, text=True,
     ).stdout.strip()
+    tree_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
     with kb.connect_closing() as conn:
         task_id = kb.create_task(conn, title="API frozen", workspace_kind="dir", workspace_path=str(repo))
         assert kb.complete_task(
             conn, task_id, summary="implemented",
-            metadata={"changed_files": ["implementation.txt"], "tests_run": 1},
+            metadata={
+                "changed_files": ["implementation.txt"],
+                "tests_run": 1,
+                "head_sha": head,
+                "tree_sha": tree_sha,
+            },
         )
     payload = {
         "head_sha": head,
         "worktree_path": str(repo),
         "evidence": {
             "head_sha": head,
+            "tree_sha": tree_sha,
             "worktree_path": str(repo),
             "clean": True,
             "implementation_complete": True,

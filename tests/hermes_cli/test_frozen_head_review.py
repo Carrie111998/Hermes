@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
+import select
 import subprocess
-import time
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,7 +21,7 @@ def kanban_home(tmp_path, monkeypatch, request):
     # The hermetic test runner may expose host processes through a restricted
     # /proc mount. Scanner behavior is exercised by the real helper test below;
     # admission tests isolate that unrelated host state.
-    if "os_writer_freeze" not in request.node.name:
+    if "writer" not in request.node.name:
         monkeypatch.setattr(
             kb, "_worktree_writer_pids",
             lambda _path: kb._WorktreeWriterScan((), True, False, ()),
@@ -75,6 +75,59 @@ def evidence(head: str, repo: Path, *, include_tree: bool = True) -> dict:
     if include_tree:
         result["tree_sha"] = git_tree(repo)
     return result
+
+
+def wait_for_helper_ready(helper: subprocess.Popen[str]) -> None:
+    assert helper.stdout is not None
+    ready, _, _ = select.select([helper.stdout], [], [], 5)
+    assert ready, "writer helper did not signal readiness"
+    assert helper.stdout.readline().strip() == "READY"
+
+
+def start_writer_helper(
+    code: str, *, cwd: Path, args: tuple[str, ...] = (),
+) -> subprocess.Popen[str]:
+    helper = subprocess.Popen(
+        [sys.executable, "-c", code, *args],
+        cwd=cwd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for_helper_ready(helper)
+    return helper
+
+
+def stop_writer_helper(helper: subprocess.Popen[str]) -> None:
+    try:
+        assert helper.stdin is not None
+        helper.stdin.write("STOP\n")
+        helper.stdin.flush()
+        helper.wait(timeout=5)
+    finally:
+        if helper.poll() is None:
+            helper.kill()
+            helper.wait(timeout=5)
+
+
+def isolate_proc_to_pid(monkeypatch, pid: int) -> None:
+    real_iterdir = Path.iterdir
+
+    def only_helper(path):
+        if path == Path("/proc"):
+            return iter([Path(f"/proc/{pid}")])
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", only_helper)
+
+
+def submit_valid_frozen_head(
+    conn, task_id: str, head: str, repo: Path,
+) -> None:
+    assert kb.submit_frozen_head_for_review(
+        conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
+    )
 
 
 def test_db_accepts_completed_clean_exact_head_without_claim(kanban_home, tmp_path):
@@ -265,25 +318,245 @@ def test_missing_task_is_frozen_head_error_without_fk_event_failure(kanban_home,
             )
 
 
-def test_os_writer_freeze_rejects_helper_with_cwd_and_writable_fd(kanban_home, tmp_path):
+def test_os_writer_freeze_rejects_cwd_only_helper(kanban_home, tmp_path):
     repo, head = make_repo(tmp_path)
-    helper = subprocess.Popen(
-        [os.environ.get("HERMES_PYTHON", "python"), "-c",
-         "import time; f=open('implemented.txt','r+'); time.sleep(30)"],
+    helper = start_writer_helper(
+        "import sys; print('READY', flush=True); sys.stdin.readline()",
         cwd=repo,
     )
     try:
-        time.sleep(0.1)
         with kb.connect_closing() as conn:
             task_id = kb.create_task(conn, title="writer", workspace_kind="dir", workspace_path=str(repo))
             complete_with_evidence(conn, task_id, repo)
             with pytest.raises(kb.FrozenHeadReviewError, match="active OS writers"):
-                kb.submit_frozen_head_for_review(
-                    conn, task_id, head_sha=head, worktree_path=str(repo), evidence=evidence(head, repo)
-                )
+                submit_valid_frozen_head(conn, task_id, head, repo)
     finally:
-        helper.terminate()
-        helper.wait(timeout=5)
+        stop_writer_helper(helper)
+
+
+def test_os_writer_freeze_rejects_writable_fd_with_cwd_outside(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    helper = start_writer_helper(
+        "import sys; f=open(sys.argv[1], 'r+b'); print('READY', flush=True); sys.stdin.readline()",
+        cwd=tmp_path,
+        args=(str(repo / "implemented.txt"),),
+    )
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="fd writer", workspace_kind="dir", workspace_path=str(repo))
+            complete_with_evidence(conn, task_id, repo)
+            with pytest.raises(kb.FrozenHeadReviewError, match="active OS writers"):
+                submit_valid_frozen_head(conn, task_id, head, repo)
+    finally:
+        stop_writer_helper(helper)
+
+
+def test_os_writer_freeze_rejects_shared_writable_mmap_after_fd_close(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    helper = start_writer_helper(
+        "import mmap, os, sys; fd=os.open(sys.argv[1], os.O_RDWR); mapping=mmap.mmap(fd, 0, access=mmap.ACCESS_WRITE); os.close(fd); print('READY', flush=True); sys.stdin.readline()",
+        cwd=tmp_path,
+        args=(str(repo / "implemented.txt"),),
+    )
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="mmap writer", workspace_kind="dir", workspace_path=str(repo))
+            complete_with_evidence(conn, task_id, repo)
+            with pytest.raises(kb.FrozenHeadReviewError, match="active OS writers"):
+                submit_valid_frozen_head(conn, task_id, head, repo)
+    finally:
+        stop_writer_helper(helper)
+
+
+def test_os_writer_freeze_allows_read_only_fd(kanban_home, tmp_path, monkeypatch):
+    repo, head = make_repo(tmp_path)
+    helper = start_writer_helper(
+        "import sys; f=open(sys.argv[1], 'rb'); print('READY', flush=True); sys.stdin.readline()",
+        cwd=tmp_path,
+        args=(str(repo / "implemented.txt"),),
+    )
+    try:
+        isolate_proc_to_pid(monkeypatch, helper.pid)
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="reader", workspace_kind="dir", workspace_path=str(repo))
+            complete_with_evidence(conn, task_id, repo)
+            submit_valid_frozen_head(conn, task_id, head, repo)
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.status == "review"
+    finally:
+        stop_writer_helper(helper)
+
+
+def test_os_writer_freeze_allows_private_writable_mmap(kanban_home, tmp_path, monkeypatch):
+    repo, head = make_repo(tmp_path)
+    helper = start_writer_helper(
+        "import ctypes, os, sys; fd=os.open(sys.argv[1], os.O_RDWR); size=os.fstat(fd).st_size; libc=ctypes.CDLL(None); mapping=libc.mmap(None, size, 3, 2, fd, 0); os.close(fd); print('READY', flush=True); sys.stdin.readline()",
+        cwd=tmp_path,
+        args=(str(repo / "implemented.txt"),),
+    )
+    try:
+        isolate_proc_to_pid(monkeypatch, helper.pid)
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(conn, title="private mmap", workspace_kind="dir", workspace_path=str(repo))
+            complete_with_evidence(conn, task_id, repo)
+            submit_valid_frozen_head(conn, task_id, head, repo)
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.status == "review"
+    finally:
+        stop_writer_helper(helper)
+
+
+def test_writer_scan_rejects_unsupported_platform(tmp_path, monkeypatch):
+    monkeypatch.setattr(kb.sys, "platform", "win32")
+    scan = kb._worktree_writer_pids(tmp_path)
+    assert scan.writers == ()
+    assert scan.complete is False
+    assert scan.unsupported is True
+    assert scan.errors == ("unsupported platform: win32",)
+
+
+def test_writer_scan_rejects_absent_proc(tmp_path, monkeypatch):
+    real_iterdir = Path.iterdir
+
+    def fail_proc_enumeration(path):
+        if path == Path("/proc"):
+            raise FileNotFoundError("/proc disappeared")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", fail_proc_enumeration)
+    scan = kb._worktree_writer_pids(tmp_path)
+    assert scan.writers == ()
+    assert scan.complete is False
+    assert scan.unsupported is False
+    assert scan.errors == ("proc unavailable",)
+
+
+def test_writer_scan_rejects_proc_enumeration_denial(tmp_path, monkeypatch):
+    real_iterdir = Path.iterdir
+
+    def deny_proc_enumeration(path):
+        if path == Path("/proc"):
+            raise PermissionError("hidden by policy")
+        return real_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", deny_proc_enumeration)
+    scan = kb._worktree_writer_pids(tmp_path)
+    assert scan.writers == ()
+    assert scan.complete is False
+    assert scan.unsupported is False
+    assert scan.errors == ("proc enumeration denied",)
+
+
+@pytest.mark.parametrize("process_kind", ["same uid", "root", "unknown"])
+def test_writer_scan_rejects_unreadable_process_without_leaking_error(
+    tmp_path, monkeypatch, process_kind,
+):
+    real_iterdir = Path.iterdir
+    real_resolve = Path.resolve
+    process = Path("/proc/424242")
+
+    def fake_iterdir(path):
+        if path == Path("/proc"):
+            return iter([process])
+        return real_iterdir(path)
+
+    def deny_process(path, *args, **kwargs):
+        if path == process / "cwd":
+            raise PermissionError(f"private {process_kind} details")
+        return real_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    monkeypatch.setattr(Path, "resolve", deny_process)
+    scan = kb._worktree_writer_pids(tmp_path)
+    assert scan.writers == ()
+    assert scan.complete is False
+    assert scan.unsupported is False
+    assert len(scan.errors) <= 32
+    assert scan.errors == ("pid 424242: permission denied",)
+    assert process_kind not in " ".join(scan.errors)
+
+
+@pytest.mark.parametrize(
+    "changed_snapshot",
+    [
+        ("changed-head", lambda head, tree: ("0" * 40, tree, "")),
+        ("changed-tree", lambda head, tree: (head, "1" * 40, "")),
+        ("changed-dirty-status", lambda head, tree: (head, tree, " M implemented.txt\n")),
+    ],
+)
+def test_git_snapshot_race_rejects_without_transition(
+    kanban_home, tmp_path, monkeypatch, changed_snapshot,
+):
+    repo, head = make_repo(tmp_path)
+    tree = git_tree(repo)
+    label, second = changed_snapshot
+    snapshots = [(head, tree, ""), second(head, tree)]
+    calls = []
+
+    def snapshots_with_race(path):
+        calls.append(path)
+        return snapshots.pop(0)
+
+    monkeypatch.setattr(kb, "_git_worktree_snapshot", snapshots_with_race)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title=label, workspace_kind="dir", workspace_path=str(repo))
+        complete_with_evidence(conn, task_id, repo)
+        with pytest.raises(kb.FrozenHeadReviewError, match="changed during verification"):
+            submit_valid_frozen_head(conn, task_id, head, repo)
+        assert len(calls) == 2
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "done"
+
+
+@pytest.mark.parametrize("race", ["status", "workspace", "current_run", "claim", "pid", "run_id", "metadata"])
+def test_final_transaction_races_reject_atomically(
+    kanban_home, tmp_path, monkeypatch, race,
+):
+    repo, head = make_repo(tmp_path)
+    tree = git_tree(repo)
+    original_write_txn = kb.write_txn
+    injected = False
+
+    def inject_race(conn):
+        nonlocal injected
+        if not injected:
+            injected = True
+            if race == "status":
+                conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (task_id,))
+            elif race == "workspace":
+                conn.execute(
+                    "UPDATE tasks SET workspace_path=? WHERE id=?",
+                    (str(tmp_path / "different-worktree"), task_id),
+                )
+            elif race == "current_run":
+                conn.execute("UPDATE tasks SET current_run_id=999999 WHERE id=?", (task_id,))
+            elif race == "claim":
+                conn.execute("UPDATE tasks SET claim_lock='racer' WHERE id=?", (task_id,))
+            elif race == "pid":
+                conn.execute("UPDATE tasks SET worker_pid=424242 WHERE id=?", (task_id,))
+            elif race == "run_id":
+                kb._synthesize_ended_run(
+                    conn, task_id, outcome="completed", summary="newer run",
+                    metadata={"changed_files": ["implemented.txt"], "tests_run": 4,
+                              "head_sha": head, "tree_sha": tree},
+                )
+            elif race == "metadata":
+                conn.execute(
+                    "UPDATE task_runs SET metadata=? WHERE task_id=? AND outcome='completed'",
+                    (json.dumps({"changed_files": ["implemented.txt"], "tests_run": 4,
+                                 "head_sha": head, "tree_sha": tree}), task_id),
+                )
+            conn.commit()
+        return original_write_txn(conn)
+
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title=f"race {race}", workspace_kind="dir", workspace_path=str(repo))
+        complete_with_evidence(conn, task_id, repo)
+        monkeypatch.setattr(kb, "write_txn", inject_race)
+        with pytest.raises(kb.FrozenHeadReviewError):
+            submit_valid_frozen_head(conn, task_id, head, repo)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status != "review"
 
 
 def test_legacy_submit_task_for_review_keeps_running_and_blocked_contract(kanban_home):
@@ -299,3 +572,23 @@ def test_legacy_submit_task_for_review_keeps_running_and_blocked_contract(kanban
         assert kb.block_task(conn, blocked_id, reason="review-required: inspect", expected_run_id=run_id)
         reviewed = kb.submit_task_for_review(conn, blocked_id, "reviewer")
         assert reviewed is not None and reviewed.status == "review"
+
+
+def test_frozen_head_rejects_unrelated_blocked_state(kanban_home, tmp_path):
+    repo, head = make_repo(tmp_path)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="unrelated blocked", workspace_kind="dir",
+            workspace_path=str(repo), assignee="programmer",
+        )
+        kb.claim_task(conn, task_id, claimer="programmer")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+        assert kb.block_task(
+            conn, task_id, reason="waiting for operator input", expected_run_id=run_id,
+        )
+        with pytest.raises(kb.FrozenHeadReviewError, match="unrelated blocked state"):
+            submit_valid_frozen_head(conn, task_id, head, repo)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
