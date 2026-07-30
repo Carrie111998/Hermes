@@ -13,6 +13,7 @@ import { selectableCardClass } from '@/lib/selectable-card'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
+import { $chatWidth, setChatWidth } from '@/store/chat-width'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
 import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
@@ -253,6 +254,7 @@ export function AppearanceSettings() {
   const translucency = useStore($translucency)
   const reactionsEnabled = useStore($reactionsEnabled)
   const backdrop = useStore($backdrop)
+  const chatWidth = useStore($chatWidth)
   const installs = useStore($marketplaceInstalls)
   const profiles = useStore($profiles)
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
@@ -297,6 +299,12 @@ export function AppearanceSettings() {
   ] as const satisfies readonly { id: EmbedMode; label: string }[]
 
   const uiScaleOptions = UI_SCALE_PRESETS.map(preset => ({ id: preset, label: `${preset}%` }))
+
+  const chatWidthOptions = [
+    { id: 'normal', label: a.chatWidthNormal },
+    { id: 'wide', label: a.chatWidthWide },
+    { id: 'full', label: a.chatWidthFull }
+  ] as const
 
   const matchedScalePreset = matchUiScalePreset(zoomPercent)
 
@@ -428,6 +436,22 @@ export function AppearanceSettings() {
             }
             description={a.uiScaleDesc(zoomPercent)}
             title={a.uiScaleTitle}
+          />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                ariaLabel={a.chatWidthTitle}
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setChatWidth(id)
+                }}
+                options={chatWidthOptions}
+                value={chatWidth}
+              />
+            }
+            description={a.chatWidthDesc}
+            title={a.chatWidthTitle}
           />
 
           <ListRow
