@@ -641,6 +641,30 @@ def _parse_target_ref(platform_name: str, target_ref: str):
     return None, None, False
 
 
+def _target_identity(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+) -> tuple[str, str, str | None]:
+    """Return a canonical identity for routing-equivalence comparisons.
+
+    Teams persists an inbound channel-thread origin as one composite
+    ``chat_id`` while outbound parsing uses a split chat/thread pair.  Treat
+    those two representations as the same lane without changing the values
+    passed to the adapter or the session-mirroring lookup.
+    """
+    platform = str(platform_name).lower()
+    chat = str(chat_id)
+    thread = None if thread_id is None else str(thread_id)
+    if platform == "teams":
+        match = _TEAMS_TARGET_RE.fullmatch(chat)
+        if match and match.group(2):
+            composite_thread = match.group(2)
+            if thread is None or thread == composite_thread:
+                return platform, match.group(1), composite_thread
+    return platform, chat, thread
+
+
 def _describe_media_for_mirror(media_files):
     """Return a human-readable mirror summary when a message only contains media."""
     if not media_files:
@@ -681,10 +705,14 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     if not auto_target:
         return None
 
-    same_target = (
-        auto_target["platform"] == platform_name
-        and str(auto_target["chat_id"]) == str(chat_id)
-        and auto_target.get("thread_id") == thread_id
+    same_target = _target_identity(
+        auto_target["platform"],
+        auto_target["chat_id"],
+        auto_target.get("thread_id"),
+    ) == _target_identity(
+        platform_name,
+        chat_id,
+        thread_id,
     )
     if not same_target:
         return None

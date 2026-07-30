@@ -10,7 +10,11 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from gateway.config import Platform
-from tools.send_message_tool import _parse_target_ref, send_message_tool
+from tools.send_message_tool import (
+    _maybe_skip_cron_duplicate_send,
+    _parse_target_ref,
+    send_message_tool,
+)
 
 
 def _run_async_immediately(coro):
@@ -73,6 +77,47 @@ def test_teams_malformed_thread_targets_are_not_explicit() -> None:
         )[2]
         is False
     )
+
+
+def test_cron_duplicate_matches_composite_teams_origin() -> None:
+    with patch(
+        "tools.send_message_tool._get_cron_auto_delivery_target",
+        return_value={
+            "platform": "teams",
+            "chat_id": (
+                "19:channel@thread.tacv2;messageid=1780267076971"
+            ),
+            "thread_id": None,
+        },
+    ):
+        result = _maybe_skip_cron_duplicate_send(
+            "teams",
+            "19:channel@thread.tacv2",
+            "1780267076971",
+        )
+
+    assert result is not None
+    assert result["reason"] == "cron_auto_delivery_duplicate_target"
+
+
+def test_cron_duplicate_rejects_different_teams_thread() -> None:
+    with patch(
+        "tools.send_message_tool._get_cron_auto_delivery_target",
+        return_value={
+            "platform": "teams",
+            "chat_id": (
+                "19:channel@thread.tacv2;messageid=1780267076971"
+            ),
+            "thread_id": None,
+        },
+    ):
+        result = _maybe_skip_cron_duplicate_send(
+            "teams",
+            "19:channel@thread.tacv2",
+            "different-root",
+        )
+
+    assert result is None
 
 
 def test_send_message_routes_discovered_teams_thread_target() -> None:

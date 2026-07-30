@@ -662,16 +662,22 @@ def _target_matches_origin(origin: dict, platform_name: str, chat_id: str,
     """
     if not origin:
         return False
-    if str(origin.get("platform", "")).lower() != str(platform_name).lower():
+    from tools.send_message_tool import _target_identity
+
+    origin_identity = _target_identity(
+        origin.get("platform", ""),
+        origin.get("chat_id", ""),
+        origin.get("thread_id"),
+    )
+    target_identity = _target_identity(platform_name, chat_id, thread_id)
+    if origin_identity[:2] != target_identity[:2]:
         return False
-    if str(origin.get("chat_id", "")) != str(chat_id):
-        return False
-    # thread_id must match when the origin pins one (topic-scoped chats); a
-    # target that lost the thread_id is not the same conversation lane.
-    origin_thread = origin.get("thread_id")
-    if origin_thread is not None and str(origin_thread) != str(thread_id or ""):
-        return False
-    return True
+    # Preserve the historical one-way rule: an origin pinned to a thread must
+    # match that lane, while a root origin may still mirror a threaded target.
+    return (
+        origin_identity[2] is None
+        or origin_identity[2] == target_identity[2]
+    )
 
 
 def _maybe_mirror_cron_delivery(

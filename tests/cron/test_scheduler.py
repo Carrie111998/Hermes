@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _target_matches_origin
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -104,6 +104,68 @@ class TestResolveOrigin:
         """
         job = {"origin": non_dict_origin}
         assert _resolve_origin(job) is None
+
+
+class TestTargetMatchesOrigin:
+    def test_teams_composite_origin_matches_split_delivery_target(self):
+        origin = {
+            "platform": "teams",
+            "chat_id": (
+                "19:channel@thread.tacv2;messageid=1780267076971"
+            ),
+            "thread_id": None,
+        }
+
+        assert _target_matches_origin(
+            origin,
+            "teams",
+            "19:channel@thread.tacv2",
+            "1780267076971",
+        )
+
+    def test_teams_split_origin_matches_composite_delivery_target(self):
+        origin = {
+            "platform": "teams",
+            "chat_id": "19:channel@thread.tacv2",
+            "thread_id": "1780267076971",
+        }
+
+        assert _target_matches_origin(
+            origin,
+            "teams",
+            "19:channel@thread.tacv2;messageid=1780267076971",
+            None,
+        )
+
+    def test_teams_different_thread_is_not_the_origin(self):
+        origin = {
+            "platform": "teams",
+            "chat_id": (
+                "19:channel@thread.tacv2;messageid=1780267076971"
+            ),
+            "thread_id": None,
+        }
+
+        assert not _target_matches_origin(
+            origin,
+            "teams",
+            "19:channel@thread.tacv2",
+            "different-root",
+        )
+
+    def test_unpinned_origin_preserves_root_match_semantics(self):
+        origin = {
+            "platform": "telegram",
+            "chat_id": "-1001",
+            "thread_id": None,
+        }
+
+        assert _target_matches_origin(
+            origin,
+            "telegram",
+            "-1001",
+            "42",
+        )
 
 
 class TestResolveDeliveryTarget:
@@ -1899,5 +1961,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-
