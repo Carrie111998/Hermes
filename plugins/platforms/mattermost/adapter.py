@@ -583,10 +583,17 @@ class MattermostAdapter(BasePlatformAdapter):
 
         p = Path(file_path)
         if not p.exists():
+            # Report the failure. Returning success here told every caller the
+            # attachment had been delivered when nothing was posted at all,
+            # silently swallowing failed generated images, documents, audio
+            # and video. Matches the Slack adapter's contract for a missing
+            # local file.
             logger.warning(
-                "Mattermost: local file not found, skipping: %s", file_path
+                "Mattermost: local file not found, not sent: %s", file_path
             )
-            return SendResult(success=True, message_id=None)
+            return SendResult(
+                success=False, error=f"Local file not found: {file_path}"
+            )
 
         fname = file_name or p.name
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"

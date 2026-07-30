@@ -454,6 +454,63 @@ class TestMattermostFileUpload:
         assert result.message_id == "post_with_file"
 
 
+class TestMattermostMissingLocalFile:
+    """A missing local file must be reported as a failure (#65858).
+
+    ``_send_local_file`` returned ``success=True, message_id=None`` when the
+    path did not exist, so callers recorded a delivered attachment for a post
+    that was never created — hiding failed generated images, documents, audio
+    and video. Matches the Slack adapter, which returns ``success=False``.
+    """
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        # Any network use would mean we got past the existence check.
+        self.adapter._session = MagicMock(
+            post=MagicMock(side_effect=AssertionError("must not post")),
+            get=MagicMock(side_effect=AssertionError("must not fetch")),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method,kwarg",
+        [
+            ("send_image_file", "image_path"),
+            ("send_document", "file_path"),
+            ("send_voice", "audio_path"),
+            ("send_video", "video_path"),
+        ],
+    )
+    async def test_missing_file_reports_failure(self, tmp_path, method, kwarg):
+        missing = tmp_path / "never-generated.png"
+        assert not missing.exists()
+
+        result = await getattr(self.adapter, method)(
+            "channel_1", **{kwarg: str(missing)}
+        )
+
+        assert result.success is False
+        assert result.message_id is None
+        assert str(missing) in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_existing_file_still_uploads(self, tmp_path):
+        """The guard must not swallow a file that is actually present."""
+        real = tmp_path / "real.png"
+        real.write_bytes(b"\x89PNG\x00fake")
+
+        self.adapter._upload_file = AsyncMock(return_value="file_abc123")
+        self.adapter._thread_root_for_send = AsyncMock(return_value=None)
+        self.adapter._post_preserving_thread = AsyncMock(
+            return_value={"id": "post_with_file"}
+        )
+
+        result = await self.adapter.send_document("channel_1", str(real))
+
+        assert result.success is True
+        assert result.message_id == "post_with_file"
+
+
 # ---------------------------------------------------------------------------
 # Dedup cache
 # ---------------------------------------------------------------------------
