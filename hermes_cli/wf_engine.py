@@ -241,6 +241,32 @@ def _instance(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
     return row
 
 
+def _assert_expected_turn(
+    task: sqlite3.Row,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
+    """Reject a stale worker attempting to settle a successor stage run."""
+
+    if expected_step is not None and task["current_step_key"] != expected_step:
+        raise WorkflowConflictError(
+            f"stale workflow step: expected {expected_step!r}, "
+            f"found {task['current_step_key']!r}"
+        )
+    if expected_run_id is not None:
+        current_run_id = task["current_run_id"]
+        if (
+            task["status"] != "running"
+            or current_run_id is None
+            or int(current_run_id) != int(expected_run_id)
+        ):
+            raise WorkflowConflictError(
+                f"stale workflow run: expected {expected_run_id}, "
+                f"found {current_run_id}"
+            )
+
+
 def _cas_step(
     conn: sqlite3.Connection,
     task_id: str,
@@ -771,13 +797,75 @@ def apply_event(conn, event_id, task_id, *, expected_step: str) -> ApplyResult:
 
 
 def advance(conn, task_id, *, to_step, event_id) -> None:
-    """Commit a worker-stage transition and enter the next stage."""
+    """Commit a transition through the frozen engine API.
 
+    Correlator and coordinator callers may use this primitive to apply a
+    template-valid transition.  Worker turns use :func:`advance_stage_turn`,
+    which additionally fences the run and enforces its declared target.
+    """
+
+    _advance(
+        conn,
+        task_id,
+        to_step=to_step,
+        event_id=event_id,
+        expected_step=None,
+        expected_run_id=None,
+        enforce_declared_target=False,
+    )
+
+
+def advance_stage_turn(
+    conn,
+    task_id,
+    *,
+    to_step,
+    event_id,
+    expected_step: str,
+    expected_run_id: int,
+) -> None:
+    """Commit a fenced worker-stage transition to its declared target."""
+
+    _advance(
+        conn,
+        task_id,
+        to_step=to_step,
+        event_id=event_id,
+        expected_step=expected_step,
+        expected_run_id=expected_run_id,
+        enforce_declared_target=True,
+    )
+
+
+def _advance(
+    conn,
+    task_id,
+    *,
+    to_step,
+    event_id,
+    expected_step: str | None,
+    expected_run_id: int | None,
+    enforce_declared_target: bool,
+) -> None:
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         instance = _instance(conn, task_id)
         spec = _load_template(conn, instance["template_id"])
         current_step = task["current_step_key"]
+        if not current_step:
+            raise WorkflowConflictError(f"workflow task has no current step: {task_id}")
+        current_spec = _step(spec, str(current_step))
+        declared_target = current_spec.get("advance_to")
+        if enforce_declared_target and str(to_step) != str(declared_target):
+            raise WorkflowConflictError(
+                f"workflow step {current_step!r} may advance only to "
+                f"{declared_target!r}, not {to_step!r}"
+            )
         next_step = _step(spec, str(to_step))
         duplicate = conn.execute(
             """
@@ -788,8 +876,6 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
         ).fetchone()
         if duplicate is not None:
             return
-        if not current_step:
-            raise WorkflowConflictError(f"workflow task has no current step: {task_id}")
         if not _cas_step(conn, task_id, str(current_step), str(to_step)):
             raise WorkflowConflictError(f"workflow stage changed: {task_id}")
         conn.execute(
@@ -820,9 +906,18 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
                 "UPDATE wf_instance SET state = 'advancing', parked_since = NULL WHERE task_id = ?",
                 (task_id,),
             )
-            if task["status"] == "blocked":
+            if task["status"] == "running":
+                if not kanban_db.complete_stage_turn(
+                    conn,
+                    task_id,
+                    summary=f"workflow stage {current_step} advanced to {to_step}",
+                ):
+                    raise WorkflowConflictError(
+                        f"cannot close workflow stage turn: {task_id}"
+                    )
+            elif task["status"] == "blocked":
                 _unblock(conn, task_id)
-            elif task["status"] not in {"ready", "running"}:
+            elif task["status"] != "ready":
                 raise WorkflowConflictError(
                     f"cannot advance workflow task from status {task['status']!r}"
                 )
@@ -835,8 +930,47 @@ def advance(conn, task_id, *, to_step, event_id) -> None:
     )
 
 
+def _stage_event(conn, task_id: str, step_key: str) -> sqlite3.Row | None:
+    """Return the structured event that caused the current stage turn.
+
+    A transition is the strongest link because it binds the event to the
+    stage being entered.  The first stage has no transition, so it falls back
+    to the newest event matched to the instance (normally ``create_on``).
+    """
+
+    row = conn.execute(
+        """
+        SELECT e.*
+          FROM wf_transition tr
+          JOIN wf_event e ON e.id = tr.event_id
+         WHERE tr.task_id = ? AND tr.to_step = ?
+         ORDER BY tr.applied_at DESC, e.id DESC
+         LIMIT 1
+        """,
+        (task_id, step_key),
+    ).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        """
+        SELECT *
+          FROM wf_event
+         WHERE matched_task_id = ?
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+
+
 def context(conn, task_id: str) -> dict:
-    """Return the tenant-neutral worker context for one instance."""
+    """Return the step-scoped, tenant-neutral context for one stage turn.
+
+    The worker receives only the current structural step, live posture dial,
+    accumulated structured variables, declared correlation values, and the
+    structured event that opened this turn.  The full template and raw inbound
+    bodies never enter the worker prompt.
+    """
 
     task = _task(conn, task_id)
     instance = _instance(conn, task_id)
@@ -848,6 +982,16 @@ def context(conn, task_id: str) -> dict:
         task["current_step_key"],
         step,
     )
+    event = _stage_event(conn, task_id, str(task["current_step_key"]))
+    event_context = None
+    if event is not None:
+        event_context = {
+            "id": int(event["id"]),
+            "source": event["source"],
+            "event_type": event["event_type"],
+            "payload": _load_json(event["payload"], {}),
+            "corr": _load_json(event["corr"], {}),
+        }
     return {
         "task_id": task_id,
         "template_id": instance["template_id"],
@@ -856,14 +1000,34 @@ def context(conn, task_id: str) -> dict:
         "vars": _load_json(instance["vars"], {}),
         "state": instance["state"],
         "step": step,
+        "event": event_context,
     }
 
 
-def propose(conn, task_id: str, action: str, payload: dict) -> int:
+def correlation(conn, task_id: str) -> dict:
+    """Return the authoritative correlation scope for one workflow instance."""
+
+    return _load_json(_instance(conn, task_id)["corr"], {})
+
+
+def propose(
+    conn,
+    task_id: str,
+    action: str,
+    payload: dict,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> int:
     """Persist a complete approval proposal and park the instance."""
 
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         instance = _instance(conn, task_id)
         token = secrets.token_urlsafe(32)
         approval = conn.execute(
@@ -890,12 +1054,25 @@ def propose(conn, task_id: str, action: str, payload: dict) -> int:
         return int(approval.lastrowid)
 
 
-def review(conn, task_id: str, reason: str, options: Any = None) -> None:
+def review(
+    conn,
+    task_id: str,
+    reason: str,
+    options: Any = None,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
     """Move a workflow instance into the human review state."""
 
     del options  # Reserved for the later adapter; no schema column is added.
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         _instance(conn, task_id)
         conn.execute(
             "UPDATE wf_instance SET state = 'needs_review', parked_since = ? WHERE task_id = ?",
@@ -905,11 +1082,23 @@ def review(conn, task_id: str, reason: str, options: Any = None) -> None:
         _assert_invariant(conn, task_id)
 
 
-def exception(conn, task_id: str, reason: str) -> None:
+def exception(
+    conn,
+    task_id: str,
+    reason: str,
+    *,
+    expected_step: str | None = None,
+    expected_run_id: int | None = None,
+) -> None:
     """Move a workflow instance into the resumable exception state."""
 
     with kanban_db.write_txn(conn):
         task = _task(conn, task_id)
+        _assert_expected_turn(
+            task,
+            expected_step=expected_step,
+            expected_run_id=expected_run_id,
+        )
         _instance(conn, task_id)
         conn.execute(
             "UPDATE wf_instance SET state = 'exception', parked_since = ? WHERE task_id = ?",

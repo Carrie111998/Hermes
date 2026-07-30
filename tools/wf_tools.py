@@ -77,6 +77,25 @@ def _workflow_scope(task_id_arg: Optional[str]) -> tuple[Optional[tuple[str, Any
         if not task.workflow_template_id:
             _close(conn)
             return None, _error(f"task {task_id} is not a workflow task")
+        run_id_text = os.environ.get("HERMES_KANBAN_RUN_ID")
+        claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+        expected_step = os.environ.get("HERMES_WORKFLOW_STEP")
+        if not run_id_text or not claim_lock or not expected_step:
+            _close(conn)
+            return None, _error("workflow worker stage-turn identity is incomplete")
+        try:
+            expected_run_id = int(run_id_text)
+        except ValueError:
+            _close(conn)
+            return None, _error("HERMES_KANBAN_RUN_ID must be an integer")
+        if (
+            task.status != "running"
+            or task.current_run_id != expected_run_id
+            or task.claim_lock != claim_lock
+            or task.current_step_key != expected_step
+        ):
+            _close(conn)
+            return None, _error("stale workflow worker stage turn")
         return (task_id, conn), None
     except Exception as exc:
         if conn is not None:
@@ -110,6 +129,13 @@ def _engine_function(name: str) -> Callable[..., Any]:
     if not callable(function):
         raise RuntimeError(f"workflow engine function {name} is unavailable")
     return function
+
+
+def _expected_turn() -> dict[str, Any]:
+    return {
+        "expected_step": os.environ["HERMES_WORKFLOW_STEP"],
+        "expected_run_id": int(os.environ["HERMES_KANBAN_RUN_ID"]),
+    }
 
 
 def _required_text(args: dict, name: str) -> tuple[Optional[str], Optional[str]]:
@@ -159,11 +185,12 @@ def _handle_advance(args: dict, **_kw: Any) -> str:
         )
         if event_id is None:
             return _error("wf_advance event was already recorded")
-        result = _engine_function("advance")(
+        result = _engine_function("advance_stage_turn")(
             conn,
             task_id,
             to_step=to_step,
             event_id=event_id,
+            **_expected_turn(),
         )
         return _ok(event_id=event_id, result=result)
 
@@ -186,6 +213,7 @@ def _handle_propose(args: dict, **_kw: Any) -> str:
             task_id,
             action=action,
             payload=payload,
+            **_expected_turn(),
         )
         return _ok(result=result)
 
@@ -208,6 +236,7 @@ def _handle_review(args: dict, **_kw: Any) -> str:
             task_id,
             reason=reason,
             options=options,
+            **_expected_turn(),
         )
         return _ok(result=result)
 
@@ -226,6 +255,7 @@ def _handle_exception(args: dict, **_kw: Any) -> str:
             conn,
             task_id,
             reason=reason,
+            **_expected_turn(),
         )
         return _ok(result=result)
 
@@ -279,11 +309,18 @@ def _handle_signal(args: dict, **_kw: Any) -> str:
     if error:
         return error
 
-    def call(_task_id: str, conn: Any) -> str:
+    def call(task_id: str, conn: Any) -> str:
+        instance_corr = _engine_function("correlation")(conn, task_id)
+        if corr != instance_corr:
+            return _error("wf_signal corr must exactly match the assigned workflow")
+        # Worker-ledgered events occupy a dedicated source/id namespace.
+        # They can never squat an engine timer id or a gateway delivery id.
+        worker_source = f"worker:{source}"
+        worker_external_id = f"wf-worker:{task_id}:{external_id}"
         event_id = _engine_function("ingest_event")(
             conn,
-            source=source,
-            external_id=external_id,
+            source=worker_source,
+            external_id=worker_external_id,
             payload=payload,
             corr=corr,
             event_type=event_type,

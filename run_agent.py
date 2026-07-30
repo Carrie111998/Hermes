@@ -15927,19 +15927,23 @@ class AIAgent:
             _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
             if _kanban_task:
                 try:
-                    handle_function_call(
-                        "kanban_block",
-                        {
-                            "task_id": _kanban_task,
-                            "reason": (
-                                f"Iteration budget exhausted "
-                                f"({api_call_count}/{self.max_iterations}) — "
-                                "task could not complete within the allowed "
-                                "iterations"
-                            ),
-                        },
-                        task_id=effective_task_id,
+                    reason = (
+                        f"Iteration budget exhausted "
+                        f"({api_call_count}/{self.max_iterations}) — "
+                        "task could not complete within the allowed iterations"
                     )
+                    if os.environ.get("HERMES_WORKFLOW_TASK"):
+                        handle_function_call(
+                            "wf_exception",
+                            {"task_id": _kanban_task, "reason": reason},
+                            task_id=effective_task_id,
+                        )
+                    else:
+                        handle_function_call(
+                            "kanban_block",
+                            {"task_id": _kanban_task, "reason": reason},
+                            task_id=effective_task_id,
+                        )
                     logger.info(
                         "kanban_block called for task %s after iteration "
                         "exhaustion (%d/%d)",
