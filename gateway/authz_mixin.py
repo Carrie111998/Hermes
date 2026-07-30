@@ -99,7 +99,18 @@ class GatewayAuthorizationMixin:
         return adapters.get(platform)
 
     def _adapter_for_source(self, source: Optional[SessionSource]):
-        """Resolve the live adapter for an inbound ``SessionSource``."""
+        """Resolve the live adapter for an inbound ``SessionSource``.
+
+        This is the *intake / authorization* resolver. It must remain
+        fail-closed: a served profile with no live same-platform adapter
+        (e.g. it failed to connect, or the routed profile deliberately owns
+        no door of its own) resolves to ``None`` so platform intake policy
+        cannot leak across profiles.
+
+        Outbound delivery is a different concern — for status, approvals,
+        clarify, progress, replies, and other user-visible paths, see
+        :meth:`_delivery_adapter_for_source`.
+        """
         if source is None:
             return None
         transport_adapter = self._registered_transport_adapter(source)
@@ -124,6 +135,95 @@ class GatewayAuthorizationMixin:
             getattr(source, "platform", None),
             getattr(source, "profile", None),
         )
+
+    def _delivery_adapter_for_source(self, source: Optional[SessionSource]):
+        """Resolve the live adapter that should OWN outbound delivery for *source*.
+
+        Distinct from :meth:`_adapter_for_source` (the intake / authorization
+        resolver) on purpose. The intake resolver is fail-closed — a routed
+        profile with no live same-platform adapter returns ``None`` so a
+        message from a different profile cannot ride the default profile's
+        allowlist. Outbound delivery cannot use the same rule: an interactive
+        approval prompt, a clarify question, status progress, or a reply that
+        *did* get authorized for a routed profile must still be *delivered*
+        through a real adapter, or the user never sees it. Pre-fix,
+        :meth:`_adapter_for_source` returned ``None`` and the outbound path
+        dereferenced it (``AttributeError: 'NoneType' object has no attribute
+        'pause_typing_for_chat'``), so approvals and clarify prompts silently
+        failed to send and the agent surfaced ``BLOCKED: Failed to send
+        approval request to user`` even though intake was authorized.
+
+        Resolution order (each step is a strict superset of the previous for
+        the cases it covers, never a leak of authorization across profiles):
+
+        1. ``_registered_transport_adapter`` — the adapter that *received*
+           the source (retained as in-process provenance by
+           :meth:`BasePlatformAdapter.build_source`). This keeps relay-ingress
+           and chat-route sources on the same adapter that owns the
+           authenticated socket, and it covers both the "profile owns its
+           door" and "routed profile uses the default's adapter" cases
+           without falling through to the cross-profile registry.
+        2. The profile-scoped adapter when the source's profile *does* own
+           one for the platform — so a profile that has its own bot keeps
+           using it for delivery. (``_authorization_adapter`` already
+           returns the profile-owned adapter for a stamped non-default
+           profile.)
+        3. The active / default profile's same-platform adapter — for a
+           routed profile that deliberately has no door of its own, fall
+           back to the adapter that actually received the platform's
+           traffic. This is the failure case the bug report names.
+        4. ``None`` — when the platform has no live adapter anywhere on
+           the runner. The caller (status / approval / clarify) is
+           responsible for degrading cleanly without dereferencing.
+
+        Never consults the cross-profile registry in a way that would let a
+        secondary profile's allowlist accept a different profile's inbound:
+        a delivered source already passed ``_is_user_authorized``, and this
+        resolver is exclusively about *which adapter emits the next user-
+        visible message*. Intake / authorization / queue / interrupt /
+        restore sites must keep using :meth:`_adapter_for_source`.
+        """
+        if source is None:
+            return None
+        # Step 1 — receiving transport. Same call the intake resolver
+        # already uses for relay + chat-route sources, so delivery stays on
+        # the adapter that owns the authenticated socket.
+        transport_adapter = self._registered_transport_adapter(source)
+        if transport_adapter is not None:
+            return transport_adapter
+        # Step 1b — relay ingress (mirror of the intake resolver's relay
+        # handling). Keep on the same RelayAdapter to preserve streaming,
+        # typing, and tool-progress for managed gateways.
+        if getattr(source, "delivered_via_upstream_relay", False) is True:
+            adapters = getattr(self, "adapters", None) or {}
+            relay = adapters.get(Platform.RELAY)
+            if relay is not None:
+                return relay
+        # Step 2 — profile-scoped adapter when the routed profile has one
+        # for the platform. ``_authorization_adapter`` returns that for a
+        # stamped non-default profile whose ``_profile_adapters[profile]``
+        # entry holds a same-platform adapter.
+        platform = getattr(source, "platform", None)
+        if not platform:
+            return None
+        profile = getattr(source, "profile", None)
+        if profile:
+            profile_adapters = getattr(self, "_profile_adapters", None) or {}
+            if profile in profile_adapters:
+                adapter = profile_adapters[profile].get(platform)
+                if adapter is not None:
+                    return adapter
+        # Step 3 — active / default profile's same-platform adapter. We do
+        # NOT use ``_authorization_adapter`` here because that helper is
+        # fail-closed for non-default profiles (it returns ``None`` when the
+        # stamped profile has no own adapter, so a routed profile's
+        # message cannot leak through the default profile's allowlist). For
+        # outbound delivery this rule is the wrong side of the trade-off:
+        # the message already passed authorization on the receiving adapter,
+        # and refusing to deliver it through the default bot means the
+        # user never sees the prompt.
+        adapters = getattr(self, "adapters", None) or {}
+        return adapters.get(platform)
 
     def _registered_transport_adapter(self, source: SessionSource):
         """Return the registered adapter that created *source*, if retained.

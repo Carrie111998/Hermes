@@ -4804,6 +4804,24 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            # Guard the dereference: ``_delivery_adapter_for_source`` can
+            # still resolve to ``None`` for a source whose platform has no
+            # live adapter anywhere on the runner (e.g. all adapters for
+            # that platform failed to start). The intake path already
+            # rejected the source, so the agent cannot proceed safely
+            # without user input — log and exit so ``tools.approval``
+            # surfaces ``BLOCKED: Failed to send approval request to
+            # user`` cleanly instead of crashing the agent thread with
+            # ``AttributeError: 'NoneType' object has no attribute
+            # 'pause_typing_for_chat'`` (the symptom in #74787).
+            if not ctx._status_adapter:
+                logger.error(
+                    "Cannot send approval request: no delivery adapter for "
+                    "platform=%s chat_id=%s; source is unresolvable",
+                    getattr(getattr(ctx, "source", None) and ctx.source.platform, "value", None),
+                    ctx._status_chat_id,
+                )
+                return
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -23575,7 +23593,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self._adapter_for_source(source)
+        # Use the delivery-only resolver (NOT the intake / authorization
+        # resolver ``_adapter_for_source``): when a routed profile has no
+        # live same-platform adapter of its own, the intake resolver is
+        # fail-closed and returns ``None`` so a different profile's
+        # allowlist cannot accept the message. Outbound delivery cannot
+        # use that rule — the message has already passed authorization,
+        # and an approval prompt or status update must still reach the
+        # user through the receiving / default adapter. See
+        # :meth:`GatewayAuthorizationMixin._delivery_adapter_for_source`.
+        _status_adapter = self._delivery_adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
