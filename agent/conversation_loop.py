@@ -4084,6 +4084,36 @@ def run_conversation(
             
             # Check for tool calls
             if assistant_message.tool_calls:
+                _repair_start = getattr(
+                    agent,
+                    "_response_contract_repair_start_index",
+                    None,
+                )
+                if isinstance(_repair_start, int):
+                    # Contract repair is a private, text-only correction turn.
+                    # Never execute or incrementally persist tools emitted from
+                    # it: discard the whole private exchange and fail closed.
+                    del messages[max(0, _repair_start):]
+                    agent._response_contract_repair_start_index = None
+                    final_response = str(
+                        getattr(
+                            agent,
+                            "final_response_validation_failure_message",
+                            "",
+                        )
+                        or "⚠️ 回覆未通過完整性檢查，請再試一次。"
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": final_response,
+                        "finish_reason": "contract_repair_tool_rejected",
+                    })
+                    _turn_exit_reason = "contract_repair_tool_rejected"
+                    logger.error(
+                        "Rejected tool call from private final-response "
+                        "contract repair turn"
+                    )
+                    break
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                 
@@ -4771,8 +4801,103 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+
+                # A gateway route may install a trusted, per-turn final-output
+                # validator (for example, the Translator Topic teaching
+                # contract). Validate before the final assistant message is
+                # persisted or exposed to stream finalization. One failed draft
+                # gets a private correction turn through the same model. The
+                # draft and correction nudge are removed once a valid
+                # replacement is available, so they never become durable
+                # conversation history.
+                _response_contract_validator = getattr(
+                    agent, "final_response_validator", None,
+                )
+                _response_contract_repair_prompt = None
+                if callable(_response_contract_validator) and final_response:
+                    try:
+                        _response_contract_repair_prompt = (
+                            _response_contract_validator(final_response)
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Final-response contract validator failed",
+                            exc_info=True,
+                        )
+                if _response_contract_repair_prompt:
+                    _repair_attempts = int(
+                        getattr(agent, "_response_contract_repair_attempts", 0)
+                        or 0
+                    )
+                    _repair_limit = max(
+                        0,
+                        int(
+                            getattr(
+                                agent,
+                                "final_response_repair_limit",
+                                1,
+                            )
+                            or 0
+                        ),
+                    )
+                    if _repair_attempts < _repair_limit:
+                        agent._response_contract_repair_start_index = len(
+                            messages
+                        )
+                        _draft_msg = agent._build_assistant_message(
+                            assistant_message, "contract_repair",
+                        )
+                        _draft_msg["_response_contract_repair_draft"] = True
+                        messages.append(_draft_msg)
+                        messages.append({
+                            "role": "user",
+                            "content": str(_response_contract_repair_prompt),
+                            "_response_contract_repair_synthetic": True,
+                        })
+                        agent._response_contract_repair_attempts = (
+                            _repair_attempts + 1
+                        )
+                        agent._session_messages = messages
+                        logger.info(
+                            "Final-response contract repair requested "
+                            "(attempt %d/%d)",
+                            _repair_attempts + 1,
+                            _repair_limit,
+                        )
+                        continue
+
+                    logger.error(
+                        "Final-response contract remained invalid after %d "
+                        "repair attempt(s); suppressing invalid draft",
+                        _repair_attempts,
+                    )
+                    final_response = str(
+                        getattr(
+                            agent,
+                            "final_response_validation_failure_message",
+                            "",
+                        )
+                        or "⚠️ 回覆未通過完整性檢查，請再試一次。"
+                    )
+                    try:
+                        assistant_message.content = final_response
+                    except Exception:
+                        pass
+
+                # Remove the entire private repair exchange, including any tool
+                # calls/results the provider emitted despite the no-tools
+                # instruction. The valid replacement has not been appended yet.
+                _repair_start = getattr(
+                    agent,
+                    "_response_contract_repair_start_index",
+                    None,
+                )
+                if isinstance(_repair_start, int):
+                    del messages[max(0, _repair_start):]
+                    agent._response_contract_repair_start_index = None
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                final_msg["content"] = final_response
 
                 # Pop thinking-only prefill and empty-response retry
                 # scaffolding before appending either a final response or a
