@@ -3012,13 +3012,23 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
         return False
 
 
-def select_provider_and_model(args=None):
+def select_provider_and_model(
+    args=None,
+    *,
+    initial_model=None,
+    initial_provider=None,
+):
     """Core provider selection + model picking logic.
 
     Shared by ``cmd_model`` (``hermes model``) and the setup wizard
     (``setup_model_provider`` in setup.py).  Handles the full flow:
     provider picker, credential prompting, model selection, and config
     persistence.
+
+    ``initial_model`` / ``initial_provider`` affect only the displayed current
+    selection and picker cursors. Persistence still uses the normal main-model
+    setup flows. Callers selecting for another target can therefore reuse the
+    complete picker without making the active primary route the UI default.
     """
     from hermes_cli.auth import (
         resolve_provider,
@@ -3033,16 +3043,18 @@ def select_provider_and_model(args=None):
     from hermes_cli.providers import resolve_provider_full
 
     config = load_config()
-    current_model = config.get("model")
-    if isinstance(current_model, dict):
-        current_model = current_model.get("default", "")
-    current_model = current_model or "(not set)"
+    initial_model_cursor = str(initial_model or "").strip()
+    configured_model = config.get("model")
+    if isinstance(configured_model, dict):
+        configured_model = configured_model.get("default", "")
+    current_model = initial_model_cursor or configured_model or "(not set)"
 
-    # Read effective provider the same way the CLI does at startup:
-    # config.yaml model.provider > env var > auto-detect
-    config_provider = None
+    # Read effective provider the same way the CLI does at startup, unless a
+    # secondary target supplied its own initial cursor:
+    # initial provider > config.yaml model.provider > env var > auto-detect
+    config_provider = str(initial_provider or "").strip() or None
     model_cfg = config.get("model")
-    if isinstance(model_cfg, dict):
+    if config_provider is None and isinstance(model_cfg, dict):
         config_provider = model_cfg.get("provider")
 
     effective_provider = (
@@ -3312,6 +3324,8 @@ def select_provider_and_model(args=None):
         base_url = provider_info["base_url"]
         short_url = base_url.replace("https://", "").replace("http://", "").rstrip("/")
         saved_model = provider_info.get("model", "")
+        if initial_model_cursor and active and key == active:
+            saved_model = initial_model_cursor
         model_hint = f" — {saved_model}" if saved_model else ""
         label = f"{name} ({short_url}){model_hint}"
         if active and key == active:
@@ -3401,6 +3415,9 @@ def select_provider_and_model(args=None):
                 "It may have been removed from config.yaml. No change."
             )
             return
+        if initial_model_cursor and selected_provider == active:
+            provider_info = dict(provider_info)
+            provider_info["model"] = initial_model_cursor
         _model_flow_named_custom(config, provider_info)
     elif selected_provider == "remove-custom":
         _remove_custom_provider(config)

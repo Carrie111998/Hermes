@@ -215,6 +215,7 @@ def select_subagent_model_interactively(
             pass
 
     before_config = load_config()
+    initial_status = _status_from_config(before_config)
     model_before = copy.deepcopy(before_config.get("model"))
     active_provider_before = _snapshot_auth_active_provider()
     selected_config: Optional[dict[str, Any]] = None
@@ -228,7 +229,10 @@ def select_subagent_model_interactively(
 
     try:
         with capture_model_selection() as selections:
-            select_provider_and_model()
+            select_provider_and_model(
+                initial_model=initial_status.model,
+                initial_provider=initial_status.provider,
+            )
         if selections:
             selected_config = copy.deepcopy(load_config())
     finally:

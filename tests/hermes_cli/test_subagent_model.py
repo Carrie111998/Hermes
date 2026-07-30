@@ -177,6 +177,123 @@ def _stub_auth_restore(monkeypatch):
     return restored
 
 
+@pytest.mark.parametrize(
+    ("delegation", "expected_initial"),
+    [
+        (
+            {"model": "sub-model", "provider": "custom:sub-endpoint"},
+            ("sub-model", "custom:sub-endpoint"),
+        ),
+        ({"model": "sub-model"}, ("sub-model", None)),
+        ({"max_spawn_depth": 2}, (None, None)),
+    ],
+    ids=("full-override", "model-only", "inherits-parent"),
+)
+def test_full_picker_starts_from_target_selection(
+    monkeypatch, delegation, expected_initial
+):
+    from hermes_cli import main as hermes_main
+
+    primary = {"default": "parent-model", "provider": "openrouter"}
+    state = _memory_config(
+        monkeypatch,
+        {"model": primary, "delegation": delegation},
+    )
+    _stub_auth_restore(monkeypatch)
+    initial: list[tuple[str | None, str | None]] = []
+
+    def fake_full_picker(
+        *, initial_model: str | None = None, initial_provider: str | None = None
+    ):
+        initial.append((initial_model, initial_provider))
+
+    monkeypatch.setattr(hermes_main, "select_provider_and_model", fake_full_picker)
+
+    assert subagent_model.select_subagent_model_interactively() is None
+    assert initial == [expected_initial]
+    assert state["model"] == primary
+
+
+def test_shared_full_picker_uses_initial_provider_and_model(monkeypatch):
+    import copy
+
+    from hermes_cli import main as hermes_main
+
+    config = {
+        "model": {"default": "parent-model", "provider": "openrouter"},
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(config))
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: copy.deepcopy(config))
+
+    provider_defaults: list[tuple[str, bool]] = []
+    selected_models: list[str] = []
+
+    def fake_prompt(choices, *, default=0, title="Select provider:"):
+        provider_defaults.append((title, "currently active" in choices[default]))
+        return default
+
+    monkeypatch.setattr(hermes_main, "_prompt_provider_choice", fake_prompt)
+    monkeypatch.setattr(
+        hermes_main,
+        "_model_flow_nous",
+        lambda _config, current_model, args=None: selected_models.append(current_model),
+    )
+    monkeypatch.setattr(hermes_main, "_clear_stale_openai_base_url", lambda: None)
+
+    hermes_main.select_provider_and_model(
+        initial_model="sub-model",
+        initial_provider="nous",
+    )
+
+    assert provider_defaults == [("Select provider:", True)]
+    assert selected_models == ["sub-model"]
+
+
+def test_shared_full_picker_uses_named_custom_initial_provider(monkeypatch):
+    import copy
+
+    from hermes_cli import main as hermes_main
+
+    config = {
+        "model": {"default": "parent-model", "provider": "openrouter"},
+        "custom_providers": [
+            {
+                "name": "Sub Endpoint",
+                "base_url": "https://sub.example/v1",
+                "model": "provider-default",
+            }
+        ],
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(config))
+    monkeypatch.setattr("hermes_cli.config.read_raw_config", lambda: copy.deepcopy(config))
+    selected_labels: list[str] = []
+    selected_provider_models: list[str] = []
+
+    def fake_prompt(choices, *, default=0, title="Select provider:"):
+        selected_labels.append(choices[default])
+        return default
+
+    monkeypatch.setattr(hermes_main, "_prompt_provider_choice", fake_prompt)
+    monkeypatch.setattr(
+        hermes_main,
+        "_model_flow_named_custom",
+        lambda _config, provider_info: selected_provider_models.append(
+            provider_info["model"]
+        ),
+    )
+
+    hermes_main.select_provider_and_model(
+        initial_model="sub-model",
+        initial_provider="custom:sub-endpoint",
+    )
+
+    assert len(selected_labels) == 1
+    assert selected_labels[0].startswith("Sub Endpoint (sub.example/v1) — sub-model")
+    assert "provider-default" not in selected_labels[0]
+    assert "currently active" in selected_labels[0]
+    assert selected_provider_models == ["sub-model"]
+
+
 def test_full_picker_keeps_setup_side_effects_and_restores_primary(monkeypatch):
     import copy
 
@@ -193,7 +310,7 @@ def test_full_picker_keeps_setup_side_effects_and_restores_primary(monkeypatch):
         "same-model", "openrouter", False
     )
 
-    def fake_full_picker():
+    def fake_full_picker(**_kwargs):
         # Explicitly selecting the same model still counts as a selection.
         auth._save_model_choice("same-model")
         updated = copy.deepcopy(state)
@@ -226,7 +343,7 @@ def test_full_picker_cancel_keeps_setup_changes_without_pinning(monkeypatch):
     state = _memory_config(monkeypatch, {"model": primary})
     restored_auth = _stub_auth_restore(monkeypatch)
 
-    def fake_cancelled_picker():
+    def fake_cancelled_picker(**_kwargs):
         updated = copy.deepcopy(state)
         updated["providers"] = {"authenticated-only": {"key_env": "AUTH_KEY"}}
         from hermes_cli.config import save_config
@@ -253,7 +370,7 @@ def test_full_picker_adds_custom_provider_and_pins_canonical_slug(monkeypatch):
         "moon-model", "custom:terra-to-moon", False
     )
 
-    def fake_custom_picker():
+    def fake_custom_picker(**_kwargs):
         auth._save_model_choice("moon-model")
         updated = copy.deepcopy(state)
         updated["model"].update(
