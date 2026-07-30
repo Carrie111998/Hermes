@@ -428,7 +428,7 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     assert (result / "dist" / "entry.js").read_text(encoding="utf-8") == (
         "console.log('cached bundle')\n"
     )
-    assert not cache_dir.with_name("tui-bundle.lock").exists()
+    assert cache_dir.with_name("tui-bundle.lock").is_file()
     assert calls[0][0] == [
         "npm",
         "install",
@@ -502,34 +502,19 @@ def test_tui_bundle_stamp_rejects_symlinks_in_external_workspace(main_mod, tmp_p
         main_mod._tui_bundle_stamp(tui_dir)
 
 
-def test_tui_cache_lock_is_not_reclaimable_while_owner_is_alive(
-    monkeypatch, main_mod, tmp_path
-):
-    from gateway import status as gateway_status
+def test_tui_cache_advisory_lock_serializes_builders(main_mod, tmp_path):
+    lock_path = tmp_path / "tui-bundle.lock"
+    first = main_mod._try_acquire_tui_cache_lock(lock_path)
+    assert first is not None
 
-    lock_dir = tmp_path / "tui-bundle.lock"
-    lock_dir.mkdir()
-    (lock_dir / "owner").write_text("pid=4242\nstarted=1\n", encoding="utf-8")
-    os.utime(lock_dir, (1, 1))
-    monkeypatch.setattr(main_mod._time, "time", lambda: 5000)
-    monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: pid == 4242)
+    try:
+        assert main_mod._try_acquire_tui_cache_lock(lock_path) is None
+    finally:
+        main_mod._release_tui_cache_lock(first)
 
-    assert not main_mod._tui_cache_lock_reclaimable(lock_dir, stale_after=1200)
-
-
-def test_tui_cache_lock_is_reclaimable_after_old_owner_exits(
-    monkeypatch, main_mod, tmp_path
-):
-    from gateway import status as gateway_status
-
-    lock_dir = tmp_path / "tui-bundle.lock"
-    lock_dir.mkdir()
-    (lock_dir / "owner").write_text("pid=4242\nstarted=1\n", encoding="utf-8")
-    os.utime(lock_dir, (1, 1))
-    monkeypatch.setattr(main_mod._time, "time", lambda: 5000)
-    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: False)
-
-    assert main_mod._tui_cache_lock_reclaimable(lock_dir, stale_after=1200)
+    second = main_mod._try_acquire_tui_cache_lock(lock_path)
+    assert second is not None
+    main_mod._release_tui_cache_lock(second)
 
 
 def test_tui_cache_refresh_keeps_previous_returned_generation_launchable(
@@ -610,3 +595,13 @@ def test_tui_cached_bundle_rejects_symlinked_generations_parent(
         main_mod._publish_tui_cached_generation(cache_root, staged, "deadbeef")
     main_mod._cleanup_tui_cached_generations(cache_root, evil)
     assert (evil / "dist" / "entry.js").is_file()
+
+
+def test_tui_cached_bundle_rejects_symlinked_cache_root(main_mod, tmp_path):
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    cache_root = tmp_path / "tui-bundle"
+    cache_root.symlink_to(outside, target_is_directory=True)
+
+    assert main_mod._tui_cached_generations_dir(cache_root, create=True) is None
+    assert not (outside / "generations").exists()

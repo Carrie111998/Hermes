@@ -1839,6 +1839,8 @@ def _tui_cached_build_dir() -> Path:
 
 def _tui_cached_generations_dir(cache_root: Path, *, create: bool = False) -> Optional[Path]:
     """Return a trusted generations directory, rejecting parent symlink escapes."""
+    if cache_root.is_symlink():
+        return None
     generations = cache_root / "generations"
     if generations.is_symlink():
         return None
@@ -2013,32 +2015,30 @@ def _tui_cached_bundle_current(tui_dir: Path, cache_dir: Path) -> bool:
         return False
 
 
-def _tui_cache_lock_reclaimable(lock_dir: Path, *, stale_after: float) -> bool:
-    """Return whether an old cache lock has no live owner and may be removed."""
-    try:
-        if _time.time() - lock_dir.stat().st_mtime <= stale_after:
-            return False
-    except OSError:
-        return False
+def _try_acquire_tui_cache_lock(lock_path: Path):
+    """Try to claim the OS-owned cache build lock, returning its live handle."""
+    from gateway.status import _try_acquire_file_lock
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(str(lock_path), flags, 0o600)
+    handle = os.fdopen(fd, "a+", encoding="utf-8")
+    if _try_acquire_file_lock(handle):
+        return handle
+    handle.close()
+    return None
+
+
+def _release_tui_cache_lock(handle) -> None:
+    """Release and close a handle returned by `_try_acquire_tui_cache_lock`."""
+    from gateway.status import _release_file_lock
 
     try:
-        fields = dict(
-            line.split("=", 1)
-            for line in (lock_dir / "owner").read_text(encoding="utf-8").splitlines()
-            if "=" in line
-        )
-        owner_pid = int(fields["pid"])
-        if owner_pid <= 0:
-            return True
-    except (OSError, KeyError, TypeError, ValueError):
-        return True
-
-    try:
-        from gateway.status import _pid_exists
-
-        return not _pid_exists(owner_pid)
-    except Exception:
-        return False
+        _release_file_lock(handle)
+    finally:
+        handle.close()
 
 
 def _ensure_tui_cached_bundle(
@@ -2056,6 +2056,8 @@ def _ensure_tui_cached_bundle(
     ``package.json`` + ``dist/`` as the runtime bundle.
     """
     cache_root = _tui_cached_bundle_dir()
+    if cache_root.is_symlink():
+        raise RuntimeError("refusing unsafe TUI cache root")
     cache_dir = _tui_cached_active_bundle_dir(cache_root)
     if _tui_cached_bundle_current(tui_dir, cache_dir):
         return cache_dir
@@ -2066,24 +2068,15 @@ def _ensure_tui_cached_bundle(
         sys.exit(1)
 
     cache_root.mkdir(parents=True, exist_ok=True)
-    lock_dir = cache_root.with_name(f"{cache_root.name}.lock")
+    lock_path = cache_root.with_name(f"{cache_root.name}.lock")
     lock_deadline = _time.monotonic() + 180.0
-    lock_acquired = False
-    while not lock_acquired:
-        try:
-            lock_dir.mkdir(mode=0o700)
-            (lock_dir / "owner").write_text(
-                f"pid={os.getpid()}\nstarted={_time.time()}\n", encoding="utf-8"
-            )
-            lock_acquired = True
-        except FileExistsError:
-            if _tui_cache_lock_reclaimable(lock_dir, stale_after=1200):
-                shutil.rmtree(lock_dir, ignore_errors=True)
-                continue
-            if _time.monotonic() >= lock_deadline:
-                print("Timed out waiting for another TUI cache build to finish.")
-                sys.exit(1)
-            _time.sleep(0.25)
+    lock_handle = _try_acquire_tui_cache_lock(lock_path)
+    while lock_handle is None:
+        if _time.monotonic() >= lock_deadline:
+            print("Timed out waiting for another TUI cache build to finish.")
+            sys.exit(1)
+        _time.sleep(0.25)
+        lock_handle = _try_acquire_tui_cache_lock(lock_path)
 
     try:
         cache_dir = _tui_cached_active_bundle_dir(cache_root)
@@ -2217,8 +2210,7 @@ def _ensure_tui_cached_bundle(
             if tmp_cache.exists():
                 shutil.rmtree(tmp_cache, ignore_errors=True)
     finally:
-        if lock_acquired:
-            shutil.rmtree(lock_dir, ignore_errors=True)
+        _release_tui_cache_lock(lock_handle)
 
     return cache_dir
 
