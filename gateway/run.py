@@ -2094,6 +2094,82 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._pa_credentials_watcher = None
+
+
+    async def _start_pa_credentials_watcher(self) -> None:
+        """Start the optional PA credential watcher from the exported rows."""
+        try:
+            from hermes_cli.pa_credentials import create_pa_credentials_watcher
+
+            # Carbon Auth v1 stays behind the runtime credential file: merely
+            # starting a gateway never sends a request.  A human-required row
+            # reaches it only after its safe probe fails.  The signer is a
+            # configured bridge wrapped by the canonical signed-url validator;
+            # no raw browser URL can enter this path.
+            watcher = create_pa_credentials_watcher(
+                on_escalation=self._on_pa_credential_escalation,
+                on_timeout=self._on_pa_credential_timeout,
+            )
+            task = await watcher.start()
+            self._pa_credentials_watcher = watcher
+            if task is not None:
+                self._background_tasks.add(task)
+                task.add_done_callback(self._on_pa_credentials_watcher_done)
+                logger.info("PA credential watcher started")
+            else:
+                logger.debug("PA credential watcher disabled or has no rows")
+        except Exception as exc:
+            # A malformed optional export must not prevent unrelated gateway
+            # adapters from starting.  The export path is checked on the next
+            # gateway start after the row is corrected.
+            logger.error("PA credential watcher failed to start: %s", exc)
+
+    async def _on_pa_credential_escalation(self, record, result) -> None:
+        """Make a credential escalation observable without logging its URL."""
+        logger.error(
+            "PA credential re-auth needs operator action: credential=%s state=%s request=%s",
+            record.credential_id,
+            record.reauth_state.value,
+            result.request_id or record.reauth_request_id or "unavailable",
+        )
+
+    async def _on_pa_credential_timeout(self, record) -> None:
+        logger.error(
+            "PA credential re-auth timed out: credential=%s request=%s",
+            record.credential_id,
+            record.reauth_request_id or "unavailable",
+        )
+
+    def _on_pa_credentials_watcher_done(self, task) -> None:
+        """Retrieve unexpected watcher failures at their source, loudly."""
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "PA credential watcher task died: %s",
+                error,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def _stop_pa_credentials_watcher(self) -> None:
+        """Stop the optional PA credential watcher before generic task cleanup."""
+        watcher = getattr(self, "_pa_credentials_watcher", None)
+        self._pa_credentials_watcher = None
+        if watcher is None:
+            return
+        try:
+            task = watcher.task
+            await watcher.stop()
+            if task is not None:
+                self._background_tasks.discard(task)
+        except Exception as exc:
+            logger.debug("PA credential watcher stop error: %s", exc)
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -4525,6 +4601,10 @@ class GatewayRunner:
         except Exception as e:
             logger.error("Recovered watcher setup error: %s", e)
 
+        # Start the optional PA credential expiry/probe watcher.  It owns its
+        # task and is stopped explicitly before the generic task sweep below.
+        await self._start_pa_credentials_watcher()
+
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
 
@@ -6083,6 +6163,10 @@ class GatewayRunner:
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
             )
+
+            # Use the class implementation so minimal GatewayRunner stand-ins
+            # that exercise shutdown still receive the optional watcher cleanup.
+            await GatewayRunner._stop_pa_credentials_watcher(self)
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:
