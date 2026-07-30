@@ -12,6 +12,7 @@ import signal
 import sys
 import time
 
+import psutil
 import pytest
 
 pytest.importorskip("ptyprocess", reason="ptyprocess not installed")
@@ -167,6 +168,51 @@ class TestPtyBridgeClose:
                 break
         assert reaped, f"pid {pid} still running after close()"
 
+    @pytest.mark.live_system_guard_bypass
+    def test_close_terminates_descendant_in_own_session(self):
+        child_script = (
+            "import signal,time;"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "time.sleep(30)"
+        )
+        parent_script = (
+            "import subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-c',sys.argv[1]],"
+            "start_new_session=True);"
+            "print(p.pid,flush=True);"
+            "time.sleep(30)"
+        )
+        bridge = PtyBridge.spawn(
+            [sys.executable, "-c", parent_script, child_script]
+        )
+        output = _read_until(bridge, b"\n")
+        child_pid = int(output.strip().splitlines()[-1])
+        try:
+            psutil.Process(bridge.pid).children(recursive=True)
+        except (psutil.Error, OSError):
+            # The Codex desktop sandbox blocks macOS's process-table sysctl.
+            # Ordinary macOS sessions and Linux CI permit this scan.
+            try:
+                psutil.Process(child_pid).kill()
+            except psutil.Error:
+                pass
+            bridge.close()
+            pytest.skip("process-tree enumeration unavailable")
+
+        bridge.close()
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail(f"detached descendant {child_pid} survived close()")
+        assert bridge.verify_closed() is True
+
     def test_close_signals_child_process_group(self, monkeypatch):
         sent: list[tuple[int, signal.Signals]] = []
         group_alive = True
@@ -207,6 +253,9 @@ class TestPtyBridgeClose:
         bridge._fd = -1
         bridge._closed = False
         bridge._pgid = 67890
+        bridge._descendants = {}
+        bridge._descendant_scan_succeeded = True
+        bridge._descendant_scan_failed = False
 
         bridge.close()
 
@@ -233,6 +282,103 @@ class TestPtyBridgeClose:
         bridge._fd = -1
         bridge._closed = True
         bridge._pgid = 67890
+        bridge._descendants = {}
+        bridge._descendant_scan_succeeded = True
+        bridge._descendant_scan_failed = False
+
+        assert bridge.verify_closed() is False
+
+    def test_close_escalates_detached_descendant(self, monkeypatch):
+        child_signals: list[signal.Signals] = []
+        group_alive = True
+
+        class _FakeProc:
+            pid = 12345
+            fd = -1
+            alive = True
+
+            def isalive(self):
+                return self.alive
+
+            def kill(self, sig):
+                raise AssertionError(f"single-process kill used: {sig}")
+
+            def close(self, force=False):
+                self.closed = force
+
+        class _DetachedChild:
+            pid = 23456
+            alive = True
+
+            def is_running(self):
+                return self.alive
+
+            def status(self):
+                return psutil.STATUS_RUNNING
+
+            def send_signal(self, sig):
+                child_signals.append(sig)
+                if sig == signal.SIGTERM:
+                    self.alive = False
+
+        root = _FakeProc()
+        child = _DetachedChild()
+
+        def fake_killpg(pgid, sig):
+            nonlocal group_alive
+            if sig == 0:
+                if group_alive:
+                    return
+                raise ProcessLookupError
+            if not group_alive:
+                raise ProcessLookupError
+            root.alive = False
+            group_alive = False
+
+        monkeypatch.setattr(os, "killpg", fake_killpg)
+        monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._proc = root
+        bridge._fd = -1
+        bridge._closed = False
+        bridge._pgid = 12345
+        bridge._descendants = {(child.pid, 1.0): child}
+        bridge._descendant_scan_succeeded = True
+        bridge._descendant_scan_failed = False
+        monkeypatch.setattr(bridge, "_track_descendants", lambda: None)
+
+        bridge.close()
+
+        assert child_signals == [signal.SIGHUP, signal.SIGTERM]
+        assert bridge.verify_closed() is True
+
+    def test_verify_closed_fails_when_descendants_cannot_be_enumerated(
+        self, monkeypatch
+    ):
+        class _ExitedProc:
+            pid = 12345
+            fd = -1
+
+            @staticmethod
+            def isalive():
+                return False
+
+        def deny_process_scan(pid):
+            raise psutil.AccessDenied(pid)
+
+        monkeypatch.setattr(psutil, "Process", deny_process_scan)
+
+        bridge = PtyBridge.__new__(PtyBridge)
+        bridge._proc = _ExitedProc()
+        bridge._fd = -1
+        bridge._closed = False
+        bridge._pgid = None
+        bridge._descendants = {}
+        bridge._descendant_scan_succeeded = False
+        bridge._descendant_scan_failed = False
+
+        bridge._track_descendants()
 
         assert bridge.verify_closed() is False
 
