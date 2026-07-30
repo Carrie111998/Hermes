@@ -464,7 +464,7 @@ class WorkflowEngine:
     def _workspace_kind(self) -> str:
         """Return workspace_kind based on board's default_workdir."""
         from pathlib import Path as _P
-        board_json = _P(kanban_db.kanban_home()) / "boards" / self.kanban_board / "board.json"
+        board_json = _P(kanban_db.kanban_home()) / "kanban" / "boards" / self.kanban_board / "board.json"
         if board_json.exists():
             import json as _json
             with open(board_json) as f:
@@ -476,7 +476,7 @@ class WorkflowEngine:
     def _workspace_path(self):
         """Return workspace_path based on board's default_workdir."""
         from pathlib import Path as _P
-        board_json = _P(kanban_db.kanban_home()) / "boards" / self.kanban_board / "board.json"
+        board_json = _P(kanban_db.kanban_home()) / "kanban" / "boards" / self.kanban_board / "board.json"
         if board_json.exists():
             import json as _json
             with open(board_json) as f:
