@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import types
@@ -291,3 +292,83 @@ class TestDDGSSearchOnlyErrors:
         assert result["success"] is False
         assert "search-only" in result["error"].lower()
         assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+
+
+class TestWorkerDurableLazyTarget:
+    """The worker subprocess must be able to import ddgs on sealed venvs (#75025).
+
+    Docker seals the agent venv (``HERMES_DISABLE_LAZY_INSTALLS=1``) and
+    redirects lazy installs to ``HERMES_LAZY_INSTALL_TARGET``. The gateway can
+    import from there because ``activate_durable_lazy_target()`` runs at
+    startup, but the search worker is spawned as a bare script and never runs
+    that bootstrap — so ``from ddgs import DDGS`` failed inside the worker even
+    though the package was installed.
+    """
+
+    def test_target_entry_empty_when_unset(self, monkeypatch):
+        from plugins.web.ddgs import provider
+
+        monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
+        assert provider._durable_lazy_target_entry() == ""
+
+    def test_target_entry_returns_existing_dir(self, monkeypatch, tmp_path):
+        from plugins.web.ddgs import provider
+
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path))
+        assert provider._durable_lazy_target_entry() == str(tmp_path)
+
+    def test_target_entry_empty_when_dir_missing(self, monkeypatch, tmp_path):
+        """A configured-but-absent target must not be put on PYTHONPATH."""
+        from plugins.web.ddgs import provider
+
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path / "nope"))
+        assert provider._durable_lazy_target_entry() == ""
+
+    @staticmethod
+    def _captured_worker_env(monkeypatch):
+        """Run the bounded search far enough to capture the child's env."""
+        from plugins.web.ddgs import provider
+
+        captured = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_popen(argv, **kwargs):
+            captured["env"] = kwargs.get("env") or {}
+            raise _Stop()
+
+        monkeypatch.setattr(provider.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
+        try:
+            provider._run_ddgs_search_bounded("q", 3)
+        except _Stop:
+            pass
+        return captured.get("env", {})
+
+    def test_worker_pythonpath_carries_durable_target(self, monkeypatch, tmp_path):
+        env = None
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path))
+        env = self._captured_worker_env(monkeypatch)
+
+        parts = env.get("PYTHONPATH", "").split(os.pathsep)
+        assert str(tmp_path) in parts, env.get("PYTHONPATH")
+
+    def test_worker_pythonpath_still_carries_plugins_entry(self, monkeypatch, tmp_path):
+        """The pre-existing plugins path entry must survive the addition."""
+        from plugins.web.ddgs import provider
+
+        monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(tmp_path))
+        env = self._captured_worker_env(monkeypatch)
+
+        parts = env.get("PYTHONPATH", "").split(os.pathsep)
+        assert provider._plugins_path_entry() in parts
+
+    def test_worker_pythonpath_unchanged_without_target(self, monkeypatch):
+        from plugins.web.ddgs import provider
+
+        monkeypatch.delenv("HERMES_LAZY_INSTALL_TARGET", raising=False)
+        env = self._captured_worker_env(monkeypatch)
+
+        parts = [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p]
+        assert parts == [provider._plugins_path_entry()]
