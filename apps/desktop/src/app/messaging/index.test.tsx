@@ -12,6 +12,7 @@ const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
 const openExternalLink = vi.fn()
+const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
   approvePairing: (platformId: string, requestId: string) => approvePairing(platformId, requestId),
@@ -27,7 +28,7 @@ vi.mock('@/lib/external-link', () => ({
 
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),
-  notifyError: vi.fn()
+  notifyError: (error: unknown, title: string) => notifyError(error, title)
 }))
 
 vi.mock('@/store/system-actions', () => ({
@@ -163,6 +164,61 @@ describe('MessagingView email policy', () => {
         env: { EMAIL_NO_REPLY_KEYWORDS: 'invoice + overdue;vip customer' }
       })
     )
+  })
+
+  it('rejects the same semantic keyword group on both reply lists', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [
+        platform({
+          configured: true,
+          id: 'email',
+          name: 'Email',
+          env_vars: [
+            {
+              advanced: false,
+              current_value: '',
+              default_value: '',
+              description: '',
+              input_type: 'textarea',
+              is_password: false,
+              is_set: false,
+              key: 'EMAIL_NO_REPLY_KEYWORDS',
+              prompt: '',
+              redacted_value: null,
+              required: false,
+              url: null
+            },
+            {
+              advanced: false,
+              current_value: '',
+              default_value: '',
+              description: '',
+              input_type: 'textarea',
+              is_password: false,
+              is_set: false,
+              key: 'EMAIL_FORCE_REPLY_KEYWORDS',
+              prompt: '',
+              redacted_value: null,
+              required: false,
+              url: null
+            }
+          ]
+        })
+      ]
+    })
+
+    await renderMessaging('zh')
+
+    fireEvent.change(await screen.findByLabelText('绝不回复'), {
+      target: { value: '发票 + 逾期' }
+    })
+    fireEvent.change(screen.getByLabelText('必须回复'), {
+      target: { value: '逾期 && 发票' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    expect(updateMessagingPlatform).not.toHaveBeenCalled()
+    expect(notifyError).toHaveBeenCalledWith(expect.any(Error), '关键词规则冲突')
   })
 })
 

@@ -3847,11 +3847,66 @@ def _validate_messaging_env_value(platform_id: str, key: str, value: str) -> Non
             for user_id in user_ids
             if user_id != "*" and not _SLACK_MEMBER_ID_RE.fullmatch(user_id)
         ]
-        if invalid:
-            raise HTTPException(
-                status_code=400,
-                detail="Slack allowed user IDs must be comma-separated member IDs like U01ABC2DEF3.",
-            )
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail="Slack allowed user IDs must be comma-separated member IDs like U01ABC2DEF3.",
+        )
+
+
+def _normalized_email_keyword_groups(raw: str) -> set[tuple[str, ...]]:
+    """Return semantic keyword groups for cross-list conflict detection."""
+    groups: set[tuple[str, ...]] = set()
+    for raw_group in re.split(r"[\n;]+", raw or ""):
+        terms = {
+            term.strip().casefold()
+            for term in re.split(r"\s*(?:\+|&&)\s*", raw_group)
+            if term.strip()
+        }
+        if terms:
+            groups.add(tuple(sorted(terms)))
+    return groups
+
+
+def _serialize_email_keyword_groups(raw: str) -> str:
+    """Store one logical keyword group per semicolon-delimited .env value."""
+    return ";".join(
+        group.strip()
+        for group in re.split(r"[\r\n;]+", raw or "")
+        if group.strip()
+    )
+
+
+def _validate_email_keyword_lists(
+    env_on_disk: dict[str, str],
+    updates: dict[str, str],
+    clear_env: list[str],
+) -> None:
+    """Reject a keyword group assigned to both reply outcomes."""
+
+    def effective(key: str) -> str:
+        if key in clear_env:
+            return ""
+        if key in updates:
+            return updates[key].strip()
+        return env_on_disk.get(key, "")
+
+    force_groups = _normalized_email_keyword_groups(
+        effective("EMAIL_FORCE_REPLY_KEYWORDS")
+    )
+    deny_groups = _normalized_email_keyword_groups(
+        effective("EMAIL_NO_REPLY_KEYWORDS")
+    )
+    conflicts = force_groups & deny_groups
+    if conflicts:
+        rendered = "; ".join("+".join(group) for group in sorted(conflicts))
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "A keyword group cannot be both must-reply and never-reply. "
+                f"Remove it from one list: {rendered}"
+            ),
+        )
 
 
 def _spawn_gateway_restart(profile: Optional[str] = None) -> Tuple[subprocess.Popen, bool]:
@@ -9241,6 +9296,9 @@ async def update_messaging_platform(
     allowed_env = set(entry["env_vars"])
     try:
         with _profile_scope(body.profile or profile):
+            if platform_id == "email":
+                _validate_email_keyword_lists(load_env(), body.env, body.clear_env)
+
             for key in body.clear_env:
                 if key not in allowed_env:
                     raise HTTPException(
@@ -9255,7 +9313,15 @@ async def update_messaging_platform(
                         status_code=400,
                         detail=f"{key} is not configurable for {entry['name']}",
                     )
-                trimmed = value.strip()
+                trimmed = (
+                    _serialize_email_keyword_groups(value)
+                    if key
+                    in {
+                        "EMAIL_FORCE_REPLY_KEYWORDS",
+                        "EMAIL_NO_REPLY_KEYWORDS",
+                    }
+                    else value.strip()
+                )
                 if trimmed:
                     _validate_messaging_env_value(platform_id, key, trimmed)
                     save_env_value(
