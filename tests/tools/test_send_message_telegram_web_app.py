@@ -154,6 +154,61 @@ def test_web_app_button_is_described_to_the_model_as_delivery_only() -> None:
         ),
         (
             "telegram:12345",
+            {"label": "Open UI", "url": "https://localhost/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://app.localhost/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://127.0.0.1/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://192.168.1.10/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://[::1]/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://2130706433/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://0x7f000001/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://0177.0.0.1/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://127.1/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://%31%32%37.0.0.1/app"},
+            "must use a public host",
+        ),
+        (
+            "telegram:12345",
+            {"label": "Open UI", "url": "https://example.com:bad/app"},
+            "is malformed",
+        ),
+        (
+            "telegram:12345",
             {"label": "Open UI", "url": "https://example.com/app", "extra": True},
             "exactly 'label' and 'url'",
         ),
