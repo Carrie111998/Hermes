@@ -858,6 +858,35 @@ class SessionSchemaMixin:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
+        # Byte-identical ACTIVE duplicate collapse (v24 data repair): the
+        # idx_messages_active_dedupe partial UNIQUE index in DEFERRED_INDEX_SQL
+        # below cannot be created while a pre-upgrade DB still carries two
+        # live rows sharing (session_id, role, content, timestamp). Delete
+        # those residual double-writes (keeping the first row) whenever the
+        # index is still absent — first open after the upgrade, or a DB
+        # whose index creation previously failed. Once the index exists,
+        # every writer version is constrained, so this probe skips forever.
+        # Soft-archived rows (active=0) are untouched: the archive+live pair
+        # produced by in-place compaction is intentional and shares the same
+        # four-tuple legally. Row deletions flow through the messages_fts*
+        # delete triggers, so FTS stays consistent with the canonical table.
+        try:
+            has_dedupe_index = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'idx_messages_active_dedupe'"
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            has_dedupe_index = False
+        if not has_dedupe_index:
+            try:
+                cursor.execute(
+                    "DELETE FROM messages WHERE active = 1 AND id NOT IN ("
+                    "SELECT MIN(id) FROM messages WHERE active = 1 "
+                    "GROUP BY session_id, role, content, timestamp)"
+                )
+            except sqlite3.OperationalError as exc:
+                logger.debug("active-duplicate collapse skipped: %s", exc)
+
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
         cursor.executescript(DEFERRED_INDEX_SQL)

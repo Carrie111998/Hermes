@@ -9353,12 +9353,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 turn_lease_holder=turn_lease_holder,
                 turn_lease_ttl_seconds=turn_lease_ttl_seconds,
             )
+            # Byte-identical ACTIVE duplicate guard (#53461): a re-append
+            # with the same (session_id, role, content, timestamp) as a live
+            # row collapses to a no-op via the idx_messages_active_dedupe
+            # partial UNIQUE index. Targeted ON CONFLICT — NOT INSERT OR
+            # IGNORE — so FK/NOT NULL violations still raise. The WHERE
+            # clause must mirror the index predicate exactly (SQLite partial
+            # -index inference); rows outside active=1 (e.g. the soft-archived
+            # compaction original) never conflict. A skipped insert does not
+            # fire messages_fts_insert, so FTS stays single-indexed.
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active = 1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9383,6 +9393,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     display_metadata_json,
                 ),
             )
+            if cursor.rowcount == 0:
+                # Duplicate of an already-live row: idempotent no-op — resolve
+                # to the existing row's id and leave sessions.* counters alone.
+                existing = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                    "AND content IS ? AND timestamp = ? AND active = 1 "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, role, stored_content, message_timestamp),
+                ).fetchone()
+                if existing is not None:
+                    return existing["id"]
+                # Defensive: a conflict with no visible active row should be
+                # impossible; fall through to the normal accounting below.
             msg_id = cursor.lastrowid
 
             # Update counters
@@ -9784,12 +9807,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
+            # Same byte-identical ACTIVE duplicate guard as append_message
+            # (#53461): a re-inserted compacted/rewrite row that matches a
+            # live (session_id, role, content, timestamp) row is skipped via
+            # the idx_messages_active_dedupe partial UNIQUE index — and must
+            # not inflate the caller's inserted/tool-call accounting. Rows
+            # archived to active=0 in the same compaction transaction are
+            # outside the index scope and never conflict.
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active = 1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9814,10 +9845,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
+            if isinstance(msg, dict) and cur.lastrowid is not None and cur.rowcount:
                 msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            if tool_calls is not None:
+            inserted += cur.rowcount
+            if cur.rowcount and tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
