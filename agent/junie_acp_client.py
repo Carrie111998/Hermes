@@ -16,6 +16,28 @@ synchronous code path (see ``agent/chat_completion_helpers.py``). We therefore
 own a dedicated asyncio event loop on a background daemon thread and bridge each
 request with :func:`asyncio.run_coroutine_threadsafe`.
 
+Two kinds of tool call meet here, and the distinction is load-bearing:
+
+  * **Junie's own tools** (read / edit / execute) run inside the ACP session and
+    arrive as native ``tool_call`` notifications — already executed. They are
+    never returned as pending OpenAI ``tool_calls`` (Hermes would re-run
+    finished work); they are projected into the transcript as completed
+    ``assistant(tool_calls=[…])`` + ``tool(result)`` rows so Hermes'
+    self-improvement loop can learn from the real work.
+  * **Hermes' agent-level tools** (the memory + skills self-improvement surface
+    and ``todo``) have no Junie equivalent and are dispatched from OpenAI
+    ``tool_calls``. They are
+    forwarded into the prompt as text and parsed back out of the response via
+    the shared bridge in ``agent/acp_openai_bridge.py``. Without that, nothing
+    agentic could be written for a whole junie-acp session. The forwarded set is
+    an allowlist (``HERMES_JUNIE_ACP_FORWARD_TOOLS`` overrides it; ``all``
+    forwards Hermes' entire toolset).
+
+A Hermes tool call splits one user turn into several ACP prompts. The first
+opens a fresh session with the full transcript; the continuations reuse that
+session and carry only the tool results, so Junie keeps its own context instead
+of restarting the task from scratch (which would redo every edit).
+
 Junie specifics (vs Copilot):
   * launched as ``junie --acp=true`` (Copilot uses ``copilot --acp --stdio``);
   * auth is supplied via ``--auth <token>`` / ``JUNIE_API_KEY`` rather than
@@ -30,6 +52,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -41,6 +64,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from agent.acp_openai_bridge import (
+    completion_to_stream_chunks as _completion_to_stream_chunks,
+    extract_tool_calls_from_text as _extract_tool_calls_from_text,
+    render_tool_bridge_sections as _render_tool_bridge_sections,
+    tool_specs_from_openai_tools as _tool_specs_from_openai_tools,
+)
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
 
@@ -99,9 +128,42 @@ _SETTLE_MAX_SECONDS = 20.0
 # Junie's ACP session/update kinds that report tool activity. Unlike an OpenAI
 # model, Junie is an autonomous agent that EXECUTES its own tools and reports
 # them here (status pending -> in_progress -> completed/failed) — these are NOT
-# delegation requests for Hermes to run. We consume them for observability, not
-# to fabricate OpenAI tool_calls (see JunieACPClient._create_chat_completion).
+# delegation requests for Hermes to run. We never turn them into *pending*
+# OpenAI tool_calls; we project them into the transcript as already-completed
+# assistant tool_call + tool-result pairs (see _project_tool_events) so Hermes'
+# self-improvement loop can learn from the real work.
 _TOOL_UPDATE_KINDS = ("tool_call", "tool_call_update")
+
+# Hermes tools forwarded to Junie through the ACP text bridge. Junie runs its
+# own read/edit/execute tools, so re-offering those would make Hermes re-run
+# work Junie already finished. What Junie has NO equivalent for is Hermes'
+# agent-level surface — the memory/skill self-improvement loop and the todo list
+# — and those are dispatched from OpenAI tool_calls, so without the bridge they
+# are unreachable for a whole junie-acp session.
+#
+# This set must COVER the background-review fork's tool whitelist (memory +
+# skills toolsets, see agent/background_review.py), reads included: a review that
+# can call skill_manage but cannot call skills_list/skill_view can only create
+# skills blindly, never decide "update the existing one". A test asserts the two
+# stay in sync — if a new agent-level tool appears, add it here.
+_DEFAULT_FORWARDED_TOOLS = (
+    "memory",
+    "todo",
+    "skill_manage",
+    "skill_view",
+    "skills_list",
+)
+
+# Namespace for projected tool names (junie_edit, junie_execute, …) so a
+# projected row can never be mistaken for a Hermes tool Hermes should dispatch,
+# and so tool-result continuations can tell Junie's own history apart from
+# results Junie is actually waiting on.
+_PROJECTED_TOOL_PREFIX = "junie_"
+
+# Caps on projected tool activity so a chatty Junie turn can't flood the
+# transcript (mirrors the codex projector's 4000-char result cap).
+_PROJECTED_RESULT_MAX_CHARS = 4000
+_PROJECTED_EVENT_LIMIT = 40
 
 # Model values that mean "let Junie use its own default" — the provider
 # sentinel/aliases, not real Junie model ids. These are NOT forwarded to
@@ -171,6 +233,25 @@ def _resolve_permission_policy() -> str:
     """
     val = os.getenv("HERMES_JUNIE_ACP_PERMISSION", "").strip().lower()
     return "allow" if val in ("allow", "allow_once", "yes", "1", "true") else "deny"
+
+
+def _resolve_forwarded_tools() -> frozenset[str] | None:
+    """Which Hermes tools are described to Junie via the text bridge.
+
+    Default: the agent-level allowlist (``memory``, ``todo``, ``skill_manage``).
+    ``HERMES_JUNIE_ACP_FORWARD_TOOLS`` overrides it — ``all`` forwards Hermes'
+    entire toolset (returns None, i.e. no filtering), ``none`` forwards nothing,
+    and a comma/space separated list forwards exactly those names.
+    """
+    raw = os.getenv("HERMES_JUNIE_ACP_FORWARD_TOOLS", "").strip()
+    if not raw:
+        return frozenset(_DEFAULT_FORWARDED_TOOLS)
+    lowered = raw.lower()
+    if lowered in ("all", "*"):
+        return None
+    if lowered in ("none", "off", "-"):
+        return frozenset()
+    return frozenset(p.strip() for p in raw.replace(",", " ").split() if p.strip())
 
 
 def _resolve_brave_override() -> bool | None:
@@ -246,19 +327,34 @@ def _format_messages_as_prompt(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    *,
+    forwarded_tools: frozenset[str] | None = None,
 ) -> str:
     # Junie is an autonomous coding agent: it runs its OWN tools (read/edit/
     # execute) inside the ACP session and reports them via native tool_call
-    # notifications. We therefore do NOT ask it to emit OpenAI-style tool
-    # calls; it should just do the work and answer. Hermes' own tool schemas
-    # are irrelevant to Junie's execution, so we don't inject them.
-    del tools, tool_choice  # accepted for OpenAI-client compatibility; unused
+    # notifications, so we don't ask it to route coding work through Hermes.
+    # But Hermes' agent-level tools (the memory/skills loop, todo) have no Junie
+    # equivalent and are dispatched from OpenAI tool_calls, so those travel into
+    # the prompt as text and come back out of the response via the shared ACP
+    # text bridge (agent/acp_openai_bridge.py).
     sections: list[str] = [
         "You are being used as the active ACP coding agent backend for Hermes.",
         "Use your own tools to complete the task, then answer normally.",
     ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
+
+    if _tool_specs_from_openai_tools(tools, allowlist=forwarded_tools):
+        sections.append(
+            "Hermes owns a few tools of its own that you cannot execute: to use "
+            "one, emit a <tool_call> block and stop — Hermes runs it and sends "
+            "you the result, then you continue. Keep using YOUR OWN tools for "
+            "reading, editing and running code; use these only for what their "
+            "descriptions cover."
+        )
+        sections.extend(
+            _render_tool_bridge_sections(tools, tool_choice, allowlist=forwarded_tools)
+        )
 
     transcript: list[str] = []
     for message in messages:
@@ -315,6 +411,57 @@ def _render_message_content(content: Any) -> str:
     return str(content).strip()
 
 
+def _trailing_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The unbroken run of ``role="tool"`` messages at the end of ``messages``.
+
+    Non-empty exactly when Hermes has just executed tool calls that Junie asked
+    for and is calling back for the continuation of the SAME turn.
+    """
+    trailing: list[dict[str, Any]] = []
+    for message in reversed(messages or []):
+        if not isinstance(message, dict):
+            break
+        if str(message.get("role") or "").strip().lower() != "tool":
+            break
+        # Rows we projected from Junie's OWN activity are history, not results
+        # Junie is waiting on — reusing the session for those would tell Junie
+        # "here are your tool results" about work it already did itself. They are
+        # identified by the namespaced tool name rather than a private message
+        # key, so nothing non-standard ends up on the wire for strict providers.
+        if str(message.get("name") or "").startswith(_PROJECTED_TOOL_PREFIX):
+            continue
+        trailing.append(message)
+    trailing.reverse()
+    return trailing
+
+
+def _format_tool_results_as_prompt(tool_messages: list[dict[str, Any]]) -> str:
+    """Continuation prompt for a reused ACP session.
+
+    When Hermes returns tool results mid-turn we must NOT replay the whole
+    transcript into a fresh Junie session: Junie would treat it as a new request
+    and redo the coding work it already finished (files re-edited, commands
+    re-run). Instead we reuse the live session — which still holds Junie's own
+    context — and send only the results it was waiting on.
+    """
+    parts: list[str] = [
+        "Hermes executed the tool call(s) you requested. Results follow.",
+        "Do NOT redo any work you already completed in this session.",
+    ]
+    for message in tool_messages:
+        rendered = _render_message_content(message.get("content"))
+        name = str(message.get("name") or "").strip()
+        call_id = str(message.get("tool_call_id") or "").strip()
+        label = "Tool result"
+        if name:
+            label += f" from {name}"
+        if call_id:
+            label += f" (id={call_id})"
+        parts.append(f"{label}:\n{rendered}" if rendered else f"{label}: (no output)")
+    parts.append("Continue from where you left off and answer the user's request.")
+    return "\n\n".join(p.strip() for p in parts if p and p.strip())
+
+
 def _chunk_text(content: Any) -> str:
     """Extract text from a session/update content that may be a dict or a list
     of {type,text} blocks."""
@@ -361,6 +508,13 @@ def _merge_tool_update(store: dict[str, dict[str, Any]], update: dict[str, Any])
     locations = update.get("locations")
     if locations:
         entry["locations"] = locations
+    # rawInput/rawOutput carry the substance the self-improvement loop learns
+    # from — the actual command, patch or query, and its raw result — so keep
+    # them for the transcript projection (see _project_tool_events).
+    for field in ("rawInput", "rawOutput"):
+        val = update.get(field)
+        if val:
+            entry[field] = val
 
 
 def _render_tool_activity(tool_events: dict[str, dict[str, Any]]) -> str:
@@ -384,6 +538,124 @@ def _render_tool_activity(tool_events: dict[str, dict[str, Any]]) -> str:
             snippet = result if len(result) <= 500 else result[:500] + "…"
             lines.append(f"    → {snippet}")
     return "\n".join(lines).strip()
+
+
+def _projected_tool_name(kind: Any) -> str:
+    """Hermes-side name for a projected Junie tool call.
+
+    Namespaced (``junie_edit``, ``junie_execute``, …) so the transcript can never
+    be mistaken for a Hermes tool Hermes should dispatch, while still telling the
+    review fork *what kind* of work happened. Underscores only — some providers
+    validate tool names against ``[A-Za-z0-9_-]``.
+    """
+    slug = "".join(c if c.isalnum() or c == "_" else "_" for c in str(kind or "other").strip().lower())
+    return f"{_PROJECTED_TOOL_PREFIX}{slug or 'other'}"
+
+
+def _truncate(text: str, limit: int = _PROJECTED_RESULT_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… [truncated, {len(text) - limit} more chars]"
+
+
+def _projected_call_id(session_id: str | None, tool_call_id: str, index: int) -> str:
+    """Stable, transcript-unique id for a projected tool call.
+
+    Junie's ``toolCallId`` is only unique *within* its session ("t1", "t2", …),
+    and Hermes opens a session per user turn — so the raw id would repeat across
+    the transcript, and providers that pair calls with results by id (Anthropic)
+    reject duplicates. Namespacing with the session id makes it unique while
+    staying deterministic, so a resumed session projects the same ids and the
+    prompt-cache prefix survives (AGENTS.md Pitfall #16).
+    """
+    base = tool_call_id or f"idx{index}"
+    if session_id:
+        return f"junie_{session_id}_{base}"
+    digest = hashlib.sha256(f"{base}|{index}".encode()).hexdigest()[:16]
+    return f"junie_{digest}"
+
+
+def _project_tool_events(
+    tool_events: dict[str, dict[str, Any]], session_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Project Junie's native tool activity into OpenAI-shaped history messages.
+
+    Junie does the real work (files read, edits applied, commands run) inside its
+    own ACP session; a one-line activity summary in ``reasoning`` is not enough
+    for Hermes' self-improvement loop, which distils skills and memories from the
+    *transcript*. So we mirror what the codex app-server path already does
+    (``agent/transports/codex_event_projector.py``): emit already-completed
+    ``assistant(tool_calls=[…])`` + ``tool(result)`` pairs so the background
+    review fork replays real calls, real results and real errors.
+
+    These are history rows only — they are appended to ``messages`` after the
+    turn, never returned as pending ``tool_calls`` for Hermes to execute.
+    """
+    projected: list[dict[str, Any]] = []
+    for index, ev in enumerate(tool_events.values()):
+        if index >= _PROJECTED_EVENT_LIMIT:
+            logger.info(
+                "Junie ACP tool activity truncated in transcript projection: %d of %d events kept",
+                _PROJECTED_EVENT_LIMIT,
+                len(tool_events),
+            )
+            break
+        call_id = _projected_call_id(session_id, str(ev.get("id") or ""), index)
+        name = _projected_tool_name(ev.get("kind"))
+        args: dict[str, Any] = {}
+        title = ev.get("title")
+        if title:
+            args["title"] = str(title)
+        raw_input = ev.get("rawInput")
+        if isinstance(raw_input, dict):
+            args.update(raw_input)
+        elif raw_input:
+            args["input"] = raw_input
+        locations = ev.get("locations")
+        if locations:
+            args["locations"] = locations
+        try:
+            arguments = json.dumps(args, ensure_ascii=False, default=str)
+        except Exception:
+            arguments = json.dumps({"title": str(title or "")}, ensure_ascii=False)
+
+        result = ev.get("result")
+        if not result:
+            raw_output = ev.get("rawOutput")
+            if raw_output:
+                try:
+                    result = json.dumps(raw_output, ensure_ascii=False, default=str)
+                except Exception:
+                    result = str(raw_output)
+        status = str(ev.get("status") or "").strip()
+        content = _truncate(str(result or "").strip())
+        if status and status not in ("completed", "success"):
+            content = f"[status {status}]\n{content}".strip()
+        if not content:
+            content = f"[status {status or 'unknown'}] (no output reported)"
+
+        projected.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments},
+                    }
+                ],
+            }
+        )
+        projected.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": content,
+            }
+        )
+    return projected
 
 
 def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
@@ -672,6 +944,16 @@ class _HermesClient:
         self._reasoning_parts: list[str] | None = None
         self._tool_events: dict[str, dict[str, Any]] | None = None
         self._last_activity = 0.0
+        # True once Junie has said or done ANYTHING this turn (an update, a
+        # permission prompt, an fs call). Read by the client's retry policy: a
+        # prompt that failed without a single inbound message almost certainly
+        # never ran, which is what makes a retry safe. See
+        # JunieACPClient._continuation_retry_allowed.
+        self._saw_agent_activity = False
+
+    @property
+    def saw_agent_activity(self) -> bool:
+        return self._saw_agent_activity
 
     def begin_turn(
         self,
@@ -685,6 +967,7 @@ class _HermesClient:
         self._reasoning_parts = reasoning_parts
         self._tool_events = tool_events
         self._last_activity = time.monotonic()
+        self._saw_agent_activity = False
 
     def end_turn(self) -> None:
         self._session_id = None
@@ -710,6 +993,7 @@ class _HermesClient:
         if self._session_id is not None and session_id and session_id != self._session_id:
             return
         self._last_activity = time.monotonic()
+        self._saw_agent_activity = True
         data = update.model_dump(by_alias=True, exclude_none=True) if hasattr(update, "model_dump") else dict(update)
         kind = str(data.get("sessionUpdate") or "").strip()
         if kind in _TOOL_UPDATE_KINDS:
@@ -731,6 +1015,7 @@ class _HermesClient:
             (o.model_dump(by_alias=True, exclude_none=True) if hasattr(o, "model_dump") else dict(o))
             for o in (options or [])
         ]
+        self._saw_agent_activity = True
         tc = tool_call.model_dump(by_alias=True, exclude_none=True) if hasattr(tool_call, "model_dump") else dict(tool_call or {})
         title = tc.get("title") or tc.get("toolCallId") or "?"
         chosen = _choose_permission_option(opt_dicts, self._policy)
@@ -743,6 +1028,7 @@ class _HermesClient:
     async def read_text_file(
         self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **_: Any
     ) -> Any:
+        self._saw_agent_activity = True
         try:
             content = _read_text_file_content(path, self._cwd, line=line, limit=limit)
         except Exception as exc:
@@ -750,6 +1036,7 @@ class _HermesClient:
         return ReadTextFileResponse(content=content)
 
     async def write_text_file(self, content: str, path: str, session_id: str, **_: Any) -> None:
+        self._saw_agent_activity = True
         try:
             _write_text_file(path, self._cwd, content or "")
         except Exception as exc:
@@ -766,6 +1053,13 @@ class _HermesClient:
 class JunieACPClient:
     """Minimal OpenAI-client-compatible facade for JetBrains Junie ACP."""
 
+    # Hermes' agent-level tools reach this provider through the ACP text bridge,
+    # so tool-call-dependent subsystems (memory/skill writes, the background
+    # review fork) work here. Checked by agent/background_review.py, which skips
+    # the review fork for an agent-as-provider that CANNOT emit Hermes tool calls
+    # rather than spawning one that could only no-op.
+    SUPPORTS_HERMES_TOOL_CALLS = True
+
     def __init__(
         self,
         *,
@@ -779,6 +1073,7 @@ class JunieACPClient:
         args: list[str] | None = None,
         permission_policy: str | None = None,
         brave_mode: bool | None = None,
+        forwarded_tools: frozenset[str] | None = None,
         **_: Any,
     ):
         self.api_key = api_key or "junie-acp"
@@ -790,6 +1085,10 @@ class JunieACPClient:
         self._permission_policy = permission_policy or _resolve_permission_policy()
         # None => don't override Junie's own Brave Mode setting.
         self._brave_override = brave_mode if brave_mode is not None else _resolve_brave_override()
+        # None => forward every Hermes tool; a set => forward only those names.
+        self._forwarded_tools = (
+            forwarded_tools if forwarded_tools is not None else _resolve_forwarded_tools()
+        )
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
 
@@ -816,6 +1115,17 @@ class JunieACPClient:
         # True once session/prompt has been dispatched this turn — gates the
         # no-replay retry policy (Junie may already have applied side effects).
         self._prompt_in_flight = False
+        # Last ACP session id, reused for a mid-turn tool-result continuation so
+        # Junie keeps its own context instead of restarting the task. Cleared
+        # whenever the subprocess is closed/respawned.
+        self._last_session_id: str | None = None
+        # The Hermes tool_call ids Junie asked for in that session's last
+        # response. A continuation is only routed back into the session when the
+        # incoming tool results answer one of them — otherwise a history that
+        # merely ENDS with a tool row (session resume, host-fed transcript) would
+        # be delivered to Junie as "here are your results" for work it never
+        # requested.
+        self._last_requested_call_ids: frozenset[str] = frozenset()
         self._req_lock = threading.Lock()
 
     # ---- lifecycle ---------------------------------------------------------
@@ -948,6 +1258,9 @@ class JunieACPClient:
         self._exit_stack = None
         self._conn = None
         self._proc = None
+        # Sessions die with the process; never reuse an id across a respawn.
+        self._last_session_id = None
+        self._last_requested_call_ids = frozenset()
         if stack is not None:
             with contextlib.suppress(Exception):
                 await stack.aclose()
@@ -962,13 +1275,27 @@ class JunieACPClient:
         timeout: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
+        stream: bool = False,
         **_: Any,
     ) -> Any:
+        messages = list(messages or [])
         prompt_text = _format_messages_as_prompt(
-            messages or [],
+            messages,
             model=model,
             tools=tools,
             tool_choice=tool_choice,
+            forwarded_tools=self._forwarded_tools,
+        )
+        # Mid-turn continuation: Hermes just ran the tool call(s) Junie asked for.
+        # Replaying the full transcript into a fresh session would make Junie
+        # redo the coding work it already did, so send only the results and let
+        # _ado_turn reuse the live session (falling back to the full prompt if
+        # that session is gone).
+        _trailing = _trailing_tool_results(messages)
+        continuation_prompt = (
+            _format_tool_results_as_prompt(_trailing)
+            if _trailing and self._answers_last_request(_trailing)
+            else None
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
@@ -989,12 +1316,14 @@ class JunieACPClient:
             prompt_text,
             timeout_seconds=_effective_timeout,
             model=model,
+            continuation_prompt=continuation_prompt,
         )
 
-        # Junie executes its own tools and reports them as completed activity;
-        # they are NOT delegation requests, so we never surface them as OpenAI
-        # tool_calls (that would make Hermes try to re-run finished work).
-        # Instead we log them and fold a readable summary into `reasoning`.
+        # Junie's OWN tools are already executed by the time we see them, so they
+        # are never returned as pending tool_calls (that would make Hermes re-run
+        # finished work). They are logged, summarised into `reasoning` for the
+        # operator, and projected into the transcript as completed call/result
+        # pairs so the self-improvement loop can learn from the real work.
         activity = _render_tool_activity(tool_events)
         if tool_events:
             for ev in tool_events.values():
@@ -1009,20 +1338,46 @@ class JunieACPClient:
             ) if p
         ).strip() or None
 
+        # HERMES tool calls, in contrast, are delegations Junie asks Hermes to
+        # run: they arrive as <tool_call> blocks in the response text.
+        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        # Remember what we're owed, so only a matching tool result re-enters this
+        # session (see _answers_last_request).
+        self._last_requested_call_ids = frozenset(
+            str(getattr(tc, "id", "") or "") for tc in tool_calls
+        )
+
         usage = self._build_usage(prompt_text, response_text, reasoning_text, usage_obj)
         assistant_message = SimpleNamespace(
-            content=response_text.strip(),
-            tool_calls=[],
+            content=cleaned_text,
+            tool_calls=tool_calls,
             reasoning=combined_reasoning,
             reasoning_content=combined_reasoning,
             reasoning_details=None,
         )
-        choice = SimpleNamespace(message=assistant_message, finish_reason="stop")
-        return SimpleNamespace(
+        choice = SimpleNamespace(
+            message=assistant_message,
+            finish_reason="tool_calls" if tool_calls else "stop",
+        )
+        completion = SimpleNamespace(
             choices=[choice],
             usage=usage,
             model=model or "junie-acp",
+            # Consumed by agent/conversation_loop.py: history rows to splice into
+            # the transcript, and the tool-iteration count that ticks the
+            # skill-review nudge (Junie's iterations happen inside its session,
+            # so Hermes' per-iteration counter would otherwise never move).
+            hermes_projected_messages=_project_tool_events(
+                tool_events, self._last_session_id
+            ),
+            hermes_provider_tool_iterations=len(tool_events),
         )
+        if stream:
+            # An ACP turn is one-shot, so "streaming" is a re-shape. The chunk
+            # carrier keeps the hermes_* extras (see acp_openai_bridge) so the
+            # transcript projection is not silently lost on this path.
+            return _completion_to_stream_chunks(completion)
+        return completion
 
     @staticmethod
     def _build_usage(
@@ -1049,7 +1404,12 @@ class JunieACPClient:
         )
 
     def _run_prompt(
-        self, prompt_text: str, *, timeout_seconds: float, model: str | None = None
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        model: str | None = None,
+        continuation_prompt: str | None = None,
     ) -> tuple[str, str, dict[str, dict[str, Any]], Any]:
         # Serialize requests: one shared connection + process.
         with self._req_lock:
@@ -1063,30 +1423,43 @@ class JunieACPClient:
                     # so the post-prompt settle can complete before we bail.
                     turn_timeout = timeout_seconds + self._settle_max + 5.0
                     return self._submit(
-                        self._ado_turn(prompt_text, timeout_seconds, model=model),
+                        self._ado_turn(
+                            prompt_text,
+                            timeout_seconds,
+                            model=model,
+                            continuation_prompt=continuation_prompt,
+                        ),
                         timeout=turn_timeout,
                     )
                 except (TimeoutError, RuntimeError, OSError, ConnectionError) as exc:
                     last_exc = exc
+                    _retry_continuation = self._continuation_retry_allowed(continuation_prompt)
                     self._safe_close_proc()
                     # Junie is autonomous: once session/prompt is dispatched it may
                     # already have edited files / run commands. Never replay a
                     # dispatched prompt — that would double-apply side effects.
                     # Only retry failures that happened BEFORE the prompt was sent
-                    # (e.g. a stale reused subprocess died on session/new).
-                    if self._prompt_in_flight:
+                    # (e.g. a stale reused subprocess died on session/new), or a
+                    # reused-session prompt Junie never acted on (see
+                    # _continuation_retry_allowed).
+                    if self._prompt_in_flight and not _retry_continuation:
                         logger.warning("Junie ACP turn failed after prompt dispatch; not retrying: %s", exc)
                         raise
+                    if _retry_continuation:
+                        continuation_prompt = None
                     logger.warning(
                         "Junie ACP turn failed before prompt (attempt %d/2), respawning: %s", attempt, exc
                     )
                 except Exception as exc:
                     # RequestError (SDK) and any other agent-side failure.
                     last_exc = exc
+                    _retry_continuation = self._continuation_retry_allowed(continuation_prompt)
                     self._safe_close_proc()
-                    if self._prompt_in_flight:
+                    if self._prompt_in_flight and not _retry_continuation:
                         logger.warning("Junie ACP turn failed after prompt dispatch; not retrying: %s", exc)
                         raise RuntimeError(f"Junie ACP prompt failed: {exc}{self._stderr_suffix()}") from exc
+                    if _retry_continuation:
+                        continuation_prompt = None
                     logger.warning(
                         "Junie ACP turn failed before prompt (attempt %d/2), respawning: %s", attempt, exc
                     )
@@ -1098,13 +1471,56 @@ class JunieACPClient:
                 raise RuntimeError(f"Junie ACP failed to start: {last_exc}{suffix}") from last_exc
             raise last_exc
 
+    def _answers_last_request(self, tool_messages: list[dict[str, Any]]) -> bool:
+        """True when these tool results answer the call ids Junie last requested."""
+        if not self._last_requested_call_ids:
+            return False
+        ids = {str(m.get("tool_call_id") or "") for m in tool_messages}
+        return bool(ids & self._last_requested_call_ids)
+
+    def _continuation_retry_allowed(self, continuation_prompt: str | None) -> bool:
+        """Whether a failed *reused-session* prompt may be retried.
+
+        Session reuse is the one case where a dispatched prompt can fail without
+        Junie having done anything: Hermes reuses a session id that Junie may no
+        longer know (it reaped the session, or the process was replaced between
+        turns), and the agent rejects the request outright. Hard-failing the user
+        turn there would be a regression versus never reusing sessions at all.
+
+        The safety condition is that Junie sent us NOTHING for this prompt — no
+        session/update, no permission request, no fs call. Junie reports its tool
+        calls as they start (status ``pending``) and routes its file writes through
+        our fs bridge, so silence means it never acted and the retry cannot
+        double-apply a side effect. The retry falls back to a fresh session with
+        the full transcript (``continuation_prompt`` is cleared by the caller).
+        """
+        return continuation_prompt is not None and not self._handler.saw_agent_activity
+
     def _safe_close_proc(self) -> None:
         with contextlib.suppress(Exception):
             self._submit(self._aclose_proc(), timeout=5.0)
 
     async def _ado_turn(
-        self, prompt_text: str, timeout_seconds: float, model: str | None = None
+        self,
+        prompt_text: str,
+        timeout_seconds: float,
+        model: str | None = None,
+        continuation_prompt: str | None = None,
     ) -> tuple[str, str, dict[str, dict[str, Any]], Any]:
+        # Mid-turn continuation on a still-live session: keep Junie's own
+        # context and send only the tool results. If the session is gone (fresh
+        # or respawned process) fall back to the full-transcript prompt in a new
+        # session — never send the bare results into a session that has no idea
+        # what they belong to.
+        reused_session_id = self._last_session_id if continuation_prompt else None
+        if reused_session_id:
+            logger.debug("Junie ACP reusing session %s for tool-result continuation", reused_session_id)
+            buffers = self._new_turn_buffers()
+            self._handler.begin_turn(reused_session_id, *buffers)
+            return await self._aprompt(
+                reused_session_id, continuation_prompt, timeout_seconds, buffers=buffers
+            )
+
         # Cap session/new so a wedged-but-alive reused process fails fast here
         # (pre-prompt → safe to respawn+retry) instead of hanging the whole turn.
         session = await asyncio.wait_for(
@@ -1145,13 +1561,33 @@ class JunieACPClient:
             except Exception as exc:
                 logger.warning("Junie ACP set brave_mode failed: %s", exc)
 
-        text_parts: list[str] = []
-        reasoning_parts: list[str] = []
-        tool_events: dict[str, dict[str, Any]] = {}
-        self._handler.begin_turn(session_id, text_parts, reasoning_parts, tool_events)
+        buffers = self._new_turn_buffers()
+        self._handler.begin_turn(session_id, *buffers)
+        return await self._aprompt(session_id, prompt_text, timeout_seconds, buffers=buffers)
+
+    @staticmethod
+    def _new_turn_buffers() -> tuple[list[str], list[str], dict[str, dict[str, Any]]]:
+        """Fresh (text, reasoning, tool_events) collection buffers for one turn."""
+        return [], [], {}
+
+    async def _aprompt(
+        self,
+        session_id: str,
+        prompt_text: str,
+        timeout_seconds: float,
+        *,
+        buffers: tuple[list[str], list[str], dict[str, dict[str, Any]]],
+    ) -> tuple[str, str, dict[str, dict[str, Any]], Any]:
+        """Send one session/prompt on an already-prepared session and collect it.
+
+        The caller installs ``buffers`` via ``begin_turn`` and passes the same
+        tuple here; the handler fills them from ``session/update`` notifications.
+        """
+        text_parts, reasoning_parts, tool_events = buffers
         # Mark dispatch so _run_prompt won't replay a prompt Junie may have
         # already acted on (see the retry guard).
         self._prompt_in_flight = True
+        self._last_session_id = session_id
         usage_obj: Any = None
         try:
             result = await self._conn.prompt(
@@ -1163,7 +1599,8 @@ class JunieACPClient:
             await self._handler.settle(self._settle_quiet_gap, min(self._settle_max, timeout_seconds))
         finally:
             self._handler.end_turn()
-        # A fresh session is opened per request (we re-send the full transcript),
-        # so we don't rely on Junie's cross-turn memory; sessions are left for
-        # the persistent process to reap, matching the original client.
+        # A fresh session is opened per USER turn (we re-send the full
+        # transcript), so we never rely on Junie's cross-turn memory matching
+        # Hermes' history. The only reuse is within a turn, for tool-result
+        # continuations. Sessions are left for the persistent process to reap.
         return "".join(text_parts), "".join(reasoning_parts), tool_events, usage_obj

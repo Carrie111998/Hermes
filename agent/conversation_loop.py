@@ -73,6 +73,7 @@ from agent.prompt_caching import (
     apply_anthropic_cache_control,
     strip_anthropic_cache_control,
 )
+from agent.provider_projection import splice_provider_projection
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -5475,6 +5476,14 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            # ── Agent-as-provider projection (ACP autonomous agents) ──────
+            # A provider that IS an agent (junie-acp) ran its own tools inside
+            # its own session before we got here: splice that work into the
+            # transcript as completed call/result rows and tick the skill-review
+            # nudge with the iterations Hermes never saw. No-op for ordinary
+            # providers. See agent/provider_projection.py for the why.
+            splice_provider_projection(agent, response, messages)
 
             try:
                 from hermes_cli.lifecycle import (

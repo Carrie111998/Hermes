@@ -2086,6 +2086,24 @@ def _model_flow_junie_acp(config, current_model=""):
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
 
+    # The self-improvement review fork inherits the main runtime by default,
+    # which on this provider means spawning a whole extra Junie session (a JVM)
+    # just to decide whether to save a memory or a skill. It works — Hermes'
+    # agent-level tools reach Junie through the ACP text bridge — but routing the
+    # review to a cheap normal model is much faster. Surface the knob instead of
+    # leaving it undocumented.
+    _aux = cfg.get("auxiliary") if isinstance(cfg.get("auxiliary"), dict) else {}
+    _review = _aux.get("background_review") if isinstance(_aux.get("background_review"), dict) else {}
+    if not (_review.get("provider") and _review.get("model")):
+        print()
+        print("  Tip: the background memory/skill review runs on this provider by")
+        print("  default, spawning an extra Junie session each time. To route it to a")
+        print("  cheaper model instead, set in ~/.hermes/config.yaml:")
+        print("    auxiliary:")
+        print("      background_review:")
+        print("        provider: <provider>")
+        print("        model: <model>")
+
 
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.

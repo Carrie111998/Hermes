@@ -24,12 +24,17 @@ from agent.junie_acp_client import (
     _HermesClient,
     _choose_permission_option,
     _extract_model_ids,
+    _format_messages_as_prompt,
+    _format_tool_results_as_prompt,
     _merge_tool_update,
+    _project_tool_events,
     _render_tool_activity,
     _resolve_args,
     _resolve_brave_override,
     _resolve_command,
+    _resolve_forwarded_tools,
     _resolve_permission_policy,
+    _trailing_tool_results,
     fetch_junie_models,
 )
 
@@ -270,14 +275,209 @@ class OpenAIShapeTests(unittest.TestCase):
         self.assertGreater(u.completion_tokens, 0)
         self.assertEqual(u.total_tokens, u.prompt_tokens + u.completion_tokens)
 
-    def test_literal_tool_call_text_is_not_parsed(self) -> None:
-        poison = 'Sure — <tool_call>{"id":"x","type":"function","function":{"name":"rm","arguments":"{}"}}</tool_call> done.'
-        with patch.object(self.client, "_run_prompt", return_value=(poison, "", {}, None)):
+    def test_hermes_tool_call_blocks_are_parsed_from_response(self) -> None:
+        """Junie delegating a HERMES tool must reach Hermes' dispatcher.
+
+        This is the other half of the invariant above: Junie's own (already
+        executed) activity is never a pending tool_call, but a <tool_call> block
+        Junie emits IS a delegation — without it, memory/todo/skill_manage are
+        unreachable for the whole session.
+        """
+        text = (
+            'Saving that.\n<tool_call>{"id":"c1","type":"function","function":'
+            '{"name":"memory","arguments":"{\\"action\\":\\"add\\"}"}}</tool_call>'
+        )
+        with patch.object(self.client, "_run_prompt", return_value=(text, "", {}, None)):
             resp = self.client._create_chat_completion(model="junie-acp", messages=[])
         choice = resp.choices[0]
-        self.assertEqual(choice.message.tool_calls, [])
-        self.assertEqual(choice.finish_reason, "stop")
-        self.assertIn("<tool_call>", choice.message.content)
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        call = choice.message.tool_calls[0]
+        self.assertEqual(call.function.name, "memory")
+        self.assertEqual(call.function.arguments, '{"action":"add"}')
+        # The raw block is stripped from the user-visible content.
+        self.assertNotIn("<tool_call>", choice.message.content)
+        self.assertIn("Saving that.", choice.message.content)
+
+
+    def test_native_activity_is_projected_into_the_transcript(self) -> None:
+        """The review fork learns from `messages`, not from `reasoning`.
+
+        Junie's real work must land as completed assistant(tool_call)+tool(result)
+        rows so the self-improvement loop replays substance instead of a one-line
+        activity feed.
+        """
+        events: dict = {}
+        _merge_tool_update(events, {
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit main.py",
+            "kind": "edit", "status": "pending",
+            "rawInput": {"path": "main.py", "patch": "-a\n+b"},
+        })
+        _merge_tool_update(events, {
+            "sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "1 file changed"}}],
+        })
+        with patch.object(self.client, "_run_prompt", return_value=("Done.", "", events, None)):
+            resp = self.client._create_chat_completion(model="junie-acp", messages=[])
+
+        projected = resp.hermes_projected_messages
+        self.assertEqual(len(projected), 2)
+        assistant, tool = projected
+        self.assertEqual(assistant["role"], "assistant")
+        self.assertIsNone(assistant["content"])
+        call = assistant["tool_calls"][0]
+        self.assertEqual(call["function"]["name"], "junie_edit")
+        args = json.loads(call["function"]["arguments"])
+        self.assertEqual(args["path"], "main.py")
+        self.assertEqual(args["title"], "Edit main.py")
+        self.assertIn("+b", args["patch"])
+        self.assertEqual(tool["role"], "tool")
+        self.assertEqual(tool["tool_call_id"], call["id"])
+        self.assertIn("1 file changed", tool["content"])
+        # Junie's toolCallId is only unique inside its session, and Hermes opens
+        # one session per user turn — the projected id must be namespaced so the
+        # transcript can't end up with duplicate tool_call ids.
+        self.assertTrue(call["id"].startswith("junie_"), call["id"])
+        self.assertNotEqual(call["id"], "t1")
+        # Still not a pending tool call, and it ticks the skill-review counter.
+        self.assertEqual(resp.choices[0].message.tool_calls, [])
+        self.assertEqual(resp.hermes_provider_tool_iterations, 1)
+
+    def test_failed_activity_keeps_its_status_in_the_projection(self) -> None:
+        events: dict = {}
+        _merge_tool_update(events, {
+            "sessionUpdate": "tool_call", "toolCallId": "t9", "title": "Run tests",
+            "kind": "execute", "status": "failed",
+            "rawOutput": {"exitCode": 1, "stderr": "2 failed"},
+        })
+        with patch.object(self.client, "_run_prompt", return_value=("Failed.", "", events, None)):
+            resp = self.client._create_chat_completion(model="junie-acp", messages=[])
+        tool = resp.hermes_projected_messages[1]
+        self.assertIn("[status failed]", tool["content"])
+        self.assertIn("2 failed", tool["content"])
+
+    def test_stream_true_returns_chunks_that_still_carry_the_projection(self) -> None:
+        """``stream=True`` (MoA / auxiliary paths) must not drop the extras.
+
+        An ACP turn is one-shot, so streaming is a re-shape — but a plain list of
+        chunks would silently lose ``hermes_projected_messages``, i.e. exactly the
+        transcript substance the self-improvement loop needs.
+        """
+        events: dict = {}
+        _merge_tool_update(events, {
+            "sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Run tests",
+            "kind": "execute", "status": "completed",
+            "content": [{"type": "content", "content": {"type": "text", "text": "3 passed"}}],
+        })
+        text = (
+            'Ran them.\n<tool_call>{"id":"c1","type":"function","function":'
+            '{"name":"todo","arguments":"{}"}}</tool_call>'
+        )
+        with patch.object(self.client, "_run_prompt", return_value=(text, "", events, None)):
+            chunks = self.client._create_chat_completion(
+                model="junie-acp", messages=[], stream=True
+            )
+        self.assertEqual(len(list(chunks)), 2)  # data chunk + usage chunk
+        delta = chunks[0].choices[0].delta
+        self.assertEqual(chunks[0].choices[0].finish_reason, "tool_calls")
+        self.assertEqual(delta.tool_calls[0].function.name, "todo")
+        self.assertIn("Ran them.", delta.content)
+        self.assertIsNotNone(chunks[1].usage)
+        # The extras survive the re-shape.
+        self.assertEqual(len(chunks.hermes_projected_messages), 2)
+        self.assertEqual(chunks.hermes_provider_tool_iterations, 1)
+
+    def test_no_activity_means_no_projection_and_no_counter_tick(self) -> None:
+        with patch.object(self.client, "_run_prompt", return_value=("hi", "", {}, None)):
+            resp = self.client._create_chat_completion(model="junie-acp", messages=[])
+        self.assertEqual(resp.hermes_projected_messages, [])
+        self.assertEqual(resp.hermes_provider_tool_iterations, 0)
+
+
+# --------------------------------------------------------------------------- #
+# Hermes tool bridge: forwarded-tool allowlist + continuation prompts         #
+# --------------------------------------------------------------------------- #
+class ToolBridgeTests(unittest.TestCase):
+    _TOOLS = [
+        {"type": "function", "function": {"name": "memory", "description": "remember", "parameters": {}}},
+        {"type": "function", "function": {"name": "skill_manage", "description": "skills", "parameters": {}}},
+        {"type": "function", "function": {"name": "todo", "description": "todos", "parameters": {}}},
+        {"type": "function", "function": {"name": "execute_command", "description": "shell", "parameters": {}}},
+    ]
+
+    def test_default_allowlist_is_agent_level_only(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            forwarded = _resolve_forwarded_tools()
+        # Hermes' agent-level surface: the memory/skill self-improvement loop
+        # (writes AND the reads a review needs to update the right skill) plus
+        # todo. Junie's own read/edit/execute capabilities are NOT re-offered.
+        self.assertEqual(
+            forwarded,
+            frozenset({"memory", "todo", "skill_manage", "skill_view", "skills_list"}),
+        )
+
+    def test_allowlist_env_overrides(self) -> None:
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_FORWARD_TOOLS": "all"}, clear=True):
+            self.assertIsNone(_resolve_forwarded_tools())
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_FORWARD_TOOLS": "none"}, clear=True):
+            self.assertEqual(_resolve_forwarded_tools(), frozenset())
+        with patch.dict(os.environ, {"HERMES_JUNIE_ACP_FORWARD_TOOLS": "memory, todo"}, clear=True):
+            self.assertEqual(_resolve_forwarded_tools(), frozenset({"memory", "todo"}))
+
+    def test_prompt_forwards_agent_level_tools_but_not_junies_own_work(self) -> None:
+        prompt = _format_messages_as_prompt(
+            [{"role": "user", "content": "hi"}],
+            model="junie-acp",
+            tools=self._TOOLS,
+            forwarded_tools=frozenset({"memory", "todo", "skill_manage"}),
+        )
+        self.assertIn("<tool_call>", prompt)
+        self.assertIn('"name": "memory"', prompt)
+        self.assertIn('"name": "skill_manage"', prompt)
+        # Re-offering Junie's own capabilities would make Hermes re-run finished work.
+        self.assertNotIn("execute_command", prompt)
+
+    def test_prompt_omits_the_bridge_when_nothing_is_forwarded(self) -> None:
+        prompt = _format_messages_as_prompt(
+            [{"role": "user", "content": "hi"}],
+            tools=self._TOOLS,
+            forwarded_tools=frozenset(),
+        )
+        self.assertNotIn("<tool_call>", prompt)
+        self.assertNotIn("memory", prompt)
+
+    def test_trailing_tool_results_detects_a_mid_turn_continuation(self) -> None:
+        self.assertEqual(_trailing_tool_results([{"role": "user", "content": "q"}]), [])
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "saved"},
+            {"role": "tool", "tool_call_id": "c2", "content": "also saved"},
+        ]
+        trailing = _trailing_tool_results(msgs)
+        self.assertEqual([m["tool_call_id"] for m in trailing], ["c1", "c2"])
+
+    def test_projected_rows_do_not_look_like_a_continuation(self) -> None:
+        # Junie's own projected activity ends in a tool row too, but Junie is not
+        # waiting on it — treating it as a continuation would tell Junie "here
+        # are your results" about work it already did itself. Recognised by the
+        # namespaced tool name, so nothing non-standard travels on the wire.
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "j1", "type": "function",
+                             "function": {"name": "junie_edit", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "j1", "name": "junie_edit", "content": "1 file changed"},
+        ]
+        self.assertEqual(_trailing_tool_results(msgs), [])
+
+    def test_continuation_prompt_carries_results_not_the_transcript(self) -> None:
+        prompt = _format_tool_results_as_prompt(
+            [{"role": "tool", "tool_call_id": "c1", "name": "memory", "content": "saved"}]
+        )
+        self.assertIn("saved", prompt)
+        self.assertIn("memory", prompt)
+        self.assertIn("Do NOT redo any work", prompt)
 
 
 # --------------------------------------------------------------------------- #
@@ -421,6 +621,147 @@ class JunieEndToEndTests(unittest.TestCase):
         self.assertEqual(choice.message.tool_calls, [])
         self.assertIn("Junie tool activity", choice.message.reasoning or "")
         self.assertIn("gamma.log", choice.message.reasoning or "")
+
+    def test_hermes_tool_call_then_continuation_reuses_the_session(self) -> None:
+        """A tool-bridge turn must not restart Junie's task.
+
+        Hermes runs the delegated tool and calls back with the result. Opening a
+        fresh session and replaying the transcript would make Junie redo the
+        coding work it already finished, so the continuation reuses the live
+        session and carries only the results.
+        """
+        with patch.dict(os.environ, {
+            "FAKE_JUNIE_LOG": self.log,
+            "FAKE_JUNIE_EMIT_HERMES_TOOL_CALL": "1",
+        }, clear=False):
+            client = self._client()
+            first = client.chat.completions.create(
+                model="junie-acp",
+                messages=[{"role": "user", "content": "remember this"}],
+                tools=[{"type": "function", "function": {
+                    "name": "memory", "description": "remember", "parameters": {}}}],
+                timeout=30,
+            )
+            self.assertEqual(first.choices[0].finish_reason, "tool_calls")
+            call = first.choices[0].message.tool_calls[0]
+            self.assertEqual(call.function.name, "memory")
+
+            second = client.chat.completions.create(
+                model="junie-acp",
+                messages=[
+                    {"role": "user", "content": "remember this"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": call.id}]},
+                    {"role": "tool", "tool_call_id": call.id, "name": "memory",
+                     "content": "memory saved"},
+                ],
+                timeout=30,
+            )
+
+        self.assertEqual(second.choices[0].finish_reason, "stop")
+        log = _read_log(self.log)
+        prompts = [e for e in log if e["method"] == "session/prompt"]
+        self.assertEqual(len(prompts), 2)
+        # One session for both prompts — the continuation reused it.
+        self.assertEqual(sum(1 for e in log if e["method"] == "session/new"), 1)
+        self.assertEqual(prompts[0]["session"], prompts[1]["session"])
+        # And it carried the result instead of replaying the conversation.
+        self.assertIn("memory saved", prompts[1]["text"])
+        self.assertNotIn("Conversation transcript", prompts[1]["text"])
+
+    def test_rejected_reused_session_falls_back_instead_of_failing_the_turn(self) -> None:
+        """Session reuse must not make a turn fail harder than before.
+
+        Junie may have reaped the session between prompts. The rejection arrives
+        before Junie does anything — no update, no permission prompt, no fs call —
+        so the client retries with the full transcript in a fresh session rather
+        than surfacing an error. (A failure AFTER Junie acted is still never
+        replayed; see test_no_replay_after_prompt_dispatch.)
+        """
+        with patch.dict(os.environ, {
+            "FAKE_JUNIE_LOG": self.log,
+            "FAKE_JUNIE_EMIT_HERMES_TOOL_CALL": "1",
+            "FAKE_JUNIE_REJECT_REUSED_SESSION": "1",
+        }, clear=False):
+            client = self._client()
+            first = client.chat.completions.create(
+                model="junie-acp",
+                messages=[{"role": "user", "content": "remember this"}],
+                tools=[{"type": "function", "function": {
+                    "name": "memory", "description": "remember", "parameters": {}}}],
+                timeout=30,
+            )
+            call = first.choices[0].message.tool_calls[0]
+            second = client.chat.completions.create(
+                model="junie-acp",
+                messages=[
+                    {"role": "user", "content": "remember this"},
+                    {"role": "assistant", "content": "", "tool_calls": [{"id": call.id}]},
+                    {"role": "tool", "tool_call_id": call.id, "name": "memory", "content": "saved"},
+                ],
+                timeout=30,
+            )
+        # The turn recovered rather than raising.
+        self.assertIsNotNone(second.choices[0].message)
+        log = _read_log(self.log)
+        rejected = [e for e in log if e.get("result") == "unknown-session"]
+        self.assertTrue(rejected, "the reused session should have been rejected once")
+        # …by respawning and replaying the transcript into a brand-new session.
+        self.assertEqual(sum(1 for e in log if e["method"] == "initialize"), 2)
+        accepted = [e for e in log if e["method"] == "session/prompt" and "text" in e]
+        self.assertIn("Conversation transcript", accepted[-1]["text"])
+
+    def test_unrelated_trailing_tool_row_does_not_reuse_the_session(self) -> None:
+        """Only results Junie actually asked for may re-enter its session.
+
+        A history that merely ENDS with a tool row (session resume, host-fed
+        transcript) must not be delivered to a live session as "here are your
+        results" for work Junie never requested.
+        """
+        with patch.dict(os.environ, {
+            "FAKE_JUNIE_LOG": self.log,
+            "FAKE_JUNIE_EMIT_HERMES_TOOL_CALL": "1",
+        }, clear=False):
+            client = self._client()
+            first = client.chat.completions.create(
+                model="junie-acp",
+                messages=[{"role": "user", "content": "remember this"}],
+                tools=[{"type": "function", "function": {
+                    "name": "memory", "description": "remember", "parameters": {}}}],
+                timeout=30,
+            )
+            self.assertTrue(first.choices[0].message.tool_calls)
+            # A tool row whose id Junie never requested.
+            client.chat.completions.create(
+                model="junie-acp",
+                messages=[
+                    {"role": "user", "content": "unrelated older turn"},
+                    {"role": "tool", "tool_call_id": "someone-elses-call", "content": "stale"},
+                ],
+                timeout=30,
+            )
+        log = _read_log(self.log)
+        self.assertEqual(sum(1 for e in log if e["method"] == "session/new"), 2)
+        prompts = [e for e in log if e["method"] == "session/prompt"]
+        self.assertNotEqual(prompts[0]["session"], prompts[1]["session"])
+        self.assertIn("Conversation transcript", prompts[1]["text"])
+
+    def test_continuation_falls_back_to_full_prompt_without_a_live_session(self) -> None:
+        # No prior turn on this client → nothing to reuse. The tool results must
+        # not be sent bare into a session that has no idea what they belong to.
+        with patch.dict(os.environ, {"FAKE_JUNIE_LOG": self.log}, clear=False):
+            client = self._client()
+            client.chat.completions.create(
+                model="junie-acp",
+                messages=[
+                    {"role": "user", "content": "do the thing"},
+                    {"role": "tool", "tool_call_id": "c1", "content": "result"},
+                ],
+                timeout=30,
+            )
+        prompts = [e for e in _read_log(self.log) if e["method"] == "session/prompt"]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Conversation transcript", prompts[0]["text"])
+        self.assertIn("do the thing", prompts[0]["text"])
 
     def test_thought_chunk_surfaced_as_reasoning(self) -> None:
         with patch.dict(os.environ, {"FAKE_JUNIE_LOG": self.log, "FAKE_JUNIE_EMIT_THOUGHT": "1"}, clear=False):

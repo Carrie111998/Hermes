@@ -16,6 +16,8 @@ metadata:
 Delegate coding tasks to [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli.html) — JetBrains' autonomous, LLM-agnostic coding agent CLI — via the Hermes terminal. Junie reads/edits files, runs commands, plans before acting, and reviews diffs. It brings its own agent harness (plan mode, code review, orchestrated sub-agents), so you delegate a *goal*, not step-by-step tool calls.
 
 > Note: this is the **delegation** skill — Hermes (on any model) drives the `junie` CLI as a tool. It is distinct from the `junie-acp` **provider**, where Junie *is* the model backend driving Hermes. Use this skill when your current agent wants to hand a coding subtask to Junie.
+>
+> On the `junie-acp` provider, Junie does the coding with its own tools while Hermes keeps its agent-level tools (`memory`, `todo`, `skill_manage`, `skill_view`, `skills_list`) over an ACP text bridge, so the memory/skill self-improvement loop keeps working. `HERMES_JUNIE_ACP_FORWARD_TOOLS` widens or narrows that set (`all` forwards Hermes' whole toolset). The background review inherits the provider by default, which spawns an extra Junie session per review — set `auxiliary.background_review.{provider,model}` to route it to a cheaper model.
 
 ## Prerequisites
 

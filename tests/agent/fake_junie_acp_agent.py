@@ -40,11 +40,25 @@ def _flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _prompt_text(prompt: Any) -> str:
+    """Flatten the ACP prompt blocks so tests can assert what was actually sent."""
+    blocks = prompt if isinstance(prompt, list) else [prompt]
+    parts: list[str] = []
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if text is None and isinstance(block, dict):
+            text = block.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
 class FakeJunieAgent:
     def __init__(self) -> None:
         self._conn: acp.AgentSideConnection | None = None
         self._session_count = 0
         self._prompt_count = 0
+        self._prompted_sessions: set[str] = set()
 
     def on_connect(self, conn: acp.AgentSideConnection) -> None:
         self._conn = conn
@@ -79,11 +93,26 @@ class FakeJunieAgent:
 
     async def prompt(self, prompt: Any, session_id: str, message_id: str | None = None, **_: Any) -> PromptResponse:
         self._prompt_count += 1
-        _log({"method": "session/prompt", "session": session_id, "count": self._prompt_count})
+        _log({
+            "method": "session/prompt",
+            "session": session_id,
+            "count": self._prompt_count,
+            "text": _prompt_text(prompt),
+        })
         assert self._conn is not None
 
         if _flag("FAKE_JUNIE_FAIL_PROMPT"):
             raise RequestError.internal_error({"details": "prompt failed mid-turn"})
+
+        # Reject a SECOND prompt on the same session — what a real agent does when
+        # the client reuses a session it has since reaped. The rejection lands
+        # before any notification, so the client may safely fall back to a fresh
+        # session (a new process/session then accepts its first prompt).
+        if _flag("FAKE_JUNIE_REJECT_REUSED_SESSION"):
+            if session_id in self._prompted_sessions:
+                _log({"method": "session/prompt", "session": session_id, "result": "unknown-session"})
+                raise RequestError.invalid_params({"details": f"unknown session {session_id}"})
+            self._prompted_sessions.add(session_id)
 
         # Optional: ask the client for permission and record what it answered.
         if _flag("FAKE_JUNIE_ASK_PERMISSION"):
@@ -114,7 +143,8 @@ class FakeJunieAgent:
             except RequestError as exc:
                 _log({"method": "fs_write_result", "ok": False, "error": str(exc)})
 
-        # Optional: stream native tool activity (never becomes an OpenAI tool_call).
+        # Optional: stream native tool activity (never becomes a *pending* OpenAI
+        # tool_call; the client projects it as completed transcript rows).
         if _flag("FAKE_JUNIE_EMIT_TOOLCALL"):
             await self._conn.session_update(
                 session_id=session_id,
@@ -126,6 +156,19 @@ class FakeJunieAgent:
                 update={"sessionUpdate": "tool_call_update", "toolCallId": "t1", "status": "completed",
                         "content": [{"type": "content", "content": {"type": "text", "text": "gamma.log\n"}}]},
             )
+
+        # Optional: delegate a HERMES tool on the FIRST prompt only, then answer
+        # normally on the continuation — the shape a real tool-bridge turn takes.
+        if _flag("FAKE_JUNIE_EMIT_HERMES_TOOL_CALL") and self._prompt_count == 1:
+            await self._conn.session_update(
+                session_id=session_id,
+                update={"sessionUpdate": "agent_message_chunk", "content": {
+                    "type": "text",
+                    "text": 'Noting that. <tool_call>{"id":"c1","type":"function","function":'
+                            '{"name":"memory","arguments":"{\\"action\\":\\"add\\"}"}}</tool_call>',
+                }},
+            )
+            return PromptResponse(stop_reason="end_turn", usage=None)
 
         # Optional: stream a thought chunk (surfaces as reasoning).
         if _flag("FAKE_JUNIE_EMIT_THOUGHT"):
