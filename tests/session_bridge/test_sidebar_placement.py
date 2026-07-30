@@ -29,7 +29,14 @@ from session_bridge.sidebar_placement import (
             "\\\\2001-0db8-0000-0000-0000-0000-0000-0001.ipv6-literal.net\\public\\workspace",
             "\\\\2001-0db8-0000-0000-0000-0000-0000-0001.ipv6-literal.net\\public\\workspace",
         ),
+        (
+            "\\\\--ffff-192.0.2.1.ipv6-literal.net\\public\\workspace",
+            "\\\\--ffff-192.0.2.1.ipv6-literal.net\\public\\workspace",
+        ),
         ("\\\\" + "n" * 15 + "\\public\\workspace", "\\\\" + "n" * 15 + "\\public\\workspace"),
+        ("\\\\" + "1" * 15 + "\\public\\workspace", "\\\\" + "1" * 15 + "\\public\\workspace"),
+        ("\\\\bad_server\\public\\workspace", "\\\\bad_server\\public\\workspace"),
+        ("\\\\3com.example\\public\\workspace", "\\\\3com.example\\public\\workspace"),
         (
             "\\\\servidor東京\\shareüber\\workspace",
             "\\\\servidor東京\\shareüber\\workspace",
@@ -98,24 +105,17 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
 @pytest.mark.parametrize(
     "server",
     [
-        "bad*server",
-        "bad?server",
-        'bad"server',
-        "bad<server",
-        "bad>server",
-        "bad|server",
         "[2001:db8::1]",
+        "2001:db8::1.ipv6-literal.net",
+        "2001-db8--1%12.ipv6-literal.net",
+        "[2001-db8--1].ipv6-literal.net",
         "not-an-address.ipv6-literal.net",
         "999.999.999.999",
-        "1" * 15,
-        "bad server",
-        "bad_server",
-        "-badserver",
-        "badserver-",
-        "s" * 64,
+        "1" * 16,
         "bad\x00server",
-        "bad\x07server",
-        "bad\x1fserver",
+        "_" * 16,
+        "💥" * 4,
+        "host.123",
     ],
 )
 def test_ordinary_windows_path_identity_rejects_invalid_unc_server(
@@ -187,13 +187,14 @@ def test_ordinary_windows_path_identity_rejects_unc_tail_over_255_characters() -
 def test_ordinary_windows_path_identity_enforces_utf8_fqdn_limits() -> None:
     valid_unicode_label = "é" * 31 + "a"
     invalid_unicode_label = "é" * 32
-    valid_total = ".".join(("a" * 63, "a" * 63, "a" * 63, "a" * 63))
+    valid_total = ".".join(("a" * 63, "a" * 63, "a" * 63, "a" * 61))
     invalid_total = ".".join(
-        ("a" * 63, "a" * 63, "a" * 63, "a" * 62, "a")
+        ("a" * 63, "a" * 63, "a" * 63, "a" * 62)
     )
 
     assert len(valid_unicode_label.encode("utf-8")) == 63
-    assert len(valid_total.encode("utf-8")) == 255
+    assert len(valid_total.encode("utf-8")) == 253
+    assert sum(len(label.encode("utf-8")) + 1 for label in valid_total.split(".")) + 1 == 255
     assert ordinary_windows_path_identity(
         f"\\\\{valid_unicode_label}\\share\\workspace"
     ) == f"\\\\{valid_unicode_label}\\share\\workspace"

@@ -96,8 +96,19 @@ def ordinary_windows_path_identity(value: object) -> str | None:
 
 def _is_ordinary_unc_server(component: str) -> bool:
     ipv6_literal_suffix = ".ipv6-literal.net"
+    if "[" in component or "]" in component:
+        return False
     if component.casefold().endswith(ipv6_literal_suffix):
         transformed_address = component[: -len(ipv6_literal_suffix)]
+        if (
+            not transformed_address
+            or any(character in ":%[]" for character in transformed_address)
+            or any(
+                character not in "0123456789abcdefABCDEF-."
+                for character in transformed_address
+            )
+        ):
+            return False
         try:
             ipaddress.IPv6Address(transformed_address.replace("-", ":"))
         except ValueError:
@@ -112,31 +123,34 @@ def _is_ordinary_unc_server(component: str) -> bool:
             return False
         return True
 
-    if "." not in component and _utf8_byte_length(component) <= _MAX_NETBIOS_NAME_BYTES:
-        return _is_ordinary_netbios_name(component)
+    if "." not in component and _is_ordinary_netbios_name(component):
+        return True
     return _is_ordinary_fqdn(component)
 
 
 def _is_ordinary_netbios_name(component: str) -> bool:
-    return (
-        1 <= _utf8_byte_length(component) <= _MAX_NETBIOS_NAME_BYTES
-        and not component.isdecimal()
-        and not component.startswith("-")
-        and not component.endswith("-")
-        and all(character.isalnum() or character == "-" for character in component)
-    )
+    try:
+        encoded = component.encode("latin-1")
+    except UnicodeEncodeError:
+        return False
+    return 1 <= len(encoded) <= _MAX_NETBIOS_NAME_BYTES and "\x00" not in component
 
 
 def _is_ordinary_fqdn(component: str) -> bool:
     if not component or _utf8_byte_length(component) > _MAX_FQDN_BYTES:
         return False
     labels = component.split(".")
-    return all(
-        0 < _utf8_byte_length(label) <= _MAX_FQDN_LABEL_BYTES
-        and not label.startswith("-")
-        and not label.endswith("-")
-        and all(character.isalnum() or character == "-" for character in label)
-        for label in labels
+    return (
+        sum(_utf8_byte_length(label) + 1 for label in labels) + 1
+        <= _MAX_FQDN_BYTES
+        and any(character.isalpha() for character in labels[-1])
+        and all(
+            0 < _utf8_byte_length(label) <= _MAX_FQDN_LABEL_BYTES
+            and not label.startswith("-")
+            and not label.endswith("-")
+            and all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        )
     )
 
 
