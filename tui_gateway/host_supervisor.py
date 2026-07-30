@@ -42,6 +42,7 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "session.reset": "idle-gated",
     "session.history.reload": "idle-gated",
     "slash.retry": "idle-gated",
+    "route.command": "idle-gated",
 }
 
 _REGISTRY_NAME = "dashboard-compute-host.json"

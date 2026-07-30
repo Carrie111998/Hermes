@@ -1459,6 +1459,9 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
         attached_images = list(session.get("attached_images", []))
+        one_turn_target = session.get("one_turn_route_target")
+        one_turn_moa_target = session.get("one_turn_moa_target")
+        routing_state = session.get("_compute_host_turn_routing_state")
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1475,12 +1478,83 @@ def _compute_host_turn_frame(rid: str, sid: str, session: dict, text: Any) -> di
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
         "attached_images": attached_images,
+        "one_turn_route_target": (
+            dict(one_turn_target) if isinstance(one_turn_target, dict) else None
+        ),
+        "one_turn_moa_target": (
+            dict(one_turn_moa_target) if isinstance(one_turn_moa_target, dict) else None
+        ),
+        "turn_routing_state": (
+            dict(routing_state) if isinstance(routing_state, dict) else None
+        ),
     }
 
 
 def _metadata_mirror(session: dict | None) -> dict:
     mirror = (session or {}).get("_metadata_mirror")
     return mirror if isinstance(mirror, dict) else {}
+
+
+def _snapshot_turn_routing_state(state: Any) -> dict | None:
+    """Return the bounded JSON-safe state owned by an isolated compute host."""
+
+    from agent.turn_routing_runtime import TurnRoutingSessionState
+
+    if not isinstance(state, TurnRoutingSessionState):
+        return None
+    return {
+        "affinity_route": state.affinity_route,
+        "affinity_target": (
+            dict(state.affinity_target) if isinstance(state.affinity_target, dict) else None
+        ),
+        "affinity_remaining": max(0, int(state.affinity_remaining or 0)),
+        "consecutive_failures": max(0, int(state.consecutive_failures or 0)),
+        "fail_off": bool(state.fail_off),
+        "fail_off_reason": state.fail_off_reason,
+        "latest_event": state.latest_event,
+        "latest_payload": (
+            dict(state.latest_payload) if isinstance(state.latest_payload, dict) else None
+        ),
+        "turn_sequence": max(0, int(state.turn_sequence or 0)),
+        "affinity_window": max(0, int(state.affinity_window or 0)),
+        "failure_limit": max(1, int(state.failure_limit or 3)),
+    }
+
+
+def _hydrate_turn_routing_state(snapshot: Any):
+    """Rebuild session routing state after an isolated host process restart."""
+
+    if not isinstance(snapshot, dict):
+        return None
+    from agent.turn_routing_runtime import TurnRoutingSessionState
+
+    affinity_target = snapshot.get("affinity_target")
+    latest_payload = snapshot.get("latest_payload")
+    return TurnRoutingSessionState(
+        affinity_route=(
+            str(snapshot.get("affinity_route"))
+            if snapshot.get("affinity_route") is not None
+            else None
+        ),
+        affinity_target=(dict(affinity_target) if isinstance(affinity_target, dict) else None),
+        affinity_remaining=max(0, int(snapshot.get("affinity_remaining") or 0)),
+        consecutive_failures=max(0, int(snapshot.get("consecutive_failures") or 0)),
+        fail_off=bool(snapshot.get("fail_off")),
+        fail_off_reason=(
+            str(snapshot.get("fail_off_reason"))
+            if snapshot.get("fail_off_reason") is not None
+            else None
+        ),
+        latest_event=(
+            str(snapshot.get("latest_event"))
+            if snapshot.get("latest_event") is not None
+            else None
+        ),
+        latest_payload=(dict(latest_payload) if isinstance(latest_payload, dict) else None),
+        turn_sequence=max(0, int(snapshot.get("turn_sequence") or 0)),
+        affinity_window=max(0, int(snapshot.get("affinity_window") or 0)),
+        failure_limit=max(1, int(snapshot.get("failure_limit") or 3)),
+    )
 
 
 def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
@@ -1514,6 +1588,9 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         mirror.update(info)
         session["_metadata_mirror"] = mirror
         session["_metadata_mirror_updated_at"] = time.time()
+    routing_state = frame.get("turn_routing_state")
+    if isinstance(routing_state, dict):
+        session["_compute_host_turn_routing_state"] = dict(routing_state)
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
@@ -1565,6 +1642,11 @@ def _submit_prompt_to_compute_host(rid: str, sid: str, session: dict, text: Any)
     with session["history_lock"]:
         session["_compute_host_active"] = True
         session["attached_images"] = []
+        # The child now owns this accepted turn. Retire parent-side staged
+        # intent only after submit_turn succeeds so a pipe failure can still
+        # fail open through the inline shared lifecycle.
+        session.pop("one_turn_route_target", None)
+        session.pop("one_turn_moa_target", None)
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -2761,7 +2843,9 @@ def _save_cfg(cfg: dict):
 
     from hermes_cli.config import atomic_config_write
 
-    path = _hermes_home / "config.yaml"
+    override = get_hermes_home_override()
+    home = Path(override) if isinstance(override, str) and override else _hermes_home
+    path = home / "config.yaml"
     atomic_config_write(path, cfg)
     with _cfg_lock:
         _cfg_cache = copy.deepcopy(cfg)
@@ -3998,39 +4082,51 @@ def _persist_model_switch(result) -> None:
 
 
 def _snapshot_agent_model_runtime(agent) -> dict:
-    """Capture the current agent model runtime for a one-turn restore."""
-    return {
-        "model": getattr(agent, "model", ""),
-        "provider": getattr(agent, "provider", ""),
-        "api_key": getattr(agent, "api_key", ""),
-        "base_url": getattr(agent, "base_url", ""),
-        "api_mode": getattr(agent, "api_mode", ""),
-        "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
-    }
+    """Compatibility wrapper for the shared one-turn runtime snapshot."""
+    from agent.agent_runtime_helpers import snapshot_agent_model_runtime
+
+    return snapshot_agent_model_runtime(agent)
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
-    """Restore an agent model runtime captured before a one-turn override."""
-    if not snapshot or agent is None:
-        return
-    primary = snapshot.get("primary_runtime")
-    if primary and hasattr(agent, "_restore_primary_runtime"):
-        try:
-            agent._primary_runtime = copy.deepcopy(primary)
-            agent._fallback_activated = True
-            agent._rate_limited_until = 0
-            if agent._restore_primary_runtime():
-                return
-        except Exception:
-            logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
-    if hasattr(agent, "switch_model"):
-        agent.switch_model(
-            new_model=snapshot.get("model", ""),
-            new_provider=snapshot.get("provider", ""),
-            api_key=snapshot.get("api_key", ""),
-            base_url=snapshot.get("base_url", ""),
-            api_mode=snapshot.get("api_mode", ""),
-        )
+    """Compatibility wrapper for the shared one-turn runtime restore."""
+    from agent.agent_runtime_helpers import restore_agent_model_runtime
+
+    restore_agent_model_runtime(agent, snapshot)
+
+
+def _load_turn_routing_config() -> dict:
+    """Load the canonical per-turn routing block for the active profile."""
+    from agent.turn_routing_runtime import load_turn_routing_config
+
+    return load_turn_routing_config()
+
+
+def _load_turn_moa_config() -> dict:
+    """Load normalized MoA slots used by the shared hard-budget identity gate."""
+    from agent.turn_routing_runtime import load_turn_moa_config
+
+    return load_turn_moa_config()
+
+
+def _quarantine_turn_routing_agent(
+    sid: str,
+    session: dict,
+    target_agent: Any,
+    reason: str,
+) -> None:
+    """Evict an unverified resident runtime without clearing conversation state."""
+
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("agent") is not target_agent:
+            return
+        session["agent"] = None
+        session["routing_quarantined"] = str(reason or "route_restore_failed")
+        ready = session.get("agent_ready")
+        if ready is not None:
+            ready.clear()
+        session.pop("agent_build_started", None)
+        session.pop("agent_error", None)
 
 
 def _apply_model_switch(
@@ -4137,9 +4233,7 @@ def _apply_model_switch(
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
-    restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
-
-    if agent:
+    if agent and not one_turn:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -4182,6 +4276,25 @@ def _apply_model_switch(
                 "confirm_message": confirm_msg,
             }
 
+    if one_turn:
+        # Queue typed intent only. The shared user-turn lifecycle authorizes,
+        # applies, and exactly restores this request-scoped runtime. Mutating
+        # the resident agent here created a second surface-owned transaction
+        # and allowed attachment/provider work to run before authorization.
+        session["one_turn_route_target"] = {
+            "kind": "model",
+            "provider": result.target_provider,
+            "model": result.new_model,
+        }
+        session.pop("one_turn_moa_target", None)
+        session.pop("one_turn_model_restore", None)
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "once",
+        }
+
     if agent:
         try:
             agent.switch_model(
@@ -4211,10 +4324,9 @@ def _apply_model_switch(
             session, model=result.new_model, provider=result.target_provider
         )
         _emit("session.info", sid, _session_info(agent, session))
-        if one_turn:
-            session["one_turn_model_restore"] = restore_snapshot
-        else:
-            session.pop("one_turn_model_restore", None)
+        session.pop("one_turn_model_restore", None)
+        session.pop("one_turn_route_target", None)
+        session.pop("one_turn_moa_target", None)
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
     # session (e.g. /new via _reset_session_agent, or resume) re-derives the
@@ -4645,7 +4757,8 @@ def _current_profile_name() -> str:
 # v3: adds approvals.mode config RPCs and session.info reconciliation.
 # v4: session.create fast=false is an explicit per-session normal-tier override.
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
-DESKTOP_BACKEND_CONTRACT = 5
+# v6: route events carry a session-monotonic turn_sequence for stale-start rejection.
+DESKTOP_BACKEND_CONTRACT = 6
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -5787,6 +5900,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("one_turn_route_target", None)
+        session.pop("one_turn_moa_target", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -6320,6 +6435,82 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
     if prefix:
         return f"{prefix}\n\n{text}" if text else prefix
     return text or "What do you see in this image?"
+
+
+def _prepare_tui_message_after_routing(
+    agent: Any,
+    prompt: Any,
+    images: list[str],
+    cwd: str,
+) -> tuple[Any, Any]:
+    """Run model-dependent message shaping after shared-core authorization."""
+
+    if isinstance(prompt, str) and "@" in prompt:
+        from agent.context_references import preprocess_context_references
+        from agent.model_metadata import get_model_context_length
+
+        ctx_len = get_model_context_length(
+            getattr(agent, "model", "") or _resolve_model(),
+            base_url=getattr(agent, "base_url", "") or "",
+            api_key=getattr(agent, "api_key", "") or "",
+            provider=getattr(agent, "provider", "") or "",
+            config_context_length=getattr(agent, "_config_context_length", None),
+        )
+        ctx = preprocess_context_references(
+            prompt,
+            cwd=cwd,
+            allowed_root=cwd,
+            context_length=ctx_len,
+        )
+        if ctx.blocked:
+            raise ValueError("\n".join(ctx.warnings) or "Context injection refused.")
+        prompt = ctx.message
+
+    run_message: Any = prompt
+    if not images:
+        return run_message, prompt
+
+    build_native_content_parts = None
+    try:
+        from agent.image_routing import build_native_content_parts, decide_image_input_mode
+        from hermes_cli.config import load_config as _tui_load_config
+
+        config = _tui_load_config()
+        provider, model = _active_image_routing_identity(agent)
+        mode = decide_image_input_mode(
+            provider,
+            model,
+            config,
+            requested_provider=getattr(agent, "requested_provider", ""),
+        )
+        if getattr(agent, "api_mode", "") == "codex_app_server":
+            mode = "text"
+    except Exception as exc:
+        print(
+            f"[tui_gateway] image_routing decision failed, defaulting to text: {exc}",
+            file=sys.stderr,
+        )
+        mode = "text"
+
+    if mode != "native":
+        return _enrich_with_attached_images(prompt, images), prompt
+    if build_native_content_parts is None:
+        return _enrich_with_attached_images(prompt, images), prompt
+    try:
+        parts, skipped = build_native_content_parts(prompt, images)
+        if skipped:
+            print(
+                f"[tui_gateway] native image attachment skipped {len(skipped)} unreadable path(s)",
+                file=sys.stderr,
+            )
+        if any(part.get("type") == "image_url" for part in parts):
+            return parts, prompt
+    except Exception as exc:
+        print(
+            f"[tui_gateway] native attach failed, falling back to text: {exc}",
+            file=sys.stderr,
+        )
+    return _enrich_with_attached_images(prompt, images), prompt
 
 
 def _build_persist_message_with_image_refs(user_text: str, image_paths: list[str]) -> str:
@@ -8606,7 +8797,13 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid,
+                            sid,
+                            session,
+                            "\n".join(_batch),
+                            display_kind="kanban_notification",
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -8702,7 +8899,13 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="process_complete",
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -8780,7 +8983,13 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    display_kind="process_complete",
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -8936,7 +9145,14 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_target = session.pop("one_turn_route_target", None)
+        one_turn_moa_target = session.pop("one_turn_moa_target", None)
+        # Retire legacy surface-owned transaction markers. New one-shot intent
+        # is applied/restored only by the shared user-turn lifecycle.
+        session.pop("one_turn_model_restore", None)
+        session.pop("moa_one_shot_restore", None)
+        explicit_turn_override = isinstance(one_turn_target, dict)
+        explicit_moa_override = isinstance(one_turn_moa_target, dict)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -8974,108 +9190,13 @@ def _run_prompt_submit(
             # the sudo.request overlay. (secret capture is a module global, so
             # re-running is a harmless no-op.)
             _wire_callbacks(sid)
-            # Skip the config-model sync while a /model --once override is
-            # active: the once-model is intentionally not pinned as a session
-            # model_override (it must not persist), so without this guard the
-            # sync would see "agent model != config model" and clobber the
-            # once-override back to the config model before the turn runs
-            # (#29923 review defect). Any config.yaml change is adopted on
-            # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
-                _sync_agent_model_with_config(sid, session)
+            _sync_agent_model_with_config(sid, session)
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
-
-            if isinstance(prompt, str) and "@" in prompt:
-                from agent.context_references import preprocess_context_references
-                from agent.model_metadata import get_model_context_length
-
-                ctx_len = get_model_context_length(
-                    getattr(agent, "model", "") or _resolve_model(),
-                    base_url=getattr(agent, "base_url", "") or "",
-                    api_key=getattr(agent, "api_key", "") or "",
-                    provider=getattr(agent, "provider", "") or "",
-                    config_context_length=getattr(
-                        agent, "_config_context_length", None
-                    ),
-                )
-                ctx = preprocess_context_references(
-                    prompt,
-                    cwd=cwd,
-                    allowed_root=cwd,
-                    context_length=ctx_len,
-                )
-                if ctx.blocked:
-                    _emit(
-                        "error",
-                        sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
-                            or "Context injection refused."
-                        },
-                    )
-                    return
-                prompt = ctx.message
-
-            # Decide image routing per-turn based on active provider/model.
-            # "native" → pass pixels to the main model as OpenAI-style content
-            # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
-            # "text"   → pre-analyze with vision_analyze and prepend the text.
-            # See agent/image_routing.py for the full decision table.
             run_message: Any = prompt
-            if images:
-                try:
-                    from agent.image_routing import (
-                        decide_image_input_mode,
-                        build_native_content_parts,
-                    )
-                    from hermes_cli.config import load_config as _tui_load_config
-
-                    _cfg = _tui_load_config()
-                    _provider, _model = _active_image_routing_identity(agent)
-                    _mode = decide_image_input_mode(
-                        _provider,
-                        _model,
-                        _cfg,
-                        requested_provider=getattr(
-                            agent, "requested_provider", ""
-                        ),
-                    )
-                    if getattr(agent, "api_mode", "") == "codex_app_server":
-                        _mode = "text"
-                except Exception as _img_exc:
-                    print(
-                        f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
-                        file=sys.stderr,
-                    )
-                    _mode = "text"
-
-                if _mode == "native":
-                    try:
-                        _parts, _skipped = build_native_content_parts(
-                            prompt,
-                            images,
-                        )
-                        if _skipped:
-                            print(
-                                f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
-                                file=sys.stderr,
-                            )
-                        if any(p.get("type") == "image_url" for p in _parts):
-                            run_message = _parts
-                        else:
-                            run_message = _enrich_with_attached_images(prompt, images)
-                    except Exception as _img_exc:
-                        print(
-                            f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
-                            file=sys.stderr,
-                        )
-                        run_message = _enrich_with_attached_images(prompt, images)
-                else:
-                    run_message = _enrich_with_attached_images(prompt, images)
 
             # Streaming TTS: voice-mode replies are spoken sentence-by-sentence
             # as tokens arrive (CLI parity) instead of after the full turn.
@@ -9126,11 +9247,7 @@ def _run_prompt_submit(
             # ("rude!") instead of being oblivious to its own interruption.
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
-            if take_speech_interrupted():
-                if isinstance(run_message, str):
-                    run_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{run_message}"
-                elif isinstance(run_message, list):
-                    run_message = [{"type": "text", "text": SPEECH_INTERRUPTED_NOTE}, *run_message]
+            speech_interrupted = take_speech_interrupted()
 
             def _stream(delta):
                 with session["history_lock"]:
@@ -9158,13 +9275,80 @@ def _run_prompt_submit(
             else:
                 agent.interim_assistant_callback = None
 
+            from agent.turn_routing_runtime import (
+                PreparedTurnMessage,
+                TurnRoutingRequest,
+                TurnRoutingSessionState,
+            )
+
+            def _prepare_message_after_routing(message: Any) -> PreparedTurnMessage:
+                prepared_message, persist_prompt = _prepare_tui_message_after_routing(
+                    agent,
+                    message,
+                    images,
+                    cwd,
+                )
+                if speech_interrupted:
+                    if isinstance(prepared_message, str):
+                        prepared_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{prepared_message}"
+                    elif isinstance(prepared_message, list):
+                        prepared_message = [
+                            {"type": "text", "text": SPEECH_INTERRUPTED_NOTE},
+                            *prepared_message,
+                        ]
+                persist_message = (
+                    _build_persist_user_message(persist_prompt, images, prepared_message)
+                    if images
+                    else persist_prompt
+                )
+                return PreparedTurnMessage(prepared_message, persist_message)
+
             run_kwargs = {
                 "conversation_history": list(history),
                 "stream_callback": _stream,
-                "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
-                ),
+                "persist_user_message": prompt,
             }
+
+            _session_pinned = bool(session.get("model_override"))
+            _explicit_target = None
+            if explicit_turn_override:
+                _explicit_target = dict(one_turn_target)
+            elif explicit_moa_override:
+                _explicit_target = dict(one_turn_moa_target)
+            elif _session_pinned:
+                _provider = str(getattr(agent, "provider", "") or "")
+                _model = str(getattr(agent, "model", "") or "")
+                _explicit_target = (
+                    {"kind": "moa", "preset": _model}
+                    if _provider == "moa"
+                    else {
+                        "kind": "model",
+                        "provider": _provider,
+                        "model": _model,
+                    }
+                )
+            run_kwargs["turn_routing_request"] = TurnRoutingRequest(
+                surface="tui",
+                session_id=str(session.get("session_key") or "") or None,
+                user_text=text if isinstance(text, str) else "",
+                explicit_turn_override=explicit_turn_override,
+                explicit_moa_override=explicit_moa_override,
+                explicit_target=_explicit_target,
+                session_pinned=_session_pinned,
+                moa_config=_load_turn_moa_config(),
+                prepare_user_message=_prepare_message_after_routing,
+                config_loader=_load_turn_routing_config,
+                emit=lambda event, payload: _emit(event, sid, payload),
+                quarantine=lambda target_agent, reason: _quarantine_turn_routing_agent(
+                    sid,
+                    session,
+                    target_agent,
+                    reason,
+                ),
+                session_state=session.setdefault(
+                    "turn_routing_state", TurnRoutingSessionState()
+                ),
+            )
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -9202,48 +9386,6 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
-            if "moa_one_shot_restore" in session:
-                _restore = session.pop("moa_one_shot_restore", None)
-                # Restore the model the user was on before the /moa one-shot.
-                # The one-shot did a real in-place agent.switch_model() to MoA
-                # (#53444), so undoing it must go back through the switch path —
-                # resetting session["model_override"] alone would leave the live
-                # agent's client pinned to MoA for the next turn.
-                if isinstance(_restore, dict):
-                    _prev_override = _restore.get("override")
-                    _prev_model = _restore.get("model")
-                    _prev_provider = _restore.get("provider")
-                    if _prev_override is None:
-                        session.pop("model_override", None)
-                    else:
-                        session["model_override"] = _prev_override
-                    if _prev_model:
-                        _raw = (
-                            f"{_prev_model} --provider {_prev_provider}"
-                            if _prev_provider
-                            else _prev_model
-                        )
-                        try:
-                            _apply_model_switch(
-                                sid,
-                                session,
-                                _raw,
-                                confirm_expensive_model=False,
-                                pin_session_override=bool(_prev_override),
-                                # Session-internal restore after the /moa
-                                # one-shot — never persist to config.yaml.
-                                persist_override=False,
-                            )
-                        except Exception as _moa_restore_exc:
-                            logger.warning(
-                                "MoA one-shot model restore failed: %s",
-                                _moa_restore_exc,
-                            )
-                elif _restore is None:
-                    session.pop("model_override", None)
-                else:
-                    session["model_override"] = _restore
-
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
@@ -9540,14 +9682,6 @@ def _run_prompt_submit(
                     pass
             if tts_queue is not None:
                 tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
-            if one_turn_restore:
-                try:
-                    _restore_agent_model_runtime(agent, one_turn_restore)
-                    _restart_slash_worker(sid, session)
-                    _persist_live_session_runtime(session)
-                    _persist_live_session_system_prompt(session)
-                except Exception:
-                    logger.debug("TUI one-turn model restore failed", exc_info=True)
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -9603,7 +9737,13 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    goal_followup,
+                    display_kind="goal_continue",
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -9649,7 +9789,13 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        display_kind="process_complete",
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
@@ -9937,8 +10083,16 @@ def _(rid, params: dict) -> dict:
         try:
             if not value:
                 return _err(rid, 4002, "model value required")
+            from hermes_cli.model_switch import parse_model_flags_detailed
+
+            parsed_flags = parse_model_flags_detailed(value)
             if session:
-                # Reject during an in-flight turn.  agent.switch_model()
+                # Reject persistent switches during an in-flight turn.
+                # A --once selection only stages typed intent for the NEXT
+                # real-user turn; it does not mutate the resident runtime read
+                # by the current worker and is therefore safe to queue here.
+                #
+                # agent.switch_model()
                 # mutates self.model / self.provider / self.base_url /
                 # self.client in place; the worker thread running
                 # agent.run_conversation is reading those on every
@@ -9946,15 +10100,12 @@ def _(rid, params: dict) -> dict:
                 # with the new base_url but old model (or vice versa),
                 # producing 400/404s the user never asked for.  Parity
                 # with the gateway's running-agent /model guard.
-                if session.get("running"):
+                if session.get("running") and not parsed_flags.is_once:
                     return _err(
                         rid,
                         4009,
                         "session busy — /interrupt the current turn before switching models",
                     )
-                from hermes_cli.model_switch import parse_model_switch_args
-
-                parsed_flags = parse_model_switch_args(value)
                 explicit_provider = parsed_flags.explicit_provider
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
@@ -10092,6 +10243,20 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4002, f"unknown busy mode: {value}")
         _write_config_key("display.busy_input_mode", raw)
         return _ok(rid, {"key": key, "value": raw})
+
+    if key == "routing_mode":
+        raw = str(value or "").strip().lower()
+        if raw not in {"off", "observe", "auto"}:
+            return _err(
+                rid,
+                4002,
+                f"unknown routing mode: {value}; pick one of off|observe|auto",
+            )
+        _write_config_key("routing.mode", raw)
+        return _ok(
+            rid,
+            {"key": key, "value": raw, "capability_version": 1},
+        )
 
     if key == "verbose":
         cycle = ["off", "new", "all", "verbose"]
@@ -11189,6 +11354,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "steer",
         "plan",
         "goal",
+        "route",
         "moa",
         "undo",
         "learn",

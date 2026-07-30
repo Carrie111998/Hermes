@@ -4065,6 +4065,11 @@ class TurnRunner:
         # message lives on the shared TurnContext instead: every rebind
         # writes `ctx.message`, so the outer `_run_agent_inner` body observes
         # the updated value exactly as it did through the closure cell.
+        # Preserve the real user-authored payload before model notes, recovery
+        # guidance, observed-group context, or native-media shaping. The router
+        # matcher sees only this value; provider-only enrichment is installed
+        # after route authorization below.
+        _routing_user_message = ctx.message
 
         # session_key is propagated via contextvars in _set_session_env()
         # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
@@ -5073,7 +5078,23 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            _conversation_user_message = _api_run_message
+            _is_real_user_turn = not bool(_is_resume_pending)
+            if _is_real_user_turn:
+                _conversation_kwargs["turn_routing_request"] = (
+                    self._runner._take_gateway_turn_routing_request(
+                        session_key=ctx.session_key or "",
+                        agent=agent,
+                        user_text=_routing_user_message,
+                        api_user_message=_api_run_message,
+                        persist_user_message=_persist_user_message_override,
+                    )
+                )
+                _conversation_user_message = _routing_user_message
+            result = agent.run_conversation(
+                _conversation_user_message,
+                **_conversation_kwargs,
+            )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -5433,6 +5454,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides = legacy_dict_property("_session_model_overrides")
     _pending_one_turn_model_restores = legacy_dict_property(
         "_pending_one_turn_model_restores"
+    )
+    _pending_turn_route_targets = legacy_dict_property(
+        "_pending_turn_route_targets"
+    )
+    _turn_routing_session_states = legacy_dict_property(
+        "_turn_routing_session_states"
     )
     _session_reasoning_overrides = legacy_dict_property("_session_reasoning_overrides")
     _session_service_tier_overrides = legacy_dict_property(
@@ -14418,6 +14445,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "model":
             return await self._handle_model_command(event)
 
+        if canonical == "route":
+            return await self._handle_route_command(event)
+
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
@@ -14592,18 +14622,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_cfg = normalize_moa_config({})
             preset = moa_cfg["default_preset"]
             try:
-                event.text = moa_payload
-                _moa_state = self._session_state(_quick_key)
-                event._moa_restore_override = _moa_state.conversation.model_override
-                _moa_state.conversation.model_override = {
-                    "provider": "moa",
-                    "model": preset,
-                    "base_url": "moa://local",
-                    "api_key": "moa-virtual-provider",
-                    "api_mode": "chat_completions",
-                }
-                self._evict_cached_agent(_quick_key)
-                event._moa_disable_after_turn = True
+                self._stage_moa_turn_route_target(
+                    event,
+                    _quick_key,
+                    preset=preset,
+                    payload=moa_payload,
+                )
             except Exception:
                 return "Failed to prepare MoA turn."
 
@@ -14933,16 +14957,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            # One-turn model/MoA application and restoration belong exclusively
+            # to TurnRoutingRequest's shared real-user-turn lifecycle. The
+            # Gateway surface only stages typed intent, so there is deliberately
+            # no second surface-level restore in this unwind path.
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -14956,38 +14974,103 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
 
-    def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
-        """Revert a ``/moa <prompt>`` one-shot model override after its turn.
+    def _take_gateway_turn_routing_request(
+        self,
+        *,
+        session_key: str,
+        agent: Any,
+        user_text: Any,
+        api_user_message: Any,
+        persist_user_message: Any,
+    ) -> Any:
+        """Consume Gateway turn intent into the shared routing lifecycle."""
+        from agent.turn_routing_runtime import (
+            PreparedTurnMessage,
+            TurnRoutingSessionState,
+            TurnRoutingRequest,
+            load_turn_moa_config,
+            load_turn_routing_config,
+        )
 
-        Called from the ``finally`` of the message-handling path so the revert
-        fires whether the turn succeeded, raised, or was interrupted. A no-op
-        unless ``event._moa_disable_after_turn`` is set. ``_moa_restore_override``
-        carries the prior per-session override (``None`` means the user had no
-        override, so the MoA override is cleared outright).
-        """
-        if not getattr(event, "_moa_disable_after_turn", False):
-            return
-        try:
-            _restore = getattr(event, "_moa_restore_override", None)
-            self._session_state(quick_key).conversation.model_override = _restore
-            self._evict_cached_agent(quick_key)
-        except Exception:
-            pass
+        conversation = self._session_state(session_key).conversation
+        explicit_target = conversation.pending_turn_route_target
+        conversation.pending_turn_route_target = None
+        session_state = conversation.turn_routing_session_state
+        if not isinstance(session_state, TurnRoutingSessionState):
+            session_state = TurnRoutingSessionState()
+            conversation.turn_routing_session_state = session_state
+        session_pinned = bool(conversation.model_override)
+        target_kind = (
+            str(explicit_target.get("kind") or "").strip().casefold()
+            if isinstance(explicit_target, dict)
+            else ""
+        )
+        clean_persist_message = (
+            persist_user_message
+            if persist_user_message is not None
+            else user_text
+        )
 
-    def _restore_pending_one_turn_model_override(self, session_key: str) -> None:
-        """Restore a per-session model override after ``/model --once`` runs."""
-        if not session_key:
-            return
-        try:
-            _otr_state = self._peek_session_state(session_key)
-            snapshot = _otr_state.conversation.one_turn_restore if _otr_state else None
-            if _otr_state is not None:
-                _otr_state.conversation.one_turn_restore = None
-            if not snapshot:
-                return
-            self._restore_session_model_override(session_key, snapshot)
-        except Exception:
-            logger.debug("Failed to restore one-turn model override", exc_info=True)
+        def _prepare(_routed_user_message: Any) -> PreparedTurnMessage:
+            return PreparedTurnMessage(
+                user_message=api_user_message,
+                persist_user_message=clean_persist_message,
+            )
+
+        def _emit(event_name: str, payload: dict[str, Any]) -> None:
+            logger.info(
+                "gateway turn routing event=%s session=%s payload=%s",
+                event_name,
+                session_key,
+                payload,
+            )
+
+        def _quarantine(target_agent: Any, reason: str) -> None:
+            setattr(
+                target_agent,
+                "_turn_routing_quarantined",
+                str(reason or "route_restore_failed"),
+            )
+            cache = getattr(self, "_agent_cache", None)
+            cached = cache.get(session_key) if isinstance(cache, dict) else None
+            cached_agent = cached[0] if isinstance(cached, tuple) and cached else cached
+            if cached_agent is target_agent:
+                self._evict_cached_agent(session_key)
+
+        return TurnRoutingRequest(
+            surface="gateway",
+            session_id=str(getattr(agent, "session_id", "") or "") or None,
+            user_text=user_text,
+            explicit_turn_override=(
+                explicit_target is not None and target_kind != "moa"
+            ),
+            explicit_moa_override=target_kind == "moa",
+            explicit_target=explicit_target,
+            session_pinned=session_pinned,
+            moa_config=load_turn_moa_config(),
+            prepare_user_message=_prepare,
+            config_loader=load_turn_routing_config,
+            emit=_emit,
+            quarantine=_quarantine,
+            session_state=session_state,
+        )
+
+    def _stage_moa_turn_route_target(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+        *,
+        preset: str,
+        payload: str,
+    ) -> None:
+        """Queue one-shot MoA intent without changing resident session state."""
+        event.text = payload
+        self._session_state(
+            session_key
+        ).conversation.pending_turn_route_target = {
+            "kind": "moa",
+            "preset": preset,
+        }
 
     async def _prepare_inbound_message_text(
         self,

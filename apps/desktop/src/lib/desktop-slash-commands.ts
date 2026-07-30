@@ -291,6 +291,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'text'
   },
+  {
+    name: '/route',
+    description: 'Inspect or control per-turn model routing',
+    surface: exec(),
+    argumentMode: 'options'
+  },
   { name: '/retry', description: 'Retry the last user message', surface: exec() },
   { name: '/rollback', description: 'List or restore filesystem checkpoints', surface: exec() },
   {

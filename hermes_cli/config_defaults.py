@@ -8,6 +8,18 @@ DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
     "fallback_providers": [],
+    # Per-user-turn model/MoA routing. Inert by default; this is intentionally
+    # separate from the legacy smart_model_routing feature.
+    "routing": {
+        "mode": "off",
+        "affinity_turns": 2,
+        "failure_limit": 3,
+        "budget": {
+            "grok_weekly_limit": 0,
+            "reservation_lease_seconds": 300,
+            "cooldown_seconds": 3600,
+        },
+    },
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
     # SQLite journal mode used by every Hermes database opener. WAL is the

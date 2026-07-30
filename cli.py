@@ -4301,6 +4301,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # query, -Q, and gateway paths never set it, which is what keeps the
         # summary line out of non-interactive surfaces.
         self._interactive_turn = False
+        self._pending_turn_route_target = None
+        self._session_model_pinned = bool(model is not None or provider is not None)
+        self._turn_routing_quarantined = None
 
         # Submitted multiline user-message preview (display.user_message_preview in config.yaml)
         _ump = CLI_CONFIG["display"].get("user_message_preview", {})
@@ -7970,6 +7973,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # so a session-only switch never leaks into the next session (#48055,
         # #23131).
         self._pending_one_turn_model_restore = None
+        self._pending_turn_route_target = None
+        self._session_model_pinned = False
         self.service_tier = _parse_service_tier_config(
             CLI_CONFIG["agent"].get("service_tier", "")
         )
@@ -8838,6 +8843,69 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as exc:
                 logger.warning("CLI one-turn model restore failed: %s", exc)
 
+    def _take_turn_routing_request(
+        self,
+        *,
+        user_text,
+        api_user_message,
+        persist_user_message,
+    ):
+        """Consume classic-CLI turn intent into the shared routing lifecycle."""
+
+        from agent.turn_routing_runtime import (
+            PreparedTurnMessage,
+            TurnRoutingSessionState,
+            TurnRoutingRequest,
+            load_turn_moa_config,
+            load_turn_routing_config,
+        )
+
+        explicit_target = getattr(self, "_pending_turn_route_target", None)
+        self._pending_turn_route_target = None
+        session_state = getattr(self, "_turn_routing_session_state", None)
+        if not isinstance(session_state, TurnRoutingSessionState):
+            session_state = TurnRoutingSessionState()
+            self._turn_routing_session_state = session_state
+
+        def _prepare(_routed_user_message):
+            return PreparedTurnMessage(
+                user_message=api_user_message,
+                persist_user_message=persist_user_message,
+            )
+
+        def _emit(event, payload):
+            logger.info("classic CLI turn routing event=%s payload=%s", event, payload)
+
+        def _quarantine(target_agent, reason):
+            if getattr(self, "agent", None) is target_agent:
+                self.agent = None
+                self._turn_routing_quarantined = str(
+                    reason or "route_restore_failed"
+                )
+
+        target_kind = (
+            str(explicit_target.get("kind") or "").strip().casefold()
+            if isinstance(explicit_target, dict)
+            else ""
+        )
+        return TurnRoutingRequest(
+            surface="cli",
+            session_id=str(getattr(self, "session_id", "") or "") or None,
+            user_text=user_text,
+            explicit_turn_override=(
+                explicit_target is not None and target_kind != "moa"
+            ),
+            explicit_moa_override=target_kind == "moa",
+            explicit_target=explicit_target,
+            session_pinned=bool(getattr(self, "_session_model_pinned", False)),
+            moa_config=load_turn_moa_config(),
+            prepare_user_message=_prepare,
+            config_loader=load_turn_routing_config,
+            emit=_emit,
+            quarantine=_quarantine,
+            session_state=session_state,
+        )
+
     @staticmethod
     def _compute_model_picker_viewport(
         selected: int,
@@ -9258,58 +9326,62 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint("  Model switch cancelled.")
             return
 
-        # Apply to CLI state.
-        # Update requested_provider so _ensure_runtime_credentials() doesn't
-        # overwrite the switch on the next turn (it re-resolves from this).
+        # A one-turn override is typed intent only. The shared real-user-turn
+        # lifecycle resolves, authorizes, applies, and restores it after the
+        # stable turn id exists; the surface must not pre-switch resident state.
         old_model = self.model
-        _one_turn_restore_snapshot = self._snapshot_model_runtime() if one_turn else None
-        # Snapshot CLI-level fields before mutation so a failed in-place swap
-        # rolls the whole CLI back to the old working model (#50163).
-        _cli_snapshot = {
-            "model": self.model,
-            "provider": self.provider,
-            "requested_provider": self.requested_provider,
-            "_explicit_api_key": getattr(self, "_explicit_api_key", None),
-            "_explicit_base_url": getattr(self, "_explicit_base_url", None),
-            "api_key": self.api_key,
-            "base_url": self.base_url,
-            "api_mode": self.api_mode,
-        }
-        self.model = result.new_model
-        self.provider = result.target_provider
-        self.requested_provider = result.target_provider
-        # Always overwrite explicit overrides so stale credentials from the
-        # previous provider (e.g. Ollama api_key/base_url) don't leak into
-        # the new provider's credential resolution on the next turn.
-        self._explicit_api_key = result.api_key
-        self._explicit_base_url = result.base_url
-        if result.api_key:
-            self.api_key = result.api_key
-        if result.base_url:
-            self.base_url = result.base_url
-        if result.api_mode:
-            self.api_mode = result.api_mode
+        if one_turn:
+            self._pending_turn_route_target = {
+                "kind": "model",
+                "provider": result.target_provider,
+                "model": result.new_model,
+            }
+            self._pending_one_turn_model_restore = None
+        else:
+            # Snapshot CLI-level fields before mutation so a failed in-place
+            # swap rolls the whole CLI back to the old working model (#50163).
+            _cli_snapshot = {
+                "model": self.model,
+                "provider": self.provider,
+                "requested_provider": self.requested_provider,
+                "_explicit_api_key": getattr(self, "_explicit_api_key", None),
+                "_explicit_base_url": getattr(self, "_explicit_base_url", None),
+                "api_key": self.api_key,
+                "base_url": self.base_url,
+                "api_mode": self.api_mode,
+            }
+            self.model = result.new_model
+            self.provider = result.target_provider
+            self.requested_provider = result.target_provider
+            # Always overwrite explicit overrides so stale credentials from the
+            # previous provider do not leak into the next runtime resolution.
+            self._explicit_api_key = result.api_key
+            self._explicit_base_url = result.base_url
+            if result.api_key:
+                self.api_key = result.api_key
+            if result.base_url:
+                self.base_url = result.base_url
+            if result.api_mode:
+                self.api_mode = result.api_mode
 
-        # Apply to running agent (in-place swap)
-        if self.agent is not None:
-            try:
-                self.agent.switch_model(
-                    new_model=result.new_model,
-                    new_provider=result.target_provider,
-                    api_key=result.api_key,
-                    base_url=result.base_url,
-                    api_mode=result.api_mode,
-                )
-            except Exception as exc:
-                # Agent rolled itself back; roll the CLI back too and abort so a
-                # failed switch is a no-op rather than a dead session (#50163).
-                for _k, _v in _cli_snapshot.items():
-                    setattr(self, _k, _v)
-                _cprint(
-                    f"  ⚠ Model switch to {result.new_model} failed ({exc}); "
-                    f"staying on {old_model}."
-                )
-                return
+            if self.agent is not None:
+                try:
+                    self.agent.switch_model(
+                        new_model=result.new_model,
+                        new_provider=result.target_provider,
+                        api_key=result.api_key,
+                        base_url=result.base_url,
+                        api_mode=result.api_mode,
+                    )
+                except Exception as exc:
+                    for _k, _v in _cli_snapshot.items():
+                        setattr(self, _k, _v)
+                    _cprint(
+                        f"  ⚠ Model switch to {result.new_model} failed ({exc}); "
+                        f"staying on {old_model}."
+                    )
+                    return
+            self._session_model_pinned = True
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history
@@ -9324,14 +9396,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             f"{'This override applies to the next turn only. ' if one_turn else ''}"
             f"Adjust your self-identification accordingly.]"
         )
-        if one_turn:
-            self._pending_one_turn_model_restore = _one_turn_restore_snapshot
-        else:
+        if not one_turn:
             self._pending_one_turn_model_restore = None
 
         # Display confirmation with full metadata
         provider_label = result.provider_label or result.target_provider
-        _cprint(f"  ✓ Model switched: {_display_new}")
+        _cprint(
+            f"  ✓ {'Model queued for next turn' if one_turn else 'Model switched'}: "
+            f"{_display_new}"
+        )
         _cprint(f"    Provider: {provider_label}")
 
         # Context: always resolve via the provider-aware chain so Codex OAuth,
@@ -9542,6 +9615,40 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print(f"    2. Or configure settings in {display_hermes_home()}/config.yaml")
             print()
     
+    def _handle_route_command(self, argument: str) -> None:
+        from agent.turn_routing_runtime import TurnRoutingSessionState
+        from hermes_cli.route_control import execute_route_command
+
+        state = getattr(self, "_turn_routing_session_state", None)
+        if not isinstance(state, TurnRoutingSessionState):
+            state = TurnRoutingSessionState()
+            self._turn_routing_session_state = state
+
+        def _routing_config():
+            config = getattr(self, "config", {})
+            routing = config.get("routing") if isinstance(config, dict) else None
+            return routing if isinstance(routing, dict) else {}
+
+        def _write_mode(mode: str) -> None:
+            if not save_config_value("routing.mode", mode):
+                raise RuntimeError("failed to save routing.mode")
+            config = getattr(self, "config", None)
+            if isinstance(config, dict):
+                routing = config.setdefault("routing", {})
+                if isinstance(routing, dict):
+                    routing["mode"] = mode
+
+        try:
+            output = execute_route_command(
+                argument,
+                state=state,
+                config_loader=_routing_config,
+                mode_writer=_write_mode,
+            )
+        except Exception as exc:
+            output = f"Route command failed: {exc}"
+        _cprint(output)
+
     def process_command(self, command: str) -> bool:
         """
         Process a slash command.
@@ -10005,6 +10112,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "route":
+            _parts = cmd_original.split(None, 1)
+            self._handle_route_command(_parts[1] if len(_parts) > 1 else "status")
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a
@@ -10023,24 +10133,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             moa_cfg = self.config.get("moa") if isinstance(self.config, dict) else {}
             normalized = normalize_moa_config(moa_cfg)
             preset = normalized["default_preset"]
-            self._pending_moa_restore_model = {
-                "requested_provider": getattr(self, "requested_provider", None),
-                "provider": getattr(self, "provider", None),
-                "model": getattr(self, "model", None),
-                "api_key": getattr(self, "api_key", None),
-                "base_url": getattr(self, "base_url", None),
-                "api_mode": getattr(self, "api_mode", None),
+            self._pending_turn_route_target = {
+                "kind": "moa",
+                "preset": preset,
             }
-            self.requested_provider = "moa"
-            self.provider = "moa"
-            self.model = preset
-            self.api_key = "moa-virtual-provider"
-            self.base_url = "moa://local"
-            self.api_mode = "chat_completions"
-            self.agent = None
-            self._pending_moa_disable_after_turn = True
+            self._pending_moa_restore_model = None
+            self._pending_moa_disable_after_turn = False
             self._pending_agent_seed = payload
-            _cprint(f"  MoA one-shot queued with preset {preset}; previous model will be restored after this turn.")
+            _cprint(
+                f"  MoA one-shot queued with preset {preset}; "
+                "resident model is unchanged."
+            )
         elif canonical == "subgoal":
             self._handle_subgoal_command(cmd_original)
         elif canonical == "skin":
@@ -13634,6 +13737,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _persist_clean_user_message = (
                     message if (_voice_prefix or agent_message != message) else None
                 )
+                _turn_routing_request = self._take_turn_routing_request(
+                    user_text=message,
+                    api_user_message=agent_message,
+                    persist_user_message=_persist_clean_user_message,
+                )
                 _one_turn_model_restore = getattr(
                     self, "_pending_one_turn_model_restore", None
                 )
@@ -13646,6 +13754,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        turn_routing_request=_turn_routing_request,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}

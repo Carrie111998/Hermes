@@ -8,7 +8,7 @@ previously bypassed the guard entirely — a user typing
 These tests pin the typed path:
 
 - warning fires → handler returns the slash-confirm prompt, switch NOT applied
-- confirm ("once") → switch applies (session override set)
+- confirm ("once") → typed one-turn route intent is staged
 - cancel → switch not applied, current model unchanged
 - no warning (cheap model) → switch applies immediately, no prompt
 """
@@ -94,7 +94,7 @@ def _setup_isolated_home(tmp_path, monkeypatch, *, warn):
 
 @pytest.mark.asyncio
 async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monkeypatch):
-    """Resolving the confirm with "once" applies the switch."""
+    """Resolving "once" stages typed intent without mutating resident state."""
     _setup_isolated_home(tmp_path, monkeypatch, warn=True)
     runner = _make_runner()
     runner._evict_cached_agent = lambda session_key: None
@@ -113,9 +113,17 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
     reply = await captured["handler"]("once")
 
     assert "gpt-5.5-pro" in reply
-    overrides = list(runner._session_model_overrides.values())
-    assert len(overrides) == 1
-    assert overrides[0]["model"] == "openai/gpt-5.5-pro"
+    source = _make_event("/model openai/gpt-5.5-pro").source
+    session_key = runner._session_key_for_source(source)
+    pending = runner._session_state(
+        session_key
+    ).conversation.pending_turn_route_target
+    assert pending == {
+        "kind": "model",
+        "model": "openai/gpt-5.5-pro",
+        "provider": "openrouter",
+    }
+    assert runner._session_model_overrides == {}
 
 
 @pytest.mark.asyncio

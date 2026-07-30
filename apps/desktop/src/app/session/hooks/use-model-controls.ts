@@ -167,6 +167,7 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
     async (selection: ModelSelection): Promise<boolean> => {
       const primaryRuntimeId = $activeSessionId.get()
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
+      const once = selection.scope === 'once'
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
       const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
@@ -178,11 +179,17 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
 
-      if (touchesPrimary) {
+      if (once && !liveSessionId) {
+        notifyError(new Error('A next-turn model requires a live session'), copy.modelSwitchFailed)
+
+        return false
+      }
+
+      if (!once && touchesPrimary) {
         setCurrentModel(selection.model)
         setCurrentProvider(selection.provider)
         markComposerSelectionManual()
-      } else if (liveSessionId) {
+      } else if (!once && liveSessionId) {
         // Optimistic tile paint — session.info will confirm; rollback on error.
         sessionTileDelegate()?.updateSession(liveSessionId, state => ({
           ...state,
@@ -191,13 +198,15 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         }))
       }
 
-      updateModelOptionsCache(
-        liveSessionId,
-        selection.provider,
-        selection.model,
-        touchesPrimary && !liveSessionId,
-        liveGatewayProfile
-      )
+      if (!once) {
+        updateModelOptionsCache(
+          liveSessionId,
+          selection.provider,
+          selection.model,
+          touchesPrimary && !liveSessionId,
+          liveGatewayProfile
+        )
+      }
 
       // No live session yet: the pick is pure UI state. session.create reads
       // $currentModel/$currentProvider and applies it as that session's override.
@@ -209,18 +218,20 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         await requestGateway('config.set', {
           session_id: liveSessionId,
           key: 'model',
-          value: `${selection.model} --provider ${selection.provider} --session`
+          value: `${selection.model} --provider ${selection.provider} --${once ? 'once' : 'session'}`
         })
 
-        void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+        if (!once) {
+          void queryClient.invalidateQueries({ queryKey: modelOptionsQueryKey(liveGatewayProfile, liveSessionId) })
+        }
 
         return true
       } catch (err) {
-        if (touchesPrimary) {
+        if (!once && touchesPrimary) {
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
           setCurrentModelSource(prevSource)
-        } else if (liveSessionId) {
+        } else if (!once && liveSessionId) {
           sessionTileDelegate()?.updateSession(liveSessionId, state => ({
             ...state,
             model: prevModel,
@@ -228,13 +239,15 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           }))
         }
 
-        updateModelOptionsCache(
-          liveSessionId,
-          prevProvider,
-          prevModel,
-          touchesPrimary && !liveSessionId,
-          liveGatewayProfile
-        )
+        if (!once) {
+          updateModelOptionsCache(
+            liveSessionId,
+            prevProvider,
+            prevModel,
+            touchesPrimary && !liveSessionId,
+            liveGatewayProfile
+          )
+        }
         notifyError(err, copy.modelSwitchFailed)
 
         return false

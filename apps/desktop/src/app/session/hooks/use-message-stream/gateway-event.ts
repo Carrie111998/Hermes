@@ -61,6 +61,7 @@ import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSu
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
+import { ingestTurnRouteEvent } from '@/store/turn-routing'
 import { reportInstallMethodWarning } from '@/store/updates'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
@@ -267,6 +268,15 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       const sessionId = route.sessionId
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
+
+      // Route provenance is backend-owned and session-scoped. Ingest every
+      // explicit session event (including background/tiled sessions) before the
+      // active-chat presentation gates below. The store rejects delayed events
+      // from an older turn so an out-of-order restore cannot repaint a newer
+      // decision.
+      if (sessionId && ingestTurnRouteEvent(sessionId, event.type, payload)) {
+        return
+      }
 
       // Mid-turn compaction does not emit another message.start. The first
       // model output or tool event proves summarization has finished and the

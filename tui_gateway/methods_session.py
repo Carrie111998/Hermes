@@ -2657,6 +2657,11 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # The accepted prompt owned any staged one-turn route. If it is cancelled
+    # before agent initialization reaches the shared turn lifecycle, retire
+    # that intent here rather than leaking it into an unrelated later prompt.
+    session.pop("one_turn_route_target", None)
+    session.pop("one_turn_moa_target", None)
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         if session.get("running"):

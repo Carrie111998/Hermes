@@ -138,3 +138,55 @@ moa:
     assert "model_override" not in s
 
 
+def test_moa_arg_is_always_one_shot(server, session, hermes_home):
+    # Any arg (even a preset name) is a one-shot prompt through the DEFAULT
+    # preset; /moa never does a sticky switch anymore.
+    _write_moa_config(hermes_home, """
+moa:
+  default_preset: default
+  presets:
+    default: {}
+    review:
+      reference_models:
+        - provider: openrouter
+          model: deepseek/deepseek-v4-pro
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""")
+    sid, _, s = session
+    r = _call(server, "command.dispatch", name="moa", arg="review", session_id=sid)
+    result = r["result"]
+    assert result["type"] == "send"
+    assert result["message"] == "review"
+    assert "one-shot" in result["notice"]
+    # Lazy session (no live agent) stages request-scoped intent. The resident
+    # model identity remains untouched, and the target is the DEFAULT preset
+    # rather than the prompt text "review".
+    assert "model_override" not in s
+    assert s["one_turn_moa_target"] == {"kind": "moa", "preset": "default"}
+
+
+def test_moa_non_preset_returns_one_shot_send(server, session, hermes_home):
+    _write_moa_config(hermes_home, """
+moa:
+  default_preset: default
+  presets:
+    default:
+      reference_models:
+        - provider: openai-codex
+          model: gpt-5.5
+      aggregator:
+        provider: openrouter
+        model: anthropic/claude-opus-4.8
+""")
+    sid, _, _ = session
+    r = _call(server, "command.dispatch", name="moa", arg="inspect this project", session_id=sid)
+    result = r["result"]
+    assert result["type"] == "send"
+    assert result["message"] == "inspect this project"
+    assert "one-shot" in result["notice"]
+
+
+def test_pending_input_commands_includes_moa(server):
+    assert "moa" in server._PENDING_INPUT_COMMANDS

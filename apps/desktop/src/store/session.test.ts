@@ -8,6 +8,8 @@ import {
   $activeSessionId,
   $connection,
   $currentCwd,
+  $modelPickerOpen,
+  $modelPickerScope,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
@@ -15,10 +17,12 @@ import {
   getRememberedRoute,
   getRememberedSessionId,
   mergeSessionPage,
+  openModelPicker,
   rememberedSessionProfile,
   resolveComposerSessionKey,
   sessionPinId,
   setCurrentCwd,
+  setModelPickerOpen,
   setRememberedRoute,
   setRememberedSessionId,
   setSelectedStoredSessionId,
@@ -50,6 +54,20 @@ const session = (over: Partial<SessionInfo>): SessionInfo => ({
   title: null,
   tool_call_count: 0,
   ...over
+})
+
+describe('model picker scope', () => {
+  afterEach(() => setModelPickerOpen(false))
+
+  it('resets a next-turn picker to session scope when it closes', () => {
+    openModelPicker('once')
+    expect($modelPickerOpen.get()).toBe(true)
+    expect($modelPickerScope.get()).toBe('once')
+
+    setModelPickerOpen(false)
+    expect($modelPickerOpen.get()).toBe(false)
+    expect($modelPickerScope.get()).toBe('session')
+  })
 })
 
 describe('computed $attentionSessionIds', () => {

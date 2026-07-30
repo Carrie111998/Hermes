@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.agent_runtime_helpers import switch_model as switch_model_runtime
 from run_agent import AIAgent
 
 
@@ -202,3 +203,54 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+def test_transient_switch_skips_every_persistent_side_effect():
+    agent = _make_agent_openrouter()
+    agent._primary_runtime = {"model": "x-ai/grok-4", "nested": {"generation": 1}}
+    agent._fallback_activated = True
+    agent._fallback_index = 1
+    agent._fallback_chain = [
+        {"provider": "nous", "model": "hermes-4"},
+        {"provider": "openrouter", "model": "x-ai/grok-4"},
+    ]
+    agent._fallback_model = agent._fallback_chain[0]
+    agent._rate_limited_until = 123.5
+    agent._credential_pool = MagicMock()
+    agent._credential_pool.entry_id_for_api_key.return_value = "entry-2"
+    agent._credential_pool_entry_id = "entry-1"
+    agent._session_db = MagicMock()
+    agent.session_id = "session-1"
+    agent._create_openai_client = MagicMock(return_value=MagicMock(name="TransientClient"))
+    original_primary = agent._primary_runtime
+    original_chain = agent._fallback_chain
+
+    with (
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+        patch("agent.chat_completion_helpers._reset_stale_streak") as reset_stale,
+    ):
+        switch_model_runtime(
+            agent,
+            new_model="openai/gpt-5",
+            new_provider="openrouter",
+            api_key="or-key-transient",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            persist=False,
+        )
+
+    assert agent.model == "openai/gpt-5"
+    assert agent.provider == "openrouter"
+    assert agent._cached_system_prompt == "cached"
+    assert agent._primary_runtime is original_primary
+    assert agent._primary_runtime == {
+        "model": "x-ai/grok-4",
+        "nested": {"generation": 1},
+    }
+    assert agent._fallback_chain is original_chain
+    assert agent._fallback_index == 1
+    assert agent._fallback_activated is True
+    assert agent._fallback_model == {"provider": "nous", "model": "hermes-4"}
+    assert agent._rate_limited_until == 123.5
+    reset_stale.assert_not_called()
+    agent._session_db.update_session_billing_route.assert_not_called()

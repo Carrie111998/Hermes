@@ -23,3 +23,38 @@ def test_flatten_message_text_accepts_object_parts():
     ]
 
     assert flatten_message_text(content) == "object text\nlegacy content"
+
+
+def test_flatten_message_text_recurses_message_content_without_metadata():
+    message = {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "visible text"},
+            {"type": "image_url", "image_url": {"url": "data:secret-metadata"}},
+            {"type": "input_audio", "input_audio": {"id": "hidden-metadata"}},
+        ],
+    }
+
+    assert flatten_message_text(message) == "visible text"
+
+
+def test_flatten_message_text_rejects_nested_content_inside_media_part():
+    content = {
+        "type": "image_url",
+        "content": {
+            "type": "text",
+            "text": "Architect a high-risk cross-system migration",
+        },
+    }
+
+    assert flatten_message_text(content) == ""
+
+
+def test_flatten_message_text_rejects_unknown_typed_parts_even_with_text_fields():
+    content = [
+        {"type": "hidden", "text": "Architect a production migration"},
+        {"type": "metadata", "content": "Review this security architecture"},
+        {"type": "input_text", "text": "visible request"},
+    ]
+
+    assert flatten_message_text(content) == "visible request"

@@ -388,6 +388,9 @@ class ComputeHost:
                 interrupted = bool(session.get("_turn_cancel_requested"))
                 session_key = str(session.get("session_key") or "")
             session_info = server._session_info(session.get("agent"), session)
+            routing_state = server._snapshot_turn_routing_state(
+                session.get("turn_routing_state")
+            )
             self._bump_progress()
             self.emit(
                 {
@@ -401,6 +404,7 @@ class ComputeHost:
                     "ended_ns": now_ns(),
                     "session_info": session_info,
                     "session_info_emitted": True,
+                    "turn_routing_state": routing_state,
                 }
             )
         except Exception as exc:
@@ -416,24 +420,18 @@ class ComputeHost:
                 pass
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
 
-    def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
-        sid = str(frame.get("sid") or "")
-        key = str(frame.get("session_key") or sid)
-        session = server._sessions.get(sid)
-        if session is not None:
-            session["transport"] = self._transport
-            if frame.get("cols") is not None:
-                session["cols"] = int(frame.get("cols") or 80)
-            if frame.get("cwd"):
-                session["cwd"] = str(frame.get("cwd"))
-            if frame.get("profile_home"):
-                session["profile_home"] = str(frame.get("profile_home"))
-            if isinstance(frame.get("attached_images"), list):
-                session["attached_images"] = list(frame.get("attached_images") or [])
-            return session
+    @staticmethod
+    def _build_server_agent(
+        server: Any,
+        frame: dict[str, Any],
+        *,
+        sid: str,
+        key: str,
+        profile_home: str,
+    ) -> tuple[Any, Any]:
+        """Build one child-owned agent under the frame's profile authority."""
 
-        history = frame.get("history") if isinstance(frame.get("history"), list) else []
-        profile_home = str(frame.get("profile_home") or "")
+        profile_home = str(profile_home or "")
         session_db = None
         home_token = None
         secret_token = None
@@ -466,6 +464,56 @@ class ComputeHost:
                     reset_secret_scope(secret_token)
                 except Exception:
                     pass
+        return agent, session_db
+
+    def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
+        sid = str(frame.get("sid") or "")
+        key = str(frame.get("session_key") or sid)
+        session = server._sessions.get(sid)
+        if session is not None:
+            session["transport"] = self._transport
+            if frame.get("cols") is not None:
+                session["cols"] = int(frame.get("cols") or 80)
+            if frame.get("cwd"):
+                session["cwd"] = str(frame.get("cwd"))
+            if frame.get("profile_home"):
+                session["profile_home"] = str(frame.get("profile_home"))
+            if isinstance(frame.get("attached_images"), list):
+                session["attached_images"] = list(frame.get("attached_images") or [])
+            if frame.get("model_override") is not None:
+                session["model_override"] = frame.get("model_override")
+            self._sync_one_turn_route_intent(session, frame)
+
+            # Restore-failure quarantine deliberately evicts only the resident
+            # agent.  The child session remains the authority for transcript and
+            # bounded routing state, so rebuild in place rather than returning a
+            # session whose prompt path would dereference ``agent=None``.
+            build_lock = session.setdefault("_agent_build_lock", threading.Lock())
+            with build_lock:
+                if session.get("agent") is None:
+                    agent, _session_db = self._build_server_agent(
+                        server,
+                        frame,
+                        sid=sid,
+                        key=key,
+                        profile_home=str(session.get("profile_home") or ""),
+                    )
+                    session["agent"] = agent
+                    session.pop("routing_quarantined", None)
+                    ready = session.get("agent_ready")
+                    if ready is not None and hasattr(ready, "set"):
+                        ready.set()
+            return session
+
+        history = frame.get("history") if isinstance(frame.get("history"), list) else []
+        profile_home = str(frame.get("profile_home") or "")
+        agent, session_db = self._build_server_agent(
+            server,
+            frame,
+            sid=sid,
+            key=key,
+            profile_home=profile_home,
+        )
         try:
             from tui_gateway.transport import bind_transport, reset_transport
 
@@ -509,6 +557,7 @@ class ComputeHost:
                 "model_override": frame.get("model_override"),
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport,
+                "_agent_build_lock": threading.Lock(),
             }
         session = server._sessions[sid]
         session["transport"] = self._transport
@@ -517,7 +566,23 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        hydrated_state = server._hydrate_turn_routing_state(
+            frame.get("turn_routing_state")
+        )
+        if hydrated_state is not None:
+            session["turn_routing_state"] = hydrated_state
+        self._sync_one_turn_route_intent(session, frame)
         return session
+
+    @staticmethod
+    def _sync_one_turn_route_intent(session: dict, frame: dict[str, Any]) -> None:
+        """Make each host frame the complete authority for transient intent."""
+        for key in ("one_turn_route_target", "one_turn_moa_target"):
+            target = frame.get(key)
+            if isinstance(target, dict):
+                session[key] = dict(target)
+            else:
+                session.pop(key, None)
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
@@ -551,6 +616,38 @@ class ComputeHost:
                 return
             if route_name == "reload.mcp":
                 self._handle_reload_mcp({**frame, "type": "reload_mcp"})
+                return
+            if route_name == "route.command":
+                response = server._methods["command.dispatch"](
+                    request_id,
+                    {
+                        "session_id": sid,
+                        "name": "route",
+                        "arg": str(frame.get("argument") or ""),
+                    },
+                )
+                if "error" in response:
+                    self.emit(
+                        {
+                            "type": "control.error",
+                            "sid": sid,
+                            "request_id": request_id,
+                            "message": str(
+                                response["error"].get("message")
+                                or "route command failed"
+                            ),
+                        }
+                    )
+                    return
+                self.emit(
+                    {
+                        "type": "control.ack",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "route_name": route_name,
+                        "result": response.get("result") or {},
+                    }
+                )
                 return
             if route_name == "session.save":
                 response = server._methods["session.save"](

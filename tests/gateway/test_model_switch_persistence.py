@@ -144,8 +144,8 @@ class TestIsIntentionalModelSwitch:
         assert runner._is_intentional_model_switch(sk, "gpt-5.4") is True
 
 
-class TestOneTurnModelOverrideRestore:
-    """Verify gateway one-turn overrides restore previous session state."""
+class TestSessionModelOverrideSnapshot:
+    """The generic snapshot helper restores previous persistent session state."""
 
     def test_restores_previous_override(self):
         runner = _make_runner()
@@ -169,15 +169,26 @@ class TestOneTurnModelOverrideRestore:
 
         assert runner._session_model_overrides[sk] == previous
 
+    def test_restores_absent_override_by_clearing(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+
+        snapshot = runner._snapshot_session_model_override(sk)
+        runner._session_model_overrides[sk] = {
+            "model": "temp/model",
+            "provider": "anthropic",
+        }
+
+        runner._restore_session_model_override(sk, snapshot)
+
+        assert sk not in runner._session_model_overrides
 
 class TestOneTurnNeverPersisted:
     """/model --once must never write through to the session store.
 
-    Regression guard for the #29923 review defect: the original
-    implementation wrote the once-override through set_model_override, so a
-    gateway restart before the finally-restore rehydrated a supposedly
-    one-turn model permanently. Drives the real _handle_model_command with
-    a mocked switch pipeline and asserts on the store boundary.
+    The surface queues typed intent and the shared turn lifecycle owns its
+    transient runtime application. Drives the real _handle_model_command with
+    a mocked resolver and asserts that the session store is never written.
     """
 
     @staticmethod
@@ -205,7 +216,7 @@ class TestOneTurnNeverPersisted:
                 new_model="gpt-5.5",
                 target_provider="openrouter",
                 provider_changed=False,
-                api_key="sk-test",
+                api_key="[REDACTED]",
                 base_url="https://openrouter.ai/api/v1",
                 api_mode="chat_completions",
                 provider_label="OpenRouter",
@@ -219,6 +230,7 @@ class TestOneTurnNeverPersisted:
         runner._voice_mode = {}
         runner._session_model_overrides = {}
         runner._pending_one_turn_model_restores = {}
+        runner._pending_turn_route_targets = {}
         runner._running_agents = {}
         # async_session_store is a property over session_store; install the
         # mock behind the private cache attribute it reads.
@@ -251,9 +263,14 @@ class TestOneTurnNeverPersisted:
         )
 
         assert result is not None and "gpt-5.5" in result
-        # In-memory override installed for the next turn + restore queued...
-        assert runner._session_model_overrides[sk]["model"] == "gpt-5.5"
-        assert sk in runner._pending_one_turn_model_restores
-        # ...but NEVER written through to the persistent session store.
+        # The surface queues typed intent only.  Shared turn routing owns the
+        # transient application and restoration on the next real user turn.
+        assert runner._pending_turn_route_targets[sk] == {
+            "kind": "model",
+            "model": "gpt-5.5",
+            "provider": "openrouter",
+        }
+        assert sk not in runner._session_model_overrides
+        assert sk not in runner._pending_one_turn_model_restores
         runner.async_session_store.set_model_override.assert_not_awaited()
 

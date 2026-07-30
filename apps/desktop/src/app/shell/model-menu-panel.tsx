@@ -48,6 +48,8 @@ export const ModelMenuCloseContext = createContext<() => void>(() => {})
 export interface ModelSelection {
   model: string
   provider: string
+  /** `once` stages typed intent for the next real-user turn only. */
+  scope?: 'once' | 'session'
   /** Runtime id of the surface that opened the menu. When set, the switch
    *  targets that session (a tile) instead of the primary `$activeSessionId`. */
   sessionId?: null | string

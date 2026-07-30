@@ -27,6 +27,7 @@ def _make_cli():
     cli._pending_moa_config = None
     cli._pending_moa_disable_after_turn = False
     cli._pending_moa_restore_model = None
+    cli._pending_turn_route_target = None
     cli._agent_running = False
     cli.agent = None
     cli.provider = "openrouter"
@@ -57,9 +58,10 @@ def test_moa_arg_is_always_one_shot_prompt():
     with patch("cli._cprint"):
         cli.process_command("/moa review")
     assert cli._pending_agent_seed == "review"
-    assert cli._pending_moa_disable_after_turn is True
-    assert cli.provider == "moa"
-    assert cli.model == "default"
+    assert cli._pending_moa_disable_after_turn is False
+    assert cli._pending_turn_route_target == {"kind": "moa", "preset": "default"}
+    assert cli.provider == "openrouter"
+    assert cli.model == "anthropic/claude-opus-4.8"
 
 
 def test_moa_non_preset_is_one_shot_prompt():
@@ -67,10 +69,11 @@ def test_moa_non_preset_is_one_shot_prompt():
     with patch("cli._cprint"):
         cli.process_command("/moa inspect the flaky test")
     assert cli._pending_agent_seed == "inspect the flaky test"
-    assert cli._pending_moa_disable_after_turn is True
-    assert cli.provider == "moa"
-    assert cli.model == "default"
-    assert cli._pending_moa_restore_model["provider"] != "moa"
+    assert cli._pending_moa_disable_after_turn is False
+    assert cli._pending_turn_route_target == {"kind": "moa", "preset": "default"}
+    assert cli.provider == "openrouter"
+    assert cli.model == "anthropic/claude-opus-4.8"
+    assert cli._pending_moa_restore_model is None
 
 
 

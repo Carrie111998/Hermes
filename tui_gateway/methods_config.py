@@ -159,6 +159,44 @@ def _(rid, params: dict) -> dict:
 @method("config.get")
 def _(rid, params: dict) -> dict:
     key = params.get("key", "")
+    if key == "routing_mode":
+        from agent.turn_router import normalize_turn_routing_config
+
+        config = _load_cfg()
+        routing = config.get("routing") if isinstance(config, dict) else None
+        normalized = normalize_turn_routing_config(routing)
+        return _ok(
+            rid,
+            {"value": normalized["mode"], "capability_version": 1},
+        )
+    if key == "routing_budget":
+        from agent.turn_router_budget import TurnRouterBudgetLedger
+
+        config = _load_cfg()
+        routing = config.get("routing") if isinstance(config, dict) else None
+        budget = routing.get("budget") if isinstance(routing, dict) else None
+        raw_limit = budget.get("grok_weekly_limit", 0) if isinstance(budget, dict) else 0
+        try:
+            weekly_limit = max(0, int(raw_limit))
+        except (TypeError, ValueError):
+            weekly_limit = 0
+        status = TurnRouterBudgetLedger(weekly_limit=weekly_limit).status(
+            cooldown_scope="grok"
+        )
+        return _ok(
+            rid,
+            {
+                "capability_version": 1,
+                "scope": "grok",
+                "week_key": status.week_key,
+                "weekly_limit": status.weekly_limit,
+                "reserved_slots": status.reserved_slots,
+                "committed_slots": status.committed_slots,
+                "available_slots": status.available_slots,
+                "cooldown_reason_code": status.cooldown_reason_code,
+                "cooldown_until_at": status.cooldown_until_at,
+            },
+        )
     if key == "provider":
         try:
             from hermes_cli.models import list_available_providers, normalize_provider

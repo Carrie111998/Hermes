@@ -7016,6 +7016,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_routing_request: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7095,19 +7096,45 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    effective_task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    persist_user_display_kind=persist_user_display_kind,
-                    persist_user_display_metadata=persist_user_display_metadata,
-                    moa_config=moa_config,
-                )
+                # Recovery/delegation/system-authored transcript rows are not
+                # external user turns. Their typed display kind is the
+                # authoritative boundary; never classify or budget-route the
+                # synthetic text, even when a surface carries its normal
+                # routing request alongside the call.
+                if turn_routing_request is None or persist_user_display_kind:
+                    result = run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        effective_task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
+                        moa_config=moa_config,
+                    )
+                else:
+                    from agent.turn_routing_runtime import turn_routing_lifecycle
+
+                    with turn_routing_lifecycle(
+                        self, turn_routing_request
+                    ) as routing_lifecycle:
+                        result = run_conversation(
+                            self,
+                            user_message,
+                            system_message,
+                            conversation_history,
+                            effective_task_id,
+                            stream_callback,
+                            persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            moa_config=moa_config,
+                            turn_routing_lifecycle=routing_lifecycle,
+                        )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"

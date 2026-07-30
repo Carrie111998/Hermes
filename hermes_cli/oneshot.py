@@ -325,6 +325,11 @@ def _run_agent(
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
+    from agent.turn_routing_runtime import (
+        TurnRoutingRequest,
+        load_turn_moa_config,
+        load_turn_routing_config,
+    )
     from run_agent import AIAgent
 
     cfg = load_config()
@@ -440,7 +445,36 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        explicit_model_selection = bool((model or "").strip() or env_model)
+        explicit_provider_selection = bool((provider or "").strip())
+        manual_selection = explicit_model_selection or explicit_provider_selection
+
+        def _emit_turn_route(event: str, payload: dict) -> None:
+            logging.info("oneshot turn routing event=%s payload=%s", event, payload)
+
+        def _quarantine_turn_route(target_agent, reason: str) -> None:
+            if target_agent is agent:
+                setattr(
+                    target_agent,
+                    "_turn_routing_quarantined",
+                    str(reason or "route_restore_failed"),
+                )
+
+        turn_routing_request = TurnRoutingRequest(
+            surface="oneshot",
+            session_id=str(getattr(agent, "session_id", "") or "") or None,
+            user_text=prompt,
+            session_pinned=manual_selection,
+            manual_mode=manual_selection,
+            moa_config=load_turn_moa_config(),
+            config_loader=load_turn_routing_config,
+            emit=_emit_turn_route,
+            quarantine=_quarantine_turn_route,
+        )
+        result = agent.run_conversation(
+            prompt,
+            turn_routing_request=turn_routing_request,
+        )
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

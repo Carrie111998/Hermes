@@ -26,6 +26,10 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/approvals')).toBe(true)
     expect(isDesktopSlashCommand('/approvals')).toBe(true)
     expect(resolveDesktopCommand('/approvals')?.surface).toEqual({ kind: 'exec' })
+    expect(isDesktopSlashSuggestion('/route')).toBe(true)
+    expect(isDesktopSlashCommand('/route')).toBe(true)
+    expect(resolveDesktopCommand('/route')?.surface).toEqual({ kind: 'exec' })
+    expect(desktopSlashCommandArgumentMode('/route')).toBe('options')
   })
 
   it('surfaces skill and quick commands (extensions) in suggestions and lets them run', () => {

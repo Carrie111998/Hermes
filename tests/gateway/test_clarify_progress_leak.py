@@ -57,11 +57,20 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
 class ClarifyThenToolAgent:
     """Emits a clarify tool.started (with raw args) then a normal tool."""
 
+    last_run_kwargs = None
+
     def __init__(self, **kwargs):
         self.tool_progress_callback = kwargs.get("tool_progress_callback")
         self.tools = []
 
-    def run_conversation(self, message, conversation_history=None, task_id=None):
+    def run_conversation(
+        self,
+        message,
+        conversation_history=None,
+        task_id=None,
+        **kwargs,
+    ):
+        type(self).last_run_kwargs = kwargs
         cb = self.tool_progress_callback
         if cb is not None:
             cb(
@@ -142,6 +151,10 @@ async def test_clarify_tool_never_renders_progress_bubble(monkeypatch, tmp_path,
     )
 
     assert result["final_response"] == "done"
+    assert ClarifyThenToolAgent.last_run_kwargs is not None
+    request = ClarifyThenToolAgent.last_run_kwargs["turn_routing_request"]
+    assert request.surface == "gateway"
+    assert request.user_text == "hello"
     all_content = "\n".join(
         [m["content"] for m in adapter.sent] + [e["content"] for e in adapter.edits]
     )

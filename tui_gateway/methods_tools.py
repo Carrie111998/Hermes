@@ -437,6 +437,66 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
+    if name == "route":
+        if session is None:
+            return _err(rid, 4018, "route command requires a live session")
+        if _session_uses_compute_host(session):
+            sid = str(params.get("session_id") or "")
+            try:
+                host_response = _send_compute_host_control(
+                    sid,
+                    route_name="route.command",
+                    payload={"argument": arg},
+                )
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host route command failed: {exc}")
+            if host_response.get("type") == "control.error":
+                return _err(
+                    rid,
+                    5019,
+                    str(
+                        host_response.get("message")
+                        or "compute-host route command failed"
+                    ),
+                )
+            result = host_response.get("result")
+            if not isinstance(result, dict) or result.get("type") != "route":
+                return _err(
+                    rid, 5019, "compute-host returned an invalid route response"
+                )
+            return _ok(rid, result)
+
+        from agent.turn_routing_runtime import TurnRoutingSessionState
+        from hermes_cli.route_control import execute_route_command
+
+        state = session.get("turn_routing_state")
+        if not isinstance(state, TurnRoutingSessionState):
+            state = TurnRoutingSessionState()
+            session["turn_routing_state"] = state
+
+        def _routing_config():
+            config = _load_cfg()
+            routing = config.get("routing") if isinstance(config, dict) else None
+            return routing if isinstance(routing, dict) else {}
+
+        home_token = None
+        profile_home = session.get("profile_home")
+        if isinstance(profile_home, str) and profile_home:
+            home_token = set_hermes_home_override(profile_home)
+        try:
+            output = execute_route_command(
+                arg,
+                state=state,
+                config_loader=_routing_config,
+                mode_writer=lambda mode: _write_config_key("routing.mode", mode),
+            )
+        except Exception as exc:
+            return _err(rid, 4018, f"route command failed: {exc}")
+        finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+        return _ok(rid, {"type": "route", "output": output})
+
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]
@@ -605,46 +665,14 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, moa_usage())
             if not session:
                 return _err(rid, 4001, "no active session")
-            sid = params.get("session_id", "")
             moa_cfg = normalize_moa_config(_load_cfg().get("moa") or {})
             preset = moa_cfg["default_preset"]
-            # Record the live model identity so it can be restored after the
-            # one-shot turn, then swap the agent's client in place (#53444:
-            # setting session["model_override"] alone never switched the
-            # already-built agent, so the turn silently ran on the old model).
-            agent = session.get("agent")
-            session["moa_one_shot_restore"] = {
-                "override": session.get("model_override"),
-                "model": getattr(agent, "model", None) if agent else None,
-                "provider": getattr(agent, "provider", None) if agent else None,
+            session["one_turn_moa_target"] = {
+                "kind": "moa",
+                "preset": preset,
             }
-            if agent is not None:
-                # Live agent: swap its client in place so THIS turn runs MoA.
-                try:
-                    _apply_model_switch(
-                        sid,
-                        session,
-                        f"{preset} --provider moa",
-                        confirm_expensive_model=False,
-                        pin_session_override=True,
-                        # One-shot turn-scoped swap — never persist the MoA
-                        # virtual provider to config.yaml.
-                        persist_override=False,
-                    )
-                except Exception as exc:
-                    session.pop("moa_one_shot_restore", None)
-                    return _err(rid, 5030, f"moa unavailable: {exc}")
-            else:
-                # No agent built yet (lazy/fresh session): the override is
-                # consumed by the first build, so the turn runs MoA without an
-                # in-place switch.
-                session["model_override"] = {
-                    "provider": "moa",
-                    "model": preset,
-                    "base_url": "moa://local",
-                    "api_key": "moa-virtual-provider",
-                    "api_mode": "chat_completions",
-                }
+            session.pop("one_turn_route_target", None)
+            session.pop("moa_one_shot_restore", None)
             return _ok(
                 rid,
                 {

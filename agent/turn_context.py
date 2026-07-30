@@ -346,6 +346,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    turn_routing_lifecycle: Optional[Any] = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -379,22 +380,6 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
-
-    # Tell auxiliary_client what the live main provider/model are for this turn
-    # after primary restoration has settled the runtime.
-    try:
-        from agent.auxiliary_client import set_runtime_main
-        set_runtime_main(
-            getattr(agent, "provider", "") or "",
-            getattr(agent, "model", "") or "",
-            requested_provider=getattr(agent, "requested_provider", "") or "",
-            base_url=getattr(agent, "base_url", "") or "",
-            api_key=getattr(agent, "api_key", "") or "",
-            api_mode=getattr(agent, "api_mode", "") or "",
-            auth_mode=getattr(agent, "auth_mode", "") or "",
-        )
-    except Exception:
-        pass
 
     # Between-turns MCP refresh: an MCP server that finished connecting since
     # the previous turn (slow HTTP/OAuth servers routinely take 2-6s on a cold
@@ -446,6 +431,7 @@ def build_turn_context(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.
@@ -615,6 +601,43 @@ def build_turn_context(
         restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+
+    # The session prompt is a conversation-stable prefix owned by the primary
+    # runtime, not by a temporary per-turn route.  Prepare only after cold
+    # restore/build has completed, but still before DB turn setup, compression,
+    # any model-dependent request shaping, and the first provider call.
+    if turn_routing_lifecycle is not None:
+        turn_routing_lifecycle.prepare(
+            agent,
+            user_message=user_message,
+            turn_id=turn_id,
+        )
+        prepare_message = getattr(turn_routing_lifecycle, "prepare_message", None)
+        if callable(prepare_message):
+            from agent.turn_routing_runtime import PreparedTurnMessage
+
+            prepared = prepare_message(user_message, persist_user_message)
+            if not isinstance(prepared, PreparedTurnMessage):
+                raise TypeError("turn routing lifecycle returned an invalid message")
+            user_message = prepared.user_message
+            persist_user_message = prepared.persist_user_message
+            user_msg["content"] = user_message
+
+    # Publish the effective live runtime only after optional request-scoped
+    # routing has settled it.
+    try:
+        from agent.auxiliary_client import set_runtime_main
+        set_runtime_main(
+            getattr(agent, "provider", "") or "",
+            getattr(agent, "model", "") or "",
+            requested_provider=getattr(agent, "requested_provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+            api_key=getattr(agent, "api_key", "") or "",
+            api_mode=getattr(agent, "api_mode", "") or "",
+            auth_mode=getattr(agent, "auth_mode", "") or "",
+        )
+    except Exception:
+        pass
 
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue

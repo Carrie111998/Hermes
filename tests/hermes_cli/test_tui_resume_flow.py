@@ -136,6 +136,69 @@ def test_oneshot_subprocess_exits_without_teardown_abort():
 
 
 
+def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
+    import hermes_cli.oneshot as oneshot_mod
+
+    closed = []
+    shutdown_messages = []
+    run_kwargs = {}
+
+    class FakeAgent:
+        session_id = "oneshot-session"
+
+        def __init__(self, **_kwargs):
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+            self._session_messages = [{"role": "user", "content": "hello"}]
+
+        def run_conversation(self, prompt, **kwargs):
+            assert prompt == "hello"
+            run_kwargs.update(kwargs)
+            return {"final_response": "done"}
+
+        def shutdown_memory_provider(self, messages=None):
+            shutdown_messages.append(messages)
+
+        def close(self):
+            closed.append(True)
+
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=FakeAgent)
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model": {"default": "gpt-test", "provider": "openai"}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "api_key": "key",
+            "base_url": "https://example.invalid",
+            "provider": "openai",
+            "api_mode": "chat_completions",
+            "credential_pool": None,
+        },
+    )
+    monkeypatch.setattr(oneshot_mod, "_create_session_db_for_oneshot", lambda: None)
+
+    assert (
+        oneshot_mod._run_agent(
+            "hello", model="gpt-test", provider="openai", use_config_toolsets=False
+        )
+        == ("done", {"final_response": "done"})
+    )
+    assert closed == [True]
+    assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
+    request = run_kwargs["turn_routing_request"]
+    assert request.surface == "oneshot"
+    assert request.session_id == "oneshot-session"
+    assert request.user_text == "hello"
+    assert request.session_pinned is True
+    assert request.manual_mode is True
+    assert request.explicit_turn_override is False
+
+
 
 
 def _stub_plugin_discovery(monkeypatch):

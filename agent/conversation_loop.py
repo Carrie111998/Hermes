@@ -23,6 +23,8 @@ import random
 import re
 import ssl
 import time
+import uuid
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -45,6 +47,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_routing_runtime import RouteBudgetDispatchBlocked
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -1093,6 +1096,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_routing_lifecycle: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1171,6 +1175,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        turn_routing_lifecycle=turn_routing_lifecycle,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -2276,22 +2281,31 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
+                    _provider_scope = (
+                        turn_routing_lifecycle.provider_submission_scope(
+                            agent,
+                            api_request_id,
+                        )
+                        if turn_routing_lifecycle is not None
+                        else nullcontext()
                     )
+                    with _provider_scope:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -3362,6 +3376,33 @@ def run_conversation(
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
                 agent._persist_session(messages, conversation_history)
                 break
+
+            except RouteBudgetDispatchBlocked as budget_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                _budget_text = (
+                    "This routed turn cannot make another provider request because "
+                    "its hard-budget authorization is no longer active."
+                )
+                close_interrupted_tool_sequence(messages, _budget_text)
+                agent._persist_session(messages, conversation_history)
+                logger.warning(
+                    "%sBlocked provider retry after route budget state=%s",
+                    agent.log_prefix,
+                    budget_error.budget_state,
+                )
+                return {
+                    "final_response": _budget_text,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": True,
+                    "error": budget_error.reason_code,
+                    "route_budget_blocked": True,
+                }
 
             except Exception as api_error:
                 # Stop spinner silently — retry status is buffered and

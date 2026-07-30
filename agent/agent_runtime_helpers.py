@@ -1430,6 +1430,45 @@ def drop_thinking_only_and_merge_users(
     return merged
 
 
+def snapshot_agent_model_runtime(agent: Any) -> dict[str, Any]:
+    """Capture the current model runtime for a one-turn restore.
+
+    The primary runtime must be deep-copied because a successful model switch
+    replaces or mutates nested runtime state before the turn completes.
+    """
+    return {
+        "model": getattr(agent, "model", ""),
+        "provider": getattr(agent, "provider", ""),
+        "api_key": getattr(agent, "api_key", ""),
+        "base_url": getattr(agent, "base_url", ""),
+        "api_mode": getattr(agent, "api_mode", ""),
+        "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
+    }
+
+
+def restore_agent_model_runtime(agent: Any, snapshot: dict[str, Any] | None) -> None:
+    """Restore a runtime captured by :func:`snapshot_agent_model_runtime`."""
+    if not snapshot or agent is None:
+        return
+    primary = snapshot.get("primary_runtime")
+    if primary and hasattr(agent, "_restore_primary_runtime"):
+        try:
+            agent._primary_runtime = copy.deepcopy(primary)
+            agent._fallback_activated = True
+            agent._rate_limited_until = 0
+            if agent._restore_primary_runtime():
+                return
+        except Exception:
+            logger.debug("One-turn model restore via primary runtime failed", exc_info=True)
+    if hasattr(agent, "switch_model"):
+        agent.switch_model(
+            new_model=snapshot.get("model", ""),
+            new_provider=snapshot.get("provider", ""),
+            api_key=snapshot.get("api_key", ""),
+            base_url=snapshot.get("base_url", ""),
+            api_mode=snapshot.get("api_mode", ""),
+        )
+
 
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
@@ -2094,14 +2133,24 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def switch_model(
+    agent,
+    new_model,
+    new_provider,
+    api_key='',
+    base_url='',
+    api_mode='',
+    *,
+    persist=True,
+):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
     ``model_switch.switch_model()`` has resolved credentials and
     validated the model.  This method performs the actual runtime
     swap: rebuilding clients, updating caching flags, and refreshing
-    the context compressor.
+    the context compressor.  ``persist=False`` stops after constructing that
+    request-scoped runtime; the caller must own an exact snapshot/restore token.
 
     The implementation mirrors ``_try_activate_fallback()`` for the
     client-swap logic but also updates ``_primary_runtime`` so the
@@ -2446,6 +2495,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         )
     except Exception as _reasoning_err:
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+
+    if not persist:
+        logger.info(
+            "Model switched request-scoped: %s (%s) -> %s (%s)",
+            old_model,
+            old_provider,
+            new_model,
+            new_provider,
+        )
+        return
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
     agent._cached_system_prompt = None
@@ -3770,6 +3829,8 @@ __all__ = [
     "recover_with_credential_pool",
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",
+    "snapshot_agent_model_runtime",
+    "restore_agent_model_runtime",
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",

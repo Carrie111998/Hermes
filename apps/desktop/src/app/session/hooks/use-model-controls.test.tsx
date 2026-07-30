@@ -241,6 +241,34 @@ describe('useModelControls', () => {
     expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
   })
 
+  it('stages a next-turn model without repainting or pinning the resident session', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('resident-model')
+    setCurrentProvider('resident-provider')
+    setCurrentModelSource('manual')
+    const requestGateway = vi.fn(async () => ({ key: 'model', scope: 'once', value: 'claude-sonnet-4.6' }) as never)
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(
+      controls.selectModel({
+        model: 'claude-sonnet-4.6',
+        provider: 'anthropic',
+        scope: 'once'
+      })
+    ).resolves.toBe(true)
+
+    expect(requestGateway).toHaveBeenCalledWith('config.set', {
+      session_id: 'session-1',
+      key: 'model',
+      value: 'claude-sonnet-4.6 --provider anthropic --once'
+    })
+    expect($currentModel.get()).toBe('resident-model')
+    expect($currentProvider.get()).toBe('resident-provider')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
   it('session-scopes MoA preset selections so they cannot persist as the global gateway default', async () => {
     $activeSessionId.set('session-1')
     const requestGateway = vi.fn(async () => ({ key: 'model', value: 'BeastMode' }) as never)

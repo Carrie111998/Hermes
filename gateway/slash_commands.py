@@ -32,6 +32,10 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
+from agent.turn_routing_runtime import (
+    TurnRoutingSessionState,
+    load_turn_routing_config,
+)
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
@@ -102,6 +106,52 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+
+    async def _handle_route_command(self, event: MessageEvent) -> str:
+        """Inspect or control profile routing without touching prompt history."""
+        import yaml
+
+        from hermes_cli.config import require_readable_config_before_write
+        from hermes_cli.route_control import execute_route_command
+        from utils import atomic_roundtrip_yaml_update
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        conversation = getattr(self, "_session_state")(session_key).conversation
+        state = conversation.turn_routing_session_state
+        if not isinstance(state, TurnRoutingSessionState):
+            state = TurnRoutingSessionState()
+            conversation.turn_routing_session_state = state
+
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(source)
+
+        if profile_home is None:
+            config_loader = load_turn_routing_config
+            from hermes_constants import get_hermes_home
+
+            config_path = get_hermes_home() / "config.yaml"
+        else:
+            config_path = Path(profile_home) / "config.yaml"
+
+            def config_loader():
+                if not config_path.exists():
+                    return {}
+                raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+                routing = raw.get("routing") if isinstance(raw, dict) else None
+                return routing if isinstance(routing, dict) else {}
+
+        def _write_mode(mode: str) -> None:
+            require_readable_config_before_write(config_path)
+            atomic_roundtrip_yaml_update(config_path, "routing.mode", mode)
+
+        return execute_route_command(
+            event.get_command_args(),
+            state=state,
+            config_loader=config_loader,
+            mode_writer=_write_mode,
+        )
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1758,9 +1808,6 @@ class GatewaySlashCommandsMixin:
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
-        restore_snapshot = (
-            self._snapshot_session_model_override(session_key) if one_turn else None
-        )
         if override:
             current_model = override.get("model", current_model)
             current_provider = override.get("provider", current_provider)
@@ -2153,8 +2200,43 @@ class GatewaySlashCommandsMixin:
         except Exception as exc:
             logger.debug("preflight-compression switch warning failed: %s", exc)
 
-        async def _finish_switch() -> str:
+        async def _finish_switch(*, confirm_one_turn: bool = False) -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            apply_one_turn = one_turn or confirm_one_turn
+            if apply_one_turn:
+                # A one-turn selection is typed intent, not a resident-runtime
+                # mutation.  The shared real-user-turn lifecycle authorizes,
+                # applies, and restores it at the stable turn boundary.
+                conversation = getattr(self, "_session_state")(session_key).conversation
+                conversation.pending_turn_route_target = {
+                    "kind": "model",
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                }
+                # Discard stale legacy restore state from older command paths;
+                # shared routing is the sole restore owner for this intent.
+                conversation.one_turn_restore = None
+
+                from hermes_cli.model_switch import format_model_for_display
+
+                provider_label = result.provider_label or result.target_provider
+                lines = [
+                    t(
+                        "gateway.model.switched",
+                        model=format_model_for_display(result.new_model),
+                    ),
+                    t("gateway.model.provider_label", provider=provider_label),
+                    "This selection applies to the next user turn only.",
+                ]
+                if result.warning_message:
+                    lines.append(
+                        t(
+                            "gateway.model.warning_prefix",
+                            warning=result.warning_message,
+                        )
+                    )
+                return "\n".join(lines)
+
             # If there's a cached agent, update it in-place
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -2217,25 +2299,23 @@ class GatewaySlashCommandsMixin:
             self._pending_model_notes[session_key] = (
                 f"[Note: model was just switched from {format_model_for_display(current_model)} to {format_model_for_display(result.new_model)} "
                 f"via {result.provider_label or result.target_provider}. "
-                f"{'This override applies to the next turn only. ' if one_turn else ''}"
                 f"Adjust your self-identification accordingly.]"
             )
 
             # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
+            resolved_override = {
                 "model": result.new_model,
                 "provider": result.target_provider,
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
-            if one_turn:
-                if not hasattr(self, "_pending_one_turn_model_restores"):
-                    self._pending_one_turn_model_restores = {}
-                self._pending_one_turn_model_restores[session_key] = (
-                    restore_snapshot or {"had_override": False, "override": None}
-                )
-            elif hasattr(self, "_pending_one_turn_model_restores"):
+            session_overrides = getattr(self, "_session_model_overrides", None)
+            if not isinstance(session_overrides, dict):
+                session_overrides = {}
+                setattr(self, "_session_model_overrides", session_overrides)
+            session_overrides[session_key] = resolved_override
+            if hasattr(self, "_pending_one_turn_model_restores"):
                 self._pending_one_turn_model_restores.pop(session_key, None)
 
             # Write-through the non-secret parts (model/provider/base_url) to
@@ -2243,23 +2323,18 @@ class GatewaySlashCommandsMixin:
             # api_key/api_mode are never persisted — they are re-resolved via
             # runtime provider resolution on rehydration.
             #
-            # /model --once is intentionally EXCLUDED from the write-through:
-            # a one-turn override must never survive a restart. The persisted
-            # value stays at the pre-once state (the prior session override,
-            # or nothing), which is exactly what the finally-restore reverts
-            # the in-memory dict to. (#29923 review defect: the original
-            # implementation wrote through, so a crash before the restore
-            # rehydrated the once-model permanently.)
-            if not one_turn:
-                try:
-                    await self.async_session_store.set_model_override(
-                        session_key,
-                        self._session_model_overrides[session_key],
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to persist session model override", exc_info=True
-                    )
+            # This branch only handles persistent/session switches: the typed
+            # one-turn path returns above before any resident or durable state
+            # is touched.
+            try:
+                await self.async_session_store.set_model_override(
+                    session_key,
+                    resolved_override,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist session model override", exc_info=True
+                )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -2379,7 +2454,7 @@ class GatewaySlashCommandsMixin:
 
             if persist_global:
                 lines.append(t("gateway.model.saved_global"))
-            elif one_turn:
+            elif apply_one_turn:
                 lines.append("    (next turn only — restores after one response)")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
@@ -2413,10 +2488,11 @@ class GatewaySlashCommandsMixin:
                         f"🟡 Model switch cancelled. Current model unchanged "
                         f"({current_model or 'unknown'})."
                     )
-                # "once" and "always" both proceed — there is no persistent
-                # opt-out for the cost guard (each expensive switch should be
-                # an explicit decision).
-                return await _finish_switch()
+                # There is no persistent opt-out for the cost guard (each
+                # expensive switch is an explicit decision), but the choice
+                # still owns lifetime: "once" stages typed turn intent while
+                # "always" uses the normal session/persist path.
+                return await _finish_switch(confirm_one_turn=choice == "once")
 
             _p = self._typed_command_prefix_for(event.source.platform)
             return await self._request_slash_confirm(

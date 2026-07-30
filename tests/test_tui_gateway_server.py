@@ -879,12 +879,23 @@ class _BrokenStdout:
         return None
 
 
-def test_write_json_serializes_concurrent_writes(monkeypatch):
+def test_write_json_serializes_concurrent_writes():
     out = _ChunkyStdout()
-    monkeypatch.setattr(server, "_real_stdout", out)
+    transport = server.StdioTransport(lambda: out, threading.Lock())
+    marker = "write-json-serialization-test"
+
+    def write_on_test_transport(payload: dict) -> None:
+        token = server.bind_transport(transport)
+        try:
+            server.write_json(payload)
+        finally:
+            server.reset_transport(token)
 
     threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
+        threading.Thread(
+            target=write_on_test_transport,
+            args=({"seq": i, "text": "x" * 24, "test_marker": marker},),
+        )
         for i in range(8)
     ]
 
@@ -894,10 +905,11 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     for t in threads:
         t.join()
 
-    lines = "".join(out.parts).splitlines()
+    frames = [json.loads(line) for line in "".join(out.parts).splitlines()]
+    frames = [frame for frame in frames if frame.get("test_marker") == marker]
 
-    assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    assert len(frames) == 8
+    assert {frame["seq"] for frame in frames} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
@@ -1155,6 +1167,82 @@ def test_config_set_battery_explicit_off(monkeypatch):
 
     assert resp["result"] == {"key": "battery", "value": "off"}
     assert writes == {"display.battery": False}
+
+
+def test_config_get_routing_mode_normalizes_backend_truth(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"routing": {"mode": "Observe"}})
+
+    resp = server.dispatch(
+        {"id": "route-get", "method": "config.get", "params": {"key": "routing_mode"}}
+    )
+
+    assert resp["result"] == {"value": "observe", "capability_version": 1}
+
+
+def test_config_set_routing_mode_validates_and_persists(monkeypatch):
+    writes: dict[str, object] = {}
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda k, v: writes.__setitem__(k, v)
+    )
+
+    ok = server.dispatch(
+        {
+            "id": "route-set",
+            "method": "config.set",
+            "params": {"key": "routing_mode", "value": "observe"},
+        }
+    )
+    bad = server.dispatch(
+        {
+            "id": "route-bad",
+            "method": "config.set",
+            "params": {"key": "routing_mode", "value": "enabled"},
+        }
+    )
+
+    assert ok["result"] == {
+        "key": "routing_mode",
+        "value": "observe",
+        "capability_version": 1,
+    }
+    assert writes == {"routing.mode": "observe"}
+    assert bad["error"]["code"] == 4002
+
+
+def test_config_get_routing_budget_returns_profile_ledger_status(monkeypatch):
+    from agent.turn_router_budget import TurnRouterBudgetLedger
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"routing": {"budget": {"grok_weekly_limit": 3}}},
+    )
+    ledger = TurnRouterBudgetLedger(weekly_limit=3)
+    reservation = ledger.reserve(turn_id="turn-1", route_id="grok-review")
+    assert reservation.reservation_id is not None
+    ledger.commit(reservation.reservation_id, provider_submission_id="safe-submission")
+    ledger.set_cooldown(
+        scope="grok",
+        reason_code="provider_rate_limited",
+        until_at=time.time() + 600,
+    )
+
+    resp = server.dispatch(
+        {"id": "budget-get", "method": "config.get", "params": {"key": "routing_budget"}}
+    )
+
+    assert resp is not None
+    result = resp["result"]
+    assert result["capability_version"] == 1
+    assert result["scope"] == "grok"
+    assert result["weekly_limit"] == 3
+    assert result["reserved_slots"] == 0
+    assert result["committed_slots"] == 1
+    assert result["available_slots"] == 2
+    assert result["cooldown_reason_code"] == "provider_rate_limited"
+    assert result["cooldown_until_at"] > time.time()
+    assert "reservation_id" not in result
+    assert "provider_submission_id" not in result
 
 
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
@@ -4234,7 +4322,8 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, *, display_kind=None):
+        assert display_kind == "process_complete"
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
         session["running"] = False
 
@@ -4450,7 +4539,9 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, *, display_kind=None: delivered.append(
+            (text, display_kind)
+        ),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -4478,7 +4569,8 @@ def test_notification_poller_delivers_owned_events(
         assert len(status_calls) == 1
         assert status_calls[0][2]["kind"] == "process"
         assert len(delivered) == 1
-        assert "proc_mine" in delivered[0]
+        assert "proc_mine" in delivered[0][0]
+        assert delivered[0][1] == "process_complete"
     finally:
         server._sessions.pop("sid_a", None)
         while not process_registry.completion_queue.empty():
@@ -4632,6 +4724,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     nested_started = threading.Event()
     release_nested = threading.Event()
     turns = []
+    owner_key = "notification-requeue-owner-unique"
 
     def _recording_thread(*args, **kwargs):
         thread = real_thread_class(*args, **kwargs)
@@ -4649,7 +4742,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
     session = _session(
-        session_key="session-a",
+        session_key=owner_key,
         agent=_BlockingNotificationAgent(turns),
         running=True,
     )
@@ -4657,7 +4750,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         {
             "type": "completion",
             "session_id": f"proc_batch_{index}",
-            "session_key": "session-a",
+            "session_key": owner_key,
             "command": "safe-test-command",
             "exit_code": 0,
             "output": f"owned-{index}",
@@ -6770,7 +6863,9 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         server._sessions.clear()
 
 
-def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
+def test_config_set_model_once_keeps_env_and_queues_typed_target(monkeypatch):
+    switch_calls = []
+
     class Agent:
         model = "old/model"
         provider = "openrouter"
@@ -6779,6 +6874,7 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
         api_mode = "chat_completions"
 
         def switch_model(self, **kwargs):
+            switch_calls.append(kwargs)
             self.model = kwargs["new_model"]
             self.provider = kwargs["new_provider"]
             self.api_key = kwargs["api_key"]
@@ -6797,6 +6893,7 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
     seen = {}
     agent = Agent()
     session = _session(agent=agent)
+    session["one_turn_moa_target"] = {"kind": "moa", "preset": "deep"}
     server._sessions["sid"] = session
     monkeypatch.setenv("HERMES_INFERENCE_PROVIDER", "openrouter")
     monkeypatch.setenv("HERMES_MODEL", "old/model")
@@ -6822,12 +6919,46 @@ def test_config_set_model_once_keeps_env_and_records_restore(monkeypatch):
 
         assert resp["result"]["scope"] == "once"
         assert seen["is_global"] is False
-        assert agent.model == "claude-sonnet-4.6"
-        assert session["one_turn_model_restore"]["model"] == "old/model"
+        assert switch_calls == []
+        assert agent.model == "old/model"
+        assert agent.provider == "openrouter"
+        assert session["one_turn_route_target"] == {
+            "kind": "model",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4.6",
+        }
+        assert "one_turn_moa_target" not in session
+        assert "one_turn_model_restore" not in session
         assert os.environ["HERMES_INFERENCE_PROVIDER"] == "openrouter"
         assert os.environ["HERMES_MODEL"] == "old/model"
     finally:
         server._sessions.clear()
+
+
+def test_command_dispatch_moa_replaces_pending_model_once(monkeypatch):
+    session = _session(running=False)
+    session["one_turn_route_target"] = {
+        "kind": "model",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4.6",
+    }
+    server._sessions["sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"moa": {"default_preset": "deep", "presets": {"deep": {}}}},
+    )
+    try:
+        response = server._methods["command.dispatch"](
+            "request-moa",
+            {"name": "moa", "arg": "analyze this", "session_id": "sid"},
+        )
+    finally:
+        server._sessions.clear()
+
+    assert response["result"]["type"] == "send"
+    assert session["one_turn_moa_target"] == {"kind": "moa", "preset": "deep"}
+    assert "one_turn_route_target" not in session
 
 
 def test_config_set_model_once_requires_live_session(monkeypatch):
@@ -6851,7 +6982,58 @@ def test_config_set_model_once_requires_live_session(monkeypatch):
     assert "/model --once requires a live session" in resp["error"]["message"]
 
 
-def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch):
+def test_config_set_model_once_can_stage_while_current_turn_is_running(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="old/model",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="test-key",
+        api_mode="chat_completions",
+    )
+    session = _session(agent=agent)
+    session["running"] = True
+    server._sessions["sid"] = session
+    result = types.SimpleNamespace(
+        success=True,
+        new_model="claude-sonnet-4.6",
+        target_provider="anthropic",
+        api_key="test-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        warning_message="",
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kwargs: result)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *args, **kwargs: None,
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "claude-sonnet-4.6 --provider anthropic --once",
+                },
+            }
+        )
+
+        assert resp["result"]["scope"] == "once"
+        assert session["one_turn_route_target"] == {
+            "kind": "model",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4.6",
+        }
+        assert agent.model == "old/model"
+        assert "model_override" not in session
+    finally:
+        server._sessions.clear()
+
+
+def test_config_set_model_session_switch_clears_pending_once_target(monkeypatch):
     class Agent:
         model = "temp/model"
         provider = "anthropic"
@@ -6876,7 +7058,12 @@ def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch
         warning_message="",
     )
     session = _session(agent=Agent())
-    session["one_turn_model_restore"] = {"model": "old/model"}
+    session["one_turn_route_target"] = {
+        "kind": "model",
+        "provider": "anthropic",
+        "model": "old/model",
+    }
+    session["one_turn_moa_target"] = {"kind": "moa", "preset": "deep"}
     server._sessions["sid"] = session
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kwargs: result)
     monkeypatch.setattr(server, "_restart_slash_worker", lambda *args, **kwargs: None)
@@ -6897,6 +7084,8 @@ def test_config_set_model_session_switch_clears_pending_once_restore(monkeypatch
 
         assert resp["result"]["scope"] == "session"
         assert "one_turn_model_restore" not in session
+        assert "one_turn_route_target" not in session
+        assert "one_turn_moa_target" not in session
     finally:
         server._sessions.clear()
 
@@ -7507,7 +7696,9 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
         api_key = ""
 
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
-            captured["prompt"] = prompt
+            request = _kwargs["turn_routing_request"]
+            assert request.prepare_user_message is not None
+            captured["prompt"] = request.prepare_user_message(prompt).user_message
             return {
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
@@ -9031,6 +9222,12 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
 
     session = _session()
     session["agent"] = None
+    session["one_turn_route_target"] = {
+        "kind": "model",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+    }
+    session["one_turn_moa_target"] = {"kind": "moa", "preset": "deep"}
     server._sessions["sid"] = session
 
     try:
@@ -9069,6 +9266,8 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         assert calls["run_prompt"] == 0
         assert session["running"] is False
         assert session.get("inflight_turn") is None
+        assert "one_turn_route_target" not in session
+        assert "one_turn_moa_target" not in session
     finally:
         server._sessions.pop("sid", None)
 
@@ -9723,6 +9922,165 @@ def test_mirror_slash_side_effects_allowed_when_idle(monkeypatch):
     # Should NOT contain "session busy" — the switch went through.
     assert "session busy" not in warning
     assert applied["model"]
+
+
+def test_command_dispatch_route_uses_live_session_state(monkeypatch):
+    from agent.turn_routing_runtime import TurnRoutingSessionState
+    from tui_gateway import server
+
+    state = TurnRoutingSessionState(
+        affinity_route="deep",
+        affinity_remaining=2,
+    )
+    session = _session(running=False)
+    session["turn_routing_state"] = state
+    server._sessions["route-sid"] = session
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"routing": {"mode": "observe", "budget": {}}},
+    )
+    try:
+        response = server._methods["command.dispatch"](
+            "request-1",
+            {"name": "route", "arg": "status", "session_id": "route-sid"},
+        )
+    finally:
+        server._sessions.pop("route-sid", None)
+
+    assert response["result"]["type"] == "route"
+    assert "Route mode: observe" in response["result"]["output"]
+    assert "Affinity: deep (2 turns remaining)" in response["result"]["output"]
+
+
+def test_command_dispatch_route_uses_compute_host_authority(monkeypatch):
+    from tui_gateway import server
+
+    session = _session(running=False, _compute_host_active=True)
+    server._sessions["route-host-sid"] = session
+    calls = []
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(
+        server,
+        "_send_compute_host_control",
+        lambda sid, **kwargs: calls.append((sid, kwargs))
+        or {
+            "type": "control.ack",
+            "result": {
+                "type": "route",
+                "output": "Route mode: observe\nAffinity: deep (1 turns remaining)",
+            },
+        },
+    )
+    try:
+        response = server._methods["command.dispatch"](
+            "request-host-route",
+            {"name": "route", "arg": "status", "session_id": "route-host-sid"},
+        )
+    finally:
+        server._sessions.pop("route-host-sid", None)
+
+    assert response["result"]["output"].endswith("deep (1 turns remaining)")
+    assert calls == [
+        (
+            "route-host-sid",
+            {
+                "route_name": "route.command",
+                "payload": {"argument": "status"},
+            },
+        )
+    ]
+
+
+def test_command_dispatch_route_mode_uses_backend_config_writer(monkeypatch):
+    from tui_gateway import server
+
+    session = _session(running=False)
+    server._sessions["route-mode-sid"] = session
+    writes = []
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"routing": {"mode": "off", "budget": {}}},
+    )
+    monkeypatch.setattr(
+        server,
+        "_write_config_key",
+        lambda key, value: writes.append((key, value)),
+    )
+    try:
+        response = server._methods["command.dispatch"](
+            "request-2",
+            {"name": "route", "arg": "observe", "session_id": "route-mode-sid"},
+        )
+    finally:
+        server._sessions.pop("route-mode-sid", None)
+
+    assert response["result"] == {
+        "type": "route",
+        "output": "Route mode set to observe",
+    }
+    assert writes == [("routing.mode", "observe")]
+
+
+def test_write_config_key_honors_profile_home_override(tmp_path, monkeypatch):
+    import yaml
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway import server
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profile"
+    launch_home.mkdir()
+    profile_home.mkdir()
+    launch_config = launch_home / "config.yaml"
+    profile_config = profile_home / "config.yaml"
+    launch_config.write_text("routing:\n  mode: off\n", encoding="utf-8")
+    profile_config.write_text("routing:\n  mode: off\n", encoding="utf-8")
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        server._write_config_key("routing.mode", "observe")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert yaml.safe_load(profile_config.read_text(encoding="utf-8"))["routing"]["mode"] == "observe"
+    assert yaml.safe_load(launch_config.read_text(encoding="utf-8"))["routing"]["mode"] is False
+
+
+def test_command_dispatch_route_mode_binds_session_profile(tmp_path, monkeypatch):
+    import yaml
+    from tui_gateway import server
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profile"
+    launch_home.mkdir()
+    profile_home.mkdir()
+    launch_config = launch_home / "config.yaml"
+    profile_config = profile_home / "config.yaml"
+    launch_config.write_text("routing:\n  mode: off\n", encoding="utf-8")
+    profile_config.write_text("routing:\n  mode: off\n", encoding="utf-8")
+    monkeypatch.setattr(server, "_hermes_home", launch_home)
+    monkeypatch.setattr(server, "_cfg_cache", None)
+    monkeypatch.setattr(server, "_cfg_mtime", None)
+    monkeypatch.setattr(server, "_cfg_path", None)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    session = _session(running=False, profile_home=str(profile_home))
+    server._sessions["route-profile-sid"] = session
+    try:
+        response = server._methods["command.dispatch"](
+            "request-route-profile",
+            {"name": "route", "arg": "observe", "session_id": "route-profile-sid"},
+        )
+    finally:
+        server._sessions.pop("route-profile-sid", None)
+
+    assert response["result"]["output"] == "Route mode set to observe"
+    assert yaml.safe_load(profile_config.read_text(encoding="utf-8"))["routing"]["mode"] == "observe"
+    assert yaml.safe_load(launch_config.read_text(encoding="utf-8"))["routing"]["mode"] is False
 
 
 def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
@@ -13171,8 +13529,8 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
-        turns.append(text)
+    def _fake_run_prompt_submit(rid, sid, session, text, *, display_kind=None):
+        turns.append((text, display_kind))
         with session["history_lock"]:
             session["running"] = False
 
@@ -13207,6 +13565,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
         assert len(turns) == 3
+        assert {kind for _text, kind in turns} == {"process_complete"}
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
@@ -15174,8 +15533,12 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
     captured = {}
 
     class _Agent:
+        provider = ""
+        model = ""
+
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             captured["persist_user_message"] = _kwargs.get("persist_user_message")
+            captured["turn_routing_request"] = _kwargs.get("turn_routing_request")
             return {
                 "final_response": "reply",
                 "messages": [{"role": "assistant", "content": "reply"}],
@@ -15188,12 +15551,18 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         def start(self):
             self._target()
 
-    server._sessions["sid"] = _session(agent=_Agent())
+    agent = _Agent()
+    session = _session(agent=agent)
+    server._sessions["sid"] = session
+    emitted = []
+    prepare_helper = Mock(return_value=("routed hi", "clean hi"))
     try:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
-        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+        monkeypatch.setattr(server, "_prepare_tui_message_after_routing", prepare_helper)
+        assert not hasattr(server, "_prepare_turn_route")
 
         resp = server.handle_request(
             {
@@ -15206,5 +15575,120 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
 
         # Without attachments the persist form equals the raw prompt.
         assert captured.get("persist_user_message") == "hi"
+        from agent.turn_routing_runtime import TurnRoutingRequest
+
+        request = captured.get("turn_routing_request")
+        assert isinstance(request, TurnRoutingRequest)
+        assert request.surface == "tui"
+        assert request.session_id == "session-key"
+        assert request.user_text == "hi"
+        assert request.explicit_turn_override is False
+        assert request.explicit_moa_override is False
+        assert request.session_pinned is False
+        # Surface preprocessing is deferred: the fake agent does not enter the
+        # shared lifecycle, so no context/image/vision work has run yet.
+        prepare_helper.assert_not_called()
+        assert request.prepare_user_message is not None
+        prepared = request.prepare_user_message("hi")
+        assert prepared.user_message == "routed hi"
+        assert prepared.persist_user_message == "clean hi"
+        prepare_helper.assert_called_once()
+        assert prepare_helper.call_args.args[:3] == (agent, "hi", [])
+        assert isinstance(prepare_helper.call_args.args[3], str)
+        request.emit("route.decided", {"turn_id": "turn-1"})
+        assert emitted[-1] == (
+            "route.decided",
+            "sid",
+            {"turn_id": "turn-1"},
+        )
+
+        agent.provider = "kimi-coding"
+        agent.model = "k3"
+        session["one_turn_route_target"] = {
+            "kind": "model",
+            "provider": "xai",
+            "model": "grok-4.5",
+        }
+        resp = server.handle_request(
+            {
+                "id": "2",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "explicit"},
+            }
+        )
+        assert resp.get("result")
+        explicit_request = captured.get("turn_routing_request")
+        assert explicit_request.explicit_turn_override is True
+        assert explicit_request.explicit_target == {
+            "kind": "model",
+            "provider": "xai",
+            "model": "grok-4.5",
+        }
+        assert agent.provider == "kimi-coding"
+        assert agent.model == "k3"
+        assert "one_turn_route_target" not in session
+
+        session["one_turn_moa_target"] = {"kind": "moa", "preset": "deep"}
+        resp = server.handle_request(
+            {
+                "id": "3",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "compare"},
+            }
+        )
+        assert resp is not None
+        assert resp.get("result")
+        moa_request = captured.get("turn_routing_request")
+        assert moa_request is not None
+        assert moa_request.explicit_turn_override is False
+        assert moa_request.explicit_moa_override is True
+        assert moa_request.explicit_target == {"kind": "moa", "preset": "deep"}
+        assert "one_turn_moa_target" not in session
+        assert (agent.provider, agent.model) == ("kimi-coding", "k3")
+
+        session["model_override"] = {"provider": "kimi-coding", "model": "k3"}
+        resp = server.handle_request(
+            {
+                "id": "4",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "pinned"},
+            }
+        )
+        assert resp is not None
+        assert resp.get("result")
+        pinned_request = captured.get("turn_routing_request")
+        assert pinned_request is not None
+        assert pinned_request.explicit_turn_override is False
+        assert pinned_request.explicit_moa_override is False
+        assert pinned_request.session_pinned is True
+        assert pinned_request.explicit_target == {
+            "kind": "model",
+            "provider": "kimi-coding",
+            "model": "k3",
+        }
+
+        assert request.quarantine is not None
+        history_before_quarantine = list(session["history"])
+        request.quarantine(agent, "route_restore_failed")
+        assert session["agent"] is None
+        assert session["routing_quarantined"] == "route_restore_failed"
+        assert session["history"] == history_before_quarantine
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_load_turn_routing_config_uses_only_canonical_routing_section(monkeypatch):
+    from hermes_cli import config as config_module
+
+    canonical = {"mode": "observe", "default_route": "k3"}
+    monkeypatch.setattr(
+        config_module,
+        "load_config_readonly",
+        lambda: {
+            "turn_routing": {"mode": "auto", "default_route": "wrong-legacy"},
+            "routing": canonical,
+            "router": {"mode": "auto", "default_route": "wrong-alias"},
+        },
+    )
+
+    assert server._load_turn_routing_config() is canonical

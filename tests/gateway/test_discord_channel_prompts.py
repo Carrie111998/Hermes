@@ -36,12 +36,21 @@ from gateway.session import SessionSource
 
 class _CapturingAgent:
     last_init = None
+    last_run = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
         self.tools = []
 
-    def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None):
+    def run_conversation(self, user_message, conversation_history=None, task_id=None, persist_user_message=None, **kwargs):
+        request = kwargs.get("turn_routing_request")
+        prepared = request.prepare_user_message(user_message) if request is not None else None
+        type(self).last_run = {
+            "persist_user_message": persist_user_message,
+            "prepared": prepared,
+            "request": request,
+            "user_message": user_message,
+        }
         return {
             "final_response": "ok",
             "messages": [],
@@ -154,3 +163,63 @@ async def test_retry_preserves_channel_prompt(monkeypatch):
     assert retried_event.channel_prompt == "Channel prompt"
 
 
+@pytest.mark.asyncio
+async def test_model_switch_note_is_provider_only_and_consumed_once(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    session_key = "agent:main:discord:thread:12345"
+    note = "[Note: model was switched; provider-only sidecar.]"
+    runner._pending_model_notes[session_key] = note
+
+    (tmp_path / "config.yaml").write_text("agent:\n  system_prompt: Global prompt\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+        },
+    )
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    await runner._run_agent(
+        message="first user message",
+        context_prompt="Context prompt",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key=session_key,
+        persist_user_message="first user message",
+    )
+
+    first = _CapturingAgent.last_run
+    assert first["user_message"] == "first user message"
+    assert first["request"].user_text == "first user message"
+    assert first["persist_user_message"] == "first user message"
+    assert first["prepared"].persist_user_message == "first user message"
+    assert first["prepared"].user_message == f"{note}\n\nfirst user message"
+    assert "route.decided" not in first["prepared"].user_message
+    assert session_key not in runner._pending_model_notes
+
+    await runner._run_agent(
+        message="second user message",
+        context_prompt="Context prompt",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key=session_key,
+        persist_user_message="second user message",
+    )
+
+    second = _CapturingAgent.last_run
+    assert second["prepared"].user_message == "second user message"
+    assert second["prepared"].persist_user_message == "second user message"

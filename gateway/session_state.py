@@ -95,6 +95,10 @@ class ConversationState:
     model_override: Optional[Dict[str, Any]] = None
     # /model --once restore snapshot.
     one_turn_restore: Optional[Dict[str, Any]] = None
+    # Explicit model/MoA target staged for the next real user turn.
+    pending_turn_route_target: Optional[Dict[str, Any]] = None
+    # Bounded affinity/failure state owned by the shared turn router.
+    turn_routing_session_state: Any = None
     # /reasoning per-session override.
     reasoning_override: Optional[Dict[str, Any]] = None
     # /fast per-session override: "priority" or None; _UNSET_TIER = absent.
@@ -119,6 +123,8 @@ class ConversationState:
         """
         self.model_override = None
         self.one_turn_restore = None
+        self.pending_turn_route_target = None
+        self.turn_routing_session_state = None
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER
         self.last_resolved_model = ""
@@ -359,6 +365,12 @@ LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
     ),
     "_pending_one_turn_model_restores": _FieldSpec(
         "conversation", "one_turn_restore", lambda: None, _present_not_none
+    ),
+    "_pending_turn_route_targets": _FieldSpec(
+        "conversation", "pending_turn_route_target", lambda: None, _present_not_none
+    ),
+    "_turn_routing_session_states": _FieldSpec(
+        "conversation", "turn_routing_session_state", lambda: None, _present_not_none
     ),
     "_session_reasoning_overrides": _FieldSpec(
         "conversation", "reasoning_override", lambda: None, _present_not_none

@@ -427,6 +427,8 @@ export const $availablePersonalities = atom<string[]>([])
 export const $introSeed = atom(0)
 export const $contextSuggestions = atom<ContextSuggestion[]>([])
 export const $modelPickerOpen = atom(false)
+export type ModelPickerScope = 'once' | 'session'
+export const $modelPickerScope = atom<ModelPickerScope>('session')
 export const $sessionPickerOpen = atom(false)
 
 export const setConnection = (next: Updater<HermesConnection | null>) => updateAtom($connection, next)
@@ -564,5 +566,15 @@ export const setCurrentPersonality = (next: Updater<string>) => updateAtom($curr
 export const setAvailablePersonalities = (next: Updater<string[]>) => updateAtom($availablePersonalities, next)
 export const setIntroSeed = (next: Updater<number>) => updateAtom($introSeed, next)
 export const setContextSuggestions = (next: Updater<ContextSuggestion[]>) => updateAtom($contextSuggestions, next)
-export const setModelPickerOpen = (next: Updater<boolean>) => updateAtom($modelPickerOpen, next)
+export const setModelPickerOpen = (next: Updater<boolean>) => {
+  updateAtom($modelPickerOpen, next)
+  if (!$modelPickerOpen.get()) {
+    $modelPickerScope.set('session')
+  }
+}
+export const setModelPickerScope = (next: Updater<ModelPickerScope>) => updateAtom($modelPickerScope, next)
+export const openModelPicker = (scope: ModelPickerScope = 'session') => {
+  $modelPickerScope.set(scope)
+  $modelPickerOpen.set(true)
+}
 export const setSessionPickerOpen = (next: Updater<boolean>) => updateAtom($sessionPickerOpen, next)

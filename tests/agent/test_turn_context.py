@@ -90,6 +90,9 @@ class _FakeAgent:
         self._persist_calls = 0
         self._session_messages = []
         self._pending_cli_user_message = None
+        self._persist_user_message_idx: int | None = None
+        self._persist_user_message_override: object | None = None
+        self._persist_user_message_timestamp: float | None = None
         self._session_persist_lock = threading.RLock()
         # Records _cached_system_prompt at the moment _ensure_db_session()
         # is called (regression guard for #45499 turn-setup ordering).
@@ -239,6 +242,85 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
 
 
+def test_turn_routing_preserves_primary_cold_prompt_before_publishing_routed_runtime():
+    agent = _FakeAgent()
+    setattr(agent, "_cached_system_prompt", None)
+    events = []
+
+    class _RouteLifecycle:
+        def prepare(self, target_agent, *, user_message, turn_id):
+            assert target_agent is agent
+            assert user_message == "hello"
+            assert turn_id == target_agent._current_turn_id
+            assert turn_id.startswith("sess-1:")
+            events.append(("prepare", turn_id))
+            target_agent.model = "routed/model"
+
+    def set_runtime_main(_provider, model, **_kwargs):
+        events.append(("runtime", model))
+
+    def restore_or_build_system_prompt(target_agent, *_args):
+        events.append(("prompt", target_agent.model))
+        target_agent._cached_system_prompt = "SYSTEM"
+
+    with patch("agent.auxiliary_client.set_runtime_main", set_runtime_main):
+        ctx = _build(
+            agent,
+            turn_routing_lifecycle=_RouteLifecycle(),
+            restore_or_build_system_prompt=restore_or_build_system_prompt,
+        )
+
+    assert events == [
+        ("prompt", "test/model"),
+        ("prepare", ctx.turn_id),
+        ("runtime", "routed/model"),
+    ]
+    assert ctx.turn_id == events[1][1]
+
+
+def test_turn_routing_prepares_routed_runtime_before_context_preflight(monkeypatch):
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent.context_compressor.model = "test/model"
+    agent.context_compressor.threshold_tokens = 100
+    agent.context_compressor.context_length = 1_000
+    agent.context_compressor.last_prompt_tokens = 0
+    agent.context_compressor.last_real_prompt_tokens = 0
+    agent.context_compressor.should_compress = lambda _tokens: False
+    agent._cached_system_prompt = "PRIMARY-SYSTEM"
+    observed = []
+
+    class _RouteLifecycle:
+        def prepare(self, target_agent, *, user_message, turn_id):
+            assert user_message == "hello"
+            assert turn_id == target_agent._current_turn_id
+            target_agent.model = "routed/model"
+            target_agent.context_compressor.model = "routed/model"
+
+        def prepare_message(self, user_message, persist_user_message):
+            from agent.turn_routing_runtime import PreparedTurnMessage
+
+            observed.append(("message", agent.model, agent.context_compressor.model))
+            assert user_message == "hello"
+            assert persist_user_message is None
+            return PreparedTurnMessage("enriched hello", "clean hello")
+
+    def estimate(*_args, **_kwargs):
+        observed.append(("estimate", agent.model, agent.context_compressor.model))
+        return 1
+
+    monkeypatch.setattr("agent.turn_context._should_run_preflight_estimate", lambda *_a: True)
+    monkeypatch.setattr("agent.turn_context.estimate_request_tokens_rough", estimate)
+
+    ctx = _build(agent, turn_routing_lifecycle=_RouteLifecycle())
+
+    assert observed == [
+        ("message", "routed/model", "routed/model"),
+        ("estimate", "routed/model", "routed/model"),
+    ]
+    assert ctx.messages[-1]["content"] == "enriched hello"
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)
@@ -258,6 +340,53 @@ def test_applies_agent_side_effects():
 
 
 
+def test_aborted_turn_persist_override_cannot_leak_into_later_turns():
+    agent = _FakeAgent()
+    # Simulate a turn that exited before its finalizer could retire the
+    # API-local persistence state. The next prologue is the authoritative
+    # request boundary and must replace every field before appending/persisting.
+    agent._persist_user_message_idx = 7
+    agent._persist_user_message_override = "stale clean text"
+    agent._persist_user_message_timestamp = 123.0
+
+    clean_ctx = _build(
+        agent,
+        user_message="[API NOTE]\n\ncurrent question",
+        persist_user_message="current question",
+        persist_user_timestamp=456.0,
+    )
+
+    assert clean_ctx.original_user_message == "current question"
+    assert agent._persist_user_message_idx == clean_ctx.current_turn_user_idx
+    assert agent._persist_user_message_override == "current question"
+    assert agent._persist_user_message_timestamp == 456.0
+
+    ordinary_ctx = _build(
+        agent,
+        user_message="later question",
+        persist_user_message=None,
+        persist_user_timestamp=None,
+    )
+
+    assert ordinary_ctx.original_user_message == "later question"
+    assert ordinary_ctx.messages[-1]["content"] == "later question"
+    assert agent._persist_user_message_idx == ordinary_ctx.current_turn_user_idx
+    assert agent._persist_user_message_override is None
+    assert agent._persist_user_message_timestamp is None
+
+
+def test_pending_cli_message_carries_durable_marker_to_new_turn_dict():
+    """A close-persisted CLI input must not be written again by turn start."""
+    agent = _FakeAgent()
+    staged = {"role": "user", "content": "already durable", "_db_persisted": True}
+    agent._pending_cli_user_message = staged
+
+    ctx = _build(agent, user_message="already durable")
+
+    assert ctx.messages[-1] is staged
+    assert ctx.messages[-1]["content"] == "already durable"
+    assert ctx.messages[-1]["_db_persisted"] is True
+    assert agent._pending_cli_user_message is None
 
 
 

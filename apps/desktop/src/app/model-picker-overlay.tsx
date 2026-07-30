@@ -10,6 +10,7 @@ import {
   $currentProvider,
   $gatewayState,
   $modelPickerOpen,
+  $modelPickerScope,
   setModelPickerOpen
 } from '@/store/session'
 import { $focusedRuntimeId, $focusedSessionState } from '@/store/session-states'
@@ -35,6 +36,7 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
   const focusedProvider = useStoreSelector($focusedSessionState, state => state?.provider ?? null)
   const gatewayOpen = useStore($gatewayState) === 'open'
   const open = useStore($modelPickerOpen)
+  const scope = useStore($modelPickerScope)
 
   // Prefer the focused tile's runtime when the overlay opens from a tile that
   // lacked a live menu (gateway closed → fallback path).
@@ -51,8 +53,10 @@ export function ModelPickerOverlay({ gateway, onSelect, profile }: ModelPickerOv
       currentModel={currentModel}
       currentProvider={currentProvider}
       gw={gateway}
-      onOpenChange={setModelPickerOpen}
-      onSelect={selection => onSelect({ ...selection, sessionId })}
+      onOpenChange={next => {
+        setModelPickerOpen(next)
+      }}
+      onSelect={selection => onSelect({ ...selection, scope, sessionId })}
       open={open}
       profile={profile}
       sessionId={sessionId}
