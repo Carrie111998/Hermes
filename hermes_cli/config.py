@@ -4854,6 +4854,22 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+
+    # Guard against #74995: a single-segment key that names an existing mapping
+    # in the user config would silently overwrite the entire mapping with a
+    # scalar (e.g. ``hermes config set model gpt-5.6-sol`` → ``model: gpt-5.6-sol``
+    # instead of ``model.default: gpt-5.6-sol``).  Refuse the write and suggest
+    # the canonical leaf path.  ``--force`` still allows it for scripted use.
+    if "." not in key and isinstance(user_config.get(key), dict) and not force:
+        leaf_keys = [k for k in user_config[key] if isinstance(k, str)]
+        print(
+            f"✗ Cannot set '{key}' to a scalar value — '{key}' is a mapping with "
+            f"{len(leaf_keys)} key(s). Use a dotted path to set a specific leaf, "
+            f"e.g. 'hermes config set {key}.{leaf_keys[0] if leaf_keys else '<leaf>'} <value>'.",
+            file=sys.stderr,
+        )
+        return
+
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
