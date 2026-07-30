@@ -2594,11 +2594,17 @@ def delegate_task(
             completed_count = 0
             spinner_ref = getattr(parent_agent, "_delegate_spinner", None)
 
-            # Daemon workers (tools.daemon_pool): the `with` block still joins
-            # normally, but if the parent is interrupted while a child is
-            # wedged, the abandoned worker must not block interpreter exit.
+            # Daemon workers (tools.daemon_pool) + an explicit
+            # shutdown(wait=False).  A `with` block would call
+            # shutdown(wait=True) on the way out and join every worker, so
+            # breaking out of the poll loop on an interrupt immediately
+            # re-blocked on exactly the wedged child we had just decided to
+            # abandon — the interrupt was honoured in the loop and un-honoured
+            # one line later.  Not joining is safe precisely because these
+            # workers are daemons: they can't hold interpreter exit open.
             from tools.daemon_pool import DaemonThreadPoolExecutor
-            with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
+            executor = DaemonThreadPoolExecutor(max_workers=max_children)
+            try:
                 futures = {}
                 for i, t, child in children:
                     future = executor.submit(
@@ -2708,6 +2714,11 @@ def delegate_task(
                                 )
                             except Exception as e:
                                 logger.debug("Spinner update_text failed: %s", e)
+            finally:
+                # Never join: on the normal path every future is already done,
+                # so this is a no-op; on the interrupt path joining would undo
+                # the abandonment we just performed.
+                executor.shutdown(wait=False)
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
