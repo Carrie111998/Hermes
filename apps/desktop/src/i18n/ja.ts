@@ -2576,6 +2576,8 @@ export const ja = defineLocale({
       skip: 'スキップ',
       skipped: 'スキップ済み',
       continueLabel: '続行',
+      recommended: 'おすすめ',
+      choiceHint: 'クリックで選択 · A/B または 1/2 · ↑↓ のあと ⏎',
       lateAnswer: (question, choice) => `「${question}」について — 私の回答: ${choice}`,
       lateAnswerTip: 'この回答をフォローアップメッセージとして下書きします',
       lateAnswerHint: 'この質問はもう回答を待っていません。選択肢を選ぶとフォローアップメッセージとして下書きされます。'

@@ -86,14 +86,20 @@ export function readClarifyResult(result: unknown): ClarifyResult {
 
 const letterFor = (index: number): string => String.fromCharCode(65 + index)
 
+/** Detect an explicit recommended / default marker in choice text (Claude-style). */
+export function isRecommendedChoice(choice: string): boolean {
+  return /推荐|建議|建议|recommended|\bdefault\b|★|⭐|（推荐）|\(推荐\)|【推荐】|\[recommended\]/i.test(choice)
+}
+
+// Card-like rows (Perplexity / Claude Code): border + padding, not bare text lines.
 const OPTION_ROW_CLASS =
-  'flex w-full items-start gap-2 rounded-[0.25rem] px-1.5 py-1 text-left disabled:cursor-not-allowed disabled:opacity-50'
+  'flex w-full items-start gap-2.5 rounded-md border border-transparent px-2 py-1.5 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50'
 
 // field-sizing on top of Textarea's shared chrome; kill min-h-16 for one-liners.
 const CLARIFY_TEXTAREA_CLASS = 'field-sizing-content max-h-40 min-h-0 resize-none'
 
 const CLARIFY_SHELL_CLASS =
-  'my-1.5 rounded-md border border-primary/20 bg-(--ui-chat-surface-background) text-[length:var(--conversation-text-font-size)] text-(--ui-text-primary)'
+  'my-1.5 rounded-lg border border-primary/25 bg-(--ui-chat-surface-background) text-[length:var(--conversation-text-font-size)] text-(--ui-text-primary) shadow-sm'
 
 const CLARIFY_ICON_CLASS = 'mt-px size-4 shrink-0 text-(--ui-text-tertiary)'
 
@@ -123,7 +129,7 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   return (
     <Kbd
       className={cn(
-        'mt-px',
+        'mt-px shrink-0',
         selected && 'border-primary bg-primary text-white shadow-none',
         !selected && preview && 'border-primary text-primary shadow-none'
       )}
@@ -134,8 +140,22 @@ function KeyBadge({ char, preview, selected }: { char: string; preview?: boolean
   )
 }
 
-/** A letter-badged option row. Shared by the live pending card (where a click
- * selects an answer) and the settled skip card (where a click drafts a
+/** True when the user was drag-selecting text inside the control — don't treat as a pick. */
+function clickWasTextSelection(target: EventTarget | null): boolean {
+  const selection = typeof window !== 'undefined' ? window.getSelection() : null
+
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    return false
+  }
+
+  const node = selection.anchorNode
+  const el = target instanceof Element ? target : null
+
+  return Boolean(el && node && el.contains(node))
+}
+
+/** A letter-badged option row. Shared by the live pending card (one-click submit,
+ * Claude Code / Perplexity style) and the settled skip card (click drafts a
  * follow-up), so both stay visually identical. */
 function ChoiceButton({
   active = false,
@@ -144,6 +164,8 @@ function ChoiceButton({
   disabled,
   keyShortcuts,
   onClick,
+  recommended = false,
+  recommendedLabel,
   selected = false,
   title
 }: {
@@ -153,6 +175,8 @@ function ChoiceButton({
   disabled?: boolean
   keyShortcuts?: string
   onClick: () => void
+  recommended?: boolean
+  recommendedLabel?: string
   selected?: boolean
   title?: string
 }) {
@@ -171,18 +195,33 @@ function ChoiceButton({
         aria-keyshortcuts={keyShortcuts}
         className={cn(
           OPTION_ROW_CLASS,
-          'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
-          active && 'bg-(--chrome-action-hover) text-(--ui-text-primary)',
-          selected && 'text-(--ui-text-primary)'
+          'text-(--ui-text-secondary) hover:border-(--ui-border) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+          active && 'border-primary/35 bg-(--chrome-action-hover) text-(--ui-text-primary)',
+          selected && 'border-primary/55 bg-primary/10 text-(--ui-text-primary)',
+          recommended && !selected && !active && 'border-primary/20 bg-primary/5'
         )}
         data-choice
         data-highlighted={active || undefined}
+        data-recommended={recommended || undefined}
         disabled={disabled}
-        onClick={onClick}
+        onClick={event => {
+          // Keep Ctrl+C / drag-select usable on the label without accidental submit.
+          if (clickWasTextSelection(event.currentTarget)) {
+            return
+          }
+
+          onClick()
+        }}
+        role="option"
         type="button"
       >
         <KeyBadge char={char} preview={active} selected={selected} />
-        <span className="flex-1 wrap-anywhere">{choice}</span>
+        <span className="min-w-0 flex-1 select-text wrap-anywhere leading-(--conversation-line-height)">{choice}</span>
+        {recommended && recommendedLabel ? (
+          <span className="mt-px shrink-0 rounded-sm bg-primary/15 px-1 py-px text-[0.625rem] font-medium leading-4 text-primary">
+            {recommendedLabel}
+          </span>
+        ) : null}
       </button>
     </Tip>
   )
@@ -258,13 +297,15 @@ function ClarifyToolSettled({ args, result }: ToolCallMessagePartProps) {
         </ClarifyLine>
       ) : null}
       {skipped && choices.length > 0 ? (
-        <div className="grid gap-px" data-clarify-late-choices="" role="group">
+        <div className="grid gap-1" data-clarify-late-choices="" role="listbox">
           {choices.map((choice, index) => (
             <ChoiceButton
               char={letterFor(index)}
               choice={choice}
               key={`${index}-${choice}`}
               onClick={() => followUp(choice)}
+              recommended={isRecommendedChoice(choice)}
+              recommendedLabel={copy.recommended}
               title={copy.lateAnswerTip}
             />
           ))}
@@ -356,17 +397,24 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   )
 
   const trimmedDraft = draft.trim()
-  // The answer is whichever input is active: a picked choice, or typed text.
-  // Picking a choice no longer fires immediately — it selects, then the user
-  // confirms with Continue (or Enter from the field).
+  // Free-text "Other" still uses Continue / Enter. Predefined choices submit on
+  // the first click or letter/number key (Claude Code / Perplexity one-shot).
   const pendingAnswer = selectedChoice ?? (trimmedDraft || null)
 
-  const selectChoice = useCallback((choice: string, index: number) => {
-    // Picking a choice and typing are mutually exclusive answers.
-    setDraft('')
-    setSelectedChoice(choice)
-    setActiveIndex(index)
-  }, [])
+  /** One-shot pick: stage for visual feedback, then resolve immediately. */
+  const pickChoice = useCallback(
+    (choice: string, index: number) => {
+      if (submitting) {
+        return
+      }
+
+      setDraft('')
+      setSelectedChoice(choice)
+      setActiveIndex(index)
+      void respond(choice)
+    },
+    [respond, submitting]
+  )
 
   // Keep the cursor in range when the choice set changes (never past "Other").
   useEffect(() => {
@@ -399,25 +447,30 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   }, [respond, selectedChoice, trimmedDraft])
 
   const activateActive = useCallback(() => {
-    // A staged answer (picked choice or typed text) wins — confirm it.
-    if (pendingAnswer) {
-      submitAnswer()
+    // Typed free-text or a mid-submit staged choice wins.
+    if (trimmedDraft) {
+      void respond(trimmedDraft)
 
       return
     }
 
-    // Otherwise act on the highlighted row: a choice responds immediately, and
-    // the trailing "Other" row focuses the free-text field.
+    if (selectedChoice !== null) {
+      void respond(selectedChoice)
+
+      return
+    }
+
+    // Highlighted predefined row → one-shot submit; "Other" focuses the field.
     const choice = choices[activeIndex]
 
     if (choice) {
-      void respond(choice)
+      pickChoice(choice, activeIndex)
 
       return
     }
 
     textareaRef.current?.focus()
-  }, [activeIndex, choices, pendingAnswer, respond, submitAnswer])
+  }, [activeIndex, choices, pickChoice, respond, selectedChoice, trimmedDraft])
 
   const handleTextareaKey = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -441,11 +494,9 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
     [submitAnswer]
   )
 
-  // Arrow keys move a visual cursor, 1-9 and A/B/C… pick directly, and Enter
-  // confirms the current answer (or acts on the highlighted row). Stands down
-  // whenever a focusable control (a field, a choice button, the action bar) is
-  // focused, so it never eats keystrokes meant for the composer, the Other box,
-  // or a button the user tabbed to.
+  // Arrow keys move a visual cursor; 1-9 and A/B/C… one-shot submit (Claude Code);
+  // Enter confirms free-text or the highlighted row. Stands down whenever a
+  // focusable control is focused so it never eats composer / Other / button keys.
   useEffect(() => {
     if (!ready || !hasChoices || submitting) {
       return
@@ -477,7 +528,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
         if (index < choices.length) {
           event.preventDefault()
-          selectChoice(choices[index], index)
+          pickChoice(choices[index], index)
         } else if (index === choices.length) {
           event.preventDefault()
           setActiveIndex(index)
@@ -498,7 +549,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
         if (index < choices.length) {
           event.preventDefault()
-          selectChoice(choices[index], index)
+          pickChoice(choices[index], index)
         } else if (index === choices.length) {
           event.preventDefault()
           setActiveIndex(index)
@@ -517,7 +568,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
     window.addEventListener('keydown', onKeyDown)
 
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activateActive, choices, hasChoices, moveActive, ready, selectChoice, submitting])
+  }, [activateActive, choices, hasChoices, moveActive, pickChoice, ready, submitting])
 
   if (loading) {
     return (
@@ -556,7 +607,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
 
       <form className="grid gap-2" onSubmit={handleSubmit}>
         {hasChoices ? (
-          <div className="grid gap-px" role="group">
+          <div className="grid gap-1" role="listbox" aria-label={question || copy.loadingQuestion}>
             {choices.map((choice, index) => (
               <ChoiceButton
                 active={activeIndex === index}
@@ -565,15 +616,17 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 disabled={submitting}
                 key={`${index}-${choice}`}
                 keyShortcuts={`${letterFor(index)} ${index + 1}`}
-                onClick={() => selectChoice(choice, index)}
+                onClick={() => pickChoice(choice, index)}
+                recommended={isRecommendedChoice(choice)}
+                recommendedLabel={copy.recommended}
                 selected={selectedChoice === choice}
               />
             ))}
             <label
               className={cn(
                 OPTION_ROW_CLASS,
-                'items-center',
-                activeIndex === choices.length && 'bg-(--chrome-action-hover)'
+                'items-center border-(--ui-border)/40',
+                activeIndex === choices.length && 'border-primary/35 bg-(--chrome-action-hover)'
               )}
               data-highlighted={activeIndex === choices.length || undefined}
             >
@@ -602,6 +655,9 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 value={draft}
               />
             </label>
+            <p className="px-1 pt-0.5 text-[0.6875rem] leading-4 text-(--ui-text-tertiary)" data-clarify-choice-hint="">
+              {copy.choiceHint}
+            </p>
           </div>
         ) : (
           <Textarea
@@ -621,6 +677,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
           <Button disabled={submitting} onClick={() => void respond('')} size="xs" type="button" variant="text">
             {copy.skip}
           </Button>
+          {/* Continue is for free-text / Other; predefined choices one-shot on click. */}
           <Button disabled={submitting || !pendingAnswer} size="xs" type="submit">
             {submitting ? (
               <Loader2 className="size-3 animate-spin" />

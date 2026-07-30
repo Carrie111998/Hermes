@@ -9,7 +9,7 @@ import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
 import { $activeSessionId } from '@/store/session'
 
-import { ClarifyTool, readClarifyResult } from './clarify-tool'
+import { ClarifyTool, isRecommendedChoice, readClarifyResult } from './clarify-tool'
 
 // The live pending card only renders while its message is running. Force that so
 // keyboard-navigation tests can exercise ClarifyToolPending directly.
@@ -86,6 +86,15 @@ function renderLiveClarify() {
 
   return request
 }
+
+describe('isRecommendedChoice', () => {
+  it('detects explicit recommended / default markers', () => {
+    expect(isRecommendedChoice('A. 推荐：走 staging')).toBe(true)
+    expect(isRecommendedChoice('Use production (recommended)')).toBe(true)
+    expect(isRecommendedChoice('default path')).toBe(true)
+    expect(isRecommendedChoice('plain option')).toBe(false)
+  })
+})
 
 describe('readClarifyResult', () => {
   it('reads question + user_response from the tool JSON payload', () => {
@@ -234,8 +243,8 @@ describe('ClarifyTool keyboard navigation', () => {
   it('cycles through choices and Other with the arrow keys', () => {
     renderLiveClarify()
 
-    const staging = screen.getByRole('button', { name: /staging/ })
-    const production = screen.getByRole('button', { name: /production/ })
+    const staging = screen.getByRole('option', { name: /staging/ })
+    const production = screen.getByRole('option', { name: /production/ })
     const other = screen.getByPlaceholderText(/Other/)
 
     expect(staging.getAttribute('data-highlighted')).toBe('true')
@@ -257,11 +266,10 @@ describe('ClarifyTool keyboard navigation', () => {
     expect(other.closest('label')?.getAttribute('data-highlighted')).toBe('true')
   })
 
-  it('selects by number and confirms the answer with Enter', async () => {
+  it('submits immediately when a number key is pressed (one-shot, Claude/Perplexity style)', async () => {
     const request = renderLiveClarify()
 
     fireEvent.keyDown(window, { key: '2' })
-    fireEvent.keyDown(window, { key: 'Enter' })
 
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('clarify.respond', {
@@ -269,6 +277,41 @@ describe('ClarifyTool keyboard navigation', () => {
         request_id: 'request-1'
       })
     })
+  })
+
+  it('submits immediately when a choice row is clicked', async () => {
+    const request = renderLiveClarify()
+
+    fireEvent.click(screen.getByRole('option', { name: /production/ }))
+
+    await waitFor(() => {
+      expect(request).toHaveBeenCalledWith('clarify.respond', {
+        answer: 'production',
+        request_id: 'request-1'
+      })
+    })
+  })
+
+  it('marks recommended choices and keeps choice labels selectable', () => {
+    $activeSessionId.set('session-1')
+    $gateway.set({ request: vi.fn().mockResolvedValue({ ok: true }) } as never)
+    setClarifyRequest({
+      choices: ['staging (recommended)', 'production'],
+      question: 'Which deployment target?',
+      requestId: 'request-1',
+      sessionId: 'session-1'
+    })
+    renderClarify(
+      <ClarifyTool
+        {...liveClarifyProps(['staging (recommended)', 'production'])}
+      />
+    )
+
+    const recommended = screen.getByRole('option', { name: /staging \(recommended\)/ })
+    expect(recommended.getAttribute('data-recommended')).toBe('true')
+    expect(screen.getByText('Recommended')).toBeTruthy()
+    expect(recommended.querySelector('span.select-text')).toBeTruthy()
+    expect(document.querySelector('[data-clarify-choice-hint]')).toBeTruthy()
   })
 
   it('focuses Other when its number is pressed and leaves typing keys alone', () => {

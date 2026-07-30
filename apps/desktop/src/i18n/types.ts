@@ -2345,6 +2345,10 @@ export interface Translations {
       skip: string
       skipped: string
       continueLabel: string
+      /** Short chip when choice text marks itself recommended / default. */
+      recommended: string
+      /** Keyboard / click affordance under the option list. */
+      choiceHint: string
       lateAnswer: (question: string, choice: string) => string
       lateAnswerTip: string
       lateAnswerHint: string

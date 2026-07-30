@@ -2749,6 +2749,8 @@ export const en: Translations = {
       skip: 'Skip',
       skipped: 'Skipped',
       continueLabel: 'Continue',
+      recommended: 'Recommended',
+      choiceHint: 'Click an option to choose · A/B or 1/2 · ↑↓ then ⏎',
       lateAnswer: (question, choice) => `Re: "${question}" — my answer: ${choice}`,
       lateAnswerTip: 'Draft this answer as a follow-up message',
       lateAnswerHint: 'This prompt is no longer waiting. Pick an option to draft it as a follow-up message.'

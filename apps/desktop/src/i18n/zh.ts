@@ -2924,6 +2924,8 @@ export const zh: Translations = {
       skip: '跳过',
       skipped: '已跳过',
       continueLabel: '继续',
+      recommended: '推荐',
+      choiceHint: '点击选项即选定 · A/B 或 1/2 · ↑↓ 后 ⏎',
       lateAnswer: (question, choice) => `关于"${question}" — 我的回答: ${choice}`,
       lateAnswerTip: '将此回答起草为后续消息',
       lateAnswerHint: '此问题已不再等待回答。选择一个选项会将其起草为后续消息。'

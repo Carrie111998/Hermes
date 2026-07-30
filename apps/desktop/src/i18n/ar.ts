@@ -2325,7 +2325,9 @@ export const ar = defineLocale({
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
-      continueLabel: 'متابعة'
+      continueLabel: 'متابعة',
+      recommended: 'موصى به',
+      choiceHint: 'انقر للاختيار · A/B أو 1/2 · ↑↓ ثم ⏎'
     },
     tool: {
       copyCode: 'نسخ الكود',
