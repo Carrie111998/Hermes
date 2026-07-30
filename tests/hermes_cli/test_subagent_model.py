@@ -126,6 +126,27 @@ def test_failed_resolution_does_not_write_config(monkeypatch):
         subagent_model.set_subagent_model("private-model", provider="missing")
 
 
+def test_full_picker_selection_capture_is_thread_local():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from hermes_cli.auth import capture_model_selection, record_model_selection
+
+    barrier = Barrier(2)
+
+    def capture_one(model_id: str) -> list[str]:
+        with capture_model_selection() as selections:
+            barrier.wait()
+            record_model_selection(model_id)
+            barrier.wait()
+            return list(selections)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(capture_one, ("terra-model", "moon-model")))
+
+    assert results == [["terra-model"], ["moon-model"]]
+
+
 def _memory_config(monkeypatch, initial):
     import copy
 
