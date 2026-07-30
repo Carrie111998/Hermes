@@ -37,6 +37,21 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+# Enhanced goal evaluation (additive — only when tool_calls available)
+try:
+    from .goal_judge import (  # type: ignore
+        JudgeVerdict,
+        evaluate_turn as evaluate_turn_enhanced,
+        verdict_icon, verdict_label, verdict_message,
+        DEFAULT_JUDGE_TIMEOUT as ENHANCED_JUDGE_TIMEOUT,
+    )
+    from .goal_scratchpad import GoalScratchpad, SubTask, Artifact  # type: ignore
+    _HAS_ENHANCED_JUDGE = True
+except Exception:
+    JudgeVerdict = None  # type: ignore
+    GoalScratchpad = None  # type: ignore
+    _HAS_ENHANCED_JUDGE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +86,29 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+
+# Enhanced goal evaluation constants (additive)
+ENHANCED_MIN_TURNS = 5
+ENHANCED_MAX_TURNS = 200
+ENHANCED_TURNS_PER_SUBTASK = 5
+ENHANCED_MAX_NEGATIVE_CONSTRAINTS = 8
+ENHANCED_HISTORY_MAX = 50
+_ENHANCED_COMPLEXITY_SIGNALS = [
+    (r"build|create|develop|implement|write.*(app|service|api|server|system|pipeline|bot)", 3),
+    (r"(full|complete|entire|whole).*(app|service|system|project)", 4),
+    (r"refactor|rewrite|migrate|port|convert", 3),
+    (r"deploy|launch|publish|release|ship", 2),
+    (r"debug|fix|investigate|diagnose|troubleshoot", 1),
+    (r"research|analyze|explore|review|audit|assess", 2),
+    (r"test|validate|verify|benchmark", 1),
+    (r"configure|setup|install|provision", 2),
+    (r"and.*and|, .*, .*,", 3),
+    (r"docker|kubernetes|k8s|terraform|ansible|ci/cd|cicd", 2),
+    (r"database|sql|schema|migration|backup", 2),
+    (r"security|auth|encrypt|oauth|jwt|ssl|tls", 2),
+    (r"multiple|several|many|various|different", 2),
+    (r"parallel|concurrent|simultaneously|both|all", 2),
+]
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -995,6 +1033,134 @@ def gather_background_processes(task_id: Optional[str] = None) -> List[Dict[str,
     return [s for s in sessions if isinstance(s, dict) and s.get("status") != "exited"]
 
 
+# ── Enhanced goal functions (additive) ──────────────────────────
+
+
+def estimate_enhanced_budget(goal: str, sub_task_count: int = 0) -> int:
+    """Estimate turn budget from goal complexity and sub-task count.
+    Uses the same pattern as the basic budget but with wider range (5-200).
+    Only active when tool_calls are available for enhanced evaluation."""
+    goal_lower = goal.lower()
+    base = max(10, len(goal.split()) // 3)
+    bonuses = sum(bonus for pattern, bonus in _ENHANCED_COMPLEXITY_SIGNALS if re.search(pattern, goal_lower))
+    if sub_task_count > 0:
+        base = max(base, sub_task_count * ENHANCED_TURNS_PER_SUBTASK)
+    return max(ENHANCED_MIN_TURNS, min(ENHANCED_MAX_TURNS, base + bonuses))
+
+
+def decompose_goal(goal: str, *, timeout: float = 30.0) -> "List[SubTask]":
+    """Break a goal into sub-tasks with dependency edges for DAG dispatch.
+    Only used by the enhanced evaluation path. Returns empty list when the
+    auxiliary model is unavailable or the goal is too short to decompose."""
+    if not _HAS_ENHANCED_JUDGE:
+        return []
+    if len(goal.split()) < 5:
+        return []
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+    except Exception:
+        return []
+    try:
+        client, model = get_text_auxiliary_client("goal_decompose")
+    except Exception:
+        return []
+    if client is None or not model:
+        return []
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Break this goal into 3-8 ordered sub-tasks. "
+                        "Output ONLY a JSON object with a 'sub_tasks' array. "
+                        'Each task: {"description": "...", "depends_on": []}. '
+                        "List IDs of tasks that must complete first in depends_on. "
+                        "Tasks with no dependencies can run in parallel."
+                    ),
+                },
+                {"role": "user", "content": goal},
+            ],
+            temperature=0, max_tokens=500, timeout=timeout,
+        )
+        raw = resp.choices[0].message.content or ""
+    except Exception:
+        return []
+    text = raw.strip().strip("`")
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*?\}", text, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except Exception:
+                data = {}
+        else:
+            data = {}
+    tasks = data.get("sub_tasks", []) if isinstance(data, dict) else []
+    result = []
+    for i, t in enumerate(tasks):
+        desc = str(t.get("description", t)) if isinstance(t, dict) else str(t)
+        deps = t.get("depends_on", []) if isinstance(t, dict) else []
+        result.append(SubTask(
+            id=f"st{i+1:02d}",
+            description=desc.strip(),
+            depends_on=deps if isinstance(deps, list) else [],
+        ))
+    return result
+
+
+def build_continuation_prompt(goal: str, scratchpad: "GoalScratchpad", verdict: "JudgeVerdict") -> str:
+    """Build a continuation prompt with enhanced context — scratchpad state,
+    negative constraints, error patterns, and hard enforcement signals.
+    Only used by the enhanced evaluation path. Preserves backward compatibility:
+    when scratchpad is empty, falls back to the basic template."""
+    if not _HAS_ENHANCED_JUDGE:
+        return CONTINUATION_PROMPT_TEMPLATE.format(goal=goal)
+    if verdict.action == "done":
+        # Goal is done — no continuation needed
+        return ""
+    parts = []
+    if verdict.action == "pivot_strategy":
+        parts.append("🔄 HARD PIVOT — change approach now. Do NOT repeat what failed.")
+        if verdict.suggested_pivot:
+            parts.append(f"   New direction: {verdict.suggested_pivot}")
+        if verdict.negative_constraint:
+            parts.append(f"   🚫 DO NOT: {verdict.negative_constraint}")
+    elif verdict.action == "refine_output":
+        parts.append("🔧 QUALITY REFINEMENT — improve existing output, do not rebuild.")
+        if verdict.suggested_next_action:
+            parts.append(f"   Focus: {verdict.suggested_next_action}")
+    elif verdict.action == "decompose_further":
+        parts.append("📋 DECOMPOSING — break current task into smaller steps.")
+    elif verdict.action == "continue_as_is":
+        parts.append("→ Continue toward goal.")
+    else:
+        parts.append("[Continuing toward goal]")
+    parts.append(f"\nGoal: {goal}\n")
+    ctx = scratchpad.context_for_prompt() if hasattr(scratchpad, 'context_for_prompt') else ""
+    if ctx:
+        parts.append(ctx)
+    if scratchpad.negative_constraints:
+        parts.insert(2, "### 🚫 Active Constraints (DO NOT violate):")
+        for nc in scratchpad.negative_constraints[-ENHANCED_MAX_NEGATIVE_CONSTRAINTS:]:
+            parts.insert(3, f"- {nc}")
+        parts.insert(4, "")
+    systemic_errors = [
+        f"{err} ({count}x)"
+        for err, count in sorted(scratchpad.error_patterns.items(), key=lambda x: -x[1])
+        if count >= 2
+    ]
+    if systemic_errors:
+        parts.append("")
+        parts.append("### ⚠ Recurring Errors — fix, don't retry:")
+        for e in systemic_errors[:3]:
+            parts.append(f"- {e}")
+    return "\n".join(parts)
+
+
 def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) -> Optional[GoalContract]:
     """Expand a plain-language objective into a structured completion contract.
 
@@ -1097,6 +1263,11 @@ class GoalManager:
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
+        # Enhanced scratchpad — fresh per session, used only when tool_calls
+        # are provided for the enhanced evaluation path.
+        self._scratchpad: Optional["GoalScratchpad"] = None
+        if _HAS_ENHANCED_JUDGE:
+            self._scratchpad = GoalScratchpad.empty(goal_id=session_id)
 
     # --- introspection ------------------------------------------------
 
@@ -1214,6 +1385,124 @@ class GoalManager:
         self._state.last_verdict = "done"
         self._state.last_reason = reason
         save_goal(self.session_id, self._state)
+
+    # --- enhanced evaluation (additive) ---------------------------------
+
+    def _extract_artifacts_from_turn(self, tool_calls: List[Dict[str, Any]]) -> None:
+        """Auto-detect files written in this turn and register as artifacts.
+        Scans tool calls for write_file, patch, append_file, and shell
+        redirects. Only active when tool_calls are available."""
+        if not _HAS_ENHANCED_JUDGE:
+            return
+        known_write_names = {"write_file", "file_write", "patch", "append_file"}
+        for tc in tool_calls:
+            name = tc.get("function", {}).get("name", tc.get("name", ""))
+            args_str = str(tc.get("function", {}).get("arguments", tc.get("args", "")))
+            try:
+                args_obj = json.loads(args_str) if isinstance(args_str, str) else {}
+            except Exception:
+                args_obj = {}
+            path = None
+            kind = "file"
+            desc = ""
+            if name in known_write_names:
+                path = str(args_obj.get("path", args_obj.get("file", "")))
+                desc = str(args_obj.get("content", ""))[:80] if "content" in args_obj else ""
+            elif name == "terminal":
+                cmd = str(args_obj.get("command", args_obj.get("code", "")))
+                for redirect in (">", ">>", "| tee"):
+                    if redirect in cmd:
+                        parts = cmd.split(redirect)
+                        if len(parts) > 1:
+                            potential = parts[-1].strip().split()[0] if parts[-1].strip() else ""
+                            if potential and "/" in potential:
+                                path = potential
+                                kind = "file"
+                                desc = cmd[:80]
+                                break
+            if path and path.strip():
+                existing = {a.path for a in self._scratchpad.artifacts}
+                if path.strip() not in existing:
+                    self._scratchpad.add_artifact(
+                        path.strip(), kind=kind,
+                        description=desc if desc else f"written by {name}",
+                    )
+
+    def evaluate_after_turn_enhanced(
+        self,
+        last_response: str,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        *,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+        user_initiated: bool = True,
+    ) -> Dict[str, Any]:
+        """Enhanced evaluation pipeline — wraps the basic judge with semantic
+        loop detection, artifact extraction, verification gates, and adaptive
+        budget. Falls back to the standard evaluate_after_turn when the
+        enhanced judge modules are unavailable.
+
+        This is purely additive: it calls the existing evaluate_after_turn for
+        the base verdict, then layers enhanced post-processing on top when
+        tool_calls are available. Every existing contract (background_processes,
+        subgoals, wait barriers, completion contracts) is fully preserved."""
+        if not _HAS_ENHANCED_JUDGE:
+            return self.evaluate_after_turn(
+                last_response, background_processes=background_processes,
+                user_initiated=user_initiated,
+            )
+        # Run the standard evaluation first (full contract preservation)
+        decision = self.evaluate_after_turn(
+            last_response, background_processes=background_processes,
+            user_initiated=user_initiated,
+        )
+        # Only apply enhanced features when the goal is still active
+        if decision.get("verdict") not in ("continue", "active"):
+            return decision
+        # Auto-extract artifacts from tool calls
+        if tool_calls:
+            self._extract_artifacts_from_turn(tool_calls)
+        # Semantic loop detection via goal_judge
+        verdict = evaluate_turn_enhanced(
+            goal=self._state.goal if self._state else "",
+            last_response=last_response,
+            scratchpad=self._scratchpad,
+            tool_calls=tool_calls,
+        )
+        # Record verdict in scratchpad history for trend detection
+        self._scratchpad.record_verdict({
+            "turn": self._state.turns_used if self._state else 0,
+            "action": verdict.action,
+            "completion": verdict.completion,
+            "progress": verdict.progress_signal,
+            "quality": verdict.quality_score,
+            "timestamp": time.time(),
+        })
+        # Track error patterns
+        if verdict.error_pattern:
+            self._scratchpad.track_error(verdict.error_pattern)
+        # Apply negative constraints
+        if verdict.negative_constraint:
+            self._scratchpad.add_negative_constraint(verdict.negative_constraint)
+        # Record approach on pivot
+        if verdict.action == "pivot_strategy" and verdict.suggested_pivot:
+            self._scratchpad.record_approach(str(verdict.suggested_pivot))
+        # Verification gate: artifacts exist but none verified → downgrade
+        if verdict.action == "done":
+            if tool_calls:
+                self._extract_artifacts_from_turn(tool_calls)
+            has_artifacts = bool(self._scratchpad.artifacts)
+            verified = sum(1 for a in self._scratchpad.artifacts if a.verified)
+            if verdict.completion > 0.75 and has_artifacts and verified == 0:
+                verdict.action = "refine_output"
+                verdict.suggested_next_action = "Verify all artifacts exist before marking done."
+        # Build enhanced continuation prompt when applicable
+        if verdict.action != "done" and self._state and self._state.status == "active":
+            enhanced_prompt = build_continuation_prompt(
+                self._state.goal, self._scratchpad, verdict,
+            )
+            if enhanced_prompt:
+                decision["continuation_prompt"] = enhanced_prompt
+        return decision
 
     # --- /subgoal user controls ---------------------------------------
 
@@ -1786,8 +2075,14 @@ __all__ = [
     "GoalState",
     "GoalContract",
     "GoalManager",
+    "GoalScratchpad",
+    "SubTask",
+    "Artifact",
+    "JudgeVerdict",
     "parse_contract",
     "draft_contract",
+    "decompose_goal",
+    "estimate_enhanced_budget",
     "CONTINUATION_PROMPT_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
