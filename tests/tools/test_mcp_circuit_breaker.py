@@ -101,6 +101,282 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_tool_level_errors_do_not_trip_server_breaker(monkeypatch, tmp_path):
+    """A completed MCP round-trip with ``isError=True`` proves transport health.
+
+    Validation/domain errors belong to the request or tool, not to the server
+    connection. Repeating them must preserve the actionable tool error without
+    opening the server-level circuit breaker.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_validation_error(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = "REQUEST_INVALID: type 'solution' is not allowed"
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv-semantic", _call_tool_validation_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv-semantic", "note_create", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1):
+            parsed = json.loads(handler({"type": "solution"}))
+            assert "REQUEST_INVALID" in parsed.get("error", ""), parsed
+
+        assert call_count["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+        assert mcp_tool._server_error_counts.get("srv-semantic", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-semantic")
+
+
+def test_mixed_success_and_tool_errors_reset_breaker(monkeypatch, tmp_path):
+    """Alternating success and isError=True results must all reach the tool
+    and keep the server breaker reset.
+
+    A server that intermittently returns domain errors (e.g. transient
+    validation) followed by healthy results should never trip the breaker.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_log = []
+
+    async def _call_tool_mixed(tool_name, arguments=None):
+        call_log.append(arguments)
+        result = MagicMock()
+        # Alternate: even calls succeed, odd calls fail
+        result.isError = len(call_log) % 2 == 0
+        block = MagicMock()
+        if result.isError:
+            block.text = f"VALIDATION_ERROR: attempt {len(call_log)}"
+        else:
+            block.text = f"ok-{len(call_log)}"
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv-mixed", _call_tool_mixed)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv-mixed", "tool_mixed", 10.0)
+        for i in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD * 2):
+            parsed = json.loads(handler({"attempt": i}))
+            if i % 2 == 0:
+                assert parsed.get("result") == f"ok-{i + 1}", parsed
+            else:
+                assert "VALIDATION_ERROR" in parsed.get("error", ""), parsed
+
+        # All calls must have been dispatched; breaker never tripped
+        assert len(call_log) == mcp_tool._CIRCUIT_BREAKER_THRESHOLD * 2
+        assert mcp_tool._server_error_counts.get("srv-mixed", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-mixed")
+
+
+def test_tool_errors_do_not_count_toward_breaker_threshold(
+    monkeypatch, tmp_path,
+):
+    """Tool-level errors (isError=True) must NOT count toward the breaker
+    threshold, while genuine transport exceptions MUST.
+
+    Sequence: THRESHOLD tool-level errors → THRESHOLD transport exceptions
+    → 1 more call blocked by open breaker.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_seq = {"n": 0}
+
+    async def _call_tool_scenario(tool_name, arguments=None):
+        call_seq["n"] += 1
+        n = call_seq["n"]
+        THRESH = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        if n <= THRESH:
+            # Tool-level isError — should NOT count toward the breaker.
+            result = MagicMock()
+            result.isError = True
+            block = MagicMock()
+            block.text = f"VALIDATION_ERROR #{n}"
+            result.content = [block]
+            result.structuredContent = None
+            return result
+        # Genuine transport failure — must count toward the breaker.
+        raise ConnectionError("MCP transport broken")
+
+    _install_stub_server(mcp_tool, "srv-boundary", _call_tool_scenario)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv-boundary", "tool_b", 10.0)
+        THRESH = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+
+        # Phase 1: THRESHOLD tool-level errors — all reach the tool,
+        # error count stays at 0.
+        for i in range(1, THRESH + 1):
+            parsed = json.loads(handler({"x": i}))
+            assert f"VALIDATION_ERROR #{i}" in parsed.get("error", ""), parsed
+
+        assert mcp_tool._server_error_counts.get("srv-boundary", 0) == 0
+
+        # Phase 2: THRESHOLD transport exceptions trip the breaker.
+        for i in range(1, THRESH + 1):
+            parsed = json.loads(handler({"x": f"exception-{i}"}))
+            assert "error" in parsed, parsed
+
+        # After THRESH transport exceptions, count = THRESH and breaker
+        # is open with opened_at stamped. The next call should be
+        # short-circuited with "unreachable".
+        assert mcp_tool._server_error_counts.get("srv-boundary", 0) == THRESH
+
+        # Phase 3: next call is blocked by open breaker.
+        parsed = json.loads(handler({"x": "blocked"}))
+        assert "unreachable" in parsed.get("error", "").lower(), parsed
+    finally:
+        _cleanup(mcp_tool, "srv-boundary")
+
+
+def test_session_recovers_after_isError_then_transport_failure(
+    monkeypatch, tmp_path,
+):
+    """After tool-level errors followed by transport failures trip the
+    breaker, a successful half-open probe must restore full operation.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    THRESH = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+
+    probe_count = {"n": 0}
+
+    async def _call_tool_recovered(tool_name, arguments=None):
+        probe_count["n"] += 1
+        result = MagicMock()
+        result.isError = False
+        block = MagicMock()
+        block.text = "recovered"
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    server = _install_stub_server(mcp_tool, "srv-recover", _call_tool_recovered)
+    # Start with a dead session to trigger the reconnect path.
+    server.session = None
+    monkeypatch.setattr(mcp_tool, "_mcp_loop", None)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        # Pre-trip the breaker.
+        mcp_tool._server_error_counts["srv-recover"] = THRESH
+        fake_now = [1000.0]
+        monkeypatch.setattr(mcp_tool.time, "monotonic", lambda: fake_now[0])
+        mcp_tool._server_breaker_opened_at["srv-recover"] = fake_now[0]
+        cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
+        fake_now[0] += cooldown + 1.0  # advance past cooldown
+
+        handler = _make_tool_handler("srv-recover", "tool_r", 10.0)
+
+        # Half-open probe with no session → reconnect requested.
+        parsed = json.loads(handler({"x": "probe-1"}))
+        assert "reconnect" in parsed.get("error", "").lower(), parsed
+
+        # Simulate run loop rebuilding the session + resetting breaker.
+        live = MagicMock()
+        live.call_tool = _call_tool_recovered
+        server.session = live
+        mcp_tool._reset_server_error("srv-recover")
+
+        # Next call passes through cleanly.
+        parsed = json.loads(handler({"x": "normal"}))
+        assert parsed.get("result") == "recovered", parsed
+        assert mcp_tool._server_error_counts.get("srv-recover", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv-recover")
+
+
+def test_tool_errors_after_transport_recovery_keep_breaker_closed(
+    monkeypatch, tmp_path,
+):
+    """After a server recovers from transport failure (breaker half-opens
+    and closes), subsequent isError=True results must NOT re-open the
+    breaker — they are tool-level errors on a healthy transport.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    THRESH = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+
+    tool_iserror_count = {"n": 0}
+
+    async def _call_tool(tool_name, arguments=None):
+        result = MagicMock()
+        result.isError = True
+        block = MagicMock()
+        block.text = f"TOOL_ERROR #{tool_iserror_count['n']}"
+        result.content = [block]
+        result.structuredContent = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv-post", _call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv-post", "tool_p", 10.0)
+
+        # Fire many tool-level errors — must NOT open the breaker
+        # since every completed round-trip (even isError) resets it.
+        for i in range(THRESH + 5):
+            tool_iserror_count["n"] = i
+            parsed = json.loads(handler({"x": i}))
+            assert f"TOOL_ERROR #{i}" in parsed.get("error", ""), parsed
+
+        assert mcp_tool._server_error_counts.get("srv-post", 0) == 0
+
+        # Now simulate a genuine transport failure by swapping the
+        # session's call_tool to raise.
+        server = mcp_tool._servers["srv-post"]
+        old_call = server.session.call_tool
+
+        async def _fail(tool_name, arguments=None):
+            raise RuntimeError("transport broken")
+
+        server.session.call_tool = _fail
+
+        # THRESHOLD transport failures must open the breaker.
+        for i in range(THRESH + 1):
+            parsed = json.loads(handler({"x": f"fail-{i}"}))
+            if i < THRESH:
+                # Pre-threshold: generic error
+                assert "error" in parsed, parsed
+            else:
+                # Post-threshold: breaker gates with "unreachable"
+                assert "unreachable" in parsed.get("error", "").lower(), parsed
+
+        # Clean up
+        server.session.call_tool = old_call
+    finally:
+        _cleanup(mcp_tool, "srv-post")
+
+
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     """After a tripped breaker's cooldown elapses, the *next* call must
     actually execute against the session (half-open probe). When the
@@ -127,8 +403,6 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     mcp_tool._ensure_mcp_loop()
 
     try:
-        # Trip the breaker by setting the count at/above threshold and
-        # stamping the open-time to "now".
         mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD
         fake_now = [1000.0]
 
@@ -136,10 +410,6 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
             return fake_now[0]
 
         monkeypatch.setattr(mcp_tool.time, "monotonic", _fake_monotonic)
-        # The breaker-open timestamp dict is introduced by the fix; on
-        # a pre-fix build it won't exist, which will cause the test to
-        # fail at the .get() inside the gate (correct — the fix is
-        # required for this state to be tracked at all).
         if hasattr(mcp_tool, "_server_breaker_opened_at"):
             mcp_tool._server_breaker_opened_at["srv"] = fake_now[0]
         cooldown = getattr(mcp_tool, "_CIRCUIT_BREAKER_COOLDOWN_SEC", 60.0)
@@ -151,12 +421,9 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
         parsed = json.loads(result)
         assert "error" in parsed, parsed
         assert "unreachable" in parsed["error"].lower()
-        assert call_count["n"] == 0, (
-            "breaker should short-circuit before cooldown elapses"
-        )
+        assert call_count["n"] == 0
 
-        # Advance past cooldown → next call is a half-open probe that
-        # actually hits the session.
+        # Advance past cooldown → next call is a half-open probe.
         fake_now[0] += cooldown + 1.0
 
         result = handler({})
@@ -164,7 +431,6 @@ def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
         assert parsed.get("result") == "ok", parsed
         assert call_count["n"] == 1, "half-open probe should invoke session"
 
-        # On probe success the breaker must close (count reset to 0).
         assert mcp_tool._server_error_counts.get("srv", 0) == 0
     finally:
         _cleanup(mcp_tool, "srv")
