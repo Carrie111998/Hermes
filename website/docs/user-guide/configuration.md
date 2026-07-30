@@ -1430,6 +1430,41 @@ tool_loop_guardrails:
 
 `hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
 
+## Trajectory Quality Routing
+
+While tool-loop guardrails act on **tool execution** (warn/block individual calls), trajectory quality routing observes the **overall trajectory** and recommends a course correction when the agent is thrashing: repeated identical failures, failed verification streaks after edits, or long stretches with no verified progress.
+
+Disabled by default. When enabled, it escalates a **one-way recommendation ladder**:
+
+1. `continue` — no intervention
+2. `recommend_stronger_model` — surface a status notice suggesting a stronger model
+3. `recommend_clean_restart` — surface a status notice suggesting a clean session restart
+4. `stop` — soft-stop further tool thrash for the current turn (if `execute_stop: true`)
+
+```yaml
+trajectory_quality_routing:
+  enabled: false                     # master switch (default: off)
+  execute_stop: true                 # honor the stop level with a soft-halt
+  execute_model_switch: false        # reserved; hard-ignored in this version
+  allow_deescalate_on_progress: false
+  persist_decisions: true            # write audit records to trajectory_quality.db
+  retention_days: 30
+  max_decisions_per_session: 200
+  stronger_model:                    # optional: name a specific model in the recommendation
+    provider: null
+    model: null
+  thresholds:
+    identical_failure: 2             # two-identical-failure circuit breaker
+    same_tool_failure: 4
+    failed_verification: 2
+    stagnation_window: 8
+  hysteresis_progress_needed: 2      # only if allow_deescalate_on_progress
+```
+
+**Privacy:** decision records store only hashes (args_hash, result_hash), tool names, counts, and short explain strings — never raw tool args, results, or stdout. All string fields are defensively redacted before persistence.
+
+**Relationship to other systems:** this is a parallel observer of the same failure signals the tool-loop guardrails consume — it does not replace them, mutate prompts/toolsets, or interfere with transport fallback (`fallback_providers`). Recommendations go through the status channel (user-visible, never injected into the model transcript). Model escalation is **recommendation-only** in this version.
+
 ## TTS Configuration
 
 ```yaml
