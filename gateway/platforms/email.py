@@ -26,6 +26,7 @@ import os
 import re
 import smtplib
 import ssl
+import tempfile
 import uuid
 from collections import OrderedDict
 from email.header import decode_header
@@ -347,14 +348,36 @@ class EmailAdapter(BasePlatformAdapter):
         body_dir = get_hermes_home() / "workflow" / "ingress" / "email" / "bodies"
         body_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         body_path = body_dir / f"{body_digest}.txt"
-        if not body_path.exists():
+        if body_path.exists():
             try:
-                with body_path.open("xb") as body_file:
-                    body_file.write(body_bytes)
-                body_path.chmod(0o600)
-            except FileExistsError:
-                # Concurrent redelivery wrote the same content-addressed body.
+                if hashlib.sha256(body_path.read_bytes()).hexdigest() == body_digest:
+                    return str(body_path)
+            except OSError:
+                # Rewrite through the atomic path below.
                 pass
+
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=body_dir,
+                prefix=f".{body_digest}.",
+                suffix=".tmp",
+                delete=False,
+            ) as body_file:
+                temp_path = Path(body_file.name)
+                body_file.write(body_bytes)
+                body_file.flush()
+                os.fsync(body_file.fileno())
+            temp_path.chmod(0o600)
+            os.replace(temp_path, body_path)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
         return str(body_path)
 
     async def _record_workflow_ingress(
@@ -483,7 +506,11 @@ class EmailAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _apply_thread_headers(msg: MIMEMultipart, context: Dict[str, str]) -> str:
-        subject = context.get("subject") or "Hermes Agent"
+        subject = re.sub(
+            r"[\r\n]+",
+            " ",
+            context.get("subject") or "Hermes Agent",
+        ).strip()
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         msg["Subject"] = subject

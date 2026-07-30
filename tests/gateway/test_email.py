@@ -835,6 +835,34 @@ class TestWorkflowIngressTap(unittest.TestCase):
             r"^<email-sha256-[0-9a-f]{64}@hermes\.local>$",
         )
 
+    def test_body_store_repairs_truncated_content_addressed_file(self):
+        import hashlib
+        import tempfile
+        from gateway.platforms.email import EmailAdapter
+
+        body = "complete workflow body"
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {"HERMES_HOME": hermes_home},
+        ):
+            body_dir = (
+                Path(hermes_home)
+                / "workflow"
+                / "ingress"
+                / "email"
+                / "bodies"
+            )
+            body_dir.mkdir(parents=True)
+            body_path = body_dir / f"{digest}.txt"
+            body_path.write_text("truncated")
+
+            body_ref = EmailAdapter._persist_workflow_body(body)
+
+            self.assertEqual(Path(body_ref), body_path)
+            self.assertEqual(body_path.read_text(), body)
+            self.assertEqual(body_path.stat().st_mode & 0o777, 0o600)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
