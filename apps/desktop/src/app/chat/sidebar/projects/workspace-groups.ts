@@ -677,16 +677,25 @@ export function excludeProjectSessions(
 export function overlayLiveLanes(
   project: SidebarProjectTree,
   live: SessionInfo[],
-  removed: ReadonlySet<string> = NO_REMOVED
+  removed: ReadonlySet<string> = NO_REMOVED,
+  explicitProjects?: ProjectInfo[]
 ): SidebarProjectTree {
   if (project.isNoProject) {
     return overlayHomeLane(project, live, removed)
   }
 
+  // A repo lane can be shared by several explicit projects inside one monorepo.
+  // Its path alone therefore cannot establish project membership: filter the
+  // optimistic rows through the same longest-prefix resolver used by previews
+  // before letting a repo place them into a lane.
+  const projectLive = explicitProjects
+    ? live.filter(session => liveSessionProjectId(session, explicitProjects) === project.id)
+    : live
+
   let changed = false
 
   const repos = project.repos.map(repo => {
-    const next = overlayRepoLanes(repo, live, removed)
+    const next = overlayRepoLanes(repo, projectLive, removed)
 
     changed ||= next !== repo
 

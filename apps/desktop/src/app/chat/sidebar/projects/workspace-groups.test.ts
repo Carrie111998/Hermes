@@ -623,6 +623,32 @@ describe('sessionProjectColor', () => {
 })
 
 describe('overlayLiveLanes', () => {
+  it('keeps live rows owned by sibling explicit projects out of the entered project sharing a git root', () => {
+    // Product folders share the same monorepo root. The optimistic overlay must
+    // retain the backend's longest-prefix ownership instead of putting every
+    // live row under whichever seeded root lane is currently open.
+    const root = '/root/thiago-ai-company-memory'
+
+    const projects = [
+      makeProject('p_tcc', [`${root}/memory/products/tcc-descomplicada-ptbr`]),
+      makeProject('p_jung', [`${root}/memory/products/jung-100-mapas-mentais`])
+    ]
+
+    const project = projectNode({
+      id: 'p_tcc',
+      repos: [{ id: root, label: 'thiago-ai-company-memory', path: root, sessionCount: 0, groups: [] }]
+    })
+
+    const tcc = makeSession(`${root}/memory/products/tcc-descomplicada-ptbr`, { id: 'tcc' })
+    const jung = makeSession(`${root}/memory/products/jung-100-mapas-mentais`, { id: 'jung' })
+
+    const overlaid = overlayLiveLanes(project, [tcc, jung], new Set(), projects)
+
+    expect(
+      overlaid.repos.flatMap(repo => repo.groups.flatMap(group => group.sessions.map(session => session.id)))
+    ).toEqual(['tcc'])
+  })
+
   it('injects a live session into the matching main lane instantly', () => {
     const project = projectNode({
       id: '/www/app',
