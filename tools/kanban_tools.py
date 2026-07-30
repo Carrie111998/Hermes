@@ -678,6 +678,7 @@ def _handle_complete(args: dict, **kw) -> str:
             # LLM's say-so alone can never turn a verify task 'done'.
             # Ordered before the goal judge: deterministic, no LLM cost,
             # and a red suite makes the judge call moot.
+            verify_gate_arg = None
             if task and task.verify_mode:
                 if os.environ.get("HERMES_KANBAN_TASK") != tid:
                     # Orchestrator / CLI-context tool caller (blessed by
@@ -720,6 +721,18 @@ def _handle_complete(args: dict, **kw) -> str:
                     task, session_ids=_verify_session_ids(kw),
                     evidence_not_before=evidence_not_before,
                 )
+                if v is not None and not v.ok and (
+                    v.gate == "verify_unsupported_platform"
+                ):
+                    # Non-counting rejection (#70806 review): the host
+                    # cannot run cmd-mode verification at all, so the
+                    # red result is the platform's fault, not the
+                    # work's. Recording it would march the task toward
+                    # 'blocked' on every attempt from this worker.
+                    return tool_error(
+                        f"kanban_complete blocked: {v.detail} No failure "
+                        f"was counted against the task's retry budget."
+                    )
                 if v is not None and not v.ok:
                     _preview = (summary or result or "").strip()
                     info = kb.record_verify_failure(
@@ -771,6 +784,7 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"then retry kanban_complete with the same "
                         f"summary/metadata."
                     )
+                verify_gate_arg = "passed"
                 if v is not None:
                     metadata = dict(metadata or {})
                     if "verification" in metadata:
@@ -833,6 +847,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    verify_gate=verify_gate_arg,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

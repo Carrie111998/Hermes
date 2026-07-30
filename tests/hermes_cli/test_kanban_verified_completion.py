@@ -434,7 +434,7 @@ def test_successful_completion_resets_verify_failures(kanban_home: Path) -> None
             failure_limit=5,
         )
         assert kb.get_task(conn, tid).consecutive_failures == 1
-        assert kb.complete_task(conn, tid, result="done")
+        assert kb.complete_task(conn, tid, result="done", verify_gate="passed")
         t = kb.get_task(conn, tid)
         assert t.status == "done"
         assert t.consecutive_failures == 0
@@ -820,3 +820,84 @@ def test_worker_context_unchanged_without_verify_config(
         tid = kb.create_task(conn, title="plain", assignee="worker")
         ctx = kb.build_worker_context(conn, tid)
         assert "Verified completion gate" not in ctx
+
+
+# ---------------------------------------------------------------------------
+# complete_task chokepoint: verify-mode tasks refuse ungated completion
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_refuses_verify_task_without_gate(kanban_home: Path) -> None:
+    """complete_task is the sole writer of status='done'; a verify-mode task
+    must not complete unless the caller declares how the gate was satisfied.
+    Fail-closed for every current and future caller by default."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd="pytest -q")
+        with pytest.raises(kb.VerifyGateRequiredError):
+            kb.complete_task(conn, tid, result="did it")
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"  # untouched
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "completion_refused_unverified" in kinds
+
+
+def test_complete_task_verify_gate_passed_completes(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd="pytest -q")
+        assert kb.complete_task(conn, tid, result="ok", verify_gate="passed")
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_verify_gate_waived_completes(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd="pytest -q")
+        assert kb.complete_task(conn, tid, result="ok", verify_gate="waived")
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_rejects_unknown_verify_gate_value(kanban_home: Path) -> None:
+    """A typo'd gate token must fail closed, not slip through."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd="pytest -q")
+        with pytest.raises(ValueError):
+            kb.complete_task(conn, tid, result="ok", verify_gate="pased")
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_task_plain_task_unaffected_by_default(kanban_home: Path) -> None:
+    """Zero-change guard: tasks without verify_mode complete exactly as
+    before with no gate argument."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.complete_task(conn, tid, result="ok")
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_refusal_never_burns_retry_budget(kanban_home: Path) -> None:
+    """The chokepoint refusal is an API-misuse/bypass signal, not a red
+    verification: consecutive_failures must not move."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn, verify_cmd="pytest -q")
+        before = kb.get_task(conn, tid).consecutive_failures
+        with pytest.raises(kb.VerifyGateRequiredError):
+            kb.complete_task(conn, tid, result="x")
+        assert kb.get_task(conn, tid).consecutive_failures == before
+
+
+# ---------------------------------------------------------------------------
+# Platform guard: cmd mode is POSIX-only, rejected without burning budget
+# ---------------------------------------------------------------------------
+
+
+def test_run_verify_command_rejects_unsupported_platform(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """cmd mode shells through /bin/sh with process-group reaping — on a
+    non-POSIX host it must return a distinct unsupported outcome, never
+    attempt the spawn."""
+    monkeypatch.setattr(kv, "platform_supported", lambda: False)
+    out = kv.run_verify_command("echo hi", cwd=str(tmp_path))
+    assert out.ok is False
+    assert out.gate == "verify_unsupported_platform"
+    assert out.exit_code is None
+    assert "posix" in out.detail.lower() or "platform" in out.detail.lower()

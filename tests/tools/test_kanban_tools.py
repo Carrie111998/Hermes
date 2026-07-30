@@ -1469,3 +1469,31 @@ def test_complete_verify_red_output_redacted_in_events(monkeypatch, tmp_path):
             assert secret not in c.body
     finally:
         conn.close()
+
+
+def test_complete_verify_unsupported_platform_rejects_without_counting(
+    monkeypatch, tmp_path
+):
+    """A verify-mode task reaching a non-POSIX worker must reject the
+    completion WITHOUT consuming retry budget: the failure is the host's,
+    not the work's — the task must not march toward 'blocked'."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_verify as kv
+    from hermes_cli import kanban_db as kb
+
+    tid, _run_id = _make_verify_worker_env(
+        monkeypatch, tmp_path, verify_cmd="pytest -q",
+    )
+    monkeypatch.setattr(kv, "platform_supported", lambda: False)
+    out = kt._handle_complete({"task_id": tid, "result": "did it"})
+    assert "posix" in out.lower()
+    assert "no failure was counted" in out.lower()
+    conn = kb.connect()
+    try:
+        t = kb.get_task(conn, tid)
+        assert t.status == "running"          # still in flight
+        assert t.consecutive_failures == 0    # nothing counted
+        kinds = [e.kind for e in kb.list_events(conn, tid)]
+        assert "completion_blocked_evidence" not in kinds
+    finally:
+        conn.close()

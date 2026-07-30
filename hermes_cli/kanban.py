@@ -56,6 +56,20 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _redacted_verify_cmd(cmd: Optional[str]) -> Optional[str]:
+    """Redact a verify command for display (#70806).
+
+    The command is a legitimate place for inline credentials
+    (``GH_TOKEN=... ./check.sh``), so every projection — JSON dicts,
+    ``show``, dashboards — routes through this instead of echoing the
+    stored value verbatim. Benign commands pass through unchanged.
+    """
+    if not cmd:
+        return cmd
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(cmd, force=True)
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -77,7 +91,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
         "verify_mode": t.verify_mode,
-        "verify_cmd": t.verify_cmd,
+        "verify_cmd": _redacted_verify_cmd(t.verify_cmd),
         "model_override": t.model_override,
         "provider_override": t.provider_override,
         "session_id": t.session_id,
@@ -1532,6 +1546,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
         print("kanban: --verify-cmd and --verify auto are mutually exclusive",
               file=sys.stderr)
         return 2
+    if verify_cmd:
+        # Creation-time platform guard (#70806): cmd mode is POSIX-only
+        # (see kanban_verify.platform_supported). Opting a task into a
+        # gate its host can never run would strand it; refuse up front.
+        # --verify auto stays available everywhere (pure-Python ledger
+        # read).
+        from hermes_cli import kanban_verify as _kv
+        if not _kv.platform_supported():
+            print(
+                "kanban: --verify-cmd is not supported on this platform "
+                "(cmd-mode verification requires a POSIX shell). Use "
+                "--verify auto, or create the task from a POSIX host.",
+                file=sys.stderr,
+            )
+            return 2
     verify_mode = "cmd" if verify_cmd else ("auto" if verify_auto else None)
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
@@ -1733,7 +1762,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
         print(f"  model:     {task.model_override}{_prov}")
     if task.verify_mode == "cmd":
-        print(f"  verify:    cmd: {task.verify_cmd}")
+        print(f"  verify:    cmd: {_redacted_verify_cmd(task.verify_cmd)}")
     elif task.verify_mode == "auto":
         print("  verify:    auto (ledger evidence)")
     # Effective retry threshold. Show the per-task override if set,
@@ -2182,6 +2211,23 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _waiver_tty_ok() -> bool:
+    """True when the process is attached to a real interactive terminal.
+
+    The verify waiver's control boundary (#70806): worker terminal tools
+    run non-interactively, so requiring a TTY on BOTH ends (plus the
+    typed confirmation and the worker-env refusal in ``_cmd_complete``)
+    keeps ``--skip-verify`` out of reach of unattended processes. A
+    worker that deliberately forges a pty defeats this layer — that
+    residual risk is documented in the kanban guide; the audit trail
+    still records the bypass.
+    """
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2227,7 +2273,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             # complete on a gated card is refused, and a --skip-verify
             # override leaves a durable audit trail on the task instead
             # of just an ephemeral stderr line.
-            if task and task.verify_mode:
+            task_verify_mode = getattr(task, "verify_mode", None)
+            if task and task_verify_mode:
                 if not getattr(args, "skip_verify", False):
                     print(
                         f"kanban: {tid} has a verified-completion gate "
@@ -2235,6 +2282,49 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                         f"would bypass the gate. Let the worker complete "
                         f"it, or re-run with --skip-verify to record a "
                         f"human override.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
+                # Waiver control boundary: --skip-verify is a human-only
+                # override. Refuse inside any worker process (workers must
+                # not waive their own gate — HERMES_KANBAN_TASK marks the
+                # dispatched environment regardless of which task id it
+                # names), refuse without a real interactive terminal
+                # (worker terminal tools and cron are non-TTY), and
+                # require the operator to type the task id back.
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    print(
+                        f"kanban: --skip-verify refused: this is a worker "
+                        f"environment (HERMES_KANBAN_TASK is set), and a "
+                        f"worker cannot waive a verification gate. Only a "
+                        f"human operator at an interactive terminal can.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
+                if not _waiver_tty_ok():
+                    print(
+                        f"kanban: --skip-verify refused: waiving the "
+                        f"{task.verify_mode} verification gate on {tid} "
+                        f"requires an interactive terminal (a human "
+                        f"operator). Non-interactive callers must let the "
+                        f"worker complete the task through the gate.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
+                try:
+                    typed = input(
+                        f"Waive the {task.verify_mode} verification gate "
+                        f"on {tid}? Type the task id to confirm: "
+                    ).strip()
+                except (EOFError, KeyboardInterrupt):
+                    typed = ""
+                if typed != tid:
+                    print(
+                        f"kanban: --skip-verify aborted: confirmation did "
+                        f"not match {tid}.",
                         file=sys.stderr,
                     )
                     failed.append(tid)
@@ -2289,12 +2379,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                verify_gate=(
+                    "waived" if (task and task_verify_mode) else None
+                ),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
             else:
                 print(f"Completed {tid}")
-                if task and task.verify_mode:
+                if task and task_verify_mode:
                     # Auditable human override (#70806): persist the bypass
                     # as an event + comment so the board records that this
                     # 'done' was NOT verified. Command redacted — events

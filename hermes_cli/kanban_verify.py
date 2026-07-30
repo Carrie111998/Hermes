@@ -150,6 +150,20 @@ def _evidence_created_ts(evidence: dict) -> Optional[float]:
     return dt.timestamp()
 
 
+def platform_supported() -> bool:
+    """True when cmd-mode verification can run on this host.
+
+    ``run_verify_command`` shells through ``/bin/sh`` and reaps timed-out
+    runs with a process-group ``SIGKILL`` — POSIX-only machinery. Auto
+    mode (ledger evidence) is pure Python and is NOT gated by this.
+    Checked at task creation (refuse stranding a task on config its host
+    can never satisfy) and again at run time (a POSIX-created task can
+    reach a non-POSIX worker through a shared board DB), where the
+    rejection is non-counting: the failure is the host's, not the work's.
+    """
+    return os.name == "posix"
+
+
 def run_verify_command(
     command: str,
     cwd: Optional[str],
@@ -172,6 +186,16 @@ def run_verify_command(
     # tool_error text, and an inline-credential invocation
     # (``TOKEN=... ./check.sh``) must not leak through any of them.
     shown_command = redact_sensitive_text(command, force=True)
+    if not platform_supported():
+        return VerifyOutcome(
+            ok=False, gate="verify_unsupported_platform",
+            command=shown_command, exit_code=None,
+            detail=(
+                "cmd-mode verification requires a POSIX host (/bin/sh + "
+                "process-group reaping) and cannot run here. The task "
+                "needs a POSIX worker, or a human waiver."
+            ),
+        )
     ws_err = _workspace_error(cwd)
     if ws_err:
         return VerifyOutcome(

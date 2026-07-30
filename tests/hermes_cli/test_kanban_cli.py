@@ -238,14 +238,54 @@ def test_cli_complete_refuses_gated_task_without_skip_verify(kanban_home):
         assert kb.get_task(conn, tid).status != "done"
 
 
-def test_cli_complete_skip_verify_bypasses_and_records_audit(kanban_home):
-    """The human override is one deliberate flag away — and leaves a
+def test_cli_skip_verify_refused_in_worker_context(kanban_home, monkeypatch):
+    """A worker terminal process must not be able to waive its own gate:
+    any HERMES_KANBAN_TASK in the environment refuses --skip-verify
+    outright, flag or no flag."""
+    out = kc.run_slash("create gated --verify-cmd 'exit 1'")
+    tid = _created_task_id(out)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setattr(kc, "_waiver_tty_ok", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: tid)
+    res = kc.run_slash(f"complete {tid} --skip-verify")
+    assert "Completed" not in res
+    assert "worker" in res.lower()
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_cli_skip_verify_refused_without_tty(kanban_home):
+    """Non-interactive invocations (scripts, worker terminal tools, cron)
+    cannot waive: the waiver requires a human at a real terminal."""
+    out = kc.run_slash("create gated --verify-cmd 'exit 1'")
+    tid = _created_task_id(out)
+    res = kc.run_slash(f"complete {tid} --skip-verify")
+    assert "Completed" not in res
+    assert "interactive" in res.lower()
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_cli_skip_verify_refused_on_wrong_confirmation(kanban_home, monkeypatch):
+    out = kc.run_slash("create gated --verify-cmd 'exit 1'")
+    tid = _created_task_id(out)
+    monkeypatch.setattr(kc, "_waiver_tty_ok", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: "t_wrong")
+    res = kc.run_slash(f"complete {tid} --skip-verify")
+    assert "Completed" not in res
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_cli_skip_verify_confirmed_waives_and_records_audit(kanban_home, monkeypatch):
+    """The human override: interactive terminal + typed task id. Leaves a
     durable trail (event + comment), not just an ephemeral stderr line."""
     out = kc.run_slash("create gated --verify-cmd 'exit 1'")
     tid = _created_task_id(out)
+    monkeypatch.setattr(kc, "_waiver_tty_ok", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *_a: tid)
     done = kc.run_slash(f"complete {tid} --skip-verify")
     assert "Completed" in done
-    assert "bypasses" in done
     with kb.connect_closing() as conn:
         assert kb.get_task(conn, tid).status == "done"
         events = [e for e in kb.list_events(conn, tid)
@@ -256,3 +296,33 @@ def test_cli_complete_skip_verify_bypasses_and_records_audit(kanban_home):
         comments = [c for c in kb.list_comments(conn, tid)
                     if c.author == "verify-gate"]
         assert comments and "bypass" in comments[0].body
+
+
+def test_verify_cmd_redacted_in_json_and_show_projections(kanban_home):
+    """A secret-bearing verify command must not be echoed verbatim by any
+    projection (JSON dict or human show) — the tests above prove inline
+    credentials are a real usage, so projections redact like events do."""
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    out = kc.run_slash(f"create gated --verify-cmd 'GH_TOKEN={secret} ./check.sh' --json")
+    d = json.loads(out)
+    assert secret not in d["verify_cmd"]
+    assert "GH_TOKEN" in d["verify_cmd"]  # the shape survives, the secret doesn't
+    tid = d["id"]
+    show = kc.run_slash(f"show {tid}")
+    assert secret not in show
+    assert "verify:" in show
+
+
+def test_create_verify_cmd_refused_on_unsupported_platform(kanban_home, monkeypatch):
+    """Creation-time guard: opting a task into cmd-mode verification on a
+    host that can never run the gate would strand it — refuse up front.
+    (--verify auto stays available: the ledger read is pure Python.)"""
+    from hermes_cli import kanban_verify as kv
+    monkeypatch.setattr(kv, "platform_supported", lambda: False)
+    out = kc.run_slash("create gated --verify-cmd 'pytest -q'")
+    assert "Created" not in out
+    assert "platform" in out.lower()
+    with kb.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+    auto = kc.run_slash("create ok --verify auto")
+    assert "Created" in auto

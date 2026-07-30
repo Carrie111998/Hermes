@@ -4742,6 +4742,30 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class VerifyGateRequiredError(ValueError):
+    """Raised by ``complete_task`` when a verify-mode task is completed
+    without a ``verify_gate`` declaration.
+
+    ``complete_task`` is the sole writer of ``status='done'``, so this is
+    the fail-closed floor under every completion surface — tool layer,
+    CLI, dashboard, and any caller added later. Surfaces that ran the
+    gate pass ``verify_gate='passed'``; audited human waivers pass
+    ``verify_gate='waived'`` (the caller owns emitting its
+    ``verify_bypassed`` audit trail). Kept a ``ValueError`` subclass so
+    existing tool-error handlers treat it as recoverable.
+    """
+
+    def __init__(self, task_id: str, verify_mode: str):
+        self.task_id = task_id
+        self.verify_mode = verify_mode
+        super().__init__(
+            f"completion refused: task {task_id} has a verified-completion "
+            f"gate ({verify_mode}); complete_task requires "
+            f"verify_gate='passed' (gate ran green) or 'waived' (audited "
+            f"human override)."
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4751,8 +4775,18 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    verify_gate: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
+
+    ``verify_gate`` declares how a verify-mode task's gate was satisfied:
+    ``'passed'`` (the caller ran the gate and it was green) or
+    ``'waived'`` (an audited human override; the caller owns the
+    ``verify_bypassed`` audit trail). For tasks with ``verify_mode`` set,
+    omitting it raises :class:`VerifyGateRequiredError` and emits a
+    ``completion_refused_unverified`` event — fail-closed for every
+    completion surface by default. Tasks without ``verify_mode`` ignore
+    the argument entirely.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -4781,6 +4815,30 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    if verify_gate not in (None, "passed", "waived"):
+        raise ValueError(
+            f"verify_gate must be 'passed' or 'waived', got {verify_gate!r}"
+        )
+
+    # Verified-completion floor (#70806): status='done' is written only by
+    # this function, so enforcing here makes every completion surface —
+    # tool layer, CLI, dashboard, and callers added later — fail closed
+    # unless it declares how the gate was satisfied. Refusals are audited
+    # in their own tiny txn (mirroring the hallucination gate below) and
+    # never mutate task state or the retry budget: an ungated call is an
+    # API-misuse/bypass signal, not a red verification.
+    if verify_gate is None:
+        row = conn.execute(
+            "SELECT verify_mode FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is not None and row["verify_mode"]:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_refused_unverified",
+                    {"mode": row["verify_mode"]},
+                )
+            raise VerifyGateRequiredError(task_id, row["verify_mode"])
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a

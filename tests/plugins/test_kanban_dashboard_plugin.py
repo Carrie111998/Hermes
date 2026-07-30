@@ -708,3 +708,81 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+# ---------------------------------------------------------------------------
+# Verified completion (#70806): dashboard surfaces honor the gate
+# ---------------------------------------------------------------------------
+
+
+def _mk_verify_task(title="gated"):
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title=title, assignee="worker",
+                             verify_cmd="exit 1")
+    return tid
+
+
+def test_patch_done_refuses_verify_task_without_waiver(client):
+    tid = _mk_verify_task()
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}", json={"status": "done"},
+    )
+    assert r.status_code == 409, r.text
+    assert "verif" in r.json()["detail"].lower()
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status != "done"
+
+
+def test_patch_done_with_waiver_completes_and_audits(client):
+    tid = _mk_verify_task()
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{tid}",
+        json={
+            "status": "done",
+            "waive_verification": True,
+            "waiver_reason": "verified manually on staging",
+        },
+    )
+    assert r.status_code == 200, r.text
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, tid).status == "done"
+        events = [e for e in kb.list_events(conn, tid)
+                  if e.kind == "verify_bypassed"]
+        assert len(events) == 1
+        assert events[0].payload["actor"] == "dashboard"
+        assert events[0].payload["reason"] == "verified manually on staging"
+        comments = [c for c in kb.list_comments(conn, tid)
+                    if c.author == "verify-gate"]
+        assert comments and "dashboard" in comments[0].body.lower()
+
+
+def test_bulk_done_refuses_verify_tasks_per_id(client):
+    """Bulk drag-to-done must not silently waive: verify-mode ids error
+    individually while plain siblings complete."""
+    gated = _mk_verify_task()
+    with kb.connect_closing() as conn:
+        plain = kb.create_task(conn, title="plain", assignee="worker")
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [gated, plain], "status": "done"},
+    )
+    assert r.status_code == 200, r.text
+    results = {e["id"]: e for e in r.json()["results"]}
+    assert results[gated]["ok"] is False
+    assert "verif" in results[gated]["error"].lower()
+    assert results[plain]["ok"] is True
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, gated).status != "done"
+        assert kb.get_task(conn, plain).status == "done"
+
+
+def test_dashboard_task_dict_redacts_verify_cmd(client):
+    secret = "ghp_" + "Abc123XyZ0" * 3
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="gated", assignee="worker",
+                             verify_cmd=f"GH_TOKEN={secret} ./check.sh")
+    r = client.get(f"/api/plugins/kanban/tasks/{tid}")
+    assert r.status_code == 200, r.text
+    assert secret not in r.text
+    r2 = client.get("/api/plugins/kanban/board")
+    assert secret not in r2.text
