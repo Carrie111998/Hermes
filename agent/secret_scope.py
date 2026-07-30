@@ -181,9 +181,11 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     """Parse a ``.env`` file into a plain dict WITHOUT touching ``os.environ``.
 
     Used to load a profile's secrets into an isolated mapping for
-    ``set_secret_scope``. Mirrors python-dotenv's basic parsing (KEY=VALUE,
-    ``export`` prefix, ``#`` comments, optional matching quotes) but never
-    mutates the process environment — that isolation is the whole point.
+    ``set_secret_scope``. Parses the small KEY=VALUE subset Hermes writes
+    itself (``export`` prefix, ``#`` comments, matching quotes with the
+    writer's ``\\"``/``\\\\`` escapes reversed — the same semantics as
+    ``hermes_cli.config._parse_env_value``) but never mutates the process
+    environment — that isolation is the whole point.
     """
     secrets: Dict[str, str] = {}
     try:
@@ -203,10 +205,15 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
         key = key.strip()
         if not key:
             continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        secrets[key] = value
+        # Parse values with the canonical Hermes parser: save_env_value
+        # escapes " and \ inside double quotes, and every other reader
+        # (load_env, python-dotenv) reverses those escapes. Stripping only
+        # the outer quotes here would corrupt credentials containing "
+        # or \ — they work interactively but fail in scoped (cron /
+        # multiplex) resolution.
+        from hermes_cli.config import _parse_env_value
+
+        secrets[key] = _parse_env_value(value)
 
     return secrets
 
