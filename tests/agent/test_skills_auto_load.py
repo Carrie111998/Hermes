@@ -21,6 +21,31 @@ import pytest
 
 # ── resolve_auto_load_skills ──
 
+def test_resolved_config_includes_auto_load_default(tmp_path):
+    """The canonical DEFAULT_CONFIG path exposes skills.auto_load."""
+    script = textwrap.dedent(
+        """
+        import json
+        from hermes_cli.config import load_config
+
+        print(json.dumps(load_config()["skills"]["auto_load"]))
+        """
+    )
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path / "profile-home")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.strip().splitlines()[-1]) == []
+
+
 def test_resolve_auto_load_skills_reads_from_config():
     """resolve_auto_load_skills reads the auto_load list from user config."""
     from agent.skill_commands import resolve_auto_load_skills
