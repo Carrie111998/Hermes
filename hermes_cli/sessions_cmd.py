@@ -55,6 +55,9 @@ def _confirm_prompt(prompt: str) -> bool:
         return False
 
 
+_INTERACTIVE_HISTORY_EXCLUDE_SOURCES = ["cron", "tool"]
+
+
 def cmd_sessions(args, sessions_parser=None):
     import json as _json
 
@@ -232,9 +235,10 @@ def cmd_sessions(args, sessions_parser=None):
         print(f"Error: Could not open session database: {e}")
         return
 
-    # Hide third-party tool sessions by default, but honour explicit --source
+    # Hide noisy non-interactive sessions by default, but honour explicit
+    # --source so cron/tool history remains available when requested.
     _source = getattr(args, "source", None)
-    _exclude = None if _source else ["tool"]
+    _exclude = None if _source else _INTERACTIVE_HISTORY_EXCLUDE_SOURCES
 
     if action == "list":
         from hermes_state import workspace_key as _ws_key
@@ -983,7 +987,7 @@ def cmd_sessions(args, sessions_parser=None):
     elif action == "browse":
         limit = getattr(args, "limit", 500) or 500
         source = getattr(args, "source", None)
-        _browse_exclude = None if source else ["tool"]
+        _browse_exclude = None if source else _INTERACTIVE_HISTORY_EXCLUDE_SOURCES
         sessions = db.list_sessions_rich(
             source=source, exclude_sources=_browse_exclude, limit=limit
         )
