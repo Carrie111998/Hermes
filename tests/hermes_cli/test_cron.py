@@ -279,3 +279,7 @@ def test_json_create_and_edit_emit_canonical_job(tmp_cron_dir, capsys):
     assert cron_cli.cron_edit(edit) == 0
     updated = json.loads(capsys.readouterr().out)
     assert updated["id"] == created["id"] and updated["repeat"] is None
+    assert updated["delivery"] == "telegram:-1004416879179:4"
+    assert updated["thread"] == "4" and updated["no_agent"] is True
+    assert updated["prompt"] == "" and updated["skills"] == []
+    assert updated["model"] is None and updated["provider"] is None and updated["workdir"] is None
