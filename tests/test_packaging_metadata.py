@@ -25,6 +25,23 @@ def _distribution_name(requirement: str) -> str:
     return spec.strip().lower()
 
 
+def _requested_extras(requirement: str) -> set[str]:
+    """Extract the extras a PEP 508 requirement asks for (``name[a,b]`` -> {a, b}).
+
+    ``_distribution_name`` deliberately *drops* extras, so it cannot answer
+    "does this aggregate extra pull in extra X?" -- ``hermes-agent[nemo-relay]``
+    reduces to ``hermes-agent`` there. This complements it for assertions about
+    self-referential extras like ``[all]``, without the false positives of a
+    plain substring match.
+    """
+    spec = requirement.split(";", 1)[0]  # drop environment markers
+    spec = spec.split("@", 1)[0]  # drop direct-reference URLs
+    if "[" not in spec:
+        return set()
+    inner = spec.split("[", 1)[1].split("]", 1)[0]
+    return {part.strip().lower() for part in inner.split(",") if part.strip()}
+
+
 def test_packaging_declared_as_core_dependency():
     """Regression for #40503.
 
@@ -79,13 +96,16 @@ def test_nemo_relay_is_not_a_base_dependency():
     )
 
     relay_extra = data["project"]["optional-dependencies"]["nemo-relay"]
-    assert any(dep.startswith("nemo-relay") for dep in relay_extra)
+    assert "nemo-relay" in {_distribution_name(dep) for dep in relay_extra}
 
     # scripts/install.sh installs '.[all]' on non-Termux platforms, so pulling
     # Relay in through [all] would reintroduce the Alpine install failure even
-    # with the base dependency removed.
+    # with the base dependency removed. [all] entries are self-referential
+    # (``hermes-agent[cron]``), so this checks requested *extras* --
+    # _distribution_name strips them and would always yield "hermes-agent".
     all_extra = data["project"]["optional-dependencies"]["all"]
-    assert not any("nemo-relay" in dep for dep in all_extra), (
+    pulled_extras = {extra for dep in all_extra for extra in _requested_extras(dep)}
+    assert "nemo-relay" not in pulled_extras, (
         "[all] must not pull nemo-relay: scripts/install.sh installs '.[all]' "
         "on non-Termux platforms, which would break musl installs again"
     )

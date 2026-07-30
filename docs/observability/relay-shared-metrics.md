@@ -1,12 +1,16 @@
 # NeMo Relay Shared Metrics
 
-Hermes installs NeMo Relay through the `hermes-agent[nemo-relay]` extra on
-platforms for which Relay publishes a native wheel. The shared-metrics
-integration is built into Hermes and does not require `hermes plugins enable
-observability/nemo_relay`. Hermes remains importable without Relay on other
-native targets. Those targets use an explicit reduced-capability no-op host:
-Hermes execution remains available, while Relay scopes, middleware, plugins,
-and subscribers are unavailable.
+NeMo Relay is available when Hermes is installed with the
+`hermes-agent[nemo-relay]` extra, on platforms for which Relay publishes a
+native wheel. It is not part of a plain base install: the extra must be
+requested explicitly. Once it is present, the shared-metrics integration is
+built into Hermes and does not require `hermes plugins enable
+observability/nemo_relay`.
+
+Hermes remains importable and fully usable without Relay — both on a base
+install and on native targets where no wheel exists. Those cases use an
+explicit reduced-capability no-op host: Hermes execution remains available,
+while Relay scopes, middleware, plugins, and subscribers are unavailable.
 
 Relay is an extra rather than a base dependency because PEP 508 markers cannot
 distinguish musl from glibc. A base-dependency marker of `sys_platform ==
