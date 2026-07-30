@@ -1281,9 +1281,46 @@ export const ar = defineLocale({
       WHATSAPP_ALLOWED_USERS: {
         label: 'مستخدمو WhatsApp المسموح بهم',
         help: 'موصى به. أرقام هواتف أو معرّفات WhatsApp مفصولة بفواصل.'
-      }
+      },
+      EMAIL_ADDRESS: { label: 'عنوان البريد', help: 'العنوان الذي يستخدمه Hermes للاستلام والرد.' },
+      EMAIL_PASSWORD: { label: 'كلمة مرور التطبيق', help: 'استخدم كلمة مرور تطبيق من مزود البريد بدلا من كلمة مرور الحساب.' },
+      EMAIL_IMAP_HOST: { label: 'خادم البريد الوارد', help: 'مضيف IMAP، مثل imap.gmail.com.' },
+      EMAIL_SMTP_HOST: { label: 'خادم البريد الصادر', help: 'مضيف SMTP، مثل smtp.gmail.com.' },
+      EMAIL_IMAP_PORT: { label: 'منفذ IMAP' },
+      EMAIL_SMTP_PORT: { label: 'منفذ SMTP' },
+      EMAIL_IMAP_SECURITY: { label: 'أمان IMAP' },
+      EMAIL_SMTP_SECURITY: { label: 'أمان SMTP' },
+      EMAIL_HOME_ADDRESS: { label: 'عنوان التسليم الافتراضي' }
     },
-    platformIntro: {}
+    platformIntro: {},
+    emailPolicy: {
+      title: 'سياسة الرد التلقائي',
+      description: 'حدّد الرسائل التي يمكنها الوصول إلى الوكيل قبل إنشاء أي رد أو إرساله.',
+      categoriesTitle: 'فئات الرسائل',
+      categoriesDescription: 'تُحظر الرسائل الترويجية والآلية افتراضيا ولا يُسمح بالرد عليها إلا عند تفعيلها صراحة.',
+      allowCategory: 'السماح بالرد التلقائي',
+      promotions: 'العروض الترويجية',
+      newsletters: 'النشرات والملخصات',
+      transactions: 'الطلبات والمدفوعات',
+      security: 'الأمان والتحقق',
+      social: 'إشعارات الشبكات الاجتماعية',
+      calendar: 'إشعارات التقويم',
+      reports: 'التقارير الدورية',
+      keywordsTitle: 'قواعد الكلمات المفتاحية',
+      keywordsDescription: 'تُفحص القواعد قبل الوكيل. ضع مجموعة واحدة في كل سطر.',
+      neverReply: 'عدم الرد أبدا',
+      neverReplyDescription: 'تُحظر الرسائل المطابقة دائما حتى إذا طلبت قاعدة أخرى الرد.',
+      mustReply: 'يجب الرد',
+      mustReplyDescription: 'تُرسل الرسائل المطابقة إلى الوكيل مع اشتراط إنشاء رد.',
+      keywordPlaceholder: 'مجموعة كلمات في كل سطر',
+      keywordSyntax: 'استخدم + لاشتراط تطابق جميع الكلمات؛ والأسطر بدائل مستقلة.',
+      clearKeywords: 'مسح قواعد الكلمات',
+      decisionTitle: 'قرار الوكيل',
+      strictDecision: 'اشتراط قرار رد منظّم',
+      strictDecisionDescription: 'لا يُرسل الرد إلا عند إرجاع بنية صالحة تحتوي need_response: true.',
+      priorityLabel: 'ترتيب القرار',
+      priorityText: 'عدم الرد → يجب الرد → مرشح الفئة → قرار الوكيل'
+    }
   },
   profiles: {
     close: 'إغلاق',

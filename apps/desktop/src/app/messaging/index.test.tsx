@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider, type Locale } from '@/i18n'
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
 const getMessagingPlatforms = vi.fn()
@@ -58,19 +59,112 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-async function renderMessaging() {
+async function renderMessaging(locale: Locale = 'en') {
   const { MessagingView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
-      <MemoryRouter>
-        <MessagingView />
-      </MemoryRouter>
+      <I18nProvider configClient={null} initialLocale={locale}>
+        <MemoryRouter>
+          <MessagingView />
+        </MemoryRouter>
+      </I18nProvider>
     )
   })
 
   return result!
 }
+
+describe('MessagingView email policy', () => {
+  it('renders the policy as a dedicated localized control surface', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [
+        platform({
+          configured: true,
+          id: 'email',
+          name: 'Email',
+          env_vars: [
+            {
+              advanced: false,
+              current_value: 'bot@example.com',
+              description: 'Backend English description',
+              input_type: 'text',
+              is_password: false,
+              is_set: true,
+              key: 'EMAIL_ADDRESS',
+              prompt: 'Backend English mailbox prompt',
+              redacted_value: null,
+              required: true,
+              url: null
+            },
+            {
+              advanced: false,
+              current_value: 'false',
+              default_value: 'false',
+              description: 'Backend English promotion description',
+              input_type: 'boolean',
+              is_password: false,
+              is_set: false,
+              key: 'EMAIL_AUTO_REPLY_PROMOTIONS',
+              prompt: 'Backend English promotion prompt',
+              redacted_value: null,
+              required: false,
+              url: null
+            },
+            {
+              advanced: false,
+              current_value: '',
+              default_value: '',
+              description: 'Backend English keyword description',
+              input_type: 'textarea',
+              is_password: false,
+              is_set: false,
+              key: 'EMAIL_NO_REPLY_KEYWORDS',
+              prompt: 'Backend English keyword prompt',
+              redacted_value: null,
+              required: false,
+              url: null
+            },
+            {
+              advanced: false,
+              current_value: 'true',
+              default_value: 'true',
+              description: 'Backend English decision description',
+              input_type: 'boolean',
+              is_password: false,
+              is_set: true,
+              key: 'EMAIL_REQUIRE_STRUCTURED_RESPONSE',
+              prompt: 'Backend English decision prompt',
+              redacted_value: null,
+              required: false,
+              url: null
+            }
+          ]
+        })
+      ]
+    })
+
+    await renderMessaging('zh')
+
+    expect(await screen.findByText('自动回复策略')).toBeTruthy()
+    expect(screen.getByText('推广与营销')).toBeTruthy()
+    expect(screen.getByText('绝不回复')).toBeTruthy()
+    expect(screen.getByText('要求结构化回复判定')).toBeTruthy()
+    expect(screen.getByText('邮箱地址')).toBeTruthy()
+    expect(screen.queryByText('Backend English promotion prompt')).toBeNull()
+
+    fireEvent.change(screen.getByPlaceholderText('每行输入一个关键词组'), {
+      target: { value: 'invoice + overdue\nvip customer' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    await waitFor(() =>
+      expect(updateMessagingPlatform).toHaveBeenCalledWith('email', {
+        env: { EMAIL_NO_REPLY_KEYWORDS: 'invoice + overdue;vip customer' }
+      })
+    )
+  })
+})
 
 describe('MessagingView setup-guide link', () => {
   it('hides the setup-guide button for a plugin platform with no docs URL', async () => {

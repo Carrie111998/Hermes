@@ -1229,6 +1229,34 @@ export interface Translations {
     waitingSince: (minutes: number) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
+    emailPolicy: {
+      title: string
+      description: string
+      categoriesTitle: string
+      categoriesDescription: string
+      allowCategory: string
+      promotions: string
+      newsletters: string
+      transactions: string
+      security: string
+      social: string
+      calendar: string
+      reports: string
+      keywordsTitle: string
+      keywordsDescription: string
+      neverReply: string
+      neverReplyDescription: string
+      mustReply: string
+      mustReplyDescription: string
+      keywordPlaceholder: string
+      keywordSyntax: string
+      clearKeywords: string
+      decisionTitle: string
+      strictDecision: string
+      strictDecisionDescription: string
+      priorityLabel: string
+      priorityText: string
+    }
   }
 
   webhooks: {

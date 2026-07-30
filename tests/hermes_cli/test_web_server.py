@@ -894,6 +894,22 @@ class TestWebServerEndpoints:
             Platform._value2member_map_.pop("pseudofake", None)
             Platform._member_map_.pop("PSEUDOFAKE", None)
 
+    def test_email_reply_policy_fields_have_dashboard_controls(self):
+        resp = self.client.get("/api/messaging/platforms")
+        assert resp.status_code == 200
+        platforms = {row["id"]: row for row in resp.json()["platforms"]}
+        fields = {
+            field["key"]: field for field in platforms["email"]["env_vars"]
+        }
+
+        assert fields["EMAIL_AUTO_REPLY_PROMOTIONS"]["input_type"] == "boolean"
+        assert fields["EMAIL_AUTO_REPLY_PROMOTIONS"]["current_value"] == "false"
+        assert fields["EMAIL_FORCE_REPLY_KEYWORDS"]["input_type"] == "textarea"
+        assert fields["EMAIL_NO_REPLY_KEYWORDS"]["input_type"] == "textarea"
+        assert (
+            fields["EMAIL_REQUIRE_STRUCTURED_RESPONSE"]["current_value"] == "true"
+        )
+
 
 
 
@@ -3516,5 +3532,3 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
-
-

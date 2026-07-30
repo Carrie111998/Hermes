@@ -93,7 +93,7 @@ sudo hermes gateway install --system   # Linux only: boot-time system service
 
 On startup, the adapter:
 1. Tests IMAP and SMTP connections
-2. Marks all existing inbox messages as "seen" (only processes new emails)
+2. Seeds its in-memory UID cache from messages already marked as seen
 3. Starts polling for new messages
 
 ---
@@ -112,6 +112,38 @@ The adapter polls the IMAP inbox for UNSEEN messages at a configurable interval 
 - **HTML-only emails** have tags stripped for plain text extraction
 - **Self-messages** are filtered out to prevent reply loops
 - **Automated/noreply senders** are silently ignored — `noreply@`, `mailer-daemon@`, `bounce@`, `no-reply@`, and emails with `Auto-Submitted`, `Precedence: bulk`, or `List-Unsubscribe` headers
+
+### Auto-reply Policy
+
+Email uses deterministic rules before invoking the model:
+
+1. A matching no-reply keyword group suppresses the message.
+2. A matching must-reply keyword group forces it through and requires a reply.
+3. Promotions, newsletters, transaction notices, security notices, social notifications, calendar notices, and recurring reports are suppressed unless their category switch is enabled.
+4. Unmatched messages reach the model. The model must return a structured `need_response` decision; false or malformed strict-mode output is blocked before SMTP.
+
+Configure these rules from **Dashboard → Channels → Email → Configure**, or with environment variables:
+
+```bash
+# Categories are false by default
+EMAIL_AUTO_REPLY_PROMOTIONS=false
+EMAIL_AUTO_REPLY_NEWSLETTERS=false
+EMAIL_AUTO_REPLY_TRANSACTIONS=false
+EMAIL_AUTO_REPLY_SECURITY=false
+EMAIL_AUTO_REPLY_SOCIAL=false
+EMAIL_AUTO_REPLY_CALENDAR=false
+EMAIL_AUTO_REPLY_REPORTS=false
+
+# Groups are OR alternatives separated by semicolons.
+# Terms joined with + must all be present.
+EMAIL_FORCE_REPLY_KEYWORDS=urgent;invoice+overdue
+EMAIL_NO_REPLY_KEYWORDS=for your information;do+not+reply
+
+# Fail closed when the model omits or corrupts its reply decision
+EMAIL_REQUIRE_STRUCTURED_RESPONSE=true
+```
+
+No-reply rules win if the same message matches both lists. Matching is case-insensitive and checks the combined subject and body.
 
 ### Sending Replies
 
@@ -196,3 +228,13 @@ Email access is stricter by default than chat-style platforms:
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
+| `EMAIL_AUTO_REPLY_PROMOTIONS` | No | `false` | Allow promotional and marketing messages to reach the agent |
+| `EMAIL_AUTO_REPLY_NEWSLETTERS` | No | `false` | Allow newsletters and digests to reach the agent |
+| `EMAIL_AUTO_REPLY_TRANSACTIONS` | No | `false` | Allow order, shipping, payment, invoice, and receipt notices |
+| `EMAIL_AUTO_REPLY_SECURITY` | No | `false` | Allow verification and security notices |
+| `EMAIL_AUTO_REPLY_SOCIAL` | No | `false` | Allow social-network notifications |
+| `EMAIL_AUTO_REPLY_CALENDAR` | No | `false` | Allow calendar invitations and reminders |
+| `EMAIL_AUTO_REPLY_REPORTS` | No | `false` | Allow recurring reports |
+| `EMAIL_FORCE_REPLY_KEYWORDS` | No | — | Must-reply keyword groups (`;` between groups, `+` between required terms) |
+| `EMAIL_NO_REPLY_KEYWORDS` | No | — | No-reply keyword groups; wins conflicts |
+| `EMAIL_REQUIRE_STRUCTURED_RESPONSE` | No | `true` | Block model output without a valid `need_response` decision |
