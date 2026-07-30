@@ -12306,6 +12306,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # unloaded Ollama model, #19027).
                     _title_model = self.model
                     _title_provider = self.provider
+                    _title_source_fn = getattr(
+                        self.agent, "_session_source_for_persistence", None
+                    )
+                    _title_source = (
+                        _title_source_fn()
+                        if callable(_title_source_fn)
+                        else getattr(self.agent, "platform", None)
+                    )
                     maybe_auto_title(
                         self._session_db,
                         self.session_id,
@@ -12323,6 +12331,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         runtime_validator=lambda: (
                             getattr(self, "model", None) == _title_model
                             and getattr(self, "provider", None) == _title_provider
+                        ),
+                        source=_title_source,
+                        model_config=getattr(
+                            self.agent, "_session_init_model_config", None
                         ),
                     )
                 except Exception:

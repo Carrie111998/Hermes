@@ -10323,6 +10323,14 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     # model changed before it fires (#19027).
                     _title_model = getattr(agent, "model", None)
                     _title_provider = getattr(agent, "provider", None)
+                    _title_source_fn = getattr(
+                        agent, "_session_source_for_persistence", None
+                    )
+                    _title_source = (
+                        _title_source_fn()
+                        if callable(_title_source_fn)
+                        else getattr(agent, "platform", None)
+                    )
                     maybe_auto_title(
                         _get_db(),
                         _title_key,
@@ -10349,6 +10357,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         # runs async, after this turn's refresh already fired).
                         title_callback=lambda t, _k=_title_key: _emit(
                             "session.title", sid, {"session_id": _k, "title": t}
+                        ),
+                        source=_title_source,
+                        model_config=getattr(
+                            agent, "_session_init_model_config", None
                         ),
                     )
                 except Exception:

@@ -21593,6 +21593,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # reload an unloaded Ollama model, #19027).
                     _title_model = getattr(agent, "model", None) if agent else None
                     _title_provider = getattr(agent, "provider", None) if agent else None
+                    _title_source_fn = getattr(
+                        agent, "_session_source_for_persistence", None
+                    )
+                    _title_source = (
+                        _title_source_fn()
+                        if callable(_title_source_fn)
+                        else source.platform.value
+                    )
                     maybe_auto_title_kwargs = {
                         "failure_callback": _title_failure_cb,
                         "main_runtime": {
@@ -21606,6 +21614,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             getattr(agent, "model", None) == _title_model
                             and getattr(agent, "provider", None) == _title_provider
                         )) if agent else None,
+                        "source": _title_source,
+                        "model_config": getattr(
+                            agent, "_session_init_model_config", None
+                        ),
                     }
                     if self._is_telegram_topic_lane(source):
                         maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(

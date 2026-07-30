@@ -611,13 +611,16 @@ class AIAgent:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
+    def _session_source_for_persistence(self) -> str:
+        return _session_source_for_agent(self.platform)
+
     def _ensure_db_session(self) -> None:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
             return
         if self._session_db_created or not self._session_db:
             return
-        source = _session_source_for_agent(self.platform)
+        source = self._session_source_for_persistence()
         try:
             try:
                 from hermes_cli.profiles import get_active_profile_name
@@ -630,7 +633,7 @@ class AIAgent:
                 session_id=self.session_id,
                 source=source,
                 model=self.model,
-                model_config=self._session_init_model_config,
+                model_config=getattr(self, "_session_init_model_config", None),
                 system_prompt=self._cached_system_prompt,
                 user_id=None,
                 parent_session_id=self._parent_session_id,
@@ -6394,7 +6397,10 @@ class AIAgent:
         # dimension) — the fix for aux spend being invisible in analytics
         # (issue #23270).
         acct_token = set_accounting_context(
-            getattr(self, "_session_db", None), getattr(self, "session_id", None)
+            getattr(self, "_session_db", None),
+            getattr(self, "session_id", None),
+            source=self._session_source_for_persistence(),
+            model_config=getattr(self, "_session_init_model_config", None),
         )
         from agent.auxiliary_client import scoped_runtime_main
 

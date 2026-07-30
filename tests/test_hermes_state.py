@@ -187,6 +187,33 @@ class TestSessionLifecycle:
         assert session["model"] == "real-model"
         assert session["source"] == "cli"
 
+    def test_create_session_upgrades_unknown_placeholder_source(self, db):
+        """An accounting placeholder must yield to later canonical provenance."""
+        db.create_session("s1", source="unknown")
+
+        db.create_session(
+            "s1",
+            source="cron",
+            model="gpt-5.6-sol",
+            model_config={"reasoning_config": {"effort": "high"}},
+        )
+
+        session = db.get_session("s1")
+        assert session["source"] == "cron"
+        assert session["model"] == "gpt-5.6-sol"
+
+    @pytest.mark.parametrize("noncanonical_source", ["", "   ", " UNKNOWN "])
+    def test_blank_source_cannot_poison_unknown_placeholder(
+        self, db, noncanonical_source
+    ):
+        db.create_session("s1", source="unknown")
+
+        db.create_session("s1", source=noncanonical_source)
+        assert db.get_session("s1")["source"] == "unknown"
+
+        db.create_session("s1", source="cron")
+        assert db.get_session("s1")["source"] == "cron"
+
     @pytest.mark.parametrize("source", ["cli", "tui"])
     def test_local_child_cwd_returns_exact_persisted_parent_cwd(
         self, db, tmp_path, source
@@ -391,6 +418,21 @@ class TestSessionLifecycle:
 
         session = db.get_session("s1")
         assert session["model"] == "openai/gpt-5.4"
+
+    def test_update_token_counts_fallback_preserves_canonical_source_marker(self, db):
+        db.update_token_counts(
+            "child",
+            input_tokens=10,
+            output_tokens=5,
+            source="subagent",
+            model_config={"_delegate_from": "missing-parent"},
+        )
+
+        session = db.get_session("child")
+        assert session["source"] == "subagent"
+        assert json.loads(session["model_config"]) == {
+            "_delegate_from": "missing-parent"
+        }
 
     def test_first_accounted_fallback_replaces_requested_primary_route(self, db):
         """First successful fallback usage must persist one coherent route pair."""

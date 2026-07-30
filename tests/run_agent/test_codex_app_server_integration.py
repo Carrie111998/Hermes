@@ -136,6 +136,40 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_total_tokens == 130
         assert agent.context_compressor.context_length == 200000
 
+    def test_codex_usage_fallback_preserves_structural_source(self, monkeypatch):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-source-1",
+                thread_id="thread-source-1",
+                token_usage_last={
+                    "totalTokens": 2,
+                    "inputTokens": 1,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 1,
+                    "reasoningOutputTokens": 0,
+                },
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-source-1"
+        )
+        session_db = MagicMock()
+        agent = _make_codex_agent(
+            session_db=session_db,
+            session_id="cron-codex",
+            platform="cron",
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hello")
+
+        session_db.update_token_counts.assert_called_once()
+        kwargs = session_db.update_token_counts.call_args.kwargs
+        assert kwargs["source"] == "cron"
+        assert kwargs["model_config"] is agent._session_init_model_config
+
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
