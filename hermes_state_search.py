@@ -840,10 +840,23 @@ class SessionSearchMixin:
             # immediately regardless of readers.
             try:
                 with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    # Let plugins override the checkpoint mode (see #45383).
+                    _ckpt_mode = "TRUNCATE"
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        for _result in _invoke_hook(
+                            "pre_db_checkpoint",
+                            context="vacuum",
+                            default_mode="TRUNCATE",
+                        ):
+                            if isinstance(_result, dict) and "mode" in _result:
+                                _ckpt_mode = str(_result["mode"]).upper()
+                    except Exception:
+                        pass  # plugins unavailable — keep default
+                    self._conn.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
             except Exception as exc:
                 logger.debug(
-                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
+                    "WAL checkpoint after optimize VACUUM failed: %s",
                     exc,
                 )
 

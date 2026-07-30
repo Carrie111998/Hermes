@@ -3516,6 +3516,21 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    # Let plugins short-circuit credential resolution (e.g. Nous JWT
+    # rotation that must run before the direct-endpoint path — see #61499).
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        for _result in _invoke_hook(
+            "pre_delegation_credentials",
+            cfg=cfg,
+            parent_provider=getattr(parent_agent, "provider", None),
+            parent_model=getattr(parent_agent, "model", None),
+        ):
+            if isinstance(_result, dict) and "provider" in _result:
+                return _result
+    except Exception:
+        pass  # plugins unavailable — fall through to built-in resolution
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None

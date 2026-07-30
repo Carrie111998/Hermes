@@ -3111,9 +3111,25 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
             return c
 
     # Fuzzy match as last resort.
-    matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
-    if matches:
-        return matches[0]
+    # Let plugins suppress fuzzy repair for specific tool names (e.g.
+    # MCP names where fuzzy substitution changes semantics — see #62701).
+    _skip_fuzzy = False
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        for _result in _invoke_hook(
+            "pre_fuzzy_repair",
+            tool_name=tool_name,
+            valid_tool_names=agent.valid_tool_names,
+        ):
+            if isinstance(_result, dict) and _result.get("skip"):
+                _skip_fuzzy = True
+                break
+    except Exception:
+        pass  # plugins unavailable — keep default
+    if not _skip_fuzzy:
+        matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
+        if matches:
+            return matches[0]
 
     return None
 

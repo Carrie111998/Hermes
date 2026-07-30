@@ -2830,14 +2830,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._read_local.conn = None
         with self._lock:
             if self._conn:
+                # Let plugins override the checkpoint mode (e.g. force PASSIVE
+                # to avoid page-tear under a SIGTERM race — see #45383).
                 if not self.read_only:
+                    _ckpt_mode = "TRUNCATE"
                     try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        for _result in _invoke_hook(
+                            "pre_db_checkpoint",
+                            context="close",
+                            default_mode="TRUNCATE",
+                        ):
+                            if isinstance(_result, dict) and "mode" in _result:
+                                _ckpt_mode = str(_result["mode"]).upper()
+                    except Exception:
+                        pass  # plugins unavailable — keep default
+                    try:
+                        self._conn.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
                     except Exception as exc:
-                        logger.debug(
-                            "WAL checkpoint (TRUNCATE) at close failed: %s",
-                            exc,
-                        )
+                        logger.debug("WAL checkpoint (%s) at close failed: %s", _ckpt_mode, exc)
                 self._conn.close()
                 self._conn = None
 
@@ -9325,10 +9336,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # VACUUM cannot be executed inside a transaction.
         with self._lock:
             # Best-effort WAL checkpoint first, then VACUUM.
+            # Let plugins override the checkpoint mode (see #45383).
+            _ckpt_mode = "TRUNCATE"
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                from hermes_cli.plugins import invoke_hook as _invoke_hook
+                for _result in _invoke_hook(
+                    "pre_db_checkpoint",
+                    context="vacuum",
+                    default_mode="TRUNCATE",
+                ):
+                    if isinstance(_result, dict) and "mode" in _result:
+                        _ckpt_mode = str(_result["mode"]).upper()
+            except Exception:
+                pass  # plugins unavailable — keep default
+            try:
+                self._conn.execute(f"PRAGMA wal_checkpoint({_ckpt_mode})")
             except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
+                logger.debug("WAL checkpoint (%s) before VACUUM failed: %s", _ckpt_mode, exc)
             self._conn.execute("VACUUM")
         return optimized
 

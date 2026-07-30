@@ -2680,6 +2680,29 @@ def compress_context(
                 existing_prompt = agent._build_system_prompt(system_message)
             return messages, existing_prompt
 
+    # Let plugins prepare for or veto compression (e.g. rebind a shared
+    # context engine to the host session — see #58512).
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        for _result in _invoke_hook(
+            "pre_compression",
+            agent=agent,
+            session_id=agent.session_id,
+            message_count=len(messages),
+        ):
+            if isinstance(_result, dict) and _result.get("skip"):
+                logger.info(
+                    "pre_compression hook vetoed compression: %s",
+                    _result.get("reason", "no reason given"),
+                )
+                _release_lock()
+                _existing_sp = getattr(agent, "_cached_system_prompt", None)
+                if not _existing_sp:
+                    _existing_sp = agent._build_system_prompt(system_message)
+                return messages, _existing_sp
+    except Exception:
+        pass  # plugins unavailable — proceed with compression
+
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
     try:

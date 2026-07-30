@@ -212,6 +212,28 @@ VALID_HOOKS: Set[str] = {
     "kanban_task_claimed",
     "kanban_task_completed",
     "kanban_task_blocked",
+    # ── Extension hooks (plugin-directed core behavior) ──────────────
+    # Fired before a WAL checkpoint in SessionDB.close() or the pre-VACUUM
+    # path.  Kwargs: context: "close" | "vacuum", default_mode: str.
+    # A callback may return {"mode": "PASSIVE"} to override the checkpoint
+    # mode; anything else (including None) keeps the default.
+    "pre_db_checkpoint",
+    # Fired before the fuzzy-match fallback in repair_tool_call().
+    # Kwargs: tool_name: str, valid_tool_names: set[str].
+    # A callback may return {"skip": True} to suppress the fuzzy fallback
+    # for this tool name; anything else proceeds with fuzzy matching.
+    "pre_fuzzy_repair",
+    # Fired at the top of _resolve_delegation_credentials() before any
+    # built-in resolution runs.  Kwargs: cfg: dict, parent_provider: str|None,
+    # parent_model: str|None.  A callback may return a full credential dict
+    # (keys: model, provider, base_url, api_key, api_mode) to short-circuit
+    # the built-in chain; None falls through to normal resolution.
+    "pre_delegation_credentials",
+    # Fired just before context compression begins.  Kwargs: agent, session_id,
+    # message_count: int.  A callback may return {"skip": True, "reason": str}
+    # to abort compression for this tick; anything else proceeds.  Side-effect
+    # hooks (e.g. rebinding a shared context engine) may run without returning.
+    "pre_compression",
 }
 
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
