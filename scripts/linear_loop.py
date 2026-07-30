@@ -39,6 +39,13 @@ DEFAULT_TEAM = "HER"
 DEFAULT_CODERS = ("hermes-code-a", "hermes-code-b")
 DEFAULT_REPO = "/Users/jeanyoder/.hermes/hermes-agent"
 
+#: Ou vivent les worktrees de mission. Ce n'est pas un detail de rangement : les
+#: profils Code n'autorisent l'ecriture que sous leur ``HERMES_WRITE_SAFE_ROOT``,
+#: et le defaut du kanban (``<repo>/.worktrees/<id>``) tombe a l'interieur du
+#: runtime deploye — hors racine sure, et de toute facon le dernier endroit ou un
+#: codeur devrait pouvoir ecrire, puisque c'est le code qui le gouverne.
+DEFAULT_WORKTREES_ROOT = "/Users/jeanyoder/Documents/GitHub/_worktrees"
+
 #: Signature des cartes creees par la boucle : tout ce que la boucle archive ou
 #: rapporte doit porter cette marque, pour ne jamais toucher une carte humaine.
 LOOP_AUTHOR = "linear-loop"
@@ -50,6 +57,7 @@ LABEL_REVIEW = "agent-review"
 
 STATE_BUILDING = "In Progress"
 STATE_REVIEW = "In Review"
+STATE_DONE = "Done"
 
 #: En dessous de ce seuil on ne demarre plus de mission : un worktree par
 #: mission finit par remplir le disque, et un disque plein casse le runtime
@@ -365,6 +373,10 @@ Branche imposee : {branch}
   `scripts/run_tests.sh`. Ne modifie jamais un test pour le faire passer.
 - Commits locaux uniquement, sur `{branch}`. Aucun push, aucune PR, aucun merge :
   la fusion appartient a Jean.
+- Ecris les migrations, ne les execute jamais. Aucune commande qui touche une
+  base de donnees, un service distant, un paiement ou une campagne publicitaire
+  — meme en lecture, meme "pour verifier". Le garde-fou d'admission raisonne en
+  proprietaire de repertoire : il ne peut pas rattraper un effet distant.
 - Des que les criteres sont satisfaits et le commit fait, termine par
   `kanban_complete` avec un resume court : ce qui a change, ce qui est prouve,
   ce qui reste. N'enchaine sur aucun travail supplementaire — pas d'auto-revue,
@@ -415,6 +427,48 @@ def git_output(repo: Path, *args: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def git_run(repo: Path, *args: str) -> tuple[bool, str]:
+    result = subprocess.run(
+        ["git", *args], cwd=repo, capture_output=True, text=True, timeout=300
+    )
+    return result.returncode == 0, (result.stderr or result.stdout).strip()
+
+
+def ensure_mission_worktree(repo: str, target: Path, branch: str) -> Path:
+    """Cree le worktree de la mission a un endroit ou le codeur a le droit d'ecrire.
+
+    Le kanban placerait le worktree sous ``<repo>/.worktrees/``, donc a
+    l'interieur du runtime : hors de la racine sure des profils Code, et sur le
+    code qui les gouverne. On le materialise nous-memes sous la racine autorisee
+    et on passe la carte en ``dir`` pour que le kanban n'y touche plus.
+    """
+    repo_path = Path(repo)
+    if target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    base = git_output(repo_path, "rev-parse", "--abbrev-ref", "HEAD") or "main"
+    existing = git_output(repo_path, "rev-parse", "--verify", "--quiet", branch)
+    args = (
+        ["worktree", "add", str(target), branch]
+        if existing
+        else ["worktree", "add", "-b", branch, str(target), base]
+    )
+    ok, detail = git_run(repo_path, *args)
+    if not ok:
+        raise LoopError(f"worktree {target} impossible: {detail[:200]}")
+    return target
+
+
+def remove_mission_worktree(repo: str, target: Path) -> bool:
+    """Rend l'espace d'une mission fusionnee. Refuse tout worktree encore sale."""
+    if not target.exists():
+        return False
+    if git_output(target, "status", "--porcelain"):
+        return False
+    ok, _ = git_run(Path(repo), "worktree", "remove", str(target))
+    return ok
+
+
 def mission_result(workspace: Path, branch: str) -> dict[str, str]:
     """Ce que la mission a reellement produit, lu dans son worktree."""
     if not workspace.exists():
@@ -444,6 +498,7 @@ class LoopConfig:
     repo: str = DEFAULT_REPO
     hermes_home: Path = Path("/Users/jeanyoder/.hermes")
     runtime_root: str = DEFAULT_REPO
+    worktrees_root: str = DEFAULT_WORKTREES_ROOT
     apply: bool = False
     min_free_disk: int = MIN_FREE_DISK_BYTES
 
@@ -454,7 +509,9 @@ def run_tick(config: LoopConfig, client: LinearClient, kanban) -> TickReport:
     by_key = {issue.key: issue for issue in issues}
 
     with kanban.connect() as conn:
+        _close_merged(config, client, issues, labels, states, report)
         _closeout_finished(config, client, kanban, conn, by_key, labels, states, report)
+        _report_blocked(config, client, kanban, conn, by_key, labels, report)
         _feed_free_coders(config, client, kanban, conn, issues, labels, states, report)
     return report
 
@@ -511,6 +568,10 @@ def _closeout_finished(config, client, kanban, conn, by_key, labels, states, rep
             client.update_issue(
                 issue.id, label_ids=label_ids, state_id=states.get(STATE_REVIEW)
             )
+        state = read_mission(config, key) or {}
+        if state:
+            state["closed_out"] = True
+            mission_state_path(config, key).write_text(json.dumps(state, indent=1))
         kanban.archive_task(conn, task.id)
 
 
@@ -547,20 +608,29 @@ def _feed_free_coders(config, client, kanban, conn, issues, labels, states, repo
     for coder, issue in zip(available, missions):
         repo = repo_for_issue(issue, config.repo)
         branch = branch_name_for(issue)
+
+        prior = _prior_missions(kanban, conn, config, issue.key)
+        if prior:
+            _hold_for_confirmation(config, client, issue, labels, prior, report)
+            continue
+
         report.started.append({"issue": issue.key, "coder": coder, "branch": branch})
         if not config.apply:
             continue
 
+        worktree = ensure_mission_worktree(
+            repo, Path(config.worktrees_root) / f"agent-{issue.key.lower()}", branch
+        )
+        record_mission(config, issue, repo=repo, branch=branch, worktree=worktree)
         attempt = _attempt_number(kanban, conn, issue.key)
         task_id = kanban.create_task(
             conn,
             title=f"{issue.key} — {issue.title}",
-            body=build_brief(issue, branch=branch, repo=repo),
+            body=build_brief(issue, branch=branch, repo=str(worktree)),
             assignee=coder,
             created_by=LOOP_AUTHOR,
-            workspace_kind="worktree",
-            workspace_path=repo,
-            branch_name=branch,
+            workspace_kind="dir",
+            workspace_path=str(worktree),
             priority=_kanban_priority(issue),
             max_runtime_seconds=MISSION_MAX_RUNTIME_SECONDS,
             idempotency_key=f"linear:{issue.key}:{attempt}",
@@ -573,6 +643,172 @@ def _feed_free_coders(config, client, kanban, conn, issues, labels, states, repo
             "sans le GO de Jean.",
         )
         client.update_issue(issue.id, label_ids=label_ids, state_id=states.get(STATE_BUILDING))
+
+
+def mission_state_path(config, key: str) -> Path:
+    return Path(config.hermes_home) / "linear-loop" / f"{key}.json"
+
+
+def record_mission(config, issue: Issue, *, repo: str, branch: str, worktree: Path) -> None:
+    """Note d'ou part la mission, pour pouvoir juger la suite sans deviner."""
+    path = mission_state_path(config, issue.key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "issue": issue.key,
+        "repo": repo,
+        "branch": branch,
+        "worktree": str(worktree),
+        "base": git_output(Path(repo), "rev-parse", "HEAD"),
+    }, indent=1))
+
+
+def read_mission(config, key: str) -> Optional[dict[str, Any]]:
+    path = mission_state_path(config, key)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (ValueError, OSError):
+        return None
+
+
+def branch_was_merged(repo: Path, branch: str, base: str) -> bool:
+    """Vrai seulement si la branche a produit du travail ET qu'il est dans `main`.
+
+    Sans la condition « a produit du travail », une branche creee puis abandonnee
+    sans le moindre commit est mecaniquement un ancetre de `main` : l'issue
+    serait fermee alors que rien n'a ete fait.
+    """
+    head = git_output(repo, "rev-parse", "--verify", "--quiet", branch)
+    if not head or (base and head == base):
+        return False
+    return subprocess.run(
+        ["git", "merge-base", "--is-ancestor", branch, "main"],
+        cwd=repo, capture_output=True, text=True, timeout=60,
+    ).returncode == 0
+
+
+def _prior_missions(kanban, conn, config, key: str) -> list[str]:
+    """Preuves qu'un travail a deja abouti sur cette issue.
+
+    HER-95 portait dix cartes terminees et decrivait un travail deja fait : rien
+    ne l'aurait signale. Deux sources exactes, jamais une devinette : une mission
+    de la boucle qui a ete cloturee, et toute carte `done` — y compris celles
+    posees a la main bien avant la boucle. Une mission simplement bloquee puis
+    rangee ne compte pas : rien n'a abouti.
+    """
+    evidence = []
+    state = read_mission(config, key) or {}
+    if state.get("closed_out"):
+        evidence.append("mission autonome déjà clôturée")
+    evidence.extend(
+        f"carte {task.id}"
+        for task in kanban.list_tasks(conn, status="done")
+        if issue_key_of_title(task.title) == key
+    )
+    return evidence
+
+
+def _hold_for_confirmation(config, client, issue, labels, prior, report) -> None:
+    """Suspend une issue deja traitee au lieu de la relancer en silence."""
+    message = (
+        f"⚠ {issue.key} — {issue.title}\n"
+        f"{len(prior)} mission(s) déjà terminée(s) sur cette issue. Je ne la relance "
+        "pas tout seul : soit le travail est fait et l'issue doit être fermée, soit "
+        "il faut préciser ce qu'il reste à faire.\n"
+        f"Pour relancer quand même : retire le label `{LABEL_BLOCKED}` de l'issue.\n"
+        f"{issue.url}"
+    )
+    report.skipped[issue.key] = f"{len(prior)} mission(s) antérieure(s)"
+    report.messages.append(message)
+    if not config.apply:
+        return
+    client.add_comment(
+        issue.id,
+        f"Boucle en attente : {len(prior)} mission(s) autonome(s) ont déjà été menées "
+        "sur cette issue. Reprise suspendue pour éviter de refaire un travail existant. "
+        f"Retirer `{LABEL_BLOCKED}` pour relancer.",
+    )
+    client.update_issue(issue.id, label_ids=_labels_after_build(
+        client, issue, labels, LABEL_BLOCKED
+    ))
+
+
+def _report_blocked(config, client, kanban, conn, by_key, labels, report) -> None:
+    """Fait remonter les missions bloquees — sinon elles restent invisibles.
+
+    Un worker qui bloque a fait ce qu'on lui demande : il attend une decision.
+    Sans ce relais, l'issue reste eternellement « en cours » et personne ne le
+    sait. Le label sert de marqueur d'idempotence : on ne signale qu'une fois.
+    """
+    for task in kanban.list_tasks(conn, status="blocked"):
+        if task.created_by != LOOP_AUTHOR:
+            continue
+        key = issue_key_of_title(task.title)
+        issue = by_key.get(key)
+        if issue is None or LABEL_BLOCKED in issue.labels:
+            continue
+        reason = (kanban.latest_summary(conn, task.id) or task.result or "").strip()
+        report.messages.append(
+            f"⛔ {key} — {issue.title}\n"
+            f"{task.assignee} s'est arrêté et attend une décision :\n"
+            f"{reason or '(aucune raison fournie)'}\n{issue.url}"
+        )
+        report.skipped[key] = "mission bloquée"
+        if not config.apply:
+            continue
+        client.add_comment(
+            issue.id,
+            f"Mission suspendue par `{task.assignee}`.\n\n{reason or '(aucune raison fournie)'}"
+            "\n\nAucun code n'a été poussé. La mission reprendra quand le point "
+            "bloquant sera levé.",
+        )
+        client.update_issue(issue.id, label_ids=_labels_after_build(
+            client, issue, labels, LABEL_BLOCKED
+        ))
+
+
+def _close_merged(config, client, issues, labels, states, report) -> None:
+    """Ferme les issues dont la branche est effectivement entree dans `main`.
+
+    Le merge est le seul signal qui vaille : tant que le commit n'est pas dans la
+    branche principale, le travail n'existe pas pour le reste du monde. On lit
+    donc le depot, on ne fait confiance ni au statut de la carte ni au notre.
+    """
+    for issue in issues:
+        if LABEL_REVIEW not in issue.labels:
+            continue
+        mission = read_mission(config, issue.key) or {}
+        repo = Path(mission.get("repo") or repo_for_issue(issue, config.repo))
+        branch = mission.get("branch") or branch_name_for(issue)
+        if not branch_was_merged(repo, branch, mission.get("base", "")):
+            continue
+
+        head = git_output(repo, "rev-parse", "--short", branch)
+        worktree = Path(
+            mission.get("worktree")
+            or Path(config.worktrees_root) / f"agent-{issue.key.lower()}"
+        )
+        done_state = states.get(STATE_DONE)
+        report.closed.append({"issue": issue.key, "merged_at": head})
+        report.messages.append(
+            f"✅ {issue.key} fusionnée ({head}) — issue fermée, worktree libéré."
+            if done_state else
+            f"✅ {issue.key} fusionnée ({head}), mais l'état « {STATE_DONE} » "
+            "n'existe pas dans cette team : ferme-la à la main."
+        )
+        if not config.apply:
+            continue
+        freed = remove_mission_worktree(str(repo), worktree)
+        client.add_comment(
+            issue.id,
+            f"Fusionné dans `main` au commit `{head}`. Issue fermée automatiquement."
+            + ("" if freed else "\n\nWorktree conservé : il contient encore des "
+                               "modifications non commitées."),
+        )
+        keep = [labels[n] for n in issue.labels if n in labels and n != LABEL_REVIEW]
+        client.update_issue(issue.id, label_ids=keep, state_id=done_state)
+        mission_state_path(config, issue.key).unlink(missing_ok=True)
 
 
 def _mission_summary(kanban, conn, task, result: dict[str, str]) -> str:

@@ -161,6 +161,7 @@ class FakeLinear:
         self.states = {
             linear_loop.STATE_BUILDING: "state-building",
             linear_loop.STATE_REVIEW: "state-review",
+            linear_loop.STATE_DONE: "state-done",
         }
 
     def __call__(self, payload):
@@ -234,7 +235,10 @@ class FakeKanban:
         return _Ctx()
 
     def list_tasks(self, conn, *, status=None, include_archived=False, **kw):
-        return [t for t in self.tasks if status is None or t.status == status]
+        rows = self.tasks if include_archived else [
+            t for t in self.tasks if t.status != "archived"
+        ]
+        return [t for t in rows if status is None or t.status == status]
 
     def create_task(self, conn, **kw):
         task_id = f"t_{len(self.created)}"
@@ -248,17 +252,35 @@ class FakeKanban:
 
     def archive_task(self, conn, task_id):
         self.archived.append(task_id)
-        self.tasks = [t for t in self.tasks if t.id != task_id]
+        for task in self.tasks:
+            if task.id == task_id:
+                task.status = "archived"
         return True
 
 
+def make_base_repo(path):
+    """Un depot git minimal sur `main`, pour que les worktrees soient reels."""
+    import subprocess
+
+    path.mkdir(parents=True, exist_ok=True)
+    for args in (["init", "-q", "-b", "main"], ["config", "user.email", "t@t"],
+                 ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=path, check=True)
+    (path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True)
+    return path
+
+
 def make_config(tmp_path, **kw):
+    repo = kw.pop("repo", None) or str(make_base_repo(tmp_path / "depot"))
     options = {
         "team": TEAM,
         "coders": ("hermes-code-a", "hermes-code-b"),
-        "repo": "/depot/hermes",
+        "repo": repo,
         "hermes_home": tmp_path,
-        "runtime_root": "/depot/hermes",
+        "runtime_root": repo,
+        "worktrees_root": str(tmp_path / "worktrees"),
         "apply": True,
         "min_free_disk": 0,
     }
@@ -284,9 +306,28 @@ def test_tick_gives_one_mission_to_each_free_coder(tmp_path):
 
     assert [m["issue"] for m in report.started] == ["HER-100", "HER-101"]
     assert [c["assignee"] for c in kanban.created] == ["hermes-code-a", "hermes-code-b"]
-    assert kanban.created[0]["workspace_kind"] == "worktree"
-    assert kanban.created[0]["workspace_path"] == "/depot/hermes"
     assert kanban.created[0]["title"].startswith("HER-100 —")
+
+
+def test_mission_worktree_lands_where_the_coder_may_write(tmp_path):
+    """Le worktree doit vivre sous la racine autorisee, pas dans le runtime.
+
+    HER-112 s'est bloquee la-dessus : le defaut du kanban place le worktree dans
+    le depot lui-meme, hors du HERMES_WRITE_SAFE_ROOT des profils Code.
+    """
+    linear = FakeLinear([make_issue("HER-104", priority=1)])
+    kanban = FakeKanban()
+    config = make_config(tmp_path)
+    linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    created = kanban.created[0]
+    workspace = Path(created["workspace_path"])
+    assert created["workspace_kind"] == "dir"
+    assert workspace.parent == Path(config.worktrees_root)
+    assert workspace.is_dir() and (workspace / "README.md").exists()
+    assert not Path(config.repo, ".worktrees").exists()
 
 
 def test_mission_carries_a_runtime_cap(tmp_path):
@@ -527,6 +568,134 @@ def test_closeout_survives_an_issue_deleted_from_linear(tmp_path):
     assert "HER-999" in report.render()
     assert kanban.archived == ["t_orphan"]
     assert linear.comments == []
+
+
+# ---------------------------------------------------------------------------
+# Blocage, fusion, anteriorite
+# ---------------------------------------------------------------------------
+
+
+def test_a_blocked_mission_reaches_jean(tmp_path):
+    """Sans relais, un worker bloque attend indefiniment sans que personne sache."""
+    stuck = FakeTask("t_stuck", "HER-400 — bloquée", "hermes-code-a", "blocked")
+    linear = FakeLinear([make_issue("HER-400", labels=(linear_loop.LABEL_READY,
+                                                       linear_loop.LABEL_BUILDING))])
+    kanban = FakeKanban([stuck], summaries={"t_stuck": "Racine d'écriture refusée."})
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    message = report.render()
+    assert "HER-400" in message and "attend une décision" in message
+    assert "Racine d'écriture refusée." in message
+    assert linear.labels[linear_loop.LABEL_BLOCKED] in linear.updates[0]["labelIds"]
+
+
+def test_a_blocked_mission_is_announced_once(tmp_path):
+    """Le label sert de marqueur : pas de rappel a chaque tick."""
+    stuck = FakeTask("t_stuck", "HER-401 — bloquée", "hermes-code-a", "blocked")
+    linear = FakeLinear([make_issue("HER-401", labels=(linear_loop.LABEL_READY,
+                                                       linear_loop.LABEL_BLOCKED))])
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=linear),
+        FakeKanban([stuck]),
+    )
+
+    assert "HER-401" not in report.render()
+
+
+def merge_branch_into_main(repo, branch):
+    import subprocess
+
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "merge", branch],
+                   cwd=repo, check=True)
+
+
+def test_merged_issue_is_closed_and_its_worktree_freed(tmp_path):
+    linear = FakeLinear([make_issue("HER-500", priority=1)])
+    config = make_config(tmp_path)
+    kanban = FakeKanban()
+    linear_loop.run_tick(config, linear_loop.LinearClient("k", transport=linear), kanban)
+
+    worktree = Path(kanban.created[0]["workspace_path"])
+    (worktree / "fix.txt").write_text("fait\n")
+    import subprocess
+    subprocess.run(["git", "add", "fix.txt"], cwd=worktree, check=True)
+    subprocess.run(["git", "commit", "-qm", "fix"], cwd=worktree, check=True)
+    branch = linear_loop.branch_name_for(make_issue("HER-500"))
+    merge_branch_into_main(Path(config.repo), branch)
+
+    # Jean a mergé : au tick suivant l'issue porte agent-review.
+    merged_view = FakeLinear([make_issue("HER-500", labels=(linear_loop.LABEL_REVIEW,))])
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=merged_view), FakeKanban()
+    )
+
+    assert "fusionnée" in report.render()
+    assert merged_view.updates[0]["stateId"] == "state-done"
+    assert not worktree.exists()
+
+
+def test_an_unmerged_branch_keeps_its_issue_open(tmp_path):
+    linear = FakeLinear([make_issue("HER-501", priority=1)])
+    config = make_config(tmp_path)
+    kanban = FakeKanban()
+    linear_loop.run_tick(config, linear_loop.LinearClient("k", transport=linear), kanban)
+    worktree = Path(kanban.created[0]["workspace_path"])
+
+    review = FakeLinear([make_issue("HER-501", labels=(linear_loop.LABEL_REVIEW,))])
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=review), FakeKanban()
+    )
+
+    assert "fusionnée" not in report.render()
+    assert review.updates == []
+    assert worktree.exists()
+
+
+def test_an_issue_already_worked_on_is_held_not_relaunched(tmp_path):
+    """Le cas HER-95 : dix cartes terminees, une issue qui repartirait en boucle.
+
+    Les cartes anterieures peuvent avoir ete posees a la main bien avant la
+    boucle — l'anteriorite ne se limite donc pas a ses propres missions.
+    """
+    past = FakeTask("t_old", "HER-600 — déjà traitée", "hermes-code", "done",
+                    created_by="jean")
+    linear = FakeLinear([make_issue("HER-600", priority=1)])
+    kanban = FakeKanban([past])
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert kanban.created == []
+    assert "déjà terminée(s)" in report.render()
+    assert linear.labels[linear_loop.LABEL_BLOCKED] in linear.updates[-1]["labelIds"]
+
+
+def test_a_mission_that_only_blocked_does_not_count_as_prior_work(tmp_path):
+    """HER-112 s'est bloquee sur l'infra : rien n'a abouti, elle doit repartir."""
+    stuck = FakeTask("t_stuck", "HER-602 — bloquée puis rangée", "hermes-code-a",
+                     "archived")
+    linear = FakeLinear([make_issue("HER-602", priority=1)])
+    kanban = FakeKanban([stuck])
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert len(kanban.created) == 1
+    assert "déjà terminée" not in report.render()
+
+
+def test_a_fresh_issue_is_not_held(tmp_path):
+    linear = FakeLinear([make_issue("HER-601", priority=1)])
+    kanban = FakeKanban()
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert len(kanban.created) == 1
+    assert "déjà terminée" not in report.render()
 
 
 # ---------------------------------------------------------------------------
