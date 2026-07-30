@@ -182,6 +182,46 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
+def _strip_trailing_commas(raw: str) -> str:
+    r"""Drop commas that sit directly before a closing brace or bracket.
+
+    String-aware replacement for a ``re.sub(r',\s*([}\]])', r'\1', ...)``
+    pass.  The regex had no notion of string boundaries, so a comma inside a
+    string *value* followed by ``]`` or ``}`` was rewritten too: the payload
+    ``{"sep": ", ]", ...}`` had its separator silently changed to ``"]"``.
+    On its own that produced JSON that still failed to parse and degraded to
+    ``"{}"``, but paired with a nesting-aware closer it parses cleanly and the
+    corrupted value reaches the tool.
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    pending: int | None = None  # index in `out` of a comma awaiting a verdict
+    for ch in raw:
+        if in_string:
+            out.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if pending is not None:
+            if ch.isspace():
+                out.append(ch)
+                continue
+            if ch in "}]":
+                del out[pending:]  # drop the comma and any whitespace after it
+            pending = None
+        if ch == '"':
+            in_string = True
+        elif ch == ",":
+            pending = len(out)
+        out.append(ch)
+    return "".join(out)
+
+
 def _close_unclosed_json_structures(raw: str) -> str:
     """Close a truncated JSON payload, honouring nesting order.
 
@@ -264,20 +304,23 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     # the most common local-model repair case (#12068).
     try:
         parsed = json.loads(raw_stripped, strict=False)
-        reserialised = json.dumps(parsed, separators=(",", ":"))
+        # allow_nan=False: json.loads turns 1e999 into inf, and the default
+        # dumps would re-emit a bare ``Infinity`` token, which is not JSON.
+        # Raising here drops us into the repair passes instead.
+        reserialised = json.dumps(parsed, separators=(",", ":"), allow_nan=False)
         if reserialised != raw_stripped:
             logger.warning(
                 "Repaired unescaped control chars in tool_call arguments for %s",
                 tool_name,
             )
         return reserialised
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         pass
 
     # Attempt common JSON repairs
     fixed = raw_stripped
-    # 1. Strip trailing commas before } or ]
-    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+    # 1. Strip trailing commas before } or ] (string-aware)
+    fixed = _strip_trailing_commas(fixed)
     # 2. Close unclosed structures, innermost first (string-aware)
     fixed = _close_unclosed_json_structures(fixed)
     # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
@@ -285,7 +328,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
         try:
             json.loads(fixed)
             break
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             if fixed.endswith('}') and fixed.count('}') > fixed.count('{'):
                 fixed = fixed[:-1]
             elif fixed.endswith(']') and fixed.count(']') > fixed.count('['):
@@ -300,7 +343,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
             tool_name, raw_stripped[:80], fixed[:80],
         )
         return fixed
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         pass
 
     # Repair pass 4: escape unescaped control chars inside JSON strings,
@@ -315,7 +358,7 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
                 tool_name, raw_stripped[:80], escaped[:80],
             )
             return escaped
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         pass
 
     # Last resort: replace with empty object so the API request doesn't

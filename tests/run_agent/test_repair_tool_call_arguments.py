@@ -194,7 +194,42 @@ class TestRepairToolCallArguments:
         result = _repair_tool_call_arguments(raw, "t")
         assert json.loads(result) == {"a": [1, 2], "b": {"c": 3}}
 
+    # -- String-aware trailing-comma strip --
+    # The comma strip used a regex with no notion of string boundaries, so a
+    # comma inside a string value followed by ']' or '}' was rewritten too.
+    # Alone that produced JSON that still failed to parse (-> "{}"); combined
+    # with a nesting-aware closer it parses cleanly and the corrupted value
+    # reaches the tool.
+
+    def test_comma_and_bracket_inside_string_value_survive(self):
+        result = _repair_tool_call_arguments('{"sep": ", ]", "files": ["a"', "t")
+        assert json.loads(result) == {"sep": ", ]", "files": ["a"]}
+
+    def test_comma_and_brace_inside_string_value_survive(self):
+        result = _repair_tool_call_arguments('{"msg": "end ,}", "n": [1', "t")
+        assert json.loads(result) == {"msg": "end ,}", "n": [1]}
+
+    def test_trailing_comma_strip_still_applies_outside_strings(self):
+        result = _repair_tool_call_arguments('{"a": [1, 2,], "b": {"c": 3,},}', "t")
+        assert json.loads(result) == {"a": [1, 2], "b": {"c": 3}}
+
     # -- Never-raises contract --
+
+    def test_pathological_nesting_does_not_raise(self):
+        """RecursionError is not a ValueError.
+
+        json.loads recurses per nesting level, so a repetition-loop payload
+        raises RecursionError out of a function documented as never raising.
+        """
+        assert _repair_tool_call_arguments("[" * 100_000, "t") == "{}"
+
+    def test_overflowing_float_is_not_laundered_into_infinity(self):
+        """json.loads turns 1e999 into inf; a default dumps re-emits the bare
+        token ``Infinity``, which is not valid JSON."""
+        result = _repair_tool_call_arguments('{"n": 1e999}', "t")
+        assert "Infinity" not in result
+        json.loads(result)
+
 
     def test_long_numeric_literal_does_not_raise(self):
         """CPython >= 3.11 raises a bare ValueError, not JSONDecodeError.
