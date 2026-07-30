@@ -111,6 +111,36 @@ def test_launcher_transport_does_not_increment_failure_or_block_recurrence(
         assert result.runtime_outcomes[0]["kind"] == "launcher_transport_failure"
 
 
+def test_launcher_transport_failure_defers_the_next_dispatch_tick(
+    kanban_home, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    spawn_calls = []
+
+    def spawn_fn(*_args, **_kwargs):
+        spawn_calls.append(True)
+        raise ConnectionError("launcher transport disconnected")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="transport cooldown", assignee="worker")
+
+        first = kb.dispatch_once(conn, spawn_fn=spawn_fn, failure_limit=1)
+        assert len(spawn_calls) == 1
+        assert first.runtime_outcomes[0]["kind"] == "launcher_transport_failure"
+
+        second = kb.dispatch_once(conn, spawn_fn=spawn_fn, failure_limit=1)
+
+        assert len(spawn_calls) == 1
+        assert (task_id, "launcher_transport_cooldown") in second.respawn_guarded
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.block_recurrences == 0
+
+
 @pytest.mark.parametrize("status", ["ready", "review"])
 def test_launcher_code_failure_is_persisted_as_string_and_blocks_at_limit(
     kanban_home, monkeypatch, status

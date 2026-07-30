@@ -6691,8 +6691,10 @@ class DispatchResult:
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
-    ``"recent_success"`` (completed run within guard window),
-    ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    ``"rate_limit_cooldown"`` / ``"launcher_transport_cooldown"``
+    (bounded transient retry delay), ``"recent_success"`` (completed run
+    within guard window), ``"active_pr"`` (GitHub PR URL in a recent
+    comment)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -7939,17 +7941,16 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     Checks in priority order:
 
-    ``"rate_limit_cooldown"``
-        The task's most recent run ended with the ``rate_limited`` outcome
-        (a worker bailed on a provider quota wall via the EX_TEMPFAIL
-        sentinel) within ``_resolve_rate_limit_cooldown_seconds()``. The
-        quota almost certainly hasn't reset yet, so defer the respawn until
-        the cooldown elapses — then allow a cheap probe. This is checked
-        BEFORE ``blocker_auth`` because the rate-limit requeue stamps a
-        quota-flavored ``last_failure_error`` that would otherwise match the
-        auth-blocker regex and park the task forever (the rate-limit path
-        never increments ``consecutive_failures``, so the breaker can't free
-        it). Once the cooldown elapses the task falls through and respawns.
+    ``"rate_limit_cooldown"`` / ``"launcher_transport_cooldown"``
+        The task's most recent run ended with a transient provider quota or
+        launcher transport outcome within
+        ``_resolve_rate_limit_cooldown_seconds()``. The upstream service may
+        still be unavailable, so defer the respawn until the cooldown elapses
+        — then allow a cheap probe. This is checked BEFORE ``blocker_auth``
+        because transient requeues can stamp errors that match the auth-
+        blocker regex and park the task forever (these paths never increment
+        ``consecutive_failures``, so the breaker cannot free them). Once the
+        cooldown elapses the task falls through and respawns.
 
     ``"blocker_auth"``
         The task's last failure error matches a quota / authentication
@@ -8004,23 +8005,25 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    if (
-        latest_run is not None
-        and latest_run["outcome"] == "rate_limited"
-    ):
+    latest_outcome = latest_run["outcome"] if latest_run is not None else None
+    if latest_outcome in {"rate_limited", "launcher_transport_failure"}:
         if rl_cooldown <= 0:
             # Cooldown disabled — respawn immediately, and skip the
-            # blocker_auth regex so the stamped rate-limit text doesn't
+            # blocker_auth regex so the stamped transient error doesn't
             # re-trap the task.
             return None
-        ended_at = latest_run["ended_at"]
+        ended_at = latest_run["ended_at"] if latest_run is not None else None
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
-            return "rate_limit_cooldown"
+            return (
+                "launcher_transport_cooldown"
+                if latest_outcome == "launcher_transport_failure"
+                else "rate_limit_cooldown"
+            )
         # Cooldown elapsed — allow the respawn. Return early so the
-        # blocker_auth check below doesn't catch the rate-limit text we
+        # blocker_auth check below doesn't catch the transient text we
         # stamped on the task; this path intentionally retries forever
-        # (cheaply, spaced by the cooldown) until quota returns or a real
-        # crash/completion supersedes it.
+        # (cheaply, spaced by the cooldown) until the upstream service
+        # returns or a real crash/completion supersedes it.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
