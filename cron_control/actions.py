@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any, Iterable
 
-from cron import provider_recovery
+import cron.provider_recovery as provider_recovery
 from cron.jobs import compute_next_run, get_job, update_job
 
 from .normalizer import canonical_json, utc_now_iso

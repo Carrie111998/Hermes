@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from cron import provider_recovery
+import cron.provider_recovery as provider_recovery
 
 from .normalizer import canonical_json, sha256_json, utc_now_iso
 from .store import (

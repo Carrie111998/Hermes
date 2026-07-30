@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from cron import delivery_watchdog, provider_recovery
+import cron.delivery_watchdog as delivery_watchdog
+import cron.provider_recovery as provider_recovery
 from hermes_constants import get_hermes_home
 
 from .normalizer import (
@@ -28,8 +29,8 @@ from .normalizer import (
 def _cron_paths() -> dict[str, Path]:
     home = get_hermes_home()
     cron_dir = home / "cron"
-    from cron import jobs as cron_jobs
-    from cron import executions as cron_executions
+    import cron.jobs as cron_jobs
+    import cron.executions as cron_executions
 
     return {
         "home": home,
