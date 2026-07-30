@@ -8374,9 +8374,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                # 【中文】"已排队，等它回来后再处理"
+                message = f"⏳ Gateway {self._status_action_gerund()} — 已排队，等它回来后再处理。"
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                # 【中文】"Gateway 正忙，暂时无法接受新消息"
+                message = f"⏳ Gateway 正在 {self._status_action_gerund()}，暂时无法接受新消息。"
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -8868,12 +8870,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active = self._snapshot_running_agents()
         restart_source = self._restart_command_source if self._restart_requested else None
 
-        action = "restarting" if self._restart_requested else "shutting down"
+        # 【中文】告诉用户：Gateway 正在重启/关闭，当前任务会被中断
+        # 重启后发送任意消息，我会尝试从中断处继续
+        action = "重启中" if self._restart_requested else "关闭中"
         hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
+            "当前任务将被中断。"
+            "重启后发送任意消息，我会尝试从中断处继续。"
             if self._restart_requested
-            else "Your current task will be interrupted."
+            else "当前任务将被中断。"
         )
         msg = f"⚠️ Gateway {action} — {hint}"
 
@@ -17526,10 +17530,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_display = str(context_length)
 
+        # 【中文】会话信息横幅：显示当前使用的模型、AI 提供商、上下文大小
+        # 例如：◆ 模型: deepseek-v4-flash / ◆ 提供商: deepseek / ◆ 上下文: 1.0M tokens
         lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
-            f"◆ Context: {ctx_display} tokens ({ctx_source})",
+            f"◆ 模型: `{model}`",
+            f"◆ 提供商: {provider or 'openrouter'}",
+            f"◆ 上下文: {ctx_display} tokens（{ctx_source}）",
         ]
 
         # Show endpoint for local/custom setups
@@ -19448,7 +19454,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _on_confirm(choice: str):
             if choice == "cancel":
-                return f"🟡 /{command} cancelled. Conversation unchanged."
+                # 【中文】"🟡 /new 已取消。当前对话保持不变。"
+                return f"🟡 /{command} 已取消。当前对话保持不变。"
             if choice == "always":
                 try:
                     from cli import save_config_value
@@ -19463,10 +19470,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
             result = await execute()
             if choice == "always":
+                # 【中文】通知用户：已关闭确认提示，/new 等命令将直接执行
+                # 如需恢复确认，在 config.yaml 中设置 approvals.destructive_slash_confirm: true
                 note = (
-                    "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
-                    "without confirmation. Re-enable via "
-                    "`approvals.destructive_slash_confirm: true` in config.yaml."
+                    "\n\nℹ️ 未来的 /clear、/new、/reset 和 /undo 将直接执行，不再需要确认。"
+                    "如需重新开启确认，请在 config.yaml 中设置 "
+                    "`approvals.destructive_slash_confirm: true`。"
                 )
                 if isinstance(result, str):
                     return result + note
@@ -19477,14 +19486,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return result
 
         _p = self._typed_command_prefix_for(event.source.platform)
+        # 【中文】确认提示：询问用户是否要执行破坏性操作
+        # 选项：批准一次 / 始终批准 / 取消
         prompt_message = (
-            f"⚠️ **Confirm /{command}**\n\n"
+            f"⚠️ **确认 /{command}**\n\n"
             f"{detail}\n\n"
-            "Choose:\n"
-            "• **Approve Once** — proceed this time only\n"
-            "• **Always Approve** — proceed and silence this prompt permanently\n"
-            "• **Cancel** — keep current conversation\n\n"
-            f"_Text fallback: reply `{_p}approve`, `{_p}always`, or `{_p}cancel`._"
+            "选择：\n"
+            "• **批准一次** — 仅本次执行\n"
+            "• **始终批准** — 执行并永久关闭确认提示\n"
+            "• **取消** — 保持当前对话不变\n\n"
+            f"_文本回复：发送 `{_p}approve`、`{_p}always` 或 `{_p}cancel`。_"
         )
         return await self._request_slash_confirm(
             event=event,
@@ -20162,7 +20173,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         delivered: set[tuple[str, str, Optional[str]]] = set()
         skipped = skip_targets or set()
-        message = "♻️ Gateway online — Hermes is back and ready."
+        # 【中文】"♻️ Gateway 已上线 — Hermes 回来了，随时待命。"
+        message = "♻️ Gateway 已上线 — Hermes 回来了，随时待命。"
 
         for platform, platform_cfg in self.config.platforms.items():
             home = platform_cfg.home_channel
