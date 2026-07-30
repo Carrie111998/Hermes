@@ -45,6 +45,11 @@ SLOTS: dict[str, dict] = {
 }
 
 MEMORY_OFF_BLOCK = "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+TIMEZONE_BLOCK = "timezone: Asia/Singapore\n"
+# One persistent session per chat that autocompacts — no daily reset, no idle
+# reset (teren ruling 2026-07-29; WB a9ab2ff5). Context is managed only by the
+# compression path, proven by tests/gateway/test_mode_none_compaction.py.
+SESSION_RESET_BLOCK = "session_reset:\n  mode: none\n"
 PYTHON_SANDBOX_BLOCK = (
     "python_sandbox:\n"
     "  enabled: true\n"
@@ -386,7 +391,7 @@ def _safe_config(source: str, slot: dict) -> str:
     )
     if not rendered.endswith("group_sessions_per_user: false\n"):
         raise RuntimeError("config baseline no longer ends at group_sessions_per_user")
-    rendered += MEMORY_OFF_BLOCK + PYTHON_SANDBOX_BLOCK
+    rendered += TIMEZONE_BLOCK + SESSION_RESET_BLOCK + MEMORY_OFF_BLOCK + PYTHON_SANDBOX_BLOCK
     if effort is not None:
         rendered = _replace_once(
             rendered,
@@ -511,6 +516,8 @@ def _validate(
         "min_free_percent": 20,
     }
     assert config["group_sessions_per_user"] is False
+    assert config["timezone"] == "Asia/Singapore"
+    assert config["session_reset"] == {"mode": "none"}
     assert config["platforms"]["whatsapp"]["enabled"] is False
     assert config["model"]["provider"] == "openai-direct-primary"
     assert config["model"]["default"] == model

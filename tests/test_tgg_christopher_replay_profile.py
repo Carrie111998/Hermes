@@ -190,8 +190,10 @@ class TestContinueSessionPlan:
 
 def test_prepare_hermes_home_writes_session_reset_none_in_continue_mode(tmp_path, monkeypatch):
     """Continue mode must land session_reset mode "none" in the prepared
-    config (config.yaml session_reset maps to default_reset_policy); fresh
-    mode must leave the key absent (live-default policy)."""
+    config (config.yaml session_reset maps to default_reset_policy).  Fresh
+    mode copies the deploy baseline untouched — which now itself carries
+    session_reset mode "none" (teren ruling 2026-07-29: one persistent
+    session per chat that autocompacts; WB a9ab2ff5)."""
     import yaml
 
     from scripts.tgg_christopher_hermes_replay import (
@@ -210,7 +212,8 @@ def test_prepare_hermes_home_writes_session_reset_none_in_continue_mode(tmp_path
         business_base_url=None,
     )
     fresh_config = yaml.safe_load((fresh_home / "config.yaml").read_text(encoding="utf-8"))
-    assert "session_reset" not in fresh_config
+    # Fresh mode adds nothing itself; the baseline's own policy passes through.
+    assert fresh_config["session_reset"] == {"mode": "none"}
 
     cont_home = tmp_path / "cont-home"
     cont_home.mkdir()

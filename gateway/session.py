@@ -19,12 +19,36 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
+from hermes_time import now as _hermes_now
+
 logger = logging.getLogger(__name__)
 
 
 def _now() -> datetime:
-    """Return the current local time."""
-    return datetime.now()
+    """Return configured Hermes wall time.
+
+    ``hermes_time`` honours ``HERMES_TIMEZONE`` and the top-level ``timezone``
+    config key and always returns an aware datetime.
+    """
+    return _hermes_now()
+
+
+def _in_clock_timezone(value: datetime, clock: datetime) -> datetime:
+    """Normalize stored timestamps for comparison with ``clock``.
+
+    Legacy ``sessions.json`` entries are naive server-local wall times. Treat
+    them as such before converting to the configured Hermes timezone. New
+    entries retain their UTC offset in JSON, so a timezone cutover does not
+    silently age or reset an otherwise-current session.
+    """
+    if value.tzinfo is None:
+        value = _legacy_server_time(value)
+    return value.astimezone(clock.tzinfo)
+
+
+def _legacy_server_time(value: datetime) -> datetime:
+    """Attach the server-local zone to a legacy naive timestamp."""
+    return value.astimezone()
 
 
 # ---------------------------------------------------------------------------
@@ -784,9 +808,10 @@ class SessionStore:
             return False
 
         now = _now()
+        updated_at = _in_clock_timezone(entry.updated_at, now)
 
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return True
 
@@ -797,7 +822,7 @@ class SessionStore:
             )
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
-            if entry.updated_at < today_reset:
+            if updated_at < today_reset:
                 return True
 
         return False
@@ -825,9 +850,10 @@ class SessionStore:
             return None
         
         now = _now()
+        updated_at = _in_clock_timezone(entry.updated_at, now)
         
         if policy.mode in {"idle", "both"}:
-            idle_deadline = entry.updated_at + timedelta(minutes=policy.idle_minutes)
+            idle_deadline = updated_at + timedelta(minutes=policy.idle_minutes)
             if now > idle_deadline:
                 return "idle"
         
@@ -841,7 +867,7 @@ class SessionStore:
             if now.hour < policy.at_hour:
                 today_reset -= timedelta(days=1)
             
-            if entry.updated_at < today_reset:
+            if updated_at < today_reset:
                 return "daily"
         
         return None
@@ -1092,7 +1118,7 @@ class SessionStore:
                             "has_active_processes_fn raised during prune for %s: %s",
                             entry.session_key, exc,
                         )
-                if entry.updated_at < cutoff:
+                if _in_clock_timezone(entry.updated_at, cutoff) < cutoff:
                     removed_keys.append(key)
             for key in removed_keys:
                 self._entries.pop(key, None)
@@ -1133,7 +1159,10 @@ class SessionStore:
             for entry in self._entries.values():
                 if entry.resume_pending:
                     continue
-                if not entry.suspended and entry.updated_at >= cutoff:
+                if (
+                    not entry.suspended
+                    and _in_clock_timezone(entry.updated_at, cutoff) >= cutoff
+                ):
                     entry.resume_pending = True
                     entry.resume_reason = "restart_interrupted"
                     entry.last_resume_marked_at = _now()
@@ -1257,9 +1286,17 @@ class SessionStore:
 
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
-            entries = [e for e in entries if e.updated_at >= cutoff]
+            entries = [
+                e
+                for e in entries
+                if _in_clock_timezone(e.updated_at, cutoff) >= cutoff
+            ]
 
-        entries.sort(key=lambda e: e.updated_at, reverse=True)
+        clock = _now()
+        entries.sort(
+            key=lambda entry: _in_clock_timezone(entry.updated_at, clock),
+            reverse=True,
+        )
 
         return entries
     

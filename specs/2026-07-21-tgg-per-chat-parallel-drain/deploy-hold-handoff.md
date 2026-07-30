@@ -56,7 +56,6 @@ Backfill WB `5ac490b5` therefore remains blocked until import assigns a durable 
 
 ## Deliberate non-changes and follow-up traps
 
-- `TGG_PERSISTENT_CHAT_SESSION_SCOPE` remains `management`. Scope `all` is still WB `24c53c9c` and was not folded into this deploy.
+- **SUPERSEDED 2026-07-29 by WB `a9ab2ff5`:** `TGG_PERSISTENT_CHAT_SESSION_SCOPE` no longer gates the ordinary live drain. Live chat turns use one stable per-chat session; bounded backplay explicitly retains isolated replay namespaces.
 - `DeliveryRouter.adapters` is rebound after construction in `run.py`. It is correct today, but fragile if future `__init__` ordering changes; preserve or eliminate that ordering dependency when the file is next touched.
 - Out-of-root `.env` files are not covered by deploy drift checks. That predates this change and remains tracked under WB `d4e194fc`.
-
