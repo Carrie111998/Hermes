@@ -71,6 +71,25 @@ def test_atomic_replace_regular_file(tmp_path: Path) -> None:
     assert not target.is_symlink()
 
 
+def test_atomic_replace_can_disable_non_atomic_copy_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "secret.env"
+    target.write_text("old-secret\n", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "new-secret\n")
+
+    def fail_replace(*args, **kwargs):
+        raise OSError(errno.EBUSY, "simulated busy target")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated busy target"):
+        atomic_replace(tmp, target, allow_copy_fallback=False)
+
+    assert target.read_text(encoding="utf-8") == "old-secret\n"
+    assert tmp.read_text(encoding="utf-8") == "new-secret\n"
+
+
 
 
 def test_atomic_replace_accepts_pathlike_and_str(tmp_path: Path) -> None:

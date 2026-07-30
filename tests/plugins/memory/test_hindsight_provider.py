@@ -10,6 +10,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -25,6 +26,8 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _embedded_profile_env_status,
+    _inspect_embedded_profile_env_metadata,
     _materialize_embedded_profile_env,
     _normalize_observation_scopes,
     _normalize_retain_tags,
@@ -480,6 +483,239 @@ class TestPostSetup:
             "HINDSIGHT_API_LLM_API_KEY=stale\n"
         )
         assert list(profile_env.parent.glob(".hermes_*.tmp")) == []
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX descriptor reuse test")
+    def test_embedded_profile_env_failure_does_not_close_reused_descriptor(
+        self, tmp_path, monkeypatch
+    ):
+        user_home = tmp_path / "user-home"
+        monkeypatch.setenv("HOME", str(user_home))
+        source_path = tmp_path / "source.fd"
+        source_fd = os.open(source_path, os.O_CREAT | os.O_RDWR, 0o600)
+        created_fd = None
+        real_mkstemp = tempfile.mkstemp
+
+        def track_mkstemp(*args, **kwargs):
+            nonlocal created_fd
+            created_fd, tmp_name = real_mkstemp(*args, **kwargs)
+            return created_fd, tmp_name
+
+        def fail_after_reuse(*args, **kwargs):
+            assert created_fd is not None
+            os.dup2(source_fd, created_fd)
+            raise OSError("simulated replace failure after descriptor reuse")
+
+        monkeypatch.setattr("tempfile.mkstemp", track_mkstemp)
+        monkeypatch.setattr("utils.atomic_replace", fail_after_reuse)
+
+        try:
+            with pytest.raises(
+                OSError, match="simulated replace failure after descriptor reuse"
+            ):
+                _materialize_embedded_profile_env(
+                    {
+                        "profile": "hermes",
+                        "llm_provider": "openai",
+                        "llm_model": "gpt-4o-mini",
+                    },
+                    llm_api_key="sk-current",
+                )
+
+            assert created_fd is not None
+            os.fstat(created_fd)
+        finally:
+            for open_fd in {source_fd, created_fd}:
+                if open_fd is None:
+                    continue
+                try:
+                    os.close(open_fd)
+                except OSError:
+                    pass
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX ownership test")
+    def test_embedded_profile_env_security_rejects_different_owner(
+        self, tmp_path, monkeypatch
+    ):
+        profile_env = tmp_path / "hermes.env"
+        profile_env.write_text("SECRET=value\n", encoding="utf-8")
+        os.chmod(profile_env, 0o600)
+
+        assert _inspect_embedded_profile_env_metadata(profile_env) == (True, True)
+        owner_uid = profile_env.stat().st_uid
+        monkeypatch.setattr(os, "geteuid", lambda: owner_uid + 1)
+
+        assert _inspect_embedded_profile_env_metadata(profile_env) == (True, False)
+
+    def test_embedded_profile_env_status_does_not_read_nonregular_target(
+        self, tmp_path, monkeypatch
+    ):
+        profile_env = tmp_path / "hermes.env"
+        profile_env.mkdir()
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._load_simple_env",
+            MagicMock(side_effect=AssertionError("non-regular target must not be read")),
+        )
+
+        assert _embedded_profile_env_status(profile_env, {"SECRET": "value"}) == (
+            True,
+            False,
+        )
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission test")
+    def test_embedded_profile_env_status_treats_unreadable_content_as_changed(
+        self, tmp_path, monkeypatch
+    ):
+        profile_env = tmp_path / "hermes.env"
+        profile_env.write_text("SECRET=value\n", encoding="utf-8")
+        os.chmod(profile_env, 0o600)
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._load_simple_env",
+            MagicMock(side_effect=PermissionError("unreadable")),
+        )
+
+        assert _embedded_profile_env_status(profile_env, {"SECRET": "value"}) == (
+            True,
+            True,
+        )
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX permission test")
+    def test_embedded_profile_env_rejects_insecure_replacement_result(
+        self, tmp_path, monkeypatch
+    ):
+        user_home = tmp_path / "user-home"
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text("HINDSIGHT_API_LLM_API_KEY=stale\n", encoding="utf-8")
+        os.chmod(profile_env, 0o644)
+        monkeypatch.setenv("HOME", str(user_home))
+
+        def insecure_replace(tmp_path, target, **kwargs):
+            target.write_bytes(Path(tmp_path).read_bytes())
+            os.unlink(tmp_path)
+            return str(target)
+
+        monkeypatch.setattr("utils.atomic_replace", insecure_replace)
+        monkeypatch.setattr(
+            os,
+            "chmod",
+            MagicMock(side_effect=PermissionError("chmod denied")),
+        )
+
+        with pytest.raises(PermissionError, match="is not owner-only"):
+            _materialize_embedded_profile_env(
+                {
+                    "profile": "hermes",
+                    "llm_provider": "openai",
+                    "llm_model": "gpt-4o-mini",
+                },
+                llm_api_key="sk-current",
+            )
+
+        assert stat.S_IMODE(profile_env.stat().st_mode) == 0o644
+
+    @pytest.mark.skipif(
+        os.name != "posix" or os.geteuid() == 0,
+        reason="requires POSIX metadata owned by a non-root test user",
+    )
+    @pytest.mark.parametrize(
+        ("contents_match", "initial_mode", "expect_materialization", "expect_restart"),
+        (
+            (True, 0o600, False, False),
+            (True, 0o644, True, False),
+            (False, 0o600, True, True),
+        ),
+        ids=("secure-fast-path", "insecure-repair", "content-change"),
+    )
+    def test_local_embedded_start_validates_profile_env_state(
+        self,
+        tmp_path,
+        monkeypatch,
+        contents_match,
+        initial_mode,
+        expect_materialization,
+        expect_restart,
+    ):
+        hermes_home = tmp_path / "hermes-home"
+        config = {
+            "mode": "local_embedded",
+            "profile": "hermes",
+            "llm_provider": "openai",
+            "llm_api_key": "sk-current",
+            "llm_model": "gpt-4o-mini",
+            "idle_timeout": 300,
+        }
+        config_path = hermes_home / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: hermes_home
+        )
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, "")
+        )
+
+        profile_env = tmp_path / "user-home" / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True)
+        expected_env = _build_embedded_profile_env(config)
+        initial_content = (
+            "".join(f"{key}={value}\n" for key, value in expected_env.items())
+            if contents_match
+            else "HINDSIGHT_API_LLM_API_KEY=stale\n"
+        )
+        profile_env.write_text(initial_content, encoding="utf-8")
+        os.chmod(profile_env, initial_mode)
+
+        daemon_module = SimpleNamespace(console=None)
+        hindsight_embed = SimpleNamespace(daemon_embed_manager=daemon_module)
+        monkeypatch.setitem(sys.modules, "hindsight_embed", hindsight_embed)
+        monkeypatch.setitem(
+            sys.modules, "hindsight_embed.daemon_embed_manager", daemon_module
+        )
+
+        client = MagicMock()
+        client._manager.is_running.return_value = True
+        monkeypatch.setattr(HindsightMemoryProvider, "_get_client", lambda self: client)
+        from plugins.memory import hindsight as hindsight_module
+
+        materialize_spy = MagicMock(
+            wraps=hindsight_module._materialize_embedded_profile_env
+        )
+        monkeypatch.setattr(
+            hindsight_module, "_materialize_embedded_profile_env", materialize_spy
+        )
+
+        class ImmediateThread:
+            def __init__(self, *, target, **kwargs):
+                self._target = target
+
+            def start(self):
+                self._target()
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.threading.Thread", ImmediateThread
+        )
+
+        provider = HindsightMemoryProvider()
+        provider.initialize(
+            session_id="test-session",
+            hermes_home=str(hermes_home),
+            platform="cli",
+        )
+
+        metadata = profile_env.stat()
+        assert metadata.st_uid == os.geteuid()
+        assert stat.S_IMODE(metadata.st_mode) == 0o600
+        assert _load_simple_env(profile_env) == expected_env
+        if expect_materialization:
+            materialize_spy.assert_called_once_with(config)
+        else:
+            materialize_spy.assert_not_called()
+        if expect_restart:
+            client._manager.stop.assert_called_once_with("hermes")
+        else:
+            client._manager.stop.assert_not_called()
+        client._ensure_started.assert_called_once_with()
 
 
 # ---------------------------------------------------------------------------

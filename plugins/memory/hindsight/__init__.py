@@ -559,6 +559,46 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
+def _inspect_embedded_profile_env_metadata(profile_env) -> tuple[bool, bool]:
+    """Return ``(is_regular, is_secure)`` for the resolved profile target."""
+    import stat
+
+    try:
+        metadata = profile_env.stat()
+    except OSError:
+        return False, False
+
+    is_regular = stat.S_ISREG(metadata.st_mode)
+    if not is_regular:
+        return False, False
+    if os.name != "posix" or not hasattr(os, "geteuid"):
+        # POSIX mode and owner checks do not model Windows ACLs.
+        return True, True
+
+    is_secure = (
+        metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
+    return True, is_secure
+
+
+def _embedded_profile_env_status(
+    profile_env, expected_env: dict[str, str]
+) -> tuple[bool, bool]:
+    """Return ``(config_changed, metadata_secure)`` without reading special files."""
+    is_regular, metadata_secure = _inspect_embedded_profile_env_metadata(profile_env)
+    if not is_regular:
+        return True, False
+
+    try:
+        saved = _load_simple_env(profile_env)
+    except OSError:
+        # Unknown daemon inputs require conservative restart semantics after
+        # secure rematerialization; they cannot be treated as matching.
+        return True, metadata_secure
+    return saved != expected_env, metadata_secure
+
+
 def _materialize_embedded_profile_env(
     config: dict[str, Any], *, llm_api_key: str | None = None
 ):
@@ -567,6 +607,7 @@ def _materialize_embedded_profile_env(
 
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
+    resolved_profile_env = profile_env.resolve(strict=False)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
     content = "".join(f"{key}={value}\n" for key, value in env_values.items())
 
@@ -574,29 +615,41 @@ def _materialize_embedded_profile_env(
     # the replacement at 0600 before writing any bytes so a normal 022 umask
     # never exposes credentials, even briefly between write and chmod.
     fd, tmp_path = tempfile.mkstemp(
-        dir=str(profile_env.parent),
+        # Stage beside the resolved target so a managed symlink crossing
+        # filesystems still takes the atomic rename path rather than EXDEV copy.
+        dir=str(resolved_profile_env.parent),
         prefix=f".{profile_env.stem}_",
         suffix=".tmp",
     )
     try:
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+        fd = None
+        with handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
         from utils import atomic_replace
 
-        real_path = atomic_replace(tmp_path, profile_env)
+        installed_path = atomic_replace(
+            tmp_path, profile_env, allow_copy_fallback=False
+        )
         try:
-            os.chmod(real_path, 0o600)
+            os.chmod(installed_path, 0o600)
         except OSError:
             pass
+        _, metadata_secure = _inspect_embedded_profile_env_metadata(profile_env)
+        if not metadata_secure:
+            raise PermissionError(
+                f"Embedded Hindsight profile environment is not owner-only: {profile_env}"
+            )
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_path)
         except OSError:
@@ -1461,12 +1514,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     # If the config changed and the daemon is running, stop it.
                     profile_env = _embedded_profile_env_path(self._config)
                     expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    config_changed, metadata_secure = _embedded_profile_env_status(
+                        profile_env, expected_env
+                    )
 
-                    if config_changed:
+                    if config_changed or not metadata_secure:
                         profile_env = _materialize_embedded_profile_env(self._config)
-                        if client._manager.is_running(profile):
+                        if config_changed and client._manager.is_running(profile):
                             with open(log_path, "a", encoding="utf-8") as f:
                                 f.write("\n=== Config changed, restarting daemon ===\n")
                             client._manager.stop(profile)

@@ -88,7 +88,12 @@ def _restore_file_mode(path: Path, mode: "int | None") -> None:
         pass
 
 
-def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
+def atomic_replace(
+    tmp_path: Union[str, Path],
+    target: Union[str, Path],
+    *,
+    allow_copy_fallback: bool = True,
+) -> str:
     """Atomically move *tmp_path* onto *target*, preserving symlinks.
 
     ``os.replace(tmp, target)`` atomically swaps ``tmp`` into place at
@@ -107,6 +112,10 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
 
     Returns the resolved real path used for the replace, so callers that
     need to re-apply permissions can target it instead of the symlink.
+
+    Set ``allow_copy_fallback=False`` when the caller must fail rather than
+    temporarily expose partial or weakly permissioned data through a
+    non-atomic EXDEV / EBUSY copy.
     """
     target_str = str(target)
     real_path = os.path.realpath(target_str) if os.path.islink(target_str) else target_str
@@ -114,7 +123,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     try:
         os.replace(tmp_str, real_path)
     except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
+        if exc.errno not in (errno.EXDEV, errno.EBUSY) or not allow_copy_fallback:
             raise
         logger.debug(
             "atomic_replace: %s -> %s failed with %s; falling back to copy",
