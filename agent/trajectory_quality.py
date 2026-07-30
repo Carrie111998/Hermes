@@ -164,6 +164,15 @@ def _level_max(a: str, b: str) -> str:
     return a if _LEVEL_ORDER.get(a, 0) >= _LEVEL_ORDER.get(b, 0) else b
 
 
+def _deescalate_one(level: str) -> str:
+    """Lower the level by one step (used only when de-escalation is enabled)."""
+    order = _LEVEL_ORDER.get(level, 0)
+    for name, val in _LEVEL_ORDER.items():
+        if val == order - 1:
+            return name
+    return "continue"
+
+
 # ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
@@ -192,6 +201,7 @@ class TrajectoryQualityController:
         self._observation_count: int = 0
         self._reason_codes_fired: set[str] = set()
         self._last_emitted_key: tuple[str, str, str, str] | None = None
+        self._progress_since_level: int = 0
 
     @property
     def level(self) -> str:
@@ -202,54 +212,76 @@ class TrajectoryQualityController:
             return None
 
         self._observation_count += 1
+        level_before = self._level
 
-        # ---- Update counters ----
-        decision = self._evaluate(obs)
-
-        # ---- Progress tracking ----
-        if obs.is_progress:
-            self._consecutive_no_progress = 0
-        else:
-            self._consecutive_no_progress += 1
-
-        if obs.failed:
-            self._turn_saw_failure = True
-
-        return decision
-
-    def _evaluate(self, obs: TrajectoryObservation) -> TrajectoryQualityDecision | None:
+        # ---- Update per-signature counters ----
         key = (obs.tool_name, obs.args_hash)
+        exact = 0
+        same = 0
 
         if obs.failed:
             exact = self._exact_failure_counts.get(key, 0) + 1
             self._exact_failure_counts[key] = exact
             same = self._same_tool_failure_counts.get(obs.tool_name, 0) + 1
             self._same_tool_failure_counts[obs.tool_name] = same
+            self._turn_saw_failure = True
         else:
             # Success clears the exact-failure counter for this signature.
             self._exact_failure_counts.pop(key, None)
             if obs.is_progress:
                 self._same_tool_failure_counts.pop(obs.tool_name, None)
-            # No decision on a plain success.
-            return None
 
-        level_before = self._level
+        # ---- Verification streak tracking ----
+        if obs.progress_kind == "verification_failed":
+            self._failed_verification_streak += 1
+            self._turn_saw_verification_failed = True
+        elif obs.progress_kind == "verification_passed" or (
+            obs.is_progress and obs.progress_kind != "verification_failed"
+        ):
+            self._failed_verification_streak = 0
+
+        # ---- Stagnation tracking ----
+        if obs.is_progress:
+            self._consecutive_no_progress = 0
+            self._progress_since_level += 1
+        else:
+            self._consecutive_no_progress += 1
+
+        # ---- Evaluate triggers ----
         target_reason: str | None = None
         target_level = level_before
-        count = exact
-
-        # ---- Trigger evaluation (ordered by severity) ----
+        count = 0
 
         # Two-identical-failure circuit breaker.
-        if exact >= self.config.identical_failure:
+        if obs.failed and exact >= self.config.identical_failure:
             target_reason = "two_identical_failures"
             target_level = _level_max(target_level, "recommend_stronger_model")
+            count = exact
 
         # Same-tool failure streak.
-        if same >= self.config.same_tool_failure:
+        if obs.failed and same >= self.config.same_tool_failure:
             if target_reason is None:
                 target_reason = "same_tool_failure_streak"
+                count = same
             target_level = _level_max(target_level, "recommend_stronger_model")
+
+        # Failed-verification streak.
+        if self._failed_verification_streak >= self.config.failed_verification:
+            if target_reason is None:
+                target_reason = "failed_verification_streak"
+                count = self._failed_verification_streak
+            target_level = _level_max(target_level, "recommend_stronger_model")
+
+        # Stagnation: no verified progress for N observations, after a prior
+        # failure or verification_failed in the turn.
+        if (
+            self._consecutive_no_progress >= self.config.stagnation_window
+            and (self._turn_saw_failure or self._turn_saw_verification_failed)
+        ):
+            if target_reason is None:
+                target_reason = "stagnation_no_progress"
+                count = self._consecutive_no_progress
+            target_level = _level_max(target_level, "recommend_clean_restart")
 
         # Compounding: a new reason while already >= level 1 pushes to level 2.
         if target_reason is not None and level_before != "continue":
@@ -260,11 +292,22 @@ class TrajectoryQualityController:
         if target_reason is not None and level_before == "recommend_clean_restart":
             target_level = _level_max(target_level, "stop")
 
+        # ---- De-escalation (optional, off by default) ----
+        if (
+            self.config.allow_deescalate_on_progress
+            and obs.is_progress
+            and self._level != "continue"
+            and self._progress_since_level >= self.config.hysteresis_progress_needed
+        ):
+            self._level = _deescalate_one(self._level)
+            self._progress_since_level = 0
+            # A de-escalation is not an emitted decision — it silently lowers.
+            return None
+
         if target_reason is None:
             return None
 
-        # Monotonic: never lower the level (unless de-escalate is enabled,
-        # which is handled at progress observation time — not here).
+        # Monotonic: never lower the level via triggers.
         new_level = _level_max(self._level, target_level)
         if new_level == self._level and target_reason in self._reason_codes_fired:
             # Same reason, same level — suppress duplicate.
@@ -272,6 +315,7 @@ class TrajectoryQualityController:
 
         self._level = new_level
         self._reason_codes_fired.add(target_reason)
+        self._progress_since_level = 0
 
         decision = self._build_decision(
             obs=obs,
