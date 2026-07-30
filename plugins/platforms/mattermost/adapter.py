@@ -361,16 +361,30 @@ class MattermostAdapter(BasePlatformAdapter):
         self, channel_id: str, thread_id: str, user_id: str
     ) -> bool:
         """Return whether this exact Mattermost DM thread already has history."""
-        session_store = getattr(self, "_session_store", None)
-        if session_store is None:
-            return False
         try:
+            from gateway.session import build_session_key
+
             source = self.build_source(
                 chat_id=channel_id,
                 chat_type="dm",
                 user_id=user_id,
                 thread_id=thread_id,
             )
+            active_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+            if active_key in self._active_sessions:
+                return True
+
+            session_store = getattr(self, "_session_store", None)
+            if session_store is None:
+                return False
             session_key = session_store._generate_session_key(source)
             lookup = getattr(session_store, "peek_session_id", None)
             if callable(lookup):
@@ -391,14 +405,34 @@ class MattermostAdapter(BasePlatformAdapter):
         try:
             data = await self._api_get(f"posts/{thread_id}/thread")
             posts = data.get("posts") if isinstance(data, dict) else None
-            order = data.get("order") if isinstance(data, dict) else None
-            if not isinstance(posts, dict) or not isinstance(order, list):
+            if not isinstance(posts, dict):
                 return ""
 
+            def _created_at(post_id: str) -> int:
+                post = posts.get(post_id)
+                if not isinstance(post, dict):
+                    return 0
+                try:
+                    return int(post.get("create_at") or 0)
+                except (TypeError, ValueError):
+                    return 0
+
+            prior_post_ids = [
+                str(post_id)
+                for post_id in posts
+                if str(post_id) != current_post_id
+            ]
+            prior_post_ids.sort(key=lambda post_id: (_created_at(post_id), post_id))
+            if thread_id in prior_post_ids:
+                recent_reply_ids = [
+                    post_id for post_id in prior_post_ids if post_id != thread_id
+                ][-29:]
+                selected_post_ids = [thread_id, *recent_reply_ids]
+            else:
+                selected_post_ids = prior_post_ids[-30:]
+
             context_parts: List[str] = []
-            for post_id in order[-30:]:
-                if str(post_id) == current_post_id:
-                    continue
+            for post_id in selected_post_ids:
                 post = posts.get(post_id)
                 if not isinstance(post, dict) or post.get("type"):
                     continue
@@ -964,6 +998,15 @@ class MattermostAdapter(BasePlatformAdapter):
             # session that answers the first message is the thread's session.
             thread_id = post_id
 
+        # Classify the triggering message before prepending imported thread
+        # context; otherwise a first-turn slash command no longer starts with
+        # "/" and is silently demoted to ordinary text.
+        if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
+            message_text = message_text.lstrip()
+        msg_type = (
+            MessageType.COMMAND if message_text.startswith("/") else MessageType.TEXT
+        )
+
         # A reply turns a flat Mattermost DM into a distinct Hermes thread
         # session. Hydrate only that exact server-side thread on its first turn;
         # later turns (including after restart) load the persisted transcript.
@@ -986,11 +1029,6 @@ class MattermostAdapter(BasePlatformAdapter):
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
-        msg_type = MessageType.TEXT
-        if message_text[:1].isspace() and message_text.lstrip().startswith("/"):
-            message_text = message_text.lstrip()
-        if message_text.startswith("/"):
-            msg_type = MessageType.COMMAND
 
         # Download file attachments immediately (URLs require auth headers
         # that downstream tools won't have).
