@@ -3,10 +3,10 @@
 Registry of record: `hermes_cli/commands.py` (`COMMAND_REGISTRY`) — built-in
 commands. Every consumer (autocomplete, `/help`, Telegram menu, Slack mapping)
 derives from it. Installed skills are also available as slash commands via
-`/<skill-name>` — these are registered dynamically at startup by
-`agent/skill_commands.py` (scanning `~/.hermes/skills/`) and not enumerated
-in `COMMAND_REGISTRY`. New commands land often; `/help` in-session always
-reflects both sets.
+`/<skill-name>` — these are dynamically discovered (lazily, on first access)
+by `agent/skill_commands.py` from the active profile's skills directory and
+any configured external directories, not enumerated in `COMMAND_REGISTRY`.
+New commands land often; `/help` in-session always reflects both sets.
 (CLI) = interactive CLI/TUI only. (GW) = gateway platforms only.
 
 ### Session
