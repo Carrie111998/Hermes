@@ -34,6 +34,12 @@ Hermes Agent 使用 SQLite 数据库（`~/.hermes/state.db`）跨 CLI 和 gatewa
 
 ### Sessions 表
 
+以下为简化结构——完整的当前列清单见 `hermes_state.py` 中的 `SCHEMA_SQL`
+（其中还包括 `session_key`、`chat_id`、`chat_type`、`thread_id`、
+`display_name`、`origin_json`、`expiry_finalized` 等 gateway 路由元数据，
+`cwd` / `git_branch` / `git_repo_root` 等工作区字段，以及 handoff、压缩失败、
+`profile_name`、`rewind_count`、`archived` 和 `pinned` 等字段）：
+
 ```sql
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
@@ -73,16 +79,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     pricing_version TEXT,
     title TEXT,
     api_call_count INTEGER DEFAULT 0,
-    handoff_state TEXT,
-    handoff_platform TEXT,
-    handoff_error TEXT,
-    compression_failure_cooldown_until REAL,
-    compression_failure_error TEXT,
-    compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
-    compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
-    profile_name TEXT,
-    rewind_count INTEGER NOT NULL DEFAULT 0,
-    archived INTEGER NOT NULL DEFAULT 0,
+    -- ... 其他 gateway/workspace/handoff/compression 列 ...
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
