@@ -2,29 +2,51 @@
 """Decode high-risk onchain actions from calldata (stdlib only).
 
 Recognizes the four dangerous selectors so an agent can pre-flight a pending
-transaction before signing. Prints JSON: {action, spender, amount, unlimited,
-risk}. No network calls, no signing, no broadcast.
+transaction before signing. Returns JSON: {action, ..., risk}.
 
-Usage:
-    python3 decode_action.py --chain ethereum --to 0x... --data 0x...
+Fail-closed: any calldata that does not match the full ABI layout for a
+recognized selector returns risk="NO-GO" with a reason, instead of a misleading
+CAUTION/GO verdict.
 """
 import argparse
 import json
 import sys
 
-# selector -> (action name, arg layout we care about)
+# selector -> (action name, min body length in hex chars = 64 * num_args)
 SELECTORS = {
-    "0x095ea7b3": ("approve", "address,uint256"),
-    "0xa22cb465": ("setApprovalForAll", "address,bool"),
-    "0xd505accf": ("permit", "token,owner,spender,value,deadline"),
-    "0x38ed1739": ("swapExactTokensForTokens", "amountIn,amountOutMin,path,to,deadline"),
+    "0x095ea7b3": ("approve", 128),            # address(32) + uint256(32)
+    "0xa22cb465": ("setApprovalForAll", 128),  # address(32) + bool(32)
+    "0xd505accf": ("permit", 512),              # 8 words (token,owner,spender,value,deadline,v,r,s)
+    "0x38ed1739": ("swapExactTokensForTokens", 256),  # amountIn(32)+amountOutMin(32)+path(32 ptr)+to(32)+deadline(32)
 }
 
+# ABI word size in hex chars (32 bytes = 64 hex)
+_WORD = 64
 MAX_UINT = (1 << 256) - 1
 
 
 def _int_from_hex(h: str) -> int:
-    return int(h, 16)
+    try:
+        return int(h, 16)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _addr_from_word(word: str) -> str:
+    # words are left-padded; take the last 40 hex chars (20 bytes)
+    if len(word) < 40:
+        return "0x0"
+    return "0x" + word[-40:]
+
+
+def _fail(action: str, selector: str, reason: str) -> dict:
+    """Fail-closed verdict for malformed calldata."""
+    return {
+        "action": action,
+        "selector": selector,
+        "risk": "NO-GO",
+        "reason": reason,
+    }
 
 
 def decode(data: str) -> dict:
@@ -35,14 +57,19 @@ def decode(data: str) -> dict:
     info = SELECTORS.get(selector)
     if not info:
         return {"action": "unknown", "selector": selector, "risk": "unknown"}
-    action, _ = info
+    action, min_body_hex = info
     body = data[8:]
     out = {"action": action, "selector": selector, "risk": "ok"}
 
-    # approve(address,uint256): spender = bytes 8..40, amount = last 32 bytes
+    if len(body) < min_body_hex:
+        return _fail(action, selector, "malformed calldata: insufficient ABI words")
+
+    # ---- approve(address,uint256) ----
     if action == "approve":
-        spender = "0x" + body[24:64]
-        amount = _int_from_hex(body[-64:]) if len(body) >= 64 else 0
+        spender_word = body[0:_WORD]
+        amount_word = body[_WORD:2 * _WORD]
+        spender = _addr_from_word(spender_word)
+        amount = _int_from_hex(amount_word)
         unlimited = amount >= MAX_UINT - 1
         out.update(spender=spender, amount=str(amount), unlimited=unlimited)
         out["risk"] = "NO-GO" if unlimited else "CAUTION"
@@ -50,19 +77,43 @@ def decode(data: str) -> dict:
             "unlimited approval (max uint256)" if unlimited
             else "bounded approval — revoke after use"
         )
+
+    # ---- setApprovalForAll(address,bool) ----
     elif action == "setApprovalForAll":
-        spender = "0x" + body[24:64]
-        approved = body[-1] == "1"
+        spender = _addr_from_word(body[0:_WORD])
+        approved = body[_WORD:2 * _WORD].lstrip("0") == "1"
         out.update(spender=spender, approved=approved)
         out["risk"] = "NO-GO" if approved else "ok"
         out["reason"] = "grants operator full NFT control" if approved else "revoke"
+
+    # ---- permit(token,owner,spender,value,deadline,v,r,s) ----
     elif action == "permit":
-        # permit(token,owner,spender,value,deadline,v,r,s) — deadline at arg 5
-        out["risk"] = "CAUTION"
-        out["reason"] = "offline approval — verify spender + deadline"
+        # word 4 = deadline (uint256). A zero deadline means the permit is
+        # only valid for the current block — flag as NO-GO (deadline abuse).
+        deadline_word = body[4 * _WORD:5 * _WORD]
+        deadline = _int_from_hex(deadline_word)
+        spender = _addr_from_word(body[2 * _WORD:3 * _WORD])
+        out.update(spender=spender, deadline=str(deadline))
+        if deadline == 0:
+            out["risk"] = "NO-GO"
+            out["reason"] = "permit deadline is zero (deadline abuse)"
+        else:
+            out["risk"] = "CAUTION"
+            out["reason"] = "offline approval — verify spender + deadline"
+
+    # ---- swapExactTokensForTokens(amountIn,amountOutMin,path,to,deadline) ----
     elif action == "swapExactTokensForTokens":
-        out["risk"] = "CAUTION"
-        out["reason"] = "verify slippage + path liquidity before signing"
+        # word 4 = deadline; word 3 = path pointer (array). We validate
+        # structure only — a zero deadline is the documented NO-GO hazard.
+        deadline_word = body[4 * _WORD:5 * _WORD]
+        deadline = _int_from_hex(deadline_word)
+        out.update(deadline=str(deadline))
+        if deadline == 0:
+            out["risk"] = "NO-GO"
+            out["reason"] = "swap deadline is zero (front-run / replay risk)"
+        else:
+            out["risk"] = "CAUTION"
+            out["reason"] = "verify slippage + path liquidity before signing"
     return out
 
 

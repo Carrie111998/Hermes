@@ -1,91 +1,98 @@
 ---
 name: onchain-safety
-description: Pre-execution risk analysis for onchain actions — flags scam contracts, dangerous token approvals, MEV exposure, and unsafe swaps before signing. For agents and users reviewing crypto transactions, ERC-20 allowances, and DEX quotes.
+description: Pre-flight risk analysis for onchain actions before signing.
 version: 0.1.0
 author: Baophan (Baophan00), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [Onchain, Blockchain, Crypto, Safety, Security, DeFi, Wallet, Risk]
+    tags: [Onchain, Blockchain, Crypto, Safety, Security, DeFi]
     related_skills: [hyperliquid, solana, evm]
 ---
 
 # Onchain Safety Skill
 
-Risk-analysis layer for onchain actions. Before an agent (or user) signs a
-swap, approval, or contract call, this skill inspects the action and returns a
-**GO / CAUTION / NO-GO** verdict with concrete reasons — mirroring how an RL
-reward model would score a trajectory step without executing it.
+Read-only risk advisor that scores a pending onchain action **before** an agent
+or agentic wallet signs it. It inspects calldata for the four high-risk ERC-20
+/ ERC-721 selectors and returns a **GO / CAUTION / NO-GO** verdict with concrete
+reasons — mirroring how an RL reward model would score a trajectory step
+without executing it.
 
-Read-only analysis. No signing, no key handling, no transaction broadcast.
+It does **not** sign, hold keys, or broadcast transactions. It is a brake, not
+an executor.
 
 ---
 
 ## When to Use
 
-- User (or agent) is about to sign an ERC-20 `approve`, a DEX swap, or call a contract
-- User pastes a transaction payload, calldata, or a contract/token address for review
+- User (or agent) is about to sign an ERC-20 `approve`, `setApprovalForAll`,
+  `permit`, or `swapExactTokensForTokens` call
+- User pastes calldata or a transaction payload for review
 - User asks "is this safe?", "should I approve this?", "is this contract a scam?"
-- Agentic wallet (e.g. OKX Agentic Wallet) is about to execute an onchain step and wants a pre-flight check
+- An agentic wallet (OKX Agentic Wallet, SmartVault) is about to execute an
+  onchain step and wants a pre-flight check
 
 ---
 
-## Pre-flight Check (agent-facing procedure)
+## Prerequisites
 
-Run this checklist on any pending onchain action. Each failed check downgrades
-the verdict one level (GO → CAUTION → NO-GO).
-
-| # | Check | NO-GO if | Tool / source |
-|---|---|---|---|
-| 1 | Address reputation | Contract not in a known-good allowlist AND no public audit/label | block explorer label API |
-| 2 | Approval size | `approve` sets `amount = max(uint256)` (unlimited) | decode calldata `spender`+`amount` |
-| 3 | Token legitimacy | Token has no liquidity, mint function owned by EOA, or honeypot flags | dex pair / holder scan |
-| 4 | MEV exposure | Swap slippage > 3% or path crosses low-liquidity pool | quote vs spot |
-| 5 | Phishing pattern | Calldata calls `setApprovalForAll` on NFT or `permit` with deadline 0 | decode calldata |
-| 6 | Chain sanity | Target chain mismatches agent's active network | config compare |
-
-### Verdict rules
-- All pass → **GO**
-- 1–2 minor (CAUTION-class) → **CAUTION** (proceed with limit: bounded amount, revocable)
-- Any NO-GO check → **NO-GO** (do not sign; explain which check failed)
-
----
-
-## Calldata decoding (stdlib only)
-
-The helper script decodes the four high-risk selectors without external libs:
+Stdlib only (`argparse`, `json`). No API key, no external packages.
 
 ```bash
 python3 ~/.hermes/skills/blockchain/onchain-safety/scripts/decode_action.py \
-  --chain ethereum \
-  --to 0x... \
-  --data 0x...
+  --chain ethereum --to 0x... --data 0x...
 ```
 
-Selectors recognized:
-- `0x095ea7b3` — `approve(address,uint256)`
-- `0xa22cb465` — `setApprovalForAll(address,bool)`
-- `0xd505accf` — `permit(...)`
-- `0x38ed1739` — `swapExactTokensForTokens(...)`
+---
 
-Output: JSON with `{action, spender, amount, unlimited, risk}`.
+## Quick Reference
+
+| Selector | Action | NO-GO trigger |
+|---|---|---|
+| `0x095ea7b3` | `approve(address,uint256)` | amount = max(uint256) |
+| `0xa22cb465` | `setApprovalForAll(address,bool)` | approved = true |
+| `0xd505accf` | `permit(...)` | deadline = 0 |
+| `0x38ed1739` | `swapExactTokensForTokens(...)` | deadline = 0 |
+
+Malformed calldata for a recognized selector → **NO-GO** (fail-closed).
 
 ---
 
-## Integrations
+## Procedure
 
-If an agentic-wallet skill is loaded (OKX Agentic Wallet, SmartVault), call
-this skill's pre-flight check **before** invoking the wallet's sign path. The
-wallet skill remains the executor; this skill is the brake.
-
-**IF** `OKX_AGENTIC_WALLET` configured → route NO-GO verdicts back to the
-wallet as a hard abort. **ELSE** → surface verdict to the user as a warning.
+1. Agent receives a pending onchain action (calldata + target address)
+2. Run `decode_action.py --to <addr> --data <hex>`
+3. Inspect the returned `risk` field:
+   - `NO-GO` — abort the sign call; surface `reason` to the user
+   - `CAUTION` — proceed with a bounded amount; log the warning
+   - `ok` — no structural red flags detected
+4. If integrated with an agentic-wallet skill, route `NO-GO` verdicts back as a
+   hard abort before the wallet's sign path is invoked
 
 ---
 
-## Security note
+## Pitfalls
 
-This skill never holds keys and never broadcasts. It is a read-only advisor.
-A GO verdict is not financial advice — it means "no structural red flags
-detected", not "this trade will profit".
+- **This skill does not validate token legitimacy or contract audits** — it
+  only decodes the four selectors. For full contract risk, pair with a block-
+  explorer label API.
+- **Deadline checks are binary** (0 = NO-GO). A non-zero but low deadline is
+  still CAUTION, not GO.
+- **Calldata must be complete.** Truncated calldata for a recognized selector
+  returns NO-GO (fail-closed) rather than guessing.
+
+---
+
+## Verification
+
+```bash
+# Unlimited approve -> NO-GO
+python3 scripts/decode_action.py --to 0xAa --data \
+  0x095ea7b300000000000000000000000000000000000000000000deadbeef00000000000000000000000000000000000000000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+# expect risk=NO-GO, unlimited=true
+
+# Truncated calldata -> NO-GO (fail-closed)
+python3 scripts/decode_action.py --to 0xAa --data 0x095ea7b3
+# expect risk=NO-GO, reason="malformed calldata: insufficient ABI words"
+```
