@@ -1051,6 +1051,91 @@ class TestChatCompletionsEndpoint:
             assert '"status": "running"' not in body
             assert '"status": "completed"' not in body
 
+    @pytest.mark.asyncio
+    async def test_stream_includes_reasoning_content(self, adapter):
+        """``reasoning.available`` previews surface as ``delta.reasoning_content``
+        chunks, not mixed into ``delta.content`` — mirrors the DeepSeek/
+        Moonshot/OpenRouter ``reasoning_content`` field so OpenAI-SDK
+        clients can opt into rendering the model's reasoning."""
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                reasoning_cb = kwargs.get("tool_progress_callback")
+                if reasoning_cb:
+                    reasoning_cb("reasoning.available", "_thinking", "Let me check the calendar.", None)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Here's your schedule.")
+                return (
+                    {"final_response": "Here's your schedule.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "what's on my calendar"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+            reasoning_chunks = []
+            for line in body.splitlines():
+                if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                    try:
+                        chunk = _json.loads(line[len("data: "):])
+                    except _json.JSONDecodeError:
+                        continue
+                    for choice in chunk.get("choices", []):
+                        delta = choice.get("delta", {})
+                        if "reasoning_content" in delta:
+                            reasoning_chunks.append(delta["reasoning_content"])
+                        # Reasoning text must never leak into delta.content.
+                        assert "Let me check the calendar." not in delta.get("content", "")
+
+            assert reasoning_chunks == ["Let me check the calendar."]
+            assert "Here's your schedule." in body
+
+    @pytest.mark.asyncio
+    async def test_non_streaming_includes_reasoning_content(self, adapter):
+        """Non-streaming ``/v1/chat/completions`` surfaces the model's
+        reasoning as ``message.reasoning_content``, matching the
+        streaming behaviour above."""
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            reasoning_cb = kwargs.get("tool_progress_callback")
+            if reasoning_cb:
+                reasoning_cb("reasoning.available", "_thinking", "Checking inbox for follow-ups.", None)
+            return (
+                {"final_response": "You have two emails needing a reply.", "messages": [], "api_calls": 1},
+                {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "check my email"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        message = data["choices"][0]["message"]
+        assert message["reasoning_content"] == "Checking inbox for follow-ups."
+        assert message["content"] == "You have two emails needing a reply."
+
 
 # ---------------------------------------------------------------------------
 # _derive_chat_session_id unit tests
