@@ -121,6 +121,13 @@ class _LexicalPathResult:
     relative: PurePath
     root: Optional[PurePath]
     outside_root: bool
+    # Keep lexical Windows paths separate from concrete filesystem paths. A
+    # PureWindowsPath is useful for deterministic classification on POSIX, but
+    # must never be handed to the host filesystem. On native Windows, Path is
+    # both concrete and PureWindowsPath, so the concrete root remains available
+    # for the support-manifest probe.
+    filesystem_root: Optional[Path] = None
+    filesystem_path: Optional[Path] = None
 
 
 def is_excluded_skill_path(path, *, root: Optional[PurePath] = None) -> bool:
@@ -153,7 +160,8 @@ def _lexical_relative_path(path, root: Optional[PurePath]) -> _LexicalPathResult
     """
     path_obj = path if isinstance(path, PurePath) else Path(str(path))
     if root is None:
-        return _LexicalPathResult(path_obj, None, False)
+        filesystem_path = path_obj if isinstance(path_obj, Path) else None
+        return _LexicalPathResult(path_obj, None, False, filesystem_path=filesystem_path)
 
     root_obj = root if isinstance(root, PurePath) else Path(str(root))
     is_windows = isinstance(path_obj, PureWindowsPath) or isinstance(
@@ -161,35 +169,58 @@ def _lexical_relative_path(path, root: Optional[PurePath]) -> _LexicalPathResult
     )
     if is_windows:
         root_lex = PureWindowsPath(ntpath.abspath(ntpath.normpath(os.fspath(root_obj))))
+        filesystem_root = None
+        if isinstance(root_obj, Path) and isinstance(path_obj, Path):
+            filesystem_root = root_obj.absolute()
         if path_obj.is_absolute():
             path_lex = PureWindowsPath(
                 ntpath.abspath(ntpath.normpath(os.fspath(path_obj)))
             )
             try:
-                return _LexicalPathResult(path_lex.relative_to(root_lex), root_lex, False)
+                return _LexicalPathResult(
+                    path_lex.relative_to(root_lex),
+                    root_lex,
+                    False,
+                    filesystem_root,
+                )
             except ValueError:
-                return _LexicalPathResult(path_lex, root_lex, True)
+                return _LexicalPathResult(
+                    path_lex, root_lex, True, filesystem_root
+                )
         relative = PureWindowsPath(ntpath.normpath(os.fspath(path_obj)))
+        # A drive-qualified path (including drive-relative ``D:foo``), a
+        # rooted path without a drive (``\\foo``), a UNC path, or a device
+        # anchor cannot safely be interpreted relative to the configured root.
+        # Only anchorless relative paths may inherit that root's exclusions.
+        if relative.drive or relative.root:
+            return _LexicalPathResult(relative, root_lex, True, filesystem_root)
         return _LexicalPathResult(
-            relative, root_lex, bool(relative.parts and relative.parts[0] == "..")
+            relative,
+            root_lex,
+            bool(relative.parts and relative.parts[0] == ".."),
+            filesystem_root,
         )
 
     root_text = os.path.abspath(os.fspath(root_obj))
     root_lex = Path(root_text) if isinstance(root_obj, Path) else PurePath(root_text)
+    filesystem_root = root_obj.absolute() if isinstance(root_obj, Path) and isinstance(path_obj, Path) else None
     if path_obj.is_absolute():
         path_text = os.path.abspath(os.fspath(path_obj))
         path_lex = Path(path_text) if isinstance(path_obj, Path) else PurePath(path_text)
         try:
-            return _LexicalPathResult(path_lex.relative_to(root_lex), root_lex, False)
+            return _LexicalPathResult(path_lex.relative_to(root_lex), root_lex, False, filesystem_root)
         except ValueError:
-            return _LexicalPathResult(path_lex, root_lex, True)
+            return _LexicalPathResult(path_lex, root_lex, True, filesystem_root)
     relative = (
         Path(os.path.normpath(os.fspath(path_obj)))
         if isinstance(path_obj, Path)
         else PurePath(os.path.normpath(os.fspath(path_obj)))
     )
     return _LexicalPathResult(
-        relative, root_lex, bool(relative.parts and relative.parts[0] == "..")
+        relative,
+        root_lex,
+        bool(relative.parts and relative.parts[0] == ".."),
+        filesystem_root,
     )
 
 
@@ -228,13 +259,29 @@ def is_skill_support_path(path, *, root: Optional[PurePath] = None) -> bool:
         if part not in SKILL_SUPPORT_DIRS or idx == 0:
             continue
         if root is None:
-            skill_root = Path(*parts[:idx])
+            if lexical.filesystem_path is None:
+                # Synthetic PurePath inputs are intentionally lexical-only.
+                # Do not probe a same-shaped path on the host OS.
+                continue
+            ancestor_depth = len(parts) - 1 - idx
+            try:
+                skill_root = lexical.filesystem_path.parents[ancestor_depth]
+            except IndexError:
+                continue
         else:
-            assert lexical.root is not None
-            skill_root = lexical.root.joinpath(*parts[:idx])
-        if isinstance(skill_root, Path) and (skill_root / "SKILL.md").exists():
+            if lexical.filesystem_root is None:
+                # PureWindowsPath/PurePath test inputs have no trustworthy
+                # filesystem representation for existence checks.
+                continue
+            skill_root = lexical.filesystem_root.joinpath(*parts[:idx])
+        if _support_manifest_exists(skill_root / "SKILL.md"):
             return True
     return False
+
+
+def _support_manifest_exists(path: Path) -> bool:
+    """Probe a concrete skill root; kept as a seam for pure-path tests."""
+    return path.exists()
 
 
 # ── Lazy YAML loader ─────────────────────────────────────────────────────

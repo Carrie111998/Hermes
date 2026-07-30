@@ -40,7 +40,7 @@ description: Description for {name}.
 
 {body}
 """
-    (skill_dir / "SKILL.md").write_text(content)
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
     return skill_dir
 
 
@@ -295,6 +295,29 @@ class TestSkillsList:
         assert result["categories"] == ["linked"]
         assert result["skills"][0]["name"] == "knowledge-brain"
 
+    def test_list_view_and_lookup_agree_on_nested_support_packages(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            umbrella = _make_skill(tmp_path, "umbrella")
+            archived = umbrella / "references" / "archived"
+            archived.mkdir(parents=True)
+            (archived / "SKILL.md").write_text(
+                "---\nname: archived\n---\n\nSTALE PACKAGE\n",
+                encoding="utf-8",
+            )
+            (archived / "legacy.md").write_text(
+                "---\nname: legacy\n---\n\nSTALE LEGACY\n",
+                encoding="utf-8",
+            )
+
+            listed = json.loads(skills_list())
+            archived_view = json.loads(skill_view("archived"))
+            legacy_view = json.loads(skill_view("legacy"))
+
+        assert listed["success"] is True
+        assert [skill["name"] for skill in listed["skills"]] == ["umbrella"]
+        assert archived_view["success"] is False
+        assert legacy_view["success"] is False
+
 
 # ---------------------------------------------------------------------------
 # skill_view
@@ -406,7 +429,9 @@ class TestSkillView:
             skill_dir = _make_skill(tmp_path, "my-skill")
             refs_dir = skill_dir / "references"
             refs_dir.mkdir()
-            (refs_dir / "api.md").write_text("# API Docs\nEndpoint info.")
+            (refs_dir / "api.md").write_text(
+                "# API Docs\nEndpoint info.", encoding="utf-8"
+            )
 
             existing = json.loads(skill_view("my-skill", file_path="references/api.md"))
             missing = json.loads(skill_view("my-skill", file_path="references/nope.md"))
@@ -955,7 +980,9 @@ class TestSkillViewCollisionDetection:
             / "sketch.md"
         )
         support_file.parent.mkdir(parents=True, exist_ok=True)
-        support_file.write_text("# Sketch style support doc\n")
+        support_file.write_text(
+            "# Sketch style support doc\n", encoding="utf-8"
+        )
         _make_skill(local_dir, "sketch", category="creative", body="REAL SKETCH SKILL")
 
         p1, p2 = self._patch_dirs(local_dir, [external_dir])

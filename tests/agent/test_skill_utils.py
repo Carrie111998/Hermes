@@ -1,11 +1,13 @@
 """Tests for agent/skill_utils.py."""
 
+import sys
 from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 import pytest
 
 from agent.skill_utils import (
+    _lexical_relative_path,
     extract_skill_config_vars,
     extract_skill_conditions,
     get_disabled_skill_names,
@@ -225,18 +227,92 @@ def test_outside_explicit_root_does_not_inherit_ancestor_exclusions(tmp_path):
     assert is_skill_support_path(relative_site_packages, root=root) is False
 
 
-def test_windows_lexical_paths_classify_root_and_drive_boundaries():
-    """Windows path behavior is deterministic even when tests run on Linux."""
-    root = PureWindowsPath("C:/configured-root")
-    inside = PureWindowsPath("C:/configured-root/live/SKILL.md")
-    different_drive = PureWindowsPath("D:/site-packages/live/SKILL.md")
-    same_drive_outside = PureWindowsPath("C:/ghost-pre-edit-snapshot-t_abcdef12/SKILL.md")
-    relative_escape = PureWindowsPath("..", "site-packages", "live", "SKILL.md")
+@pytest.mark.parametrize(
+    ("raw_path", "root", "outside"),
+    [
+        (r"C:/configured-root/live/SKILL.md", r"C:/configured-root", False),
+        (r"C:/configured-root/./site-packages/live/SKILL.md", r"C:/configured-root", False),
+        (r"C:/other/site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"D:/site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"D:site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"C:../site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"/site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"../site-packages/live/SKILL.md", r"C:/configured-root", True),
+        (r"./site-packages/live/SKILL.md", r"C:/configured-root", False),
+        (r"\\server\share\configured-root/live/SKILL.md", r"C:/configured-root", True),
+        (r"\\?\C:\configured-root/live/SKILL.md", r"C:/configured-root", True),
+        (
+            r"\\server\share\configured-root/live/SKILL.md",
+            r"\\server\share\configured-root",
+            False,
+        ),
+    ],
+)
+def test_windows_lexical_path_matrix_is_deterministic(raw_path, root, outside):
+    """Windows anchors and relative forms never inherit the wrong root."""
+    result = _lexical_relative_path(
+        PureWindowsPath(raw_path), root=PureWindowsPath(root)
+    )
+    assert result.outside_root is outside
 
-    assert is_excluded_skill_path(inside, root=root) is False
-    assert is_excluded_skill_path(different_drive, root=root) is False
-    assert is_excluded_skill_path(same_drive_outside, root=root) is False
-    assert is_excluded_skill_path(relative_escape, root=root) is False
+
+def test_windows_lexical_exclusions_use_only_anchorless_relative_paths():
+    root = PureWindowsPath("C:/configured-root")
+    inside_site_packages = PureWindowsPath(
+        "C:/configured-root/site-packages/live/SKILL.md"
+    )
+    for outside_path in (
+        PureWindowsPath(r"D:site-packages/live/SKILL.md"),
+        PureWindowsPath(r"C:../site-packages/live/SKILL.md"),
+        PureWindowsPath(r"/site-packages/live/SKILL.md"),
+        PureWindowsPath(r"../site-packages/live/SKILL.md"),
+    ):
+        assert is_excluded_skill_path(outside_path, root=root) is False
+    assert is_excluded_skill_path(inside_site_packages, root=root) is True
+
+
+def test_pure_windows_support_paths_do_not_probe_host_filesystem(monkeypatch):
+    """Synthetic Windows paths on POSIX remain lexical-only."""
+    calls = []
+    monkeypatch.setattr(
+        "agent.skill_utils._support_manifest_exists",
+        lambda path: calls.append(path) or True,
+    )
+    nested = PureWindowsPath(
+        "C:/configured-root/umbrella/references/archived/SKILL.md"
+    )
+    assert is_skill_support_path(
+        nested, root=PureWindowsPath("C:/configured-root")
+    ) is False
+    assert calls == []
+
+
+def test_support_manifest_probe_can_be_injected_platform_independently(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    nested = root / "umbrella" / "references" / "archived" / "SKILL.md"
+    nested.parent.mkdir(parents=True)
+    probe_calls = []
+    monkeypatch.setattr(
+        "agent.skill_utils._support_manifest_exists",
+        lambda path: probe_calls.append(path) or path == root / "umbrella" / "SKILL.md",
+    )
+
+    assert is_skill_support_path(nested, root=root) is True
+    assert probe_calls == [root / "umbrella" / "SKILL.md"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows paths")
+def test_native_windows_support_root_probe_uses_concrete_paths(tmp_path):
+    root = tmp_path / "skills"
+    umbrella = root / "umbrella"
+    nested = umbrella / "references" / "archived" / "SKILL.md"
+    umbrella.mkdir(parents=True)
+    nested.parent.mkdir()
+    (umbrella / "SKILL.md").write_text("---\nname: umbrella\n---\n", encoding="utf-8")
+    nested.write_text("---\nname: archived\n---\n", encoding="utf-8")
+
+    assert is_skill_support_path(nested, root=root) is True
+    assert is_excluded_skill_path(nested, root=root) is True
 
 
 def test_exclusions_are_relative_to_discovery_root(tmp_path):
