@@ -112,6 +112,33 @@ def test_dependency_wait_is_sticky_until_explicit_unblock(kanban_home: Path) -> 
         assert unblocked.status == "ready"
 
 
+def test_unblock_dependency_with_archived_parent_lands_ready(kanban_home: Path) -> None:
+    """Archived parents satisfy dependencies just like completed parents."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="archived upstream")
+        child = kb.create_task(conn, title="dependent child", parents=[parent])
+        assert kb.complete_task(conn, parent, result="done")
+        assert kb.archive_task(conn, parent)
+        promoted_child = kb.get_task(conn, child)
+        assert promoted_child is not None
+        assert promoted_child.status == "ready"
+
+        claimed = kb.claim_task(conn, child)
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            child,
+            reason="external follow-up still pending",
+            kind="dependency",
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.unblock_task(conn, child)
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "ready"
+
+
 def test_dispatcher_cannot_race_retry_of_dependency_block(kanban_home: Path) -> None:
     """Concurrent promotion ticks cannot resurrect a dependency-blocked run."""
     with kb.connect() as conn:

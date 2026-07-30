@@ -617,7 +617,10 @@ class GatewayKanbanWatchersMixin:
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = (
+                            "completed", "gave_up", "crashed", "timed_out",
+                            "blocked", "dependency_wait",
+                        )
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
@@ -634,7 +637,8 @@ class GatewayKanbanWatchersMixin:
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
-                            if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                            if "blocked" in _wake_kinds or "dependency_wait" in _wake_kinds:
+                                _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
                                 "gateway.kanban.wake.message",
@@ -644,6 +648,19 @@ class GatewayKanbanWatchersMixin:
                                 assignee=_assignee,
                                 board=board_slug,
                             )
+                            if "dependency_wait" in _wake_kinds:
+                                _reason = next(
+                                    (
+                                        str(ev.payload["reason"])[:160]
+                                        for ev in d["events"]
+                                        if ev.kind == "dependency_wait"
+                                        and ev.payload
+                                        and ev.payload.get("reason")
+                                    ),
+                                    "",
+                                )
+                                if _reason:
+                                    _synth = f"{_synth}\n{_reason}"
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
                             # Wake self-post IS the delivery on this path —
