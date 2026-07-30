@@ -95,6 +95,7 @@ BACKOFF_DELAY_SECONDS = 30
 SESSION_EXPIRED_ERRCODE = -14
 RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
+SEND_SESSION_MAX_IDLE_SECONDS = 120  # Recreate send_session after this idle period to avoid stale TCP connections
 
 
 def _is_stale_session_ret(
@@ -1170,6 +1171,7 @@ class WeixinAdapter(BasePlatformAdapter):
         self._send_session: Optional[aiohttp.ClientSession] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._dedup = MessageDeduplicator(ttl_seconds=MESSAGE_DEDUP_TTL_SECONDS)
+        self._last_send_time = 0.0  # Monotonic timestamp of last successful outbound send
 
         self._account_id = str(extra.get("account_id") or get_secret("WEIXIN_ACCOUNT_ID", "")).strip()
         self._token = str(config.token or extra.get("token") or get_secret("WEIXIN_TOKEN", "")).strip()
@@ -1849,6 +1851,41 @@ class WeixinAdapter(BasePlatformAdapter):
         assert last_error is not None
         raise last_error
 
+    def _record_send(self) -> None:
+        """Record that a send was attempted (for idle-tracking)."""
+        self._last_send_time = time.monotonic()
+
+    async def _ensure_send_session_alive(self) -> None:
+        """Recreate the send session if it has been idle beyond the threshold.
+
+        After long idle periods (e.g. 2+ hours), intermediate network devices
+        (NAT gateways, firewalls, Cloudflare Warp) may silently drop TCP
+        connections. The aiohttp connection pool is unaware of this, so a POST
+        appears to succeed (HTTP 200) while iLink silently discards the message.
+
+        Rebuilding the session forces a fresh TCP handshake, which either
+        succeeds (healthy) or fails immediately (no false-positive delivery).
+        """
+        if not self._send_session or self._send_session.closed:
+            # Already disconnected — connect() will recreate on next run.
+            return
+        idle = time.monotonic() - self._last_send_time
+        if idle >= SEND_SESSION_MAX_IDLE_SECONDS:
+            logger.info(
+                "[%s] send_session idle for %.0fs (threshold %ds); recreating",
+                self.name, idle, SEND_SESSION_MAX_IDLE_SECONDS,
+            )
+            try:
+                await self._send_session.close()
+            except Exception:
+                pass
+            _no_aiohttp_timeout = aiohttp.ClientTimeout(
+                total=None, connect=None, sock_connect=None, sock_read=None,
+            )
+            self._send_session = aiohttp.ClientSession(
+                trust_env=True, connector=_make_ssl_connector(), timeout=_no_aiohttp_timeout,
+            )
+
     async def send(
         self,
         chat_id: str,
@@ -1858,6 +1895,9 @@ class WeixinAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._send_session or not self._token:
             return SendResult(success=False, error="Not connected")
+
+        # Ensure the underlying TCP connection is not stale before sending.
+        await self._ensure_send_session_alive()
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
@@ -1911,6 +1951,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
                     await asyncio.sleep(self._send_chunk_delay_seconds)
+            self._record_send()
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
@@ -2178,7 +2219,6 @@ class WeixinAdapter(BasePlatformAdapter):
             item_kwargs["bits_per_sample"] = 16
         media_item = item_builder(**item_kwargs)
 
-        last_message_id = None
         if caption:
             last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
             await _send_message(
@@ -2190,6 +2230,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 context_token=context_token,
                 client_id=last_message_id,
             )
+            self._record_send()
 
         last_message_id = f"hermes-weixin-{uuid.uuid4().hex}"
         await _api_post(
@@ -2210,6 +2251,7 @@ class WeixinAdapter(BasePlatformAdapter):
             token=self._token,
             timeout_ms=API_TIMEOUT_MS,
         )
+        self._record_send()
         return last_message_id
 
     def _outbound_media_builder(self, path: str, force_file_attachment: bool = False):
