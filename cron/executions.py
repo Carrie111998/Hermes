@@ -29,7 +29,23 @@ _PROCESS_ID = uuid.uuid4().hex
 
 def _connect() -> sqlite3.Connection:
     EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    conn = sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    try:
+        _initialize_schema(conn)
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+@contextmanager
+def _transaction() -> Iterator[sqlite3.Connection]:
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -84,7 +100,6 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
-    return conn
 
 
 def _record(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
