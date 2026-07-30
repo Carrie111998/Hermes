@@ -391,6 +391,85 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
     return s
 
 
+def _main_db_path_for_connection(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the resolved path of SQLite's main database, when file-backed."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except Exception:
+        return None
+
+    filename = ""
+    for row in rows:
+        try:
+            name, row_filename = row["name"], row["file"]
+        except (IndexError, KeyError, TypeError):
+            try:
+                name, row_filename = row[1], row[2]
+            except (IndexError, TypeError):
+                continue
+        if name == "main":
+            filename = str(row_filename or "").strip()
+            break
+    if not filename:
+        return None
+
+    try:
+        return Path(filename).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def _dispatch_board_for_connection(
+    conn: sqlite3.Connection,
+    requested_board: Optional[str],
+) -> Optional[str]:
+    """Resolve the board actually backing ``conn`` for fallback authorization.
+
+    ``requested_board`` is not authoritative: a caller can accidentally open
+    one board and pass another slug (or omit the slug while the ambient current
+    board points elsewhere). Authorization therefore follows SQLite's main DB
+    path. Unknown/custom paths fail closed unless ``HERMES_KANBAN_DB`` explicitly
+    pins that exact path, in which case the requested/current board supplies the
+    legacy override's otherwise-unavailable slug.
+    """
+    actual_path = _main_db_path_for_connection(conn)
+    if actual_path is None:
+        return None
+    try:
+        default_path = (kanban_home() / "kanban.db").expanduser().resolve()
+    except (OSError, RuntimeError):
+        return None
+    if actual_path == default_path:
+        return DEFAULT_BOARD
+
+    try:
+        relative = actual_path.relative_to(boards_root().expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        relative = None
+    if relative is not None and len(relative.parts) == 2:
+        slug_part, db_filename = relative.parts
+        if db_filename == "kanban.db":
+            try:
+                slug = _normalize_board_slug(slug_part)
+            except ValueError:
+                slug = None
+            if slug:
+                return slug
+
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        try:
+            override_path = Path(override).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return None
+        if actual_path == override_path:
+            try:
+                return _normalize_board_slug(requested_board) or get_current_board()
+            except ValueError:
+                return None
+    return None
+
+
 def default_assignee_routing_rule(
     board: Optional[str],
     configured_boards: object | None,
@@ -8132,8 +8211,11 @@ def dispatch_once(
     this check below gateway/CLI orchestration prevents sibling callers from
     bypassing board scope.
     """
+    connection_db_path = _main_db_path_for_connection(conn)
+    connection_board = _dispatch_board_for_connection(conn, board)
+    effective_board = connection_board if connection_board is not None else board
     try:
-        db_path = kanban_db_path(board=board)
+        db_path = connection_db_path or kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
@@ -8147,7 +8229,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            board=effective_board,
             default_assignee=default_assignee,
             default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
             default_assignee_boards=default_assignee_boards,
@@ -8165,7 +8247,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            board=effective_board,
             default_assignee=default_assignee,
             default_assignee_dispatcher_profile=default_assignee_dispatcher_profile,
             default_assignee_boards=default_assignee_boards,
@@ -8308,10 +8390,10 @@ def _dispatch_once_locked(
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
-    effective_board = _normalize_board_slug(board) or get_current_board()
+    effective_board = _dispatch_board_for_connection(conn, board)
     default_assignee_rule = default_assignee_routing_rule(
         effective_board,
-        default_assignee_boards,
+        default_assignee_boards if effective_board is not None else (),
     )
     _default_assignee = (
         (default_assignee or "").strip() or None
