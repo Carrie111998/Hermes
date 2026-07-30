@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -296,6 +296,9 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
 | `kanban_comment` | Append a durable note to the task thread. | `task_id`, `body` |
+| `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
+| `kanban_attach_url` | Attach a file to a task by URL. | `url` |
+| `kanban_attachments` | List a task's attachments. | — |
 | `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) move a blocked task to `ready` when all parents are done, or `todo` while any parent remains open. | `task_id` |
@@ -454,6 +457,33 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+### Per-task model override
+
+Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
+
+```bash
+# At creation
+hermes kanban create "hard refactor" --assignee coder \
+    --model claude-opus-4.6 --provider anthropic
+
+# Or later — takes effect on the next dispatch
+hermes kanban set-model t_abcd claude-opus-4.6 --provider anthropic
+hermes kanban set-model t_abcd none    # clear the override
+```
+
+The dispatcher spawns the worker with the pinned model (`--provider <name>` is passed when set; `--provider` requires a model). The dashboard's per-task model dropdown drives the same `model_override` field. With no override, the worker uses its profile's configured model.
+
+### Lifecycle plugin hooks
+
+Board transitions fire [plugin hooks](/user-guide/features/hooks#plugin-hooks): `kanban_task_claimed`, `kanban_task_completed`, and `kanban_task_blocked`, each carrying `task_id` and `profile_name`. Hooks fire **after** the board DB change commits, so callbacks always see durable state. Note the process split: `kanban_task_claimed` fires in the **dispatcher** process, while `kanban_task_completed`/`kanban_task_blocked` fire in the **worker** process — register the hook in the dispatcher profile to observe every transition centrally.
+
+```python
+def register(ctx):
+    def on_blocked(task_id=None, profile_name=None, **kw):
+        ctx.dispatch_tool("terminal", {"command": f"notify-send 'kanban blocked: {task_id}'"})
+    ctx.register_hook("kanban_task_blocked", on_blocked)
+```
+
 ### Goal-mode cards (`--goal`)
 
 By default each worker gets **one shot** at its card — do the work, call `kanban_complete`/`kanban_block`, exit. Pass `--goal` (CLI) or `goal_mode=True` (the `kanban_create` tool / dashboard) to instead run that worker in a **goal loop**, the same Ralph-style engine behind the `/goal` slash command: after every turn an auxiliary judge checks the worker's output against the card's title + body (treated as the acceptance criteria), and if the work isn't done — and the turn budget remains — the worker keeps going **in the same session** until the judge agrees, the worker terminates the task itself, or the budget runs out (which **blocks** the card for human review rather than exiting silently).
@@ -550,6 +580,7 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `notify_artifacts` | `true` | Upload completed-task artifacts as native attachments with the notification. Set to `false` to keep the text notification while suppressing uploads. |
 
 And the two auxiliary LLM slots:
 
