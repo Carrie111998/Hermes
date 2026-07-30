@@ -2142,6 +2142,9 @@ def _ensure_tui_cached_bundle(
                     "install",
                     "--workspace",
                     "ui-tui",
+                    # Cache builds need ui-tui's esbuild/TypeScript dev toolchain
+                    # even when NODE_ENV or npm config inherits omit=dev.
+                    "--include=dev",
                     "--silent",
                     "--no-fund",
                     "--no-audit",

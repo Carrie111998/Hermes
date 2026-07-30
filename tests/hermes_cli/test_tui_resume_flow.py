@@ -434,6 +434,7 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
         "install",
         "--workspace",
         "ui-tui",
+        "--include=dev",
         "--silent",
         "--no-fund",
         "--no-audit",
