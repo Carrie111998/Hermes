@@ -234,12 +234,31 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.tools_config",
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.skill_commands",
+        mod(
+            "agent.skill_commands",
+            build_preloaded_skills_prompt=lambda skills: (
+                f"preloaded:{','.join(skills)}",
+                ["ticket-decomposition"],
+                [],
+            ),
+        ),
+    )
 
-    text, result = _run_agent("recall this")
+    text, result = _run_agent(
+        "recall this",
+        skills=["planning/ticket-decomposition"],
+    )
     assert text == "ok"
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert (
+        captured["ephemeral_system_prompt"]
+        == "preloaded:planning/ticket-decomposition"
+    )
     assert captured["prompt"] == "recall this"
 
 
@@ -309,6 +328,5 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
 
 

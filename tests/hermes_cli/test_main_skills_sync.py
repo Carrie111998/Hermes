@@ -1,6 +1,7 @@
 """Startup behavior at the managed read-only skills boundary."""
 
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -87,6 +88,53 @@ def test_invalid_config_still_reaches_read_only_discovery(
     )
     assert _census(skills) == before
     assert not (home / "state").exists()
+
+
+def test_main_oneshot_routes_preloaded_nested_skill(monkeypatch):
+    from hermes_cli import main as main_mod
+
+    class RoutedOneshot(Exception):
+        pass
+
+    captured = {}
+
+    def capture_oneshot(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        raise RoutedOneshot
+
+    monkeypatch.setattr(main_mod, "_set_process_title", lambda: None)
+    monkeypatch.setattr(
+        main_mod,
+        "_sweep_stale_bytecode_if_checkout_changed",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "_recover_from_interrupted_install",
+        lambda: None,
+    )
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
+    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", capture_oneshot)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "--skills",
+            "planning/ticket-decomposition",
+            "--oneshot",
+            "Return the loaded skill name only.",
+        ],
+    )
+
+    with pytest.raises(RoutedOneshot):
+        main_mod.main()
+
+    assert captured["prompt"] == "Return the loaded skill name only."
+    assert captured["skills"] == ["planning/ticket-decomposition"]
 
 
 @pytest.mark.asyncio

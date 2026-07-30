@@ -2,6 +2,7 @@
 
 import json
 
+from hermes_cli import oneshot
 from hermes_cli.oneshot import _write_usage_file
 
 
@@ -54,4 +55,36 @@ class TestWriteUsageFile:
         # Missing result fields serialize as null, not KeyError.
         assert report["estimated_cost_usd"] is None
 
+
+def test_run_oneshot_passes_normalized_preloaded_skills(monkeypatch, capsys):
+    captured = {}
+
+    def fake_run_agent(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        return "ticket-decomposition", {
+            "final_response": "ticket-decomposition",
+            "failed": False,
+            "partial": False,
+        }
+
+    monkeypatch.setattr(oneshot, "_run_agent", fake_run_agent)
+
+    assert (
+        oneshot.run_oneshot(
+            "Return the loaded skill name only.",
+            skills=[
+                "planning/ticket-decomposition, github-auth",
+                "planning/ticket-decomposition",
+            ],
+        )
+        == 0
+    )
+
+    output = capsys.readouterr()
+    assert output.out == "ticket-decomposition\n"
+    assert captured["skills"] == [
+        "planning/ticket-decomposition",
+        "github-auth",
+    ]
 
