@@ -16,6 +16,93 @@ logger = logging.getLogger(__name__)
 
 
 _GRACE_TURN_ATTR = "_delegation_reconciliation_grace_turn_id"
+_PENDING_CLAIMS_ATTR = "_pending_delegation_inject_claims"
+
+
+def _event_identity(event: dict[str, Any]) -> str:
+    return (
+        f"{event.get('delegation_id') or ''}:"
+        f"{event.get('delivery_event_key') or 'aggregate'}"
+    )
+
+
+def _message_event_ids(message: dict[str, Any]) -> set[str]:
+    metadata = message.get("display_metadata")
+    if isinstance(metadata, dict):
+        values = metadata.get("delegation_event_ids") or []
+    else:
+        values = message.get("_delegation_event_ids") or []
+    return {str(value) for value in values if value}
+
+
+def _durable_event_is_in_history(
+    messages: list[dict[str, Any]], event_id: str
+) -> bool:
+    return any(
+        message.get("_db_persisted") is True
+        and event_id in _message_event_ids(message)
+        for message in messages
+        if isinstance(message, dict)
+    )
+
+
+def acknowledge_pending_injects(agent: Any, *, turn_id: str | None = None) -> int:
+    """Acknowledge inject claims after a provider consumed their message."""
+
+    from tools.async_delegation import complete_event_delivery
+
+    pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
+    keep: list[dict[str, Any]] = []
+    acknowledged = 0
+    for entry in pending:
+        if turn_id is not None and str(entry.get("turn_id") or "") != str(turn_id):
+            keep.append(entry)
+            continue
+        complete_event_delivery(entry["event"], entry["claim_id"])
+        acknowledged += 1
+    setattr(agent, _PENDING_CLAIMS_ATTR, keep)
+    return acknowledged
+
+
+def release_pending_injects(
+    agent: Any,
+    messages: list[dict[str, Any]],
+    *,
+    turn_id: str | None = None,
+) -> int:
+    """Roll back unconsumed RAM injects, preserving already-durable copies."""
+
+    from tools.async_delegation import (
+        complete_event_delivery,
+        release_event_delivery,
+    )
+    from tools.process_registry import process_registry
+
+    pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
+    keep: list[dict[str, Any]] = []
+    removable_message_ids: set[int] = set()
+    released = 0
+    for entry in pending:
+        if turn_id is not None and str(entry.get("turn_id") or "") != str(turn_id):
+            keep.append(entry)
+            continue
+        event = entry["event"]
+        event_id = str(entry["event_id"])
+        if _durable_event_is_in_history(messages, event_id):
+            complete_event_delivery(event, entry["claim_id"])
+        else:
+            release_event_delivery(event, entry["claim_id"])
+            process_registry.completion_queue.put(event)
+            removable_message_ids.add(id(entry["message"]))
+        released += 1
+
+    if removable_message_ids:
+        messages[:] = [
+            message for message in messages if id(message) not in removable_message_ids
+        ]
+        agent._session_messages = messages
+    setattr(agent, _PENDING_CLAIMS_ATTR, keep)
+    return released
 
 
 def _normal_budget_available(agent: Any) -> bool:
@@ -93,6 +180,16 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
 
     if not turn_id:
         return 0
+    # A cached agent may enter a new turn after an early-return path that never
+    # reached the common finalizer.  Settle only claims from older turns; claims
+    # from this turn must survive compression/API retries without duplication.
+    stale_turn_ids = {
+        str(entry.get("turn_id") or "")
+        for entry in (getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
+        if str(entry.get("turn_id") or "") != str(turn_id)
+    }
+    for stale_turn_id in stale_turn_ids:
+        release_pending_injects(agent, messages, turn_id=stale_turn_id)
     # A previous inject may already be the tail while its reconciliation API
     # request is being retried after a transport failure. Appending another
     # synthetic user message here would create user→user history and force the
@@ -121,7 +218,7 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
     except Exception:
         return 0
 
-    accepted: list[tuple[dict[str, Any], str, str]] = []
+    accepted: list[tuple[dict[str, Any], str, str, str]] = []
     for _ in range(max(0, scan_count)):
         try:
             event = completion_queue.get_nowait()
@@ -140,52 +237,70 @@ def drain_ready_injects(agent: Any, messages: list[dict[str, Any]], turn_id: str
             completion_queue.put(event)
             continue
 
+        # Formatting is local preparation, not a delivery attempt.  Do it before
+        # the durable claim so a broken spill/formatter cannot exhaust the
+        # bounded delivery-attempt budget without ever showing the result.
+        try:
+            text = _format_async_delegation(event)
+        except Exception:
+            logger.debug("Failed to format inject delegation event", exc_info=True)
+            completion_queue.put(event)
+            continue
+        if not text:
+            completion_queue.put(event)
+            continue
+
         claim_id = claim_event_delivery(event, f"conversation-loop:{os.getpid()}")
         if claim_id is None:
             # A competing CLI/gateway process already owns this durable event,
             # or it was delivered from a duplicate restored queue entry.
             continue
-
-        try:
-            text = _format_async_delegation(event)
-        except Exception:
-            logger.debug("Failed to format inject delegation event", exc_info=True)
-            release_event_delivery(event, claim_id)
-            completion_queue.put(event)
+        event_id = _event_identity(event)
+        if _durable_event_is_in_history(messages, event_id):
+            # A previous process persisted the synthetic message before it
+            # crashed.  The active transcript is now the durable handoff.
+            complete_event_delivery(event, claim_id)
             continue
-        if not text:
-            release_event_delivery(event, claim_id)
-            completion_queue.put(event)
-            continue
-        accepted.append((event, claim_id, text))
+        accepted.append((event, claim_id, text, event_id))
 
     if not accepted:
         return 0
 
     content = "\n\n".join(item[2] for item in accepted)
     delegation_ids = [str(item[0].get("delegation_id") or "") for item in accepted]
-    event_ids = [
-        f"{item[0].get('delegation_id') or ''}:{item[0].get('delivery_event_key') or 'aggregate'}"
-        for item in accepted
-    ]
+    event_ids = [item[3] for item in accepted]
     try:
-        messages.append(
-            {
-                "role": "user",
-                "content": content,
-                "_synthetic_delegation_inject": True,
-                "_delegation_ids": delegation_ids,
-                "_delegation_event_ids": event_ids,
-            }
-        )
+        synthetic_message = {
+            "role": "user",
+            "content": content,
+            "display_kind": "delegation_inject",
+            "display_metadata": {
+                "delegation_ids": delegation_ids,
+                "delegation_event_ids": event_ids,
+            },
+            "_synthetic_delegation_inject": True,
+            "_delegation_ids": delegation_ids,
+            "_delegation_event_ids": event_ids,
+        }
+        messages.append(synthetic_message)
         agent._session_messages = messages
     except Exception:
-        for event, claim_id, _text in accepted:
+        for event, claim_id, _text, _event_id in accepted:
             release_event_delivery(event, claim_id)
             completion_queue.put(event)
         raise
 
-    for event, claim_id, _text in accepted:
-        complete_event_delivery(event, claim_id)
+    pending = list(getattr(agent, _PENDING_CLAIMS_ATTR, []) or [])
+    pending.extend(
+        {
+            "event": event,
+            "claim_id": claim_id,
+            "event_id": event_id,
+            "message": synthetic_message,
+            "turn_id": str(turn_id),
+        }
+        for event, claim_id, _text, event_id in accepted
+    )
+    setattr(agent, _PENDING_CLAIMS_ATTR, pending)
     _grant_reconciliation_grace_if_needed(agent, turn_id)
     return len(accepted)

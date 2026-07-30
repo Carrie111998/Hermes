@@ -6,11 +6,17 @@ from copy import deepcopy
 from types import SimpleNamespace
 import threading
 import time
+from typing import Any
 import uuid
 
 import pytest
 
-from agent.delegation_inject import drain_ready_injects, reconcile_provisional_final
+from agent.delegation_inject import (
+    acknowledge_pending_injects,
+    drain_ready_injects,
+    reconcile_provisional_final,
+    release_pending_injects,
+)
 from tools import async_delegation as ad
 from tools import delegate_tool
 from tools.process_registry import process_registry
@@ -86,6 +92,27 @@ def _event_state(delegation_id: str, event_key: str):
         ).fetchone()
 
 
+def _parent_state(delegation_id: str):
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            "SELECT state, delivery_state FROM async_delegations "
+            "WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+
+
+def _durable_event_keys(delegation_id: str):
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT event_key FROM async_delegation_events "
+                "WHERE delegation_id=? ORDER BY event_key",
+                (delegation_id,),
+            ).fetchall()
+        ]
+
+
 def test_inject_drain_rotates_unrelated_queue_items_and_coalesces_ready_children():
     delegation_id = _record(goals=("audit A", "audit B"))
     unrelated = {"type": "completion", "session_id": "process-1"}
@@ -103,9 +130,8 @@ def test_inject_drain_rotates_unrelated_queue_items_and_coalesces_ready_children
         {"role": "assistant", "tool_calls": [{"id": "tc1", "function": {}}]},
         {"role": "tool", "tool_call_id": "tc1", "content": "done"},
     ]
-    count = drain_ready_injects(
-        SimpleNamespace(_active_turn_id="turn-current"), messages, "turn-current"
-    )
+    agent = SimpleNamespace(_active_turn_id="turn-current")
+    count = drain_ready_injects(agent, messages, "turn-current")
 
     assert count == 2
     assert [m["role"] for m in messages] == ["assistant", "tool", "user"]
@@ -118,6 +144,9 @@ def test_inject_drain_rotates_unrelated_queue_items_and_coalesces_ready_children
         f"{delegation_id}:task:1",
     ]
     assert _queue_contents() == [unrelated, legacy]
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+    assert _event_state(delegation_id, "task:1") == ("pending", 1)
+    assert acknowledge_pending_injects(agent, turn_id="turn-current") == 2
     assert _event_state(delegation_id, "task:0") == ("delivered", 1)
     assert _event_state(delegation_id, "task:1") == ("delivered", 1)
 
@@ -130,10 +159,13 @@ def test_inject_drain_is_exactly_once_when_queue_contains_duplicate_event():
     process_registry.completion_queue.put(deepcopy(event))
     messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
 
-    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 1
+    agent = SimpleNamespace()
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
     assert messages[-1]["content"].count("once") == 1
     assert process_registry.completion_queue.empty()
-    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 0
+    assert drain_ready_injects(agent, messages, "turn-current") == 0
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+    assert acknowledge_pending_injects(agent, turn_id="turn-current") == 1
     assert _event_state(delegation_id, "task:0") == ("delivered", 1)
 
 
@@ -343,6 +375,84 @@ def test_after_turn_remains_default_and_emits_only_combined_batch_event():
     assert [r["summary"] for r in event["results"]] == ["A", "B"]
 
 
+def test_inject_batch_finalization_rolls_back_children_if_parent_update_fails(
+    monkeypatch,
+):
+    delegation_id = _record(goals=("A", "B"))
+    with ad._records_lock:
+        event_record = dict(ad._records[delegation_id])
+    combined = {"results": [_child(0, "A"), _child(1, "B")]}
+    parent_event = {
+        **event_record,
+        "type": "async_delegation",
+        "status": "completed",
+        "completed_at": time.time(),
+    }
+
+    def crash_before_parent_update(*_args, **_kwargs):
+        raise RuntimeError("simulated crash before parent terminal update")
+
+    monkeypatch.setattr(ad, "_update_completion_row", crash_before_parent_update)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        ad._persist_inject_batch_finalization(
+            event_record, parent_event, combined, "completed"
+        )
+
+    assert _durable_event_keys(delegation_id) == []
+    assert _parent_state(delegation_id) == ("running", "pending")
+
+
+def test_recovery_with_complete_inject_children_suppresses_parent_aggregate():
+    delegation_id = _record(goals=("A", "B"))
+    assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
+    assert ad.publish_batch_child_completion(delegation_id, 1, _child(1, "B"))
+    while not process_registry.completion_queue.empty():
+        process_registry.completion_queue.get_nowait()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=99999999, owner_started_at=0 "
+            "WHERE delegation_id=?",
+            (delegation_id,),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+
+    assert _parent_state(delegation_id) == ("completed", "delivered")
+    assert _durable_event_keys(delegation_id) == ["task:0", "task:1"]
+    restored = __import__("queue").Queue()
+    assert ad.restore_undelivered_completions(restored) == 2
+    assert {restored.get_nowait()["delivery_event_key"] for _ in range(2)} == {
+        "task:0",
+        "task:1",
+    }
+
+
+def test_recovery_with_partial_inject_children_emits_only_terminal_gap_event():
+    delegation_id = _record(goals=("A", "B"))
+    assert ad.publish_batch_child_completion(delegation_id, 0, _child(0, "A"))
+    process_registry.completion_queue.get_nowait()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=99999999, owner_started_at=0 "
+            "WHERE delegation_id=?",
+            (delegation_id,),
+        )
+
+    assert ad.recover_abandoned_delegations() == 1
+
+    assert _parent_state(delegation_id) == ("unknown", "delivered")
+    assert _durable_event_keys(delegation_id) == ["task:0", "terminal"]
+    restored = __import__("queue").Queue()
+    assert ad.restore_undelivered_completions(restored) == 2
+    events = [restored.get_nowait() for _ in range(2)]
+    assert {event["delivery_event_key"] for event in events} == {
+        "task:0",
+        "terminal",
+    }
+    terminal = next(event for event in events if event["delivery_event_key"] == "terminal")
+    assert "1/2 batch child results" in terminal["error"]
+
+
 def test_child_timeout_error_is_injectable_and_durable():
     delegation_id = _record()
     assert ad.publish_batch_child_completion(
@@ -351,10 +461,89 @@ def test_child_timeout_error_is_injectable_and_durable():
         _child(0, "", status="timeout", error="child exceeded 10s"),
     )
     messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
-    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 1
+    agent = SimpleNamespace()
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
     assert "timeout" in messages[-1]["content"]
     assert "child exceeded 10s" in messages[-1]["content"]
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+    assert acknowledge_pending_injects(agent, turn_id="turn-current") == 1
     assert _event_state(delegation_id, "task:0") == ("delivered", 1)
+
+
+def test_unconsumed_ram_inject_is_removed_released_and_requeued():
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "retry after interrupt")
+    )
+    original = {"role": "tool", "tool_call_id": "tc", "content": "done"}
+    messages = [original]
+    agent = SimpleNamespace()
+
+    assert drain_ready_injects(agent, messages, "turn-current") == 1
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+
+    assert release_pending_injects(agent, messages, turn_id="turn-current") == 1
+    assert messages == [original]
+    assert [event["delegation_id"] for event in _queue_contents()] == [delegation_id]
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+
+
+def test_restart_dedups_inject_already_persisted_in_active_history():
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "persisted before crash")
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "tool", "tool_call_id": "tc", "content": "done"}
+    ]
+    crashed_agent = SimpleNamespace()
+
+    assert drain_ready_injects(crashed_agent, messages, "turn-current") == 1
+    persisted = messages[-1]
+    persisted["_db_persisted"] = True
+    pending = crashed_agent._pending_delegation_inject_claims
+    crashed_event = deepcopy(pending[0]["event"])
+    # Simulate process loss and expiry of the dead consumer's durable lease.
+    del crashed_agent._pending_delegation_inject_claims
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegation_events SET delivery_claimed_at=0 "
+            "WHERE delegation_id=? AND event_key='task:0'",
+            (delegation_id,),
+        )
+    process_registry.completion_queue.put(crashed_event)
+
+    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 0
+    assert messages[-1] is persisted
+    assert sum("persisted before crash" in m.get("content", "") for m in messages) == 1
+    assert _event_state(delegation_id, "task:0") == ("pending", 1)
+
+    # The resumed provider consumes the durable tail user message. At the next
+    # append-only boundary, the queued duplicate is acknowledged without append.
+    messages.append({"role": "assistant", "content": "consumed"})
+    assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 0
+    assert sum("persisted before crash" in m.get("content", "") for m in messages) == 1
+    assert _event_state(delegation_id, "task:0") == ("delivered", 2)
+
+
+def test_formatter_failure_does_not_consume_delivery_attempts(monkeypatch):
+    delegation_id = _record()
+    assert ad.publish_batch_child_completion(
+        delegation_id, 0, _child(0, "format me")
+    )
+
+    def broken_formatter(_event):
+        raise ValueError("broken spill")
+
+    monkeypatch.setattr(
+        "tools.process_registry._format_async_delegation", broken_formatter
+    )
+    messages = [{"role": "tool", "tool_call_id": "tc", "content": "done"}]
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS + 2):
+        assert drain_ready_injects(SimpleNamespace(), messages, "turn-current") == 0
+
+    assert _event_state(delegation_id, "task:0") == ("pending", 0)
+    assert len(_queue_contents()) == 1
 
 
 def test_pending_child_event_restores_with_same_durable_identity(tmp_path, monkeypatch):

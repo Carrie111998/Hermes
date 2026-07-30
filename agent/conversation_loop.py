@@ -1285,6 +1285,12 @@ def run_conversation(
 
         # Check for interrupt request (e.g., user sent new message)
         if agent._interrupt_requested:
+            try:
+                from agent.delegation_inject import release_pending_injects
+
+                release_pending_injects(agent, messages, turn_id=turn_id)
+            except Exception:
+                logger.debug("Failed to release interrupted inject claims", exc_info=True)
             interrupted = True
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
@@ -5364,6 +5370,15 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
+                        try:
+                            from agent.delegation_inject import release_pending_injects
+
+                            release_pending_injects(agent, messages, turn_id=turn_id)
+                        except Exception:
+                            logger.debug(
+                                "Failed to release backoff-interrupted inject claims",
+                                exc_info=True,
+                            )
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
@@ -5467,6 +5482,15 @@ def run_conversation(
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
+            # A normalized provider response is the acceptance boundary for any
+            # synthetic delegation result in this request.  Until here its
+            # durable row remains pending+claimed so a crash can recover it.
+            try:
+                from agent.delegation_inject import acknowledge_pending_injects
+
+                acknowledge_pending_injects(agent, turn_id=turn_id)
+            except Exception:
+                logger.debug("Failed to acknowledge consumed inject claims", exc_info=True)
             
             # Normalize content to string — some OpenAI-compatible servers
             # (llama-server, etc.) return content as a dict or list instead
@@ -7057,6 +7081,17 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
+    # Any claim left here was never consumed by a normalized provider response.
+    # Drop its RAM-only synthetic message and return the durable event to the
+    # queue.  If a persistence boundary already saved it, that transcript row
+    # is the durable handoff and the helper acknowledges rather than requeues.
+    try:
+        from agent.delegation_inject import release_pending_injects
+
+        release_pending_injects(agent, messages, turn_id=turn_id)
+    except Exception:
+        logger.debug("Failed to settle unconsumed inject claims", exc_info=True)
+
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.

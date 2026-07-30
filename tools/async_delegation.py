@@ -316,59 +316,63 @@ def _prune_durable_records() -> None:
         )
 
 
+def _update_completion_row(
+    conn,
+    event: Dict[str, Any],
+    result: Dict[str, Any],
+    *,
+    delivery_state: str = "pending",
+    now: Optional[float] = None,
+) -> None:
+    now = time.time() if now is None else now
+    state = "delivered" if delivery_state == "delivered" else "pending"
+    delivered_at = now if state == "delivered" else None
+    conn.execute(
+        """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+           event_json=?, result_json=?, delivery_state=?, delivered_at=?
+           WHERE delegation_id=?""",
+        (
+            event.get("status", "completed"),
+            event.get("completed_at", now),
+            now,
+            json.dumps(event),
+            json.dumps(result),
+            state,
+            delivered_at,
+            event["delegation_id"],
+        ),
+    )
+
+
 def _persist_completion(
     event: Dict[str, Any],
     result: Dict[str, Any],
     *,
     delivery_state: str = "pending",
 ) -> None:
-    now = time.time()
-    state = "delivered" if delivery_state == "delivered" else "pending"
-    delivered_at = now if state == "delivered" else None
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state=?, delivered_at=?
-               WHERE delegation_id=?""",
-            (
-                event.get("status", "completed"),
-                event.get("completed_at", now),
-                now,
-                json.dumps(event),
-                json.dumps(result),
-                state,
-                delivered_at,
-                event["delegation_id"],
-            ),
+        _update_completion_row(
+            conn, event, result, delivery_state=delivery_state
         )
 
 
-def publish_batch_child_completion(
-    delegation_id: str,
+def _build_batch_child_event(
+    record: Dict[str, Any],
     task_index: int,
     result: Dict[str, Any],
-) -> bool:
-    """Durably enqueue one ready child from an ``inject`` batch.
-
-    The parent batch remains the execution/stall unit.  This function only
-    creates an independently claimable delivery event, keyed by task index.
-    Repeated publication is idempotent and never resets a delivered claim.
-    """
-    with _records_lock:
-        record = dict(_records.get(delegation_id) or {})
-    if str(record.get("result_delivery") or "after_turn").lower() != "inject":
-        return False
-
+    *,
+    completed_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    delegation_id = str(record.get("delegation_id") or "")
     goals = list(record.get("goals") or [])
     goal = goals[task_index] if 0 <= task_index < len(goals) else record.get("goal", "")
-    completed_at = time.time()
+    completed_at = time.time() if completed_at is None else completed_at
     child_result = dict(result or {})
     child_result.setdefault("task_index", task_index)
-    event_key = f"task:{task_index}"
-    event = {
+    return {
         "type": "async_delegation",
         "delegation_id": delegation_id,
-        "delivery_event_key": event_key,
+        "delivery_event_key": f"task:{task_index}",
         "batch_id": delegation_id,
         "task_index": task_index,
         "batch_size": len(goals),
@@ -399,16 +403,46 @@ def publish_batch_child_completion(
         "completed_at": completed_at,
         "result_delivery": "inject",
     }
+
+
+def _insert_batch_event(conn, event: Dict[str, Any], *, now: float) -> bool:
+    cur = conn.execute(
+        """INSERT OR IGNORE INTO async_delegation_events
+           (delegation_id, event_key, event_json, delivery_state,
+            delivery_attempts, created_at, updated_at)
+           VALUES (?, ?, ?, 'pending', 0, ?, ?)""",
+        (
+            event["delegation_id"],
+            event["delivery_event_key"],
+            json.dumps(event),
+            now,
+            now,
+        ),
+    )
+    return cur.rowcount == 1
+
+
+def publish_batch_child_completion(
+    delegation_id: str,
+    task_index: int,
+    result: Dict[str, Any],
+) -> bool:
+    """Durably enqueue one ready child from an ``inject`` batch.
+
+    The parent batch remains the execution/stall unit.  This function only
+    creates an independently claimable delivery event, keyed by task index.
+    Repeated publication is idempotent and never resets a delivered claim.
+    """
+    with _records_lock:
+        record = dict(_records.get(delegation_id) or {})
+    if str(record.get("result_delivery") or "after_turn").lower() != "inject":
+        return False
+
+    event = _build_batch_child_event(record, task_index, result)
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO async_delegation_events
-               (delegation_id, event_key, event_json, delivery_state,
-                delivery_attempts, created_at, updated_at)
-               VALUES (?, ?, ?, 'pending', 0, ?, ?)""",
-            (delegation_id, event_key, json.dumps(event), now, now),
-        )
-    if cur.rowcount != 1:
+        inserted = _insert_batch_event(conn, event, now=now)
+    if not inserted:
         return False
     from tools.process_registry import process_registry
 
@@ -416,19 +450,23 @@ def publish_batch_child_completion(
     return True
 
 
-def _publish_batch_terminal_event(
-    event_record: Dict[str, Any], combined: Dict[str, Any], status: str
-) -> bool:
-    """Deliver a parent-level inject failure not represented by child events."""
-    if status in {"completed", "success"} or (combined.get("results") or []):
-        return False
+def _build_batch_terminal_event(
+    event_record: Dict[str, Any],
+    combined: Dict[str, Any],
+    status: str,
+    *,
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not force and (
+        status in {"completed", "success"} or (combined.get("results") or [])
+    ):
+        return None
     delegation_id = str(event_record.get("delegation_id") or "")
-    event_key = "terminal"
     now = time.time()
-    event = {
+    event: Dict[str, Any] = {
         "type": "async_delegation",
         "delegation_id": delegation_id,
-        "delivery_event_key": event_key,
+        "delivery_event_key": "terminal",
         "batch_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
@@ -457,20 +495,71 @@ def _publish_batch_terminal_event(
     ):
         if key in combined:
             event[key] = combined[key]
+    return event
+
+
+def _publish_batch_terminal_event(
+    event_record: Dict[str, Any], combined: Dict[str, Any], status: str
+) -> bool:
+    """Deliver a parent-level inject failure not represented by child events."""
+    event = _build_batch_terminal_event(event_record, combined, status)
+    if event is None:
+        return False
+    now = time.time()
     with _DB_LOCK, _transaction() as conn:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO async_delegation_events
-               (delegation_id, event_key, event_json, delivery_state,
-                delivery_attempts, created_at, updated_at)
-               VALUES (?, ?, ?, 'pending', 0, ?, ?)""",
-            (delegation_id, event_key, json.dumps(event), now, now),
-        )
-    if cur.rowcount != 1:
+        inserted = _insert_batch_event(conn, event, now=now)
+    if not inserted:
         return False
     from tools.process_registry import process_registry
 
     process_registry.completion_queue.put(event)
     return True
+
+
+def _persist_inject_batch_finalization(
+    event_record: Dict[str, Any],
+    parent_event: Dict[str, Any],
+    combined: Dict[str, Any],
+    status: str,
+) -> None:
+    """Atomically persist missing child events and the terminal parent row."""
+
+    now = time.time()
+    newly_inserted: list[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        for child in combined.get("results") or []:
+            child_event = _build_batch_child_event(
+                event_record,
+                int(child.get("task_index", 0)),
+                child,
+                completed_at=now,
+            )
+            if _insert_batch_event(conn, child_event, now=now):
+                newly_inserted.append(child_event)
+
+        terminal_event = _build_batch_terminal_event(
+            event_record, combined, status
+        )
+        if terminal_event is not None and _insert_batch_event(
+            conn, terminal_event, now=now
+        ):
+            newly_inserted.append(terminal_event)
+
+        # The aggregate row is bookkeeping-only for inject batches. Commit its
+        # terminal state in the same transaction as the idempotent child safety
+        # net so restart recovery can never observe a half-finalized parent.
+        _update_completion_row(
+            conn,
+            parent_event,
+            combined,
+            delivery_state="delivered",
+            now=now,
+        )
+
+    from tools.process_registry import process_registry
+
+    for queued_event in newly_inserted:
+        process_registry.completion_queue.put(queued_event)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -508,6 +597,81 @@ def recover_abandoned_delegations() -> int:
             if live:
                 continue
             task = json.loads(task_json or "{}")
+            restored_delivery = str(
+                result_delivery or task.get("result_delivery") or "after_turn"
+            ).lower()
+            if bool(task.get("is_batch")) and restored_delivery == "inject":
+                # Inject batches deliver child-scoped rows, never an aggregate.
+                # A crash after one or more child inserts must preserve that wire
+                # shape instead of manufacturing a contradictory parent unknown.
+                child_rows = conn.execute(
+                    """SELECT event_json FROM async_delegation_events
+                       WHERE delegation_id=? AND event_key LIKE 'task:%'
+                       ORDER BY event_key""",
+                    (delegation_id,),
+                ).fetchall()
+                child_results: list[Dict[str, Any]] = []
+                for (child_payload,) in child_rows:
+                    child_event = json.loads(child_payload or "{}")
+                    results = child_event.get("results") or []
+                    if results and isinstance(results[0], dict):
+                        child_results.append(results[0])
+
+                goals = list(task.get("goals") or [])
+                complete_children = bool(goals) and len(child_results) >= len(goals)
+                status = "completed" if complete_children else "unknown"
+                recovery_error = None
+                if not complete_children:
+                    recovery_error = (
+                        "Delegation owner exited after recording "
+                        f"{len(child_results)}/{len(goals)} batch child results; "
+                        "remaining outcomes are unknown."
+                    )
+                combined = {
+                    "results": child_results,
+                    "error": recovery_error,
+                }
+                event_record = {
+                    "delegation_id": delegation_id,
+                    "session_key": session_key,
+                    "origin_ui_session_id": origin_ui,
+                    "origin_session_id": origin_session_id or "",
+                    "parent_session_id": parent_id,
+                    "parent_turn_id": task.get("parent_turn_id", ""),
+                    "goal": task.get("goal", ""),
+                    "goals": goals,
+                    "context": task.get("context"),
+                    "toolsets": task.get("toolsets"),
+                    "role": task.get("role"),
+                    "model": task.get("model"),
+                    "dispatched_at": dispatched_at,
+                }
+                if not complete_children:
+                    terminal_event = _build_batch_terminal_event(
+                        event_record, combined, status, force=True
+                    )
+                    if terminal_event is not None:
+                        _insert_batch_event(conn, terminal_event, now=now)
+
+                parent_event = {
+                    **event_record,
+                    "type": "async_delegation",
+                    "status": status,
+                    "is_batch": True,
+                    "results": child_results,
+                    "error": recovery_error,
+                    "completed_at": now,
+                    "result_delivery": "inject",
+                }
+                _update_completion_row(
+                    conn,
+                    parent_event,
+                    combined,
+                    delivery_state="delivered",
+                    now=now,
+                )
+                recovered += 1
+                continue
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -519,9 +683,7 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
-                "result_delivery": str(
-                    result_delivery or task.get("result_delivery") or "after_turn"
-                ),
+                "result_delivery": restored_delivery,
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -1389,20 +1551,13 @@ def _push_batch_completion_event(
         if _k in combined:
             evt[_k] = combined[_k]
     if str(event_record.get("result_delivery") or "after_turn").lower() == "inject":
-        # Child callbacks normally publish immediately. Re-publish here as an
-        # idempotent safety net for callback failures. Persist every child event
-        # before atomically acknowledging the aggregate parent row: otherwise a
-        # crash between a pending aggregate write and a separate acknowledgement
-        # could restore both the aggregate and its child events after restart.
-        delegation_id = str(event_record.get("delegation_id") or "")
-        for child in combined.get("results") or []:
-            publish_batch_child_completion(
-                delegation_id,
-                int(child.get("task_index", 0)),
-                child,
-            )
-        _publish_batch_terminal_event(event_record, combined, status)
-        _persist_completion(evt, combined, delivery_state="delivered")
+        # Child callbacks publish incrementally for same-turn visibility. The
+        # finalizer idempotently inserts any missed child and commits the parent
+        # terminal row in one SQLite transaction; only newly inserted events are
+        # queued after that transaction commits.
+        _persist_inject_batch_finalization(
+            event_record, evt, combined, status
+        )
         return
     _persist_completion(evt, combined)
     try:
