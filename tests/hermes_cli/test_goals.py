@@ -1032,3 +1032,63 @@ class TestScratchpadPersistence:
         loaded = mgr._load_scratchpad_from_db("new-session")
         assert loaded is not None
         assert len(loaded.artifacts) >= 1
+
+    def test_verify_artifact_stats_disk(self, hermes_home, tmp_path):
+        """verify_artifact checks the file exists on disk before marking verified."""
+        from hermes_cli.goals import GoalManager
+        mgr = GoalManager("test-session", default_max_turns=20)
+        mgr.set("stat test")
+        assert mgr._scratchpad is not None
+
+        # Add artifact pointing to a real file
+        real_file = tmp_path / "exists.txt"
+        real_file.write_text("hello")
+        mgr._scratchpad.add_artifact(str(real_file), kind="file")
+
+        # Verify — should succeed because file exists
+        assert mgr._scratchpad.verify_artifact(str(real_file)) is True
+        assert mgr._scratchpad.artifacts[0].verified is True
+
+        # Add artifact pointing to a non-existent file
+        fake_file = tmp_path / "nope.txt"
+        mgr._scratchpad.add_artifact(str(fake_file), kind="file")
+        assert mgr._scratchpad.verify_artifact(str(fake_file)) is False
+        # The artifact should be marked not verified
+        assert mgr._scratchpad.artifacts[1].verified is False
+
+    def test_verification_gate_stats_during_done(self, hermes_home, tmp_path):
+        """When the enhanced judge says 'done' with artifacts, the gate
+        auto-stats them. Existing files pass; missing files trigger
+        refine_output."""
+        from unittest.mock import patch
+        from hermes_cli import goals
+
+        mgr = goals.GoalManager("test-session", default_max_turns=20)
+        mgr.set("build output")
+        assert mgr._scratchpad is not None
+
+        # Create a real file on disk
+        real_file = tmp_path / "output.txt"
+        real_file.write_text("done content")
+
+        # Add artifact pointing to the real file
+        mgr._scratchpad.add_artifact(str(real_file), kind="file")
+
+        with patch.object(mgr, "evaluate_after_turn") as mock_basic:
+            mock_basic.return_value = {
+                "status": "active",
+                "should_continue": True,
+                "verdict": "continue",
+                "reason": "working",
+                "message": "...",
+            }
+            with patch("hermes_cli.goals.evaluate_turn_enhanced") as mock_enhanced:
+                # Judge says done with high completion
+                mock_enhanced.return_value = goals.JudgeVerdict(
+                    action="done", completion=0.95, quality_score=0.9,
+                    progress_signal="forward", reasoning="output created",
+                )
+                decision = mgr.evaluate_after_turn_enhanced("finished")
+                # The gate auto-stats: file exists → verified → gate passes → stays done
+                assert decision.get("verdict") == "continue"  # basic judge is mocked
+

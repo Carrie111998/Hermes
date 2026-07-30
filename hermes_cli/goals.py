@@ -1529,15 +1529,19 @@ class GoalManager:
         # Record approach on pivot
         if verdict.action == "pivot_strategy" and verdict.suggested_pivot:
             self._scratchpad.record_approach(str(verdict.suggested_pivot))
-        # Verification gate: artifacts exist but none verified → downgrade
+        # Verification gate: auto-verify artifacts by checking disk
         if verdict.action == "done":
             if tool_calls:
                 self._extract_artifacts_from_turn(tool_calls)
+            # Auto-stats every artifact — verifies it exists on disk
+            for a in self._scratchpad.artifacts:
+                if not a.verified:
+                    self._scratchpad.verify_artifact(a.path)
             has_artifacts = bool(self._scratchpad.artifacts)
             verified = sum(1 for a in self._scratchpad.artifacts if a.verified)
             if verdict.completion > 0.75 and has_artifacts and verified == 0:
                 verdict.action = "refine_output"
-                verdict.suggested_next_action = "Verify all artifacts exist before marking done."
+                verdict.suggested_next_action = "Create all required output files before marking done."
         # Build enhanced continuation prompt when applicable
         if verdict.action != "done" and self._state and self._state.status == "active":
             enhanced_prompt = build_continuation_prompt(
