@@ -7162,6 +7162,54 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
 
+    @staticmethod
+    def _probe_video_meta(video_path: str) -> Dict[str, int]:
+        """Best-effort width/height/duration probe for outgoing videos.
+
+        Telegram's Bot API treats ``width``/``height``/``duration`` as optional
+        on ``sendVideo``, but when they are omitted the server has to guess the
+        aspect ratio from the file and sometimes falls back to a square player
+        (portrait 9:16 videos are the usual casualty). Passing the real
+        dimensions makes every client render the video exactly as encoded.
+
+        Uses ``ffprobe`` when available (checking PATH plus the common Homebrew
+        and /usr/local install locations); returns ``{}`` when it is not, which
+        preserves the previous behavior.
+        """
+        import shutil
+        import subprocess
+
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            for candidate in ("/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe"):
+                if os.path.exists(candidate):
+                    ffprobe = candidate
+                    break
+        if not ffprobe:
+            return {}
+        try:
+            out = subprocess.run(
+                [
+                    ffprobe, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height:format=duration",
+                    "-of", "json", video_path,
+                ],
+                capture_output=True,
+                timeout=10,
+            )
+            data = json.loads(out.stdout or b"{}")
+            meta: Dict[str, int] = {}
+            stream = (data.get("streams") or [{}])[0]
+            width, height = stream.get("width"), stream.get("height")
+            if width and height:
+                meta["width"], meta["height"] = int(width), int(height)
+            duration = (data.get("format") or {}).get("duration")
+            if duration:
+                meta["duration"] = int(round(float(duration)))
+            return meta
+        except Exception:
+            return {}
+
     async def send_video(
         self,
         chat_id: str,
@@ -7188,6 +7236,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_message_id=reply_to_id,
                 reply_to_mode=self._reply_to_mode
             )
+            video_meta = self._probe_video_meta(video_path)
             with open(video_path, "rb") as f:
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_video,
@@ -7196,6 +7245,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "video": f,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
+                        **video_meta,
                         **thread_kwargs,
                         **self._notification_kwargs(metadata),
                     },
