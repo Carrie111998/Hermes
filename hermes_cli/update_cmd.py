@@ -2615,7 +2615,12 @@ def _detect_venv_python_processes(
 
     matches: list[tuple[int, str, str]] = []
     try:
-        proc_iter = psutil.process_iter(["pid", "exe", "name", "cmdline", "cwd"])
+        # On Windows, cmdline/cwd collection is dramatically more expensive
+        # than pid/name/exe (roughly 15s vs 4s on process-heavy desktops).  Take
+        # a cheap broad snapshot first so every executable under the venv is
+        # still covered, then load command details only for actual venv holders
+        # or Python/Hermes processes that could be base-interpreter trampolines.
+        proc_iter = psutil.process_iter(["pid", "name", "exe"])
     except Exception:
         return []
     for proc in proc_iter:
@@ -2631,13 +2636,24 @@ def _detect_venv_python_processes(
             exe_norm = str(Path(exe).resolve()).lower()
         except (OSError, ValueError):
             exe_norm = str(exe).lower()
-        cmdline_raw = " ".join(info.get("cmdline") or [])
+
+        name = info.get("name") or Path(exe).name
+        name_low = str(name).lower()
+        is_holder = exe_norm.startswith(venv_prefix)
+        could_be_trampoline = name_low.startswith("python") or name_low == "hermes.exe"
+        if not is_holder and not could_be_trampoline:
+            continue
+
+        try:
+            details = proc.as_dict(attrs=["cmdline", "cwd"])
+        except Exception:
+            details = {}
+        cmdline_raw = " ".join(details.get("cmdline") or [])
         cmdline_low = cmdline_raw.lower()
-        cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
+        cwd_low = str(details.get("cwd") or "").lower().rstrip(os.sep) + os.sep
 
         # Primary match: the executable itself lives under this venv
         # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
-        is_holder = exe_norm.startswith(venv_prefix)
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
@@ -2650,7 +2666,6 @@ def _detect_venv_python_processes(
                 is_holder = True
         if not is_holder:
             continue
-        name = info.get("name") or Path(exe).name
         matches.append((int(pid), str(name), cmdline_raw[:120]))
     return matches
 
