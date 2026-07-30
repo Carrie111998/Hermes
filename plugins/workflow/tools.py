@@ -170,15 +170,7 @@ def handle_workflow_start(
     single_flight = args.get("single_flight", False)
     inputs = args.get("inputs")
     board = args.get("board", "")
-    attachments_raw = args.get("attachments")
-    # Tool schema defines attachments as dict (name→path).
-    # Engine expects a list of file paths. Convert values.
-    if isinstance(attachments_raw, dict):
-        attachments = list(attachments_raw.values())
-    elif isinstance(attachments_raw, list):
-        attachments = attachments_raw
-    else:
-        attachments = None
+    attachments = args.get("attachments")
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
