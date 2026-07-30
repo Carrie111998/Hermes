@@ -131,6 +131,27 @@ def get_hermes_home() -> Path:
     return _hermes_home_from_env()
 
 
+def get_hermes_auth_home_override() -> Path | None:
+    """Return the launcher-scoped provider credential residence, if set."""
+    if "HERMES_AUTH_HOME" not in os.environ:
+        return None
+    raw = os.environ["HERMES_AUTH_HOME"].strip()
+    if not raw:
+        raise ValueError("HERMES_AUTH_HOME must not be empty")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("HERMES_AUTH_HOME must be an absolute path")
+    return path.resolve(strict=False)
+
+
+def get_hermes_auth_home() -> Path:
+    """Return the directory containing Hermes-owned provider credentials."""
+    override = get_hermes_auth_home_override()
+    if override is not None:
+        return override
+    return get_hermes_home()
+
+
 def get_process_hermes_home() -> Path:
     """Return the Hermes home for the running process, ignoring task overrides.
 

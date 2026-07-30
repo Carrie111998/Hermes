@@ -10004,8 +10004,11 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
     # OAuth token file was world-readable at the default umask (0o644 on most
     # hosts) between the rename and the chmod. atomic_json_write also preserves
     # the existing file's owner and cleans up its temp on failure.
+    from hermes_constants import secure_parent_dir
     from utils import atomic_json_write
 
+    oauth_file.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(oauth_file)
     atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
     # Best-effort credential-pool insert. Failure here doesn't invalidate
     # the file write — pool registration only matters for the rotation

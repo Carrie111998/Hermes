@@ -3079,9 +3079,12 @@ def _credential_fingerprint(provider: str) -> str:
 
     # OAuth / external-file mtimes that change on re-auth
     try:
-        from hermes_constants import get_hermes_home
-        for rel in ("auth.json", "credentials.json"):
-            p = get_hermes_home() / rel
+        from hermes_constants import get_hermes_auth_home, get_hermes_home
+        credential_paths = (
+            ("auth.json", get_hermes_auth_home() / "auth.json"),
+            ("credentials.json", get_hermes_home() / "credentials.json"),
+        )
+        for rel, p in credential_paths:
             try:
                 parts.append(f"{rel}@{p.stat().st_mtime_ns}")
             except FileNotFoundError:

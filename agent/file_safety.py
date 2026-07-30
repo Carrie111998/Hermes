@@ -25,10 +25,29 @@ def _hermes_root_path() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
+def _hermes_auth_home_path() -> Path:
+    """Resolve the provider credential residence."""
+    try:
+        from hermes_constants import get_hermes_auth_home
+    except ImportError:
+        return _hermes_home_path()
+    return get_hermes_auth_home()
+
+
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     hermes_home = _hermes_home_path()
     hermes_root = _hermes_root_path()
+    auth_home = _hermes_auth_home_path()
+    from hermes_constants import get_hermes_auth_home_override
+
+    auth_home_paths = []
+    if get_hermes_auth_home_override() is not None:
+        auth_home_paths = [
+            str(auth_home / "auth.json"),
+            str(auth_home / "auth.lock"),
+            str(auth_home / ".anthropic_oauth.json"),
+        ]
     return {
         os.path.realpath(p)
         for p in [
@@ -57,7 +76,7 @@ def build_write_denied_paths(home: str) -> set[str]:
             "/etc/sudoers",
             "/etc/passwd",
             "/etc/shadow",
-        ]
+        ] + auth_home_paths
     }
 
 
@@ -112,7 +131,11 @@ def _classify_write_denial(path: str) -> Optional[str]:
     mcp_tokens_dir_name = "mcp-tokens"
 
     hermes_dirs = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
+    for base in (
+        _hermes_home_path(),
+        _hermes_root_path(),
+        _hermes_auth_home_path(),
+    ):
         try:
             real = os.path.realpath(base)
             if real not in hermes_dirs:
@@ -244,7 +267,11 @@ def get_read_block_error(path: str) -> Optional[str]:
     # <root>/profiles/<name> in profile mode). Same shape as the write
     # deny widening (#15981, #14157).
     hermes_dirs: list[Path] = []
-    for base in (_hermes_home_path(), _hermes_root_path()):
+    for base in (
+        _hermes_home_path(),
+        _hermes_root_path(),
+        _hermes_auth_home_path(),
+    ):
         try:
             real = base.resolve()
             if real not in hermes_dirs:

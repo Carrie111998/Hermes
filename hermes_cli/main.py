@@ -392,12 +392,17 @@ def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
     print(f"Hermes Agent v{__version__} ({__release_date__})")
+    _print_runtime_capabilities()
     print(f"Install directory: {PROJECT_ROOT}")
 
     print(f"Python: {sys.version.split()[0]}")
 
     openai_version = _read_openai_version_fast()
     print(f"OpenAI SDK: {openai_version}" if openai_version else "OpenAI SDK: Not installed")
+
+
+def _print_runtime_capabilities() -> None:
+    print("Runtime capabilities: provider-auth-home-v1")
 
 
 def _try_termux_ultrafast_version() -> bool:
@@ -958,7 +963,7 @@ def _relative_time(ts) -> str:
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
     from hermes_cli.config import get_env_path, get_hermes_home, load_config
-    from hermes_cli.auth import get_auth_status
+    from hermes_cli.auth import get_active_provider, get_auth_status
 
     # Determine whether Hermes itself has been explicitly configured (model
     # in config that isn't the hardcoded default). Used below to gate external
@@ -1024,20 +1029,15 @@ def _has_any_provider_configured() -> bool:
     except Exception:
         pass
 
-    # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
-    if auth_file.exists():
-        try:
-            import json
-
-            auth = json.loads(auth_file.read_text(encoding="utf-8"))
-            active = auth.get("active_provider")
-            if active:
-                status = get_auth_status(active)
-                if status.get("logged_in"):
-                    return True
-        except Exception:
-            pass
+    # Check for an active OAuth provider.
+    try:
+        active = get_active_provider()
+        if active:
+            status = get_auth_status(active)
+            if status.get("logged_in"):
+                return True
+    except Exception:
+        pass
 
     # Check config.yaml — if model is a dict with an explicit provider set,
     # the user has gone through setup (fresh installs have model as a plain
@@ -4881,6 +4881,7 @@ def _print_version_info(*, check_updates: bool = True) -> None:
     # Core version line is registry-owned (shared with the gateway /version);
     # the install/python/SDK detail below is CLI-only decoration.
     print(execute_command("version", CommandContext(surface="cli")).text)
+    _print_runtime_capabilities()
     print(f"Install directory: {PROJECT_ROOT}")
     print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
 

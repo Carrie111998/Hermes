@@ -49,7 +49,12 @@ from hermes_cli.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import (
+    OPENROUTER_BASE_URL,
+    get_hermes_auth_home,
+    get_hermes_auth_home_override,
+    secure_parent_dir,
+)
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -903,7 +908,7 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # =============================================================================
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    path = get_hermes_auth_home() / "auth.json"
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
     # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
@@ -918,7 +923,8 @@ def _auth_file_path() -> Path:
         if resolved == real_home_auth:
             raise RuntimeError(
                 f"Refusing to touch real user auth store during test run: {path}. "
-                "Set HERMES_HOME to a tmp_path in your test fixture, or run "
+                "Set HERMES_HOME and HERMES_AUTH_HOME to tmp_path directories "
+                "in your test fixture, or run "
                 "via scripts/run_tests.sh for hermetic CI-parity env."
             )
     return path
@@ -934,6 +940,8 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    if get_hermes_auth_home_override() is not None:
+        return None
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
@@ -5086,6 +5094,10 @@ NOUS_SHARED_STORE_FILENAME = "nous_auth.json"
 _nous_shared_lock_holder = threading.local()
 
 
+def _nous_shared_store_enabled() -> bool:
+    return get_hermes_auth_home_override() is None
+
+
 def _nous_shared_auth_dir() -> Path:
     """Resolve the directory that holds the shared Nous token store.
 
@@ -5204,6 +5216,8 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
     We deliberately omit the runtime ``agent_key`` compatibility field;
     the OAuth tokens are the cross-profile source of truth.
     """
+    if not _nous_shared_store_enabled():
+        return
     refresh_token = state.get("refresh_token")
     access_token = state.get("access_token")
     if not (isinstance(refresh_token, str) and refresh_token.strip()):
@@ -5268,6 +5282,8 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     lacks required fields. Callers should treat ``None`` as "no shared
     credentials available — fall through to device-code".
     """
+    if not _nous_shared_store_enabled():
+        return None
     try:
         path = _nous_shared_store_path()
     except RuntimeError:
@@ -5293,6 +5309,8 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
 
 def _clear_shared_nous_state(reason: str) -> None:
     """Remove the shared Nous OAuth store after a terminal token failure."""
+    if not _nous_shared_store_enabled():
+        return
     try:
         with _nous_shared_store_lock():
             path = _nous_shared_store_path()
@@ -5489,6 +5507,8 @@ def _try_import_shared_nous_state(
     etc.) — caller should then fall through to the normal device-code
     flow.
     """
+    if not _nous_shared_store_enabled():
+        return None
     try:
         with _nous_shared_store_lock(timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)):
             shared = _read_shared_nous_state()
