@@ -1351,8 +1351,8 @@ class BuzzAdapter(BasePlatformAdapter):
             if profiles:
                 raw_name = profiles[0].get("display_name")
                 name = raw_name.strip() if isinstance(raw_name, str) else ""
-            if not name:
-                name = (hex_to_npub(pubkey) or pubkey)[:16]
+        if not name:
+            name = (hex_to_npub(pubkey) or pubkey)[:16]
         self._user_names[pubkey] = name
         return name
 
