@@ -59,6 +59,35 @@ describe('watchSessionPins', () => {
     expect(patch).toHaveBeenCalledWith('b', false, undefined)
   })
 
+  it('does not let a stale pinned=true row undo a user unpin', async () => {
+    $sessions.set([row('user-unpin', { pinned: true })])
+    await flush()
+    expect($pinnedSessionIds.get()).toContain('user-unpin')
+    patch.mockClear()
+
+    // The click changes local state before the PATCH response can be reflected
+    // in the next session-list page. The still-true row must not re-add it.
+    $pinnedSessionIds.set([])
+    await flush()
+
+    expect($pinnedSessionIds.get()).not.toContain('user-unpin')
+    expect(patch).toHaveBeenCalledWith('user-unpin', false, undefined)
+  })
+
+  it('does not let a stale pinned=false row undo a user pin', async () => {
+    $sessions.set([row('user-pin', { pinned: false })])
+    await flush()
+    patch.mockClear()
+
+    // The list page predates the user's click. The local write must be
+    // registered before remote reconciliation consults that stale row.
+    $pinnedSessionIds.set(['user-pin'])
+    await flush()
+
+    expect($pinnedSessionIds.get()).toContain('user-pin')
+    expect(patch).toHaveBeenCalledWith('user-pin', true, undefined)
+  })
+
   it('defers a pin whose row is not loaded, then flushes once it appears', async () => {
     $pinnedSessionIds.set(['c'])
     await flush()

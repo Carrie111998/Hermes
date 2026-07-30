@@ -82,24 +82,23 @@ function pullRemotePins(): void {
     }
 
     if (row.pinned && !heldLocally) {
-      pinSession(pinId)
       // Already true server-side; record it so the push pass doesn't re-PATCH.
       mirrored.add(pinId)
+      pinSession(pinId)
     } else if (!row.pinned && heldLocally) {
-      unpinSession(local.has(pinId) ? pinId : row.id)
       mirrored.delete(pinId)
       mirrored.delete(row.id)
+      unpinSession(local.has(pinId) ? pinId : row.id)
     }
   }
 }
 
-function reconcile(): void {
+/** Push local membership changes to the backend. */
+function pushLocalPins(): void {
   // Config/session REST is only reachable through the Electron bridge.
   if (!window.hermesDesktop) {
     return
   }
-
-  pullRemotePins()
 
   const current = new Set($pinnedSessionIds.get())
 
@@ -138,9 +137,22 @@ function reconcile(): void {
   }
 }
 
-// Sync once, then re-sync on pin-set and session-list changes. Call once per app.
+/** Pull a fresh server page, then flush any local pins that became resolvable. */
+function reconcileRemotePins(): void {
+  if (!window.hermesDesktop) {
+    return
+  }
+
+  pullRemotePins()
+  pushLocalPins()
+}
+
+// Sync once, then push clicks and pull server refreshes through separate paths.
+// A local click must register its PATCH before any stale list row is consulted;
+// otherwise pinned=true immediately resurrects an unpin (and pinned=false
+// immediately cancels a pin) before `unconfirmed` can guard the write.
 export function watchSessionPins(): void {
-  reconcile()
-  $pinnedSessionIds.listen(reconcile)
-  $sessions.listen(reconcile)
+  reconcileRemotePins()
+  $pinnedSessionIds.listen(pushLocalPins)
+  $sessions.listen(reconcileRemotePins)
 }
