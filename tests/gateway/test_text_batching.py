@@ -214,6 +214,7 @@ def _make_telegram_adapter():
     adapter = object.__new__(TelegramAdapter)
     adapter._platform = Platform.TELEGRAM
     adapter.config = config
+    adapter._bot = None
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0.1
@@ -229,7 +230,7 @@ class TestTelegramAdaptiveDelay:
     @pytest.mark.asyncio
     async def test_short_chunk_uses_normal_delay(self):
         adapter = _make_telegram_adapter()
-        adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
+        await adapter._enqueue_text_event(_make_event("short msg", Platform.TELEGRAM))
 
         # Should flush after the normal 0.1s delay
         await asyncio.sleep(0.15)
@@ -272,5 +273,3 @@ class TestFeishuAdaptiveDelay:
 
         await asyncio.sleep(0.15)
         adapter._handle_message_with_guards.assert_called_once()
-
-

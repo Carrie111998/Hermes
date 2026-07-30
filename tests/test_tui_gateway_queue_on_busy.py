@@ -35,8 +35,13 @@ def _session(agent=None, **extra):
 
 def test_enqueue_pins_text_and_transport():
     session = _session()
-    server._enqueue_prompt(session, "hello", "ws-1")
-    assert session["queued_prompt"] == {"text": "hello", "transport": "ws-1"}
+    surface_context = {"accepted_text": "hello"}
+    server._enqueue_prompt(session, "hello", "ws-1", surface_context)
+    assert session["queued_prompt"] == {
+        "text": "hello",
+        "transport": "ws-1",
+        "surface_context": surface_context,
+    }
 
 
 
@@ -156,12 +161,29 @@ def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     fired = {}
     monkeypatch.setattr(
         server, "_run_prompt_submit",
-        lambda rid, sid, session, text: fired.update(rid=rid, sid=sid, text=text),
+        lambda rid, sid, session, text, surface_context=None: fired.update(
+            rid=rid,
+            sid=sid,
+            text=text,
+            surface_context=surface_context,
+        ),
     )
-    session = _session(queued_prompt={"text": "go", "transport": "ws-9"})
+    surface_context = {"accepted_text": "go"}
+    session = _session(
+        queued_prompt={
+            "text": "go",
+            "transport": "ws-9",
+            "surface_context": surface_context,
+        }
+    )
 
     assert server._drain_queued_prompt("r1", "sid", session) is True
-    assert fired == {"rid": "r1", "sid": "sid", "text": "go"}
+    assert fired == {
+        "rid": "r1",
+        "sid": "sid",
+        "text": "go",
+        "surface_context": surface_context,
+    }
     assert session["running"] is True
     assert session["queued_prompt"] is None
     assert session["transport"] == "ws-9"
@@ -180,5 +202,4 @@ def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     assert server._drain_queued_prompt("r1", "sid", session) is True
     # Failure must not leave the session wedged as running.
     assert session["running"] is False
-
 
