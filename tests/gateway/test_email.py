@@ -835,7 +835,7 @@ class TestWorkflowIngressTap(unittest.TestCase):
             r"^<email-sha256-[0-9a-f]{64}@hermes\.local>$",
         )
 
-    def test_body_store_repairs_truncated_content_addressed_file(self):
+    def test_body_store_refuses_mismatched_content_addressed_file(self):
         import hashlib
         import tempfile
         from gateway.platforms.email import EmailAdapter
@@ -857,11 +857,46 @@ class TestWorkflowIngressTap(unittest.TestCase):
             body_path = body_dir / f"{digest}.txt"
             body_path.write_text("truncated")
 
-            body_ref = EmailAdapter._persist_workflow_body(body)
+            adapter = self._make_adapter()
+            with self.assertRaisesRegex(ValueError, "content mismatch"):
+                adapter._persist_workflow_body(body)
 
-            self.assertEqual(Path(body_ref), body_path)
-            self.assertEqual(body_path.read_text(), body)
-            self.assertEqual(body_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(body_path.read_text(), "truncated")
+
+    def test_body_store_is_mode_0600_and_reuses_identical_content(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {"HERMES_HOME": hermes_home},
+        ):
+            adapter = self._make_adapter()
+            first = Path(adapter._persist_workflow_body("same body"))
+            second = Path(adapter._persist_workflow_body("same body"))
+
+            self.assertEqual(first, second)
+            self.assertEqual(first.read_text(), "same body")
+            self.assertEqual(first.stat().st_mode & 0o777, 0o600)
+
+    def test_body_store_size_limit_fails_closed(self):
+        import tempfile
+
+        from gateway.config import PlatformConfig
+        from gateway.platforms.email import EmailAdapter
+
+        with tempfile.TemporaryDirectory() as hermes_home, patch.dict(
+            os.environ,
+            {"HERMES_HOME": hermes_home},
+        ):
+            adapter = EmailAdapter(
+                PlatformConfig(
+                    enabled=True,
+                    extra={"workflow_ingress_max_body_bytes": 4},
+                )
+            )
+            with self.assertRaisesRegex(ValueError, "configured maximum"):
+                adapter._persist_workflow_body("12345")
+            self.assertFalse((Path(hermes_home) / "workflow").exists())
 
 
 class TestSendMethods(unittest.TestCase):
