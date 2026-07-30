@@ -69,8 +69,24 @@ def _list_openrouter(
     *,
     response: bytes | Exception,
     user_providers=None,
+    configured_api_key: str | None = None,
 ):
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+    if configured_api_key is None:
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    else:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "model": {
+                    "provider": "openrouter",
+                    "api_key": configured_api_key,
+                    "base_url": "https://openrouter.ai/api/v1",
+                }
+            },
+        )
     monkeypatch.setattr(models_mod, "_provider_models_cache_path", lambda: tmp_path / "models.json")
     monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {"openrouter": "openrouter"})
     monkeypatch.setattr(
@@ -127,3 +143,19 @@ def test_openrouter_declarations_only_reorder_verified_catalog(monkeypatch, tmp_
     openrouter = next(provider for provider in providers if provider["slug"] == "openrouter")
     assert openrouter["models"] == ["verified/model", "curated/model"]
     assert "blocked/model" not in openrouter["models"]
+
+
+def test_configured_only_openrouter_credential_reaches_policy_picker(monkeypatch, tmp_path):
+    providers = _list_openrouter(
+        monkeypatch,
+        tmp_path,
+        configured_api_key="configured-only-key",
+        response=(
+            b'{"data":['
+            b'{"id":"verified/model","supported_parameters":["tools"]}'
+            b']}'
+        ),
+    )
+
+    openrouter = next(provider for provider in providers if provider["slug"] == "openrouter")
+    assert openrouter["models"] == ["verified/model"]

@@ -2199,8 +2199,18 @@ def list_authenticated_providers(
             if not isinstance(env_vars, list):
                 continue
 
-        # Check if any env var is set
+        # Check the canonical effective credential path for OpenRouter so a
+        # profile configured through model.api_key is not hidden before its
+        # authenticated policy catalog can be queried. Other providers retain
+        # their existing environment/auth-store availability checks.
         has_creds = any(os.environ.get(ev) for ev in env_vars)
+        if hermes_id == "openrouter":
+            try:
+                from hermes_cli.models import has_openrouter_catalog_credential
+
+                has_creds = has_openrouter_catalog_credential()
+            except Exception:
+                pass
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store

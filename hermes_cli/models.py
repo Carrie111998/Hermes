@@ -183,6 +183,11 @@ def _resolve_openrouter_catalog_api_key(
     return "" if api_key == "no-key-required" else api_key
 
 
+def has_openrouter_catalog_credential() -> bool:
+    """Return whether the canonical OpenRouter runtime credential is usable."""
+    return bool(_resolve_openrouter_catalog_api_key())
+
+
 
 def _codex_curated_models() -> list[str]:
     """Derive the openai-codex curated list from codex_models.py.

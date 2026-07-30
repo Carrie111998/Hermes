@@ -26,13 +26,25 @@ def test_config_set_enables_final_boundary_enforcement(monkeypatch, tmp_path):
 
 def test_shared_enforcement_overrides_false(monkeypatch):
     monkeypatch.setattr("hermes_cli.config.openrouter_zdr_enabled", lambda: True)
-    kwargs = {"extra_body": {"provider": {"sort": "price", "zdr": False}}}
+    kwargs = {
+        "extra_body": {
+            "provider": {
+                "sort": "price",
+                "data_collection": "allow",
+                "zdr": False,
+            }
+        }
+    }
     enforce_openrouter_zdr(
         kwargs,
         is_openrouter=True,
         base_url="https://openrouter.ai/api/v1",
     )
-    assert kwargs["extra_body"]["provider"] == {"sort": "price", "zdr": True}
+    assert kwargs["extra_body"]["provider"] == {
+        "sort": "price",
+        "data_collection": "allow",
+        "zdr": True,
+    }
 
 
 def test_shared_enforcement_skips_native_gemini(monkeypatch):
