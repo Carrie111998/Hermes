@@ -24,6 +24,7 @@ if TYPE_CHECKING:  # pragma: no cover — runtime import is lazy (see below)
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -2975,7 +2976,7 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
         return len(str(msg))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
+        if k == "_anthropic_content_blocks" or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             continue
         if k == "content":
             if isinstance(v, list):
@@ -3004,7 +3005,7 @@ def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
         return estimate_tokens_rough(str(msg))
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k == "_anthropic_content_blocks":
+        if k == "_anthropic_content_blocks" or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             continue
         if k == "content":
             if isinstance(v, list):

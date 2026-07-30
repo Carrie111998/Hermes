@@ -62,6 +62,24 @@ class TestEstimateMessagesTokensRough:
         assert result > 0
         assert result == (len(str(msg)) + 3) // 4
 
+    def test_persistence_timestamp_does_not_change_estimate(self):
+        """Durability metadata must not create artificial context pressure."""
+        msg = {
+            "role": "assistant",
+            "content": "done",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        }
+        stamped = {**msg, "timestamp": 1_781_976_577.123456}
+
+        assert estimate_messages_tokens_rough([stamped]) == (
+            estimate_messages_tokens_rough([msg])
+        )
+
     def test_message_with_list_content(self):
         """Vision messages with multimodal content arrays.
 
@@ -1076,4 +1094,3 @@ class TestMoAContextLength:
         assert compressor.context_length == configured_context
         assert compressor.threshold_tokens == configured_context // 2
         endpoint_probe.assert_not_called()
-
