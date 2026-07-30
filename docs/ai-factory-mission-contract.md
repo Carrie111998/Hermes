@@ -33,19 +33,26 @@ Règles :
 
 ## 2. Labels-sémaphores Linear
 
+Créés sur la team HER par `scripts/linear_loop.py ensure-labels --apply`.
+
 | Label | Sens | Posé par |
 |---|---|---|
-| `agent-ready` | Contrat AC/NG complet, dispatchable | Jean (ou `/finn-spec`-équivalent) |
-| `agent-building` | Carte kanban active, owner claimé | contrôleur |
-| `loop-approved` | Revue verte sur SHA exact | reviewer (délégation lecture-seule) |
-| `loop-changes-requested` | Revue rouge, ≤ 2 itérations | reviewer |
-| `loop-stuck` | 2 blocages/échecs — escalade humaine | contrôleur (failure_limit=2) |
-| `needs-human-review` | Ambiguïté de contrat ou risque détecté | worker ou reviewer |
+| `agent-ready` | Jean autorise un codeur à traiter l'issue | **Jean, à la main** |
+| `agent-building` | Mission en cours | la boucle |
+| `agent-blocked` | Le codeur attend une décision de Jean | la boucle |
+| `agent-review` | Branche locale prête, en attente du GO de merge | la boucle |
+
+`agent-ready` est le seul geste humain requis, et le seul filtre qui sépare une
+issue codable d'une tâche business (signature de deal, relecture juridique,
+achat média). Une issue sans ce label est invisible pour la boucle.
 
 ## 3. Cycle d'une mission
 
-1. **Sélection** : `default` prend l'issue `agent-ready` la plus prioritaire
-   dont les dépendances sont Done.
+1. **Sélection** : la boucle (`scripts/linear_loop.py`, tick cron toutes les
+   10 min) prend l'issue `agent-ready` la plus prioritaire — priorité Linear
+   d'abord, puis ancienneté — pour chaque codeur libre. La sélection est
+   **déterministe** : aucun modèle n'intervient dans le choix de l'issue, du
+   codeur ou du moment. Le seul LLM du système est celui qui code.
 2. **Admission** : évidence de fraîcheur (`current|superseded|duplicate|
    needs-rebase`, ≤ 24 h, SHA canonique) → carte kanban → claim owner exact →
    spawn gated. Tout échec = pas de worker, carte routée, raison visible.
@@ -55,12 +62,20 @@ Règles :
 4. **Revue** : délégation lecture-seule sur le SHA exact; verdict trois états.
    Après 2 `loop-changes-requested` → `loop-stuck`, STOP (budget incident :
    1 implémenteur + 1 revue).
-5. **Clôture** : handoff capturé, owner libéré, writeback Linear (HER-99),
-   **fusion par Jean uniquement** — jamais par un agent.
+5. **Clôture** : au tick suivant, la boucle commente l'issue (branche, HEAD,
+   nombre de commits, résumé du worker), la passe en `In Review` avec le label
+   `agent-review`, archive la carte et envoie à Jean une demande de GO sur
+   Telegram. **La fusion appartient à Jean** — le hook d'admission n'admet
+   aucun `push`, `merge` ni PR, donc aucun agent ne peut fusionner, même par
+   accident.
 
 ## 4. Suivi (où en sont-ils ?)
 
-- `hermes kanban list` / `show <carte>` — état canonique.
+- **Linear est la seule interface nécessaire** : l'état d'une issue (`In
+  Progress` + `agent-building`, puis `In Review` + `agent-review`) suffit à
+  savoir où en est le travail. Le kanban est de la plomberie ; il n'y a aucune
+  raison de l'ouvrir au quotidien.
+- `hermes kanban list` / `show <carte>` — état canonique quand on veut le détail.
 - Dashboard `GET /workers/active` — chaque worker est qualifié
   `spawned`/`alive`/`heartbeat_fresh`/`productive`. **Un PID seul n'est
   jamais « en train de travailler ».**
@@ -80,3 +95,36 @@ Règles :
 - Le canari hermétique `tests/hermes_cli/test_kanban_code_ab_canary.py`
   fait partie de la suite : toute régression d'admission casse un test
   avant de casser un run live.
+
+## 6. La boucle (câblage)
+
+| Élément | Où |
+|---|---|
+| Code de la boucle | `scripts/linear_loop.py` (versionné) |
+| Lanceur cron | `~/.hermes/scripts/linear_loop_tick.py` — inerte, n'évolue jamais |
+| Job cron | « Boucle Linear → codeurs (HER) », `no_agent`, toutes les 10 min |
+| Tests | `tests/test_linear_loop.py` — Linear simulé, aucune sortie réseau |
+
+Commandes utiles :
+
+```bash
+python scripts/linear_loop.py status              # qui travaille, quoi est prêt
+python scripts/linear_loop.py tick                # simulation : n'écrit rien
+python scripts/linear_loop.py tick --apply        # un tick réel
+python scripts/linear_loop.py ensure-labels --apply
+```
+
+Garde-fous de la boucle :
+
+- **Sans `--apply`, rien n'est muté** — ni Linear, ni le kanban.
+- **Un codeur libre = une mission.** Une carte `blocked` n'occupe pas un
+  codeur (sinon un blocage le gèlerait indéfiniment), mais elle retient son
+  issue : celle-ci n'est jamais redistribuée tant que la carte vit.
+- **Gate disque** : sous 3 Gio libres, aucune mission ne démarre et Jean est
+  prévenu. Chaque mission crée un worktree ; un disque plein casse le runtime
+  bien plus sûrement qu'une issue traitée en retard.
+- **Silence par défaut** : un tick sans rien à signaler n'écrit rien sur la
+  sortie, donc le cron n'envoie aucun message. Jean n'est sollicité que pour un
+  GO de merge, un blocage ou une panne.
+- **Les cartes humaines sont intouchables** : la boucle ne rapporte et
+  n'archive que les cartes qu'elle a créées (`created_by = linear-loop`).
