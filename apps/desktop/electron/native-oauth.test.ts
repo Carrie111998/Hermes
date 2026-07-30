@@ -23,6 +23,7 @@ import {
   parseTokenResponse,
   resolveLoginProvider,
   resolveLoginStrategy,
+  resolveNativeLoginRoute,
   statusSupportsNativeFlow,
   tokenNeedsRefresh
 } from './native-oauth'
@@ -296,17 +297,25 @@ test('resolveLoginProvider: empty/unknown list → auto (gateway single-provider
   })
 })
 
-test('resolveLoginProvider: no unintended portal launch for password-preferring mixed gateway', () => {
-  // Regression guard for the incident's core symptom: a mixed basic+nous
-  // gateway where the user prefers local/basic must NOT auto-open the system
-  // browser at the Nous portal. resolveLoginProvider returns 'named' for the
-  // single redirect provider, but the caller in main.ts only opens the
-  // browser when the resolution is 'auto' or 'named' AND it actually invokes
-  // runNativeLogin. For a password-only preference, the caller routes to the
-  // embedded chooser instead. Here we pin that 'none' (password-only) never
-  // yields a named provider, so the native browser never opens.
-  const passwordOnly = resolveLoginProvider([{ name: 'basic', supportsPassword: true }])
+test('resolveNativeLoginRoute: mixed basic+nous invokes native flow with provider query', () => {
+  const route = resolveNativeLoginRoute([
+    { name: 'basic', supportsPassword: true },
+    { name: 'nous', supportsPassword: false }
+  ])
 
-  assert.equal(passwordOnly.kind, 'none')
-  assert.notEqual(passwordOnly.kind, 'named')
+  assert.deepEqual(route, { kind: 'native', provider: 'nous' })
+  assert.equal(route.kind, 'native')
+
+  const authorizeUrl = buildNativeAuthorizeUrl('https://gw.example.com', {
+    challenge: 'CHAL',
+    redirectUri: 'http://127.0.0.1:51000/callback',
+    state: 'STATE',
+    provider: route.kind === 'native' ? route.provider : undefined
+  })
+
+  assert.equal(new URL(authorizeUrl).searchParams.get('provider'), 'nous')
+})
+
+test('resolveNativeLoginRoute: password-only inventory uses embedded chooser', () => {
+  assert.deepEqual(resolveNativeLoginRoute([{ name: 'basic', supportsPassword: true }]), { kind: 'embedded' })
 })

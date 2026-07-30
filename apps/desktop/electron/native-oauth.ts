@@ -180,6 +180,30 @@ export function resolveLoginProvider(
 }
 
 /**
+ * Convert provider resolution into the caller's actual native-vs-embedded
+ * branch. This deliberately does not model a user's preferred login method;
+ * it only selects a viable route after the caller has chosen the native PKCE
+ * strategy from gateway capabilities.
+ */
+export type NativeLoginRoute = { kind: 'native'; provider?: string } | { kind: 'embedded' }
+
+export function resolveNativeLoginRoute(
+  providers: AdvertisedSessionProvider[] | null | undefined
+): NativeLoginRoute {
+  const providerResolution = resolveLoginProvider(providers)
+
+  if (providerResolution.kind === 'none') {
+    return { kind: 'embedded' }
+  }
+
+  if (providerResolution.kind === 'named') {
+    return { kind: 'native', provider: providerResolution.provider }
+  }
+
+  return { kind: 'native' }
+}
+
+/**
  * Build the gateway `/auth/native/authorize` URL the system browser opens.
  * `redirectUri` is the desktop's loopback callback (127.0.0.1:<port>/...).
  * `provider` is optional — omitted lets the gateway pick when it has exactly

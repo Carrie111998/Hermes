@@ -146,8 +146,8 @@ import {
   nativeRefreshUrl,
   type NativeTokenSet,
   parseTokenResponse,
-  resolveLoginProvider,
   resolveLoginStrategy,
+  resolveNativeLoginRoute,
   tokenNeedsRefresh
 } from './native-oauth'
 import { runNativeLogin } from './native-oauth-login'
@@ -9733,14 +9733,14 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
     // symptom on first-run.
     //
     // providers may be [] when /api/auth/providers is unreadable or the
-    // gateway predates it; resolveLoginProvider returns 'auto' for that case
-    // so the gateway's single-provider shortcut still applies.
+    // gateway predates it; resolveNativeLoginRoute keeps the native route with
+    // no named provider so the gateway's single-provider shortcut still
+    // applies.
     const providers = await gatewayAuthProviders(baseUrl)
-    const providerResolution = resolveLoginProvider(providers)
-    const shouldSkipNative = providerResolution.kind === 'none'
+    const loginRoute = resolveNativeLoginRoute(providers)
 
-    if (!shouldSkipNative) {
-      const nativeProvider = providerResolution.kind === 'named' ? providerResolution.provider : undefined
+    if (loginRoute.kind === 'native') {
+      const nativeProvider = loginRoute.provider
 
       try {
         const tokens = await runNativeLogin(
