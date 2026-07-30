@@ -3,6 +3,8 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +64,9 @@ class _AuthRunner:
     def __init__(self, auth_fn=None):
         self._auth_fn = auth_fn or (lambda _source: True)
         self.seen_sources = []
+        self.config = SimpleNamespace(multiplex_profiles=False)
+        self.profile_name_fn: Callable[[Any], Any] = lambda _source: None
+        self.profile_home_fn: Callable[[Any], Any] = lambda _source: None
 
     async def handle(self, event):
         return None
@@ -69,6 +74,12 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.seen_sources.append(source)
         return self._auth_fn(source)
+
+    def _profile_name_for_source(self, source):
+        return self.profile_name_fn(source)
+
+    def _require_served_profile_home(self, source):
+        return self.profile_home_fn(source)
 
 
 def _attach_auth_runner(adapter, auth_fn=None):
@@ -205,6 +216,30 @@ class TestSlackApprovalAction:
         ack.assert_called_once()
         mock_resolve.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_click_auth_preserves_workspace_and_thread_scope(self):
+        adapter = _make_adapter()
+        adapter._is_interactive_user_authorized = MagicMock(return_value=False)
+
+        await adapter._handle_approval_action(
+            AsyncMock(),
+            {
+                "team": {"id": "T_SECONDARY"},
+                "message": {"ts": "222.001", "thread_ts": "111.000", "blocks": []},
+                "channel": {"id": "C_SHARED"},
+                "user": {"name": "operator", "id": "U_OK"},
+            },
+            {"action_id": "hermes_approve_once", "value": "session-key"},
+        )
+
+        adapter._is_interactive_user_authorized.assert_called_once_with(
+            "U_OK",
+            channel_id="C_SHARED",
+            user_name="operator",
+            team_id="T_SECONDARY",
+            thread_id="111.000",
+        )
+
 
 class TestSlackInteractiveAuth:
     def test_delegates_to_gateway_runner_auth(self):
@@ -226,6 +261,55 @@ class TestSlackInteractiveAuth:
         assert runner.seen_sources[0].platform == Platform.SLACK
         assert runner.seen_sources[0].chat_id == "C1"
         assert runner.seen_sources[0].chat_type == "group"
+
+    def test_thread_route_outranks_channel_route(self):
+        adapter = _make_adapter()
+        runner = _attach_auth_runner(adapter)
+        runner.profile_name_fn = lambda source: (
+            "thread-profile" if source.thread_id == "111.000" else "channel-profile"
+        )
+        adapter.gateway_runner = runner  # type: ignore[assignment]
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OK",
+            channel_id="C1",
+            team_id="T1",
+            thread_id="111.000",
+        ) is True
+
+        assert runner.seen_sources[-1].thread_id == "111.000"
+        assert runner.seen_sources[-1].profile == "thread-profile"
+
+    def test_authorizes_inside_routed_profile_secret_scope(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_scope import get_secret
+
+        secondary = tmp_path / "secondary"
+        secondary.mkdir()
+        (secondary / ".env").write_text("GATEWAY_ALLOWED_USERS=U_SECONDARY\n")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_DEFAULT")
+
+        adapter = _make_adapter()
+        runner = _attach_auth_runner(adapter)
+        runner.config = SimpleNamespace(multiplex_profiles=True)
+        runner.profile_name_fn = lambda _source: "secondary"
+        runner.profile_home_fn = lambda _source: secondary
+        runner._auth_fn = lambda source: (
+            get_secret("GATEWAY_ALLOWED_USERS") == source.user_id
+        )
+        adapter.gateway_runner = runner  # type: ignore[assignment]
+
+        assert adapter._is_interactive_user_authorized(
+            "U_SECONDARY",
+            channel_id="C1",
+            team_id="T1",
+        ) is True
+        assert adapter._is_interactive_user_authorized(
+            "U_DEFAULT",
+            channel_id="C1",
+            team_id="T1",
+        ) is False
 
 
 class TestSlackSlashConfirmAction:

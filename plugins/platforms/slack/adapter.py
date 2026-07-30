@@ -1694,7 +1694,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] response_url POST failed: %s",
                 _sanitized_slack_error(e),
             )
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=SEND_FAILED_ERROR)
 
     async def _post_ephemeral_fallback(
         self,
@@ -1744,7 +1744,11 @@ class SlackAdapter(BasePlatformAdapter):
                     )
             return SendResult(success=True, message_id=None)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            logger.warning(
+                "[Slack] chat.postEphemeral failed: %s",
+                _sanitized_slack_error(e),
+            )
+            return SendResult(success=False, error=SEND_FAILED_ERROR)
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge existing installs to reinstall when group-DM scopes are absent.
@@ -4758,7 +4762,11 @@ class SlackAdapter(BasePlatformAdapter):
         auth_fn = getattr(self._gateway_runner(), "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                return bool(auth_fn(source))
+                # Multiplexed allowlists live in the routed profile's secret
+                # scope. Authorizing outside it makes get_secret() fall back to
+                # the process-default profile and can admit the wrong user.
+                with self._profile_runtime_scope_for(source):
+                    return bool(auth_fn(source))
             except Exception:
                 logger.warning(
                     "[Slack] Custom-message authorization failed closed",
@@ -4776,9 +4784,9 @@ class SlackAdapter(BasePlatformAdapter):
         memory) and the credential scope match what an ordinary agent turn for
         this source would see. A no-op on single-profile gateways.
 
-        Needed because a handled custom message *replaces* the agent turn —
-        it never reaches ``handle_message``, so it would otherwise run under
-        whichever profile happens to own the process.
+        Needed for pre-dispatch operations such as custom-message authorization,
+        custom handlers, and interactive authorization. None reaches the normal
+        agent-turn scope before consulting profile-owned credentials or state.
         """
         from contextlib import nullcontext
 
@@ -4790,7 +4798,7 @@ class SlackAdapter(BasePlatformAdapter):
             # execute it against whichever profile's HERMES_HOME owns the
             # process. Raise so the caller consumes the message instead.
             raise RuntimeError(
-                "cannot determine the owning profile for a custom Slack message"
+                "cannot determine the owning profile for this Slack operation"
             )
         try:
             from gateway.run import _profile_runtime_scope
@@ -4806,7 +4814,7 @@ class SlackAdapter(BasePlatformAdapter):
             return _profile_runtime_scope(resolve(source))
         except Exception:
             logger.warning(
-                "[Slack] Could not enter routed profile scope; custom message will fail closed",
+                "[Slack] Could not enter routed profile scope; operation will fail closed",
                 exc_info=True,
             )
             raise
@@ -4827,14 +4835,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         Contract, and the reason this is split from :meth:`_on_custom_message`:
 
-        * **Sync and side-effect-free.**  It runs on every inbound message,
-          including ones that are about to be dropped.  Do not send, mutate
+        * **Sync and side-effect-free.**  It may run on messages that the
+          routed authorization or mention gate will drop.  Do not send, mutate
           state, or do I/O here — parse and return.
-        * **It runs before mention gating and before user authorization**, so
-          that a bare top-level ``!log`` is recognisable at all.  Classifying
-          is deliberately the one stage that precedes auth; nothing a token
-          buys takes effect until the caller has been authorized.  A returned
-          token then waives *only* the mention/session gate
+        * **It runs before mention gating and before this seam's routed
+          authorization**, so that a bare top-level ``!log`` is recognisable at
+          all. Adapter-wide guards may already reject bot/self messages,
+          duplicates, ignored channels, or unauthorized media senders before
+          this method is reached. Nothing a token buys takes effect until the
+          routed caller has been authorized. A returned token then waives
+          *only* the mention/session gate
           (``require_mention`` / ``strict_mention`` / bot-thread /
           active-session).  It never waives user authorization, the
           ``allowed_channels`` whitelist, the bot/self-message filters, dedup,
@@ -5867,14 +5877,25 @@ class SlackAdapter(BasePlatformAdapter):
         _runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         _auth_fn = getattr(_runner, "_is_user_authorized", None)
         if user_id and callable(_auth_fn):
-            _source = self.build_source(
-                chat_id=channel_id,
-                chat_name="",
-                chat_type="dm" if is_dm else "group",
+            _source = self._build_message_source(
+                channel_id=channel_id,
+                is_dm=is_dm,
                 user_id=user_id,
-                user_name="",
+                thread_ts=event.get("thread_ts") or assistant_meta.get("thread_ts"),
+                team_id=team_id,
+                event=event,
             )
-            if not _auth_fn(_source):
+            try:
+                with self._profile_runtime_scope_for(_source):
+                    early_authorized = bool(_auth_fn(_source))
+            except Exception:
+                logger.warning(
+                    "[Slack] Early authorization failed closed for user %s in channel %s",
+                    user_id,
+                    channel_id,
+                )
+                return
+            if not early_authorized:
                 logger.warning(
                     "[Slack] Early reject of unauthorized user %s in channel %s",
                     user_id,
@@ -5986,8 +6007,8 @@ class SlackAdapter(BasePlatformAdapter):
         # Stage 1 of the custom-message seam (see CUSTOM_MESSAGE_HOOK_VERSION).
         # Sync and side-effect-free by contract: it only labels the message so
         # the mention gate below can let a custom command through. Classifying
-        # is the one stage allowed to run before user auth — the token is not
-        # honoured until the authorization check right after this.
+        # does not authorize anything — the token is not honoured until the
+        # routed authorization check right after this.
         # Runs on the raw pre-rewrite text minus our own mention, so a subclass
         # sees the leading "!" as typed in both "!log" and "<@bot> !log".
         classification_text = raw_text
@@ -7017,6 +7038,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        thread_id: str = "",
     ) -> Any:
         """Build the routed ``SessionSource`` a Slack interactive payload speaks for.
 
@@ -7026,9 +7048,9 @@ class SlackAdapter(BasePlatformAdapter):
         channel would. Without that, the routed profile is never even a
         candidate and the caller cannot tell whose policy applies.
 
-        A button click carries no thread identity we need for authorization —
-        ``thread_id`` is deliberately left unset, mirroring the pre-existing
-        stand-in source this replaces.
+        Slack includes ``message.thread_ts`` for buttons posted inside a thread.
+        Preserve it so a thread-specific profile route authorizes the click
+        under the same profile that rendered the button.
         """
         chat_id = str(channel_id or user_id)
         return self.build_source(
@@ -7037,6 +7059,7 @@ class SlackAdapter(BasePlatformAdapter):
             chat_type="dm" if str(channel_id or "").startswith("D") else "group",
             user_id=user_id,
             user_name=str(user_name).strip() if user_name else None,
+            thread_id=str(thread_id) if thread_id else None,
             scope_id=str(team_id) if team_id else None,
         )
 
@@ -7152,6 +7175,7 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        thread_id: str = "",
     ) -> bool:
         """Return whether a Slack interactive caller may perform gated actions.
 
@@ -7186,6 +7210,7 @@ class SlackAdapter(BasePlatformAdapter):
                 channel_id=channel_id,
                 user_name=user_name,
                 team_id=team_id,
+                thread_id=thread_id,
             )
         except Exception:
             logger.warning(
@@ -7211,7 +7236,8 @@ class SlackAdapter(BasePlatformAdapter):
         auth_fn = getattr(self._gateway_runner(), "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                return bool(auth_fn(source))
+                with self._profile_runtime_scope_for(source):
+                    return bool(auth_fn(source))
             except Exception:
                 logger.warning(
                     "[Slack] Interactive authorization failed closed for user %s",
@@ -7284,6 +7310,9 @@ class SlackAdapter(BasePlatformAdapter):
         value = action.get("value", "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
+        thread_id = message.get("thread_ts") or body.get("container", {}).get(
+            "thread_ts", ""
+        )
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
@@ -7292,6 +7321,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id=channel_id,
             user_name=user_name,
             team_id=team_id,
+            thread_id=thread_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized slash-confirm click by %s (%s) - ignoring",
@@ -7444,6 +7474,9 @@ class SlackAdapter(BasePlatformAdapter):
         session_key = action.get("value", "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
+        thread_id = message.get("thread_ts") or body.get("container", {}).get(
+            "thread_ts", ""
+        )
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
@@ -7453,6 +7486,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_id=channel_id,
             user_name=user_name,
             team_id=team_id,
+            thread_id=thread_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized approval click by %s (%s) - ignoring",
@@ -7607,14 +7641,20 @@ class SlackAdapter(BasePlatformAdapter):
         value = action.get("value", "")
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
+        thread_id = message.get("thread_ts") or body.get("container", {}).get(
+            "thread_ts", ""
+        )
         channel_id = body.get("channel", {}).get("id", "")
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
+        team_id = self._event_team_id({}, body)
 
         if not self._is_interactive_user_authorized(
             user_id,
             channel_id=channel_id,
             user_name=user_name,
+            team_id=team_id,
+            thread_id=thread_id,
         ):
             logger.warning(
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",

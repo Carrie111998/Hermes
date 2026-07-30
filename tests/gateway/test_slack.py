@@ -1499,7 +1499,9 @@ class _FakeRunner:
     the one policy every inbound message is judged by).
     """
 
-    def __init__(self, *, multiplex=False, routes=None, homes=None, authorized=True):
+    def __init__(
+        self, *, multiplex=False, routes=None, homes=None, authorized: object = True
+    ):
         self.config = SimpleNamespace(multiplex_profiles=multiplex)
         self._routes = routes or {}
         self._homes = homes or {}
@@ -1876,6 +1878,38 @@ class TestCustomMessageHook:
         a.send.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_custom_command_auth_runs_inside_routed_secret_scope(
+        self, tmp_path, monkeypatch
+    ):
+        """Secondary-profile allowlists must not fall back to process secrets."""
+        from agent.secret_scope import get_secret
+
+        secondary = tmp_path / "secondary"
+        secondary.mkdir()
+        (secondary / ".env").write_text("GATEWAY_ALLOWED_USERS=U_USER\n")
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "U_DEFAULT")
+        observed = []
+
+        def authorized(source):
+            observed.append(get_secret("GATEWAY_ALLOWED_USERS"))
+            return observed[-1] == source.user_id
+
+        runner = _FakeRunner(
+            multiplex=True,
+            routes={"C_SECONDARY": "secondary"},
+            homes={"secondary": secondary},
+        )
+        runner.authorized = authorized
+        a = self._make_adapter(handled=True, runner=runner)
+
+        await a._handle_slack_message(
+            self._make_event("!log", channel_type="channel", channel="C_SECONDARY")
+        )
+
+        assert observed == ["U_USER"]
+        assert len(a.hook_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_hook_runs_inside_the_routed_profile_runtime_scope(self, tmp_path):
         """The hook resolves config/skills/memory against its own profile home.
 
@@ -1917,8 +1951,10 @@ class TestCustomMessageHook:
 
         assert a.hook_calls == []
         handle_mock.assert_not_called()
-        send_mock.assert_awaited_once()
-        assert send_mock.await_args.kwargs["metadata"] == {}
+        # Authorization could not be evaluated under the owning profile, so do
+        # not reveal command handling to a caller whose identity is still
+        # untrusted.
+        send_mock.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_hook_scope_is_released_after_the_hook_returns(self, tmp_path):
@@ -5711,6 +5747,67 @@ class TestSendErrorSanitization:
         assert self.TOKEN not in blob
         assert self.TOKEN not in (result.error or "")
         assert "RuntimeError" in blob, "the exception type should still be logged"
+
+    def test_response_url_failure_does_not_escape_through_send_result(self, caplog):
+        """aiohttp exceptions can contain the credential-bearing response_url."""
+        adapter = self._adapter()
+
+        token = self.TOKEN
+
+        class _RaisingSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, *args, **kwargs):
+                raise RuntimeError(f"request failed at {args[0]} {token}")
+
+        with (
+            patch.object(
+                _slack_mod.aiohttp,
+                "ClientSession",
+                return_value=_RaisingSession(),
+            ),
+            caplog.at_level(logging.DEBUG),
+        ):
+            result = asyncio.run(
+                adapter._send_slash_ephemeral(
+                    {"response_url": f"https://hooks.slack.com/actions/{self.TOKEN}"},
+                    "hello",
+                )
+            )
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert result.success is False
+        assert self.TOKEN not in (result.error or "")
+        assert self.TOKEN not in blob
+        assert "RuntimeError" in blob
+
+    def test_post_ephemeral_failure_does_not_escape_through_send_result(self, caplog):
+        """The Web API fallback also returns and logs only sanitized errors."""
+        adapter = self._adapter()
+        client = AsyncMock()
+        client.chat_postEphemeral = AsyncMock(
+            side_effect=RuntimeError(f"Slack request carried {self.TOKEN}")
+        )
+        adapter._get_client = MagicMock(return_value=client)
+
+        with caplog.at_level(logging.DEBUG):
+            result = asyncio.run(
+                adapter._post_ephemeral_fallback(
+                    "C1",
+                    {"user_id": "U1"},
+                    "hello",
+                )
+            )
+
+        blob = "\n".join(r.getMessage() for r in caplog.records)
+        assert result.success is False
+        assert self.TOKEN not in (result.error or "")
+        assert self.TOKEN not in blob
+        assert "RuntimeError" in blob
 
     def test_junk_error_code_is_dropped(self, caplog):
         """Only the known slug shape is trusted; anything else is dropped."""
