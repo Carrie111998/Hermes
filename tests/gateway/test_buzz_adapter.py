@@ -634,6 +634,75 @@ def test_interactive_setup_resolves_cli_and_reprompts_invalid_auth_tag(monkeypat
     assert any("must be valid JSON" in warning for warning in warnings)
 
 
+def test_interactive_setup_live_probe_never_joins_dm_shaped_channels(monkeypatch):
+    import hermes_cli.setup as setup_mod
+    import subprocess
+
+    answers = iter(
+        [
+            "https://community.example",
+            "nsec1test",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    )
+    yes_no_answers = iter([True, False, True])
+    saved = {}
+    subprocess_calls = []
+
+    def fake_run(args, **_kwargs):
+        subprocess_calls.append(args)
+        if args[1:] == ["channels", "list"]:
+            return MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "channel_id": DM_CHANNEL,
+                            "name": "DM",
+                            "description": "",
+                        },
+                        {
+                            "channel_id": CHANNEL,
+                            "name": "general",
+                            "description": "General conversation",
+                        },
+                    ]
+                ),
+                stderr="",
+            )
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(setup_mod, "prompt", lambda *_args, **_kwargs: next(answers))
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt_yes_no",
+        lambda *_args, **_kwargs: next(yes_no_answers),
+    )
+    monkeypatch.setattr(setup_mod, "get_env_value", lambda key: saved.get(key, ""))
+    monkeypatch.setattr(setup_mod, "save_env_value", saved.__setitem__)
+    monkeypatch.setattr(setup_mod, "print_header", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(setup_mod, "print_info", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(setup_mod, "print_success", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(setup_mod, "print_warning", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(_buzz_mod, "_resolve_cli_path", lambda *_args, **_kwargs: "/bin/buzz")
+    monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda *_args, **_kwargs: "nsec1test")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _buzz_mod.interactive_setup()
+
+    join_calls = [
+        args for args in subprocess_calls if args[1:3] == ["channels", "join"]
+    ]
+    assert join_calls == [
+        ["/bin/buzz", "channels", "join", "--channel", CHANNEL]
+    ]
+    assert all(DM_CHANNEL not in args for args in subprocess_calls)
+
+
 def test_buzz_recommended_setup_steps_cover_field_path():
     steps = "\n".join(_buzz_recommended_setup_steps())
     assert "Desktop" in steps

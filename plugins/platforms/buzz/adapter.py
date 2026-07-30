@@ -320,6 +320,13 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _is_dm_shaped_channel(channel: dict) -> bool:
+    """Return whether a ``channels list`` entry is a relay-materialized DM."""
+    name = str(channel.get("name") or "").strip()
+    description = str(channel.get("description") or "").strip()
+    return name == "DM" and not description
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -1103,9 +1110,7 @@ class BuzzAdapter(BasePlatformAdapter):
         meta = self._channel_meta.get(channel_id)
         if meta is None:
             return channel_id not in self.channels
-        name = str(meta.get("name") or "").strip()
-        description = str(meta.get("description") or "").strip()
-        return name == "DM" and not description
+        return _is_dm_shaped_channel(meta)
 
     def _is_direct_message_event(self, channel_id: str, event: dict) -> bool:
         """True when ``event`` is shaped like a direct message to us: a chat
@@ -1632,12 +1637,12 @@ def interactive_setup() -> None:
                     "auth tag, stop Desktop ACP, then re-run this setup."
                 )
             else:
-                try:
-                    channels_data = json.loads(listed.stdout or "[]")
-                except ValueError:
-                    channels_data = []
-                if not isinstance(channels_data, list):
-                    channels_data = []
+                channels_data = _parse_json_list(listed.stdout)
+                joinable_channels = [
+                    channel
+                    for channel in channels_data
+                    if not _is_dm_shaped_channel(channel)
+                ]
                 print_success(
                     f"Relay OK — {len(channels_data)} channel(s) visible to this identity"
                 )
@@ -1665,14 +1670,12 @@ def interactive_setup() -> None:
                             f"set-profile failed: {(prof.stderr or prof.stdout or '')[:200]}"
                         )
                 # Join assist — the field failure mode is "connected but unfindable"
-                if channels_data and prompt_yes_no(
-                    "Join all visible channels now so humans can DM/@mention this agent?",
+                if joinable_channels and prompt_yes_no(
+                    "Join all visible community channels now so humans can DM/@mention this agent?",
                     True,
                 ):
                     joined = 0
-                    for ch in channels_data:
-                        if not isinstance(ch, dict):
-                            continue
+                    for ch in joinable_channels:
                         cid = str(ch.get("channel_id") or "").strip()
                         if not cid:
                             continue
@@ -1689,7 +1692,7 @@ def interactive_setup() -> None:
                             print_warning(
                                 f"join {cid[:8]}… failed: {(j.stderr or j.stdout or '')[:160]}"
                             )
-                    print_success(f"Joined {joined}/{len(channels_data)} channel(s)")
+                    print_success(f"Joined {joined}/{len(joinable_channels)} channel(s)")
                 subprocess.run(
                     [cli_bin, "users", "set-presence", "--status", "online"],
                     capture_output=True,
