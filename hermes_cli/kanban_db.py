@@ -6818,6 +6818,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if os.name == "nt":
+        # Windows has no waitpid/WIFEXITED helpers. Supervised Popen.wait()
+        # callbacks encode their direct return code in the POSIX-compatible
+        # high byte before storing it in this shared registry.
+        code = int(raw) >> 8
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -7459,13 +7469,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    main_db_row = next(
+        (row for row in conn.execute("PRAGMA database_list") if row[1] == "main"),
+        None,
+    )
+    main_db_path = str(Path(main_db_row[2]).resolve()) if main_db_row and main_db_row[2] else None
+    supervisor = (
+        _dispatcher_worker_supervisors.get(main_db_path) if main_db_path else None
+    )
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
+            active_pid = supervisor.active_pid(row["id"]) if supervisor is not None else None
+            if active_pid is not None:
+                if int(row["worker_pid"]) != active_pid:
+                    conn.execute(
+                        "UPDATE tasks SET worker_pid = ? "
+                        "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                        (active_pid, row["id"], row["current_run_id"]),
+                    )
+                continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -8177,6 +8204,29 @@ def dispatch_once(
         return result
 
 
+def _invoke_dispatch_spawn(
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Optional[int]:
+    """Invoke the test seam or the dispatcher-owned production supervisor."""
+    if spawn_fn is None:
+        return _start_supervised_worker(task, workspace, board=board)
+
+    # Back-compat: older spawn_fn signatures accept only (task, workspace).
+    # Introspect the callable and pass `board` only when supported.
+    import inspect
+    try:
+        sig = inspect.signature(spawn_fn)
+        if "board" in sig.parameters:
+            return spawn_fn(task, workspace, board=board)
+        return spawn_fn(task, workspace)
+    except (TypeError, ValueError):
+        return spawn_fn(task, workspace)
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -8456,20 +8506,10 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_dispatch_spawn(
+                spawn_fn, claimed, str(workspace), board=board,
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures
@@ -8554,17 +8594,10 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_dispatch_spawn(
+                spawn_fn, claimed, str(workspace), board=board,
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
@@ -8867,18 +8900,121 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _default_spawn(
+_dispatcher_worker_supervisors: dict[str, Any] = {}
+
+
+def _dispatcher_worker_supervisor(*, board: Optional[str] = None):
+    """Return the long-lived process owner for one resolved board."""
+    from hermes_cli.worker_supervisor import DispatcherWorkerSupervisor
+
+    db_path = kanban_db_path(board=board).resolve()
+    key = str(db_path)
+    supervisor = _dispatcher_worker_supervisors.get(key)
+    if supervisor is None:
+        supervisor = DispatcherWorkerSupervisor(
+            event_root=db_path.parent / "worker-lifecycle",
+        )
+        _dispatcher_worker_supervisors[key] = supervisor
+    return supervisor
+
+
+def signal_worker_recovery(
+    task_id: str,
+    reason: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Deliver one explicit recovery signal to a supervised board worker."""
+    key = str(kanban_db_path(board=board).resolve())
+    supervisor = _dispatcher_worker_supervisors.get(key)
+    return bool(supervisor and supervisor.signal_recovery(task_id, reason))
+
+
+def _record_supervised_worker_exit(attempt_exit) -> None:
+    """Retain a Popen.wait return code for existing crash classification."""
+    returncode = int(attempt_exit.exit_code)
+    raw_status = returncode << 8 if returncode >= 0 else -returncode
+    _record_worker_exit(int(attempt_exit.pid), raw_status)
+
+
+def _start_supervised_worker(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Launch and retain a real dispatcher child under lifecycle supervision."""
+    from hermes_cli.worker_supervisor import WorkerIdentity
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    session_id = task.session_id or f"kanban:{task.id}:{task.current_run_id or 0}"
+    identity = WorkerIdentity(task.id, session_id, Path(workspace))
+    db_path = kanban_db_path(board=board).resolve()
+    stable_run_id = task.current_run_id
+
+    def launch(_identity, attempt: int, event_path: Path):
+        proc = _default_spawn(
+            task,
+            workspace,
+            board=board,
+            lifecycle_event_path=event_path,
+            lifecycle_attempt=attempt,
+        )
+        if attempt > 1:
+            retry_conn = connect(db_path)
+            try:
+                with write_txn(retry_conn):
+                    retry_conn.execute(
+                        "UPDATE tasks SET worker_pid = ? "
+                        "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                        (int(proc.pid), task.id, stable_run_id),
+                    )
+            finally:
+                retry_conn.close()
+        return proc
+
+    def on_exit(attempt_exit) -> None:
+        _record_supervised_worker_exit(attempt_exit)
+        event_conn = connect(db_path)
+        try:
+            with write_txn(event_conn):
+                _append_event(
+                    event_conn, task.id, "worker_attempt_exit",
+                    attempt_exit.as_dict(), run_id=stable_run_id,
+                )
+        finally:
+            event_conn.close()
+
+    supervisor = _dispatcher_worker_supervisor(board=board)
+    initial_event_path = supervisor.allocate_event_path(identity, 1)
+    initial_proc = _default_spawn(
+        task,
+        workspace,
+        board=board,
+        lifecycle_event_path=initial_event_path,
+        lifecycle_attempt=1,
+    )
+    handle = supervisor.start(
+        identity,
+        launch,
+        on_exit=on_exit,
+        initial_proc=initial_proc,
+        initial_event_path=initial_event_path,
+    )
+    return handle.pid
+
+
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    lifecycle_event_path: Optional[Path] = None,
+    lifecycle_attempt: int = 1,
+):
+    """Spawn ``hermes -p <profile> chat -q ...`` and return its live handle.
+
+    The child is started in a new session/process group so it survives gateway
+    restarts and can be cleanly killed as a unit.
 
     ``board`` pins the child's kanban context to that board: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
@@ -8932,6 +9068,9 @@ def _default_spawn(
     # sidebar renders one row per attempt, labeled with the worker's own prompt
     # ("work kanban task t_…").
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    if lifecycle_event_path is not None:
+        env["HERMES_WORKER_LIFECYCLE_EVENT_PATH"] = str(lifecycle_event_path)
+        env["HERMES_WORKER_LIFECYCLE_ATTEMPT"] = str(int(lifecycle_attempt))
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -9074,7 +9213,7 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    return proc
 
 
 # ---------------------------------------------------------------------------

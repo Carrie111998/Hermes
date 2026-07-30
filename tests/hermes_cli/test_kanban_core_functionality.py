@@ -723,8 +723,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
                              assignee="some-profile")
         task = kb.get_task(conn, tid)
         workspace = kb.resolve_workspace(task)
-        pid = kb._default_spawn(task, str(workspace))
-        assert pid == 99999
+        proc = kb._default_spawn(task, str(workspace))
+        assert isinstance(proc, FakeProc)
+        assert proc.pid == 99999
     finally:
         conn.close()
 
