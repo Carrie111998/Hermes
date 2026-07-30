@@ -311,6 +311,47 @@ def test_ssh_setup_warns_on_timeout(tmp_path, monkeypatch, capsys):
     assert "timed out" in out
 
 
+def test_ssh_setup_warns_on_oserror(tmp_path, monkeypatch, capsys):
+    """`subprocess.run` can still raise OSError *after* a successful precheck.
+
+    The `shutil.which("ssh") is None` guard only proves a name resolved on
+    PATH at that instant. The exec itself can fail afterwards: the resolved
+    file is not executable (PermissionError), a wrapper shim is a dangling
+    symlink or was removed in between (FileNotFoundError), the binary is a
+    corrupt/foreign-arch image (OSError EXEC_FORMAT_ERROR), or the process
+    table is exhausted. All are OSError.
+
+    `test_ssh_setup_warns_when_ssh_client_missing` cannot cover this: it
+    returns None from `shutil.which`, so it exits at the precheck and never
+    reaches `subprocess.run`. This test forces the opposite — the precheck
+    passes and the exec is what fails — so it is the only coverage for the
+    `except OSError` branch.
+    """
+    config = _drive_ssh_backend(monkeypatch, tmp_path)
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ssh")
+
+    ran = []
+
+    def _permission_denied(*_a, **_k):
+        ran.append(True)
+        raise PermissionError("Permission denied")
+
+    monkeypatch.setattr("subprocess.run", _permission_denied)
+
+    setup_mod.setup_terminal_backend(config)
+
+    # The precheck really was cleared and the exec really was attempted —
+    # otherwise this would be the missing-client test wearing a new name.
+    assert ran, "subprocess.run was never reached; the precheck short-circuited"
+
+    out = capsys.readouterr().out
+    assert "Could not run the SSH client" in out
+    # The OS reason is surfaced, not swallowed into a generic message.
+    assert "Permission denied" in out
+    assert "SSH client not found" not in out
+    assert "SSH connection successful" not in out
+
+
 def test_ssh_setup_reports_success(tmp_path, monkeypatch, capsys):
     """Positive control: a returncode==0 result still reports success, so the
     warning-path tests cannot pass vacuously."""
