@@ -242,20 +242,69 @@ class TestRealNaClDecrypt:
 class TestRealNaClWithDAVE:
     """NaCl decrypt + DAVE passthrough scenarios with real crypto."""
 
-    def test_dave_unknown_ssrc_passthrough(self):
-        """DAVE enabled but SSRC unknown → skip DAVE, buffer audio."""
+    def test_dave_unknown_ssrc_encrypted_never_decoded(self):
+        """DAVE + unknown SSRC + non-inferable → payload never Opus-decoded.
+
+        Regression for the live first-utterance corruption: with DAVE
+        active, an unmapped SSRC payload is still DAVE-encrypted.  It must
+        never reach the Opus decoder, the PCM buffer, or a completed
+        utterance — regardless of how much energy the ciphertext carries.
+        """
         key = _make_secret_key()
         dave = MagicMock()  # DAVE session present but SSRC not mapped
-        receiver = _make_voice_receiver(key, dave_session=dave)
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Bob"),
+        ]
+        receiver = _make_voice_receiver(key, dave_session=dave, members=members)
 
-        packet = _build_encrypted_rtp_packet(key, b'\xf8\xff\xfe', ssrc=100)
-        receiver._on_packet(packet)
+        # Full utterance worth of frames (real Opus tone payloads standing
+        # in for still-DAVE-encrypted bytes from the receiver's viewpoint).
+        _send_opus_tone(receiver, key, ssrc=100)
 
-        # DAVE decrypt not called (SSRC unknown)
         dave.decrypt.assert_not_called()
-        # Audio still buffered via passthrough
-        assert 100 in receiver._buffers
-        assert len(receiver._buffers[100]) > 0
+        assert 100 not in receiver._decoders
+        assert len(receiver._buffers.get(100, b"")) == 0
+
+        # Even after the silence window, nothing completes.
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+        assert receiver.check_silence() == []
+
+    def test_dave_unknown_ssrc_inferred_first_utterance_preserved(self):
+        """DAVE + unknown SSRC + sole allowed member → first utterance kept.
+
+        Identity is inferred at packet time, DAVE decrypt runs with the
+        inferred sender, and the flushed utterance is attributed to that
+        user with its speech energy intact.
+        """
+        key = _make_secret_key()
+        dave = MagicMock()
+        dave.decrypt.side_effect = lambda user_id, media_type, data: data
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+        ]
+        receiver = _make_voice_receiver(
+            key, dave_session=dave, allowed_user_ids={"42"}, members=members,
+        )
+        # No map_ssrc call — simulating missing SPEAKING event after join.
+
+        _send_opus_tone(receiver, key, ssrc=100)
+
+        assert receiver._ssrc_to_user[100] == 42
+        assert dave.decrypt.call_count > 0
+        assert all(
+            call.args[0] == 42 for call in dave.decrypt.call_args_list
+        )
+
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+        completed = receiver.check_silence()
+        assert len(completed) == 1
+        assert completed[0][0] == 42
+        # Real tone PCM survived both DAVE and the speech gate.
+        has_speech, _ = VoiceReceiver._pcm_speech_activity(completed[0][1])
+        assert has_speech
 
     def test_dave_unencrypted_error_passthrough(self):
         """DAVE raises 'Unencrypted' → use NaCl-decrypted data as-is."""
@@ -326,13 +375,19 @@ class TestRTPPaddingStrip:
         """Padding stripped before DAVE → passthrough buffers cleanly."""
         key = _make_secret_key()
         opus_silence = b"\xf8\xff\xfe"
-        dave = MagicMock()  # SSRC unmapped → DAVE skipped, passthrough used
+        dave = MagicMock()
+        dave.decrypt.side_effect = Exception(
+            "DecryptionFailed(UnencryptedWhenPassthroughDisabled)"
+        )
         receiver = _make_voice_receiver(key, dave_session=dave)
+        receiver.map_ssrc(100, 42)
 
         packet = _build_padded_rtp_packet(key, opus_silence, pad_len=4, ssrc=100)
         receiver._on_packet(packet)
 
-        dave.decrypt.assert_not_called()
+        # DAVE saw the padding-stripped payload and declared it unencrypted.
+        dave.decrypt.assert_called_once()
+        assert dave.decrypt.call_args[0][2] == opus_silence
         assert 100 in receiver._buffers
         assert len(receiver._buffers[100]) > 0
 

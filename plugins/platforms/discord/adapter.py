@@ -465,6 +465,10 @@ class VoiceReceiver:
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
 
+        # Content-free counters: packets dropped because DAVE is active but
+        # the sender SSRC is neither mapped nor inferable (no user IDs).
+        self._dave_unresolved_drops: Dict[int, int] = {}
+
         # Pause flag: don't capture while bot is playing TTS
         self._paused = False
 
@@ -499,6 +503,7 @@ class VoiceReceiver:
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
+            self._dave_unresolved_drops.clear()
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -532,7 +537,7 @@ class VoiceReceiver:
                 ssrc = data.get("ssrc")
                 user_id = data.get("user_id")
                 if ssrc and user_id:
-                    logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
+                    logger.info("SPEAKING event: ssrc=%d mapped to user", ssrc)
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
             if original_hook:
                 await original_hook(ws, msg)
@@ -658,7 +663,19 @@ class VoiceReceiver:
         if self._dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id:
+                # SPEAKING can lag or be missing after a (re)join.  Resolve
+                # the sender now, at packet time: DAVE needs the sender's
+                # user_id to pick the right ratchet, and waiting for the
+                # silence flush is too late for the first utterance.
+                # NOTE: _infer_user_for_ssrc writes _ssrc_to_user without
+                # the lock — a single GIL-atomic dict store, idempotent,
+                # and _on_packet runs on the single SocketReader thread.
+                user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
+                # Resolved — reset the drop counter so the dict only ever
+                # holds currently-unresolved SSRCs.
+                self._dave_unresolved_drops.pop(ssrc, None)
                 try:
                     import davey
                     decrypted = self._dave_session.decrypt(
@@ -670,9 +687,22 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            else:
+                # Sender unknown and not inferable: with DAVE active the
+                # payload is almost certainly still DAVE-encrypted.  Feeding
+                # it to the Opus decoder buffers noise that survives the
+                # energy gate and corrupts the first utterance (live repro).
+                # Drop until SPEAKING/inference maps the SSRC; no decoder is
+                # created, so a later mapping starts from a clean state.
+                drops = self._dave_unresolved_drops.get(ssrc, 0) + 1
+                self._dave_unresolved_drops[ssrc] = drops
+                if drops == 1 or drops % 50 == 0:
+                    logger.info(
+                        "DAVE active with unresolved sender: dropping "
+                        "encrypted packets (ssrc=%d drops=%d)",
+                        ssrc, drops,
+                    )
+                return
 
         # --- Opus decode -> PCM ---
         try:
@@ -767,24 +797,30 @@ class VoiceReceiver:
         """Try to infer user_id for an unmapped SSRC.
 
         When the bot rejoins a voice channel, Discord may not resend
-        SPEAKING events for users already speaking.  If exactly one
-        allowed user is in the channel, map the SSRC to them.
+        SPEAKING events for users already speaking.  Inference is only
+        safe when exactly one non-bot human is in the channel: with two
+        or more humans an unknown SSRC cannot be attributed without
+        risking cross-user misattribution — allowlist filtering does NOT
+        make it safe, because a non-allowed user's packets still arrive.
         """
         try:
             channel = self._vc.channel
             if not channel:
                 return 0
             bot_id = self._vc.user.id if self._vc.user else 0
+            humans = [m for m in channel.members if m.id != bot_id]
+            if len(humans) != 1:
+                return 0
+            member = humans[0]
             allowed = self._allowed_user_ids
-            candidates = [
-                m.id for m in channel.members
-                if m.id != bot_id and (not allowed or str(m.id) in allowed)
-            ]
-            if len(candidates) == 1:
-                uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
-                logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
-                return uid
+            if allowed and str(member.id) not in allowed:
+                return 0
+            uid = member.id
+            self._ssrc_to_user[ssrc] = uid
+            logger.info(
+                "Auto-mapped ssrc=%d to sole channel member", ssrc,
+            )
+            return uid
         except Exception:
             pass
         return 0
