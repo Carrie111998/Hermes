@@ -91,14 +91,14 @@ gateway:
     always_plural:         "✅ تمت الموافقة على الأوامر (النمط مُوافق عليه دائمًا) ({count} أوامر). الوكيل يستأنف..."
 
   auto_reset:
-    notice:                "◐ Session automatically reset ({reason}). Conversation history cleared.\nUse /resume to browse and restore a previous session.\nAdjust reset timing in config.yaml under session_reset."
-    reason_suspended:      "previous session was stopped or interrupted"
-    reason_resume_pending_expired: "gateway restart recovery timed out"
-    reason_daily:          "daily schedule at {hour}:00"
-    reason_idle:           "inactive for {duration}"
-    duration_hours_minutes: "{hours}h {minutes}m"
-    duration_hours:        "{hours}h"
-    duration_minutes:      "{minutes}m"
+    notice:                "◐ تمت إعادة ضبط الجلسة تلقائيًا ({reason}). مُسح سجل المحادثة.\nاستخدم /resume لتصفّح جلسة سابقة واستعادتها.\nاضبط توقيت إعادة الضبط في config.yaml ضمن session_reset."
+    reason_suspended:      "أُوقفت الجلسة السابقة أو تمت مقاطعتها"
+    reason_resume_pending_expired: "انتهت مهلة الاستعادة بعد إعادة تشغيل البوابة"
+    reason_daily:          "الجدول اليومي عند الساعة {hour}:00"
+    reason_idle:           "عدم النشاط لمدة {duration}"
+    duration_hours_minutes: "{hours} ساعة و{minutes} دقيقة"
+    duration_hours:        "{hours} ساعة"
+    duration_minutes:      "{minutes} دقيقة"
 
   background:
     usage:                 "الاستخدام: /background <prompt>\nمثال: /background لخّص أهم قصص HN اليوم\n\nيشغّل الموجِّه في جلسة منفصلة. يمكنك متابعة المحادثة — ستظهر النتيجة هنا عند الانتهاء."
@@ -315,13 +315,13 @@ gateway:
     failed:                "{error}"
 
   session_info:
-    model:                 "◆ Model: `{model}`"
-    provider:              "◆ Provider: {provider}"
-    context:               "◆ Context: {context} tokens ({source})"
-    endpoint:              "◆ Endpoint: {endpoint}"
-    ctx_source_config:     "config"
-    ctx_source_default:    "default — set model.context_length in config to override"
-    ctx_source_detected:   "detected"
+    model:                 "◆ النموذج: `{model}`"
+    provider:              "◆ المزوّد: {provider}"
+    context:               "◆ السياق: {context} رمز ({source})"
+    endpoint:              "◆ نقطة النهاية: {endpoint}"
+    ctx_source_config:     "الإعدادات"
+    ctx_source_default:    "الافتراضي — اضبط model.context_length في الإعدادات لتغييره"
+    ctx_source_detected:   "مكتشف"
 
   set_home:
     save_failed:           "فشل حفظ القناة الرئيسية: {error}"

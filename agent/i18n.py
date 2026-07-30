@@ -206,9 +206,8 @@ def _config_language_cached() -> str | None:
 def get_config_language() -> str | None:
     """Read ``display.language`` from the current scoped home."""
     try:
-        from hermes_cli.config import load_config
-
-        cfg = load_config()
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
         lang = (cfg.get("display") or {}).get("language")
         if lang:
             return _normalize_lang(lang)
