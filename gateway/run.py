@@ -8743,6 +8743,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # idle case where the subagent finishes with no agent turn running.
         self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
 
+        # Start background watch-pattern watcher — drains watch_match /
+        # watch_disabled events from the completion queue when the session is
+        # idle (no agent turn running), covering the case where a
+        # watch_patterns match fires while no user message has triggered a
+        # new turn. Without this, notifications sit in the queue until the
+        # next user activity — observed as 14.5 min delays (#75065).
+        self._spawn_supervised(self._watch_pattern_watcher, "watch_pattern_watcher")
+
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
         # relay-only/absent, and a wakeUrl is registered (decisions.md D1/D11/
@@ -18516,6 +18524,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Async delegation injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
+            await asyncio.sleep(interval)
+
+    async def _watch_pattern_watcher(self, interval: float = 2.0) -> None:
+        """Drain watch-pattern completions and inject them as synthetic turns.
+
+        Background processes with ``watch_patterns`` emit ``watch_match`` /
+        ``watch_disabled`` events into ``process_registry.completion_queue``
+        from reader threads running in executor threads.  The post-turn
+        gateway drain (lines ~14413–14433) processes these events **only
+        after** an agent turn completes.  When the session is idle (no user
+        message triggering a new turn) the events sat in the queue until the
+        next user-initiated activity — observed as 14.5 minute delays for
+        ``watch_patterns`` notifications on idle Discord sessions (#75065).
+
+        This watcher covers the IDLE case: when a ``watch_match`` fires while
+        no agent turn is running, its result still re-enters the originating
+        session promptly.  Mirrors ``_async_delegation_watcher`` but drains
+        ``watch_match``/``watch_disabled`` instead of ``async_delegation``.
+        """
+        await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.process_registry import process_registry as _pr
+        while self._running:
+            try:
+                _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
+                for evt in _watch_events:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        await self._inject_watch_notification(synth_text, evt)
+                    except Exception as e:
+                        logger.error("Idle watch-pattern notification injection error: %s", e)
+            except Exception as e:
+                logger.debug("Watch-pattern idle watcher error: %s", e)
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
