@@ -1343,10 +1343,12 @@ display:
 #   pre_api_request, post_api_request, on_session_start, on_session_end,
 #   on_session_finalize, on_session_reset, subagent_stop
 #
-# First-use consent: each (event, command) pair prompts once on a TTY, then
-# is persisted to ~/.hermes/shell-hooks-allowlist.json.  Non-interactive
-# runs (gateway, cron) need --accept-hooks, HERMES_ACCEPT_HOOKS=1, or the
-# hooks_auto_accept key below.
+# First-use consent: each (event, command, matcher) triple prompts once on a
+# TTY, then is persisted to ~/.hermes/shell-hooks-allowlist.json.  Widening
+# matcher (e.g. terminal -> .*) requires a fresh approval.  Legacy allowlist
+# rows that omit matcher only authorize match-all (matcher absent/null).
+# Non-interactive runs (gateway, cron) need --accept-hooks,
+# HERMES_ACCEPT_HOOKS=1, or the hooks_auto_accept key below.
 #
 # See website/docs/user-guide/features/hooks.md for the full JSON wire
 # protocol and worked examples.

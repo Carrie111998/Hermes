@@ -597,7 +597,9 @@ class TestOpsEndpoints:
         assert "valid_events" in data and len(data["valid_events"]) >= 1
 
     def test_hook_create_and_delete(self):
-        # Create with consent approval.
+        from agent import shell_hooks
+
+        # Create with consent approval — matcher is part of the consent key.
         r = self.client.post(
             "/api/ops/hooks",
             json={
@@ -613,6 +615,18 @@ class TestOpsEndpoints:
         hooks = self.client.get("/api/ops/hooks").json()["hooks"]
         created = [h for h in hooks if h["command"] == "/bin/echo created"]
         assert created and created[0]["allowed"] is True
+        assert created[0]["matcher"] == "terminal"
+        assert created[0]["event"] == "pre_tool_call"
+
+        # Persisted allowlist row must keep the approved matcher (not match-all).
+        entry = shell_hooks.allowlist_entry_for(
+            "pre_tool_call", "/bin/echo created", "terminal",
+        )
+        assert entry is not None
+        assert entry.get("matcher") == "terminal"
+        assert shell_hooks.allowlist_entry_for(
+            "pre_tool_call", "/bin/echo created", ".*",
+        ) is None
 
         # Unknown event rejected.
         assert self.client.post(

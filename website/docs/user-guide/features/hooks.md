@@ -1305,7 +1305,7 @@ Shell hooks are registered by calling `agent.shell_hooks.register_from_config(cf
 | Events | `VALID_HOOKS` (incl. `subagent_stop`) | `VALID_HOOKS` | Gateway lifecycle (`gateway:startup`, `agent:*`, `command:*`) |
 | Can block a tool call | Yes (`pre_tool_call`) | Yes (`pre_tool_call`) | No |
 | Can inject LLM context | Yes (`pre_llm_call`) | Yes (`pre_llm_call`) | No |
-| Consent | First-use prompt per `(event, command)` pair | Implicit (Python plugin trust) | Implicit (dir trust) |
+| Consent | First-use prompt per `(event, command, matcher)` triple | Implicit (Python plugin trust) | Implicit (dir trust) |
 | Inter-process isolation | Yes (subprocess) | No (in-process) | No (in-process) |
 
 ### Configuration schema
@@ -1445,7 +1445,7 @@ printf '{}\n'
 
 ### Consent model
 
-Each unique `(event, command)` pair prompts the user for approval the first time Hermes sees it, then persists the decision to `~/.hermes/shell-hooks-allowlist.json`. Subsequent runs (CLI or gateway) skip the prompt.
+Each unique `(event, command, matcher)` triple prompts the user for approval the first time Hermes sees it, then persists the decision to `~/.hermes/shell-hooks-allowlist.json`. Subsequent runs (CLI or gateway) skip the prompt when the triple matches. Changing matcher scope (for example `terminal` to `.*`, or adding a matcher where none was set) requires a fresh approval — a prior approval does not cover a wider tool filter.
 
 Three escape hatches bypass the interactive prompt — any one is sufficient:
 
@@ -1455,15 +1455,20 @@ Three escape hatches bypass the interactive prompt — any one is sufficient:
 
 Non-TTY runs (gateway, cron, CI) need one of these three — otherwise any newly-added hook silently stays un-registered and logs a warning.
 
-**Script edits are silently trusted.** The allowlist keys on the exact command string, not the script's hash, so editing the script on disk does not invalidate consent. `hermes hooks doctor` flags mtime drift so you can spot edits and decide whether to re-approve.
+**Script edits are silently trusted.** The allowlist keys on the exact command string (plus event and matcher), not the script's hash, so editing the script on disk does not invalidate consent. `hermes hooks doctor` flags mtime drift so you can spot edits and decide whether to re-approve.
 
 #### Manual allowlisting
 
-Manual allowlisting is useful for non-TTY or service-account deployments where an operator cannot answer the first-use prompt interactively. The allowlist file is `~/.hermes/shell-hooks-allowlist.json`, and the expected format is an `approvals` array. Each approval records the hook `event` and the exact `command` string:
+Manual allowlisting is useful for non-TTY or service-account deployments where an operator cannot answer the first-use prompt interactively. The allowlist file is `~/.hermes/shell-hooks-allowlist.json`, and the expected format is an `approvals` array. Each approval records the hook `event`, the exact `command` string, and optionally `matcher` (normalized the same way as config — empty/omitted means match-all):
 
 ```json
 {
   "approvals": [
+    {
+      "event": "pre_tool_call",
+      "command": "/home/hermes/.hermes/hooks/block-rm-rf.sh",
+      "matcher": "terminal"
+    },
     {
       "event": "post_llm_call",
       "command": "/home/hermes/.hermes/hooks/my-hook.py"
@@ -1472,7 +1477,7 @@ Manual allowlisting is useful for non-TTY or service-account deployments where a
 }
 ```
 
-The command string must match the configured hook command exactly. A path-keyed object with a `sha256` field is not the expected format and will not approve the hook. Verify manual entries with `hermes hooks list`.
+The command string must match the configured hook command exactly. A row without `matcher` (or `"matcher": null`) only authorizes a match-all hook — it does **not** cover a later config that sets `matcher: ".*"`. A path-keyed object with a `sha256` field is not the expected format and will not approve the hook. Verify manual entries with `hermes hooks list`.
 
 ### The `hermes hooks` CLI
 
