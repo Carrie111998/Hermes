@@ -185,7 +185,22 @@ class HolographicMemoryProvider(MemoryProvider):
         # -- Auto-capture config --------------------------------------------------
         self._auto_capture = is_truthy_value(self._config.get("auto_capture", False))
         self._capture_interval = int(self._config.get("capture_interval", 5))
-        self._capture = None  # lazily initialized when ctx.llm becomes available
+        self._capture = None
+        self._msg_cursor = 0  # index of next message to process
+
+        if self._auto_capture:
+            try:
+                from agent.plugin_llm import PluginLlm
+                llm = PluginLlm(plugin_id="hermes-memory-store")
+                from .capture import CaptureEngine
+                self._capture = CaptureEngine(
+                    store=self._store,
+                    llm=llm,
+                    interval=self._capture_interval,
+                )
+                logger.debug("Holographic auto-capture initialized")
+            except Exception as e:
+                logger.warning("Holographic auto-capture init failed: %s", e)
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -227,10 +242,14 @@ class HolographicMemoryProvider(MemoryProvider):
             return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", messages: Optional[List[Dict[str, Any]]] = None) -> None:
-        # Auto-capture: feed turn messages to CaptureEngine
+        # Auto-capture: feed new-turn messages to CaptureEngine
         if self._auto_capture and self._capture is not None and messages:
             try:
-                self._capture.observe_turn(messages)
+                # Only process messages we haven't seen yet (delta since last sync_turn)
+                new_messages = messages[self._msg_cursor:]
+                if new_messages:
+                    self._capture.observe_turn(new_messages)
+                self._msg_cursor = len(messages)
             except Exception as e:
                 logger.debug("Auto-capture observe_turn failed: %s", e)
 
@@ -243,6 +262,30 @@ class HolographicMemoryProvider(MemoryProvider):
         elif tool_name == "fact_feedback":
             return self._handle_fact_feedback(args)
         return tool_error(f"Unknown tool: {tool_name}")
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        """Handle session rotation."""
+        self._session_id = new_session_id
+        if self._auto_capture and self._capture is not None:
+            # If genuinely new, or a resume (different transcript size),
+            # flush whatever was pending for the old session and reset cursor.
+            # (If it's a compression continuation, the transcript starts fresh too).
+            try:
+                self._capture.compress_and_store()
+            except Exception as e:
+                logger.debug("Auto-capture flush on switch failed: %s", e)
+            self._msg_cursor = 0
+            if reset or parent_session_id or rewound:
+                self._capture._turn_count = 0
+                self._capture._buffer.clear()
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         # Flush any remaining capture buffer before session ends
@@ -281,24 +324,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 logger.debug("Holographic shutdown close() failed: %s", e)
         self._store = None
         self._retriever = None
-
-    def init_capture(self, llm: Any) -> None:
-        """Initialize the CaptureEngine once ctx.llm is available.
-
-        Called from register() after ctx is handed to the plugin.
-        Separate from initialize() because ctx.llm is not available
-        until after register() completes.
-        """
-        if not self._auto_capture:
-            return
-        if self._capture is not None:
-            return  # already initialized
-        from .capture import CaptureEngine
-        self._capture = CaptureEngine(
-            store=self._store,
-            llm=llm,
-            interval=self._capture_interval,
-        )
+        self._capture = None
 
     # -- Tool handlers -------------------------------------------------------
 
@@ -493,5 +519,4 @@ def register(ctx) -> None:
     """Register the holographic memory provider with the plugin system."""
     config = _load_plugin_config()
     provider = HolographicMemoryProvider(config=config)
-    provider.init_capture(ctx.llm)  # wire capture engine
     ctx.register_memory_provider(provider)
