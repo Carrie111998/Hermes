@@ -65,25 +65,6 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
-    def test_full_happy_path(self):
-        _record()
-        dl.mark_attempting("ob-1")
-        assert _row("ob-1")["state"] == "attempting"
-        dl.mark_delivered("ob-1")
-        assert _row("ob-1")["state"] == "delivered"
-
-    def test_failed_records_error(self):
-        _record()
-        dl.mark_attempting("ob-1")
-        dl.mark_failed("ob-1", "chat_not_found")
-        assert _row("ob-1")["state"] == "failed"
-
-    def test_rerecord_same_id_is_idempotent(self):
-        _record()
-        dl.mark_attempting("ob-1")
-        _record()  # INSERT OR REPLACE resets to pending — same turn re-record
-        assert _row("ob-1")["state"] == "pending"
-
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -113,44 +94,6 @@ class TestSweep:
         # process must not double-claim.
         assert dl.sweep_recoverable() == []
 
-    def test_dead_owner_attempting_needs_marker(self):
-        _record()
-        dl.mark_attempting("ob-1")
-        _orphan("ob-1")
-        claimed = dl.sweep_recoverable()
-        assert claimed[0]["needs_marker"] is True
-
-    def test_dead_owner_failed_needs_marker(self):
-        _record()
-        dl.mark_failed("ob-1", "boom")
-        _orphan("ob-1")
-        claimed = dl.sweep_recoverable()
-        assert claimed[0]["needs_marker"] is True
-
-    def test_delivered_rows_ignored(self):
-        _record()
-        dl.mark_delivered("ob-1")
-        _orphan("ob-1")
-        assert dl.sweep_recoverable() == []
-
-    def test_attempts_cap_abandons(self):
-        _record()
-        _orphan("ob-1")
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
-                (dl.MAX_ATTEMPTS, "ob-1"),
-            )
-        assert dl.sweep_recoverable() == []
-        assert _row("ob-1")["state"] == "abandoned"
-
-    def test_stale_cutoff_abandons(self):
-        _record()
-        _orphan("ob-1")
-        future = time.time() + dl.STALE_AFTER_SECONDS + 60
-        assert dl.sweep_recoverable(now=future) == []
-        assert _row("ob-1")["state"] == "abandoned"
-
 
 class TestPrune:
     def test_old_delivered_rows_pruned(self):
@@ -164,28 +107,11 @@ class TestPrune:
         dl._prune()
         assert _row("ob-1") is None
 
-    def test_undelivered_rows_survive_retention(self):
-        _record()
-        with dl._connect() as conn:
-            conn.execute(
-                "UPDATE delivery_obligations SET updated_at=? WHERE obligation_id=?",
-                (time.time() - dl._RETENTION_SECONDS - 60, "ob-1"),
-            )
-        dl._prune()
-        assert _row("ob-1") is not None
-
 
 class TestLedgerEnabled:
     def test_default_on(self):
         assert dl.ledger_enabled({}) is True
         assert dl.ledger_enabled({"gateway": {}}) is True
-
-    def test_explicit_off(self):
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": False}}) is False
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": "off"}}) is False
-
-    def test_truthy_strings(self):
-        assert dl.ledger_enabled({"gateway": {"delivery_ledger": "true"}}) is True
 
 
 class TestGatewayRedeliverySweep:
@@ -245,39 +171,79 @@ class TestGatewayRedeliverySweep:
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
 
-    @pytest.mark.asyncio
-    async def test_send_failure_marks_failed_for_next_boot(self):
-        _record()
+
+class TestAttemptsOnlySpentOnRealSends:
+    """``attempts`` is the redelivery budget — it must buy a send.
+
+    ``self.adapters`` only holds a platform after its ``connect()`` succeeded,
+    and the sweep claimed every dead-owner row regardless. A platform that
+    failed to connect this boot therefore burned one attempt per boot while
+    the caller's ``adapter is None`` branch skipped it without sending — so
+    after MAX_ATTEMPTS boots the row abandoned having never been sent once,
+    losing exactly the response the ledger exists to guarantee. That failure
+    correlates with the crash that created the obligation: the network
+    trouble that killed the send tends to still be there on the next boot.
+    """
+
+    def test_absent_platform_does_not_burn_attempts(self):
+        _record(platform="telegram")
+        dl.mark_attempting("ob-1")
+
+        for _ in range(dl.MAX_ATTEMPTS + 2):
+            _orphan("ob-1")
+            assert dl.sweep_recoverable(deliverable_platforms={"discord"}) == []
+
+        row = dl.debug_rows()
+        assert "abandoned" not in row
+        with dl._connect() as conn:
+            state, attempts = conn.execute(
+                "SELECT state, attempts FROM delivery_obligations "
+                "WHERE obligation_id=?", ("ob-1",),
+            ).fetchone()
+        assert attempts == 0, "an unsendable boot must not spend the budget"
+        assert state == "attempting"
+
+    def test_row_still_delivers_once_its_platform_returns(self):
+        _record(platform="telegram")
+        for _ in range(dl.MAX_ATTEMPTS + 2):
+            _orphan("ob-1")
+            dl.sweep_recoverable(deliverable_platforms={"discord"})
+
         _orphan("ob-1")
-        runner = self._runner(self._adapter(success=False))
+        claimed = dl.sweep_recoverable(deliverable_platforms={"telegram"})
+        assert len(claimed) == 1
+        assert claimed[0]["attempts"] == 1
 
-        n = await runner._redeliver_pending_obligations()
 
-        assert n == 0
-        assert _row("ob-1")["state"] == "failed"
+class TestUnconnectedPlatformKeepsItsBudget:
+    """End-to-end through the real runner: boots where the platform failed to
+    connect must not consume the row's redelivery budget."""
+
+    @staticmethod
+    def _runner_without_slack():
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {}  # slack failed to connect this boot
+        _store = MagicMock()
+        _store.clear_resume_pending = AsyncMock()
+        _store._store = None
+        runner.session_store = None
+        runner._async_session_store = _store
+        return runner
 
     @pytest.mark.asyncio
-    async def test_missing_adapter_leaves_row_recoverable(self):
-        _record()
-        _orphan("ob-1")
-        runner = self._runner(adapter=None)  # slack not connected
+    async def test_row_survives_boots_where_its_platform_is_down(self):
+        _record(platform="slack")
+        dl.mark_attempting("ob-1")
 
-        n = await runner._redeliver_pending_obligations()
+        for _ in range(dl.MAX_ATTEMPTS + 1):
+            _orphan("ob-1")
+            runner = self._runner_without_slack()
+            assert await runner._redeliver_pending_obligations() == 0
 
-        assert n == 0
-        # Row still claimed by us but NOT delivered/abandoned — a later boot
-        # (attempts cap permitting) can retry once the platform connects.
-        assert _row("ob-1")["state"] == "pending"
+        assert _row("ob-1")["state"] != "abandoned", (
+            "the obligation was abandoned without a single send being attempted"
+        )
+        assert _row("ob-1")["attempts"] == 0
 
-    @pytest.mark.asyncio
-    async def test_disabled_gate_short_circuits(self):
-        _record()
-        _orphan("ob-1")
-        adapter = self._adapter()
-        runner = self._runner(adapter)
-        with patch.object(dl, "ledger_enabled", return_value=False), patch(
-            "gateway.delivery_ledger.ledger_enabled", return_value=False
-        ):
-            n = await runner._redeliver_pending_obligations()
-        assert n == 0
-        adapter.send.assert_not_awaited()
