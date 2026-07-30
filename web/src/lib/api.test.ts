@@ -150,4 +150,26 @@ describe("api.setProfileSettings", () => {
       }),
     );
   });
+
+  it("normalizes unchanged nullable model values for the profile settings endpoint", async () => {
+    vi.stubGlobal("window", {});
+    const fetchMock = jsonFetchMock({
+      ok: true,
+      provider: null,
+      model: null,
+      reasoning_effort: "high",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.setProfileSettings("my profile", null, null, "high");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/profiles/my%20profile/settings",
+      expect.objectContaining({
+        body: JSON.stringify({ provider: "", model: "", effort: "high" }),
+        credentials: "include",
+        method: "PUT",
+      }),
+    );
+  });
 });
