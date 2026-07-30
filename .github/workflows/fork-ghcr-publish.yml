@@ -27,6 +27,7 @@ on:
       - 'Dockerfile'
       - 'docker/**'
       - 'web/**'
+      - 'skills/**'
       - '.github/workflows/fork-ghcr-publish.yml'
 
 permissions:
