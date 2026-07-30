@@ -66,7 +66,7 @@ logger = logging.getLogger("run_agent")
 _warned_unavailable_providers: set[str] = set()
 
 
-def _warn_memory_provider_unavailable(name: str) -> None:
+def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
 
     ``is_available()`` is a fast, side-effect-free hot-path check, so it can't
@@ -74,6 +74,11 @@ def _warn_memory_provider_unavailable(name: str) -> None:
     missing is silently dropped — the user has ``memory.provider`` set but gets
     no memory and no diagnostic. A common trigger is systemd/gateway services
     not inheriting ``~/.hermes/.env``. See NousResearch/hermes-agent#2765.
+
+    ``reason`` is the provider's ``unavailable_reason()`` — a provider-specific,
+    actionable hint (e.g. which package to install). Because an unavailable
+    provider is never initialized, this is the only place such a hint can reach
+    the user, so it is appended to the warning when present (#7718).
     """
     if name in _warned_unavailable_providers:
         return
@@ -83,8 +88,9 @@ def _warn_memory_provider_unavailable(name: str) -> None:
         "is disabled for this session (built-in memory still works). Check the "
         "provider's credentials/config with 'hermes memory status'. Note: "
         "systemd/gateway services do not inherit ~/.hermes/.env automatically; set "
-        "any required variables in the service environment.",
+        "any required variables in the service environment.%s",
         name,
+        f" {reason}" if reason else "",
     )
 
 
@@ -1677,7 +1683,11 @@ def init_agent(
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
-                    _warn_memory_provider_unavailable(_mem_provider_name)
+                    try:
+                        _unavailable_reason = _mp.unavailable_reason()
+                    except Exception:
+                        _unavailable_reason = ""
+                    _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
                 if agent._memory_manager.providers:
                     _init_kwargs = {
                         "session_id": agent.session_id,

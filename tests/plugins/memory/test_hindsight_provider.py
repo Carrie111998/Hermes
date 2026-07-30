@@ -383,16 +383,17 @@ class TestConfig:
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
 
-    def test_retain_source_defaults_to_hermes(self, provider):
-        # No retain_source configured -> defaults to "hermes" so Hindsight can
-        # attribute the memory to Hermes via metadata.source.
-        assert provider._retain_source == "hermes"
+    def test_retain_source_defaults_empty(self, provider):
+        # Opt-in per AGENTS.md: no attribution tag ships by default.
+        assert provider._retain_source == ""
 
-    def test_retain_source_default_lands_in_metadata(self, provider):
+    def test_retain_source_absent_from_metadata_by_default(self, provider):
+        # metadata.source is stamped only when the user sets retain_source.
         meta = provider._build_metadata(message_count=2, turn_index=1)
-        assert meta["source"] == "hermes"
+        assert "source" not in meta
 
     def test_retain_source_user_override_wins(self, provider_with_config):
+        # Users can still opt in explicitly (config key / env var).
         p = provider_with_config(retain_source="cogoport")
         assert p._retain_source == "cogoport"
         assert p._build_metadata(message_count=2, turn_index=1)["source"] == "cogoport"

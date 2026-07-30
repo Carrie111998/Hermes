@@ -71,10 +71,11 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
-# Stamped as ``metadata.source`` on every retained memory so Hindsight can
-# attribute memories to Hermes (analytics, provenance). User-overridable via
-# the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE.
-_DEFAULT_RETAIN_SOURCE = "hermes"
+# ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
+# AGENTS.md forbids shipping third-party attribution tags on-by-default until a
+# generic user-facing opt-in exists, so this stays unset unless the user sets it
+# via the ``retain_source`` config key or HINDSIGHT_RETAIN_SOURCE (e.g. "hermes").
+_DEFAULT_RETAIN_SOURCE = ""
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -806,6 +807,26 @@ class HindsightMemoryProvider(MemoryProvider):
             return has_key or has_url
         except Exception:
             return False
+
+    def unavailable_reason(self) -> str:
+        """Explain an unavailable local_embedded provider (missing runtime).
+
+        ``is_available()`` returns False for local modes when the embedded
+        runtime can't be imported, so ``initialize()`` — and the hint it would
+        log — is never reached (#7718). Surface the install guidance here, where
+        agent_init warns about an unavailable provider.
+        """
+        try:
+            cfg = _load_config()
+            mode = cfg.get("mode", "cloud")
+        except Exception:
+            return ""
+        if mode not in {"local", "local_embedded"}:
+            return ""
+        available, reason = _check_local_runtime()
+        if available:
+            return ""
+        return _local_runtime_hint(reason).strip()
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/hindsight/config.json."""

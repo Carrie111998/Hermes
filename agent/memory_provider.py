@@ -106,6 +106,17 @@ class MemoryProvider(ABC):
           - user_id_alt (str): Optional alternate stable platform user identifier.
         """
 
+    def unavailable_reason(self) -> str:
+        """Actionable reason this provider reports unavailable, for the caller.
+
+        ``is_available()`` gates initialization, so a provider that reports
+        unavailable is never initialized — any diagnostic it would log from
+        ``initialize()`` is unreachable. Return a short, user-facing hint here
+        (e.g. which package to install) so the caller's "provider unavailable"
+        warning can surface it. Empty string (the default) adds nothing.
+        """
+        return ""
+
     def system_prompt_block(self) -> str:
         """Return text to include in the system prompt.
 
