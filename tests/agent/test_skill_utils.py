@@ -158,6 +158,14 @@ def test_pre_edit_snapshot_directories_are_excluded_without_overmatching(tmp_pat
     assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [legitimate]
 
 
+def test_pre_edit_snapshot_name_requires_canonical_task_id(tmp_path):
+    legitimate = tmp_path / "photo-pre-edit-snapshot-helper" / "SKILL.md"
+    legitimate.parent.mkdir(parents=True)
+    legitimate.write_text("---\nname: photo\n---\n", encoding="utf-8")
+
+    assert is_excluded_skill_path(legitimate) is False
+
+
 # ── skill_matches_platform on Termux ──────────────────────────────────────
 
 

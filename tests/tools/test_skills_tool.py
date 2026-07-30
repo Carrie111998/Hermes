@@ -302,6 +302,29 @@ class TestSkillsList:
 
 
 class TestSkillView:
+    def test_view_ignores_direct_snapshot_artifact(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            artifact = tmp_path / "real-skill-pre-edit-snapshot-t_abcdef12"
+            artifact.mkdir()
+            (artifact / "SKILL.md").write_text(
+                "---\nname: real-skill\n---\n\nSTALE\n", encoding="utf-8"
+            )
+            result = json.loads(skill_view("real-skill-pre-edit-snapshot-t_abcdef12"))
+
+        assert result["success"] is False
+
+    def test_view_ignores_categorized_snapshot_artifact(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            artifact = tmp_path / "category" / "real-skill-pre-edit-snapshot-t_abcdef12"
+            artifact.mkdir(parents=True)
+            (artifact / "SKILL.md").write_text(
+                "---\nname: real-skill\n---\n\nSTALE\n", encoding="utf-8"
+            )
+            _make_skill(tmp_path, "real-skill", category="category")
+            result = json.loads(skill_view("category:real-skill-pre-edit-snapshot-t_abcdef12"))
+
+        assert result["success"] is False
+
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(

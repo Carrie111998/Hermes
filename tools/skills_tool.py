@@ -1125,6 +1125,7 @@ def skill_view(
             direct_path = search_dir / name
             if (
                 not _is_skill_support_path(direct_path)
+                and not _is_excluded_skill_path(direct_path / "SKILL.md", root=search_dir)
                 and direct_path.is_dir()
                 and (direct_path / "SKILL.md").exists()
             ):
@@ -1141,6 +1142,9 @@ def skill_view(
                 categorized_path = search_dir / local_category_name
                 if (
                     not _is_skill_support_path(categorized_path)
+                    and not _is_excluded_skill_path(
+                        categorized_path / "SKILL.md", root=search_dir
+                    )
                     and categorized_path.is_dir()
                     and (categorized_path / "SKILL.md").exists()
                 ):

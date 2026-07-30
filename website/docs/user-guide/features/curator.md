@@ -128,7 +128,7 @@ The rollback itself is reversible: before replacing the skills tree, Hermes take
 
 You can also take manual snapshots at any time with `hermes curator backup --reason "before-refactor"`. The `--reason` string lands in the snapshot's `manifest.json` and is shown in `--list`.
 
-Snapshots are pruned to `curator.backup.keep` (default 5) to keep disk usage bounded:
+Snapshots in the new `skill-snapshots/` root are pruned to `curator.backup.keep` (default 5) to keep disk usage bounded. Legacy snapshots in `skills/.curator_backups/` remain read-only and discoverable for rollback; they are never pruned:
 
 ```yaml
 curator:

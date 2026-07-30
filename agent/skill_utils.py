@@ -54,7 +54,7 @@ SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 # Keep this narrow so ordinary directories named ``snapshot`` or ``pre-edit``
 # remain valid skill categories.
 _PRE_EDIT_SNAPSHOT_DIR_RE = re.compile(
-    r"^[A-Za-z0-9_-]+-pre-edit-snapshot-[A-Za-z0-9_-]+$"
+    r"^[A-Za-z0-9_-]+-pre-edit-snapshot-t_[0-9a-f]+$"
 )
 
 # ── Org-shared skills (sync contract) ───────────────────────────

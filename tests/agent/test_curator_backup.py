@@ -82,6 +82,21 @@ def test_snapshot_prunes_to_keep_count(backup_env, monkeypatch):
     assert remaining == ids[2:], f"expected newest 3, got {remaining}"
 
 
+def test_incomplete_new_snapshot_does_not_shadow_valid_legacy(backup_env):
+    cb = backup_env["cb"]
+    backup_id = "2026-05-01T00-00-00Z"
+    new = backup_env["home"] / "skill-snapshots" / backup_id
+    legacy = backup_env["skills"] / ".curator_backups" / backup_id
+    new.mkdir(parents=True)
+    legacy.mkdir(parents=True)
+    with tarfile.open(legacy / "skills.tar.gz", "w:gz"):
+        pass
+
+    assert cb.list_backups()[0]["path"] == str(legacy)
+    assert cb._resolve_backup(None) == legacy
+    assert cb._resolve_backup(backup_id) == legacy
+
+
 # ---------------------------------------------------------------------------
 # list_backups / _resolve_backup
 # ---------------------------------------------------------------------------

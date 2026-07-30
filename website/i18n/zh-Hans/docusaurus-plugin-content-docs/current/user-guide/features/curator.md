@@ -113,7 +113,7 @@ hermes curator rollback --list # see all snapshots with reason + size
 
 你也可以随时通过 `hermes curator backup --reason "before-refactor"` 手动创建快照。`--reason` 字符串会写入快照的 `manifest.json`，并在 `--list` 中显示。
 
-快照会被裁剪至 `curator.backup.keep`（默认 5 个）以控制磁盘占用：
+新 `skill-snapshots/` 根目录中的快照会被裁剪至 `curator.backup.keep`（默认 5 个）以控制磁盘占用。旧版 `skills/.curator_backups/` 中的快照保持只读且仍可发现、用于回滚；不会被裁剪：
 
 ```yaml
 curator:

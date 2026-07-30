@@ -87,12 +87,21 @@ def _backup_roots() -> List[Path]:
     return [_backups_dir(), _legacy_backups_dir()]
 
 
+def _has_restorable_archive(snapshot_dir: Path) -> bool:
+    archive = snapshot_dir / "skills.tar.gz"
+    if not archive.is_file():
+        return False
+    try:
+        return tarfile.is_tarfile(archive)
+    except OSError:
+        return False
+
+
 def _iter_snapshot_dirs() -> List[Path]:
     """Every id-shaped snapshot dir across all roots, newest id first.
 
-    When the same snapshot id exists in both roots the new root wins
-    deterministically (roots are visited in precedence order and the first
-    hit for an id is kept).
+    When the same snapshot id exists in both roots the new root wins only if
+    it is restorable; an incomplete new entry must not hide a legacy backup.
     """
     found: Dict[str, Path] = {}
     for root in _backup_roots():
@@ -106,6 +115,8 @@ def _iter_snapshot_dirs() -> List[Path]:
             if not child.is_dir():
                 continue
             if not _ID_RE.match(child.name):
+                continue
+            if not _has_restorable_archive(child):
                 continue
             found.setdefault(child.name, child)
     return [found[snap_id] for snap_id in sorted(found, reverse=True)]
@@ -428,12 +439,11 @@ def _resolve_backup(backup_id: Optional[str]) -> Optional[Path]:
             return None
         for root in _backup_roots():
             target = root / backup_id
-            if target.is_dir() and (target / "skills.tar.gz").exists():
+            if target.is_dir() and _has_restorable_archive(target):
                 return target
         return None
     for candidate in _iter_snapshot_dirs():
-        if (candidate / "skills.tar.gz").exists():
-            return candidate
+        return candidate
     return None
 
 
