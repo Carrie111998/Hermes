@@ -30,6 +30,12 @@ export const LOCALE_OPTIONS = [
     configValue: 'ja'
   },
   {
+    id: 'vi',
+    name: 'Tiếng Việt',
+    englishName: 'Vietnamese',
+    configValue: 'vi'
+  },
+  {
     id: 'ar',
     name: 'العربية',
     englishName: 'Arabic',
@@ -71,6 +77,11 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   ja: 'ja',
   'ja-jp': 'ja',
   ja_jp: 'ja',
+  vi: 'vi',
+  'vi-vn': 'vi',
+  vi_vn: 'vi',
+  vietnamese: 'vi',
+  'tiếng việt': 'vi',
   ar: 'ar',
   'ar-sa': 'ar',
   ar_sa: 'ar',

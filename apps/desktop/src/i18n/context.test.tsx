@@ -133,6 +133,27 @@ describe('I18nProvider', () => {
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
+  it('loads Vietnamese from display.language config with LTR direction', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'vi-VN' } }),
+      saveConfig: vi.fn()
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+
+    expect(screen.getByTestId('locale').textContent).toBe('vi')
+    expect(screen.getByTestId('save').textContent).toBe('Lưu')
+    expect(globalThis.document.documentElement.lang).toBe('vi')
+    expect(globalThis.document.documentElement.dir).toBe('ltr')
+    expect(configClient.saveConfig).not.toHaveBeenCalled()
+  })
+
   it('does not overwrite unsupported configured languages', async () => {
     const configClient: I18nConfigClient = {
       getConfig: vi.fn().mockResolvedValue({ display: { language: 'de' } }),
@@ -197,7 +218,7 @@ describe('I18nProvider', () => {
 
     render(
       <I18nProvider configClient={configClient}>
-        <LanguageProbe target="ja" />
+        <LanguageProbe target="vi" />
       </I18nProvider>
     )
 
@@ -205,8 +226,8 @@ describe('I18nProvider', () => {
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
-    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'ja', skin: 'mono' } })
-    expect(screen.getByTestId('locale').textContent).toBe('ja')
+    expect(saveConfig).toHaveBeenCalledWith({ display: { language: 'vi', skin: 'mono' } })
+    expect(screen.getByTestId('locale').textContent).toBe('vi')
   })
 
   it('applies RTL direction for Arabic and restores LTR on switch back', async () => {
@@ -217,14 +238,14 @@ describe('I18nProvider', () => {
     )
 
     expect(screen.getByTestId('locale').textContent).toBe('ar')
-    expect(document.documentElement.dir).toBe('rtl')
-    expect(document.documentElement.lang).toBe('ar')
+    expect(globalThis.document.documentElement.dir).toBe('rtl')
+    expect(globalThis.document.documentElement.lang).toBe('ar')
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
     await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
-    expect(document.documentElement.dir).toBe('ltr')
-    expect(document.documentElement.lang).toBe('en')
+    expect(globalThis.document.documentElement.dir).toBe('ltr')
+    expect(globalThis.document.documentElement.lang).toBe('en')
   })
 
   it('rolls back the visible locale when saving fails', async () => {
