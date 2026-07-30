@@ -203,6 +203,7 @@ SIDEBAR_RETRYABLE_ERRORS = frozenset({
     "project_lookup_failed",
     "native_task_not_indexed",
     "broker_time_budget",
+    "inbox_unavailable",
 })
 SIDEBAR_FATAL_ERRORS = frozenset({
     "native_create_ambiguous",
@@ -213,6 +214,7 @@ SIDEBAR_FATAL_ERRORS = frozenset({
     "source_cwd_missing",
     "permission_preflight_failed",
     "retry_budget_exhausted",
+    "placement_mismatch",
 })
 HYDRATION_RETRYABLE_ERRORS = frozenset({
     "codex_tool_unavailable",

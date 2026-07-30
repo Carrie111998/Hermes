@@ -23,13 +23,13 @@ from .sidebar import (
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
+from .sidebar_placement import SidebarPlacement, SidebarPlacementError
 from .store import (
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
     SidebarNativeTaskNotIndexed,
 )
-
 
 _PROCESS_DELIVERY_LOCK = threading.Lock()
 _SIDEBAR_EXECUTION_BLOCKER_ORDER = (
@@ -106,6 +106,7 @@ class NativeSidebarDelivery(Protocol):
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        placement: SidebarPlacement,
         recovery_key: str,
         deadline: float,
     ) -> str: ...
@@ -195,11 +196,16 @@ class CodexAppServerSidebarDelivery:
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        placement: SidebarPlacement,
         recovery_key: str,
         deadline: float,
     ) -> str:
         del prompt
         expected_recovery_key = _required_recovery_key(recovery_key)
+        try:
+            placement = _validated_sidebar_placement(placement, candidate)
+        except SidebarPlacementError as exc:
+            raise NativeCreateRejected(exc.code) from exc
         self._ensure_initialized(deadline)
         # Expiry is the sole trusted pre-dispatch rejection. Once request()
         # is entered, even a nonconforming injected client that raises
@@ -209,7 +215,8 @@ class CodexAppServerSidebarDelivery:
             result = self._client.request(
                 "thread/start",
                 {
-                    "cwd": candidate.cwd,
+                    "cwd": placement.inbox_cwd,
+                    "runtimeWorkspaceRoots": list(placement.runtime_workspace_roots),
                     "threadSource": expected_recovery_key,
                 },
                 timeout=timeout,
@@ -227,7 +234,7 @@ class CodexAppServerSidebarDelivery:
             returned_cwd = _required_text(thread.get("cwd"), "created Codex cwd")
             if not hmac.compare_digest(
                 returned_recovery_key, expected_recovery_key
-            ) or not _filesystem_equivalent(returned_cwd, candidate.cwd):
+            ) or not _filesystem_equivalent(returned_cwd, placement.inbox_cwd):
                 raise ValueError("thread/start response identity mismatch")
         except (AttributeError, TypeError, ValueError) as exc:
             raise NativeCreateAmbiguous() from exc
@@ -623,6 +630,7 @@ class SidebarExecutor:
         store: SessionBridgeStore,
         verifier: SidebarThreadVerifier,
         native: NativeSidebarDelivery,
+        placement_resolver: Callable[[SidebarCandidate], SidebarPlacement],
         marker_secret: bytes,
         clock=time.time,
         monotonic=time.monotonic,
@@ -663,6 +671,7 @@ class SidebarExecutor:
         self._store = store
         self._verifier = verifier
         self._native = native
+        self._placement_resolver = placement_resolver
         self._marker_secret = marker_secret
         self._clock = clock
         self._monotonic = monotonic
@@ -825,6 +834,29 @@ class SidebarExecutor:
                 error_code="source_identity_mismatch",
             )
 
+        try:
+            placement = self._placement_resolver(candidate)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except SidebarPlacementError as exc:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code=exc.code,
+            )
+        except Exception:
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code="bridge_temporarily_unavailable",
+            )
+        if not isinstance(placement, SidebarPlacement):
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                error_code="source_identity_mismatch",
+            )
+
         expected = BridgeMarkerPayload(
             bridge_id=bridge_id,
             source_session_id=source_session_id,
@@ -967,7 +999,7 @@ class SidebarExecutor:
                         )
                     thread_id, recovery_error = self._recover_reserved_thread(
                         recovery_key,
-                        expected_cwd=candidate.cwd,
+                        expected_cwd=placement.inbox_cwd,
                         operation_deadline=operation_deadline,
                     )
                     if recovery_error is not None:
@@ -1008,6 +1040,7 @@ class SidebarExecutor:
                         raw_created_thread_id = self._native.create_thread(
                             prompt=prompt,
                             candidate=candidate,
+                            placement=placement,
                             recovery_key=recovery_key,
                             deadline=operation_deadline,
                         )
@@ -1036,7 +1069,7 @@ class SidebarExecutor:
                     except NativeCreateAmbiguous:
                         thread_id, recovery_error = self._recover_reserved_thread(
                             recovery_key,
-                            expected_cwd=candidate.cwd,
+                            expected_cwd=placement.inbox_cwd,
                             operation_deadline=operation_deadline,
                         )
                         if recovery_error is not None:
@@ -1140,7 +1173,7 @@ class SidebarExecutor:
 
         read_error = self._wait_until_idle(
             thread_id,
-            expected_cwd=candidate.cwd,
+            expected_cwd=placement.inbox_cwd,
             operation_deadline=operation_deadline,
             lease_expires_at=lease_expires_at,
         )
@@ -1190,6 +1223,17 @@ class SidebarExecutor:
                 lease_token=lease_token,
                 thread_id=thread_id,
                 error_code="source_identity_mismatch",
+            )
+
+        if verified.projection is not None and not _filesystem_equivalent(
+            verified.projection.cwd,
+            placement.inbox_cwd,
+        ):
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="placement_mismatch",
             )
 
         if verified.projection is not None:
@@ -1398,10 +1442,10 @@ class SidebarExecutor:
             if state is not None:
                 if not isinstance(state, NativeThreadState):
                     return "native_task_not_indexed"
-                if state.thread_id != thread_id or not _filesystem_equivalent(
-                    state.cwd, expected_cwd
-                ):
+                if state.thread_id != thread_id:
                     return "codex_thread_conflict"
+                if not _filesystem_equivalent(state.cwd, expected_cwd):
+                    return "placement_mismatch"
                 if not isinstance(state.status, NativeThreadStatus):
                     return "native_task_not_indexed"
                 if state.status is NativeThreadStatus.IDLE:
@@ -1669,6 +1713,40 @@ def _required_recovery_key(value: object) -> str:
     if digest == recovery_key or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise ValueError("sidebar recovery key is malformed")
     return recovery_key
+
+
+def _validated_sidebar_placement(
+    placement: object,
+    candidate: SidebarCandidate,
+) -> SidebarPlacement:
+    if not isinstance(placement, SidebarPlacement):
+        raise SidebarPlacementError("inbox_unavailable")
+    try:
+        inbox_cwd = _required_text(placement.inbox_cwd, "sidebar inbox cwd")
+        if (
+            placement.local_host != "local"
+            or type(placement.placement_generation) is not int
+            or placement.placement_generation != 1
+        ):
+            raise SidebarPlacementError("inbox_unavailable")
+        roots = placement.runtime_workspace_roots
+        if type(roots) is not tuple or len(roots) not in {1, 2}:
+            raise SidebarPlacementError("inbox_unavailable")
+        if any(
+            _required_text(root, "sidebar runtime workspace root") != root
+            for root in roots
+        ):
+            raise SidebarPlacementError("inbox_unavailable")
+        if not _filesystem_equivalent(roots[0], inbox_cwd):
+            raise SidebarPlacementError("inbox_unavailable")
+        if len(roots) == 1:
+            if not _filesystem_equivalent(inbox_cwd, candidate.cwd):
+                raise SidebarPlacementError("inbox_unavailable")
+        elif not _filesystem_equivalent(roots[1], candidate.cwd):
+            raise SidebarPlacementError("inbox_unavailable")
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise SidebarPlacementError("inbox_unavailable") from exc
+    return placement
 
 
 def _finite_time(value: object) -> float:

@@ -55,6 +55,7 @@ from session_bridge.sidebar import (
 )
 from session_bridge.store import (
     SIDEBAR_EXCLUSION_REASONS,
+    SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
     SessionBridgeStore,
     sidebar_precreate_terminal_evidence_digest,
@@ -10232,6 +10233,7 @@ def test_sidebar_retryable_error_allowlist_is_the_exact_fixed_contract() -> None
         "project_lookup_failed",
         "native_task_not_indexed",
         "broker_time_budget",
+        "inbox_unavailable",
     })
 
 
@@ -10386,6 +10388,7 @@ def test_sidebar_retry_backoff_counts_failures_and_fails_on_attempt_five(db) -> 
         "source_cwd_missing",
         "permission_preflight_failed",
         "retry_budget_exhausted",
+        "placement_mismatch",
     ],
 )
 def test_sidebar_fatal_errors_fail_immediately_without_counting_attempt(
@@ -10410,6 +10413,20 @@ def test_sidebar_fatal_errors_fail_immediately_without_counting_attempt(
     assert failed["attempts"] == 0
     assert failed["error_code"] == error_code
     assert failed["lease_digest"] is None
+
+
+def test_sidebar_fatal_error_allowlist_is_the_exact_fixed_contract() -> None:
+    assert SIDEBAR_FATAL_ERRORS == frozenset({
+        "native_create_ambiguous",
+        "marker_conflict",
+        "source_identity_mismatch",
+        "codex_thread_conflict",
+        "provider_mismatch",
+        "source_cwd_missing",
+        "permission_preflight_failed",
+        "retry_budget_exhausted",
+        "placement_mismatch",
+    })
 
 
 def test_sidebar_broker_budget_failure_releases_without_attempt_or_delay(db) -> None:

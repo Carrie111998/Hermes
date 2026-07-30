@@ -26,6 +26,7 @@ from session_bridge.sidebar import (
     build_registration_prompt,
     sidebar_bridge_id,
 )
+from session_bridge.sidebar_placement import SidebarPlacement, SidebarPlacementError
 from session_bridge.sidebar_executor import (
     CodexAppServerSidebarDelivery,
     NativeCreateAmbiguous,
@@ -51,6 +52,15 @@ THREAD_2 = "22222222-2222-4222-8222-222222222222"
 TURN_1 = "33333333-3333-4333-8333-333333333333"
 SECRET = b"sidebar-executor-test-secret"
 RECOVERY_KEY = "hermes-session-bridge-create-v1:" + "a" * 64
+
+
+def _placement() -> SidebarPlacement:
+    return SidebarPlacement(
+        inbox_cwd="C:/Users/diego/.hermes",
+        local_host="local",
+        runtime_workspace_roots=("C:/Users/diego/.hermes", "C:/source"),
+        placement_generation=1,
+    )
 
 
 def test_concrete_codex_app_server_delivery_is_available() -> None:
@@ -174,8 +184,88 @@ def _persisted_registration(
     }
 
 
-def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
+def test_codex_delivery_starts_inbox_cwd_and_returns_exact_thread_id() -> None:
     clock = FakeClock()
+    client = FakeCodexAppServerClient({
+        "thread/start": [
+            {
+                "thread": {
+                    "id": THREAD_1,
+                    "cwd": "C:/Users/diego/.hermes",
+                    "threadSource": RECOVERY_KEY,
+                }
+            }
+        ],
+    })
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=clock)
+
+    created = delivery.create_thread(
+        prompt="registration happens only after durable binding",
+        candidate=_candidate(SOURCE_1),
+        placement=_placement(),
+        recovery_key=RECOVERY_KEY,
+        deadline=105.0,
+    )
+
+    assert created == THREAD_1
+    assert client.initialize_timeouts == [5.0]
+    assert client.calls[0] == (
+        "thread/start",
+        {
+            "cwd": "C:/Users/diego/.hermes",
+            "runtimeWorkspaceRoots": ["C:/Users/diego/.hermes", "C:/source"],
+            "threadSource": RECOVERY_KEY,
+        },
+        5.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "placement",
+    [
+        SidebarPlacement(
+            inbox_cwd="C:/Users/diego/.hermes",
+            local_host="local",
+            runtime_workspace_roots=("C:/source",),
+            placement_generation=1,
+        ),
+        SidebarPlacement(
+            inbox_cwd="C:/Users/diego/.hermes",
+            local_host="local",
+            runtime_workspace_roots=(
+                "C:/Users/diego/.hermes",
+                42,
+            ),  # type: ignore[arg-type]
+            placement_generation=1,
+        ),
+        SidebarPlacement(
+            inbox_cwd="C:/Users/diego/.hermes",
+            local_host="local",
+            runtime_workspace_roots=("C:/Users/diego/.hermes", "C:/source"),
+            placement_generation=True,  # type: ignore[arg-type]
+        ),
+    ],
+)
+def test_codex_delivery_rejects_malformed_placement_before_create_dispatch(
+    placement: SidebarPlacement,
+) -> None:
+    client = FakeCodexAppServerClient({"thread/start": []})
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
+
+    with pytest.raises(NativeCreateRejected) as caught:
+        delivery.create_thread(
+            prompt="registration happens later",
+            candidate=_candidate(SOURCE_1),
+            placement=placement,
+            recovery_key=RECOVERY_KEY,
+            deadline=105.0,
+        )
+
+    assert caught.value.code == "inbox_unavailable"
+    assert client.calls == []
+
+
+def test_codex_delivery_rejects_returned_source_cwd_as_ambiguous() -> None:
     client = FakeCodexAppServerClient({
         "thread/start": [
             {
@@ -187,24 +277,44 @@ def test_codex_delivery_starts_exact_cwd_and_returns_exact_thread_id() -> None:
             }
         ],
     })
-    delivery = CodexAppServerSidebarDelivery(client, monotonic=clock)
+    delivery = CodexAppServerSidebarDelivery(client, monotonic=lambda: 100.0)
 
-    created = delivery.create_thread(
-        prompt="registration happens only after durable binding",
-        candidate=_candidate(SOURCE_1),
-        recovery_key=RECOVERY_KEY,
-        deadline=105.0,
+    with pytest.raises(NativeCreateAmbiguous):
+        delivery.create_thread(
+            prompt="registration happens later",
+            candidate=_candidate(SOURCE_1),
+            placement=_placement(),
+            recovery_key=RECOVERY_KEY,
+            deadline=105.0,
+        )
+
+    assert client.calls[0][1]["cwd"] == "C:/Users/diego/.hermes"
+
+
+def test_sidebar_executor_settles_placement_failure_before_reservation() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1)])
+    native = FakeNative(events)
+    executor = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+        placement_resolver=lambda _candidate: (_ for _ in ()).throw(
+            SidebarPlacementError("inbox_unavailable")
+        ),
     )
 
-    assert created == THREAD_1
-    assert client.initialize_timeouts == [5.0]
-    assert client.calls == [
-        (
-            "thread/start",
-            {"cwd": "C:/source", "threadSource": RECOVERY_KEY},
-            5.0,
-        )
-    ]
+    result = executor.run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="inbox_unavailable",
+    )
+    assert native.create_calls == 0
+    assert not any(event[0] == "reserve" for event in events)
 
 
 @pytest.mark.parametrize(
@@ -225,6 +335,7 @@ def test_codex_delivery_maps_post_dispatch_create_failures_to_ambiguity(
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            placement=_placement(),
             recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
@@ -244,6 +355,7 @@ def test_codex_delivery_treats_missing_exact_create_identity_as_ambiguous(
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            placement=_placement(),
             recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
@@ -259,6 +371,7 @@ def test_codex_delivery_rejects_expired_deadline_before_create_dispatch() -> Non
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            placement=_placement(),
             recovery_key=RECOVERY_KEY,
             deadline=100.0,
         )
@@ -279,6 +392,7 @@ def test_codex_delivery_maps_initialize_failure_to_pre_dispatch_rejection() -> N
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            placement=_placement(),
             recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
@@ -320,6 +434,7 @@ def test_codex_delivery_rejects_create_response_identity_mismatch_as_ambiguous(
         delivery.create_thread(
             prompt="registration happens later",
             candidate=_candidate(SOURCE_1),
+            placement=_placement(),
             recovery_key=RECOVERY_KEY,
             deadline=105.0,
         )
@@ -1291,7 +1406,7 @@ class FakeNative:
         statuses: list[str | None] | None = None,
         rename_error: Exception | None = None,
         read_thread_id: str | None = None,
-        read_cwd: str = "C:/source",
+        read_cwd: str = "C:/Users/diego/.hermes",
         after_create: Callable[[], None] | None = None,
         register_error: Exception | None = None,
         preflight_error: Exception | None = None,
@@ -1321,10 +1436,12 @@ class FakeNative:
         *,
         prompt: str,
         candidate: SidebarCandidate,
+        placement: SidebarPlacement,
         recovery_key: str,
         deadline: float,
     ) -> str:
         assert candidate.cwd == "C:/source"
+        assert placement == _placement()
         assert "Signed marker:" in prompt
         assert recovery_key.startswith("hermes-session-bridge-create-v1:")
         self.events.append((
@@ -1389,11 +1506,15 @@ def _executor(
     operation_budget_seconds: float = 240.0,
     readable_preview_enabled: bool = False,
     preview_budget_chars: int = 24_000,
+    placement_resolver: Callable[[SidebarCandidate], SidebarPlacement] = (
+        lambda _candidate: _placement()
+    ),
 ) -> SidebarExecutor:
     return SidebarExecutor(
         store=cast(SessionBridgeStore, store),
         verifier=cast(SidebarThreadVerifier, verifier),
         native=native,
+        placement_resolver=placement_resolver,
         marker_secret=SECRET,
         clock=clock,
         monotonic=clock,
@@ -1444,7 +1565,7 @@ def test_verified_projection_is_indexed_before_lineage_commit() -> None:
         provider=Provider.CODEX,
         native_id=THREAD_1,
         title="[Claude] Indexed before commit",
-        cwd="C:/source",
+        cwd="C:/Users/diego/.hermes",
         started_at=90.0,
         last_active=100.0,
         messages=(),
@@ -1467,6 +1588,38 @@ def test_verified_projection_is_indexed_before_lineage_commit() -> None:
         "rename",
         "commit",
     ]
+
+
+def test_final_verification_rejects_projection_in_source_placement() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id=THREAD_1,
+        title="[Claude] Wrong placement",
+        cwd="C:/source",
+        started_at=90.0,
+        last_active=100.0,
+        messages=(),
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=sidebar_bridge_id(SOURCE_1),
+    )
+
+    result = _executor(
+        store,
+        FakeVerifier(events, projection=projection),
+        FakeNative(events),
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="placement_mismatch",
+    )
+    assert not any(event[0] in {"index", "rename", "commit"} for event in events)
 
 
 def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:
@@ -2145,15 +2298,16 @@ def test_read_until_idle_timeout_is_retryable_and_never_renames() -> None:
 
 
 @pytest.mark.parametrize(
-    ("read_thread_id", "read_cwd"),
+    ("read_thread_id", "read_cwd", "expected_code"),
     [
-        (THREAD_2, "C:/source"),
-        (THREAD_1, "C:/different-source"),
+        (THREAD_2, "C:/Users/diego/.hermes", "codex_thread_conflict"),
+        (THREAD_1, "C:/different-source", "placement_mismatch"),
     ],
 )
-def test_native_read_identity_mismatch_is_fatal_conflict(
+def test_native_read_identity_mismatch_is_fatal(
     read_thread_id: str,
     read_cwd: str,
+    expected_code: str,
 ) -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
@@ -2168,8 +2322,8 @@ def test_native_read_identity_mismatch_is_fatal_conflict(
     result = executor.run_once()
 
     assert result.status == "failed"
-    assert result.error_code == "codex_thread_conflict"
-    assert store.failures == ["codex_thread_conflict"]
+    assert result.error_code == expected_code
+    assert store.failures == [expected_code]
     assert not any(event[0] in {"verify", "rename", "commit"} for event in events)
 
 
@@ -2177,7 +2331,7 @@ def test_native_read_accepts_filesystem_equivalent_cwd() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()
     store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
-    native = FakeNative(events, read_cwd="c:\\SOURCE\\.")
+    native = FakeNative(events, read_cwd="c:\\Users\\diego\\.hermes\\.")
     executor = _executor(store, FakeVerifier(events), native, clock)
 
     result = executor.run_once()
@@ -2510,12 +2664,14 @@ def test_two_executor_instances_share_one_process_wide_delivery_lock() -> None:
             *,
             prompt: str,
             candidate: SidebarCandidate,
+            placement: SidebarPlacement,
             recovery_key: str,
             deadline: float,
         ) -> str:
             result = super().create_thread(
                 prompt=prompt,
                 candidate=candidate,
+                placement=placement,
                 recovery_key=recovery_key,
                 deadline=deadline,
             )
