@@ -3132,6 +3132,82 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
+
+def _warn_launchd_gateway_left_down() -> None:
+    """Say the gateway is down and how to bring it back.
+
+    Every failure path below is otherwise silent: the update still prints its
+    success summary and exits 0, so messaging adapters and cron stay dark with
+    no signal but the bot going quiet.
+    """
+    print(
+        "    The gateway is NOT running. Messaging channels and cron will "
+        "stay down until you run:\n"
+        "      hermes gateway restart"
+    )
+
+
+def _restart_launchd_gateway_after_update() -> list[str]:
+    """Restart the macOS launchd gateway after an update.
+
+    Returns the labels that were restarted, for the update summary and for
+    PID exclusion by the manual-gateway sweep that follows.
+
+    Extracted from ``_cmd_update_impl`` so the recovery branches are reachable
+    from tests, mirroring ``_for_each_systemd_gateway_unit`` on the systemd
+    side (#68523).
+    """
+    label = None
+    try:
+        from hermes_cli.gateway import (
+            launchd_restart,
+            launchd_start,
+            get_launchd_label,
+            get_launchd_plist_path,
+        )
+
+        label = get_launchd_label()
+        plist_path = get_launchd_plist_path()
+        if not plist_path.exists():
+            # No service definition installed — this install isn't launchd
+            # managed, so there is nothing to restart and nothing to warn about.
+            return []
+
+        check = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=5,
+        )
+        try:
+            if check.returncode == 0:
+                launchd_restart()
+            else:
+                # Booted out of launchd while the plist is still installed:
+                # `launchctl list` exits non-zero, and KeepAlive cannot revive
+                # a definition that is no longer registered. This branch used
+                # to be skipped with no else and no message, so the update
+                # exited 0 with the gateway dead — the one state that actually
+                # needs recovery was the state being screened out.
+                # launchd_start() bootstraps the plist rather than assuming a
+                # live process to drain.
+                print("  ↻ Gateway was unloaded from launchd; reloading it")
+                launchd_start()
+            return [label]
+        except subprocess.CalledProcessError as e:
+            stderr = (getattr(e, "stderr", "") or "").strip()
+            print(f"  ⚠ Gateway restart failed: {stderr}")
+            _warn_launchd_gateway_left_down()
+            return []
+    except (FileNotFoundError, subprocess.TimeoutExpired, ImportError) as e:
+        # A missing launchctl, a 5s timeout, or a failed import used to
+        # `pass`, producing a silent no-op restart beneath a success-looking
+        # update.
+        print(f"  ⚠ Could not restart the gateway: {e}")
+        _warn_launchd_gateway_left_down()
+        return []
+
+
 def _cmd_update_impl(args, gateway_mode: bool):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
@@ -4743,30 +4819,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             # --- Launchd services (macOS) ---
             if is_macos():
-                try:
-                    from hermes_cli.gateway import (
-                        launchd_restart,
-                        get_launchd_label,
-                        get_launchd_plist_path,
-                    )
-
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
-                    pass
+                restarted_services.extend(_restart_launchd_gateway_after_update())
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.
