@@ -277,6 +277,16 @@ def _read_optional_record(path: Path) -> dict[str, Any] | None:
         raise ReconciliationValidationError(f"malformed JSON record: {path}") from exc
 
 
+def _read_optional_record_if_published(path: Path) -> dict[str, Any] | None:
+    """Return a durably published record, or None if absent or still being published."""
+    try:
+        return _read_optional_record(path)
+    except ReconciliationValidationError as exc:
+        if str(exc).startswith("malformed JSON record:"):
+            return None
+        raise
+
+
 def _extract_event_id(issue: dict[str, Any]) -> str:
     inputs = _argument_entries_to_inputs(issue["bound_arguments"])
     event_id = inputs.get("event_id")
@@ -644,6 +654,41 @@ def _validate_directory_state(entries: frozenset[str], *, allowed: frozenset[str
         f"unexpected reconciliation case directory entries: {sorted(entries)}",
         case_id=case_id,
     )
+
+
+def _exact_replay_published_record_under_lock(
+    *,
+    case_id: str,
+    case_fd: int,
+    filename: Literal["open.json", "observation.json", "decision.json"],
+    request_projection: dict[str, Any],
+    intent_from_record: Callable[[dict[str, Any]], dict[str, Any]],
+    validate_existing: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Reload a published immutable record under case ``flock(LOCK_EX)`` for exact replay."""
+    flags_read = _O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+    record_ctx = f"reconciliation/{case_id}/{filename}"
+    fcntl.flock(case_fd, fcntl.LOCK_EX)
+    try:
+        existing_fd = _openat_control_file_no_follow(
+            case_fd,
+            filename,
+            flags_read,
+            context=record_ctx,
+        )
+        try:
+            existing = _read_json_fd(existing_fd)
+        finally:
+            os.close(existing_fd)
+        validate_existing(existing)
+        if intent_from_record(existing) != request_projection:
+            raise ReconciliationConflictError(
+                f"{filename} already exists with conflicting semantics",
+                case_id=case_id,
+            )
+        return existing
+    finally:
+        fcntl.flock(case_fd, fcntl.LOCK_UN)
 
 
 def _bootstrap_reconciliation_tree(
@@ -1109,7 +1154,7 @@ def open_reconciliation_case(
     )
 
     open_path = paths.reconciliation_open_path(case_id, base_dir)
-    existing = _read_optional_record(open_path)
+    existing = _read_optional_record_if_published(open_path)
     if existing is not None:
         _validate_open_record(existing, case_id=case_id)
         if _open_intent_projection(existing) != request:
@@ -1128,9 +1173,9 @@ def open_reconciliation_case(
             pre_identity = _fstat_identity(case_fd)
             entries = _list_dir_entries(case_fd)
             if entries == frozenset({"open.json"}):
-                existing = _read_optional_record(open_path)
+                existing = _read_optional_record_if_published(open_path)
                 if existing is None:
-                    existing, _replay = _wait_for_published_immutable_record(
+                    existing = _exact_replay_published_record_under_lock(
                         case_id=case_id,
                         case_fd=case_fd,
                         filename="open.json",
@@ -1200,7 +1245,7 @@ def record_reconciliation_observation(
     request = _observation_request_projection(case_id=case_id, observed_by=observed_by)
 
     obs_path = paths.reconciliation_observation_path(case_id, base_dir)
-    existing = _read_optional_record(obs_path)
+    existing = _read_optional_record_if_published(obs_path)
     if existing is not None:
         _validate_observation_record(existing)
         if _observation_intent_projection(existing) != request:
@@ -1216,6 +1261,17 @@ def record_reconciliation_observation(
     case_fd = _open_control_dir_no_follow(case_dir, context=f"reconciliation/{case_id}")
     try:
         entries = _list_dir_entries(case_fd)
+        if entries == _OBSERVED_ALLOWED:
+            existing = _exact_replay_published_record_under_lock(
+                case_id=case_id,
+                case_fd=case_fd,
+                filename="observation.json",
+                request_projection=request,
+                intent_from_record=_observation_intent_projection,
+                validate_existing=_validate_observation_record,
+            )
+            return _to_observation_record(existing), _write_metadata(exact_replay=True)
+
         _validate_directory_state(entries, allowed=_OBSERVED_ALLOWED - {"observation.json"}, case_id=case_id)
 
         approval_id = open_record["approval_id"]
@@ -1292,7 +1348,7 @@ def record_reconciliation_decision(
     )
 
     decision_path = paths.reconciliation_decision_path(case_id, base_dir)
-    existing = _read_optional_record(decision_path)
+    existing = _read_optional_record_if_published(decision_path)
     if existing is not None:
         _validate_decision_record(existing, case_id=case_id)
         if _decision_intent_projection(existing) != request:
@@ -1306,6 +1362,17 @@ def record_reconciliation_decision(
     case_fd = _open_control_dir_no_follow(case_dir, context=f"reconciliation/{case_id}")
     try:
         entries = _list_dir_entries(case_fd)
+        if entries == _DECIDED_ALLOWED:
+            existing = _exact_replay_published_record_under_lock(
+                case_id=case_id,
+                case_fd=case_fd,
+                filename="decision.json",
+                request_projection=request,
+                intent_from_record=_decision_intent_projection,
+                validate_existing=lambda body: _validate_decision_record(body, case_id=case_id),
+            )
+            return _to_decision_record(existing), _write_metadata(exact_replay=True)
+
         _validate_directory_state(entries, allowed=_DECIDED_ALLOWED - {"decision.json"}, case_id=case_id)
 
         approval_id = open_record["approval_id"]

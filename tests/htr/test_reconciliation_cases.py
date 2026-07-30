@@ -991,31 +991,73 @@ def test_subprocess_simultaneous_open_conflicting_intent_one_conflict(tmp_path):
 
 
 def test_subprocess_simultaneous_observation_creation(tmp_path):
+    _subprocess_simultaneous_observation_creation(tmp_path, worker_count=4)
+
+
+@pytest.mark.parametrize("worker_count", [2, 4, 8])
+def test_subprocess_simultaneous_observation_creation_deterministic(
+    tmp_path,
+    worker_count: int,
+) -> None:
+    _subprocess_simultaneous_observation_creation(tmp_path, worker_count=worker_count)
+
+
+def _subprocess_simultaneous_observation_creation(tmp_path, *, worker_count: int) -> None:
     run_id, _task_id, completion = _run_ready_for_completion(tmp_path)
     issue, _event_id = _issue_completion_approval(tmp_path, run_id, completion)
     case_id = _open_case(tmp_path, issue)
     ctx = multiprocessing.get_context("spawn")
-    barrier = ctx.Barrier(4)
-    slots = [ctx.Queue() for _ in range(4)]
+    barrier = ctx.Barrier(worker_count)
+    slots = [ctx.Queue() for _ in range(worker_count)]
     procs = [
         ctx.Process(
             target=_subprocess_observe_worker,
             args=(case_id, str(tmp_path), "operator", slots[i], barrier),
         )
-        for i in range(4)
+        for i in range(worker_count)
     ]
     for proc in procs:
         proc.start()
     for proc in procs:
         proc.join(timeout=60)
         assert proc.exitcode == 0
-    results = [slots[i].get(timeout=10) for i in range(4)]
+    results = [slots[i].get(timeout=10) for i in range(worker_count)]
     ok = [r for r in results if r[0] == "ok"]
     errs = [r for r in results if r[0] == "err"]
     assert len(errs) == 0, errs
-    assert len(ok) == 4
+    assert len(ok) == worker_count
     assert sum(1 for r in ok if r[2] is False) == 1
-    assert sum(1 for r in ok if r[2] is True) == 3
+    assert sum(1 for r in ok if r[2] is True) == worker_count - 1
+
+
+def test_subprocess_simultaneous_observation_conflicting_intent_one_conflict(tmp_path):
+    run_id, _task_id, completion = _run_ready_for_completion(tmp_path)
+    issue, _event_id = _issue_completion_approval(tmp_path, run_id, completion)
+    case_id = _open_case(tmp_path, issue)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_observe_worker,
+            args=(case_id, str(tmp_path), "alice", slots[0], barrier),
+        ),
+        ctx.Process(
+            target=_subprocess_observe_worker,
+            args=(case_id, str(tmp_path), "bob", slots[1], barrier),
+        ),
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    r0, r1 = slots[0].get(timeout=5), slots[1].get(timeout=5)
+    assert {r0[0], r1[0]} == {"ok", "err"}
+    ok = r0 if r0[0] == "ok" else r1
+    err = r1 if r0[0] == "ok" else r0
+    assert ok[2] is False
+    assert err[1] == "ReconciliationConflictError"
 
 
 def test_subprocess_simultaneous_decision_creation(tmp_path):
