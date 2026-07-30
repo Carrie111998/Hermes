@@ -66,6 +66,19 @@ if [ "$(id -u)" = "0" ]; then
         chown -R hermes:hermes "$HERMES_HOME/pairing" 2>/dev/null || true
     fi
 
+    # Always ensure logs/gateways is hermes-owned (mirrors upstream
+    # stage2-hook.sh, #45258). The mkdir below runs as root, so on a warm
+    # volume with a hermes-owned $HERMES_HOME the targeted chown above is
+    # skipped and a root-owned logs/gateways survives — the gateway then runs
+    # under s6-setuidgid hermes and its mkdir fails with Permission denied.
+    # Non-recursive: profile leaf dirs are each created by their own log/run
+    # as hermes.
+    # `! -L` mirrors upstream's refuse_symlinked_path guard: chown follows
+    # symlinks, so a planted link would retarget the chown (CWE-59/367).
+    if [ -d "$HERMES_HOME/logs/gateways" ] && [ ! -L "$HERMES_HOME/logs/gateways" ]; then
+        chown hermes:hermes "$HERMES_HOME/logs/gateways" 2>/dev/null || true
+    fi
+
     # Ensure config.yaml is readable by the hermes runtime user even if it was
     # edited on the host after initial ownership setup. Must run here (as root)
     # rather than after the privilege drop, otherwise a non-root caller like
