@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -396,6 +397,24 @@ def _read_optional_record(path: Path) -> dict[str, Any] | None:
         return read_json(path)
     except json.JSONDecodeError as exc:
         raise RecoveryRunValidationError(f"malformed JSON record: {path}") from exc
+
+
+def _read_optional_record_at(case_fd: int, filename: str) -> dict[str, Any] | None:
+    flags_read = _O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
+    try:
+        file_fd = os.open(filename, flags_read, dir_fd=case_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            return None
+        _raise_unsafe_path(f"recovery_runs/{filename}", exc)
+    try:
+        return _read_json_fd(file_fd)
+    except json.JSONDecodeError as exc:
+        raise RecoveryRunValidationError(f"malformed JSON record: {filename}") from exc
+    finally:
+        os.close(file_fd)
 
 
 def _validate_record_digest(
@@ -966,6 +985,7 @@ def _create_immutable_record(
     intent_from_record: Callable[[dict[str, Any]], dict[str, Any]],
     validate_existing: Callable[[dict[str, Any]], None] | None = None,
     actor_fields: dict[str, Any] | None = None,
+    case_lock_already_held: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     if record is None and record_factory is None:
         raise RecoveryRunValidationError("record or record_factory required")
@@ -978,7 +998,8 @@ def _create_immutable_record(
     flags = _O_CREAT | _O_EXCL | _O_WRONLY | _O_NOFOLLOW | _O_CLOEXEC
     flags_read = _O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC
     record_ctx = f"recovery_runs/{recovery_request_id}/{filename}"
-    fcntl.flock(case_fd, fcntl.LOCK_EX)
+    if not case_lock_already_held:
+        fcntl.flock(case_fd, fcntl.LOCK_EX)
     file_fd: int | None = None
     try:
         try:
@@ -1045,7 +1066,8 @@ def _create_immutable_record(
     finally:
         if file_fd is not None:
             os.close(file_fd)
-        fcntl.flock(case_fd, fcntl.LOCK_UN)
+        if not case_lock_already_held:
+            fcntl.flock(case_fd, fcntl.LOCK_UN)
 
 
 def _validate_directory_state(
@@ -1392,13 +1414,6 @@ def revoke_recovery_run_approval(
         raise RecoveryRunStateError("issue.json missing", recovery_request_id=recovery_request_id)
     _validate_record_digest(issue, digest_field="issue_digest", projection_fn=_issue_digest_projection)
 
-    claim = _read_optional_record(paths.recovery_run_claim_path(recovery_request_id, base_dir))
-    if claim is not None:
-        raise RecoveryRunConflictError(
-            "revoke after claim is conflicting/ineffective",
-            recovery_request_id=recovery_request_id,
-        )
-
     intent = {
         "revoke_intent_projection_version": REVOKE_INTENT_PROJECTION_VERSION,
         "recovery_request_id": recovery_request_id,
@@ -1420,7 +1435,19 @@ def revoke_recovery_run_approval(
 
     case_dir = paths.recovery_run_control_dir(recovery_request_id, base_dir)
     case_fd = _open_control_dir_no_follow(case_dir, context=f"recovery_runs/{recovery_request_id}")
+    fcntl.flock(case_fd, fcntl.LOCK_EX)
     try:
+        claim = _read_optional_record_at(case_fd, "claim.json")
+        if claim is not None:
+            _validate_record_digest(
+                claim,
+                digest_field="claim_digest",
+                projection_fn=_claim_digest_projection,
+            )
+            raise RecoveryRunConflictError(
+                "revoke after claim is conflicting/ineffective",
+                recovery_request_id=recovery_request_id,
+            )
         persisted, exact_replay = _create_immutable_record(
             recovery_request_id=recovery_request_id,
             case_fd=case_fd,
@@ -1434,11 +1461,13 @@ def revoke_recovery_run_approval(
                 digest_field="revoke_digest",
                 projection_fn=_revoke_digest_projection,
             ),
+            case_lock_already_held=True,
         )
         post = _list_dir_entries(case_fd)
         _validate_directory_state(post, allowed=_REVOKED_ALLOWED, recovery_request_id=recovery_request_id)
         return persisted, _write_metadata(exact_replay=exact_replay)
     finally:
+        fcntl.flock(case_fd, fcntl.LOCK_UN)
         os.close(case_fd)
 
 
@@ -1458,11 +1487,6 @@ def claim_recovery_run_approval(
     if issue is None:
         raise RecoveryRunStateError("issue.json missing", recovery_request_id=recovery_request_id)
     _validate_record_digest(issue, digest_field="issue_digest", projection_fn=_issue_digest_projection)
-    revoke = _read_optional_record(paths.recovery_run_revoke_path(recovery_request_id, base_dir))
-    if revoke is not None:
-        raise RecoveryRunValidationError("cannot claim revoked recovery approval")
-
-    _assert_approval_active(issue=issue, revoke=revoke, claim=None)
 
     intent = {
         "claim_intent_projection_version": CLAIM_INTENT_PROJECTION_VERSION,
@@ -1487,9 +1511,17 @@ def claim_recovery_run_approval(
 
     case_dir = paths.recovery_run_control_dir(recovery_request_id, base_dir)
     case_fd = _open_control_dir_no_follow(case_dir, context=f"recovery_runs/{recovery_request_id}")
+    fcntl.flock(case_fd, fcntl.LOCK_EX)
     try:
+        revoke = _read_optional_record_at(case_fd, "revoke.json")
         if revoke is not None:
+            _validate_record_digest(
+                revoke,
+                digest_field="revoke_digest",
+                projection_fn=_revoke_digest_projection,
+            )
             raise RecoveryRunValidationError("cannot claim revoked recovery approval")
+        _assert_approval_active(issue=issue, revoke=revoke, claim=None)
         persisted, exact_replay = _create_immutable_record(
             recovery_request_id=recovery_request_id,
             case_fd=case_fd,
@@ -1503,11 +1535,13 @@ def claim_recovery_run_approval(
                 digest_field="claim_digest",
                 projection_fn=_claim_digest_projection,
             ),
+            case_lock_already_held=True,
         )
         post = _list_dir_entries(case_fd)
         _validate_directory_state(post, allowed=_CLAIMED_ALLOWED, recovery_request_id=recovery_request_id)
         return _to_claim_record(persisted), _write_metadata(exact_replay=exact_replay)
     finally:
+        fcntl.flock(case_fd, fcntl.LOCK_UN)
         os.close(case_fd)
 
 

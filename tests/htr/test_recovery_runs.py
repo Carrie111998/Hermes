@@ -821,34 +821,416 @@ def _subprocess_recovery_claim_worker(
     recovery_request_id: str,
     claim_id: str,
     slot: Any,
+    *,
+    barrier: Any | None = None,
+    gate: Any | None = None,
 ) -> None:
     try:
-        claim_recovery_run_approval(
+        if gate is not None:
+            gate.wait(timeout=30)
+        if barrier is not None:
+            barrier.wait(timeout=30)
+        _rec, meta = claim_recovery_run_approval(
             recovery_request_id,
             claim_id,
             claimant="executor",
             base_dir=Path(runs_root),
         )
-        slot.put("claimed")
+        slot.put(("claimed", meta.exact_replay))
     except Exception as exc:
-        slot.put(type(exc).__name__)
+        slot.put(("err", type(exc).__name__, str(exc)))
 
 
 def _subprocess_recovery_revoke_worker(
     runs_root: str,
     recovery_request_id: str,
     slot: Any,
+    *,
+    barrier: Any | None = None,
+    gate: Any | None = None,
+    done: Any | None = None,
 ) -> None:
     try:
-        revoke_recovery_run_approval(
+        if gate is not None:
+            gate.wait(timeout=30)
+        if barrier is not None:
+            barrier.wait(timeout=30)
+        _rec, meta = revoke_recovery_run_approval(
             recovery_request_id,
             revoked_by="approver",
             reason="race",
             base_dir=Path(runs_root),
         )
-        slot.put("revoked")
+        if done is not None:
+            done.set()
+        slot.put(("revoked", meta.exact_replay))
     except Exception as exc:
-        slot.put(type(exc).__name__)
+        slot.put(("err", type(exc).__name__, str(exc)))
+
+
+def _subprocess_crash_holding_recovery_case_flock_worker(
+    runs_root: str,
+    recovery_request_id: str,
+    slot: Any,
+    release_gate: Any,
+) -> None:
+    import fcntl
+
+    from htr.recovery_runs import _open_control_dir_no_follow
+
+    case_dir = paths.recovery_run_control_dir(recovery_request_id, Path(runs_root))
+    case_fd = _open_control_dir_no_follow(case_dir, context=f"recovery_runs/{recovery_request_id}")
+    try:
+        fcntl.flock(case_fd, fcntl.LOCK_EX)
+        slot.put("flock_held")
+        release_gate.wait(timeout=10)
+        os._exit(1)
+    finally:
+        os.close(case_fd)
+
+
+def _subprocess_claim_then_signal_worker(
+    runs_root: str,
+    recovery_request_id: str,
+    claim_id: str,
+    slot: Any,
+    claim_done: Any,
+) -> None:
+    try:
+        _rec, meta = claim_recovery_run_approval(
+            recovery_request_id,
+            claim_id,
+            claimant="executor",
+            base_dir=Path(runs_root),
+        )
+        claim_done.set()
+        slot.put(("claimed", meta.exact_replay))
+    except Exception as exc:
+        slot.put(("err", type(exc).__name__, str(exc)))
+
+
+def _issued_recovery_request(tmp_path: Path) -> str:
+    recovery_request_id, _successor, _case_id, _source = _path_r1_request(tmp_path)
+    issue_recovery_run_approval(
+        recovery_request_id,
+        generate_recovery_approval_id(),
+        issued_by="approver",
+        expires_at=_expires_in_minutes(10),
+        base_dir=tmp_path,
+    )
+    return recovery_request_id
+
+
+def _recovery_case_entries(recovery_request_id: str, tmp_path: Path) -> frozenset[str]:
+    case_dir = paths.recovery_run_control_dir(recovery_request_id, tmp_path)
+    return frozenset(p.name for p in case_dir.iterdir() if p.is_file())
+
+
+def test_subprocess_revoke_wins_claim_rejected(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    ctx = multiprocessing.get_context("spawn")
+    revoke_done = ctx.Event()
+    claim_q: Any = ctx.Queue()
+    revoke_q: Any = ctx.Queue()
+    revoke_proc = ctx.Process(
+        target=_subprocess_recovery_revoke_worker,
+        args=(str(tmp_path), recovery_request_id, revoke_q),
+        kwargs={"done": revoke_done},
+    )
+    claim_proc = ctx.Process(
+        target=_subprocess_recovery_claim_worker,
+        args=(str(tmp_path), recovery_request_id, claim_id, claim_q),
+        kwargs={"gate": revoke_done},
+    )
+    revoke_proc.start()
+    claim_proc.start()
+    revoke_proc.join(timeout=30)
+    claim_proc.join(timeout=30)
+    assert revoke_proc.exitcode == 0
+    assert claim_proc.exitcode == 0
+    assert revoke_q.get(timeout=5) == ("revoked", False)
+    claim_result = claim_q.get(timeout=5)
+    assert claim_result[0] == "err"
+    assert claim_result[1] == "RecoveryRunValidationError"
+    assert paths.recovery_run_revoke_path(recovery_request_id, tmp_path).is_file()
+    assert not paths.recovery_run_claim_path(recovery_request_id, tmp_path).exists()
+    assert _recovery_case_entries(recovery_request_id, tmp_path) == frozenset(
+        {"request.json", "issue.json", "revoke.json"}
+    )
+
+
+def test_subprocess_claim_wins_revoke_rejected(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    ctx = multiprocessing.get_context("spawn")
+    claim_done = ctx.Event()
+    claim_q: Any = ctx.Queue()
+    revoke_q: Any = ctx.Queue()
+    claim_proc = ctx.Process(
+        target=_subprocess_claim_then_signal_worker,
+        args=(str(tmp_path), recovery_request_id, claim_id, claim_q, claim_done),
+    )
+    revoke_proc = ctx.Process(
+        target=_subprocess_recovery_revoke_worker,
+        args=(str(tmp_path), recovery_request_id, revoke_q),
+        kwargs={"gate": claim_done},
+    )
+    claim_proc.start()
+    revoke_proc.start()
+    claim_proc.join(timeout=30)
+    revoke_proc.join(timeout=30)
+    assert claim_proc.exitcode == 0
+    assert revoke_proc.exitcode == 0
+    assert claim_q.get(timeout=5)[0] == "claimed"
+    revoke_result = revoke_q.get(timeout=5)
+    assert revoke_result[0] == "err"
+    assert revoke_result[1] == "RecoveryRunConflictError"
+    assert paths.recovery_run_claim_path(recovery_request_id, tmp_path).is_file()
+    assert not paths.recovery_run_revoke_path(recovery_request_id, tmp_path).exists()
+    assert _recovery_case_entries(recovery_request_id, tmp_path) == frozenset(
+        {"request.json", "issue.json", "claim.json"}
+    )
+
+
+def test_subprocess_simultaneous_revoke_claim_exactly_one_wins(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    claim_q: Any = ctx.Queue()
+    revoke_q: Any = ctx.Queue()
+    claim_proc = ctx.Process(
+        target=_subprocess_recovery_claim_worker,
+        args=(str(tmp_path), recovery_request_id, claim_id, claim_q),
+        kwargs={"barrier": barrier},
+    )
+    revoke_proc = ctx.Process(
+        target=_subprocess_recovery_revoke_worker,
+        args=(str(tmp_path), recovery_request_id, revoke_q),
+        kwargs={"barrier": barrier},
+    )
+    claim_proc.start()
+    revoke_proc.start()
+    claim_proc.join(timeout=30)
+    revoke_proc.join(timeout=30)
+    assert claim_proc.exitcode == 0
+    assert revoke_proc.exitcode == 0
+    claim_result = claim_q.get(timeout=5)
+    revoke_result = revoke_q.get(timeout=5)
+    winners = [r for r in (claim_result, revoke_result) if r[0] in ("claimed", "revoked")]
+    losers = [r for r in (claim_result, revoke_result) if r[0] == "err"]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    if winners[0][0] == "revoked":
+        assert losers[0][1] == "RecoveryRunValidationError"
+        assert _recovery_case_entries(recovery_request_id, tmp_path) == frozenset(
+            {"request.json", "issue.json", "revoke.json"}
+        )
+    else:
+        assert losers[0][1] == "RecoveryRunConflictError"
+        assert _recovery_case_entries(recovery_request_id, tmp_path) == frozenset(
+            {"request.json", "issue.json", "claim.json"}
+        )
+
+
+def test_subprocess_simultaneous_identical_revoke_replay(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_recovery_revoke_worker,
+            args=(str(tmp_path), recovery_request_id, slots[i]),
+            kwargs={"barrier": barrier},
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    results = [slots[i].get(timeout=5) for i in range(2)]
+    assert all(r[0] == "revoked" for r in results)
+    assert sum(1 for r in results if r[1] is False) == 1
+    assert sum(1 for r in results if r[1] is True) == 1
+
+
+def test_subprocess_simultaneous_identical_claim_replay(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_recovery_claim_worker,
+            args=(str(tmp_path), recovery_request_id, claim_id, slots[i]),
+            kwargs={"barrier": barrier},
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    results = [slots[i].get(timeout=5) for i in range(2)]
+    assert all(r[0] == "claimed" for r in results)
+    assert sum(1 for r in results if r[1] is False) == 1
+    assert sum(1 for r in results if r[1] is True) == 1
+
+
+def test_subprocess_conflicting_claim_fails_closed(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    barrier = ctx.Barrier(2)
+    slots = [ctx.Queue(), ctx.Queue()]
+    claim_ids = [generate_recovery_claim_id(), generate_recovery_claim_id()]
+    procs = [
+        ctx.Process(
+            target=_subprocess_recovery_claim_worker,
+            args=(str(tmp_path), recovery_request_id, claim_ids[i], slots[i]),
+            kwargs={"barrier": barrier},
+        )
+        for i in range(2)
+    ]
+    for proc in procs:
+        proc.start()
+    for proc in procs:
+        proc.join(timeout=30)
+        assert proc.exitcode == 0
+    results = [slots[i].get(timeout=5) for i in range(2)]
+    ok = [r for r in results if r[0] == "claimed"]
+    err = [r for r in results if r[0] == "err"]
+    assert len(ok) == 1
+    assert len(err) == 1
+    assert err[0][1] == "RecoveryRunConflictError"
+
+
+def test_revoke_conflicting_actor_replay_fails_closed(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    revoke_recovery_run_approval(
+        recovery_request_id,
+        revoked_by="approver",
+        reason="first",
+        base_dir=tmp_path,
+    )
+    with pytest.raises(RecoveryRunConflictError):
+        revoke_recovery_run_approval(
+            recovery_request_id,
+            revoked_by="other-approver",
+            reason="first",
+            base_dir=tmp_path,
+        )
+
+
+def test_claim_conflicting_actor_replay_fails_closed(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    claim_recovery_run_approval(
+        recovery_request_id,
+        claim_id,
+        claimant="executor",
+        base_dir=tmp_path,
+    )
+    with pytest.raises(RecoveryRunConflictError):
+        claim_recovery_run_approval(
+            recovery_request_id,
+            claim_id,
+            claimant="other-executor",
+            base_dir=tmp_path,
+        )
+
+
+@pytest.mark.parametrize("filename", ("revoke.json", "claim.json"))
+def test_partial_revoke_or_claim_record_fails_closed(tmp_path, filename):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    target = paths.recovery_run_control_dir(recovery_request_id, tmp_path) / filename
+    target.write_text('{"partial": true', encoding="utf-8")
+    if filename == "revoke.json":
+        with pytest.raises(RecoveryRunValidationError):
+            revoke_recovery_run_approval(
+                recovery_request_id,
+                revoked_by="approver",
+                reason="race",
+                base_dir=tmp_path,
+            )
+    else:
+        with pytest.raises(RecoveryRunValidationError):
+            claim_recovery_run_approval(
+                recovery_request_id,
+                generate_recovery_claim_id(),
+                claimant="executor",
+                base_dir=tmp_path,
+            )
+
+
+def test_subprocess_crash_holding_case_flock_releases_lock(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    ctx = multiprocessing.get_context("spawn")
+    release_gate = ctx.Event()
+    slot: Any = ctx.Queue()
+    proc = ctx.Process(
+        target=_subprocess_crash_holding_recovery_case_flock_worker,
+        args=(str(tmp_path), recovery_request_id, slot, release_gate),
+    )
+    proc.start()
+    assert slot.get(timeout=10) == "flock_held"
+    release_gate.set()
+    proc.join(timeout=10)
+    assert proc.exitcode == 1
+    revoke_recovery_run_approval(
+        recovery_request_id,
+        revoked_by="approver",
+        reason="after-crash",
+        base_dir=tmp_path,
+    )
+    assert paths.recovery_run_revoke_path(recovery_request_id, tmp_path).is_file()
+
+
+def test_thread_revoke_claim_coordination_no_deadlock(tmp_path):
+    recovery_request_id = _issued_recovery_request(tmp_path)
+    claim_id = generate_recovery_claim_id()
+    barrier = threading.Barrier(2)
+    slots: list[tuple[str, ...]] = []
+
+    def _revoke() -> None:
+        barrier.wait(timeout=30)
+        try:
+            revoke_recovery_run_approval(
+                recovery_request_id,
+                revoked_by="approver",
+                reason="thread",
+                base_dir=tmp_path,
+            )
+            slots.append(("revoked",))
+        except Exception as exc:
+            slots.append(("err", type(exc).__name__))
+
+    def _claim() -> None:
+        barrier.wait(timeout=30)
+        try:
+            _rec, meta = claim_recovery_run_approval(
+                recovery_request_id,
+                claim_id,
+                claimant="executor",
+                base_dir=tmp_path,
+            )
+            slots.append(("claimed", str(meta.exact_replay)))
+        except Exception as exc:
+            slots.append(("err", type(exc).__name__))
+
+    threads = [threading.Thread(target=_revoke), threading.Thread(target=_claim)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+    assert len(slots) == 2
+    assert sum(1 for s in slots if s[0] in ("revoked", "claimed")) == 1
 
 
 def test_hardening_path_r1_integration_all_eligibility_fields(tmp_path):
@@ -1317,37 +1699,6 @@ def test_hardening_invalid_ids_rejected(tmp_path):
             executor="executor",
             base_dir=tmp_path,
         )
-
-
-def test_hardening_subprocess_revoke_claim_race(tmp_path):
-    ctx = multiprocessing.get_context("spawn")
-    recovery_request_id, _successor, _case_id, _source = _path_r1_request(tmp_path)
-    issue_recovery_run_approval(
-        recovery_request_id,
-        generate_recovery_approval_id(),
-        issued_by="approver",
-        expires_at=_expires_in_minutes(10),
-        base_dir=tmp_path,
-    )
-    claim_q: Any = ctx.Queue()
-    revoke_q: Any = ctx.Queue()
-    claim_proc = ctx.Process(
-        target=_subprocess_recovery_claim_worker,
-        args=(str(tmp_path), recovery_request_id, generate_recovery_claim_id(), claim_q),
-    )
-    revoke_proc = ctx.Process(
-        target=_subprocess_recovery_revoke_worker,
-        args=(str(tmp_path), recovery_request_id, revoke_q),
-    )
-    claim_proc.start()
-    revoke_proc.start()
-    claim_proc.join(timeout=30)
-    revoke_proc.join(timeout=30)
-    assert not claim_proc.is_alive()
-    assert not revoke_proc.is_alive()
-    outcomes = {claim_q.get_nowait(), revoke_q.get_nowait()}
-    assert "claimed" in outcomes or "RecoveryRunValidationError" in outcomes
-    assert "revoked" in outcomes or "RecoveryRunConflictError" in outcomes
 
 
 def test_hardening_thread_concurrent_execute_one_creator_exact_replays(tmp_path):
