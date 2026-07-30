@@ -527,6 +527,44 @@ def test_venv_holder_guard_excludes_explicit_supervisor(monkeypatch, capsys):
     assert seen == [{555, 666}]
 
 
+def test_quiesced_dashboard_does_not_exclude_detached_venv_worker(
+    monkeypatch, capsys
+):
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_PID", "555")
+    monkeypatch.setenv("_HERMES_UPDATE_SUPERVISOR_QUIESCED", "dashboard")
+    seen = []
+    supervisor = SimpleNamespace(pid=555)
+    fake_psutil = types.SimpleNamespace(
+        Process=lambda: SimpleNamespace(parents=lambda: [supervisor])
+    )
+
+    def detect(*, exclude_pids=None):
+        seen.append(exclude_pids)
+        # A profile-scoped dashboard TUI can have a slash worker or compute
+        # host that intentionally called setsid(). It is not the attested
+        # dashboard supervisor or a drained gateway and must still block.
+        return [
+            (
+                777,
+                "python",
+                "venv/bin/python -m tui_gateway.slash_worker",
+            )
+        ]
+
+    with patch.dict(sys.modules, {"psutil": fake_psutil}), patch(
+        "hermes_cli.gateway.find_gateway_pids", return_value=[]
+    ):
+        result = _run_update_until_guard(
+            _update_args(force=False, force_venv=False),
+            is_windows=False,
+            detector=detect,
+            quiesce_token=None,
+        )
+
+    assert result == "exit_2", capsys.readouterr().out
+    assert seen == [{555}]
+
+
 def test_venv_holder_guard_does_not_trust_unquiesced_dashboard_supervisor(
     monkeypatch, capsys
 ):

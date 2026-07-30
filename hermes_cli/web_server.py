@@ -14578,7 +14578,14 @@ _LEGACY_PTY_BRIDGES: set[object] = set()
 
 
 async def _close_legacy_pty(bridge) -> None:
-    """Verify one legacy PTY and retain failures for the update boundary."""
+    """Verify one legacy PTY and retain failures for the update boundary.
+
+    The bridge proves its leader and dedicated PTY group exited. Any
+    Hermes-owned Python helper that deliberately called ``setsid()`` remains
+    outside the dashboard-supervisor exclusion and is caught by the updater's
+    managed-venv holder guard; external detached applications are neither
+    tracked nor signalled here.
+    """
     await close_and_verify_bridge(bridge)
     _LEGACY_PTY_BRIDGES.discard(bridge)
 

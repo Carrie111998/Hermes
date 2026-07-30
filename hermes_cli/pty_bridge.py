@@ -39,8 +39,6 @@ import termios
 import time
 from typing import Optional, Sequence
 
-import psutil
-
 try:
     import ptyprocess  # type: ignore
     _PTY_AVAILABLE = not sys.platform.startswith("win")
@@ -60,7 +58,6 @@ __all__ = ["PtyBridge", "PtyUnavailableError"]
 _MIN_DIMENSION = 1
 _MAX_COLS = 2000
 _MAX_ROWS = 1000
-_DESCENDANT_SCAN_INTERVAL_S = 1.0
 
 
 def _clamp_dimension(value: int, maximum: int) -> int:
@@ -114,15 +111,6 @@ class PtyBridge:
             )
         except Exception:
             self._pgid = None
-        # Some embedded-TUI helpers intentionally call setsid(), so they leave
-        # the PTY leader's process group.  Retain psutil Process identities
-        # (PID + creation time) captured while the leader is still alive; this
-        # avoids both losing reparented helpers and signalling a reused PID.
-        self._descendants: dict[tuple[int, float], psutil.Process] = {}
-        self._descendant_scan_succeeded = False
-        self._descendant_scan_failed = False
-        self._next_descendant_scan = 0.0
-        self._track_descendants()
 
     # -- lifecycle --------------------------------------------------------
 
@@ -196,13 +184,8 @@ class PtyBridge:
             return False
 
     def verify_closed(self) -> bool:
-        """Strict process-tree exit probe used by fail-closed update shutdown."""
-        return (
-            not bool(self._proc.isalive())
-            and not self._process_group_alive()
-            and not self._live_descendants()
-            and not self._descendant_scan_failed
-        )
+        """Strict PTY-leader/group probe used by fail-closed update shutdown."""
+        return not bool(self._proc.isalive()) and not self._process_group_alive()
 
     def _process_group_alive(self) -> bool:
         """Return whether any process remains in the PTY's dedicated group."""
@@ -217,62 +200,6 @@ class PtyBridge:
         except PermissionError:
             # The group exists even if the current user cannot signal it.
             return True
-
-    def _track_descendants(self) -> None:
-        """Snapshot descendants before the PTY leader can exit and reparent them."""
-        try:
-            descendants = psutil.Process(self._proc.pid).children(recursive=True)
-        except psutil.NoSuchProcess:
-            # If the leader disappeared before our first successful snapshot,
-            # there is no safe way to prove that it left no reparented helper.
-            if not self._descendant_scan_succeeded:
-                self._descendant_scan_failed = True
-            return
-        except (psutil.Error, OSError):
-            self._descendant_scan_failed = True
-            return
-        self._descendant_scan_succeeded = True
-        tracked = self._descendants
-        for proc in descendants:
-            try:
-                tracked[(proc.pid, proc.create_time())] = proc
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                continue
-            except (psutil.Error, OSError):
-                self._descendant_scan_failed = True
-
-    def _maybe_track_descendants(self) -> None:
-        """Refresh descendants periodically while the PTY leader is alive."""
-        now = time.monotonic()
-        if now < self._next_descendant_scan:
-            return
-        self._next_descendant_scan = now + _DESCENDANT_SCAN_INTERVAL_S
-        self._track_descendants()
-
-    def _live_descendants(self) -> list[psutil.Process]:
-        """Return tracked descendants that can still execute code."""
-        live: list[psutil.Process] = []
-        for proc in self._descendants.values():
-            try:
-                if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
-                    live.append(proc)
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                continue
-            except (psutil.Error, OSError):
-                self._descendant_scan_failed = True
-        return live
-
-    def _signal_detached_descendants(self, sig: signal.Signals) -> None:
-        """Signal tracked helpers that left the PTY leader's process group."""
-        for proc in self._live_descendants():
-            try:
-                if self._pgid is not None and os.getpgid(proc.pid) == self._pgid:
-                    continue
-                proc.send_signal(sig)
-            except (psutil.NoSuchProcess, ProcessLookupError):
-                continue
-            except (psutil.Error, OSError):
-                self._descendant_scan_failed = True
 
     # -- I/O --------------------------------------------------------------
 
@@ -289,7 +216,6 @@ class PtyBridge:
         """
         if self._closed:
             return None
-        self._maybe_track_descendants()
         try:
             readable, _, _ = select.select([self._fd], [], [], timeout)
         except (OSError, ValueError):
@@ -301,11 +227,9 @@ class PtyBridge:
         except OSError as exc:
             # EIO on Linux = slave side closed.  EBADF = already closed.
             if exc.errno in {errno.EIO, errno.EBADF}:
-                self._track_descendants()
                 return None
             raise
         if not data:
-            self._track_descendants()
             return None
         return data
 
@@ -364,16 +288,14 @@ class PtyBridge:
         pgid = self._pgid
 
         # SIGHUP is the conventional "your terminal went away" signal.
-        # Send it to the whole foreground process group, not just the PTY
-        # leader: the dashboard TUI starts helper children such as the Python
-        # slash worker, and killing only the leader can strand those helpers.
+        # Send it to the whole PTY process group, not just the leader, so
+        # ordinary helper children cannot be stranded. Hermes-owned helpers
+        # that intentionally create a separate session are Python/PyPy
+        # processes from the managed venv; the updater's holder guard sees
+        # those processes and does not include them in the dashboard
+        # supervisor exclusion.
         for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok — POSIX-only module (imports fcntl/termios/ptyprocess at top)
-            self._track_descendants()
-            if (
-                not self._proc.isalive()
-                and not self._process_group_alive()
-                and not self._live_descendants()
-            ):
+            if not self._proc.isalive() and not self._process_group_alive():
                 break
             try:
                 if pgid is not None:
@@ -382,14 +304,9 @@ class PtyBridge:
                     self._proc.kill(sig)
             except Exception:
                 pass
-            self._signal_detached_descendants(sig)
             deadline = time.monotonic() + 0.5
             while (
-                (
-                    self._proc.isalive()
-                    or self._process_group_alive()
-                    or self._live_descendants()
-                )
+                (self._proc.isalive() or self._process_group_alive())
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.02)
