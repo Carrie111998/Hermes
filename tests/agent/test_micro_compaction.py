@@ -680,6 +680,92 @@ class TestMicroCompaction:
                 "the user's message disappears from every transcript surface"
             )
 
+    def test_forward_collision_is_merged_deliberately_not_left_to_the_repair(self):
+        """The merge must be done here, not left to happen downstream.
+
+        Pass 2 would fold the successor into the marker anyway, but relying on
+        that leaves the ordering and the metadata to a repair pass in another
+        module, and leaves the transcript wrong on any path where that pass
+        does not run. Do it in one place: summary first, live message after,
+        metadata set atomically.
+        """
+        cc = _compressor()
+        cc._micro_compact_rolling_summary = "ROLLING SUMMARY"
+        messages = [
+            {"role": "user", "content": "opening ask"},
+            {"role": "assistant", "content": "interim"},
+        ]
+        for i in range(8):
+            messages.append({"role": "assistant", "content": f"answer {i} " + "z" * 400})
+            messages.append({"role": "user", "content": f"REAL USER TURN {i}"})
+        cc._micro_compact_cursor = 2
+
+        # No repair pass run at all -- the transcript must already be correct.
+        result = cc._micro_compact(list(messages))
+
+        merged = [
+            m for m in result
+            if m.get(COMPRESSED_SUMMARY_METADATA_KEY)
+            and "REAL USER TURN 0" in str(m.get("content"))
+        ]
+        assert len(merged) == 1, "successor was not merged at splice time"
+        row = merged[0]
+        assert row.get(COMPRESSED_SUMMARY_HAS_USER_TURN_KEY) is True
+        assert row.get(COMPRESSED_SUMMARY_SOURCE_KEY) == "micro"
+        body = str(row["content"])
+        # Summary first, end marker, then the live user message after it.
+        assert body.index("ROLLING SUMMARY") < body.index("REAL USER TURN 0")
+        assert body.index(_SUMMARY_END_MARKER) < body.index("REAL USER TURN 0")
+        # The user's turn must not also survive as a separate row.
+        assert sum(
+            1 for m in result if str(m.get("content")) == "REAL USER TURN 0"
+        ) == 0
+
+    def test_zero_user_backstop_actually_fires(self):
+        """Force the backstop branch rather than asserting around it.
+
+        Reaching it needs the only user-role row to be an earlier micro marker
+        that supersede then removes: the role picker sees ``prev_role="user"``
+        and picks ``assistant``, supersede drops the old marker because it
+        carries this mechanism's own tag, and nothing user-role is left. Without
+        the backstop the request 400s on strict OpenAI-compatible backends.
+        """
+        cc = _compressor()
+        cc._micro_compact_rolling_summary = "ROLLING SUMMARY"
+        prior_marker = {
+            "role": "user",  # an earlier pass's fallback/backstop choice
+            "content": (
+                f"{SUMMARY_PREFIX}\n\n{HISTORICAL_TASK_HEADING}\n"
+                f"earlier micro summary\n\n{_SUMMARY_END_MARKER}"
+            ),
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            COMPRESSED_SUMMARY_SOURCE_KEY: "micro",
+        }
+        messages = [prior_marker]
+        for i in range(8):
+            messages.append({
+                "role": "assistant", "content": f"step {i} " + "z" * 400,
+                "tool_calls": [{
+                    "id": f"c{i}", "type": "function",
+                    "function": {"name": "sh", "arguments": "{}"},
+                }],
+            })
+            messages.append({
+                "role": "tool", "tool_call_id": f"c{i}",
+                "content": "output " + "y" * 300,
+            })
+
+        result = cc._micro_compact(list(messages))
+
+        # The old marker really was superseded (its own lineage, so fair game).
+        assert not any(
+            "earlier micro summary" in str(m.get("content")) for m in result
+        )
+        # ...and the backstop kept a user-role row alive anyway.
+        assert any(m.get("role") == "user" for m in result), (
+            "zero-user transcript: 400 'No user query found' on vLLM/Qwen"
+        )
+
     def test_supersede_never_deletes_a_foreign_summary_marker(self):
         """A batch marker must survive micro-compaction passes.
 

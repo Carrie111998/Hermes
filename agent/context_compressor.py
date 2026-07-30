@@ -5757,12 +5757,42 @@ This compaction should PRIORITISE preserving all information related to the focu
             COMPRESSED_SUMMARY_SOURCE_KEY: _MICRO_COMPACT_SOURCE,
         }
 
-        result = (
-            messages[:splice_start]
-            + [summary_msg]
-            + retained
-            + messages[splice_end:]
-        )
+        if will_absorb_user_turn:
+            # Do the merge deliberately instead of leaving it to pass 2. That
+            # fold happens anyway -- the marker is the survivor and the user's
+            # text is concatenated onto it -- but doing it here means the
+            # ordering and the metadata are decided in one place rather than
+            # emerging from a repair pass in another module, and the result is
+            # the same whether or not that pass ever runs. Batch compaction
+            # merges the same way when neither role works (see ``compress``'s
+            # ``_merge_summary_into_tail``): summary first, then the live
+            # message, separated by the end marker already sitting at the tail
+            # of ``content``, so the model is told plainly which part to
+            # respond to.
+            merged = dict(successor)
+            merged["content"] = _append_text_to_content(
+                successor.get("content", ""), content + "\n\n", prepend=True
+            )
+            merged[COMPRESSED_SUMMARY_METADATA_KEY] = True
+            merged[COMPRESSED_SUMMARY_HAS_USER_TURN_KEY] = True
+            merged[COMPRESSED_SUMMARY_SOURCE_KEY] = _MICRO_COMPACT_SOURCE
+            # Content rewritten, so the api_content sidecar (the exact bytes
+            # sent before) is stale; replay must not resend the pre-merge copy.
+            drop_stale_api_content(merged)
+            summary_msg = merged
+            tail = (
+                retained[1:] + messages[splice_end:]
+                if retained
+                else messages[splice_end + 1:]
+            )
+            result = messages[:splice_start] + [merged] + tail
+        else:
+            result = (
+                messages[:splice_start]
+                + [summary_msg]
+                + retained
+                + messages[splice_end:]
+            )
 
         # The rolling summary is cumulative: this marker already contains
         # everything every earlier micro-compaction marker held. Leaving those
