@@ -2588,6 +2588,11 @@ class BasePlatformAdapter(ABC):
     # it) means EVERY platform adapter receives the injection, so profile
     # routing is platform-generic instead of Discord-only.
     gateway_runner = None  # type: ignore[assignment]  # set by gateway/run.py
+    # The gateway's asyncio event loop, set by gateway/run.py alongside
+    # ``gateway_runner``.  Async adapter methods that use an aiohttp session
+    # (e.g. discord.py's ``channel.send()``) must run their coroutines on this
+    # loop, not on a worker loop created by ``_run_async()``.
+    _gateway_loop = None  # type: ignore[assignment]  # set by gateway/run.py
 
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config

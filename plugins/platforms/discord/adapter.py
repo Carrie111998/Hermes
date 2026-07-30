@@ -888,6 +888,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._allowed_user_ids: set = set()  # For button approval authorization
         self._allowed_role_ids: set = set()  # For DISCORD_ALLOWED_ROLES filtering
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
+        # The gateway's asyncio event loop, set by the gateway runner. This loop
+        # owns the discord.py client's aiohttp session — all async adapter calls
+        # from sync tool-handler contexts must schedule their coroutines on THIS
+        # loop, not on a worker loop created by ``_run_async()``.
+        self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         # Voice channel state (per-guild)
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
@@ -981,6 +986,39 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+
+    def _run_coro_on_loop(
+        self, coro: "Coroutine[Any, Any, Any]",
+        timeout: float = 30,
+    ) -> Any:
+        """Schedule *coro* on the gateway event loop from a sync context.
+
+        The discord.py client's ``aiohttp`` session is bound to the gateway
+        loop — calling ``channel.send()`` or any other discord.py method from
+        a worker-thread loop (as ``_run_async()`` would) raises
+        ``"Timeout context manager should be used inside a task"``.
+
+        Use this method instead of ``_run_async(coro)`` when calling adapter
+        methods from a sync tool-handler context.  It schedules the coroutine
+        on ``self._gateway_loop`` via ``asyncio.run_coroutine_threadsafe``,
+        which is thread-safe and preserves the aiohttp session binding.
+
+        Falls back to ``_run_async(coro)`` when no gateway loop is available
+        (standalone/cron context without a live gateway).
+        """
+        loop = self._gateway_loop
+        if loop is not None and not loop.is_closed():
+            from agent.async_utils import safe_schedule_threadsafe
+            import logging
+            fut = safe_schedule_threadsafe(
+                coro, loop,
+                logger=logging.getLogger(__name__),
+                log_message="Discord adapter coroutine scheduling on gateway loop",
+            )
+            if fut is not None:
+                return fut.result(timeout=timeout)
+        from model_tools import _run_async
+        return _run_async(coro)
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None

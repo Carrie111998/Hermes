@@ -10571,6 +10571,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # this reaches ALL platforms (not just the ones that
                     # pre-declared it), making profile routing platform-generic.
                     adapter.gateway_runner = self
+                    # Share the gateway event loop so adapter methods that
+                    # use an aiohttp session (e.g. discord.py's
+                    # ``channel.send()``) can schedule coroutines on the
+                    # correct loop from sync tool-handler contexts.
+                    if hasattr(adapter, '_gateway_loop'):
+                        adapter._gateway_loop = getattr(self, '_gateway_loop', None)
                     return adapter
                 # Registered but failed to instantiate — don't silently fall
                 # through to built-ins (there are none for plugin platforms).
@@ -10624,6 +10630,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             adapter = APIServerAdapter(config)
             adapter.gateway_runner = self
+            if hasattr(adapter, '_gateway_loop'):
+                adapter._gateway_loop = getattr(self, '_gateway_loop', None)
             return adapter
 
         elif platform == Platform.WEBHOOK:
@@ -10633,6 +10641,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
             adapter = WebhookAdapter(config)
             adapter.gateway_runner = self  # For cross-platform delivery
+            if hasattr(adapter, '_gateway_loop'):
+                adapter._gateway_loop = getattr(self, '_gateway_loop', None)
             return adapter
 
         elif platform == Platform.MSGRAPH_WEBHOOK:
