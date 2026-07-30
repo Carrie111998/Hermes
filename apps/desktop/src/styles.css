@@ -188,6 +188,13 @@
     --context-usage-subagents: color-mix(in srgb, var(--ui-blue) 70%, var(--ui-cyan));
     --context-usage-memory: color-mix(in srgb, var(--ui-orange) 80%, var(--ui-yellow));
     --context-usage-conversation: var(--ui-cyan);
+    /* Landed memory-write tool row — gold → purple, never amber warning. */
+    --tool-memory-legendary-from: color-mix(in srgb, var(--ui-yellow) 72%, #f5d08a);
+    --tool-memory-legendary-mid: color-mix(in srgb, var(--ui-orange) 55%, var(--ui-purple));
+    --tool-memory-legendary-to: color-mix(in srgb, var(--ui-purple) 82%, #c4b5fd);
+    --tool-memory-legendary-icon: color-mix(in srgb, var(--ui-yellow) 55%, var(--ui-purple));
+    --tool-memory-legendary-meta: color-mix(in srgb, var(--ui-purple) 58%, var(--ui-text-tertiary));
+    --tool-memory-legendary-glow: color-mix(in srgb, var(--ui-purple) 38%, transparent);
     /* Diff add/remove, derived from the semantic palette so every diff surface
        (tool cards, preview, review pane) tracks the theme's green/red. Only the
        foregrounds need a dark override — they mix toward the page instead of
@@ -738,6 +745,29 @@
   }
 }
 
+/* Landed `memory` tool row — gold → purple on the brain glyph + title.
+   Pair with `text-transparent` so the scaffold label color can't win. */
+.tool-memory-legendary-title {
+  background-image: linear-gradient(
+    105deg,
+    var(--tool-memory-legendary-from) 0%,
+    var(--tool-memory-legendary-mid) 48%,
+    var(--tool-memory-legendary-to) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent !important;
+  font-weight: 600;
+}
+
+.tool-memory-legendary-glyph {
+  filter: drop-shadow(0 0 0.28rem var(--tool-memory-legendary-glow));
+}
+
+.tool-memory-legendary-meta {
+  color: var(--tool-memory-legendary-meta);
+}
+
 .quest-glow {
   animation: quest-glow 1.8s ease-in-out infinite;
 }
@@ -965,36 +995,42 @@ text-* variant utilities. */ .btn-arc {
      thin on mac still looks chunky. Use webkit for real thin thumbs; gate the
      standard props so only non-webkit engines (Firefox) take that path.
      https://developer.chrome.com/docs/css-ui/scrollbar-styling
-     https://syntackle.com/blog/changes-to-scrollbar-styling-in-chrome-121/ */
+     https://syntackle.com/blog/changes-to-scrollbar-styling-in-chrome-121/
+
+     Any author rule on ::-webkit-scrollbar switches that scroller from
+     platform overlay (fade in on scroll, zero gutter) to classic always-on
+     gutters. `.scrollbar-overlay` opts a surface out of the themed rules so
+     Electron keeps native overlay — used by conversation code blocks where a
+     permanent 4px track eats the card and always draws a bar. */
 
   .scrollbar-dt::-webkit-scrollbar,
-  .scrollbar-dt *::-webkit-scrollbar {
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar {
     width: 0.25rem;
     height: 0.25rem;
   }
 
   .scrollbar-dt::-webkit-scrollbar-track,
   .scrollbar-dt::-webkit-scrollbar-corner,
-  .scrollbar-dt *::-webkit-scrollbar-track,
-  .scrollbar-dt *::-webkit-scrollbar-corner {
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-track,
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-corner {
     background: transparent;
   }
 
   .scrollbar-dt::-webkit-scrollbar-thumb,
-  .scrollbar-dt *::-webkit-scrollbar-thumb {
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-thumb {
     background: color-mix(in srgb, var(--dt-midground) 18%, transparent);
     border-radius: 9999rem;
     background-clip: padding-box;
   }
 
   .scrollbar-dt::-webkit-scrollbar-thumb:hover,
-  .scrollbar-dt *::-webkit-scrollbar-thumb:hover {
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-thumb:hover {
     background: color-mix(in srgb, var(--dt-midground) 40%, transparent);
     background-clip: padding-box;
   }
 
   .scrollbar-dt::-webkit-scrollbar-button,
-  .scrollbar-dt *::-webkit-scrollbar-button {
+  .scrollbar-dt *:not(.scrollbar-overlay)::-webkit-scrollbar-button {
     display: none;
   }
 
@@ -1029,12 +1065,19 @@ text-* variant utilities. */ .btn-arc {
 
   @supports not selector(::-webkit-scrollbar) {
     .scrollbar-dt,
-    .scrollbar-dt * {
+    .scrollbar-dt *:not(.scrollbar-overlay) {
       scrollbar-width: thin;
       scrollbar-color: color-mix(in srgb, var(--dt-midground) 18%, transparent) transparent;
     }
 
     .dt-portal-scrollbar {
+      scrollbar-width: thin;
+      scrollbar-color: color-mix(in srgb, var(--dt-midground) 28%, transparent) transparent;
+    }
+
+    /* Firefox has no real overlay mode; thin + transparent track is the closest
+       match to the Chromium overlay opt-out above. */
+    .scrollbar-overlay {
       scrollbar-width: thin;
       scrollbar-color: color-mix(in srgb, var(--dt-midground) 28%, transparent) transparent;
     }
