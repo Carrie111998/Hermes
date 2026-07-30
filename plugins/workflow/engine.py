@@ -460,6 +460,30 @@ class WorkflowEngine:
 
     # ── Kanban dispatch ────────────────────────────────────────
 
+
+    def _workspace_kind(self) -> str:
+        """Return workspace_kind based on board's default_workdir."""
+        from pathlib import Path as _P
+        board_json = _P(kanban_db.kanban_home()) / "boards" / self.kanban_board / "board.json"
+        if board_json.exists():
+            import json as _json
+            with open(board_json) as f:
+                cfg = _json.load(f)
+            if cfg.get("default_workdir"):
+                return "worktree"
+        return "scratch"
+
+    def _workspace_path(self):
+        """Return workspace_path based on board's default_workdir."""
+        from pathlib import Path as _P
+        board_json = _P(kanban_db.kanban_home()) / "boards" / self.kanban_board / "board.json"
+        if board_json.exists():
+            import json as _json
+            with open(board_json) as f:
+                cfg = _json.load(f)
+            return cfg.get("default_workdir")
+        return None
+
     def create_kanban_card(self, node: WorkflowNode, context: dict = None,
                             *, workflow: Optional["Workflow"] = None,
                             states: Optional[dict] = None,
@@ -538,8 +562,8 @@ class WorkflowEngine:
                 parents=(),
                 tenant=self.kanban_board,
                 priority=2,
-                workspace_kind="scratch",
-                workspace_path=None,
+                workspace_kind=self._workspace_kind(),
+                workspace_path=self._workspace_path(),
                 project_id=None,
                 triage=node.triage if hasattr(node, 'triage') else False,
                 max_runtime_seconds=(
