@@ -217,8 +217,9 @@ export function registerPaneOpener(paneId: string, open: () => void) {
 // TOOL PANELS (terminal, logs, …): their toggle COLLAPSES the zone to a rail
 // (tab stays) instead of hiding it, and the tab's ✕ REMOVES it (vs a session
 // tile, whose ✕ closes the session). Membership tells the renderer which
-// semantics a tab gets. See bindPaneCollapse in the controller.
+// semantics a tab gets.
 const collapsePanes = new Set<string>()
+const initialGroupMinimized = new Map<string, boolean | undefined>()
 
 export function markCollapsePane(paneId: string) {
   collapsePanes.add(paneId)
@@ -226,6 +227,66 @@ export function markCollapsePane(paneId: string) {
 
 export function isCollapsePane(paneId: string): boolean {
   return collapsePanes.has(paneId)
+}
+
+/**
+ * Bind a tool pane's open toggle to its layout zone.
+ *
+ * An explicit v2 tree value is the persisted presentation authority. Capture
+ * it once per group because terminal and logs can share a zone, and binding
+ * the first pane may mutate the live tree before the second pane binds.
+ * Trees without an explicit value retain the legacy toggle-store migration.
+ */
+export function bindPaneCollapse(
+  paneId: string,
+  $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
+  close: () => void,
+  open: () => void
+) {
+  markCollapsePane(paneId)
+  const group = paneGroup(paneId)
+  let minimized = group?.id ? initialGroupMinimized.get(group.id) : undefined
+
+  if (group?.id && !initialGroupMinimized.has(group.id)) {
+    minimized = group.minimized
+    initialGroupMinimized.set(group.id, minimized)
+  }
+
+  if (minimized === true) {
+    if ($open.get()) {
+      close()
+    }
+  } else if (minimized === false) {
+    if (group?.active === paneId && !$open.get()) {
+      open()
+    }
+  } else {
+    setPaneCollapsed(paneId, !$open.get())
+  }
+
+  $open.listen(isOpen => setPaneCollapsed(paneId, !isOpen))
+  registerPaneCloser(paneId, close)
+  registerPaneOpener(paneId, open)
+}
+
+function reconcileCollapsePaneStores() {
+  const tree = $layoutTree.get()
+
+  if (!tree) {
+    return
+  }
+
+  for (const paneId of collapsePanes) {
+    const group = findGroupOfPane(tree, paneId)
+
+    if (!group) {
+      continue
+    }
+
+    const action = !group.minimized && group.active === paneId ? paneOpeners[paneId] : paneClosers[paneId]
+
+    action?.()
+  }
 }
 
 const resetHandlers = new Set<() => void>()
@@ -1390,6 +1451,10 @@ export function resetLayoutTree() {
   resetHandlers.forEach(fn => fn())
   // Everything still missing (plugin panes) adopts by placement.
   adoptContributedPanes()
+  // Boot restoration may have closed a collapse pane's legacy toggle store.
+  // The reset tree is authoritative again, so mirror its active/minimized
+  // presentation back into those stores before controls render the next state.
+  reconcileCollapsePaneStores()
 
   // "Restore everything" includes collapsed SIDES: reopen every bound side
   // (through its store, so $sidebarOpen / the toggles stay truthful). Without
