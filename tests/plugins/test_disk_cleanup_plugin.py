@@ -86,6 +86,19 @@ class TestIsSafePath:
         dg = _load_lib()
         assert dg.is_safe_path(Path("/etc/passwd")) is False
 
+    def test_accepts_tmp_hermes_prefix(self, _isolate_env):
+        dg = _load_lib()
+        assert dg.is_safe_path(Path("/tmp/hermes-abc/x.log")) is True
+
+    def test_rejects_tmp_hermes_path_traversal(self, _isolate_env):
+        dg = _load_lib()
+        escaped = Path("/tmp/hermes-abc/../../tmp/outside/test_victim.py")
+        assert dg.is_safe_path(escaped) is False
+
+    def test_rejects_plain_tmp(self, _isolate_env):
+        dg = _load_lib()
+        assert dg.is_safe_path(Path("/tmp/other.log")) is False
+
 
 class TestGuessCategory:
     def test_test_prefix(self, _isolate_env):
@@ -113,6 +126,14 @@ class TestGuessCategory:
         p = logs_dir / "test_log.txt"
         p.write_text("x")
         # Even though it matches test_* pattern, logs/ is excluded.
+        assert dg.guess_category(p) is None
+
+    def test_skips_durable_ops_workspaces(self, _isolate_env):
+        dg = _load_lib()
+        tests_dir = _isolate_env / "ops" / "model-routing" / "tests"
+        tests_dir.mkdir(parents=True)
+        p = tests_dir / "test_usage_collection.py"
+        p.write_text("def test_durable(): pass")
         assert dg.guess_category(p) is None
 
     def test_cron_subtree_categorised(self, _isolate_env):
@@ -226,6 +247,114 @@ class TestStaleCronEntryMigration:
 
 
 class TestTrackForgetQuick:
+    def test_quick_rejects_forged_outside_home_entry(self, _isolate_env, tmp_path):
+        dg = _load_lib()
+        victim = tmp_path / "outside" / "test_victim.py"
+        victim.parent.mkdir()
+        victim.write_text("durable")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(victim),
+            "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00",
+            "size": victim.stat().st_size,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_rejects_lexical_traversal_inside_home(self, _isolate_env):
+        dg = _load_lib()
+        victim = _isolate_env / "test_victim.py"
+        victim.write_text("durable")
+        forged = _isolate_env / "disk-cleanup" / ".." / "test_victim.py"
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(forged), "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00", "size": 7,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_rejects_malformed_entry_without_deleting(self, _isolate_env):
+        dg = _load_lib()
+        victim = _isolate_env / "test_victim.py"
+        victim.write_text("durable")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{"path": str(victim)}]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_rejects_unknown_category(self, _isolate_env):
+        dg = _load_lib()
+        victim = _isolate_env / "test_victim.py"
+        victim.write_text("durable")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(victim), "category": "unknown-danger",
+            "timestamp": "2025-01-01T00:00:00+00:00", "size": 7,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    def test_quick_rejects_invalid_timestamp(self, _isolate_env):
+        dg = _load_lib()
+        victim = _isolate_env / "test_victim.py"
+        victim.write_text("durable")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(victim), "category": "test",
+            "timestamp": "not-a-timestamp", "size": 7,
+        }]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
+    @pytest.mark.parametrize("field,value", [("path", None), ("size", "seven")])
+    def test_quick_rejects_invalid_field_types(
+        self, _isolate_env, field, value
+    ):
+        dg = _load_lib()
+        victim = _isolate_env / "test_victim.py"
+        victim.write_text("durable")
+        item = {
+            "path": str(victim), "category": "test",
+            "timestamp": "2025-01-01T00:00:00+00:00", "size": 7,
+        }
+        item[field] = value
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([item]))
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.read_text() == "durable"
+        assert json.loads(tracked_file.read_text()) == []
+
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"

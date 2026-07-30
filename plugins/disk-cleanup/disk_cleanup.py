@@ -70,12 +70,16 @@ def is_safe_path(path: Path) -> bool:
     """
     hermes_home = get_hermes_home()
     try:
-        path.resolve().relative_to(hermes_home)
+        resolved = path.resolve()
+    except OSError:
+        return False
+    try:
+        resolved.relative_to(hermes_home)
         return True
-    except (ValueError, OSError):
+    except ValueError:
         pass
-    # Allow /tmp/hermes-* explicitly
-    parts = path.parts
+    # Allow /tmp/hermes-* explicitly, but only after canonical resolution.
+    parts = resolved.parts
     if len(parts) >= 3 and parts[1] == "tmp" and parts[2].startswith("hermes-"):
         return True
     return False
@@ -311,14 +315,47 @@ def quick() -> Dict[str, Any]:
     errors: List[str] = []
 
     for item in tracked:
+        if not isinstance(item, dict) or not {
+            "path", "category", "timestamp", "size"
+        }.issubset(item):
+            _log("SKIP malformed tracked entry: missing required fields")
+            continue
+
+        if not (
+            isinstance(item["path"], str) and item["path"].strip()
+            and isinstance(item["category"], str)
+            and isinstance(item["timestamp"], str)
+            and isinstance(item["size"], int)
+            and not isinstance(item["size"], bool)
+            and item["size"] >= 0
+        ):
+            _log("SKIP malformed tracked entry: invalid field types")
+            continue
+
         p = Path(item["path"])
         cat = item["category"]
+
+        if cat not in ALLOWED_CATEGORIES:
+            _log(f"SKIP malformed tracked entry: unknown category {cat!r}")
+            continue
+
+        if ".." in p.parts:
+            _log(f"SKIP unsafe tracked path traversal: {p}")
+            continue
+
+        if not is_safe_path(p):
+            _log(f"SKIP unsafe tracked path: {p}")
+            continue
 
         if not p.exists():
             _log(f"STALE: {p} (removed from tracking)")
             continue
 
-        age = (now - datetime.fromisoformat(item["timestamp"])).days
+        try:
+            age = (now - datetime.fromisoformat(item["timestamp"])).days
+        except (TypeError, ValueError):
+            _log("SKIP malformed tracked entry: invalid timestamp")
+            continue
 
         # ---- stale-state migration (fixes #37721) ----
         # Old tracked.json entries may carry a "cron-output" category for
@@ -561,7 +598,7 @@ def guess_category(path: Path) -> Optional[str]:
         top = rel.parts[0] if rel.parts else ""
         if top in {
             "disk-cleanup", "logs", "memories", "sessions", "config.yaml",
-            "skills", "plugins", ".env", "USER.md", "MEMORY.md", "SOUL.md",
+            "skills", "plugins", "ops", ".env", "USER.md", "MEMORY.md", "SOUL.md",
             "auth.json", "hermes-agent",
         }:
             return None
