@@ -143,6 +143,43 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
+def test_single_completion_is_queued_when_persistence_fails(monkeypatch):
+    def fail_persist(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ad, "_persist_completion", fail_persist)
+    dispatched = ad.dispatch_async_delegation(
+        goal="single", context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", runner=lambda: {"status": "completed", "summary": "done"},
+    )
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    assert (evt["status"], evt["summary"]) == ("completed", "done")
+
+
+def test_batch_completion_is_queued_when_persistence_fails(monkeypatch):
+    def fail_persist(*_args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(ad, "_persist_completion", fail_persist)
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner",
+        runner=lambda: {
+            "results": [
+                {"status": "completed", "summary": "a done"},
+                {"status": "completed", "summary": "b done"},
+            ]
+        },
+    )
+
+    evt = _drain_for(dispatched["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "completed"
+    assert [result["summary"] for result in evt["results"]] == ["a done", "b done"]
+
+
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",

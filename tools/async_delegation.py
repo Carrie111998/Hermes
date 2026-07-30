@@ -282,6 +282,20 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
         )
 
 
+def _persist_completion_best_effort(
+    event: Dict[str, Any], result: Dict[str, Any]
+) -> None:
+    """Keep live delivery available when durable completion storage fails."""
+    try:
+        _persist_completion(event, result)
+    except Exception:  # noqa: BLE001 — in-memory delivery must still proceed
+        logger.exception(
+            "Async delegation %s: failed to persist completion; "
+            "publishing the in-memory event without restart durability",
+            event.get("delegation_id"),
+        )
+
+
 def _note_delivery_attempt(delegation_id: str) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -865,7 +879,7 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
+    _persist_completion_best_effort(evt, result)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1074,7 +1088,7 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
+    _persist_completion_best_effort(evt, combined)
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
