@@ -427,20 +427,32 @@ def _parse_tool_result(raw):
     those, which used to surface inside execute_code as a spurious parse
     failure even though the tool call itself succeeded. Decode the first JSON
     value and keep any trailing text under the "_hint" key so nothing is lost.
+
+    A payload can also be doubly encoded (the outer JSON value is itself a JSON
+    string), and the trailing text can sit after either the outer or the inner
+    payload. Unwrap iteratively and carry the suffix through the unwrap instead
+    of dropping it.
     """
+    def _decode(text):
+        """Decode the first JSON value in `text` -> (value, trailing_text)."""
+        try:
+            return json.loads(text), ""
+        except json.JSONDecodeError:
+            value, end = json.JSONDecoder().raw_decode(text)
+            return value, text[end:].strip()
+
     text = raw.strip() if isinstance(raw, str) else raw
-    trailing = ""
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError:
-        result, end = json.JSONDecoder().raw_decode(text)
-        trailing = text[end:].strip()
-    if isinstance(result, str):
+    result, trailing = _decode(text)
+    while isinstance(result, str):
         # Doubly-encoded payload: the outer JSON value is itself a JSON string.
         try:
-            return _parse_tool_result(result)
+            inner, inner_trailing = _decode(result.strip())
         except (json.JSONDecodeError, TypeError):
-            return result
+            break
+        result = inner
+        # A hint attached to the inner payload is the more specific one; keep
+        # the outer suffix when the inner level had none.
+        trailing = inner_trailing or trailing
     if trailing and isinstance(result, dict) and "_hint" not in result:
         result["_hint"] = trailing
     return result

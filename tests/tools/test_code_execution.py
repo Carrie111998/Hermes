@@ -157,13 +157,6 @@ class TestGeneratedToolResultParsing(unittest.TestCase):
         self.assertIn("_parse_tool_result", ns)
         return ns["_parse_tool_result"]
 
-    def test_both_transports_define_the_parser(self):
-        for transport in ("uds", "file"):
-            src = generate_hermes_tools_module(["search_files"], transport=transport)
-            self.assertIn("def _parse_tool_result(raw):", src)
-            # Neither transport should hand the raw payload to a strict loads().
-            self.assertNotIn("result = json.loads(raw)", src)
-
     def test_plain_json_object_roundtrips(self):
         for transport in ("uds", "file"):
             parse = self._parser_for(transport)
@@ -183,23 +176,56 @@ class TestGeneratedToolResultParsing(unittest.TestCase):
 
     def test_existing_hint_key_is_not_clobbered(self):
         payload = json.dumps({"ok": True, "_hint": "from tool"}) + "\n\ntrailing"
-        parse = self._parser_for("uds")
-        self.assertEqual(parse(payload)["_hint"], "from tool")
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            self.assertEqual(parse(payload)["_hint"], "from tool")
 
     def test_double_encoded_payload_still_unwraps(self):
         payload = json.dumps(json.dumps({"output": "hi", "exit_code": 0}))
-        parse = self._parser_for("file")
-        self.assertEqual(parse(payload)["output"], "hi")
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            self.assertEqual(parse(payload)["output"], "hi")
+
+    def test_double_encoded_payload_keeps_outer_trailing_hint(self):
+        """The suffix survives the double-encoded unwrap.
+
+        The outer value is a JSON string holding the real payload, and the hint
+        sits after that outer string. Unwrapping must not discard it.
+        """
+        hint = "[Hint: Results truncated. Use offset=50 to see more.]"
+        payload = json.dumps(json.dumps({"ok": True})) + "\n\n" + hint
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            result = parse(payload)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["_hint"], hint)
+
+    def test_double_encoded_payload_keeps_inner_trailing_hint(self):
+        """A hint after the inner payload is preserved too."""
+        hint = "[Hint: inner]"
+        payload = json.dumps(json.dumps({"ok": True}) + "\n\n" + hint)
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            result = parse(payload)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["_hint"], hint)
 
     def test_non_json_trailing_on_json_list_does_not_raise(self):
         payload = "[1, 2, 3]\n\n[Hint: more]"
-        parse = self._parser_for("uds")
-        self.assertEqual(parse(payload), [1, 2, 3])
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            self.assertEqual(parse(payload), [1, 2, 3])
+
+    def test_plain_string_payload_returned_as_is(self):
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            self.assertEqual(parse(json.dumps("just a message")), "just a message")
 
     def test_truly_malformed_payload_still_raises(self):
-        parse = self._parser_for("uds")
-        with self.assertRaises(json.JSONDecodeError):
-            parse("not json at all")
+        for transport in ("uds", "file"):
+            parse = self._parser_for(transport)
+            with self.assertRaises(json.JSONDecodeError):
+                parse("not json at all")
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
