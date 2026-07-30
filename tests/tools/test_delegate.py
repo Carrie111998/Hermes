@@ -765,6 +765,41 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertTrue(any("native-SDK" in m for m in logs.output))
 
     @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_path_bedrock_alias_still_excluded(self, mock_resolve):
+        """A registered alias (aws -> bedrock) resolves to a canonical native-SDK
+        provider; the api_mode exclusion keys on the RESOLVED provider, so an override
+        cannot become valid merely because an alias spelling was configured."""
+        mock_resolve.return_value = {
+            "provider": "bedrock",       # canonical, resolved from the "aws" alias
+            "base_url": None,
+            "api_key": "k",
+            "api_mode": "bedrock_converse",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "m", "provider": "aws", "api_mode": "chat_completions"}
+        with self.assertLogs("tools.delegate_tool", level="WARNING") as logs:
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["api_mode"], "bedrock_converse")
+        self.assertTrue(any("native-SDK" in m for m in logs.output))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_provider_path_vertex_alias_still_excluded(self, mock_resolve):
+        """Same for vertex aliases (google-vertex -> vertex): resolved-canonical
+        exclusion, override ignored, loud warning."""
+        mock_resolve.return_value = {
+            "provider": "vertex",        # canonical, resolved from the "google-vertex" alias
+            "base_url": "https://aiplatform.googleapis.com",
+            "api_key": "k",
+            "api_mode": "chat_completions",
+        }
+        parent = _make_mock_parent(depth=0)
+        cfg = {"model": "m", "provider": "google-vertex", "api_mode": "anthropic_messages"}
+        with self.assertLogs("tools.delegate_tool", level="WARNING") as logs:
+            creds = _resolve_delegation_credentials(cfg, parent)
+        self.assertEqual(creds["api_mode"], "chat_completions")
+        self.assertTrue(any("native-SDK" in m for m in logs.output))
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
     def test_provider_path_no_api_mode_unchanged(self, mock_resolve):
         """Without delegation.api_mode the provider-resolved transport flows through
         untouched — zero behavior change for existing configs."""

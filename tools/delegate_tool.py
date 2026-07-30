@@ -3597,14 +3597,25 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     # the child always got the runtime-resolved transport. Native-SDK providers
     # are excluded (their wire protocol is fixed by the bundle), and an
     # unsupported value keeps the resolved mode — loudly, never silently.
+    #
+    # The exclusion is keyed on the RESOLVED canonical provider, not the configured
+    # spelling: registered aliases (bedrock: aws/aws-bedrock/amazon-bedrock/amazon;
+    # vertex: google-vertex/vertex-ai/gcp-vertex) resolve to a canonical native-SDK
+    # provider, and an override must not become valid merely because an alias was
+    # used. The configured-spelling check stays as a fallback for the rare path
+    # where resolution reports "custom" but the spelling itself is canonical.
+    resolved_provider_name = str(runtime.get("provider") or "").strip().lower()
+    _is_native_resolved = (
+        resolved_provider_name in _NATIVE_SDK_PROVIDERS or _is_native_sdk_provider
+    )
     resolved_api_mode = runtime.get("api_mode")
     if configured_api_mode:
-        if _is_native_sdk_provider:
+        if _is_native_resolved:
             logger.warning(
                 "delegation.api_mode '%s' is ignored for native-SDK provider '%s' "
                 "(its wire protocol is fixed)",
                 configured_api_mode,
-                configured_provider,
+                resolved_provider_name or configured_provider,
             )
         elif configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
             resolved_api_mode = configured_api_mode
