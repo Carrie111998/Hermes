@@ -1273,6 +1273,56 @@ class TestWebServerEndpoints:
         model_cfg = load_config()["model"]
         assert model_cfg["api_key"] == "sk-legacy"
 
+    # -- negative limit/offset validation -----------------------------------
+
+    def test_get_sessions_rejects_negative_limit(self):
+        """GET /api/sessions?limit=-1 should return 422."""
+        resp = self.client.get("/api/sessions?limit=-1")
+        assert resp.status_code == 422
+
+    def test_get_sessions_rejects_negative_offset(self):
+        """GET /api/sessions?offset=-1 should return 422."""
+        resp = self.client.get("/api/sessions?offset=-1")
+        assert resp.status_code == 422
+
+    def test_get_sessions_rejects_excessive_limit(self):
+        """GET /api/sessions?limit=501 should return 422 (capped at 500)."""
+        resp = self.client.get("/api/sessions?limit=501")
+        assert resp.status_code == 422
+
+    def test_get_profiles_sessions_rejects_negative_limit(self):
+        """GET /api/profiles/sessions?limit=-1 should return 422."""
+        resp = self.client.get("/api/profiles/sessions?limit=-1")
+        assert resp.status_code == 422
+
+    def test_get_profiles_sessions_rejects_negative_offset(self):
+        """GET /api/profiles/sessions?offset=-1 should return 422."""
+        resp = self.client.get("/api/profiles/sessions?offset=-1")
+        assert resp.status_code == 422
+
+    def test_get_profiles_sessions_rejects_excessive_limit(self):
+        """GET /api/profiles/sessions?limit=501 should return 422 (capped at 500)."""
+        resp = self.client.get("/api/profiles/sessions?limit=501")
+        assert resp.status_code == 422
+
+    def test_get_session_messages_rejects_negative_limit(self):
+        """GET /api/sessions/nonexistent/messages?limit=-1 should return 422
+        before reaching the route handler (validation layer)."""
+        resp = self.client.get("/api/sessions/nonexistent/messages?limit=-1")
+        assert resp.status_code == 422
+
+    def test_get_session_messages_rejects_negative_offset(self):
+        """GET /api/sessions/nonexistent/messages?offset=-1 should return 422
+        before reaching the route handler (validation layer)."""
+        resp = self.client.get("/api/sessions/nonexistent/messages?offset=-1")
+        assert resp.status_code == 422
+
+    def test_get_session_messages_rejects_excessive_limit(self):
+        """GET /api/sessions/nonexistent/messages?limit=501 should return 422
+        (capped at 500)."""
+        resp = self.client.get("/api/sessions/nonexistent/messages?limit=501")
+        assert resp.status_code == 422
+
 
 
 
