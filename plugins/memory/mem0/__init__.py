@@ -88,6 +88,12 @@ def _load_config() -> dict:
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "host": os.environ.get("MEM0_HOST", ""),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
+        # HTTP client timeout (seconds) for the self-hosted backend. A
+        # self-hosted /memories add fans out into several server-side LLM
+        # rounds, so a slow local model can exceed the old fixed 30s ceiling.
+        # Behavioral setting -> lives in mem0.json, not an env var. 120s keeps
+        # slow-model adds working while still bounding a truly hung server.
+        "http_timeout": 120.0,
         "oss": {},
     }
     # Only carry user_id when the operator explicitly configured one (env or
@@ -282,7 +288,12 @@ class Mem0MemoryProvider(MemoryProvider):
                 return OSSBackend(self._config.get("oss", {}))
             if self._host:
                 from ._backend import SelfHostedBackend
-                return SelfHostedBackend(self._api_key, self._host)
+                cfg = self._config or {}
+                try:
+                    timeout = float(cfg.get("http_timeout", 120.0))
+                except (TypeError, ValueError):
+                    timeout = 120.0
+                return SelfHostedBackend(self._api_key, self._host, timeout=timeout)
             from ._backend import PlatformBackend
             return PlatformBackend(self._api_key)
         except Exception as e:

@@ -371,8 +371,9 @@ class TestCreateBackendRouting:
         captured = {}
 
         class SH(_SentinelBackend):
-            def __init__(self, api_key, host):
+            def __init__(self, api_key, host, timeout=30.0):
                 captured["args"] = (api_key, host)
+                captured["timeout"] = timeout
 
         monkeypatch.setattr("plugins.memory.mem0._backend.SelfHostedBackend", SH)
         provider = self._provider(monkeypatch, host="http://sh:8888", api_key="adminkey")

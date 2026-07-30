@@ -201,6 +201,18 @@ class TestSelfHostedBackend:
         assert "authorization" not in b._client.headers  # NOT the cloud 'Token' scheme
 
 
+    def test_default_http_timeout_is_30s(self):
+        # Backward compatibility: unspecified timeout keeps the historical 30s.
+        b = SelfHostedBackend("adminkey", "http://sh:8888")
+        assert b._client.timeout.read == 30.0
+
+    def test_http_timeout_is_configurable(self):
+        # A slow self-hosted server + slow local LLM needs a larger ceiling so
+        # a multi-round /memories add doesn't time out mid-flight.
+        b = SelfHostedBackend("adminkey", "http://sh:8888", timeout=120.0)
+        assert b._client.timeout.read == 120.0
+
+
     # --- search ----------------------------------------------------------
 
 

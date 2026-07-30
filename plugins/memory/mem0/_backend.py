@@ -91,7 +91,7 @@ class SelfHostedBackend(Mem0Backend):
     ``/search`` routes.
     """
 
-    def __init__(self, api_key: str, host: str, transport=None):
+    def __init__(self, api_key: str, host: str, transport=None, timeout: float = 30.0):
         import httpx
 
         headers = {"Content-Type": "application/json"}
@@ -102,8 +102,14 @@ class SelfHostedBackend(Mem0Backend):
         # ``transport`` is injectable for tests (httpx.MockTransport).
         if transport is None:
             transport = httpx.HTTPTransport(retries=2)
+        # ``timeout`` is configurable (via mem0.json ``http_timeout``) because a
+        # self-hosted /memories add fans out into several server-side LLM rounds
+        # (fact extraction + per-fact update decision). Against a slow local
+        # model (e.g. a 27B on llama.cpp at ~30 tok/s) one add can exceed the
+        # historical 30s default and time out even though the server is still
+        # working. Default stays 30.0 for backward compatibility.
         self._client = httpx.Client(
-            base_url=host.rstrip("/"), headers=headers, timeout=30.0,
+            base_url=host.rstrip("/"), headers=headers, timeout=timeout,
             transport=transport,
         )
 
