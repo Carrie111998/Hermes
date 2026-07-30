@@ -21,7 +21,7 @@ import re
 from typing import Optional
 
 # ── secret shapes (belt-and-suspenders on top of agent/redact.py) ───────────
-_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+\-/]+=*", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bBearer\s+[A-Za-z0-9._~+\-/:]+=*", re.IGNORECASE)
 _TOKEN_RE = re.compile(
     r"\b(xox[baprs]-[A-Za-z0-9-]+|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,})\b"
 )

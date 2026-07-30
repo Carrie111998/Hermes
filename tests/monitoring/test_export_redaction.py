@@ -28,6 +28,15 @@ def test_bearer_header_stripped():
     assert "abc.def-ghi_jkl" not in out
 
 
+def test_bearer_token_with_colon_stripped():
+    """Regression test for #74967 — Bearer token containing colon leaked suffix."""
+    out = R.redact_for_export("Authorization: Bearer abc:def:ghi")
+    assert out is not None
+    assert "abc:def:ghi" not in out
+    # Ensure the colon didn't cause a partial match
+    assert ":def:ghi" not in out
+
+
 
 
 
