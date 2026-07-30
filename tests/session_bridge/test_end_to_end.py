@@ -21,6 +21,7 @@ import pytest
 from mcp.shared.version import LATEST_PROTOCOL_VERSION
 from starlette.testclient import TestClient
 
+from hermes_constants import get_hermes_home
 from hermes_state import SessionDB
 from session_bridge.catalog import UnifiedCatalog
 from session_bridge.claude_adapter import (
@@ -55,6 +56,7 @@ from session_bridge.models import (
 from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     VerifiedSidebarThread,
+    decode_sidebar_registration_identity,
     encode_hydration_marker,
 )
 from session_bridge.sidebar_executor import NativeTurnAmbiguous
@@ -1422,9 +1424,23 @@ class _FakeNativeCodexTasks:
         prompt: str,
         project_id: str,
         source_cwd: str,
+        cwd: str | None = None,
+        runtime_workspace_roots: tuple[str, ...] | None = None,
     ) -> str:
         if not self.available:
             raise RuntimeError("synthetic Desktop offline")
+        if cwd is None or runtime_workspace_roots is None:
+            if project_id != "session-inbox":
+                raise AssertionError("sidebar test creation must use the Session Inbox")
+            cwd = next(
+                project["path"]
+                for project in self.projects
+                if project["projectId"] == project_id
+            )
+            runtime_workspace_roots = (
+                cwd,
+                _canonical_sidebar_path(source_cwd),
+            )
         thread_id = self.next_thread_id or f"native-sidebar-{len(self.threads) + 1}"
         self.next_thread_id = None
         marker = _registration_marker(prompt)
@@ -1434,6 +1450,8 @@ class _FakeNativeCodexTasks:
             "prompt": prompt,
             "project_id": project_id,
             "source_cwd": source_cwd,
+            "cwd": cwd,
+            "runtime_workspace_roots": runtime_workspace_roots,
         }
         self.create_calls.append(call)
         self.threads[thread_id] = {
@@ -1590,14 +1608,26 @@ class _SidebarEndToEndHarness:
         self.now = time.time()
         self.db_path = tmp_path / "sidebar-e2e-state.db"
         self.db = SessionDB(self.db_path)
+        # The hermetic Windows runner intentionally clears HOME/TEMP-like
+        # ambient state. Keep this high-volume end-to-end fixture's SQLite
+        # scratch pages inside the connection rather than depending on a
+        # process-global temp directory.
+        self.db._conn.execute("PRAGMA temp_store=MEMORY")
         self.store = SessionBridgeStore(
             self.db,
             clock=lambda: self.now,
             sidebar_jitter=lambda _bound: 0.0,
         )
+        self.inbox = get_hermes_home()
+        self.inbox.mkdir(parents=True, exist_ok=True)
         self.config = replace(
             BridgeConfig(),
-            sidebar=replace(SidebarConfig(), enabled=True, continuous=False),
+            sidebar=replace(
+                SidebarConfig(),
+                enabled=True,
+                continuous=False,
+                inbox_cwd=str(self.inbox),
+            ),
         )
         self.native = _FakeNativeCodexTasks(
             _MARKER_SECRET,
@@ -1623,8 +1653,6 @@ class _SidebarEndToEndHarness:
         self.production_codex_target: CodexTargetAdapter | None = None
         self.allow_forbidden_app_server_fallback_for_mutation = False
         self.worker_traces: list[list[dict[str, Any]]] = []
-        self.inbox = tmp_path / ".hermes"
-        self.inbox.mkdir()
         self.native.add_project("session-inbox", self.inbox)
         self._rebuild_app()
 
@@ -1777,7 +1805,7 @@ class _SidebarEndToEndHarness:
                 provider=Provider.CODEX,
                 native_id=thread["thread_id"],
                 title="Native sidebar placeholder",
-                cwd=thread["source_cwd"],
+                cwd=thread["cwd"],
                 started_at=self.now,
                 last_active=self.now,
                 messages=(
@@ -1885,23 +1913,14 @@ class _SidebarEndToEndHarness:
         for ordinal, job in enumerate(jobs):
             job_id = job.get("source_session_id", f"job-{ordinal}")
             cwd = _canonical_sidebar_path(job["cwd"])
-            git_root = (
-                None
-                if job["git_root"] is None
-                else _canonical_sidebar_path(job["git_root"])
-            )
-            project_id = self.contract.choose_project(
-                projects,
-                cwd=cwd,
-                git_root=git_root,
-                inbox=_canonical_sidebar_path(self.inbox),
-            )
+            inbox_cwd = _canonical_sidebar_path(self.inbox)
+            project_id = projects[inbox_cwd]
             trace.append({
                 "tool": "project_choice",
                 "job": job_id,
                 "arguments": {
-                    "cwd": cwd,
-                    "git_root": git_root,
+                    "cwd": inbox_cwd,
+                    "runtime_workspace_roots": (inbox_cwd, cwd),
                     "project_id": project_id,
                 },
             })
@@ -2026,11 +2045,8 @@ class _SidebarEndToEndHarness:
                     continue
                 create_arguments = {
                     "prompt": job["registration_prompt"],
-                    "target": {
-                        "type": "project",
-                        "projectId": project_id,
-                        "environment": {"type": "local"},
-                    },
+                    "cwd": inbox_cwd,
+                    "runtimeWorkspaceRoots": [inbox_cwd, cwd],
                 }
                 trace.append({
                     "tool": self.contract.create_tool,
@@ -2046,6 +2062,8 @@ class _SidebarEndToEndHarness:
                         prompt=job["registration_prompt"],
                         project_id=project_id,
                         source_cwd=job["cwd"],
+                        cwd=inbox_cwd,
+                        runtime_workspace_roots=(inbox_cwd, cwd),
                     )
                     created = True
                 except RuntimeError:
@@ -2310,6 +2328,20 @@ def _verified_native_thread(thread: dict[str, Any]) -> VerifiedSidebarThread:
         thread_id=thread["thread_id"],
         source_session_id=payload.source_session_id,
         bridge_id=payload.bridge_id,
+        projection=SessionProjection(
+            provider=Provider.CODEX,
+            native_id=thread["thread_id"],
+            title=thread["title"] or "Native sidebar placeholder",
+            cwd=thread["cwd"],
+            started_at=0.0,
+            last_active=0.0,
+            messages=(),
+            native_path=f"native://{thread['thread_id']}",
+            native_cursor=f"cursor-{thread['thread_id']}",
+            native_hash=f"hash-{thread['thread_id']}",
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=payload.bridge_id,
+        ),
     )
 
 
@@ -2747,6 +2779,7 @@ def test_sidebar_backlog_recovery_preserves_exact_tasks_and_drains_both_ledgers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     from session_bridge.cli import ProductionBackend
 
     harness = _SidebarEndToEndHarness(tmp_path)
@@ -3059,7 +3092,7 @@ def test_sidebar_backlog_recovery_preserves_exact_tasks_and_drains_both_ledgers(
         harness.close()
 
 
-def test_sidebar_exact_cwd_saved_project_selection(tmp_path: Path) -> None:
+def test_sidebar_saved_source_project_still_uses_session_inbox(tmp_path: Path) -> None:
     harness = _SidebarEndToEndHarness(tmp_path)
     try:
         source_cwd = tmp_path / "exact-cwd"
@@ -3070,12 +3103,20 @@ def test_sidebar_exact_cwd_saved_project_selection(tmp_path: Path) -> None:
         with harness.client() as client:
             harness.run_worker_once(client)
 
-        assert harness.native.create_calls[0]["project_id"] == "exact-cwd-project"
+        created = harness.native.create_calls[0]
+        assert created["project_id"] == "session-inbox"
+        assert _canonical_sidebar_path(created["cwd"]) == _canonical_sidebar_path(
+            harness.inbox
+        )
+        assert tuple(created["runtime_workspace_roots"]) == (
+            _canonical_sidebar_path(harness.inbox),
+            _canonical_sidebar_path(source_cwd),
+        )
     finally:
         harness.close()
 
 
-def test_sidebar_exact_git_root_saved_project_selection(tmp_path: Path) -> None:
+def test_sidebar_saved_git_root_still_uses_session_inbox(tmp_path: Path) -> None:
     harness = _SidebarEndToEndHarness(tmp_path)
     try:
         repo = tmp_path / "saved-git-root"
@@ -3098,7 +3139,15 @@ def test_sidebar_exact_git_root_saved_project_selection(tmp_path: Path) -> None:
         with harness.client() as client:
             harness.run_worker_once(client)
 
-        assert harness.native.create_calls[0]["project_id"] == "git-root-project"
+        created = harness.native.create_calls[0]
+        assert created["project_id"] == "session-inbox"
+        assert _canonical_sidebar_path(created["cwd"]) == _canonical_sidebar_path(
+            harness.inbox
+        )
+        assert tuple(created["runtime_workspace_roots"]) == (
+            _canonical_sidebar_path(harness.inbox),
+            _canonical_sidebar_path(source_cwd),
+        )
     finally:
         harness.close()
 
@@ -3119,6 +3168,89 @@ def test_sidebar_inbox_fallback_preserves_exact_source_cwd(tmp_path: Path) -> No
             _canonical_sidebar_path(source_cwd)
         )
         assert f"Source cwd: {json.dumps(created['source_cwd'])}" in created["prompt"]
+    finally:
+        harness.close()
+
+
+def test_sidebar_transient_source_starts_in_inbox_and_restart_never_duplicates(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = (
+            tmp_path
+            / "transient"
+            / "repo"
+            / ".claude"
+            / "worktrees"
+            / "placement-proof"
+        )
+        harness.add_project("transient-source-project", source_cwd)
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "placement-proof",
+            cwd=source_cwd,
+            content="Keep the exact source identity while presenting this in the inbox",
+        )
+        harness.register()
+
+        with harness.client() as client:
+            dropped_client = _BindDroppingClient(client, timing="after_processing")
+            first = harness.run_worker_once(dropped_client)
+
+        harness.restart_bridge()
+        harness.advance_retry()
+        with harness.client() as client:
+            second = harness.run_worker_once(client)
+
+        created = harness.native.create_calls[0]
+        assert _canonical_sidebar_path(created["cwd"]) == _canonical_sidebar_path(
+            harness.inbox
+        )
+        assert tuple(
+            _canonical_sidebar_path(root)
+            for root in created["runtime_workspace_roots"]
+        ) == (
+            _canonical_sidebar_path(harness.inbox),
+            _canonical_sidebar_path(source_cwd),
+        )
+        registration = decode_sidebar_registration_identity(
+            created["prompt"],
+            _MARKER_SECRET,
+        )
+        assert registration.source_session_id == source_id
+        assert registration.source_cwd == str(source_cwd)
+        assert f"Source cwd: {json.dumps(str(source_cwd))}" in created["prompt"]
+        assert dropped_client.bind_attempts == 1
+        assert first == [
+            {
+                "state": "sidebar_retry",
+                "error_code": "bridge_temporarily_unavailable",
+                "codex_thread_id": "native-sidebar-1",
+            }
+        ]
+        assert second == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ]
+        assert len(harness.native.create_calls) == 1
+        assert (
+            sum(
+                event["tool"] == harness.contract.commit_tool
+                for trace in harness.worker_traces
+                for event in trace
+            )
+            == 1
+        )
+        job = harness.store.get_sidebar_job_for_source(source_id)
+        assert job["state"] == SidebarJobState.VISIBLE.value
+        assert job["codex_thread_id"] == "native-sidebar-1"
+        assert job["placement_generation"] == 1
+        links = harness.store.get_bridge_summaries([source_id])[source_id][
+            "bridge_links"
+        ]
+        assert len(links) == 1
+        assert links[0]["relation"] == Relation.MIRRORS.value
+        assert links[0]["to_session_id"] == "codex:native-sidebar-1"
     finally:
         harness.close()
 
