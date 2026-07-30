@@ -1053,6 +1053,7 @@ class ProcessRegistry:
         env_vars: dict = None,
         use_pty: bool = False,
         owner_task_id: str = "",
+        origin_ui_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1079,6 +1080,10 @@ class ProcessRegistry:
             task_id=task_id,
             owner_task_id=owner_task_id or task_id,
             session_key=session_key,
+            # Set at construction — BEFORE any reader/poller thread starts —
+            # so the very first output chunk already has a routable UI owner
+            # (a post-spawn assignment races the reader, #61719).
+            origin_ui_session_id=origin_ui_session_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -1298,6 +1303,7 @@ class ProcessRegistry:
         session_key: str = "",
         timeout: int = 10,
         owner_task_id: str = "",
+        origin_ui_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1316,6 +1322,8 @@ class ProcessRegistry:
             task_id=task_id,
             owner_task_id=owner_task_id or task_id,
             session_key=session_key,
+            # Before the log poller starts — see spawn_local (#61719).
+            origin_ui_session_id=origin_ui_session_id,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
