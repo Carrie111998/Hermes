@@ -484,13 +484,13 @@ Hermes injects project-level instructions into the system prompt by reading cont
 | `CLAUDE.md` / `claude.md` | Cwd only | Same as AGENTS.md, Claude-flavored |
 | `.cursorrules` / `.cursor/rules/*.mdc` | Cwd only | Migrating from Cursor |
 
-`SOUL.md` (in `$HERMES_HOME`) is independent and always loaded when present — it sets the agent's identity, not project rules.
+`SOUL.md` (in `$HERMES_HOME`) is independent and always loaded when present — it sets the agent's identity, not project rules. For a named profile, Hermes also loads the default/root `$HERMES_HOME/AGENTS.md` as an explicitly labelled **universal profile policy**. This is distinct from cwd project-context discovery, remains stable for the session, and is suppressed if the same root file was deliberately loaded as the cwd-local `AGENTS.md` to avoid duplication.
 
 ### Pick the right one
 
 - **Use `.hermes.md`** when you want Hermes-specific behavior that lives above the cwd (root + subtree), or when you want rules to inherit from a parent directory. The parent walk stops at the git root, so a home-level `.hermes.md` won't leak into every project (a git repo's root is the boundary).
 - **Use `AGENTS.md`** when the same project will also be worked on by other agents (Codex, Claude Code, OpenCode). Those tools all have their own conventions for `AGENTS.md`, and the "cwd only" contract keeps the file portable.
-- **Don't put project rules in `~/.hermes/AGENTS.md`** (or any other home-level location). When Hermes runs with that directory as cwd, the file loads — but only for that one directory. For cross-project context, use `SOUL.md` (in `$HERMES_HOME`, identity-only) or install a skill via `hermes skills install`.
+- **Keep project rules out of `~/.hermes/AGENTS.md`** (or any other home-level location). A root `AGENTS.md` is reserved for deliberate universal policy shared with named profiles; ordinary `AGENTS.md` discovery remains cwd-only. For cross-project context that is not a fleet-wide policy, use `SOUL.md` (in `$HERMES_HOME`, identity-only) or install a skill via `hermes skills install`.
 
 ### Size and truncation
 
