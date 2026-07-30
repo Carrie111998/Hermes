@@ -8809,6 +8809,44 @@ async def disconnect_oauth_provider(
             raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/providers/oauth/{provider_id}/re-enable")
+async def re_enable_oauth_provider(
+    provider_id: str,
+    request: Request,
+    profile: Optional[str] = None,
+):
+    """Clear the suppression marker so a disconnected provider is visible again.
+
+    Only ``claude-code`` supports this — its disconnect is a non-destructive
+    suppression write, and re-enabling clears that marker.  Other external
+    providers have no suppression layer and are rejected."""
+    _require_token(request)
+
+    with _profile_scope(profile):
+        if provider_id != "claude-code":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Re-enable is only supported for claude-code, not {provider_id}.",
+            )
+
+        from hermes_cli.auth import is_source_suppressed, unsuppress_credential_source
+
+        if not is_source_suppressed("anthropic", "claude_code"):
+            return {"ok": True, "provider": provider_id, "was_suppressed": False}
+
+        try:
+            unsuppress_credential_source("anthropic", "claude_code")
+        except Exception as exc:
+            _log.exception("oauth/re-enable: failed to unsuppress %s", provider_id)
+            raise HTTPException(
+                status_code=500,
+                detail="Could not re-enable Claude Code.",
+            ) from exc
+
+        _log.info("oauth/re-enable: %s (cleared suppression)", provider_id)
+        return {"ok": True, "provider": provider_id, "was_suppressed": True}
+
+
 # ---------------------------------------------------------------------------
 # OAuth Phase 2 — in-browser PKCE & device-code flows
 # ---------------------------------------------------------------------------

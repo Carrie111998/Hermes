@@ -639,6 +639,41 @@ def test_claude_code_disconnect_reports_suppression_write_failure(monkeypatch, t
     assert resp.json()["detail"] == "Could not unlink Claude Code from Hermes."
 
 
+def test_claude_code_re_enable_clears_suppression(monkeypatch, tmp_path):
+    """POST /re-enable must clear the suppression marker so token
+    resolution resumes."""
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    auth_mod.suppress_credential_source("anthropic", "claude_code")
+    assert auth_mod.is_source_suppressed("anthropic", "claude_code") is True
+
+    resp = client.post("/api/providers/oauth/claude-code/re-enable", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["provider"] == "claude-code"
+    assert body["was_suppressed"] is True
+    assert auth_mod.is_source_suppressed("anthropic", "claude_code") is False
+
+
+def test_claude_code_re_enable_idempotent_when_not_suppressed(monkeypatch, tmp_path):
+    """Calling re-enable when not suppressed is a no-op, not an error."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+    resp = client.post("/api/providers/oauth/claude-code/re-enable", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["was_suppressed"] is False
+
+
+def test_re_enable_rejects_non_claude_code_providers():
+    """Only claude-code supports re-enable; every other provider is rejected."""
+    resp = client.post("/api/providers/oauth/qwen-oauth/re-enable", headers=HEADERS)
+    assert resp.status_code == 400, resp.text
+
+
 def test_external_oauth_disconnect_rejected_before_auth_mutation(monkeypatch):
     """DELETE must not pretend to remove credentials owned by another CLI."""
     from hermes_cli import auth as auth_mod
