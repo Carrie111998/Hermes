@@ -1223,6 +1223,20 @@ export async function pickProjectFolder(): Promise<null | string> {
   return dir || null
 }
 
+// Multi-select variant of pickProjectFolder: opens the native directory picker
+// with multiSelections enabled so the user can pick several folders at once
+// (used by the add-folder flow on existing projects). Returns all chosen paths,
+// or an empty array when cancelled.
+export async function pickProjectFolders(): Promise<string[]> {
+  const dirs = await selectDesktopPaths({
+    defaultPath: (await desktopDefaultCwd())?.cwd,
+    directories: true,
+    multiple: true
+  })
+
+  return dirs.filter(Boolean)
+}
+
 // ⌘O / palette "Open folder…": open a folder AS a project, upserting. A folder
 // already covered by a project (explicit or auto) just enters it; anything else
 // becomes a new project named after the folder. Either way the sidebar scopes
