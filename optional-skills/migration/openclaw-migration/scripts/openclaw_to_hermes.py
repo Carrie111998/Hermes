@@ -312,7 +312,7 @@ def sha256_file(path: Path) -> str:
 
 
 def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8")
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def normalize_text(text: str) -> str:
@@ -349,7 +349,12 @@ def resolve_secret_input(value: Any, env: Optional[Dict[str, str]] = None) -> Op
 def load_yaml_file(path: Path) -> Dict[str, Any]:
     if yaml is None or not path.exists():
         return {}
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        # errors="replace" means read_text() cannot raise UnicodeDecodeError;
+        # OSError covers races like the file disappearing or being unreadable.
+        data = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+    except (yaml.YAMLError, OSError):
+        return {}
     return data if isinstance(data, dict) else {}
 
 
@@ -367,7 +372,13 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
     data: Dict[str, str] = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    try:
+        # errors="replace" means read_text() cannot raise UnicodeDecodeError;
+        # OSError covers races like the file disappearing or being unreadable.
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    for raw_line in lines:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -439,14 +450,21 @@ def rebrand_text(text: str) -> str:
 
 
 def parse_existing_memory_entries(path: Path) -> List[str]:
+    """Parse a DESTINATION Hermes memory store (memories/MEMORY.md, USER.md).
+
+    Splits on ``ENTRY_DELIMITER`` only, matching ``MemoryStore._parse_entries``
+    in ``tools/memory_tool.py``: a store with no delimiter is ONE intact entry.
+    Do NOT fall back to :func:`extract_markdown_entries` — it is the *source*
+    parser (workspace/MEMORY.md and friends), it drops fenced code blocks and
+    table rows and splits a block into one entry per bullet, and the merged
+    result is written back over the destination.
+    """
     if not path.exists():
         return []
     raw = read_text(path)
     if not raw.strip():
         return []
-    if ENTRY_DELIMITER in raw:
-        return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
-    return extract_markdown_entries(raw)
+    return [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
 
 
 def extract_markdown_entries(text: str) -> List[str]:
@@ -610,7 +628,7 @@ def _is_secret_key(key: str) -> bool:
     normalized = _normalize_secret_key(key)
     if normalized == "token" or normalized.endswith("token"):
         return True
-    if normalized in ("auth", "authorization"):
+    if normalized in {"auth", "authorization"}:
         return True
     return any(marker in normalized for marker in _SECRET_KEY_MARKERS)
 
@@ -831,7 +849,7 @@ class Migrator:
         # Flip the config-block flag when a conflict/error occurs on a
         # config.yaml write.  Later config-mutating options will skip rather
         # than attempting a partial write.
-        if status in (STATUS_CONFLICT, STATUS_ERROR) and destination is not None:
+        if status in {STATUS_CONFLICT, STATUS_ERROR} and destination is not None:
             dest_str = str(destination)
             if dest_str.endswith("config.yaml") or dest_str.endswith("config.yml"):
                 self._config_apply_blocked = True
@@ -1208,9 +1226,12 @@ class Migrator:
             return
 
         try:
-            data = json.loads(source.read_text(encoding="utf-8"))
+            data = json.loads(source.read_text(encoding="utf-8", errors="replace"))
         except json.JSONDecodeError as exc:
             self.record("command-allowlist", source, destination, "error", f"Invalid JSON: {exc}")
+            return
+        except OSError as exc:
+            self.record("command-allowlist", source, destination, "error", f"Could not read file: {exc}")
             return
 
         patterns: List[str] = []
@@ -1262,9 +1283,11 @@ class Migrator:
             config_path = self.source_root / name
             if config_path.exists():
                 try:
-                    data = json.loads(config_path.read_text(encoding="utf-8"))
+                    # errors="replace" means read_text() cannot raise
+                    # UnicodeDecodeError; OSError covers unreadable/vanished files.
+                    data = json.loads(config_path.read_text(encoding="utf-8", errors="replace"))
                     return data if isinstance(data, dict) else {}
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, OSError):
                     continue
         return {}
 
@@ -1343,9 +1366,11 @@ class Migrator:
         allowlist_path = self.source_root / "credentials" / "telegram-default-allowFrom.json"
         if allowlist_path.exists():
             try:
-                allow_data = json.loads(allowlist_path.read_text(encoding="utf-8"))
+                allow_data = json.loads(allowlist_path.read_text(encoding="utf-8", errors="replace"))
             except json.JSONDecodeError:
                 self.record("messaging-settings", allowlist_path, self.target_root / ".env", "error", "Invalid JSON in Telegram allowlist file")
+            except OSError as exc:
+                self.record("messaging-settings", allowlist_path, self.target_root / ".env", "error", f"Could not read Telegram allowlist file: {exc}")
             else:
                 allow_from = allow_data.get("allowFrom", [])
                 if isinstance(allow_from, list):
@@ -1526,7 +1551,7 @@ class Migrator:
                 api_key = resolve_secret_input(raw_key, openclaw_env)
                 if not api_key:
                     # Warn if a SecretRef with file/exec source was silently unresolvable
-                    if isinstance(raw_key, dict) and raw_key.get("source") in ("file", "exec"):
+                    if isinstance(raw_key, dict) and raw_key.get("source") in {"file", "exec"}:
                         self.record(
                             "provider-keys",
                             self.source_root / "openclaw.json",
@@ -1617,7 +1642,7 @@ class Migrator:
         auth_profiles_path = self.source_root / "agents" / "main" / "agent" / "auth-profiles.json"
         if auth_profiles_path.exists():
             try:
-                profiles = json.loads(auth_profiles_path.read_text(encoding="utf-8"))
+                profiles = json.loads(auth_profiles_path.read_text(encoding="utf-8", errors="replace"))
                 if isinstance(profiles, dict):
                     # auth-profiles.json wraps profiles in a "profiles" key
                     profile_entries = profiles.get("profiles", profiles) if isinstance(profiles.get("profiles"), dict) else profiles
@@ -1736,7 +1761,7 @@ class Migrator:
         tts_data: Dict[str, Any] = {}
 
         provider = tts.get("provider")
-        if isinstance(provider, str) and provider in ("elevenlabs", "openai", "edge", "microsoft"):
+        if isinstance(provider, str) and provider in {"elevenlabs", "openai", "edge", "microsoft"}:
             # OpenClaw renamed "edge" to "microsoft"; Hermes still uses "edge"
             tts_data["provider"] = "edge" if provider == "microsoft" else provider
 
@@ -1901,7 +1926,12 @@ class Migrator:
 
         all_incoming: List[str] = []
         for md_file in md_files:
-            entries = extract_markdown_entries(read_text(md_file))
+            try:
+                # read_text() uses errors="replace" so it cannot raise
+                # UnicodeDecodeError; OSError covers unreadable/vanished files.
+                entries = extract_markdown_entries(read_text(md_file))
+            except OSError:
+                continue
             all_incoming.extend(entries)
 
         if not all_incoming:
@@ -2304,11 +2334,11 @@ class Migrator:
         if defaults.get("thinkingDefault"):
             # Map OpenClaw thinking -> Hermes reasoning_effort
             thinking = defaults["thinkingDefault"]
-            if thinking in ("always", "high", "xhigh"):
+            if thinking in {"always", "high", "xhigh"}:
                 agent_cfg["reasoning_effort"] = "high"
-            elif thinking in ("auto", "medium", "adaptive"):
+            elif thinking in {"auto", "medium", "adaptive"}:
                 agent_cfg["reasoning_effort"] = "medium"
-            elif thinking in ("off", "low", "none", "minimal"):
+            elif thinking in {"off", "low", "none", "minimal"}:
                 agent_cfg["reasoning_effort"] = "low"
             changes = True
 
@@ -2626,8 +2656,8 @@ class Migrator:
             if not isinstance(ch_cfg, dict):
                 continue
             complex_keys = {k: v for k, v in ch_cfg.items()
-                          if k not in ("botToken", "appToken", "allowFrom", "enabled")
-                          and v and k not in ("requireMention", "autoThread")}
+                          if k not in {"botToken", "appToken", "allowFrom", "enabled"}
+                          and v and k not in {"requireMention", "autoThread"}}
             if complex_keys:
                 complex_archive[ch_name] = complex_keys
 
@@ -2671,7 +2701,7 @@ class Migrator:
 
         # Archive remaining browser settings
         advanced = {k: v for k, v in browser.items()
-                   if k not in ("cdpUrl", "headless") and v}
+                   if k not in {"cdpUrl", "headless"} and v}
         if advanced and self.archive_dir:
             if self.execute:
                 self.archive_dir.mkdir(parents=True, exist_ok=True)
@@ -3043,16 +3073,16 @@ def main() -> int:
     total = sum(s.values())
 
     print()
-    print(f"  ╔══════════════════════════════════════════════════════╗")
+    print("  ╔══════════════════════════════════════════════════════╗")
     print(f"  ║   OpenClaw -> Hermes Migration   [{mode_label:>8s}]   ║")
-    print(f"  ╠══════════════════════════════════════════════════════╣")
+    print("  ╠══════════════════════════════════════════════════════╣")
     print(f"  ║  Source:  {str(report['source_root'])[:42]:<42s}  ║")
     print(f"  ║  Target:  {str(report['target_root'])[:42]:<42s}  ║")
-    print(f"  ╠══════════════════════════════════════════════════════╣")
+    print("  ╠══════════════════════════════════════════════════════╣")
     print(f"  ║  ✔ Migrated:  {s.get('migrated', 0):>3d}    ◆ Archived:  {s.get('archived', 0):>3d}        ║")
     print(f"  ║  ⊘ Skipped:   {s.get('skipped', 0):>3d}    ⚠ Conflicts: {s.get('conflict', 0):>3d}        ║")
     print(f"  ║  ✖ Errors:    {s.get('error', 0):>3d}    Total:       {total:>3d}        ║")
-    print(f"  ╚══════════════════════════════════════════════════════╝")
+    print("  ╚══════════════════════════════════════════════════════╝")
 
     # Show what was migrated
     migrated = [i for i in items if i["status"] == "migrated"]
