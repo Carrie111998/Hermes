@@ -2133,6 +2133,11 @@ def _ensure_tui_cached_bundle(
                 shutil.rmtree(build_dir)
             tmp_build.replace(build_dir)
 
+            # Publish the stamp for the exact validated staging bytes. Source
+            # files may change while they are copied; such a change may cause
+            # a later rebuild, but must never mislabel this generation.
+            stamp = _tui_bundle_stamp(build_dir / "ui-tui")
+
             install_result = subprocess.run(
                 [
                     npm,

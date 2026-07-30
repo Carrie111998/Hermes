@@ -443,6 +443,62 @@ def test_ensure_tui_cached_bundle_uses_root_lockfile_and_workspace_install(
     assert calls[1][0] == ["npm", "run", "build", "--workspace", "ui-tui"]
 
 
+def test_tui_cached_bundle_stamps_the_staged_copy(main_mod, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    tui_dir = repo / "ui-tui"
+    (tui_dir / "src").mkdir(parents=True)
+    (repo / "package.json").write_text(
+        '{"private":true,"workspaces":["ui-tui"]}', encoding="utf-8"
+    )
+    (repo / "package-lock.json").write_text(
+        '{"name":"hermes-agent","lockfileVersion":3,"packages":{}}',
+        encoding="utf-8",
+    )
+    (tui_dir / "package.json").write_text(
+        '{"name":"hermes-tui","scripts":{"build":"node build.js"}}',
+        encoding="utf-8",
+    )
+    source_file = tui_dir / "src" / "index.tsx"
+    source_file.write_text("export const version = 'before'\n", encoding="utf-8")
+
+    cache_root = tmp_path / "home" / "cache" / "tui-bundle"
+    monkeypatch.setattr(main_mod, "_tui_cached_bundle_dir", lambda: cache_root)
+    monkeypatch.setattr(main_mod, "_tui_workspace_writable", lambda _path: False)
+    monkeypatch.setattr(main_mod, "_resolve_node_runtime_npm", lambda: "/usr/bin/npm")
+
+    original_copytree = main_mod.shutil.copytree
+
+    def mutate_before_primary_copy(src, dst, *args, **kwargs):
+        if Path(src) == tui_dir:
+            source_file.write_text("export const version = 'after'\n", encoding="utf-8")
+        return original_copytree(src, dst, *args, **kwargs)
+
+    staged = {}
+
+    def fake_run(cmd, **kwargs):
+        if "cwd" not in kwargs:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        cwd = Path(kwargs["cwd"])
+        if cmd[1:2] == ["install"]:
+            staged["stamp"] = main_mod._tui_bundle_stamp(cwd / "ui-tui")
+        elif cmd[1:3] == ["run", "build"]:
+            dist = cwd / "ui-tui" / "dist"
+            dist.mkdir(parents=True, exist_ok=True)
+            (dist / "entry.js").write_text("console.log('built')\n", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.shutil, "copytree", mutate_before_primary_copy)
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    initial_stamp = main_mod._tui_bundle_stamp(tui_dir)
+    result = main_mod._ensure_tui_cached_bundle(tui_dir, node="node", npm="npm")
+
+    assert staged["stamp"] != initial_stamp
+    assert (result / ".hermes-tui-bundle-stamp").read_text(
+        encoding="utf-8"
+    ).strip() == staged["stamp"]
+
+
 def test_tui_bundle_stamp_tracks_external_file_workspace(main_mod, tmp_path):
     repo = tmp_path / "repo"
     tui_dir = repo / "ui-tui"
