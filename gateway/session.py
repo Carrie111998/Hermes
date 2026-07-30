@@ -1246,8 +1246,8 @@ class SessionStore:
             if canonical_path is not None and canonical_path.exists():
                 self._canonical_store_open_failed = True
                 logger.error(
-                    "[gateway] canonical routing store %s is present but failed "
-                    "to open (%s); refusing legacy sessions.json fallback",
+                    "[gateway] canonical routing store %s is present but unavailable "
+                    "(%s); refusing legacy sessions.json fallback",
                     canonical_path,
                     e,
                 )
