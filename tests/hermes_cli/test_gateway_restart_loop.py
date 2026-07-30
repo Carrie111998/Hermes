@@ -31,6 +31,15 @@ class TestGatewayLifecyclePattern:
         "hermes  gateway  restart",         # double spaces
         "Hermez Gateway Restart".lower().replace("z", "s"),  # case handled
         "HERMES GATEWAY RESTART",           # uppercase
+        # Regression: a shell alias for the Hermes executable previously
+        # bypassed the literal `hermes gateway restart` branch. This is the
+        # shape used by a launchctl-submitted delayed restart job.
+        (
+            "H=/Users/test/.hermes/hermes-agent/venv/bin/hermes; "
+            "launchctl submit -l ai.hermes.restart-once -- /bin/zsh -c "
+            "'sleep 30; $H gateway restart'"
+        ),
+        "H='/opt/Hermes Agent/bin/hermes'; ${H} gateway stop",
     ])
     def test_hermes_gateway_commands(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
@@ -57,6 +66,10 @@ class TestGatewayLifecyclePattern:
         "launchctl restart ai.hermes.daemon",
         "systemctl restart hermes-meta.service",
         "systemctl restart hermes-cron-helper",
+        # Alias resolution must stay scoped to an executable whose basename is
+        # `hermes`, and only lifecycle verbs are blocked.
+        "APP=/usr/local/bin/acme; $APP gateway restart",
+        "H=/usr/local/bin/hermes; $H gateway status",
         # Regression (#30728 follow-up): legit prompts that merely mention an
         # unrelated gateway + a restart must NOT be blocked. The cron prompt is
         # fed to an LLM, not a shell, so substring detection on English text is
@@ -235,6 +248,11 @@ class TestTerminalToolGatewayLifecycleGuard:
         "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         "pkill -f hermes.*gateway",
+        (
+            "H=/Users/test/.hermes/hermes-agent/venv/bin/hermes; "
+            "launchctl submit -l ai.hermes.restart-once -- /bin/zsh -c "
+            "'sleep 30; $H gateway restart'"
+        ),
     ])
     def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
         import tools.terminal_tool as tt

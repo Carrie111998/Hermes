@@ -66,11 +66,59 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
 )
 
 
+# A delayed restart is often wrapped in a shell variable so the submitted job
+# can use the exact Hermes executable that is running the current checkout:
+#
+#     H=/path/to/hermes; launchctl submit ... -c '$H gateway restart'
+#
+# The literal lifecycle regex above cannot connect the assignment to the later
+# variable expansion. Resolve only simple assignments whose value's basename is
+# exactly `hermes` (or `hermes.exe`); this avoids treating arbitrary
+# `$APP gateway restart` commands as Hermes lifecycle operations.
+_SHELL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?:^|[;\n]\s*)"
+    r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(?:\"(?P<double>[^\"\n]*)\"|'(?P<single>[^'\n]*)'|(?P<bare>[^\s;\n]+))",
+    re.MULTILINE,
+)
+_HERMES_EXECUTABLE_PATTERN = re.compile(
+    r"(?:^|[/\\])hermes(?:\.exe)?$",
+    re.IGNORECASE,
+)
+
+
+def _contains_aliased_hermes_lifecycle_command(text: str) -> bool:
+    """Detect a simple shell alias that resolves to the Hermes executable."""
+    aliases: set[str] = set()
+    for match in _SHELL_ASSIGNMENT_PATTERN.finditer(text):
+        value = next(
+            group
+            for group in (
+                match.group("double"),
+                match.group("single"),
+                match.group("bare"),
+            )
+            if group is not None
+        )
+        if _HERMES_EXECUTABLE_PATTERN.search(value.strip()):
+            aliases.add(match.group("name"))
+
+    for alias in aliases:
+        alias_ref = rf"\$(?:{re.escape(alias)}\b|\{{{re.escape(alias)}\}})"
+        lifecycle = rf"{alias_ref}\s+(?i:gateway\s+(?:restart|stop))\b"
+        if re.search(lifecycle, text):
+            return True
+    return False
+
+
 def contains_gateway_lifecycle_command(text: str) -> bool:
     """Return True if *text* contains a gateway lifecycle command pattern."""
     if not text:
         return False
-    return bool(_GATEWAY_LIFECYCLE_PATTERN.search(text))
+    return bool(
+        _GATEWAY_LIFECYCLE_PATTERN.search(text)
+        or _contains_aliased_hermes_lifecycle_command(text)
+    )
 
 
 def _resolve_script_path(script_path: str) -> Path:
