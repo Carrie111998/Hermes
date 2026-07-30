@@ -3124,36 +3124,46 @@ class DiscordAdapter(BasePlatformAdapter):
                 return SendResult(success=True, raw_response={"skipped": "not_forum_thread"})
 
             available = list(getattr(parent, "available_tags", None) or [])
-            tag_by_name: Dict[str, int] = {}
+            # Keep the discord.py ForumTag OBJECTS: thread.edit(applied_tags=...)
+            # expects Snowflake-like tag objects, not raw integer ids. All
+            # membership / dedup / equality below goes through ``.id``.
+            tag_by_name: Dict[str, Any] = {}
             for tag in available:
                 name = str(getattr(tag, "name", "")).casefold()
                 tag_id = getattr(tag, "id", None)
                 if name and tag_id is not None:
-                    tag_by_name[name] = int(tag_id)
+                    tag_by_name[name] = tag
 
-            desired_id = tag_by_name.get(str(desired_name).casefold())
-            if desired_id is None:
+            desired_tag = tag_by_name.get(str(desired_name).casefold())
+            if desired_tag is None:
                 return SendResult(success=True, raw_response={"skipped": "missing_tag"})
 
             configured_status_ids = {
-                tag_id
+                int(getattr(tag, "id"))
                 for name in (status_tag_map or {}).values()
-                for tag_id in [tag_by_name.get(str(name).casefold())]
-                if tag_id is not None
+                for tag in [tag_by_name.get(str(name).casefold())]
+                if tag is not None
             }
-            current_ids = [int(tag_id) for tag_id in (getattr(thread, "applied_tags", None) or [])]
-            preserved = []
-            for tag_id in current_ids:
-                if tag_id not in configured_status_ids and tag_id not in preserved:
-                    preserved.append(tag_id)
+            current = list(getattr(thread, "applied_tags", None) or [])
+            preserved: list = []
+            preserved_ids: set = set()
+            for tag in current:
+                tag_id = getattr(tag, "id", None)
+                if tag_id is None:
+                    continue
+                tag_id = int(tag_id)
+                if tag_id not in configured_status_ids and tag_id not in preserved_ids:
+                    preserved.append(tag)
+                    preserved_ids.add(tag_id)
 
-            new_ids = preserved + [desired_id]
-            if len(new_ids) > 5:
+            new_tags = preserved + [desired_tag]
+            if len(new_tags) > 5:
                 return SendResult(success=True, raw_response={"skipped": "tag_limit"})
-            if current_ids == new_ids:
+            new_ids = [int(getattr(tag, "id")) for tag in new_tags]
+            if [int(getattr(tag, "id", -1)) for tag in current] == new_ids:
                 return SendResult(success=True, raw_response={"applied_tags": new_ids, "changed": False})
 
-            await thread.edit(applied_tags=new_ids)
+            await thread.edit(applied_tags=new_tags)
             return SendResult(success=True, raw_response={"applied_tags": new_ids, "changed": True})
         except Exception as e:  # pragma: no cover - defensive fail-open surface
             logger.debug("[%s] Kanban forum tag sync skipped for thread %s: %s", self.name, thread_id, e)
