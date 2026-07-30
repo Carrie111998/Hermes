@@ -1992,6 +1992,85 @@ def test_final_verification_accepts_exact_inbox_and_authenticated_source_identit
     assert store.failures == []
 
 
+def test_initial_prompt_read_budget_expiry_stops_before_projection_index() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+    projection = SessionProjection(
+        provider=Provider.CODEX,
+        native_id=THREAD_1,
+        title="[Claude] Budget expires during prompt read",
+        cwd=INBOX_CWD,
+        started_at=90.0,
+        last_active=100.0,
+        messages=(),
+        origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+        origin_bridge_id=sidebar_bridge_id(SOURCE_1),
+    )
+
+    class ExpiringPromptReadNative(FakeNative):
+        def read_thread_initial_prompt(
+            self, *, thread_id: str, deadline: float
+        ) -> str:
+            prompt = super().read_thread_initial_prompt(
+                thread_id=thread_id,
+                deadline=deadline,
+            )
+            clock.sleep(241.0)
+            return prompt
+
+    native = ExpiringPromptReadNative(events)
+    result = _executor(
+        store,
+        FakeVerifier(events, projection=projection),
+        native,
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="broker_time_budget",
+    )
+    assert store.failures == ["broker_time_budget"]
+    assert store.failure_thread_ids == [THREAD_1]
+    assert not any(event[0] in {"index", "rename", "commit"} for event in events)
+
+
+def test_initial_prompt_read_preserves_native_budget_rejection() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    store = FakeStore(events, [_job(SOURCE_1, thread_id=THREAD_1)])
+
+    class BudgetRejectedPromptReadNative(FakeNative):
+        def read_thread_initial_prompt(
+            self, *, thread_id: str, deadline: float
+        ) -> str:
+            del deadline
+            self.initial_prompt_reads.append(thread_id)
+            raise NativeCreateRejected("broker_time_budget")
+
+    native = BudgetRejectedPromptReadNative(events)
+    result = _executor(
+        store,
+        FakeVerifier(events),
+        native,
+        clock,
+    ).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="retry",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        thread_id=THREAD_1,
+        error_code="broker_time_budget",
+    )
+    assert native.initial_prompt_reads == [THREAD_1]
+    assert store.failures == ["broker_time_budget"]
+    assert store.failure_thread_ids == [THREAD_1]
+    assert not any(event[0] in {"index", "rename", "commit"} for event in events)
+
+
 def test_idle_cycle_records_broker_heartbeat_under_the_executor_lock() -> None:
     events: list[tuple[Any, ...]] = []
     clock = FakeClock()

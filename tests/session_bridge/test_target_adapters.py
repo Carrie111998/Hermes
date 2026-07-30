@@ -51,6 +51,7 @@ from session_bridge.models import (
     SessionProjection,
     encode_bridge_marker,
 )
+from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
@@ -512,7 +513,7 @@ def _sidebar_expected(
     )
 
 
-def _registration_prompt(*, cwd: str) -> str:
+def _registration_prompt(*, cwd: str, readable: bool = False) -> str:
     source_session_id = "claude:source-1"
     candidate = SidebarCandidate(
         source_session_id=source_session_id,
@@ -535,7 +536,23 @@ def _registration_prompt(*, cwd: str) -> str:
         ),
         SECRET,
     )
-    return build_registration_prompt(candidate, marker)
+    preview = None
+    if readable:
+        preview = build_session_preview(
+            source_session_id=source_session_id,
+            source_cursor="cursor-readable",
+            source_hash="hash-readable",
+            title="Readable source identity",
+            provider=candidate.provider.value,
+            cwd=cwd,
+            captured_at=100.0,
+            messages=[],
+            git_root=candidate.git_root,
+            git_branch=candidate.git_branch,
+            git_head=candidate.git_head,
+            worktree_id=candidate.worktree_id,
+        )
+    return build_registration_prompt(candidate, marker, preview=preview)
 
 
 def test_decode_sidebar_registration_identity_authenticates_exact_metadata(
@@ -552,6 +569,52 @@ def test_decode_sidebar_registration_identity_authenticates_exact_metadata(
     assert identity.source_session_id == "claude:source-1"
     assert identity.source_cwd == str(source.resolve())
     assert identity.bridge_id == sidebar_bridge_id("claude:source-1")
+
+
+def test_decode_sidebar_registration_identity_round_trips_readable_registration(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "readable-source"
+    source.mkdir()
+    prompt = _registration_prompt(cwd=str(source.resolve()), readable=True)
+
+    identity = sidebar_module.decode_sidebar_registration_identity(
+        prompt,
+        SECRET,
+    )
+
+    assert identity.source_session_id == "claude:source-1"
+    assert identity.source_cwd == str(source.resolve())
+    assert identity.bridge_id == sidebar_bridge_id("claude:source-1")
+
+
+def test_decode_sidebar_registration_identity_rejects_marker_source_disagreement(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    prompt = _registration_prompt(cwd=str(source.resolve()))
+    exact_marker = next(
+        line.removeprefix("Signed marker: ")
+        for line in prompt.splitlines()
+        if line.startswith("Signed marker: ")
+    )
+    conflicting_source = "claude:other-source"
+    conflicting_marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=sidebar_bridge_id(conflicting_source),
+            source_session_id=conflicting_source,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        SECRET,
+    )
+
+    with pytest.raises(ValueError, match="registration identity"):
+        sidebar_module.decode_sidebar_registration_identity(
+            prompt.replace(exact_marker, conflicting_marker, 1),
+            SECRET,
+        )
 
 
 @pytest.mark.parametrize(

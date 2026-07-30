@@ -1303,6 +1303,14 @@ class SidebarExecutor:
                 error_code="source_identity_mismatch",
             )
 
+        if not self._has_budget(operation_deadline, lease_expires_at):
+            return self._settle(
+                job_id=job_id,
+                lease_token=lease_token,
+                thread_id=thread_id,
+                error_code="broker_time_budget",
+            )
+
         if verified.projection is not None:
             try:
                 self._store.upsert_projection(verified.projection)
