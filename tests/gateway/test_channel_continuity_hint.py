@@ -154,6 +154,7 @@ class TestContinuityNoteOnDirectChatPlatforms:
         "platform",
         [
             Platform.API_SERVER,
+            Platform.HOMEASSISTANT,
             Platform.WEBHOOK,
             Platform.MSGRAPH_WEBHOOK,
             Platform.WECOM_CALLBACK,

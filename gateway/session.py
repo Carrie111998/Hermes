@@ -993,17 +993,24 @@ def build_session_rotate_hint(*, tokens: int) -> str:
     )
 
 
-#: Surfaces with no durable human thread — inbound machine callers.  A
+#: Surfaces with no durable human thread — inbound machine callers and
+#: system-generated event streams. A
 #: continuity pointer here would aim the agent at unrelated history and cost
 #: tokens for nothing, so they stay silent.  Everything else (Telegram,
 #: Signal, WhatsApp, Matrix, email, CLI, plugin platforms, ...) is a real
 #: conversation that survives a session reset and benefits from the hint.
-_MACHINE_CALLER_PLATFORMS = frozenset({
+_NON_HUMAN_SESSION_HINT_PLATFORMS = frozenset({
     Platform.API_SERVER,
+    Platform.HOMEASSISTANT,
     Platform.WEBHOOK,
     Platform.MSGRAPH_WEBHOOK,
     Platform.WECOM_CALLBACK,
 })
+
+
+def supports_human_session_hints(platform: Platform) -> bool:
+    """Whether a source represents a durable human conversation."""
+    return platform not in _NON_HUMAN_SESSION_HINT_PLATFORMS
 
 
 def build_channel_continuity_note(
@@ -1038,7 +1045,7 @@ def build_channel_continuity_note(
     agent pays retrieval cost only when the user actually refers back,
     which is why a pointer beats carrying a summary into every session.
     """
-    if source.platform in _MACHINE_CALLER_PLATFORMS:
+    if not supports_human_session_hints(source.platform):
         return None
     if not getattr(entry, "reset_had_activity", False):
         return None

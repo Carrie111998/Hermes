@@ -13552,6 +13552,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_goal_command(event)
         return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
 
+    async def _send_session_rotate_hint(
+        self,
+        source: SessionSource,
+        event: MessageEvent,
+        *,
+        tokens: int,
+    ) -> bool:
+        """Deliver the rotate nudge only to durable human conversations."""
+        from gateway.session import (
+            build_session_rotate_hint,
+            supports_human_session_hints,
+        )
+
+        if not supports_human_session_hints(source.platform) or not source.chat_id:
+            return False
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+
+        metadata = self._thread_metadata_for_source(
+            source,
+            self._reply_anchor_for_event(event),
+        )
+        await adapter.send(
+            source.chat_id,
+            build_session_rotate_hint(tokens=tokens),
+            metadata=metadata,
+        )
+        return True
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -16055,10 +16086,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # with a cooldown; never blocks or delays the turn.
                 if _hyg_rotate_hint_tokens > 0:
                     try:
-                        from gateway.session import (
-                            build_session_rotate_hint,
-                            should_hint_session_rotate,
-                        )
+                        from gateway.session import should_hint_session_rotate
 
                         _rotate_seen = getattr(self, "_session_rotate_hint_at", None)
                         if _rotate_seen is None:
@@ -16073,20 +16101,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             now=_now,
                             cooldown_s=_hyg_rotate_hint_cooldown_s,
                         ):
-                            _rotate_seen[_rotate_key] = _now
-                            _rotate_adapter = self._adapter_for_source(source)
-                            if _rotate_adapter and source.chat_id:
-                                # Compute thread metadata locally — `_hyg_meta`
-                                # is built inside the `_needs_compress` branch
-                                # below and is not in scope here.
-                                _rotate_meta = self._thread_metadata_for_source(
-                                    source, self._reply_anchor_for_event(event)
-                                )
-                                await _rotate_adapter.send(
-                                    source.chat_id,
-                                    build_session_rotate_hint(tokens=_approx_tokens),
-                                    metadata=_rotate_meta,
-                                )
+                            delivered = await self._send_session_rotate_hint(
+                                source,
+                                event,
+                                tokens=_approx_tokens,
+                            )
+                            if delivered:
+                                _rotate_seen[_rotate_key] = _now
                     except Exception:
                         # Decorative: a failed hint must never break a turn.
                         logger.debug("session rotate hint failed", exc_info=True)

@@ -8,9 +8,17 @@ conversation never reaches. This hint is an ABSOLUTE token threshold with a
 cooldown, so it actually fires and does not spam.
 """
 
+from unittest.mock import AsyncMock
+
 import pytest
 
-from gateway.session import build_session_rotate_hint, should_hint_session_rotate
+from gateway.config import Platform
+from gateway.platforms.base import MessageEvent
+from gateway.session import (
+    SessionSource,
+    build_session_rotate_hint,
+    should_hint_session_rotate,
+)
 
 
 class TestShouldHintSessionRotate:
@@ -65,3 +73,48 @@ class TestBuildSessionRotateHint:
         msg = build_session_rotate_hint(tokens=232_000)
         assert "|" not in msg
         assert "\n\n" not in msg
+
+
+class TestSessionRotateHintDelivery:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("platform", [Platform.API_SERVER, Platform.WEBHOOK])
+    async def test_machine_sources_never_receive_the_hint(self, platform):
+        from gateway.run import GatewayRunner
+
+        adapter = AsyncMock()
+        runner = object.__new__(GatewayRunner)
+        runner._adapter_for_source = lambda _source: adapter
+        runner._reply_anchor_for_event = lambda _event: None
+        runner._thread_metadata_for_source = lambda _source, _anchor: {}
+        source = SessionSource(platform=platform, chat_id="machine-target")
+        event = MessageEvent(text="payload", source=source)
+
+        delivered = await runner._send_session_rotate_hint(
+            source,
+            event,
+            tokens=232_000,
+        )
+
+        assert delivered is False
+        adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_human_chat_receives_the_hint(self):
+        from gateway.run import GatewayRunner
+
+        adapter = AsyncMock()
+        runner = object.__new__(GatewayRunner)
+        runner._adapter_for_source = lambda _source: adapter
+        runner._reply_anchor_for_event = lambda _event: None
+        runner._thread_metadata_for_source = lambda _source, _anchor: {}
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="human-chat")
+        event = MessageEvent(text="hello", source=source)
+
+        delivered = await runner._send_session_rotate_hint(
+            source,
+            event,
+            tokens=232_000,
+        )
+
+        assert delivered is True
+        adapter.send.assert_awaited_once()
