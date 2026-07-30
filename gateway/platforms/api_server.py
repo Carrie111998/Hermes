@@ -1410,17 +1410,22 @@ class APIServerAdapter(BasePlatformAdapter):
         1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
         2. Active profile name (so each profile advertises a distinct model)
         3. Fallback: "hermes-agent"
+
+        Delegates the tiered fallthrough to
+        :func:`hermes_cli.model_switch.resolve_effective_model` (the shared
+        override > mid-tier > default precedence owner).
         """
-        if explicit and explicit.strip():
-            return explicit.strip()
+        from hermes_cli.model_switch import resolve_effective_model
+
+        profile_name = ""
         try:
             from hermes_cli.profiles import get_active_profile_name
             profile = get_active_profile_name()
             if profile and profile not in {"default", "custom"}:
-                return profile
+                profile_name = profile
         except Exception:
             pass
-        return "hermes-agent"
+        return resolve_effective_model(explicit, profile_name, "hermes-agent")
 
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
@@ -1508,6 +1513,30 @@ class APIServerAdapter(BasePlatformAdapter):
     # Auth helper
     # ------------------------------------------------------------------
 
+    def _expected_api_key(self) -> str:
+        """Return the API key authorized for the URL-selected profile."""
+        profile = _api_request_profile.get()
+        if not profile or profile == "default":
+            return self._api_key
+
+        try:
+            from agent.secret_scope import get_secret
+            from hermes_cli.auth import has_usable_secret
+
+            key = get_secret("API_SERVER_KEY", "") or ""
+            if not has_usable_secret(key, min_length=16):
+                return ""
+            return key
+        except Exception as exc:
+            # Fail closed if the profile scope or strength guard cannot resolve
+            # the credential. Do not log the key or exception text.
+            logger.warning(
+                "Failed to resolve a usable profile-scoped API_SERVER_KEY for %r: %s",
+                profile,
+                type(exc).__name__,
+            )
+            return ""
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
         Validate Bearer token from Authorization header.
@@ -1516,8 +1545,31 @@ class APIServerAdapter(BasePlatformAdapter):
         connect() refuses to start the API server without API_SERVER_KEY, so
         the no-key branch only exists for tests or unsupported manual wiring.
         """
-        if not self._api_key:
-            return None
+        profile = _api_request_profile.get()
+        is_named_profile = bool(profile and profile != "default")
+        expected_key = self._expected_api_key()
+        if not expected_key:
+            # Preserve the historical no-key test/manual-wiring behavior only
+            # for the default listener. Named profiles must fail closed rather
+            # than inherit the listener owner's key.
+            if not is_named_profile:
+                return None
+            logger.warning(
+                "API server rejected request for profile %r: no profile-scoped "
+                "API_SERVER_KEY is configured; %s",
+                profile,
+                self._request_audit_log_suffix(request),
+            )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Invalid gateway API key (API_SERVER_KEY)",
+                        "type": "gateway_auth_error",
+                        "code": "gateway_auth_failed",
+                    }
+                },
+                status=401,
+            )
 
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -1528,7 +1580,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # otherwise crash this handler (500) instead of returning a clean
             # 401. Encoding both sides keeps the timing-safe comparison and
             # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), self._api_key.encode()):
+            if hmac.compare_digest(token.encode(), expected_key.encode()):
                 return None  # Auth OK
 
         logger.warning(
@@ -2451,8 +2503,13 @@ class APIServerAdapter(BasePlatformAdapter):
         session_override = None
         if not confirmed_runtime_lock:
             session_override = self._session_model_override_for(session_key)
+        # Model-string precedence delegates to the shared owner
+        # hermes_cli.model_switch.resolve_effective_model (session /model
+        # override > session-persisted model > global) — the rule 7dd00bb47d
+        # had to re-fix here after it diverged from gateway/run.py.
+        from hermes_cli.model_switch import resolve_effective_model
         if session_override:
-            override_model = _clean_request_string(session_override.get("model")) or model
+            override_model = resolve_effective_model(session_override, None, model)
             session_provider = _clean_request_string(session_override.get("provider"))
             current_provider = _clean_request_string(runtime_kwargs.get("provider"))
             provider_runtime = _resolve_provider_runtime(
@@ -2482,7 +2539,7 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if provider_runtime:
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
-            model = session_row_model
+            model = resolve_effective_model(None, session_row_model, model)
             if request_model or request_provider:
                 logger.debug(
                     "api_server request selection skipped: session-persisted model wins for %s",
@@ -3087,18 +3144,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        # Never persist the virtual model alias (self._model_name, e.g.
-        # "hermes-agent") as if it were a real provider model id — a bare
-        # "hermes-agent" is not a model_routes alias, so a later chat on
-        # this session would fall into the raw session_model precedence
-        # branch in _handle_session_chat and get sent to the provider
-        # literally, failing with "invalid model identifier" (#session-
-        # model-alias-leak). Treat "no model" / "the virtual alias" the
-        # same: leave the session's model unset so it falls through to the
-        # global default on every turn, exactly as an omitted model would.
-        model = _clean_request_string(body.get("model"))
-        if model == self._model_name:
-            model = None
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -3108,7 +3153,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        model_name = self._clean_runtime_id(requested.get("model")) or model
+        # requested["model"] is already normalized by
+        # _session_runtime_request_from_body: provider-prefixed values
+        # (e.g. "provider::hermes-agent") are split, and the virtual model
+        # alias (self._model_name, e.g. "hermes-agent") is nulled out
+        # there — a bare "hermes-agent" is not a model_routes alias, so a
+        # later chat on this session would otherwise fall into the raw
+        # session_model precedence branch in _handle_session_chat and get
+        # sent to the provider literally, failing with "invalid model
+        # identifier" (#session-model-alias-leak). Re-deriving straight
+        # from the raw body here would bypass that normalization and
+        # reintroduce the leak for the provider-prefixed case.
+        model_name = self._clean_runtime_id(requested.get("model")) or None
         model_config = None
         if requested.get("model") or requested.get("provider"):
             model_config = {
@@ -3354,6 +3410,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # A row created before the alias-leak fix may still have the
+            # virtual model alias persisted literally (#session-model-
+            # alias-leak) — treat that the same as no stored model so it
+            # doesn't get threaded through as a raw session_model override.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
@@ -3464,6 +3526,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # A row created before the alias-leak fix may still have the
+            # virtual model alias persisted literally (#session-model-
+            # alias-leak) — treat that the same as no stored model so it
+            # doesn't get threaded through as a raw session_model override.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
@@ -3608,21 +3676,18 @@ class APIServerAdapter(BasePlatformAdapter):
             headers["X-Hermes-Session-Key"] = gateway_session_key
         response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
-        last_write = time.monotonic()
         try:
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
                 except asyncio.TimeoutError:
                     await response.write(b": keepalive\n\n")
-                    last_write = time.monotonic()
                     continue
                 if item is None:
                     break
                 name, payload = item
                 data = json.dumps(payload, ensure_ascii=False)
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
-                last_write = time.monotonic()
         except (asyncio.CancelledError, ConnectionResetError):
             task.cancel()
             raise
