@@ -22,7 +22,6 @@ class SidebarPlacement:
 
 
 def resolve_sidebar_placement(
-    *,
     configured_inbox_cwd: str,
     hermes_home: Path | str,
     placement_generation: int,

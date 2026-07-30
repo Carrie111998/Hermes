@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib
 import re
+import tempfile
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, asdict
 from decimal import Decimal
@@ -9,13 +11,26 @@ from typing import Any
 
 import pytest
 
-from hermes_cli.config import DEFAULT_CONFIG
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+_DEFAULT_CONFIG_HOME = Path(
+    tempfile.mkdtemp(prefix="session-bridge-config-")
+).resolve()
+_default_config_home_token = set_hermes_home_override(_DEFAULT_CONFIG_HOME)
+try:
+    DEFAULT_CONFIG = importlib.import_module("hermes_cli.config").DEFAULT_CONFIG
+finally:
+    reset_hermes_home_override(_default_config_home_token)
 from session_bridge.config import (
     BridgeConfig,
     ClaudeVisibilityConfig,
     SidebarConfig,
     _ENV_NAMES,
 )
+
+
+def _installed_default_bridge_config() -> BridgeConfig:
+    return BridgeConfig(sidebar=SidebarConfig(inbox_cwd=str(_DEFAULT_CONFIG_HOME)))
 
 
 def _load(
@@ -124,7 +139,7 @@ def test_mcp_token_is_whitelisted_but_not_persisted_in_config(
         environ={"HERMES_SESSION_BRIDGE_TOKEN": "x" * 32},
     )
 
-    assert config == BridgeConfig()
+    assert config == _installed_default_bridge_config()
     assert not hasattr(config, "token")
 
 
@@ -142,7 +157,7 @@ def test_live_characterization_gate_is_allowlisted_but_not_persisted_in_config(
         environ={"HERMES_SESSION_BRIDGE_LIVE_TESTS": "1"},
     )
 
-    assert config == BridgeConfig()
+    assert config == _installed_default_bridge_config()
     assert not hasattr(config, "live_tests")
 
 
@@ -189,6 +204,9 @@ _SIDEBAR_DEFAULTS = {
     "legacy_hydration_enabled": False,
     "preview_budget_chars": 24_000,
 }
+_SIDEBAR_CONFIG_DEFAULTS = {
+    key: value for key, value in _SIDEBAR_DEFAULTS.items() if key != "inbox_cwd"
+}
 
 
 def _load_with_sidebar(
@@ -214,12 +232,9 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
     assert DEFAULT_CONFIG["session_bridge"] == {
         "sidebar": {
             **_SIDEBAR_DEFAULTS,
-            "inbox_cwd": DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"],
+            "inbox_cwd": str(_DEFAULT_CONFIG_HOME),
         }
     }
-    assert DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"] is None or isinstance(
-        DEFAULT_CONFIG["session_bridge"]["sidebar"]["inbox_cwd"], str
-    )
     assert asdict(SidebarConfig()) == _SIDEBAR_DEFAULTS
     assert not any("SIDEBAR" in name for name in _ENV_NAMES)
 
@@ -261,6 +276,7 @@ def test_sidebar_config_loads_only_from_config_yaml(
     (
         ("inbox_cwd", "", "inbox_cwd must be a non-empty string"),
         ("inbox_cwd", 1, "inbox_cwd must be a non-empty string"),
+        ("inbox_cwd", None, "inbox_cwd must be a non-empty string"),
         ("placement_generation", True, "placement_generation must be an integer"),
         (
             "placement_generation",
@@ -276,7 +292,7 @@ def test_sidebar_config_rejects_invalid_placement_settings(
     message: str,
 ) -> None:
     with pytest.raises(ValueError, match=re.escape(message)):
-        _load_with_sidebar(monkeypatch, {**_SIDEBAR_DEFAULTS, field: value})
+        _load_with_sidebar(monkeypatch, {**_SIDEBAR_CONFIG_DEFAULTS, field: value})
 
 
 def test_unknown_sidebar_config_key_is_rejected(
@@ -286,7 +302,7 @@ def test_unknown_sidebar_config_key_is_rejected(
         ValueError,
         match="unknown session_bridge.sidebar configuration key: typo",
     ):
-        _load_with_sidebar(monkeypatch, {**_SIDEBAR_DEFAULTS, "typo": True})
+        _load_with_sidebar(monkeypatch, {**_SIDEBAR_CONFIG_DEFAULTS, "typo": True})
 
 
 @pytest.mark.parametrize(
@@ -336,7 +352,7 @@ def test_sidebar_config_rejects_unsafe_values(
     with pytest.raises(ValueError, match=re.escape(message)):
         _load_with_sidebar(
             monkeypatch,
-            {**_SIDEBAR_DEFAULTS, field: value},
+            {**_SIDEBAR_CONFIG_DEFAULTS, field: value},
         )
 
 

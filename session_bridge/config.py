@@ -359,13 +359,14 @@ class BridgeConfig:
             ),
         )
         sidebar_defaults = cls().sidebar
-        inbox_cwd = sidebar.get("inbox_cwd", sidebar_defaults.inbox_cwd)
-        if inbox_cwd is not None and (
-            not isinstance(inbox_cwd, str) or not inbox_cwd
-        ):
-            raise ValueError(
-                "session_bridge.sidebar.inbox_cwd must be a non-empty string"
-            )
+        if "inbox_cwd" in sidebar:
+            inbox_cwd = sidebar["inbox_cwd"]
+            if not isinstance(inbox_cwd, str) or not inbox_cwd:
+                raise ValueError(
+                    "session_bridge.sidebar.inbox_cwd must be a non-empty string"
+                )
+        else:
+            inbox_cwd = sidebar_defaults.inbox_cwd
         placement_generation = _toml_int(
             sidebar.get(
                 "placement_generation", sidebar_defaults.placement_generation

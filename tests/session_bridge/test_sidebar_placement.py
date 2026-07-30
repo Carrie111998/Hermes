@@ -7,6 +7,7 @@ import pytest
 
 from session_bridge.sidebar_placement import (
     SidebarPlacementError,
+    _windows_identity,
     resolve_sidebar_placement,
 )
 
@@ -27,6 +28,22 @@ def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) 
     assert placement.inbox_cwd == str(inbox.resolve())
     assert placement.local_host == "local"
     assert placement.placement_generation == 1
+    assert placement.runtime_workspace_roots == (
+        str(inbox.resolve()),
+        str(source.resolve()),
+    )
+
+
+def test_resolve_sidebar_placement_accepts_stated_positional_signature(
+    tmp_path: Path,
+) -> None:
+    inbox = tmp_path / ".hermes"
+    source = tmp_path / "source"
+    inbox.mkdir()
+    source.mkdir()
+
+    placement = resolve_sidebar_placement(str(inbox), inbox, 1, str(source))
+
     assert placement.runtime_workspace_roots == (
         str(inbox.resolve()),
         str(source.resolve()),
@@ -129,21 +146,26 @@ def test_resolve_sidebar_placement_rejects_any_generation_except_integer_one(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows path equivalence")
-def test_resolve_sidebar_placement_compares_windows_equivalents_without_rewriting_inbox(
+def test_resolve_sidebar_placement_normalizes_windows_equivalents_and_deduplicates(
     tmp_path: Path,
 ) -> None:
     inbox = tmp_path / ".hermes"
-    source = tmp_path / "source"
     inbox.mkdir()
-    source.mkdir()
     configured_inbox = str(inbox.resolve())
     equivalent_home = configured_inbox.upper().replace("\\", "/")
+    equivalent_source = configured_inbox.upper().replace("\\", "/")
+
+    assert equivalent_home != configured_inbox
+    assert _windows_identity(Path(configured_inbox)) == _windows_identity(
+        Path(equivalent_home)
+    )
 
     placement = resolve_sidebar_placement(
         configured_inbox_cwd=configured_inbox,
         hermes_home=equivalent_home,
         placement_generation=1,
-        source_cwd=str(source),
+        source_cwd=equivalent_source,
     )
 
     assert placement.inbox_cwd == configured_inbox
+    assert placement.runtime_workspace_roots == (configured_inbox,)
