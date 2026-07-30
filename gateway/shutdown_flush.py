@@ -193,6 +193,14 @@ def _serialise_value(value: Any) -> Optional[dict]:
     # MessageEvent objects have a .text attribute and other fields
     if hasattr(value, "text"):
         result: Dict[str, Any] = {"text": getattr(value, "text", "")}
+        source = getattr(value, "source", None)
+        if source is not None:
+            try:
+                source_value = source.to_dict()
+                json.dumps(source_value)
+                result["source"] = source_value
+            except (AttributeError, TypeError, ValueError):
+                logger.debug("Could not serialise pending message source", exc_info=True)
         # Preserve additional fields if present
         for attr in (
             "session_id",

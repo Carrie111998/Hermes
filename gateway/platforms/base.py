@@ -2163,6 +2163,9 @@ class TextDebounceState:
     last_ts: float
 
 
+_DEBOUNCE_STATE_UNSET = object()
+
+
 _PLAINTEXT_GATEWAY_RESTART_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?gateway[.!?\s]*$", re.IGNORECASE),
     re.compile(r"^(?:please\s+)?restart\s+(?:the\s+)?hermes\s+gateway[.!?\s]*$", re.IGNORECASE),
@@ -5536,6 +5539,7 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
+        preexisting_debounce_state: Any = _DEBOUNCE_STATE_UNSET,
     ) -> None:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
@@ -5559,11 +5563,17 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        # This method is the ownership boundary for reset-like commands. Drop
-        # only debounce work that already existed when the command began;
-        # follow-ups arriving during the awaits below create fresh state and
-        # are intentionally drained after the command completes.
-        self._discard_text_debounce(session_key)
+        # Drop only the debounce object captured when the command entered the
+        # outer handle_message boundary.  Topic recovery above can await long
+        # enough for a follow-up to install fresh state; that state belongs
+        # after the command and must be drained rather than discarded.
+        if preexisting_debounce_state is _DEBOUNCE_STATE_UNSET:
+            preexisting_debounce_state = self._text_debounce_store().get(session_key)
+        if (
+            preexisting_debounce_state is not None
+            and self._text_debounce_store().get(session_key) is preexisting_debounce_state
+        ):
+            self._discard_text_debounce(session_key)
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
@@ -5626,6 +5636,13 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
+        # Capture debounce ownership before the topic-recovery await.  The
+        # recovered key is selected afterward from this mapping, preserving
+        # correctness when recovery rewrites the thread lane.
+        pre_recovery_debounce = (
+            dict(self._text_debounce_store()) if event.is_command() else {}
+        )
+
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
         # (Telegram DM topic mode) so the session key, guard checks, and
         # downstream delivery all agree on the same lane.
@@ -5672,7 +5689,12 @@ class BasePlatformAdapter(ABC):
                 # (Registry-derived: busy_policy == "interrupt_then_dispatch".)
                 if cmd and is_interrupt_then_dispatch(cmd):
                     try:
-                        await self._dispatch_active_session_command(event, session_key, cmd)
+                        await self._dispatch_active_session_command(
+                            event,
+                            session_key,
+                            cmd,
+                            pre_recovery_debounce.get(session_key),
+                        )
                     except Exception as e:
                         logger.error(
                             "[%s] Command '/%s' dispatch failed: %s",

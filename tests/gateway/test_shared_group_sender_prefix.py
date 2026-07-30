@@ -1,4 +1,6 @@
 import asyncio
+import json
+import threading
 
 import pytest
 
@@ -709,6 +711,70 @@ async def test_control_command_discards_only_preexisting_debounce(cmd):
     assert delivered == [during], f"/{cmd} lost or duplicated the in-command follow-up"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cmd", ["stop", "new", "reset"])
+async def test_control_command_preserves_followup_arriving_during_topic_recovery(cmd):
+    """The outer handle_message boundary must not misclassify a racing follow-up as stale."""
+    runner, adapter = _runner_with_adapter()
+    adapter.config.extra["group_sessions_per_user"] = False
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    recovered_source = _alice_source(thread_id="topic-7")
+    session_key = build_session_key(recovered_source, group_sessions_per_user=False)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    command = _text_event(f"/{cmd}", _alice_source(), message_id=f"cmd-{cmd}")
+    stale = _text_event(
+        "stale-before-control", _carol_source(thread_id="topic-7"), message_id="stale"
+    )
+    during = _text_event(
+        "follow-up-during-topic-recovery",
+        _bob_source(thread_id="topic-7"),
+        message_id="during",
+    )
+    recovery_entered = threading.Event()
+    release_recovery = threading.Event()
+    delivered = []
+
+    def _recover(source):
+        if source.user_id == command.source.user_id:
+            recovery_entered.set()
+            assert release_recovery.wait(timeout=2.0)
+        return "topic-7" if source.user_id == command.source.user_id else source.thread_id
+
+    async def _handler(event):
+        if event is command:
+            await runner._interrupt_and_clear_session(
+                session_key,
+                command.source,
+                interrupt_reason=f"test-{cmd}",
+                invalidation_reason=f"test-{cmd}",
+            )
+            return f"/{cmd} complete"
+        delivered.append(event)
+        return None
+
+    adapter.set_topic_recovery_fn(_recover)
+    adapter.set_message_handler(_handler)
+    await adapter._queue_text_debounce(session_key, stale)
+    command_task = asyncio.create_task(adapter.handle_message(command))
+    try:
+        assert await asyncio.to_thread(recovery_entered.wait, 1.0)
+        await adapter.handle_message(during)
+        state = adapter._text_debounce_store().get(session_key)
+        assert state is not None and state.event is during
+    finally:
+        release_recovery.set()
+    await asyncio.wait_for(command_task, timeout=2.0)
+    task = adapter._session_tasks.get(session_key)
+    if task is not None:
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert stale not in delivered, f"/{cmd} replayed debounce work predating command receipt"
+    assert delivered == [during], f"/{cmd} lost the follow-up received after command entry"
+
+
 def test_refused_runner_fifo_is_preserved_in_shutdown_forensics(tmp_path, monkeypatch):
     """A refused overflow turn must reach disk without stopping the gateway."""
     from gateway import shutdown_flush
@@ -720,7 +786,10 @@ def test_refused_runner_fifo_is_preserved_in_shutdown_forensics(tmp_path, monkey
         _alice_source(), "/tmp/a.jpg", caption=ALICE_MARK, message_id="a"
     )
     bob = _photo_event(
-        _bob_source(), "/tmp/b.jpg", caption="", message_id="b"
+        _bob_source(user_id_alt="bob-stable", thread_id="topic-7"),
+        "/tmp/b.jpg",
+        caption="",
+        message_id="b",
     )
 
     adapter._pending_messages[session_key] = alice
@@ -747,6 +816,24 @@ def test_refused_runner_fifo_is_preserved_in_shutdown_forensics(tmp_path, monkey
     assert "/tmp/b.jpg" in payload_text, (
         "refused runner-FIFO media is absent from shutdown forensics"
     )
+    payloads = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "pending_messages").glob("*.json")
+    ]
+    bob_payload = next(
+        payload for payload in payloads if "/tmp/b.jpg" in payload["data"].get("media_urls", [])
+    )
+    assert bob_payload["data"]["source"] == {
+        "platform": "telegram",
+        "chat_id": "-1002285219667",
+        "chat_name": "Shared Group",
+        "chat_type": "group",
+        "user_id": "bob-2",
+        "user_name": "Bob",
+        "thread_id": "topic-7",
+        "chat_topic": None,
+        "user_id_alt": "bob-stable",
+    }
 
 
 @pytest.mark.asyncio
