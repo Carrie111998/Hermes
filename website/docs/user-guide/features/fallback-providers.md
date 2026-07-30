@@ -341,9 +341,12 @@ auxiliary:
     fallback_chain:
       - provider: openai
         model: gpt-4o-mini
+        timeout: 240            # optional — this candidate's own deadline (seconds)
 ```
 
 You do **not** need to configure `fallback_chain` to get fallback — the main-agent safety net runs regardless. Use it only when you specifically want a different order than the default.
+
+Each `fallback_chain` entry may also declare its own `timeout` (seconds). Without it, a fallback candidate inherits the task-level timeout — which may be tuned for the primary provider. Declaring a per-entry `timeout` lets a slower-but-reliable fallback (e.g. a large-context summarizer) get the budget it actually needs instead of dying on the primary's clock.
 
 ### Provider quota errors that trigger fallback
 
@@ -425,5 +428,5 @@ See [Scheduled Tasks (Cron)](/user-guide/features/cron) for full configuration d
 | Approval classification | Layered (see above) | `auxiliary.approval` |
 | Title generation | Layered (see above) | `auxiliary.title_generation` |
 | Triage specifier | Layered (see above) | `auxiliary.triage_specifier` |
-| Delegation | Provider override only (no automatic fallback) | `delegation.provider` / `delegation.model` |
-| Cron jobs | Per-job provider override only (no automatic fallback) | Per-job `provider` / `model` |
+| Delegation | Inherits the parent's `fallback_providers` chain; optional provider/model override | `delegation.provider` / `delegation.model` |
+| Cron jobs | Inherit the configured `fallback_providers` chain; optional per-job provider override | Per-job `provider` / `model` |
