@@ -177,12 +177,10 @@ function parseDiff(diff: string): DiffLine[] {
 
   const out: DiffLine[] = []
   let emitted = false
-  let oldNo = 1
-  let newNo = 1
 
   for (const hunk of hunks) {
-    oldNo = hunk.oldStart
-    newNo = hunk.newStart
+    let oldNo = hunk.oldStart
+    let newNo = hunk.newStart
 
     if (emitted) {
       out.push({ kind: 'context', text: '' })

@@ -86,44 +86,50 @@ function preserveStructuralParts(message: ChatMessage, previous: ChatMessage): C
 // or a new part type appears in the ChatMessagePart union (e.g. @assistant-ui
 // ships one), these fail tsc until someone explicitly classifies it.
 //
-// COMPARED: fields whose change must trigger a re-render (setMessages).
-// IGNORED:  fields that are intentionally not compared — display-only metadata
+// ComparedMessageField: fields whose change must trigger a re-render (setMessages).
+// IgnoredMessageField: fields intentionally not compared — display-only metadata
 //           or reference identity the runtime already guarantees.
 //   timestamp  — presentation-only (sort/age display), never affects transcript equality
 //   attachmentRefs — composer-side metadata; already reconciled in reconcileResumeMessages
 //   rowId — durable backend identity; stable for a given row, never changes what's painted
 //
 // If your new field affects what the user sees in the transcript, add it to
-// COMPARED. If it's metadata that shouldn't trigger a re-render, add it to
-// IGNORED.
+// ComparedMessageField. If it's metadata that shouldn't trigger a re-render,
+// add it to IgnoredMessageField.
+type ComparedMessageField =
+  | 'branchGroupId'
+  | 'error'
+  | 'hidden'
+  | 'id'
+  | 'interim'
+  | 'pending'
+  | 'reactions'
+  | 'role'
+type IgnoredMessageField = 'attachmentRefs' | 'parts' | 'rowId' | 'timestamp'
+
 const _chatMessageFieldsExhaustive: {
-  [K in Exclude<keyof ChatMessage, (typeof COMPARED_FIELDS)[number] | (typeof IGNORED_FIELDS)[number]>]: never
+  [K in Exclude<keyof ChatMessage, ComparedMessageField | IgnoredMessageField>]: never
 } = {}
-
-const COMPARED_FIELDS = ['id', 'role', 'pending', 'error', 'hidden', 'branchGroupId', 'interim', 'reactions'] as const
-
-const IGNORED_FIELDS = ['timestamp', 'attachmentRefs', 'parts', 'rowId'] as const
 
 // Compile-time check: every ChatMessagePart discriminant must be handled by
 // chatPartsEquivalent. If @assistant-ui adds a new part type, this fails tsc.
 //   text, reasoning      → compared by .text
 //   tool-call             → compared by toolCallId/toolName + result presence
 //   source, image, file, data, generative-ui, audio, data-* → shallow primitive compare
-const _chatMessagePartTypesExhaustive: {
-  [T in Exclude<ChatMessage['parts'][number]['type'], (typeof HANDLED_PART_TYPES)[number]>]: never
-} = {}
+type HandledMessagePartType =
+  | 'audio'
+  | 'data'
+  | 'file'
+  | 'generative-ui'
+  | 'image'
+  | 'reasoning'
+  | 'source'
+  | 'text'
+  | 'tool-call'
 
-const HANDLED_PART_TYPES = [
-  'text',
-  'reasoning',
-  'tool-call',
-  'source',
-  'image',
-  'file',
-  'data',
-  'generative-ui',
-  'audio'
-] as const
+const _chatMessagePartTypesExhaustive: {
+  [T in Exclude<ChatMessage['parts'][number]['type'], HandledMessagePartType>]: never
+} = {}
 
 // Structural compare WITHOUT JSON.stringify — the only consumer asks "did
 // the transcript change, should I call setMessages?", so a slightly

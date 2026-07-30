@@ -323,7 +323,6 @@ export function rangeBeforeCaret(editor: HTMLElement, length: number): Range | n
   while (remaining > 0) {
     if (startOffset >= remaining) {
       startOffset -= remaining
-      remaining = 0
 
       break
     }

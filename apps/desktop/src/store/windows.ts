@@ -14,7 +14,7 @@ export function isSecondaryWindow(): boolean {
     return secondaryWindowCache
   }
 
-  let result = false
+  let result: boolean
 
   try {
     result = new URLSearchParams(window.location.search).get('win') === SECONDARY_WINDOW_FLAG
@@ -38,7 +38,7 @@ export function isWatchWindow(): boolean {
     return watchWindowCache
   }
 
-  let result = false
+  let result: boolean
 
   try {
     result = new URLSearchParams(window.location.search).get('watch') === '1'

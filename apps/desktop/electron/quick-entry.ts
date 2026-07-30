@@ -373,7 +373,7 @@ export function createQuickEntryShortcut(
       // `isRegistered` catches the common conflict before we ask, and
       // `register()` returning false catches the rest (another process owns it
       // OS-wide). Both land in the same surfaced 'taken' state.
-      let ok = false
+      let ok: boolean
 
       try {
         ok = globalShortcut.isRegistered(parsed.accelerator)

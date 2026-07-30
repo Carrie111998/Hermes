@@ -820,7 +820,7 @@ export async function saveOnboardingLocalEndpoint(baseUrl: string, apiKey: strin
   // Probe connectivity + discover the served models. Any HTTP response proves
   // the endpoint is up; an unreachable probe hard-blocks because we can't
   // resolve a model to route to.
-  let model = ''
+  let model: string
 
   try {
     const probe = await validateProviderCredential('OPENAI_BASE_URL', url, key)

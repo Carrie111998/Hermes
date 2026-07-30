@@ -521,10 +521,6 @@ function renderFrameSlice(
 ): VirtualScreen {
   let currentStyleId = stylePool.none
   let currentHyperlink: Hyperlink = undefined
-  // Track the styleId of the last rendered cell on this line (-1 if none).
-  // Passed to visibleCellAtIndex to enable fg-only space optimization.
-  let lastRenderedStyleId = -1
-
   const { width: screenWidth, cells, charPool, hyperlinkPool } = frame.screen
 
   let index = startY * screenWidth
@@ -550,8 +546,9 @@ function renderFrameSlice(
       })
     }
 
-    // Reset at start of each line — no cell rendered yet
-    lastRenderedStyleId = -1
+    // Track the styleId of the last rendered cell on this line (-1 if none).
+    // Passed to visibleCellAtIndex to enable fg-only space optimization.
+    let lastRenderedStyleId = -1
 
     for (let x = 0; x < screenWidth; x += 1, index += 1) {
       // Skip spacers, unstyled empty cells, and fg-only styled spaces that

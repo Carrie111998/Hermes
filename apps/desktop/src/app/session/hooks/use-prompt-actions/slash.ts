@@ -257,7 +257,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           return
         }
 
-        let slashExecError: unknown = null
+        let slashExecError: unknown
 
         const handleDispatch = async (
           dispatch: NonNullable<ReturnType<typeof parseCommandDispatch>>

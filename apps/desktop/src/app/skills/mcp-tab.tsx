@@ -244,7 +244,7 @@ function scanServerBlocks(text: string): ServerBlock[] {
   }
 
   // Container: the object after "mcpServers"/"mcp_servers", else the doc root.
-  let start = -1
+  let start: number
   const wrapper = /"mcpServers"|"mcp_servers"/.exec(text)
 
   if (wrapper) {

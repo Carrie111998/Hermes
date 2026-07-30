@@ -187,7 +187,7 @@ export function extractDroppedFiles(transfer: DataTransfer): DroppedFile[] {
         continue
       }
 
-      let isDirectory = false
+      let isDirectory: boolean
 
       try {
         const entry = typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null

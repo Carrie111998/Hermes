@@ -25,7 +25,7 @@ export function profileNameFromDeleteRequest(request) {
     return null
   }
 
-  let raw = ''
+  let raw: string
 
   try {
     raw = decodeURIComponent(match[1])

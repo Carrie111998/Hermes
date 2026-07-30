@@ -58,7 +58,9 @@ function normalizeRemoteBaseUrl(rawUrl) {
   try {
     parsed = new URL(value)
   } catch (error) {
-    throw new Error(`Remote gateway URL is not valid: ${error.message}`)
+    throw new Error(`Remote gateway URL is not valid: ${error.message}`, {
+      cause: error
+    })
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {

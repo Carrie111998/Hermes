@@ -55,7 +55,7 @@ function encryptDesktopSecret(value, safeStorageApi) {
     return null
   }
 
-  let encryptionAvailable = false
+  let encryptionAvailable: boolean
 
   try {
     encryptionAvailable = Boolean(safeStorageApi?.isEncryptionAvailable?.())
@@ -79,7 +79,8 @@ function encryptDesktopSecret(value, safeStorageApi) {
     const detail = error instanceof Error && error.message ? ` (${error.message})` : ''
     throw new Error(
       `Failed to encrypt the remote gateway token for secure storage${detail}. ` +
-        'Set HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN in your environment as a fallback.'
+        'Set HERMES_DESKTOP_REMOTE_URL and HERMES_DESKTOP_REMOTE_TOKEN in your environment as a fallback.',
+      { cause: error }
     )
   }
 }

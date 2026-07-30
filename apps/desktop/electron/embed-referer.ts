@@ -12,7 +12,7 @@ function installEmbedRefererForSession(embedSession) {
   }
 
   embedSession.webRequest.onBeforeSendHeaders((details, callback) => {
-    let host = ''
+    let host: string
 
     try {
       host = new URL(details.url).hostname

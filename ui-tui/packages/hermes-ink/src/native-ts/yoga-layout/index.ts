@@ -1569,8 +1569,6 @@ function layoutNode(
     for (const c of line) {
       const cMargin = c.style.margin
       const cLayoutMargin = c.layout.margin
-      let autoMainLead = false
-      let autoMainTrail = false
       let autoCrossLead = false
       let autoCrossTrail = false
       let mMainLead: number
@@ -1579,8 +1577,9 @@ function layoutNode(
       let mCrossTrail: number
 
       if (c._hasAutoMargin) {
-        autoMainLead = isMarginAuto(cMargin, mainLeadEdgePhys)
-        autoMainTrail = isMarginAuto(cMargin, mainTrailEdgePhys)
+        const autoMainLead = isMarginAuto(cMargin, mainLeadEdgePhys)
+        const autoMainTrail = isMarginAuto(cMargin, mainTrailEdgePhys)
+
         autoCrossLead = isMarginAuto(cMargin, crossLeadEdgePhys)
         autoCrossTrail = isMarginAuto(cMargin, crossTrailEdgePhys)
         mMainLead = autoMainLead ? autoMarginMainSize : cLayoutMargin[mainLeadEdgePhys]!

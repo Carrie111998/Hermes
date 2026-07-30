@@ -108,18 +108,18 @@ describe('flush-boundary SGR mouse reassembly', () => {
     expect(keys).toEqual([])
 
     // continuation arrives; the whole report reassembles, nothing leaks
-    ;[keys, state] = parseMultipleKeypresses(state, '46M')
+    ;[keys] = parseMultipleKeypresses(state, '46M')
     expect(keys).toEqual([expect.objectContaining({ kind: 'mouse', button: 0, col: 35, row: 46, action: 'press' })])
   })
 
   it('drops a truncated mouse prefix after a second flush instead of leaking it', () => {
-    let [keys, state] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[<0;35;')
+    let [, state] = parseMultipleKeypresses(INITIAL_STATE, '\x1b[<0;35;')
 
-    ;[keys, state] = parseMultipleKeypresses(state, null) // first flush keeps it
-    ;[keys, state] = parseMultipleKeypresses(state, null) // second flush drops it
+    ;[, state] = parseMultipleKeypresses(state, null) // first flush keeps it
+    const [keys, finalState] = parseMultipleKeypresses(state, null) // second flush drops it
 
     expect(keys).toEqual([])
-    expect(state.incomplete).toBe('')
+    expect(finalState.incomplete).toBe('')
   })
 
   it('re-synthesizes an orphaned X10 wheel tail (legacy mouse) into a scroll key', () => {
