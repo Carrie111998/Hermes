@@ -514,6 +514,29 @@ class TestSteerClearedOnInterrupt:
         assert agent._pending_steer is None
         assert agent._pending_redirect is None
 
+    def test_clear_interrupt_retains_acknowledged_ipc_steers(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+        agent.steer("ordinary steer")
+        agent.steer(
+            "/restart acknowledged task",
+            _gateway_session_ipc=True,
+        )
+        native_token = object()
+        agent._codex_native_pending_steer_chunks = [
+            (object(), "ordinary native steer", False),
+            (native_token, "/status acknowledged task", True),
+        ]
+
+        agent.clear_interrupt()
+
+        assert agent._drain_pending_steer_chunks() == [
+            ("/restart acknowledged task", True),
+        ]
+        assert agent._codex_native_pending_steer_chunks == [
+            (native_token, "/status acknowledged task", True),
+        ]
+
 
 class TestPreApiCallSteerDrain:
     """Test that steers arriving during an API call are drained before the

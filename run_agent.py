@@ -3080,17 +3080,28 @@ class AIAgent:
                     _set_interrupt(False, _wtid)
                 except Exception:
                     pass
-        # A hard interrupt supersedes any pending /steer — the steer was
-        # meant for the agent's next tool-call iteration, which will no
-        # longer happen. Drop it instead of surprising the user with a
-        # late injection on the post-interrupt turn.
+        # A hard interrupt supersedes an ordinary user /steer — the steer was
+        # meant for the agent's next tool-call iteration, which will no longer
+        # happen. A trusted gateway-session IPC steer is different: its caller
+        # has already received ``disposition: steered``, so dropping it here
+        # would lose an acknowledged task. Retain trusted chunks for the failed
+        # turn recovery path (or the next turn) while discarding user steers.
         _steer_lock = getattr(self, "_pending_steer_lock", None)
         if _steer_lock is not None:
             with _steer_lock:
-                self._pending_steer = None
-                self._pending_steer_chunks = []
-                self._pending_steer_is_gateway_session_ipc = False
-                self._codex_native_pending_steer_chunks = []
+                self._pending_steer_chunks = [
+                    (text, trusted)
+                    for text, trusted in self._pending_steer_chunks_locked()
+                    if trusted
+                ]
+                self._sync_pending_steer_compat_locked()
+                self._codex_native_pending_steer_chunks = [
+                    item
+                    for item in getattr(
+                        self, "_codex_native_pending_steer_chunks", []
+                    )
+                    if len(item) >= 3 and item[2]
+                ]
         return True
 
     def steer(self, text: str, *, _gateway_session_ipc: bool = False) -> bool:
