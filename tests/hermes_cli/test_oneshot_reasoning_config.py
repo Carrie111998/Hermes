@@ -135,6 +135,41 @@ def test_oneshot_resolves_reasoning_for_remapped_model(monkeypatch):
     assert expected != resolve_reasoning_config(cfg, "requested-alias")
 
 
+def test_oneshot_resolves_reasoning_for_direct_alias_model(monkeypatch):
+    """The other remapping branch: a config.yaml ``model_aliases:`` hit
+    (``DIRECT_ALIASES``) also rewrites effective_model before construction,
+    so reasoning must likewise resolve against the alias TARGET."""
+    from hermes_cli import model_switch as ms_mod
+
+    cfg = {
+        "model": {"default": "cfg/unused"},
+        "agent": {
+            "reasoning_effort": "low",
+            "reasoning_overrides": {"real/alias-target": "high"},
+        },
+    }
+    _wire_oneshot_stubs(monkeypatch, cfg)
+    monkeypatch.setattr(ms_mod, "_ensure_direct_aliases", lambda: None)
+    monkeypatch.setattr(
+        ms_mod,
+        "DIRECT_ALIASES",
+        {
+            "my-alias": ms_mod.DirectAlias(
+                model="real/alias-target", provider="openrouter", base_url=""
+            )
+        },
+    )
+
+    # Mixed case exercises the .lower() lookup normalization too.
+    oneshot._run_agent("hello", model="My-Alias", use_config_toolsets=False)
+
+    captured = _CapturingAgent.captured
+    assert captured["model"] == "real/alias-target"
+    expected = resolve_reasoning_config(cfg, "real/alias-target")
+    assert captured["reasoning_config"] == expected
+    assert expected != resolve_reasoning_config(cfg, "my-alias")
+
+
 def test_oneshot_reasoning_absent_config_passes_none(monkeypatch):
     """No reasoning config anywhere -> the constructor receives None
     (unchanged default behavior, pinned so the wiring can't invent one)."""
