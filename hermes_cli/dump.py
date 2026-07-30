@@ -291,6 +291,26 @@ def _fallback_placeholder(value) -> str:
     return f"<omitted: {type(value).__name__}>"
 
 
+def _is_sensitive_query_param(name) -> bool:
+    """True when a URL query parameter name carries a credential.
+
+    The repository already owns this policy in ``agent.redact``, and it lists
+    names the field-name markers above cannot reach — ``signature``,
+    ``x-amz-signature``, ``code`` — so a pre-signed URL or an OAuth callback
+    would otherwise print its secret in full. Ask that policy first, so this
+    path stays in step with it as it grows, and fall back to the markers for
+    names it doesn't list (``access_key``, ``auth_token``, ``client_secret``).
+    """
+    if not isinstance(name, str):
+        return False
+
+    from agent.redact import is_sensitive_query_param
+
+    if is_sensitive_query_param(name):
+        return True
+    return _is_fallback_secret_field(name)
+
+
 def _mask_url_credentials(value: str) -> str:
     """Strip userinfo and redact secret query parameters from a URL."""
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -319,10 +339,10 @@ def _mask_url_credentials(value: str) -> str:
     query = parts.query
     if query:
         pairs = parse_qsl(query, keep_blank_values=True)
-        if any(_is_fallback_secret_field(name) for name, _ in pairs):
+        if any(_is_sensitive_query_param(name) for name, _ in pairs):
             query = urlencode(
                 [
-                    (name, _redact(val) if val and _is_fallback_secret_field(name) else val)
+                    (name, _redact(val) if val and _is_sensitive_query_param(name) else val)
                     for name, val in pairs
                 ]
             )

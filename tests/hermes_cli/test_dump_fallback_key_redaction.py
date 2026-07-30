@@ -177,6 +177,87 @@ def test_strips_credentials_embedded_in_the_endpoint_url():
     assert "api.example.com" in out["fallback_providers"]
 
 
+def test_masks_query_credentials_named_by_the_repository_policy():
+    # The field-name markers ("key", "token", "secret"...) answer a question
+    # about config fields and miss query names the repository already treats as
+    # sensitive in agent/redact.py: a pre-signed URL signature and an OAuth
+    # code carry no marker word at all.
+    for param in ("signature", "x-amz-signature", "code", "access-token", "jwt"):
+        out = dump._config_overrides(
+            {
+                "fallback_providers": [
+                    _fallback_entry(
+                        base_url=f"https://api.example.com/v1?{param}={_SK_KEY}"
+                    )
+                ]
+            }
+        )
+        rendered = out["fallback_providers"]
+        assert _SK_KEY not in rendered, param
+        # The parameter name itself stays — operators need to see the shape of
+        # the endpoint, only the value goes.
+        assert "api.example.com" in rendered, param
+
+    # A public parameter next to a secret one must survive, or the masking is
+    # just a blunt instrument that costs diagnostics.
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(
+                    base_url=f"https://api.example.com/v1?region=eu-west-1&signature={_SK_KEY}"
+                )
+            ]
+        }
+    )
+    assert _SK_KEY not in out["fallback_providers"]
+    assert "eu-west-1" in out["fallback_providers"]
+
+
+def test_debug_share_upload_never_carries_the_raw_fallback_key(monkeypatch, tmp_path):
+    """The real boundary: what `hermes debug share` hands to the paste service.
+
+    The tests above pin `_config_overrides` and `run_dump`, but the credential
+    only becomes public when `build_debug_share` uploads the bundle. This test
+    stands at that exact call and reads the payloads that would go out.
+    """
+    from hermes_cli import debug
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model: gpt-4o\n"
+        "provider: openai\n"
+        "fallback_providers:\n"
+        "  - name: my-backup\n"
+        "    provider: openai\n"
+        "    model: gpt-4o\n"
+        "    base_url: https://api.example.com/v1\n"
+        f"    api_key: {_SK_KEY}\n",
+        encoding="utf-8",
+    )
+
+    uploaded: list[str] = []
+
+    def _capture(content: str, expiry_days: int = 7) -> str:
+        uploaded.append(content)
+        return f"https://paste.example/{len(uploaded)}"
+
+    monkeypatch.setattr(debug, "upload_to_pastebin", _capture)
+    monkeypatch.setattr(debug, "_best_effort_sweep_expired_pastes", lambda: None)
+    monkeypatch.setattr(debug, "_schedule_auto_delete", lambda urls: None)
+
+    debug.build_debug_share(log_lines=5, redact=True)
+
+    assert uploaded, "nothing was uploaded — the boundary was never reached"
+    for payload in uploaded:
+        assert _SK_KEY not in payload
+    # Non-vacuous: the fallback block really is in what goes out, masked.
+    assert any("sk-l...SHIP" in payload for payload in uploaded)
+
+
 def test_numeric_token_budgets_are_not_mistaken_for_secrets():
     # The name-marker rule fails closed, so the few known-safe fields that
     # contain a marker word must stay readable or the dump loses diagnostics.
