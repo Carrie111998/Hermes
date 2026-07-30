@@ -2473,13 +2473,20 @@ def detect_provider_for_model(
     if not name:
         return None
 
+    if _is_explicit_custom_or_local_provider(current_provider):
+        resolved_provider = _PROVIDER_ALIASES.get(name.lower(), name.lower())
+        if (
+            resolved_provider not in {"custom", "openrouter"}
+            and resolved_provider in _PROVIDER_LABELS
+            and _PROVIDER_MODELS.get(resolved_provider)
+        ):
+            return detect_static_provider_for_model(name, current_provider)
+        return None
+
     static_match = detect_static_provider_for_model(name, current_provider)
     if static_match:
         return static_match
     if _model_in_provider_catalog(name.lower(), _provider_keys(current_provider)):
-        return None
-
-    if _is_explicit_custom_or_local_provider(current_provider):
         return None
 
     # --- Step 2: check OpenRouter catalog ---

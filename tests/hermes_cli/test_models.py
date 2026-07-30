@@ -164,15 +164,17 @@ class TestDetectProviderForModel:
             for provider in ("custom", "custom:myproxy", "local"):
                 assert detect_provider_for_model("anthropic/claude-opus-4.6", provider) is None
 
-    def test_explicit_custom_provider_still_resolves_static_short_alias(self):
-        """The live-catalog guard must not suppress intentional static aliases."""
-        with patch(
-            "hermes_cli.models.fetch_openrouter_models",
-            side_effect=AssertionError("network lookup should not run"),
-        ):
-            result = detect_provider_for_model("sonnet", "custom")
-        assert result is not None
-        assert result[0] == "anthropic"
+    def test_explicit_custom_or_local_provider_allows_bare_provider_switch_only(self):
+        """Only a documented bare-provider command may override an endpoint."""
+        for provider in ("custom:myproxy", "local"):
+            result = detect_provider_for_model("anthropic", provider)
+            assert result is not None
+            assert result[0] == "anthropic"
+            assert result[1]
+            assert detect_provider_for_model("sonnet", provider) is None
+
+    def test_local_provider_not_overridden_by_native_static_catalog(self):
+        assert detect_provider_for_model("gpt-5.4", "local") is None
 
 
 class TestIsNousFreeTier:
