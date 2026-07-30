@@ -7430,6 +7430,7 @@ def _fallback_session_info(session: dict) -> dict:
         "project": _project_info_for_cwd(cwd),
         "lazy": True,
         "model": _resolve_model(),
+        "stored_session_id": _session_lookup_key(session) or "",
         "skills": {},
         "tools": {},
     }
