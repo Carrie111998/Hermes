@@ -3234,6 +3234,10 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                for dependent_id in dependents:
+                    _inherit_notify_subs(
+                        conn, dependent_id, (task_id,), created_at=now,
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
