@@ -266,3 +266,149 @@ def test_isatty_exception_is_treated_non_interactive(local_mode, monkeypatch):
     )
     monkeypatch.setattr(browser_tool.sys.stdin, "isatty", _boom)
     assert browser_tool.check_browser_requirements() is False
+
+
+# --- #69071 second pass: the gate must survive the two caches + child construction ---
+
+def test_check_fn_cache_no_cross_session_leak(local_mode, monkeypatch):
+    """#69071 Part 1: the browser check_fn is context-sensitive, so its verdict
+    must not persist in the process-global check_fn cache across sessions on the
+    same worker. Order-sensitive and deliberately does NOT invalidate between
+    reads — the pre-fix bug was that a warmed interactive verdict was served to a
+    later gateway/cron read (and vice versa)."""
+    monkeypatch.setattr(
+        browser_tool, "_find_agent_browser", lambda validate=False: "npx agent-browser"
+    )
+    monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)
+    invalidate_check_fn_cache()  # start clean; no invalidate between the reads below
+
+    tok = browser_tool.set_browser_session_interactive(True)
+    try:
+        assert _browser_visible_in_toolset() is True   # interactive -> visible (warms cache)
+    finally:
+        browser_tool.reset_browser_session_interactive(tok)
+
+    tok = browser_tool.set_browser_session_interactive(False)
+    try:
+        assert _browser_visible_in_toolset() is False  # non-interactive -> gated, no leak
+    finally:
+        browser_tool.reset_browser_session_interactive(tok)
+
+    tok = browser_tool.set_browser_session_interactive(True)
+    try:
+        assert _browser_visible_in_toolset() is True    # reverse order: no stale gate
+    finally:
+        browser_tool.reset_browser_session_interactive(tok)
+
+
+def test_tool_defs_cache_keys_on_session_context(local_mode, monkeypatch):
+    """#69071 Part 2: model_tools memoizes the assembled tool-definition list; the
+    cache key now includes session interactivity, so a long-lived process does not
+    serve one session type's cached list to the other."""
+    import model_tools
+
+    monkeypatch.setattr(
+        browser_tool, "_find_agent_browser", lambda validate=False: "npx agent-browser"
+    )
+    monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()  # process-global, no TTL — start clean
+
+    def browser_in_defs():
+        defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser"], quiet_mode=True
+        )
+        return any(d["function"]["name"] == "browser_navigate" for d in defs)
+
+    tok = browser_tool.set_browser_session_interactive(True)
+    try:
+        interactive = browser_in_defs()
+    finally:
+        browser_tool.reset_browser_session_interactive(tok)
+
+    tok = browser_tool.set_browser_session_interactive(False)
+    try:
+        gated = browser_in_defs()
+    finally:
+        browser_tool.reset_browser_session_interactive(tok)
+
+    assert interactive is True
+    assert gated is False
+
+
+def test_delegate_construction_gates_browser_before_snapshot(local_mode, monkeypatch):
+    """#69071 Part 3: a delegate child's tool list is snapshotted during
+    *construction* (`_build_child_agent` -> AIAgent -> get_tool_definitions) on the
+    calling thread, before the run-time worker gate. delegate_task must apply the
+    non-interactive browser mark around that construction loop, so an interactive
+    parent does not bake browser tools into the child snapshot.
+
+    This drives the real delegate_task path: a recording _build_child_agent
+    captures the session interactivity seen at construction time. Reverting the
+    construction-wrap hunk makes this fail (it would record an interactive
+    parent, i.e. non-interactive == False)."""
+    import threading
+    from unittest.mock import MagicMock
+
+    import model_tools
+    import tools.delegate_tool as dt
+
+    monkeypatch.setattr(
+        browser_tool, "_find_agent_browser", lambda validate=False: "npx agent-browser"
+    )
+    monkeypatch.setattr(browser_tool.sys.stdin, "isatty", lambda: True)  # interactive parent
+    invalidate_check_fn_cache()
+    model_tools._clear_tool_defs_cache()
+    assert browser_tool._is_non_interactive_session() is False  # ambient parent is interactive
+
+    seen = []
+    child_snapshot_has_browser = []
+
+    class _StopAfterConstruction(Exception):
+        pass
+
+    def _recording_build_child_agent(*args, **kwargs):
+        # The gate must already be active here (construction happens inside the
+        # mark). Record both the session flag AND the tool snapshot the child
+        # would capture at this exact moment (what agent_init does via
+        # get_tool_definitions), then short-circuit before the run/aggregate phase.
+        seen.append(browser_tool._is_non_interactive_session())
+        defs = model_tools.get_tool_definitions(
+            enabled_toolsets=["browser"], quiet_mode=True
+        )
+        child_snapshot_has_browser.append(
+            any(d["function"]["name"] == "browser_navigate" for d in defs)
+        )
+        raise _StopAfterConstruction
+
+    monkeypatch.setattr(dt, "_build_child_agent", _recording_build_child_agent)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials",
+        lambda cfg, parent: {
+            "model": "m", "provider": "p", "base_url": "u", "api_key": "k",
+            "api_mode": "chat_completions", "request_overrides": None,
+            "max_output_tokens": None, "command": None, "args": None,
+        },
+    )
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent.enabled_toolsets = None
+    parent.disabled_toolsets = []
+    parent.platform = "cli"
+
+    try:
+        dt.delegate_task(goal="probe", parent_agent=parent)
+    except _StopAfterConstruction:
+        pass
+
+    assert seen == [True], f"construction did not see a non-interactive session: {seen}"
+    # the sweeper's literal ask: the child's would-be tool snapshot excludes browser
+    assert child_snapshot_has_browser == [False], (
+        f"child construction snapshot still exposed browser: {child_snapshot_has_browser}"
+    )
+    # the construction-time mark is reset afterward — the parent stays interactive
+    assert browser_tool._is_non_interactive_session() is False

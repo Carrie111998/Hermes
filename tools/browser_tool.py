@@ -4967,6 +4967,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
 
+# These predicates read per-session interactivity (`_is_non_interactive_session`
+# via contextvars), so their verdict must not be cached by callable in the
+# process-global check_fn cache — that would leak an interactive session's result
+# into a later gateway/cron session on the same worker (#69071). registry marks
+# such fns re-probe-every-call; see tools/registry._check_fn_cached.
+check_browser_requirements._hermes_context_sensitive = True
+check_browser_vision_requirements._hermes_context_sensitive = True
+
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
 registry.register(

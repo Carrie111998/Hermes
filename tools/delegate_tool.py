@@ -2610,6 +2610,12 @@ def delegate_task(
     # Wrapped in try/finally so the global is always restored even if a
     # child build raises (otherwise _last_resolved_tool_names stays corrupted).
     children = []
+    # Gate the browser tool OFF for the duration of child *construction*, not only
+    # the later run_conversation. _build_child_agent() -> AIAgent() -> get_tool_definitions()
+    # snapshots the child's tool list here on the main thread; without the override an
+    # interactive parent would bake browser tools into that snapshot before the
+    # run-time gate (in _run_with_thread_capture) ever applies (#69071).
+    _ctor_browser_tok = _mark_subagent_browser_non_interactive()
     try:
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
@@ -2640,6 +2646,8 @@ def delegate_task(
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
     finally:
+        # Reset the construction-time browser gate before anything else.
+        _unmark_subagent_browser_non_interactive(_ctor_browser_tok)
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
