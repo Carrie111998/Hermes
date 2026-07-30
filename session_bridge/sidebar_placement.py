@@ -96,8 +96,6 @@ def ordinary_windows_path_identity(value: object) -> str | None:
 
 def _is_ordinary_unc_server(component: str) -> bool:
     ipv6_literal_suffix = ".ipv6-literal.net"
-    if "[" in component or "]" in component:
-        return False
     if component.casefold().endswith(ipv6_literal_suffix):
         transformed_address = component[: -len(ipv6_literal_suffix)]
         if (
@@ -123,9 +121,29 @@ def _is_ordinary_unc_server(component: str) -> bool:
             return False
         return True
 
-    if "." not in component and _is_ordinary_netbios_name(component):
+    if _is_recognizable_ipv6_lookalike(component):
+        return False
+    if _is_ordinary_netbios_name(component):
         return True
     return _is_ordinary_fqdn(component)
+
+
+def _is_recognizable_ipv6_lookalike(component: str) -> bool:
+    candidate = component
+    if candidate.startswith("["):
+        closing_bracket = candidate.find("]")
+        if closing_bracket > 1:
+            candidate = (
+                candidate[1:closing_bracket] + candidate[closing_bracket + 1 :]
+            )
+    address, separator, _zone = candidate.partition("%")
+    if separator and not address:
+        return False
+    try:
+        ipaddress.IPv6Address(address)
+    except ValueError:
+        return False
+    return True
 
 
 def _is_ordinary_netbios_name(component: str) -> bool:

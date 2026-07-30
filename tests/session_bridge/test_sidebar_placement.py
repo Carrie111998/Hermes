@@ -36,6 +36,9 @@ from session_bridge.sidebar_placement import (
         ("\\\\" + "n" * 15 + "\\public\\workspace", "\\\\" + "n" * 15 + "\\public\\workspace"),
         ("\\\\" + "1" * 15 + "\\public\\workspace", "\\\\" + "1" * 15 + "\\public\\workspace"),
         ("\\\\bad_server\\public\\workspace", "\\\\bad_server\\public\\workspace"),
+        ("\\\\srv[1]\\public\\workspace", "\\\\srv[1]\\public\\workspace"),
+        ("\\\\srv..name\\public\\workspace", "\\\\srv..name\\public\\workspace"),
+        ("\\\\host.123\\public\\workspace", "\\\\host.123\\public\\workspace"),
         ("\\\\3com.example\\public\\workspace", "\\\\3com.example\\public\\workspace"),
         (
             "\\\\servidor東京\\shareüber\\workspace",
@@ -106,6 +109,7 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
     "server",
     [
         "[2001:db8::1]",
+        "fe80::1%12",
         "2001:db8::1.ipv6-literal.net",
         "2001-db8--1%12.ipv6-literal.net",
         "[2001-db8--1].ipv6-literal.net",
@@ -115,7 +119,6 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
         "bad\x00server",
         "_" * 16,
         "💥" * 4,
-        "host.123",
     ],
 )
 def test_ordinary_windows_path_identity_rejects_invalid_unc_server(
