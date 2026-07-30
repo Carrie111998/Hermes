@@ -46,7 +46,7 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
+                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"},"supported_parameters":["tools"]},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"},"supported_parameters":["tools"]},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"},"supported_parameters":["tools"]}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         monkeypatch.setattr(_models_mod, "_openrouter_policy_catalog_cache", None)
@@ -156,14 +156,8 @@ class TestFetchOpenRouterModels:
         # Image-only model advertised supported_parameters WITHOUT tools → must be dropped.
         assert "google/gemini-3-pro-image-preview" not in ids
 
-    def test_permissive_when_supported_parameters_missing(self, monkeypatch):
-        """Models missing the supported_parameters field keep appearing in the picker.
-
-        Some OpenRouter-compatible gateways (Nous Portal, private mirrors, older
-        catalog snapshots) don't populate supported_parameters. Treating missing
-        as 'unknown → allow' prevents the picker from silently emptying on
-        those gateways.
-        """
+    def test_fails_closed_when_supported_parameters_missing(self, monkeypatch):
+        """Unknown tool capability must not authorize a picker entry."""
         class _Resp:
             def __enter__(self):
                 return self
@@ -172,7 +166,6 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                # No supported_parameters field at all on either entry.
                 return (
                     b'{"data":['
                     b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
@@ -186,9 +179,7 @@ class TestFetchOpenRouterModels:
         with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
             models = fetch_openrouter_models(force_refresh=True)
 
-        ids = [mid for mid, _ in models]
-        assert "anthropic/claude-opus-4.8" in ids
-        assert "qwen/qwen3.7-max" in ids
+        assert models == []
 
 
 
@@ -252,6 +243,85 @@ class TestOpenRouterPolicyCatalog:
         assert catalog is not None
         assert list(catalog) == ["alias/model"]
         assert seen["authorization"] == "Bearer openai-alias-key"
+
+    def test_fetch_uses_explicit_openrouter_runtime_inputs(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data":[{"id":"explicit/model","supported_parameters":["tools"]}]}'
+
+        seen = {}
+
+        def _open(req, *, timeout):
+            seen["authorization"] = req.get_header("Authorization")
+            return _Resp()
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(_models_mod, "_openrouter_policy_catalog_cache", None)
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_open):
+            catalog = _models_mod._fetch_openrouter_policy_catalog(
+                force_refresh=True,
+                api_key="explicit-key",
+                base_url="https://openrouter.ai/api/v1",
+            )
+
+        assert catalog is not None
+        assert list(catalog) == ["explicit/model"]
+        assert seen["authorization"] == "Bearer explicit-key"
+
+    def test_fetch_uses_configured_main_openrouter_credential(self, monkeypatch):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data":[{"id":"configured/model","supported_parameters":["tools"]}]}'
+
+        seen = {}
+
+        def _open(req, *, timeout):
+            seen["authorization"] = req.get_header("Authorization")
+            return _Resp()
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "model": {
+                    "provider": "openrouter",
+                    "api_key": "configured-key",
+                    "base_url": "https://openrouter.ai/api/v1",
+                }
+            },
+        )
+        monkeypatch.setattr(_models_mod, "_openrouter_policy_catalog_cache", None)
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_open):
+            catalog = _models_mod._fetch_openrouter_policy_catalog(force_refresh=True)
+
+        assert catalog is not None
+        assert list(catalog) == ["configured/model"]
+        assert seen["authorization"] == "Bearer configured-key"
+
+    def test_explicit_custom_endpoint_key_is_not_sent_to_openrouter(self, monkeypatch):
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        resolved = _models_mod._resolve_openrouter_catalog_api_key(
+            explicit_api_key="custom-endpoint-key",
+            explicit_base_url="https://llm.example.com/v1",
+        )
+
+        assert resolved == ""
 
     def test_policy_and_picker_caches_are_partitioned_by_api_key(self, monkeypatch):
         class _Resp:
@@ -389,6 +459,23 @@ class TestOpenRouterPolicyCatalog:
         assert result["persist"] is True
         assert result["recognized"] is True
 
+    def test_direct_selection_rejects_missing_tool_capability_metadata(self):
+        from hermes_cli.models import validate_requested_model
+
+        with patch(
+            "hermes_cli.models._fetch_openrouter_policy_catalog",
+            return_value={"policy/model": {"id": "policy/model"}},
+        ):
+            result = validate_requested_model(
+                "policy/model",
+                "openrouter",
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+            )
+
+        assert result["accepted"] is False
+        assert result["persist"] is False
+
 
 class TestOpenRouterToolSupportHelper:
     """Unit tests for _openrouter_model_supports_tools (Kilo port #9068)."""
@@ -406,6 +493,13 @@ class TestOpenRouterToolSupportHelper:
         assert _openrouter_model_supports_tools(
             {"id": "x", "supported_parameters": []}
         ) is False
+
+    def test_missing_or_malformed_supported_parameters_drops_model(self):
+        from hermes_cli.models import _openrouter_model_supports_tools
+
+        assert _openrouter_model_supports_tools({"id": "x"}) is False
+        assert _openrouter_model_supports_tools({"id": "x", "supported_parameters": "tools"}) is False
+        assert _openrouter_model_supports_tools(None) is False
 
 
 class TestFindOpenrouterSlug:

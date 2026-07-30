@@ -328,6 +328,24 @@ describe('ModelSettings', () => {
     )
   })
 
+  it('cancels a pending ZDR disable when the profile changes', async () => {
+    getHermesConfigRecord.mockResolvedValueOnce({
+      agent: { reasoning_effort: 'medium', service_tier: 'normal' },
+      openrouter: { zdr: true, response_cache: true }
+    })
+    await renderModelSettings()
+    const zdrSwitch = await screen.findByRole('switch', { name: 'Enforce OpenRouter Zero Data Retention' })
+    await waitFor(() => expect(zdrSwitch.getAttribute('data-state')).toBe('checked'))
+
+    fireEvent.click(zdrSwitch)
+    expect(await screen.findByText('Disable request-time ZDR?')).toBeTruthy()
+
+    act(() => profileSwitchHandler?.())
+
+    await waitFor(() => expect(screen.queryByText('Disable request-time ZDR?')).toBeNull())
+    expect(saveHermesConfig).not.toHaveBeenCalled()
+  })
+
   it('renders the auxiliary task rows', async () => {
     await renderModelSettings()
 

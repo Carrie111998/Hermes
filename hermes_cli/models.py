@@ -139,13 +139,41 @@ def _openrouter_api_key_fingerprint(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
-def _resolve_openrouter_catalog_api_key() -> str:
-    """Resolve the catalog credential through the canonical runtime chain."""
-    try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+def _resolve_openrouter_catalog_api_key(
+    *,
+    explicit_api_key: str | None = None,
+    explicit_base_url: str | None = None,
+) -> str:
+    """Resolve the catalog credential through the canonical runtime chain.
 
-        runtime = resolve_runtime_provider(requested="openrouter")
+    Explicit request inputs take precedence. When the picker has no request
+    context, mirror the configured main OpenRouter model inputs so legacy
+    ``model.api_key`` profiles use the same credential as inference.
+    """
+    try:
+        from hermes_cli.runtime_provider import base_url_host_matches, resolve_runtime_provider
+
+        if not explicit_api_key and not explicit_base_url:
+            from hermes_cli.config import load_config_readonly
+
+            config = load_config_readonly()
+            model_config = config.get("model", {}) if isinstance(config, dict) else {}
+            if (
+                isinstance(model_config, dict)
+                and str(model_config.get("provider") or "").strip().lower() == "openrouter"
+            ):
+                explicit_api_key = str(model_config.get("api_key") or "").strip() or None
+                explicit_base_url = str(model_config.get("base_url") or "").strip() or None
+
+        runtime = resolve_runtime_provider(
+            requested="openrouter",
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
     except Exception:
+        return ""
+    resolved_base_url = runtime.get("base_url") if isinstance(runtime, dict) else ""
+    if not isinstance(resolved_base_url, str) or not base_url_host_matches(resolved_base_url, "openrouter.ai"):
         return ""
     api_key = runtime.get("api_key") if isinstance(runtime, dict) else ""
     if not isinstance(api_key, str):
@@ -1497,34 +1525,28 @@ def _openrouter_model_is_free(pricing: Any) -> bool:
 
 
 def _openrouter_model_supports_tools(item: Any) -> bool:
-    """Return True when the model's ``supported_parameters`` advertise tool calling.
+    """Return True only when the model explicitly advertises tool calling.
 
-    hermes-agent is tool-calling-first — every provider path assumes the model
-    can invoke tools. Models that don't advertise ``tools`` in their
-    ``supported_parameters`` (e.g. image-only or completion-only models) cannot
-    be driven by the agent loop and would fail at the first tool call.
-
-    **Permissive when the field is missing.** Some OpenRouter-compatible gateways
-    (Nous Portal, private mirrors, older catalog snapshots) don't populate
-    ``supported_parameters`` at all. Treat that as "unknown capability → allow"
-    so the picker doesn't silently empty for those users. Only hide models
-    whose ``supported_parameters`` is an explicit list that omits ``tools``.
+    hermes-agent is tool-calling-first, so missing or malformed capability
+    metadata must fail closed rather than authorizing a model that may reject
+    the first tool request.
 
     Ported from Kilo-Org/kilocode#9068.
     """
     if not isinstance(item, dict):
-        return True
+        return False
     params = item.get("supported_parameters")
     if not isinstance(params, list):
-        # Field absent / malformed / None — be permissive.
-        return True
-    return "tools" in params
+        return False
+    return any(isinstance(param, str) and param == "tools" for param in params)
 
 
 def _fetch_openrouter_policy_catalog(
     timeout: float = 8.0,
     *,
     force_refresh: bool = False,
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> dict[str, dict[str, Any]] | None:
     """Fetch OpenRouter's catalog filtered by account privacy and guardrails.
 
@@ -1536,10 +1558,13 @@ def _fetch_openrouter_policy_catalog(
     global _openrouter_policy_catalog_cache, _openrouter_policy_catalog_cache_at
     global _openrouter_policy_catalog_cache_key_fp
 
-    api_key = _resolve_openrouter_catalog_api_key()
-    if not api_key:
+    resolved_api_key = _resolve_openrouter_catalog_api_key(
+        explicit_api_key=api_key,
+        explicit_base_url=base_url,
+    )
+    if not resolved_api_key:
         return None
-    key_fp = _openrouter_api_key_fingerprint(api_key)
+    key_fp = _openrouter_api_key_fingerprint(resolved_api_key)
 
     now = time.time()
     if (
@@ -1554,7 +1579,7 @@ def _fetch_openrouter_policy_catalog(
         _OPENROUTER_USER_MODELS_URL,
         headers={
             "Accept": "application/json",
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {resolved_api_key}",
             "User-Agent": _HERMES_USER_AGENT,
         },
     )
@@ -1586,9 +1611,15 @@ def _openrouter_policy_model_ids(
     *,
     force_refresh: bool = False,
     tool_capable: bool = False,
+    api_key: str | None = None,
+    base_url: str | None = None,
 ) -> list[str] | None:
     """Return model IDs eligible under the current OpenRouter policy."""
-    catalog = _fetch_openrouter_policy_catalog(force_refresh=force_refresh)
+    catalog = _fetch_openrouter_policy_catalog(
+        force_refresh=force_refresh,
+        api_key=api_key,
+        base_url=base_url,
+    )
     if catalog is None:
         return None
     if tool_capable:
@@ -5239,7 +5270,11 @@ def validate_requested_model(
         }
 
     if normalized == "openrouter":
-        eligible_models = _openrouter_policy_model_ids(tool_capable=True)
+        eligible_models = _openrouter_policy_model_ids(
+            tool_capable=True,
+            api_key=api_key,
+            base_url=base_url,
+        )
         if eligible_models is None:
             return {
                 "accepted": False,

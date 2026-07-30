@@ -126,7 +126,7 @@ metrics:
   output_file: my_metrics.json
 """
         yaml_file = tmp_path / "config.yaml"
-        yaml_file.write_text(yaml_content)
+        yaml_file.write_text(yaml_content, encoding="utf-8")
         config = CompressionConfig.from_yaml(str(yaml_file))
         assert config.tokenizer_name == "custom-tokenizer"
         assert config.trust_remote_code is False

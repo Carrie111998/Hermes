@@ -1704,11 +1704,13 @@ def switch_model(
             "message": f"Could not validate `{new_model}`: {e}",
         }
 
-    # Override rejection if model is in the user's saved provider config.
-    # API /v1/models may not list cloud/aliased models even though the server supports them.
+    # Override rejection if a model is declared for a non-authoritative custom
+    # provider. OpenRouter's authenticated /models/user catalog is authoritative
+    # and must never be bypassed by a stale local declaration.
     if not validation.get("accepted"):
         override = False
-        if user_providers:
+        authoritative_openrouter = str(target_provider).strip().lower() == "openrouter"
+        if user_providers and not authoritative_openrouter:
             from hermes_cli.config import is_provider_enabled
             # user_providers is a dict: {provider_slug: config_dict}
             for slug, cfg in user_providers.items():
@@ -1719,8 +1721,14 @@ def switch_model(
                         override = True
                         break
         # Also check custom_providers list — models declared there should be accepted
-        # even if the remote /v1/models endpoint doesn't list them.
-        if not override and custom_providers and isinstance(custom_providers, list):
+        # even if the remote /v1/models endpoint doesn't list them. Never soften
+        # an authoritative OpenRouter policy rejection.
+        if (
+            not override
+            and not authoritative_openrouter
+            and custom_providers
+            and isinstance(custom_providers, list)
+        ):
             for entry in custom_providers:
                 if not isinstance(entry, dict):
                     continue
