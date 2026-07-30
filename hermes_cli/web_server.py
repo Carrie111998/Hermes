@@ -2695,6 +2695,10 @@ async def fs_mkdir(payload: FsMkdir):
 
     try:
         target.mkdir()
+    except FileExistsError:
+        # TOCTOU: another writer created the target between the stat()
+        # preflight above and mkdir() — honour the same conflict contract.
+        raise HTTPException(status_code=409, detail="Path already exists")
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not writable")
     except OSError as exc:

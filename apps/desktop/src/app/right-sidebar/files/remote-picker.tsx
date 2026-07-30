@@ -146,7 +146,15 @@ export function RemoteFolderPicker() {
   }
 
   const trimmedName = newName.trim()
-  const nameValid = Boolean(trimmedName) && trimmedName !== '.' && trimmedName !== '..' && !trimmedName.includes('/')
+
+  // Reject both separators: a Windows backend treats `\` as a separator too,
+  // so allowing it would smuggle a multi-segment path past the one-level contract.
+  const nameValid =
+    Boolean(trimmedName) &&
+    trimmedName !== '.' &&
+    trimmedName !== '..' &&
+    !trimmedName.includes('/') &&
+    !trimmedName.includes('\\')
 
   const submitCreate = async () => {
     if (!nameValid || createBusy) {
@@ -208,11 +216,7 @@ export function RemoteFolderPicker() {
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-2">
-            <FolderRow
-              disabled={currentPath === '/'}
-              name=".."
-              onClick={() => navigate(parentDir(currentPath))}
-            />
+            <FolderRow disabled={currentPath === '/'} name=".." onClick={() => navigate(parentDir(currentPath))} />
             {creating ? (
               <div className="flex items-center gap-1.5 px-2 py-1.5">
                 <Codicon name="folder" size="0.875rem" />

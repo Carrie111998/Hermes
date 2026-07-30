@@ -10,25 +10,23 @@ import { RemoteFolderPicker } from './remote-picker'
 // The picker drives the real desktop-fs facade against a stubbed Electron
 // bridge, so the test covers the whole loop: dialog open -> list -> create ->
 // POST /api/fs/mkdir -> land inside the new folder -> resolve the selection.
-const api = vi.fn(
-  async (request: { body?: { path?: string }; method?: string; path: string; profile?: string }) => {
-    if (request.path.startsWith('/api/fs/list?')) {
-      const dir = decodeURIComponent(request.path.slice(request.path.indexOf('path=') + 'path='.length))
+const api = vi.fn(async (request: { body?: { path?: string }; method?: string; path: string; profile?: string }) => {
+  if (request.path.startsWith('/api/fs/list?')) {
+    const dir = decodeURIComponent(request.path.slice(request.path.indexOf('path=') + 'path='.length))
 
-      if (dir === '/remote') {
-        return { entries: [{ name: 'existing', path: '/remote/existing', isDirectory: true }] }
-      }
-
-      return { entries: [] }
+    if (dir === '/remote') {
+      return { entries: [{ name: 'existing', path: '/remote/existing', isDirectory: true }] }
     }
 
-    if (request.path === '/api/fs/mkdir') {
-      return { ok: true, path: request.body?.path }
-    }
-
-    throw new Error(`unexpected path ${request.path}`)
+    return { entries: [] }
   }
-)
+
+  if (request.path === '/api/fs/mkdir') {
+    return { ok: true, path: request.body?.path }
+  }
+
+  throw new Error(`unexpected path ${request.path}`)
+})
 
 function openPicker(defaultPath = '/remote') {
   let selection!: Promise<string[]>
@@ -114,6 +112,23 @@ describe('RemoteFolderPicker new folder', () => {
 
     const input = screen.getByPlaceholderText('Folder name')
     fireEvent.change(input, { target: { value: 'a/b' } })
+
+    expect(screen.getByRole('button', { name: 'Confirm' })).toHaveProperty('disabled', true)
+
+    fireEvent.keyDown(input, { key: 'Enter' })
+    expect(api).not.toHaveBeenCalledWith(expect.objectContaining({ path: '/api/fs/mkdir' }))
+  })
+
+  it('rejects names containing a backslash before any backend call', async () => {
+    openPicker()
+
+    await screen.findByRole('button', { name: 'existing' })
+    fireEvent.click(screen.getByRole('button', { name: 'New folder' }))
+
+    const input = screen.getByPlaceholderText('Folder name')
+    // String.fromCharCode(92) is a literal backslash — written this way so no
+    // escape-sequence ambiguity (\b is backspace) can creep into the test.
+    fireEvent.change(input, { target: { value: `a${String.fromCharCode(92)}b` } })
 
     expect(screen.getByRole('button', { name: 'Confirm' })).toHaveProperty('disabled', true)
 

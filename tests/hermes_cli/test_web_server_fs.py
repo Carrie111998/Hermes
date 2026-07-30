@@ -91,6 +91,20 @@ def test_fs_mkdir_rejects_invalid_path(client, tmp_path):
     assert response.status_code == 400
 
 
+def test_fs_mkdir_maps_mkdir_time_conflict_to_409(client, tmp_path, monkeypatch):
+    # TOCTOU: the target appears after the stat() preflight, so mkdir() itself
+    # raises FileExistsError — the endpoint must keep the 409 contract.
+    def _raise_exists(self, *args, **kwargs):
+        raise FileExistsError(17, "File exists", str(self))
+
+    monkeypatch.setattr(web_server.Path, "mkdir", _raise_exists)
+
+    response = client.post("/api/fs/mkdir", json={"path": str(tmp_path / "race")})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Path already exists"
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
