@@ -9,8 +9,10 @@
 //   2. Escape goes back one history entry when the guest can go back
 // The renderer surfaces an explicit Back titlebar tool from canGoBack().
 
-import type { App, WebContents } from 'electron'
-import { webContents as electronWebContents } from 'electron'
+import type { App, Session, WebContents } from 'electron'
+import { session as electronSession, webContents as electronWebContents } from 'electron'
+
+const PREVIEW_WEBVIEW_PARTITION = 'persist:hermes-preview'
 
 type WindowOpenDetails = { url: string }
 
@@ -26,6 +28,12 @@ type GuestWebContents = Pick<WebContents, 'canGoBack' | 'goBack' | 'isDestroyed'
   setWindowOpenHandler: (handler: (details: WindowOpenDetails) => { action: 'allow' | 'deny' }) => void
 }
 
+type CandidateWebContents = GuestWebContents & Pick<WebContents, 'getType' | 'session'>
+
+type SessionApi = {
+  fromPartition: (partition: string) => Session
+}
+
 const wiredGuestIds = new Set<number>()
 
 /** In-place navigation keeps history so Back/Escape can restore the report. */
@@ -34,10 +42,7 @@ export function previewWindowOpenDecision(_url: string): 'navigate-in-place' {
 }
 
 /** Escape means "leave the attachment view", not "close the preview pane". */
-export function shouldHandleEscapeAsPreviewBack(
-  input: InputEventLike,
-  canGoBack: boolean
-): boolean {
+export function shouldHandleEscapeAsPreviewBack(input: InputEventLike, canGoBack: boolean): boolean {
   if (!canGoBack) {
     return false
   }
@@ -94,34 +99,38 @@ export function wirePreviewWebviewContents(contents: GuestWebContents): void {
 }
 
 /**
- * Install once at app ready. Every subsequent <webview> guest (preview pane
- * partition or otherwise) gets the same back-friendly window.open + Escape
- * behavior. The renderer also calls wirePreviewWebviewById after mount so we
- * still win if type detection on web-contents-created is delayed/odd.
+ * Install once at app ready. Only <webview> guests in the dedicated preview
+ * partition get the back-friendly window.open + Escape behavior. The renderer
+ * also calls wirePreviewWebviewById after mount so we still win if type
+ * detection on web-contents-created is delayed/odd.
  */
-export function installPreviewWebviewGuards(electronApp: Pick<App, 'on'>): void {
+export function installPreviewWebviewGuards(
+  electronApp: Pick<App, 'on'>,
+  sessionApi: SessionApi = electronSession
+): void {
+  const previewSession = sessionApi.fromPartition(PREVIEW_WEBVIEW_PARTITION)
+
   electronApp.on('web-contents-created', (_event, contents) => {
-    const type = (contents as WebContents).getType?.()
-    // Only <webview> guests. BrowserWindows already have their own open handlers.
-    if (type !== 'webview') {
+    const candidate = contents as CandidateWebContents
+
+    // BrowserWindows and unrelated embedded surfaces retain their own open and
+    // keyboard contracts.
+    if (candidate.getType?.() !== 'webview' || candidate.session !== previewSession) {
       return
     }
 
-    wirePreviewWebviewContents(contents as unknown as GuestWebContents)
+    wirePreviewWebviewContents(candidate)
   })
 }
 
 /** Explicit wire from the renderer after a preview <webview> mounts. */
 export function wirePreviewWebviewById(
   webContentsId: number,
-  webContentsApi: Pick<typeof electronWebContents, 'fromId'> = electronWebContents
+  webContentsApi: Pick<typeof electronWebContents, 'fromId'> = electronWebContents,
+  sessionApi: SessionApi = electronSession
 ): boolean {
   if (!Number.isFinite(webContentsId) || webContentsId <= 0) {
     return false
-  }
-
-  if (wiredGuestIds.has(webContentsId)) {
-    return true
   }
 
   const contents = webContentsApi.fromId(webContentsId)
@@ -130,7 +139,18 @@ export function wirePreviewWebviewById(
     return false
   }
 
-  wirePreviewWebviewContents(contents as unknown as GuestWebContents)
+  const candidate = contents as CandidateWebContents
+  const previewSession = sessionApi.fromPartition(PREVIEW_WEBVIEW_PARTITION)
 
-  return wiredGuestIds.has(webContentsId) || true
+  if (candidate.getType?.() !== 'webview' || candidate.session !== previewSession) {
+    return false
+  }
+
+  if (wiredGuestIds.has(webContentsId)) {
+    return true
+  }
+
+  wirePreviewWebviewContents(candidate)
+
+  return true
 }

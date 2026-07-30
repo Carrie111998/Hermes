@@ -87,6 +87,42 @@ describe('PreviewPane console state', () => {
     expect(setTitlebarToolGroup).toHaveBeenCalledTimes(initialCalls)
   })
 
+  it('does not treat guest console output as a navigation command', async () => {
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          setTitlebarToolGroup={vi.fn()}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      loadURL?: (url: string) => Promise<void>
+    }
+
+    const loadURL = vi.fn(async () => undefined)
+    webview.loadURL = loadURL
+
+    act(() => {
+      webview.dispatchEvent(
+        Object.assign(new Event('console-message'), {
+          level: 0,
+          message: '__hermes_preview_navigate__:https://example.com/guest-controlled',
+          sourceId: 'http://localhost:5174/report.html'
+        })
+      )
+    })
+
+    expect(loadURL).not.toHaveBeenCalled()
+  })
+
   it('surfaces a Back titlebar tool once the webview can go back', async () => {
     const setTitlebarToolGroup = vi.fn()
 

@@ -14,8 +14,8 @@ import {
   $previewCanGoBack,
   $previewServerRestart,
   failPreviewServerRestart,
-  setPreviewGoBackHandler,
-  type PreviewTarget
+  type PreviewTarget,
+  setPreviewGoBackHandler
 } from '@/store/preview'
 
 import { ArtifactPreview } from './preview-artifact'
@@ -33,7 +33,6 @@ import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
   closeDevTools?: () => void
-  executeJavaScript?: (code: string) => Promise<unknown>
   getURL?: () => string
   getWebContentsId?: () => number
   goBack?: () => void
@@ -622,24 +621,6 @@ export function PreviewPane({
 
       const message = detail.message || ''
 
-      // Guest-injected capture for target=_blank anchors. Prefer host loadURL so
-      // the webview history stack always gets a real entry (guest location.assign
-      // from the initial src load often does not).
-      const navigatePrefix = '__hermes_preview_navigate__:'
-      if (message.startsWith(navigatePrefix)) {
-        const href = message.slice(navigatePrefix.length).trim()
-
-        if (href) {
-          void (webview as PreviewWebview & { loadURL?: (url: string) => Promise<void> })
-            .loadURL?.(href)
-            .catch(() => {
-              // Fall through to console logging only.
-            })
-        }
-
-        return
-      }
-
       appendConsoleEntry({
         level: detail.level ?? 0,
         line: detail.line,
@@ -694,6 +675,7 @@ export function PreviewPane({
     }
 
     const onStart = () => setLoading(true)
+
     const onStop = () => {
       setLoading(false)
       syncNavigationState(webview)
@@ -722,39 +704,7 @@ export function PreviewPane({
       }
     }
 
-    // Belt-and-braces for HTML reports whose attachments use target=_blank:
-    // ask the host to loadURL so history/Back work even if main-process
-    // setWindowOpenHandler is delayed or silent.
-    const injectBlankLinkCapture = () => {
-      void webview
-        .executeJavaScript?.(
-          `(() => {
-            if (window.__hermesPreviewBlankCapture) return true;
-            window.__hermesPreviewBlankCapture = true;
-            document.addEventListener('click', event => {
-              const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
-              const anchor = path.find(node => node instanceof HTMLAnchorElement)
-                || (event.target instanceof Element ? event.target.closest('a') : null);
-              if (!(anchor instanceof HTMLAnchorElement)) return;
-              if ((anchor.getAttribute('target') || '').toLowerCase() !== '_blank') return;
-              const href = anchor.href;
-              if (!href) return;
-              event.preventDefault();
-              event.stopPropagation();
-              console.log('__hermes_preview_navigate__:' + href);
-            }, true);
-            return true;
-          })()`
-        )
-        .catch(() => {
-          // Guest may not be scriptable yet; ignore.
-        })
-    }
-
-    const onDomReady = () => {
-      wireGuest()
-      injectBlankLinkCapture()
-    }
+    const onDomReady = () => wireGuest()
 
     webview.addEventListener('dom-ready', onDomReady)
     // Prefer dom-ready; a delayed attempt covers guests that already fired it.
