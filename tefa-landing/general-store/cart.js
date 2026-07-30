@@ -1,9 +1,9 @@
 /* Prototype-only client-side cart + checkout for the General Store — a
-   separate retail line (books, activity books) sold for real payment,
+   separate retail line (books, activity books) intended for a future retail payment flow,
    kept apart from the ESA-funded store/cart.js on purpose so a retail
    sale never gets mixed into a TEFA/ESA invoice.
 
-   No payment is ever collected here. "Place order" on checkout.html only
+   No payment is ever collected here. "Preview confirmation" on checkout.html only
    ever shows a client-side confirmation panel — there is no backend, and
    this file must not be extended with a real card-number field without
    first wiring up an actual PCI-compliant payment processor. */
@@ -93,7 +93,7 @@
         const qty = qtyInput ? parseInt(qtyInput.value, 10) || 1 : 1;
         addToCart(sku, qty);
         const p = PRODUCTS[sku];
-        toast((p ? p.name : sku) + ' added — ' + cartCount() + ' in cart');
+        toast((p ? p.name : sku) + ' added to preview — ' + cartCount() + ' in preview cart');
       });
     });
 
@@ -190,7 +190,7 @@
       e.preventDefault();
       const form = document.getElementById('checkout-form');
       if (form && !form.reportValidity()) return;
-      writeCart({}); // a placed order clears the cart, same as any real checkout
+      writeCart({}); // the preview confirmation resets this device-only cart
       document.getElementById('checkout-body').hidden = true;
       document.getElementById('checkout-confirm').hidden = false;
       window.scrollTo({ top: 0, behavior: 'smooth' });
