@@ -3959,25 +3959,87 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             if pull_result.returncode != 0:
                 # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                # force-pushed or rebase).  Before nuking local history with
+                # `git reset --hard` (which silently destroys any commits the
+                # user made on top of origin), check whether the local branch
+                # is actually ahead of origin.  If it is, try to rebase local
+                # commits onto the remote first; only fall back to reset when
+                # there is nothing to preserve (#74885).
+                ahead_result = subprocess.run(
+                    git_cmd + ["rev-list", f"origin/{branch}..HEAD", "--count"],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                try:
+                    ahead_count = int((ahead_result.stdout or "0").strip() or "0")
+                except ValueError:
+                    ahead_count = 0
+
+                if ahead_count > 0:
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  ⚠ Fast-forward not possible and local branch has "
+                        f"{ahead_count} commit(s) ahead of origin/{branch}; "
+                        f"rebasing onto remote to preserve your work..."
                     )
-                    sys.exit(1)
+                    rebase_result = subprocess.run(
+                        git_cmd + ["rebase", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if rebase_result.returncode == 0:
+                        # Rebase succeeded; treat as a successful pull. Fall
+                        # through to the post-pull syntax guard below.
+                        pull_result = rebase_result
+                    else:
+                        # Rebase failed (likely conflicts). Abort so we leave
+                        # the user's history untouched, then fall back to the
+                        # destructive reset so the install can still recover.
+                        subprocess.run(
+                            git_cmd + ["rebase", "--abort"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        print(
+                            "  ⚠ Rebase hit conflicts; aborting and resetting "
+                            "to match remote (local commits will be lost — "
+                            "recover with `git reflog` if needed)..."
+                        )
+                        reset_result = subprocess.run(
+                            git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                        )
+                        if reset_result.returncode != 0:
+                            print(f"✗ Failed to reset to origin/{branch}.")
+                            if reset_result.stderr.strip():
+                                print(f"  {reset_result.stderr.strip()}")
+                            print(
+                                f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                            )
+                            sys.exit(1)
+                else:
+                    # Local branch is not ahead of origin — nothing to preserve.
+                    print(
+                        "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    )
+                    reset_result = subprocess.run(
+                        git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    if reset_result.returncode != 0:
+                        print(f"✗ Failed to reset to origin/{branch}.")
+                        if reset_result.stderr.strip():
+                            print(f"  {reset_result.stderr.strip()}")
+                        print(
+                            f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        )
+                        sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
