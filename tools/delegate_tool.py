@@ -1748,6 +1748,13 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
+    if read_only and effective_acp_command:
+        raise ValueError(
+            "read_only delegation is unavailable with ACP transports because "
+            "ACP executes outside Hermes' tool allowlist; use a direct API "
+            "provider or disable read_only explicitly"
+        )
+
     # Resolve reasoning config: delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
@@ -2344,6 +2351,22 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _normalize_child_result(
+    entry: Dict[str, Any], child=None
+) -> Dict[str, Any]:
+    """Apply the public delegation-result envelope on every exit path."""
+    status = str(entry.get("status") or "error")
+    entry.setdefault(
+        "semantic_status",
+        "unverified" if status == "completed" else "not_applicable",
+    )
+    entry.setdefault(
+        "read_only", bool(getattr(child, "_delegate_read_only", False))
+    )
+    entry.setdefault("exit_reason", status)
+    return entry
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2793,7 +2816,7 @@ def _run_single_child(
                     f"{_late_pending_steer}]"
                 )
             _attach_worktree(_error_entry)
-            return _error_entry
+            return _normalize_child_result(_error_entry, child)
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -3168,7 +3191,7 @@ def _run_single_child(
             )
         # _attach_worktree defaults to a no-op when isolation never engaged.
         _attach_worktree(_error_entry)
-        return _error_entry
+        return _normalize_child_result(_error_entry, child)
 
     finally:
         # Stop the heartbeat thread so it doesn't keep touching parent activity
@@ -3285,8 +3308,12 @@ def _finalize_child_results(
 ) -> None:
     """Apply host-owned summary, memory, hook, and cost contracts once."""
     with _parent_finalization_lock(parent_agent):
-        _apply_summary_budget(results, parent_agent)
         child_by_index = {index: child for index, _task, child in children}
+        for entry in results:
+            _normalize_child_result(
+                entry, child_by_index.get(entry.get("task_index", -1))
+            )
+        _apply_summary_budget(results, parent_agent)
 
         if parent_agent and getattr(parent_agent, "_memory_manager", None):
             for entry in results:
