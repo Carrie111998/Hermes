@@ -4187,11 +4187,11 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
     "MISTRAL_API_KEY": {
-        "description": "Mistral API key for Voxtral TTS and transcription (STT)",
+        "description": "Mistral API key for Mistral models and Voxtral voice features",
         "prompt": "Mistral API key",
         "url": "https://console.mistral.ai/",
         "password": True,
-        "category": "tool",
+        "category": "provider",
     },
     "GITHUB_TOKEN": {
         "description": "GitHub token for Skills Hub (higher API rate limits, skill publish)",

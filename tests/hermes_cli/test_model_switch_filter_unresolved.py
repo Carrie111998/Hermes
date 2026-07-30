@@ -23,11 +23,13 @@ def _rows_with_env(monkeypatch, env_name: str, provider: str) -> list[dict]:
         return list_authenticated_providers(max_models=5)
 
 
-def test_models_dev_only_provider_is_not_selectable(monkeypatch):
+def test_registered_mistral_provider_remains_selectable(monkeypatch):
     rows = _rows_with_env(monkeypatch, "MISTRAL_API_KEY", "mistral")
 
-    assert all(row["slug"] != "mistral" for row in rows)
-    assert not is_runtime_provider_routable("mistral")
+    row = next(row for row in rows if row["slug"] == "mistral")
+    assert row["models"] == ["model-a"]
+    assert row["total_models"] == 1
+    assert is_runtime_provider_routable("mistral")
 
 
 def test_registered_provider_remains_selectable(monkeypatch):
