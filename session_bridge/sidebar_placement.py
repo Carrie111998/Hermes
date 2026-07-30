@@ -7,7 +7,7 @@ from pathlib import Path, PureWindowsPath
 
 
 _WIN32_COMPONENT_FORBIDDEN = frozenset('<>:"|?*')
-_UNC_SHARE_COMPONENT_FORBIDDEN = _WIN32_COMPONENT_FORBIDDEN | frozenset("[]+=;,")
+_UNC_PCHAR_FORBIDDEN = frozenset('"\\\\/:|<>+=;,*?[]')
 _RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
     {
         "con",
@@ -18,9 +18,11 @@ _RESERVED_WINDOWS_COMPONENT_NAMES = frozenset(
         *(f"lpt{number}" for number in range(1, 10)),
     }
 )
-_MAX_UNC_SERVER_LENGTH = 253
-_MAX_UNC_SERVER_LABEL_LENGTH = 63
 _MAX_UNC_SHARE_LENGTH = 80
+_MAX_UNC_TAIL_COMPONENT_LENGTH = 255
+_MAX_NETBIOS_NAME_BYTES = 15
+_MAX_FQDN_LABEL_BYTES = 63
+_MAX_FQDN_BYTES = 255
 
 
 class SidebarPlacementError(ValueError):
@@ -80,9 +82,12 @@ def ordinary_windows_path_identity(value: object) -> str | None:
             if not (
                 _is_ordinary_unc_server(server)
                 and _is_ordinary_unc_share(share)
+                and all(_is_ordinary_unc_tail_component(part) for part in components)
             ):
                 return None
-        if any(not _is_ordinary_windows_component(component) for component in components):
+        elif any(
+            not _is_ordinary_windows_component(component) for component in components
+        ):
             return None
         return identity
     except (TypeError, ValueError):
@@ -90,23 +95,44 @@ def ordinary_windows_path_identity(value: object) -> str | None:
 
 
 def _is_ordinary_unc_server(component: str) -> bool:
-    if not component or len(component) > _MAX_UNC_SERVER_LENGTH:
-        return False
-    if component.startswith("[") and component.endswith("]"):
+    ipv6_literal_suffix = ".ipv6-literal.net"
+    if component.casefold().endswith(ipv6_literal_suffix):
+        transformed_address = component[: -len(ipv6_literal_suffix)]
         try:
-            ipaddress.IPv6Address(component[1:-1])
+            ipaddress.IPv6Address(transformed_address.replace("-", ":"))
         except ValueError:
             return False
         return True
-    try:
-        ipaddress.IPv4Address(component)
-    except ValueError:
-        pass
-    else:
+
+    labels = component.split(".")
+    if len(labels) > 1 and all(label.isdecimal() for label in labels):
+        try:
+            ipaddress.IPv4Address(component)
+        except ValueError:
+            return False
         return True
+
+    if "." not in component and _utf8_byte_length(component) <= _MAX_NETBIOS_NAME_BYTES:
+        return _is_ordinary_netbios_name(component)
+    return _is_ordinary_fqdn(component)
+
+
+def _is_ordinary_netbios_name(component: str) -> bool:
+    return (
+        1 <= _utf8_byte_length(component) <= _MAX_NETBIOS_NAME_BYTES
+        and not component.isdecimal()
+        and not component.startswith("-")
+        and not component.endswith("-")
+        and all(character.isalnum() or character == "-" for character in component)
+    )
+
+
+def _is_ordinary_fqdn(component: str) -> bool:
+    if not component or _utf8_byte_length(component) > _MAX_FQDN_BYTES:
+        return False
     labels = component.split(".")
     return all(
-        0 < len(label) <= _MAX_UNC_SERVER_LABEL_LENGTH
+        0 < _utf8_byte_length(label) <= _MAX_FQDN_LABEL_BYTES
         and not label.startswith("-")
         and not label.endswith("-")
         and all(character.isalnum() or character == "-" for character in label)
@@ -115,9 +141,30 @@ def _is_ordinary_unc_server(component: str) -> bool:
 
 
 def _is_ordinary_unc_share(component: str) -> bool:
-    return len(component) <= _MAX_UNC_SHARE_LENGTH and _is_ordinary_windows_component(
+    return _is_ordinary_unc_pchar_component(
         component,
-        forbidden=_UNC_SHARE_COMPONENT_FORBIDDEN,
+        maximum_length=_MAX_UNC_SHARE_LENGTH,
+    )
+
+
+def _is_ordinary_unc_tail_component(component: str) -> bool:
+    return _is_ordinary_unc_pchar_component(
+        component,
+        maximum_length=_MAX_UNC_TAIL_COMPONENT_LENGTH,
+    )
+
+
+def _is_ordinary_unc_pchar_component(
+    component: str,
+    *,
+    maximum_length: int,
+) -> bool:
+    return (
+        1 <= len(component) <= maximum_length
+        and not any(
+            ord(character) <= 31 or character in _UNC_PCHAR_FORBIDDEN
+            for character in component
+        )
     )
 
 
@@ -135,6 +182,13 @@ def _is_ordinary_windows_component(
         and component.split(".", 1)[0].casefold()
         not in _RESERVED_WINDOWS_COMPONENT_NAMES
     )
+
+
+def _utf8_byte_length(value: str) -> int:
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        return _MAX_FQDN_BYTES + 1
 
 
 def resolve_sidebar_placement(

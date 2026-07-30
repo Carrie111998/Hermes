@@ -21,12 +21,25 @@ from session_bridge.sidebar_placement import (
         ("\\\\server\\share\\workspace", "\\\\server\\share\\workspace"),
         ("\\\\host.example\\public-share\\workspace", "\\\\host.example\\public-share\\workspace"),
         ("\\\\192.0.2.1\\public\\workspace", "\\\\192.0.2.1\\public\\workspace"),
-        ("\\\\[2001:db8::1]\\public\\workspace", "\\\\[2001:db8::1]\\public\\workspace"),
+        (
+            "\\\\2001-db8--1.ipv6-literal.net\\public\\workspace",
+            "\\\\2001-db8--1.ipv6-literal.net\\public\\workspace",
+        ),
+        (
+            "\\\\2001-0db8-0000-0000-0000-0000-0000-0001.ipv6-literal.net\\public\\workspace",
+            "\\\\2001-0db8-0000-0000-0000-0000-0000-0001.ipv6-literal.net\\public\\workspace",
+        ),
+        ("\\\\" + "n" * 15 + "\\public\\workspace", "\\\\" + "n" * 15 + "\\public\\workspace"),
         (
             "\\\\servidor東京\\shareüber\\workspace",
             "\\\\servidor東京\\shareüber\\workspace",
         ),
+        ("\\\\server\\CON\\workspace", "\\\\server\\con\\workspace"),
+        ("\\\\server\\share.\\workspace", "\\\\server\\share.\\workspace"),
+        ("\\\\server\\share \\workspace", "\\\\server\\share \\workspace"),
         ("\\\\server\\" + "s" * 80 + "\\workspace", "\\\\server\\" + "s" * 80 + "\\workspace"),
+        ("\\\\server\\share\\tail東京", "\\\\server\\share\\tail東京"),
+        ("\\\\server\\share\\" + "p" * 255, "\\\\server\\share\\" + "p" * 255),
         ("C:/workspace/東京/über", "c:\\workspace\\東京\\über"),
     ],
 )
@@ -91,6 +104,10 @@ def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
         "bad<server",
         "bad>server",
         "bad|server",
+        "[2001:db8::1]",
+        "not-an-address.ipv6-literal.net",
+        "999.999.999.999",
+        "1" * 15,
         "bad server",
         "bad_server",
         "-badserver",
@@ -135,6 +152,60 @@ def test_ordinary_windows_path_identity_rejects_invalid_unc_share(
 
 def test_ordinary_windows_path_identity_rejects_unc_share_over_80_characters() -> None:
     assert ordinary_windows_path_identity("\\\\server\\" + "s" * 81 + "\\workspace") is None
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        'bad"tail',
+        "bad[tail",
+        "bad]tail",
+        "bad+tail",
+        "bad=tail",
+        "bad;tail",
+        "bad,tail",
+        "bad:tail",
+        "bad|tail",
+        "bad<tail",
+        "bad>tail",
+        "bad*tail",
+        "bad?tail",
+        "bad\x00tail",
+        "bad\x1ftail",
+    ],
+)
+def test_ordinary_windows_path_identity_rejects_invalid_unc_tail_component(
+    tail: str,
+) -> None:
+    assert ordinary_windows_path_identity(f"\\\\server\\share\\{tail}") is None
+
+
+def test_ordinary_windows_path_identity_rejects_unc_tail_over_255_characters() -> None:
+    assert ordinary_windows_path_identity("\\\\server\\share\\" + "p" * 256) is None
+
+
+def test_ordinary_windows_path_identity_enforces_utf8_fqdn_limits() -> None:
+    valid_unicode_label = "é" * 31 + "a"
+    invalid_unicode_label = "é" * 32
+    valid_total = ".".join(("a" * 63, "a" * 63, "a" * 63, "a" * 63))
+    invalid_total = ".".join(
+        ("a" * 63, "a" * 63, "a" * 63, "a" * 62, "a")
+    )
+
+    assert len(valid_unicode_label.encode("utf-8")) == 63
+    assert len(valid_total.encode("utf-8")) == 255
+    assert ordinary_windows_path_identity(
+        f"\\\\{valid_unicode_label}\\share\\workspace"
+    ) == f"\\\\{valid_unicode_label}\\share\\workspace"
+    assert ordinary_windows_path_identity(f"\\\\{valid_total}\\share\\workspace") == (
+        f"\\\\{valid_total}\\share\\workspace"
+    )
+    assert ordinary_windows_path_identity(
+        f"\\\\{invalid_unicode_label}\\share\\workspace"
+    ) is None
+    assert ordinary_windows_path_identity(
+        f"\\\\{invalid_total}\\share\\workspace"
+    ) is None
 
 
 def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) -> None:
