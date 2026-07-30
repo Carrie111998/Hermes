@@ -1,0 +1,19 @@
+fix: resolve lazy-refresh startup warning in Docker images
+
+The import-probe recovery for lazy-backend refresh produces a
+"Import probes unavailable" warning on every Docker container
+startup, caused by two bugs:
+
+1. Wrong Docker detection in _recover_from_interrupted_install():
+   The guard checked `not (PROJECT_ROOT / "pyproject.toml").is_file()`,
+   but Docker images DO ship pyproject.toml, so the Docker skip
+   never fired. Fixed by using detect_install_method() which reads
+   the baked /opt/hermes/.install_method stamp.
+
+2. Hardcoded venv path in three call sites: uv sync creates .venv/
+   (dot-prefixed) by default, but the recovery code hardcoded
+   PROJECT_ROOT / "venv" (no dot). The import-probe subprocess
+   couldn't find a Python at the wrong path, returned None, and
+   the marker was never cleared. Fixed by adding a shared
+   _detect_venv_path() helper that probes both .venv and venv,
+   and using it in all three call sites.
