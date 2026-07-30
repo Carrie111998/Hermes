@@ -199,7 +199,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
+            preexec_fn=os.setsid,
         )
 
         s = _make_session(sid="proc_orphan_test")
@@ -229,7 +229,7 @@ class TestOrphanedPipeReconciliation:
 
         # Clean up the orphaned descendant.
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -239,7 +239,7 @@ class TestOrphanedPipeReconciliation:
             ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
+            preexec_fn=os.setsid,
         )
 
         s = _make_session(sid="proc_wait_orphan")
@@ -259,7 +259,7 @@ class TestOrphanedPipeReconciliation:
         )
 
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -326,10 +326,6 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
-    @pytest.mark.skipif(
-        sys.platform == "win32",
-        reason="pywinpty sendeof does not deliver console EOF to the child",
-    )
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -485,10 +481,6 @@ class TestSpawnEnvSanitization:
             "PATH": "/usr/bin:/bin",
             "HOME": "/home/user",
             "USER": "tester",
-            # Windows Path.home()/Hermes-home discovery ignores HOME and
-            # requires these variables even in the test's clear environment.
-            "USERPROFILE": "C:\\Users\\tester",
-            "LOCALAPPDATA": "C:\\Users\\tester\\AppData\\Local",
             "TELEGRAM_BOT_TOKEN": "bot-secret",
             "FIRECRAWL_API_KEY": "fc-secret",
         }, clear=True), \
@@ -608,7 +600,7 @@ class TestPopenLeakOnSetupFailure:
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError, create=True), \
+             patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
@@ -736,14 +728,14 @@ class TestCheckpoint:
             "task_id": "t1",
             "pid_scope": "sandbox",
         }]
-        checkpoint.write_text(json.dumps(original), encoding="utf-8")
+        checkpoint.write_text(json.dumps(original))
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
 
-            data = json.loads(checkpoint.read_text(encoding="utf-8"))
+            data = json.loads(checkpoint.read_text())
             assert data == []
 
 # =========================================================================
@@ -784,8 +776,7 @@ class TestKillProcess:
             # touches ``os.kill`` directly. Mock both seams.  Disable the
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
-            with patch("tools.process_registry._IS_WINDOWS", False), \
-                 patch("gateway.status._pid_exists", return_value=True), \
+            with patch("gateway.status._pid_exists", return_value=True), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -1187,13 +1178,16 @@ def test_windows_pty_kill_removes_owned_tree_and_preserves_unrelated_sentinel(
         wrapper_pid = session.pid
         child_pid = int(receipt["child"])
         grandchild_pid = int(receipt["grandchild"])
-        assert len({wrapper_pid, child_pid, grandchild_pid, sentinel.pid, os.getpid()}) == 5
+        named_application_pids = {wrapper_pid, child_pid, grandchild_pid}
+        assert len({*named_application_pids, sentinel.pid, os.getpid()}) == 5
 
-        owned = [
-            (wrapper_pid, session.host_start_time),
-            (child_pid, ProcessRegistry._safe_host_start_time(child_pid)),
-            (grandchild_pid, ProcessRegistry._safe_host_start_time(grandchild_pid)),
-        ]
+        owned = ProcessRegistry._snapshot_windows_tree_identities(
+            wrapper_pid, session.host_start_time
+        )
+        snapshot_pids = {pid for pid, _ in owned}
+        assert named_application_pids <= snapshot_pids
+        assert sentinel.pid not in snapshot_pids
+        assert len(snapshot_pids) == len(owned)
         assert all(start is not None for _, start in owned)
         assert all(ProcessRegistry._host_pid_is_ours(pid, start) for pid, start in owned)
         assert ProcessRegistry._host_pid_is_ours(sentinel.pid, sentinel_start)
@@ -1214,6 +1208,7 @@ def test_windows_pty_kill_removes_owned_tree_and_preserves_unrelated_sentinel(
         if sentinel.poll() is None:
             sentinel.kill()
         sentinel.wait(timeout=10)
+        assert not ProcessRegistry._host_pid_is_ours(sentinel.pid, sentinel_start)
 
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
@@ -1453,7 +1448,7 @@ class TestSigkillEscalation:
         finally:
             for p in all_pids:
                 try:
-                    os.kill(p, signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
+                    os.kill(p, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
             parent.wait()
@@ -1542,7 +1537,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
+            preexec_fn=os.setsid,
         )
         s = _make_session(sid="proc_orphan_reader")
         s.process = proc
@@ -1572,7 +1567,7 @@ class TestReaderLoopOrphanedPipe:
             assert s.id in registry._finished
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
 
@@ -1586,7 +1581,7 @@ class TestReaderLoopOrphanedPipe:
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,  # windows-footgun: ok - POSIX-only test class
+            preexec_fn=os.setsid,
         )
         s = _make_session(sid="proc_orphan_notify")
         s.process = proc
@@ -1613,7 +1608,7 @@ class TestReaderLoopOrphanedPipe:
             assert item["exit_code"] == 0
         finally:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok - POSIX-only test class
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
 
