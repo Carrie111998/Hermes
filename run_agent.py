@@ -63,7 +63,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from hermes_constants import get_hermes_home
+from hermes_constants import degrade_reasoning_effort, get_hermes_home
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -6576,15 +6576,8 @@ class AIAgent:
         else:
             requested_effort = "medium"
 
-        if requested_effort == "xhigh" and "xhigh" not in supported_efforts and "high" in supported_efforts:
-            requested_effort = "high"
-        elif requested_effort not in supported_efforts:
-            if requested_effort == "minimal" and "low" in supported_efforts:
-                requested_effort = "low"
-            elif "medium" in supported_efforts:
-                requested_effort = "medium"
-            else:
-                requested_effort = supported_efforts[0]
+        if requested_effort not in supported_efforts:
+            requested_effort = degrade_reasoning_effort(requested_effort, supported_efforts)
 
         return {"effort": requested_effort}
 

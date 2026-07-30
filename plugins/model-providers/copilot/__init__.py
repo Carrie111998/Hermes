@@ -12,6 +12,7 @@ Key quirks for the chat_completions subset:
 
 from typing import Any
 
+from hermes_constants import degrade_reasoning_effort
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -39,21 +40,14 @@ class CopilotProfile(ProviderProfile):
                     # lists it as supported: gpt-5.5/gpt-5.4 DO support
                     # ``xhigh``. Only downgrade levels the catalog does NOT
                     # list (e.g. ``xhigh``/``max`` on models capped lower, or
-                    # ``minimal`` where unsupported), choosing the nearest
-                    # weaker supported level rather than forwarding verbatim.
+                    # ``minimal`` where unsupported), stepping down Hermes'
+                    # canonical ladder so the mapping stays monotonic.
                     #
                     # (Previously this unconditionally mapped xhigh->high, a
                     #  stale guard that silently capped models which do support
                     #  the higher level.)
                     if effort not in supported_efforts:
-                        if effort == "xhigh" and "high" in supported_efforts:
-                            effort = "high"
-                        elif effort == "minimal" and "low" in supported_efforts:
-                            effort = "low"
-                        elif "medium" in supported_efforts:
-                            effort = "medium"
-                        else:
-                            effort = supported_efforts[0]
+                        effort = degrade_reasoning_effort(effort, supported_efforts)
                     if effort in supported_efforts:
                         extra_body["reasoning"] = {"effort": effort}
                 elif supported_efforts:

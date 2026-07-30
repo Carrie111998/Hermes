@@ -1245,6 +1245,41 @@ class TestBuildApiKwargs:
 
         assert agent._github_models_reasoning_extra_body() == {"effort": "xhigh"}
 
+    def test_core_responses_ultra_degrades_to_max(self, agent, monkeypatch):
+        """`ultra` steps down to the strongest supported level, not `medium`.
+
+        Regression for #74295: no Copilot catalog lists `ultra`, so selecting
+        the strongest level in the picker used to send `medium` — weaker than
+        selecting `high`.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.models.github_model_reasoning_efforts",
+            lambda _model: ["low", "medium", "high", "xhigh", "max"],
+        )
+        agent.model = "claude-opus-5"
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+
+        assert agent._github_models_reasoning_extra_body() == {"effort": "max"}
+
+    def test_core_responses_effort_ladder_is_monotonic(self, agent, monkeypatch):
+        """Requesting a stronger effort never sends a weaker one (#74295)."""
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        supported = ["low", "medium", "high", "max"]
+        monkeypatch.setattr(
+            "hermes_cli.models.github_model_reasoning_efforts",
+            lambda _model: supported,
+        )
+        agent.model = "claude-opus-4.6"
+
+        sent = []
+        for effort in VALID_REASONING_EFFORTS:
+            agent.reasoning_config = {"enabled": True, "effort": effort}
+            sent.append(agent._github_models_reasoning_extra_body()["effort"])
+
+        ranks = [supported.index(value) for value in sent]
+        assert ranks == sorted(ranks), dict(zip(VALID_REASONING_EFFORTS, sent))
+
 
 
 
