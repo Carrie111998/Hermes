@@ -9,6 +9,8 @@ shown when starting a brand new one.
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from cli import HermesCLI
 
 
@@ -109,19 +111,62 @@ class TestShowPreviousSessionRecap:
         cli_obj._list_recent_sessions.assert_called_once_with(limit=1)
 
 
-def test_run_calls_recap_only_on_the_non_resumed_branch():
-    """Source-level regression guard for the wiring in HermesCLI.run():
-    _show_previous_session_recap() must sit in the same if/else as
-    _display_resumed_history() (mutually exclusive), not run unconditionally
-    or alongside it — otherwise /resume would show both recaps at once.
-    """
-    import inspect
+class _StopRun(Exception):
+    """Raised by the stubbed ``_console_print`` to abort ``run()`` right after
+    the startup dispatch branch, before it reaches the interactive input loop
+    (which would otherwise block forever in a test)."""
 
-    src = inspect.getsource(HermesCLI.run)
-    resumed_branch, _, rest = src.partition("if self._resumed:")
-    assert resumed_branch != src, "run() no longer branches on self._resumed"
-    else_branch = rest.split("else:", 1)[1]
-    # Only look at the immediate else: block, not the rest of run().
-    else_block = else_branch.split("\n\n", 1)[0]
-    assert "_show_previous_session_recap()" in else_block
-    assert "_display_resumed_history()" not in else_block
+
+def _make_run_ready_cli(*, resumed):
+    """A HermesCLI wired to run real dispatch logic in HermesCLI.run(), with
+    everything before and after the branch under test stubbed out."""
+    cli_obj = HermesCLI.__new__(HermesCLI)
+    cli_obj._resumed = resumed
+    cli_obj._claim_active_session = MagicMock(return_value=True)
+    cli_obj.show_banner = MagicMock()
+    cli_obj._show_security_advisories = MagicMock()
+    cli_obj._preload_resumed_session = MagicMock(return_value=True)
+    cli_obj._display_resumed_history = MagicMock()
+    cli_obj._show_previous_session_recap = MagicMock()
+    # First real print after the dispatch branch (the welcome banner) aborts
+    # the run — we only want to exercise the branch itself.
+    cli_obj._console_print = MagicMock(side_effect=_StopRun)
+    return cli_obj
+
+
+class TestRunStartupDispatch:
+    """Runtime coverage for the wiring in HermesCLI.run(): the previous-session
+    recap and the resumed-history recap are mutually exclusive, driven by
+    self._resumed. Executes the real run() dispatch rather than reading its
+    source (AGENTS.md bans source-inspection tests: they pass on broken wiring
+    and fail on harmless refactors)."""
+
+    def test_fresh_start_shows_recap_not_resumed_history(self):
+        cli_obj = _make_run_ready_cli(resumed=False)
+
+        with pytest.raises(_StopRun):
+            cli_obj.run()
+
+        cli_obj._show_previous_session_recap.assert_called_once()
+        cli_obj._display_resumed_history.assert_not_called()
+
+    def test_resumed_start_shows_history_not_recap(self):
+        cli_obj = _make_run_ready_cli(resumed=True)
+
+        with pytest.raises(_StopRun):
+            cli_obj.run()
+
+        cli_obj._display_resumed_history.assert_called_once()
+        cli_obj._show_previous_session_recap.assert_not_called()
+
+    def test_resumed_but_preload_failure_shows_neither(self):
+        """A resumed session whose history fails to preload shows no recap at
+        all rather than falling back to the fresh-start one."""
+        cli_obj = _make_run_ready_cli(resumed=True)
+        cli_obj._preload_resumed_session.return_value = False
+
+        with pytest.raises(_StopRun):
+            cli_obj.run()
+
+        cli_obj._display_resumed_history.assert_not_called()
+        cli_obj._show_previous_session_recap.assert_not_called()
