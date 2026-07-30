@@ -179,6 +179,7 @@ export const ruOverrides = {
       noSpeechDetected: 'Речь не обнаружена',
       playbackFailed: 'Ошибка воспроизведения голоса',
       recordingFailed: 'Ошибка записи голоса',
+      sayStopToEnd: phrase => `Скажите «${phrase}», чтобы завершить голосовой разговор.`,
       transcriptionFailed: 'Ошибка транскрипции голоса',
       transcriptionUnavailable: 'Транскрипция голоса пока недоступна.',
       tryRecordingAgain: 'Попробуйте записать снова.',
@@ -275,6 +276,7 @@ export const ruOverrides = {
       'session.focusSearch': 'Поиск сессий',
       'session.togglePin': 'Закрепить / открепить текущую сессию',
       'workspace.newWorktree': 'Новое рабочее дерево',
+      'workspace.openFolder': 'Открыть папку как проект',
       'composer.focus': 'Перейти в поле ввода',
       'composer.modelPicker': 'Открыть выбор модели',
       'composer.voice': 'Начать / остановить голосовой разговор',
@@ -289,6 +291,8 @@ export const ruOverrides = {
       'view.prevTerminal': 'Предыдущий терминал',
       'view.closeTerminal': 'Закрыть терминал',
       'view.terminalSelection': 'Отправить выделение терминала в поле ввода',
+      'view.terminalCopy': 'Копировать выделенный текст из терминала',
+      'view.terminalPaste': 'Вставить в терминал',
       'view.closeTab': 'Закрыть вкладку',
       'view.reopenTab': 'Открыть закрытую вкладку',
       'view.flipPanes': 'Поменять стороны панелей',
@@ -468,6 +472,8 @@ export const ruOverrides = {
       translucencyDesc: 'Позволяет видеть рабочий стол через всё окно. Доступно только в macOS и Windows.',
       backdropTitle: 'Фон чата',
       backdropDesc: 'Едва заметное изображение статуи за областью диалога.',
+      reactionsTitle: 'Реакции на сообщения',
+      reactionsDesc: 'Эмодзи-реакции в стиле iMessage: вы можете реагировать на сообщения, а Hermes — на ваши.',
       embedsTitle: 'Встроенные предпросмотры',
       embedsDesc:
         'Расширенные предпросмотры загружаются со сторонних сайтов, например YouTube и X. «Спрашивать» показывает заглушку до вашего разрешения для каждого сервиса; «Всегда» загружает их автоматически; «Выключено» оставляет обычные ссылки.',
@@ -568,6 +574,9 @@ export const ruOverrides = {
       builtinOnly: 'Только встроенные',
       notSet: 'Не задано',
       commaSeparated: 'значения через запятую',
+      searchPlaceholder: 'Поиск…',
+      noResults: 'Ничего не найдено',
+      systemDefault: 'По умолчанию в системе',
       loading: 'Загрузка конфигурации Hermes…',
       emptyTitle: 'Нет доступных настроек',
       emptyDesc: 'В этом разделе нет параметров, которые можно изменить.',
@@ -577,7 +586,12 @@ export const ruOverrides = {
       invalidJson: 'Некорректный JSON конфигурации',
       keepAwakeTitle: 'Не переводить компьютер в режим сна',
       keepAwakeDesc:
-        'Не переводить компьютер в режим сна, чтобы длительные и ночные задачи не прерывались. Экран при этом может затемняться.'
+        'Не переводить компьютер в режим сна, чтобы длительные и ночные задачи не прерывались. Экран при этом может затемняться.',
+      attachmentSizeTitle: 'Максимальный размер файла для предпросмотра и прикрепления изображений',
+      attachmentSizeDesc:
+        'Максимальный размер локального файла, который Hermes Desktop загружает для предпросмотра или прикрепления изображения. Размер указывается в МБ; значение по умолчанию — 16. Для прикрепления к удалённому бэкенду файлов других типов действует отдельный лимит 256 МБ. При слишком большом значении файл целиком загружается в память, из-за чего приложение может зависнуть или аварийно завершить работу.',
+      attachmentSizeUnit: 'МБ',
+      attachmentSizeLabel: 'Максимальный размер файла для предпросмотра или прикрепления изображения, МБ'
     },
     quickEntry: {
       enabledTitle: 'Быстрый ввод',
@@ -949,6 +963,9 @@ export const ruOverrides = {
       ready: 'Готово',
       needsSignIn: 'Требуется вход',
       needsSetup: 'Требуется настройка',
+      activeBackend: 'Активен',
+      activeBackendHint: 'Этот бэкенд сейчас активен',
+      useBackend: 'Использовать этот бэкенд',
       nousIncluded: 'Включено с подпиской Nous — войдите в Nous Portal для активации.',
       nousAuthNeededTitle: 'Требуется вход в Nous Portal',
       nousAuthNeededMessage: provider =>
@@ -1180,6 +1197,10 @@ export const ruOverrides = {
     goTo: 'Перейти к',
     goToSession: 'Перейти к сессии',
     branches: 'Ветки',
+    projects: 'Проекты',
+    openFolder: 'Открыть папку как проект…',
+    openFolderAt: path => `Открыть папку как проект — ${path}`,
+    newSessionInProject: project => `Новая сессия в проекте: ${project}`,
     commands: 'Команды',
     startInBranch: branch => `Начать в ветке ${branch}`,
     commandCenter: 'Центр управления',
@@ -1404,6 +1425,31 @@ export const ruOverrides = {
     failedUpdate: name => `Не удалось обновить ${name}`,
     failedSave: name => `Не удалось сохранить ${name}`,
     failedClear: key => `Не удалось очистить ${key}`,
+    pendingRequests: count => `Запросы на доступ (${count})`,
+    pendingAria: count =>
+      `${countRu(count, 'запрос на доступ', 'запроса на доступ', 'запросов на доступ')} ${pluralRu(
+        count,
+        'ожидает',
+        'ожидают',
+        'ожидают'
+      )} подтверждения`,
+    approvedUsers: count => `Пользователи с доступом (${count})`,
+    approve: 'Разрешить доступ',
+    approving: 'Предоставление доступа…',
+    revoke: 'Отозвать доступ',
+    revoking: 'Отзыв доступа…',
+    revokeAria: name => `Отозвать доступ: ${name}`,
+    revokeTitle: 'Отозвать доступ',
+    revokeDesc: (name: string) =>
+      `Доступ для «${name}» будет отозван. Со следующего сообщения Hermes перестанет распознавать пользователя.`,
+    approvedUser: name => `Доступ разрешён: ${name}`,
+    approvedHint: 'Со следующего сообщения Hermes будет распознавать пользователя автоматически.',
+    revokedUser: name => `Доступ отозван: ${name}`,
+    failedApprove: name => `Не удалось разрешить доступ: ${name}`,
+    failedRevoke: name => `Не удалось отозвать доступ: ${name}`,
+    pairingLockedOut:
+      'Слишком много неудачных попыток подтверждения — подключение новых пользователей на этой платформе временно заблокировано. Повторите попытку позже.',
+    waitingSince: minutes => (minutes < 1 ? 'только что' : `${minutes} мин. назад`),
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'Токен бота',
@@ -2016,6 +2062,9 @@ export const ruOverrides = {
     voiceDictation: 'Голосовая диктовка',
     speakReplies: 'Озвучивать ответы',
     stopSpeakingReplies: 'Остановить чтение ответов вслух',
+    wakeWordListening: phrase => `Фраза активации «${phrase}» — включена`,
+    wakeWordOff: phrase => `Фраза активации «${phrase}» — выключена`,
+    wakeWordPausedVoice: phrase => `Фраза активации «${phrase}» — приостановлена на время голосового разговора`,
     lookupLoading: 'Поиск…',
     lookupNoMatches: 'Нет совпадений.',
     lookupTry: 'Попробуйте',
@@ -2742,6 +2791,7 @@ export const ruOverrides = {
       refresh: 'Обновить',
       moreActions: 'Ещё действия',
       branchNewChat: 'Создать ответвление в новом чате',
+      react: 'Добавить реакцию',
       dismissError: 'Скрыть ошибку',
       readAloudFailed: 'Ошибка озвучки',
       preparingAudio: 'Подготовка аудио',
@@ -2816,6 +2866,7 @@ export const ruOverrides = {
       statusError: 'Ошибка',
       statusRecovered: 'Восстановлено',
       statusDone: 'Готово',
+      memoryWriteNoted: 'Запись в память не выполнена',
       actions: {
         read: 'прочитано',
         reading: 'чтение',

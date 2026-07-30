@@ -57,6 +57,10 @@ describe('Russian locale', () => {
     expect(ru.artifactCard.generating(21)).toBe('Создание… 21 строка')
     expect(ru.artifactCard.versionBadge(12)).toBe('12 версий')
     expect(ru.artifactCard.versionBadge(22)).toBe('22 версии')
+    expect(ru.messaging.pendingAria(1)).toBe('1 запрос на доступ ожидает подтверждения')
+    expect(ru.messaging.pendingAria(2)).toBe('2 запроса на доступ ожидают подтверждения')
+    expect(ru.messaging.pendingAria(11)).toBe('11 запросов на доступ ожидают подтверждения')
+    expect(ru.messaging.pendingAria(21)).toBe('21 запрос на доступ ожидает подтверждения')
   })
 
   it('keeps pending actions compatible with their rendered status', () => {
