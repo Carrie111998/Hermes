@@ -1178,8 +1178,10 @@ def skill_view(
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
             for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
+                if (
+                    found_md.name != "SKILL.md"
+                    and not _is_excluded_skill_path(found_md, root=search_dir)
+                    and not _is_skill_support_path(found_md)
                 ):
                     _record(None, found_md)
 

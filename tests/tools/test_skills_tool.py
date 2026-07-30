@@ -325,6 +325,31 @@ class TestSkillView:
 
         assert result["success"] is False
 
+    def test_view_ignores_snapshot_only_legacy_flat_file(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            snapshot = tmp_path / "ghost-skill-pre-edit-snapshot-t_abcdef12"
+            snapshot.mkdir()
+            (snapshot / "ghost-skill.md").write_text(
+                "---\nname: ghost-skill\n---\n\nSTALE\n", encoding="utf-8"
+            )
+            result = json.loads(skill_view("ghost-skill"))
+
+        assert result["success"] is False
+
+    def test_view_prefers_live_skill_over_snapshot_legacy_collision(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "colliding-skill", body="LIVE")
+            snapshot = tmp_path / "colliding-skill-pre-edit-snapshot-t_abcdef12"
+            snapshot.mkdir()
+            (snapshot / "colliding-skill.md").write_text(
+                "---\nname: colliding-skill\n---\n\nSTALE\n", encoding="utf-8"
+            )
+            result = json.loads(skill_view("colliding-skill"))
+
+        assert result["success"] is True
+        assert "LIVE" in result["content"]
+        assert "STALE" not in result["content"]
+
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(
