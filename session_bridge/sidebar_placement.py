@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 
 
+_WIN32_COMPONENT_FORBIDDEN = frozenset('<>:"|?*')
+
+
 class SidebarPlacementError(ValueError):
     def __init__(self, code: str) -> None:
         if code not in {"inbox_unavailable", "source_identity_mismatch"}:
@@ -64,7 +67,10 @@ def ordinary_windows_path_identity(value: object) -> str | None:
         }
         if any(
             component.endswith((".", " "))
-            or ":" in component
+            or any(
+                ord(character) <= 31 or character in _WIN32_COMPONENT_FORBIDDEN
+                for character in component
+            )
             or component.split(".", 1)[0].casefold() in reserved_names
             for component in components
         ):

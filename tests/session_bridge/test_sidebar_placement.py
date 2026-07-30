@@ -19,6 +19,7 @@ from session_bridge.sidebar_placement import (
         ("C:/Users/diego/.hermes", "c:\\users\\diego\\.hermes"),
         ("c:\\USERS\\diego\\.hermes", "c:\\users\\diego\\.hermes"),
         ("\\\\server\\share\\workspace", "\\\\server\\share\\workspace"),
+        ("C:/workspace/東京/über", "c:\\workspace\\東京\\über"),
     ],
 )
 def test_ordinary_windows_path_identity_normalizes_ordinary_filesystem_paths(
@@ -51,6 +52,26 @@ def test_ordinary_windows_path_identity_rejects_nonfilesystem_spellings(
     value: str,
 ) -> None:
     assert ordinary_windows_path_identity(value) is None
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        "bad*name",
+        "bad?name",
+        'bad"name',
+        "bad<name",
+        "bad>name",
+        "bad|name",
+        "bad\x00name",
+        "bad\x07name",
+        "bad\x1fname",
+    ],
+)
+def test_ordinary_windows_path_identity_rejects_win32_invalid_components(
+    component: str,
+) -> None:
+    assert ordinary_windows_path_identity(f"C:/workspace/{component}") is None
 
 
 def test_resolve_sidebar_placement_keeps_source_out_of_identity(tmp_path: Path) -> None:
