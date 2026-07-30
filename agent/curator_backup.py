@@ -596,11 +596,14 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
 
     Returns ``(ok, message, snapshot_path)``.
     """
-    from tools.skills_policy import require_skills_content_writable
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
 
     try:
         require_skills_content_writable("rollback curator skill snapshot")
-    except RuntimeError as exc:
+    except SkillsContentPolicyError as exc:
         return False, str(exc), None
 
     target = _resolve_backup(backup_id)

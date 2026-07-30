@@ -1772,7 +1772,7 @@ def do_snapshot_import(input_path: str, force: bool = False,
 # CLI argparse entry point
 # ---------------------------------------------------------------------------
 
-def skills_command(args) -> Optional[int]:
+def skills_command(args) -> int:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     action = getattr(args, "skills_action", None)
 
@@ -1836,11 +1836,12 @@ def skills_command(args) -> Optional[int]:
         repo = getattr(args, "repo", "") or getattr(args, "name", "")
         if not tap_action:
             _console.print("Usage: hermes skills tap [list|add|remove]\n")
-            return
+            return 0
         do_tap(tap_action, repo=repo)
     else:
         _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
+    return 0
 
 
 # ---------------------------------------------------------------------------

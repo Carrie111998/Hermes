@@ -907,11 +907,14 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
 
 def _content_write_refusal(operation: str) -> Optional[Dict[str, Any]]:
     """Return a stable tool error when discovery content is managed read-only."""
-    from tools.skills_policy import require_skills_content_writable
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
 
     try:
         require_skills_content_writable(operation)
-    except RuntimeError as exc:
+    except SkillsContentPolicyError as exc:
         return {"success": False, "error": str(exc)}
     return None
 

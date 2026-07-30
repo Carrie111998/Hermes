@@ -3774,11 +3774,14 @@ def install_from_quarantine(
 
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
-    from tools.skills_policy import require_skills_content_writable
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
 
     try:
         require_skills_content_writable(f"uninstall skill {skill_name!r}")
-    except RuntimeError as exc:
+    except SkillsContentPolicyError as exc:
         return False, str(exc)
     lock = HubLockFile()
     entry = lock.get_installed(skill_name)
