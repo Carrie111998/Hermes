@@ -712,8 +712,13 @@ async def test_control_command_discards_only_preexisting_debounce(cmd):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "same_sender", [False, True], ids=["different-sender", "same-sender"]
+)
 @pytest.mark.parametrize("cmd", ["stop", "new", "reset"])
-async def test_control_command_preserves_followup_arriving_during_topic_recovery(cmd):
+async def test_control_command_preserves_followup_arriving_during_topic_recovery(
+    cmd, same_sender
+):
     """The outer handle_message boundary must not misclassify a racing follow-up as stale."""
     runner, adapter = _runner_with_adapter()
     adapter.config.extra["group_sessions_per_user"] = False
@@ -725,9 +730,12 @@ async def test_control_command_preserves_followup_arriving_during_topic_recovery
     adapter._active_sessions[session_key] = asyncio.Event()
 
     command = _text_event(f"/{cmd}", _alice_source(), message_id=f"cmd-{cmd}")
-    stale = _text_event(
-        "stale-before-control", _carol_source(thread_id="topic-7"), message_id="stale"
+    stale_source = (
+        _bob_source(thread_id="topic-7")
+        if same_sender
+        else _carol_source(thread_id="topic-7")
     )
+    stale = _text_event("stale-before-control", stale_source, message_id="stale")
     during = _text_event(
         "follow-up-during-topic-recovery",
         _bob_source(thread_id="topic-7"),
@@ -763,7 +771,14 @@ async def test_control_command_preserves_followup_arriving_during_topic_recovery
         assert await asyncio.to_thread(recovery_entered.wait, 1.0)
         await adapter.handle_message(during)
         state = adapter._text_debounce_store().get(session_key)
-        assert state is not None and state.event is during
+        assert state is not None
+        if same_sender:
+            assert state.event is stale
+            assert state.event.text == (
+                "stale-before-control\nfollow-up-during-topic-recovery"
+            )
+        else:
+            assert state.event is during
     finally:
         release_recovery.set()
     await asyncio.wait_for(command_task, timeout=2.0)
@@ -771,8 +786,10 @@ async def test_control_command_preserves_followup_arriving_during_topic_recovery
     if task is not None:
         await asyncio.wait_for(task, timeout=1.0)
 
-    assert stale not in delivered, f"/{cmd} replayed debounce work predating command receipt"
-    assert delivered == [during], f"/{cmd} lost the follow-up received after command entry"
+    assert [event.text for event in delivered] == [
+        "follow-up-during-topic-recovery"
+    ], f"/{cmd} replayed stale work or lost/duplicated the follow-up"
+    assert delivered[0].message_id == "during", f"/{cmd} lost latest follow-up metadata"
 
 
 def test_refused_runner_fifo_is_preserved_in_shutdown_forensics(tmp_path, monkeypatch):

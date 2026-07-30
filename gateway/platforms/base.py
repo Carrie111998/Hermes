@@ -2163,6 +2163,14 @@ class TextDebounceState:
     last_ts: float
 
 
+@dataclass(frozen=True)
+class TextDebounceBoundary:
+    """Immutable view of debounce work that predates a control command."""
+
+    state: TextDebounceState
+    text: str
+
+
 _DEBOUNCE_STATE_UNSET = object()
 
 
@@ -5539,7 +5547,7 @@ class BasePlatformAdapter(ABC):
         event: MessageEvent,
         session_key: str,
         cmd: str,
-        preexisting_debounce_state: Any = _DEBOUNCE_STATE_UNSET,
+        preexisting_debounce_boundary: Any = _DEBOUNCE_STATE_UNSET,
     ) -> None:
         """Dispatch a reset-like bypass command while preserving guard ordering.
 
@@ -5563,17 +5571,32 @@ class BasePlatformAdapter(ABC):
         current_guard = self._active_sessions.get(session_key)
         command_guard = asyncio.Event()
         self._active_sessions[session_key] = command_guard
-        # Drop only the debounce object captured when the command entered the
-        # outer handle_message boundary.  Topic recovery above can await long
-        # enough for a follow-up to install fresh state; that state belongs
-        # after the command and must be drained rather than discarded.
-        if preexisting_debounce_state is _DEBOUNCE_STATE_UNSET:
-            preexisting_debounce_state = self._text_debounce_store().get(session_key)
-        if (
-            preexisting_debounce_state is not None
-            and self._text_debounce_store().get(session_key) is preexisting_debounce_state
-        ):
-            self._discard_text_debounce(session_key)
+        # Drop only debounce work captured when the command entered the outer
+        # handle_message boundary. Topic recovery above can await long enough
+        # for a same-sender follow-up to mutate that object in place, so object
+        # identity alone is not an arrival boundary: remove the snapshotted
+        # prefix while preserving the post-snapshot suffix and latest metadata.
+        store = self._text_debounce_store()
+        if preexisting_debounce_boundary is _DEBOUNCE_STATE_UNSET:
+            state = store.get(session_key)
+            preexisting_debounce_boundary = (
+                TextDebounceBoundary(state=state, text=state.event.text or "")
+                if state is not None
+                else None
+            )
+        if preexisting_debounce_boundary is not None:
+            current_state = store.get(session_key)
+            if (
+                current_state is not None
+                and current_state is preexisting_debounce_boundary.state
+            ):
+                stale_text = preexisting_debounce_boundary.text
+                current_text = current_state.event.text or ""
+                if current_text == stale_text:
+                    self._discard_text_debounce(session_key)
+                elif current_text.startswith(f"{stale_text}\n"):
+                    current_state.event.text = current_text[len(stale_text) + 1 :]
+                    current_state.first_ts = current_state.last_ts
         thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
 
         try:
@@ -5640,7 +5663,12 @@ class BasePlatformAdapter(ABC):
         # recovered key is selected afterward from this mapping, preserving
         # correctness when recovery rewrites the thread lane.
         pre_recovery_debounce = (
-            dict(self._text_debounce_store()) if event.is_command() else {}
+            {
+                key: TextDebounceBoundary(state=state, text=state.event.text or "")
+                for key, state in self._text_debounce_store().items()
+            }
+            if event.is_command()
+            else {}
         )
 
         # Rewrite ``event.source.thread_id`` via the installed recovery hook
