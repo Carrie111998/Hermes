@@ -167,7 +167,12 @@ def test_kanban_notifier_delivers_dependency_wait_reason(tmp_path, monkeypatch):
     kb.init_db()
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="wait for upstream", assignee="worker")
+        tid = kb.create_task(
+            conn,
+            title="wait for upstream",
+            assignee="worker",
+            session_id="push-session",
+        )
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
@@ -187,6 +192,7 @@ def test_kanban_notifier_delivers_dependency_wait_reason(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     assert "dependency wait" in adapter.sent[0]["text"]
     assert "upstream lane is unfinished" in adapter.sent[0]["text"]
+    assert adapter.handled == []
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():

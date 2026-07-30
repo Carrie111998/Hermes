@@ -1632,8 +1632,8 @@ KANBAN_BLOCK_SCHEMA = {
     "description": (
         "Stop work on this task and route it according to WHY you're stuck. "
         "Set ``kind`` to say which: 'dependency' (waiting on another task — "
-        "goes to todo and auto-resumes when that task finishes, no human "
-        "needed), 'needs_input' (you need a human decision/answer), "
+        "remains blocked until an explicit unblock after it clears), "
+        "'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "

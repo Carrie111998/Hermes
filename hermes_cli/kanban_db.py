@@ -1206,10 +1206,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- larger boards.
     session_id           TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
-    -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
-    -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
-    -- to ``blocked`` for a human. Preserved across unblock so a re-block for
-    -- the SAME kind can be recognised as a loop.
+    -- NULL for legacy/un-typed blocks). ``dependency`` is a terminal blocked
+    -- outcome until an explicit unblock; the other kinds also surface to a
+    -- human. Preserved across unblock so a re-block for the SAME kind can be
+    -- recognised as a loop.
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
@@ -3417,11 +3417,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
+        # If child was ready but parent is not terminal, demote child to todo.
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if parent_status not in {"done", "archived"}:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),

@@ -172,6 +172,22 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 
 
 
+def test_link_keeps_ready_child_when_parent_archived(kanban_home):
+    """An archived terminal parent must not demote a late-linked child."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="archived parent")
+        assert kb.complete_task(conn, parent)
+        assert kb.archive_task(conn, parent)
+        child = kb.create_task(conn, title="late-linked child")
+        child_before_link = kb.get_task(conn, child)
+        assert child_before_link is not None
+        assert child_before_link.status == "ready"
+
+        kb.link_tasks(conn, parent, child)
+
+        linked_child = kb.get_task(conn, child)
+        assert linked_child is not None
+        assert linked_child.status == "ready"
 
 
 # ---------------------------------------------------------------------------

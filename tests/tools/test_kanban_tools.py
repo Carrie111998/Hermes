@@ -19,6 +19,14 @@ import pytest
 # Gating
 # ---------------------------------------------------------------------------
 
+def test_kanban_block_schema_requires_explicit_dependency_unblock():
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+
+    description = KANBAN_BLOCK_SCHEMA["description"].lower()
+    assert "explicit unblock" in description
+    assert "auto-resumes" not in description
+    assert "goes to todo" not in description
+
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
     zero kanban_* tools in their schema."""
