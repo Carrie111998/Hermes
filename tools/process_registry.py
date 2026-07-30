@@ -846,7 +846,7 @@ class ProcessRegistry:
         """
         Spawn a background process through a non-local environment backend.
 
-        For Docker/Singularity/Modal/Daytona/k8s-agent-sandbox/SSH: runs the command inside the sandbox
+        For Docker/Singularity/Modal/Daytona/agent-sandbox/SSH: runs the command inside the sandbox
         using the environment's execute() interface. We wrap the command to
         capture the in-sandbox PID and redirect output to a log file inside
         the sandbox, then poll the log via subsequent execute() calls.

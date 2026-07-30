@@ -40,7 +40,7 @@ class ConnectionConfigParams(TypedDict):
     use_pod_ip: bool
 
 
-class K8sSandboxBackend(BaseEnvironment):
+class AgentSandboxBackend(BaseEnvironment):
     """K8s-agent-sandbox cloud sandbox execution backend.
 
     Spawn-per-call via _ThreadedProcessHandle wrapping blocking SDK calls.
@@ -59,7 +59,7 @@ class K8sSandboxBackend(BaseEnvironment):
 
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.k8s_agent_sandbox", prompt=False)
+            _lazy_ensure("terminal.agent_sandbox", prompt=False)
         except ImportError:
             pass
         except Exception as e:
@@ -113,10 +113,10 @@ class K8sSandboxBackend(BaseEnvironment):
                 claim_name = self.client.list_all_sandboxes(label_selector=f"hermes_task_id={task_id}")[0]
                 self._sandbox = self.client.get_sandbox(claim_name)
             except IndexError:
-                logger.info(f"k8s-agent-sandbox: The requested sandbox with label_selector=\"hermes_task_id={task_id}\" wasn't found.")
+                logger.info(f"agent-sandbox: The requested sandbox with label_selector=\"hermes_task_id={task_id}\" wasn't found.")
                 self._sandbox = None
             except Exception as e:
-                logger.warning(f"k8s-agent-sandbox: Error: {e}\nhermes_task_id={task_id}")
+                logger.warning(f"agent-sandbox: Error: {e}\nhermes_task_id={task_id}")
                 self._sandbox = None
         if self._sandbox is None:
             self._sandbox = self.client.create_sandbox(
@@ -125,27 +125,27 @@ class K8sSandboxBackend(BaseEnvironment):
             )
         self._sync_manager = FileSyncManager(
             get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._k8s_agent_sandbox_upload,
-            delete_fn=self._k8s_agent_sandbox_delete,
-            bulk_upload_fn=self._k8s_agent_sandbox_bulk_upload,
-            bulk_download_fn=self._k8s_agent_sandbox_bulk_download,
+            upload_fn=self._agent_sandbox_upload,
+            delete_fn=self._agent_sandbox_delete,
+            bulk_upload_fn=self._agent_sandbox_bulk_upload,
+            bulk_download_fn=self._agent_sandbox_bulk_download,
         )
         self._sync_manager.sync(force=True)
         self.init_session()
 
-    def _k8s_agent_sandbox_upload(self, host_path: str, remote_path: str):
+    def _agent_sandbox_upload(self, host_path: str, remote_path: str):
         """Upload a single file via k8s-agent-sandbox Python SDK."""
         with open(host_path, "rb") as fi:
             content = fi.read()
         self._sandbox.files.write(path=remote_path, content=content)
 
-    def _k8s_agent_sandbox_bulk_upload(self, files: list[tuple[str, str]]):
+    def _agent_sandbox_bulk_upload(self, files: list[tuple[str, str]]):
         if not files:
             return
         for host_path, remote_path in files:
-            self._k8s_agent_sandbox_upload(host_path, remote_path)
+            self._agent_sandbox_upload(host_path, remote_path)
 
-    def _k8s_agent_sandbox_bulk_download(self, dest: Path):
+    def _agent_sandbox_bulk_download(self, dest: Path):
         """Download remote .hermes/ dir as a tar archive."""
         rel_base = f"{self._remote_home}/.hermes".lstrip("/")
         rel_remote_tar = f"{rel_base}_sync.{os.getpid()}.tar"
@@ -160,7 +160,7 @@ class K8sSandboxBackend(BaseEnvironment):
         except Exception:
             pass
 
-    def _k8s_agent_sandbox_delete(self, remote_paths: list[str]):
+    def _agent_sandbox_delete(self, remote_paths: list[str]):
         self._sandbox.commands.run(quoted_rm_command(remote_paths))
 
     def _before_execute(self):
@@ -192,20 +192,20 @@ class K8sSandboxBackend(BaseEnvironment):
                 return
 
             if self._sync_manager:
-                logger.info("k8s-agent-sandbox: syncing files from sandbox...")
+                logger.info("agent-sandbox: syncing files from sandbox...")
                 try:
                     self._sync_manager.sync_back()
                 except Exception as e:
-                    logger.warning("k8s-agent-sandbox: sync_back failed: %s", e)
+                    logger.warning("agent-sandbox: sync_back failed: %s", e)
 
             try:
                 if not self._persistent:
                     claim_name = self._sandbox.claim_name
                     self._sandbox.terminate()
-                    logger.info(f"k8s-agent-sandbox: deleted sandbox with claim name \"{claim_name}\"")
+                    logger.info(f"agent-sandbox: deleted sandbox with claim name \"{claim_name}\"")
                 else:
                     self._sandbox.close_connection()
                 self._sandbox = None
-                logger.info(f"k8s-agent-sandbox: clean up succeeded")
+                logger.info(f"agent-sandbox: clean up succeeded")
             except Exception as e:
-                logger.warning(f"k8s-agent-sandbox: cleanup failed: {e}")
+                logger.warning(f"agent-sandbox: cleanup failed: {e}")

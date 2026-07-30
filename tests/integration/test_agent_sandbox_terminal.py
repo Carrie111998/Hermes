@@ -1,7 +1,7 @@
-"""Integration tests for the K8s-agent-sandbox terminal backend.
+"""Integration tests for the agent-sandbox terminal backend.
 
-Requires K8S_AGENT_SANDBOX_CONNECTION_CONFIG to be set. Run with:
-    TERMINAL_ENV=k8s-agent-sandbox pytest tests/integration/test_k8s_agent_sandbox_terminal.py -v
+Requires AGENT_SANDBOX_CONNECTION_CONFIG to be set. Run with:
+    TERMINAL_ENV=agent-sandbox pytest tests/integration/test_agent_sandbox_terminal.py -v
 """
 
 import json
@@ -19,8 +19,8 @@ try:
 except ImportError:
     pytest.skip("k8s_agent_sandbox package not installed", allow_module_level=True)
 
-if not os.getenv("K8S_AGENT_SANDBOX_CONNECTION_CONFIG"):
-    pytest.skip("K8S_AGENT_SANDBOX_CONNECTION_CONFIG not set", allow_module_level=True)
+if not os.getenv("AGENT_SANDBOX_CONNECTION_CONFIG"):
+    pytest.skip("AGENT_SANDBOX_CONNECTION_CONFIG not set", allow_module_level=True)
 
 # Import terminal_tool via importlib to avoid tools/__init__.py side effects
 import importlib.util
@@ -39,15 +39,15 @@ cleanup_vm = terminal_module.cleanup_vm
 
 
 @pytest.fixture(autouse=True)
-def _force_k8s_agent_sandbox(monkeypatch):
-    monkeypatch.setenv("TERMINAL_ENV", "k8s-agent-sandbox")
+def _force_agent_sandbox(monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "agent-sandbox")
     monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
 
 
 @pytest.fixture()
 def task_id(request):
     """Provide a unique task_id and clean up the sandbox after the test."""
-    tid = f"k8s_test_{request.node.name}"
+    tid = f"test_{request.node.name}"
     yield tid
     cleanup_vm(tid)
 

@@ -1197,10 +1197,10 @@ def setup_terminal_backend(config: dict):
         "Modal - serverless cloud sandbox",
         "SSH - run on a remote machine",
         "Daytona - persistent cloud development environment",
-        "k8s-agent-sandbox - persistent cloud development environment",
+        "agent-sandbox - persistent cloud development environment",
     ]
-    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "k8s-agent-sandbox"}
-    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "k8s-agent-sandbox": 5}
+    idx_to_backend = {0: "local", 1: "docker", 2: "modal", 3: "ssh", 4: "daytona", 5: "agent-sandbox"}
+    backend_to_idx = {"local": 0, "docker": 1, "modal": 2, "ssh": 3, "daytona": 4, "agent-sandbox": 5}
 
     next_idx = 6
     if is_linux:
@@ -1410,8 +1410,8 @@ def setup_terminal_backend(config: dict):
             "daytona_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
 
-    elif selected_backend == "k8s-agent-sandbox":
-        print_success("Terminal backend: k8s-agent-sandbox")
+    elif selected_backend == "agent-sandbox":
+        print_success("Terminal backend: agent-sandbox")
         print_info("Commands run directly in a sandbox.")
         config["terminal"].setdefault("cwd", "/app")
 

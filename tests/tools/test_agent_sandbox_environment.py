@@ -1,4 +1,4 @@
-"""Unit tests for the k8s-agent-sandbox environment backend."""
+"""Unit tests for the agent-sandbox environment backend."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -7,7 +7,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Helpers to build mock K8s-agent-sandbox SDK objects
+# Helpers to build mock agent-sandbox SDK objects
 # ---------------------------------------------------------------------------
 
 def _make_exec_response(stdout="", stderr="", exit_code=0):
@@ -88,13 +88,13 @@ def make_env(k8s_sdk, monkeypatch):
 
         k8s_sdk.SandboxClient = MagicMock(return_value=mock_client)
 
-        from tools.environments.k8s_agent_sandbox import K8sSandboxBackend
+        from tools.environments.agent_sandbox import AgentSandboxBackend
 
         if connection_config is None:
             connection_config = {"name": "SandboxLocalTunnelConnectionConfig"}
 
         kwargs.setdefault("cwd", "/home/test")
-        env = K8sSandboxBackend(
+        env = AgentSandboxBackend(
             connection_config_args=connection_config,
             persistent_filesystem=persistent,
             **kwargs,

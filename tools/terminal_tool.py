@@ -3,7 +3,7 @@
 Terminal Tool Module
 
 A terminal tool that executes commands in local, Docker, Modal, SSH,
-Singularity, Daytona, and k8s-agent-sandbox environments. Supports local execution,
+Singularity, Daytona, and agent-sandbox environments. Supports local execution,
 containerized backends, and cloud sandboxes, including managed Modal mode.
 
 Supported environments:
@@ -892,7 +892,7 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     should prepend sudo_stdin to their stdin_data and pass the merged bytes to
     Popen's stdin pipe.
 
-    Callers that cannot pipe subprocess stdin (modal, daytona, k8s-agent-sandbox) must embed
+    Callers that cannot pipe subprocess stdin (modal, daytona, agent-sandbox) must embed
     the password in the command string themselves; see their execute()
     methods for how they handle the non-None sudo_stdin case.
 
@@ -1265,7 +1265,7 @@ def _safe_getcwd() -> str:
 # cwd looks when it leaks toward a Linux container's ``-w`` flag.
 _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
-_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "k8s-agent-sandbox"})
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "agent-sandbox"})
 
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
@@ -1354,7 +1354,7 @@ def _get_env_config() -> Dict[str, Any]:
     env_type = os.getenv("TERMINAL_ENV", "local")
 
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
-    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "k8s-agent-sandbox"}
+    container_backend = env_type in {"docker", "singularity", "modal", "daytona", "agent-sandbox"}
     docker_backend = env_type == "docker"
 
     # Docker/container-only env vars may be bridged from config.yaml even when
@@ -1469,8 +1469,8 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_orphan_reaper": os.getenv(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
-        "k8s_agent_sandbox_connection_config": _parse_env_var(
-            "K8S_AGENT_SANDBOX_CONNECTION_CONFIG", "{}", json.loads, "valid JSON"
+        "agent_sandbox_connection_config": _parse_env_var(
+            "AGENT_SANDBOX_CONNECTION_CONFIG", "{}", json.loads, "valid JSON"
         ),
     }
 
@@ -1494,7 +1494,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
-            "daytona", "k8s-agent-sandbox", "ssh"
+            "daytona", "agent-sandbox", "ssh"
         image: Docker/Singularity/Modal image name (ignored for local/ssh)
         cwd: Working directory
         timeout: Default command timeout
@@ -1617,11 +1617,11 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             persistent_filesystem=persistent, task_id=task_id,
         )
 
-    elif env_type == "k8s-agent-sandbox":
-        from tools.environments.k8s_agent_sandbox import K8sSandboxBackend as _K8sSandboxBackend
-        return _K8sSandboxBackend(
+    elif env_type == "agent-sandbox":
+        from tools.environments.agent_sandbox import AgentSandboxBackend as _AgentSandboxBackend
+        return _AgentSandboxBackend(
             cwd=cwd, timeout=timeout, task_id=task_id,
-            connection_config_args=cc["k8s_agent_sandbox_connection_config"],
+            connection_config_args=cc["agent_sandbox_connection_config"],
             persistent_filesystem=persistent,
         )
 
@@ -1640,7 +1640,7 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     else:
         raise ValueError(
             f"Unknown environment type: {env_type}. Use 'local', 'docker', "
-            f"'singularity', 'modal', 'daytona', 'k8s-agent-sandbox', or 'ssh'"
+            f"'singularity', 'modal', 'daytona', 'agent-sandbox', or 'ssh'"
         )
 
 
@@ -1756,7 +1756,7 @@ def is_persistent_env(task_id: str) -> bool:
 
     Used by the agent loop to skip per-turn teardown for backends whose whole
     point is to survive between turns (docker with ``container_persistent``,
-    daytona, modal, k8s-agent-sandbox, etc.). Non-persistent backends (e.g. Morph) still get torn
+    daytona, modal, agent-sandbox, etc.). Non-persistent backends (e.g. Morph) still get torn
     down at end-of-turn to prevent leakage. The idle reaper
     (``_cleanup_inactive_envs``) handles persistent envs once they exceed
     ``terminal.lifetime_seconds``.
@@ -2300,7 +2300,7 @@ def terminal_tool(
                             }
 
                         container_config = None
-                        if env_type in {"docker", "singularity", "modal", "daytona", "k8s-agent-sandbox"}:
+                        if env_type in {"docker", "singularity", "modal", "daytona", "agent-sandbox"}:
                             container_config = {
                                 "container_cpu": config.get("container_cpu", 1),
                                 "container_memory": config.get("container_memory", 5120),
@@ -2316,7 +2316,7 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
-                                "k8s_agent_sandbox_connection_config": config.get("k8s_agent_sandbox_connection_config", {}),
+                                "agent_sandbox_connection_config": config.get("agent_sandbox_connection_config", {}),
                             }
 
                         local_config = None
@@ -3018,7 +3018,7 @@ def check_terminal_requirements() -> bool:
             from daytona import Daytona  # noqa: F401 — SDK presence check
             return os.getenv("DAYTONA_API_KEY") is not None
 
-        elif env_type == "k8s-agent-sandbox":
+        elif env_type == "agent-sandbox":
             try:
                 from k8s_agent_sandbox import SandboxClient
                 return True
@@ -3028,7 +3028,7 @@ def check_terminal_requirements() -> bool:
         else:
             logger.error(
                 "Unknown TERMINAL_ENV '%s'. Use one of: local, docker, singularity, "
-                "modal, daytona, k8s-agent-sandbox, ssh.",
+                "modal, daytona, agent-sandbox, ssh.",
                 env_type,
             )
             return False
@@ -3071,7 +3071,7 @@ if __name__ == "__main__":
     print(
         "  TERMINAL_ENV: "
         f"{os.getenv('TERMINAL_ENV', 'local')} "
-        "(local/docker/singularity/modal/daytona/k8s-agent-sandbox/ssh)"
+        "(local/docker/singularity/modal/daytona/agent-sandbox/ssh)"
     )
     print(f"  TERMINAL_DOCKER_IMAGE: {os.getenv('TERMINAL_DOCKER_IMAGE', default_img)}")
     print(f"  TERMINAL_SINGULARITY_IMAGE: {os.getenv('TERMINAL_SINGULARITY_IMAGE', f'docker://{default_img}')}")

@@ -907,7 +907,7 @@ def run_doctor(args):
     env_path = HERMES_HOME / '.env'
     if env_path.exists():
         check_ok(f"{_DHH}/.env file exists")
-        
+
         # Prefer UTF-8 (.env is written as UTF-8 elsewhere). Fall back to
         # latin-1 for Windows Notepad/cp1252 files that are not valid UTF-8 —
         # matches hermes_cli.env_loader._load_dotenv_with_fallback.
@@ -1804,15 +1804,15 @@ def run_doctor(args):
                 issues,
             )
 
-    if terminal_env == "k8s-agent-sandbox":
+    if terminal_env == "agent-sandbox":
         try:
-            from k8s_agent_sandbox import SandboxClient  # noqa: F401 — SDK presence check
-            check_ok("k8s-agent-sandbox SDK", "(installed)")
+            from agent_sandbox import SandboxClient  # noqa: F401 — SDK presence check
+            check_ok("agent-sandbox SDK", "(installed)")
         except ImportError:
             _fail_and_issue(
-                "k8s-agent-sandbox SDK not installed",
-                "(pip install k8s-agent-sandbox)",
-                "Install k8s-agent-sandbox SDK: pip install k8s-agent-sandbox",
+                "agent-sandbox SDK not installed",
+                "(pip install agent-sandbox)",
+                "Install agent-sandbox SDK: pip install k8s-agent-sandbox",
                 issues,
             )
 
