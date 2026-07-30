@@ -9,7 +9,7 @@
 - Feature branch: `codex/provider-neutral-streaming-tts`
 - Human owner: plebdev
 - Started: 2026-07-30
-- Current status: implementation
+- Current status: branch review complete; publication pending
 - Skill setup status: GitHub issue tracker inferred from origin; root and Desktop
   AGENTS guidance loaded; no repo-local Plebdev issue/triage/domain adapter exists.
 
@@ -29,8 +29,8 @@ Audio as the first conforming front-door provider.
 - Tickets: four delivery slices in the spec; delegated approval recorded below.
 - Ticket sessions: pending.
 - Agent briefs: three Luna-high read-only architecture briefs in current task.
-- Review packets: pending.
-- Local CodeRabbit report: pending.
+- Review packets: Luna-high standards/spec reviews completed; all P1/P2 findings resolved.
+- Local CodeRabbit report: one round completed; nine findings addressed and reverified.
 - PR URL: pending.
 
 ## Commands
@@ -45,9 +45,9 @@ Audio as the first conforming front-door provider.
 
 | Issue | Type | Status | Review thread | Fixes needed | Verified |
 | --- | --- | --- | --- | --- | --- |
-| Frame contract | AFK | in progress | pending | pending | no |
-| Gateway transport | AFK | pending | pending | pending | no |
-| Desktop playout | AFK | pending | pending | pending | no |
+| Frame contract | AFK | complete | Luna + CodeRabbit | fixed | yes |
+| Gateway transport | AFK | complete | Luna + CodeRabbit | fixed | yes |
+| Desktop playout | AFK | complete | Luna + CodeRabbit | fixed | yes |
 | Fish qualification | AFK + production handoff | pending | pending | pending | no |
 
 ## Parked HITL Slices
@@ -60,7 +60,9 @@ Audio as the first conforming front-door provider.
 
 | Issue | Fixed point | Worker session | Commit | Review result | Checks |
 | --- | --- | --- | --- | --- | --- |
-| Frame contract | `07447bd5d` | pending | pending | pending | pending |
+| Frame + gateway | `07447bd5d` | Luna worker | `45f895572` | passed after fixes | 39 Python tests |
+| Desktop playout | `45f895572` | Luna worker | `75fdf2acf` | passed after fixes | 12 focused Vitest + typecheck + build |
+| Design record | `75fdf2acf` | orchestrator | `695c2a772` | passed | docs review |
 
 ## Open Questions
 

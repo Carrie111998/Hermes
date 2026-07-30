@@ -8,6 +8,8 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
     this.cancelled = false
     this.started = false
     this.stableCallbacks = 0
+    this.underrunActive = false
+    this.drainReady = false
     this.port.onmessage = event => {
       const message = event.data || {}
 
@@ -48,6 +50,14 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
       return !this.cancelled
     }
 
+    if (this.drainReady) {
+      channel.fill(0)
+      this.port.postMessage({ id: this.drainRequest, type: 'drained' })
+      this.drainRequest = null
+      this.drainReady = false
+      return !this.cancelled
+    }
+
     let written = 0
 
     while (written < channel.length && this.queue.length > 0) {
@@ -67,10 +77,12 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
     if (written < channel.length) {
       channel.fill(0, written)
       this.stableCallbacks = 0
-      if (!this.cancelled) {
+      if (!this.cancelled && this.drainRequest === null && !this.underrunActive) {
+        this.underrunActive = true
         this.port.postMessage({ type: 'underrun' })
       }
     } else {
+      this.underrunActive = false
       this.stableCallbacks += 1
       if (this.stableCallbacks >= 25) {
         this.stableCallbacks = 0
@@ -79,8 +91,7 @@ class HermesVoicePlayoutProcessor extends AudioWorkletProcessor {
     }
 
     if (this.drainRequest !== null && this.queuedSamples === 0) {
-      this.port.postMessage({ id: this.drainRequest, type: 'drained' })
-      this.drainRequest = null
+      this.drainReady = true
     }
 
     return !this.cancelled

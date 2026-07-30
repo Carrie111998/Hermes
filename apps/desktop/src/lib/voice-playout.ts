@@ -86,6 +86,7 @@ export function createVoicePlayoutController(
   const initialBufferMs = Math.max(0, options.initialBufferMs ?? DEFAULT_INITIAL_BUFFER_MS)
   const maxBufferMs = Math.max(0, options.maxBufferMs ?? DEFAULT_MAX_BUFFER_MS)
   const stableFramesToDecrease = Math.max(1, options.stableFramesToDecrease ?? 12)
+  const targetCeilingMs = Math.max(0, maxBufferMs - 20)
 
   let state: VoicePlayoutState = {
     bufferedMs: 0,
@@ -94,7 +95,7 @@ export function createVoicePlayoutController(
     failed: false,
     maxBufferMs,
     started: false,
-    targetBufferMs: Math.min(initialBufferMs, maxBufferMs)
+    targetBufferMs: Math.min(initialBufferMs, targetCeilingMs)
   }
   let telemetry: VoicePlayoutTelemetry = {
     framesReceived: 0,
@@ -212,6 +213,11 @@ export function createVoicePlayoutController(
       }
 
       state = { ...state, ended: true }
+      if (rebuffering && queue.length > 0) {
+        rebuffering = false
+        void sink.start(sampleRate, channels)
+        flush()
+      }
       if (telemetry.framesReceived > 0) {
         maybeStart()
       }
@@ -266,7 +272,7 @@ export function createVoicePlayoutController(
       }
       state = {
         ...state,
-        targetBufferMs: Math.min(maxBufferMs, Math.max(state.targetBufferMs + 20, state.targetBufferMs * 1.5))
+        targetBufferMs: Math.min(targetCeilingMs, Math.max(state.targetBufferMs + 20, state.targetBufferMs * 1.5))
       }
       publish()
     }

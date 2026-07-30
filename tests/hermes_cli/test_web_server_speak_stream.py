@@ -123,7 +123,9 @@ def test_long_text_is_split_across_provider_requests(stream_client, monkeypatch)
             message = conn.receive()
             if message.get("bytes") is not None:
                 pytest.fail("binary payload was not preceded by metadata")
+            assert message.get("text") is not None, f"unexpected message: {message}"
             frame = json.loads(message["text"])
+            assert frame["type"] != "error", frame
             if frame["type"] == "end":
                 break
             assert frame["type"] == "audio"

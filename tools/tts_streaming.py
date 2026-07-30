@@ -74,6 +74,7 @@ class AudioFormat:
             raise ValueError("sample_rate must be a positive integer")
         if int(self.sample_rate) != self.sample_rate:
             raise ValueError("sample_rate must be an integer")
+        object.__setattr__(self, "sample_rate", int(self.sample_rate))
 
     @property
     def bytes_per_sample(self) -> int:

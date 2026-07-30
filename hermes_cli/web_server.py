@@ -4714,7 +4714,12 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
             with contextlib.suppress(Exception):
                 cancel()
         text_q.put(None)  # unblock the producer
-        await chunks.put(("cancelled", None))
+        while True:
+            try:
+                chunks.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        chunks.put_nowait(("cancelled", None))
 
     pump = asyncio.ensure_future(_pump_client())
     try:

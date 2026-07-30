@@ -347,7 +347,10 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
         return
       }
 
-      void controller.end().then(() => settle('done'))
+      void controller
+        .end()
+        .then(() => settle('done'))
+        .catch(() => settle(started ? 'done' : 'fallback'))
       return
     }
 
@@ -568,10 +571,6 @@ function openSpeechStream(wsUrl: string, options: VoicePlaybackOptions): SpeechS
       } else {
         // Older gateways send raw PCM without a versioned start frame.
         scheduleLegacy(event.data as ArrayBuffer)
-        if (!started) {
-          started = true
-          setVoicePlaybackState(currentState('speaking', options))
-        }
       }
 
       return
