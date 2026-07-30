@@ -8,6 +8,7 @@ from plugins.skyai_customer import dev_gateway, public_tools
 
 ARCHITECTURE_PATH = Path("plugins/skyai_customer/ARCHITECTURE.md")
 QA_PRINCIPLES_PATH = Path("plugins/skyai_customer/fixtures/qa_behavior_principles.json")
+COMPARE_SCENARIOS_PATH = Path("plugins/skyai_customer/fixtures/compare_scenarios.json")
 
 
 def test_architecture_contract_declares_hermes_led_reasoning() -> None:
@@ -31,7 +32,7 @@ def test_skyai_prompt_is_principle_based_not_script_pack() -> None:
 
     assert "Hermes мисли" in prompt
     assert "не е заповед какво да кажеш" in prompt
-    assert len(prompt) < 5200
+    assert len(prompt) < 6000
     assert "SkyAI sales playbook" not in prompt
     assert "do_not_say" not in prompt
     assert "customer_facing_flow" not in prompt
@@ -62,6 +63,60 @@ def test_skyai_prompt_treats_prior_turns_as_shared_context() -> None:
     assert "prompt-and-evaluation principle" in architecture
     assert "backend deduplication" in architecture
     assert "keyword rule" in architecture
+
+
+def test_campaign_gift_validity_precedes_transfer_reasoning() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+
+    assert "не извеждай едната дата от другата" in prompt
+    assert "историческите условия на конкретната кампания" in prompt
+    assert "отделно от ползването на основния ваучер" in prompt
+    assert "„Неизползван“ не означава „използваем сега“" in prompt
+    assert "само че изтичане е възможно и е нужна проверка" in prompt
+    assert "не обявявай подаръка за изтекъл" in prompt
+    assert "не предлагай прехвърляне, ръчно изключение или ескалация" in prompt
+    assert prompt.index(
+        "точната дата на покупката или създаването на entitlement"
+    ) < prompt.index(
+        "собственост, профил или прехвърляне"
+    )
+
+
+def test_campaign_gift_validity_is_general_evaluation_material() -> None:
+    principles = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    principle = next(
+        case for case in principles if case["id"] == "campaign_gift_time_validity"
+    )
+    assert principle["source_threads"] == ["generalized_campaign_validity_regression"]
+    assert "received or gifted" in principle["principle"]
+    assert "purchase or entitlement-creation date" in principle["principle"]
+    assert "historical campaign terms" in principle["principle"]
+    assert "separate from main-voucher use" in principle["principle"]
+    assert "Unused is not the same as currently usable" in principle["principle"]
+    assert "expiry is possible" in principle["principle"]
+    assert "never declare expiry as fact" in principle["principle"]
+    assert "before transfer or exception guidance" in principle["principle"]
+
+    scenario = next(
+        case for case in scenarios if case["id"] == "campaign_gift_time_validity"
+    )
+    assert scenario["history"] == [
+        {
+            "role": "user",
+            "content": (
+                "Получих основния ваучер като подарък преди няколко години, "
+                "а в профила виждам неизползван подарък от кампания."
+            ),
+        }
+    ]
+    assert scenario["message"] == (
+        "Щом пише „неизползван“, мога ли да го ползвам сега "
+        "или да го дам на друг човек?"
+    )
+    assert "historical campaign terms" in scenario["focus"]
+    assert "no expiry claim without evidence" in scenario["focus"]
 
 
 def test_external_voucher_boundary_is_a_general_hermes_principle() -> None:

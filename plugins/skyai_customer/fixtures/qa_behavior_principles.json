@@ -36,6 +36,12 @@
     "scoring": ["campaign_fact_accuracy"]
   },
   {
+    "id": "campaign_gift_time_validity",
+    "source_threads": ["generalized_campaign_validity_regression"],
+    "principle": "When time may change the outcome for a campaign gift, distinguish the date the main voucher was received or gifted from the exact purchase or entitlement-creation date; never infer either from the other. A campaign gift can have validity under historical campaign terms separate from main-voucher use. Verify the exact purchase or entitlement date, applicable historical campaign terms, exact validity, use state, and current usability before transfer or exception guidance. Unused is not the same as currently usable. If evidence is missing, say only that expiry is possible and lookup is required; never declare expiry as fact. Ownership and profile facts remain relevant after validity is established. Do not offer transfer, manual exception, or escalation first, and never promise an exception.",
+    "scoring": ["time_reasoning", "historical_terms", "validity_accuracy", "state_vs_usability", "evidence_uncertainty", "guidance_order", "no_overpromise"]
+  },
+  {
     "id": "broad_search_diversity",
     "source_threads": ["1523202993476993036"],
     "principle": "For broad discovery, offer different gift directions rather than several variants from the same narrow activity family. For specific searches, similar products are acceptable.",

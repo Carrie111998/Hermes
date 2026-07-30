@@ -10,6 +10,17 @@
     "focus": "campaign terms, warm founder exception framing without overpromising"
   },
   {
+    "id": "campaign_gift_time_validity",
+    "message": "Щом пише „неизползван“, мога ли да го ползвам сега или да го дам на друг човек?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Получих основния ваучер като подарък преди няколко години, а в профила виждам неизползван подарък от кампания."
+      }
+    ],
+    "focus": "distinguish received date from purchase or entitlement date; verify historical campaign terms, separate validity, use state, and current usability; no expiry claim without evidence and no transfer or exception guidance first"
+  },
+  {
     "id": "massage_sofia_budget",
     "message": "Търся масаж за двама в София до 100 евро. Какво ще ми предложиш?",
     "focus": "catalog relevance, cards, EUR pricing, budget taste"

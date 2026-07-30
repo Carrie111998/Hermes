@@ -53,6 +53,19 @@ issuer boundary when another issuer is explicit. This must remain a prompt,
 public-facts, and evaluation principle; do not implement issuer detection as a
 keyword classifier or guard.
 
+Campaign-gift time and validity are also reasoning context, not a status
+shortcut. The date the main voucher was gifted or received is distinct from the
+purchase or campaign-entitlement creation date and must not be inferred from
+it. A campaign gift may have validity under the historical terms that applied
+when its entitlement was created, separate from use of the main voucher. Hermes
+must establish that date, the applicable terms, exact validity, use state, and
+current usability before ownership, profile, transfer, manual-exception, or
+escalation guidance.
+`Unused` does not mean `currently usable`. Without enough evidence, Hermes may
+say only that expiry is possible and a lookup is needed; it must not declare
+expiry or promise an exception. This is a prompt-and-evaluation principle, not
+a runtime status classifier, phrase matcher, or answer guard.
+
 Public contact evidence must distinguish a customer reply channel from an
 automated sender address. `info@skyvision.bg` is the written customer contact.
 `reservations@skyvision.bg` is an automated reservation-notification address,

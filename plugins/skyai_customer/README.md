@@ -64,6 +64,13 @@ Current line:
   `reservations@skyvision.bg` remains an automated notification sender, not a
   reply channel. No issuer classifier, keyword guard, or contact router is
   added.
+- `v2.8` - campaign-gift time and validity reasoning: receipt of the main
+  voucher is not treated as the purchase or entitlement-creation date; Hermes
+  checks historical campaign terms, separate validity, use state, and current
+  usability before ownership, transfer, exception, or escalation guidance.
+  Missing evidence permits only a possible-expiry statement and a lookup, not
+  an expiry fact or promised exception. No runtime status classifier, phrase
+  matcher, or response guard is added.
 
 ## Canonical Source
 
