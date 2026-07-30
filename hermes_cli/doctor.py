@@ -1966,7 +1966,7 @@ def run_doctor(args):
                 )
                 if not skip_chromium_check:
                     if _chromium_installed():
-                        check_ok("Playwright Chromium", "(browser engine)")
+                        check_ok("Chromium browser", "(browser engine)")
                     else:
                         check_warn(
                             "Chromium browser not installed",

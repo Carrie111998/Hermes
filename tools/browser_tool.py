@@ -15,8 +15,8 @@ Features:
 - **Local mode** (default): zero-cost headless Chromium via agent-browser.
   Works on Linux servers without a display.  One-time setup:
   ``agent-browser install`` (downloads Chromium) or
-  ``agent-browser install --with-deps`` (also installs system libraries for
-  Debian/Ubuntu/Docker).
+  ``agent-browser install --with-deps`` (also installs system libraries on
+  supported Debian- and RPM-family Linux hosts).
 - **Cloud mode**: Browserbase or Browser Use cloud execution when configured.
 - Session isolation per task ID
 - Text-based page snapshots using accessibility tree
@@ -54,6 +54,7 @@ import functools
 import json
 import logging
 import os
+import platform
 import re
 import subprocess
 import shutil
@@ -381,6 +382,38 @@ def _unlink_command_output_files(*paths: str) -> None:
             pass
 
 
+def _browser_system_dependency_hint() -> str:
+    """Return a distro-appropriate Chromium shared-library remediation hint."""
+    try:
+        os_release = platform.freedesktop_os_release()
+    except (AttributeError, OSError):
+        os_release = {}
+
+    distro_ids = {
+        value.lower()
+        for key in ("ID", "ID_LIKE")
+        for value in str(os_release.get(key, "")).split()
+    }
+    if distro_ids & {"arch", "manjaro", "cachyos", "endeavouros", "garuda"}:
+        # Keep this in sync with the Arch-family dependency install in scripts/install.sh.
+        return (
+            "Install Chromium system libraries with: sudo pacman -S --needed "
+            "nss atk at-spi2-core cups libdrm libxkbcommon mesa pango cairo alsa-lib"
+        )
+    if distro_ids & {
+        "debian",
+        "ubuntu",
+        "raspbian",
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+    }:
+        return "Install Chromium system libraries with: npx agent-browser install --with-deps"
+    return "Install Chromium system libraries with your distribution's package manager."
+
+
 def _format_browser_timeout_error(
     command: str,
     timeout: int,
@@ -398,8 +431,7 @@ def _format_browser_timeout_error(
     if "sandbox" in combined:
         hints.append(
             "Chromium sandbox launch failed. Set AGENT_BROWSER_ARGS="
-            "'--no-sandbox,--disable-dev-shm-usage' in your environment, "
-            "or reinstall Chromium with: npx agent-browser install"
+            "'--no-sandbox,--disable-dev-shm-usage' in your environment and retry."
         )
     elif command == "open" and _is_local_mode():
         if _running_in_docker():
@@ -411,9 +443,7 @@ def _format_browser_timeout_error(
         else:
             hints.append(
                 "The browser daemon may still be starting, or Chromium may be "
-                "missing. Install/repair it with: npx agent-browser install. "
-                "If it still fails, install Chromium system libraries with your "
-                "distribution's package manager."
+                f"missing system libraries. {_browser_system_dependency_hint()}"
             )
     if hints:
         parts.extend(hints)

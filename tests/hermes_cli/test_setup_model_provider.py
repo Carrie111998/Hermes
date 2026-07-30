@@ -166,5 +166,5 @@ def test_setup_summary_local_browser_unavailable_without_chromium(
     output = capsys.readouterr().out
 
     assert "Browser Automation (Local browser)" not in output
-    assert "agent-browser install" in output
-    assert "--with-deps" not in output
+    assert "npm install -g agent-browser && agent-browser install" in output
+    assert "npm install -g agent-browser && agent-browser install --with-deps" not in output
