@@ -134,9 +134,7 @@ _endpoint_probe_path_cache: Dict[str, tuple] = {}
 # short-circuiting on it performs no network I/O of its own — it adds no probe
 # for callers or tests to mock, and it can only ever fire after a real timeout
 # has already been paid, so it cannot suppress a probe that would have worked.
-_ENDPOINT_BLACKHOLE_TTL_SECONDS = float(
-    os.environ.get("HERMES_ENDPOINT_BLACKHOLE_TTL", "30.0")
-)
+_ENDPOINT_BLACKHOLE_TTL_SECONDS = 30.0
 # Values are monotonic timestamps of the last observed connect timeout.
 _endpoint_blackhole_cache: Dict[str, float] = {}
 
@@ -179,8 +177,7 @@ def _endpoint_blackholed(base_url: str) -> bool:
     Pure cache lookup; never touches the network. The entry expires after
     _ENDPOINT_BLACKHOLE_TTL_SECONDS — long enough to collapse one startup's
     burst of probes, short enough that bringing the VPN up mid-session is
-    picked up without a restart. ``HERMES_ENDPOINT_BLACKHOLE_TTL=0`` disables
-    the short-circuit entirely.
+    picked up without a restart.
     """
     if _ENDPOINT_BLACKHOLE_TTL_SECONDS <= 0:
         return False
