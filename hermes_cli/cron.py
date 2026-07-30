@@ -98,9 +98,19 @@ def _warn_if_gateway_not_running() -> None:
 
 def _canonical_job(job: dict) -> dict:
     """Return a lossless, versioned persisted-job shape."""
-    record = json.loads(json.dumps(job, ensure_ascii=False))
-    repeat = job.get("repeat") or {}
-    schedule = job.get("schedule") or {}
+    from cron.jobs import PERSISTED_JOB_FIELDS
+
+    # list_jobs() adds latest_execution as a derived display field.  Never put
+    # that projection into a restore record, and never copy arbitrary keys from
+    # a hand-edited jobs.json into the interchange format.
+    record = {
+        key: json.loads(json.dumps(job[key], ensure_ascii=False))
+        for key in sorted(PERSISTED_JOB_FIELDS)
+        if key in job
+    }
+    repeat = record.get("repeat")
+    repeat_mapping = repeat if isinstance(repeat, dict) else {}
+    schedule = record.get("schedule")
     raw_deliver = job.get("deliver") or job.get("delivery") or "local"
     if isinstance(raw_deliver, str):
         delivery_targets = [part.strip() for part in raw_deliver.split(",") if part.strip()]
@@ -125,20 +135,25 @@ def _canonical_job(job: dict) -> dict:
         "schema_version": 2,
         "record": record,
         "presence": sorted(record),
-        "id": job.get("id"), "name": job.get("name"),
-        "enabled": bool(job.get("enabled", True)),
-        "state": job.get("state", "scheduled"),
-        "schedule": job.get("schedule_display") or schedule.get("display"),
-        "run_at": schedule.get("run_at"), "next_run_at": job.get("next_run_at"),
-        "repeat": repeat.get("times"), "delivery": deliver, "deliver": deliver,
+        "id": record.get("id"), "name": record.get("name"),
+        "enabled": record.get("enabled", True),
+        "state": record.get("state", "scheduled"),
+        "schedule": record.get("schedule_display") or (schedule or {}).get("display"),
+        "schedule_state": json.loads(json.dumps(schedule, ensure_ascii=False)),
+        "run_at": (schedule or {}).get("run_at"), "next_run_at": record.get("next_run_at"),
+        "repeat": repeat_mapping.get("times"), "delivery": deliver, "deliver": deliver,
         "platform": platform, "recipient": recipient, "thread": thread,
-        "script": job.get("script"), "skills": list(job.get("skills") or []),
-        "no_agent": bool(job.get("no_agent", False)),
-        "prompt": job.get("prompt"), "model": job.get("model"),
-        "provider": job.get("provider"), "workdir": job.get("workdir"),
+        "script": record.get("script"), "skills": list(record.get("skills") or []),
+        "no_agent": record.get("no_agent", False),
+        "prompt": record.get("prompt"), "model": record.get("model"),
+        "provider": record.get("provider"), "workdir": record.get("workdir"),
     }
-    result["schedule"] = json.loads(json.dumps(job.get("schedule")))
-    result["repeat_state"] = json.loads(json.dumps(job.get("repeat")))
+    result["repeat_state"] = json.loads(json.dumps(record.get("repeat"), ensure_ascii=False))
+    # Keep all supported persisted metadata visible at the canonical surface;
+    # ``presence`` is the authoritative distinction between absent and null.
+    for field in sorted(PERSISTED_JOB_FIELDS):
+        result.setdefault(field, json.loads(json.dumps(record[field], ensure_ascii=False))
+                           if field in record else None)
     return result
 
 
@@ -553,17 +568,26 @@ def cron_restore(args):
             raise ValueError("cron restore snapshot exceeds 64 KiB")
         snapshot_text = raw.decode("utf-8")
         restored = restore_job(args.job_id, json.loads(snapshot_text))
-    except json.JSONDecodeError:
-        print(color("Failed to restore job: invalid JSON", Colors.RED))
+    except UnicodeDecodeError:
+        print(color("Failed to restore job: CRON_RESTORE_INVALID_UTF8", Colors.RED))
         return 1
-    except (ValueError, TypeError):
-        print(color("Failed to restore job: invalid snapshot", Colors.RED))
+    except json.JSONDecodeError:
+        print(color("Failed to restore job: CRON_RESTORE_INVALID_JSON", Colors.RED))
+        return 1
+    except (ValueError, TypeError) as exc:
+        code = str(exc)
+        if not code.startswith("CRON_RESTORE_"):
+            code = "CRON_RESTORE_INVALID_SNAPSHOT"
+        print(color(f"Failed to restore job: {code}", Colors.RED))
         return 1
     if restored is None:
-        print(color(f"Job not found: {args.job_id}", Colors.RED))
+        print(color("Failed to restore job: CRON_RESTORE_JOB_NOT_FOUND", Colors.RED))
         return 1
-    from cron.scheduler import _notify_provider_jobs_changed
-    _notify_provider_jobs_changed()
+    try:
+        from cron.scheduler import _notify_provider_jobs_changed
+        _notify_provider_jobs_changed()
+    except Exception:
+        pass
     if getattr(args, "json", False):
         print(json.dumps(_canonical_job(restored), ensure_ascii=False, sort_keys=True))
     else:
