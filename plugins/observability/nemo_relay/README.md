@@ -81,17 +81,18 @@ uv run hermes chat --query 'Reply exactly ok' --provider custom --model qwen3.6:
 
 To ship the updated CLI into another environment, build and install a fresh
 wheel from this checkout. On platforms for which Relay publishes a native
-wheel, Hermes installs its supported NeMo Relay runtime as a normal dependency:
+wheel, add the `nemo-relay` extra to pull in the supported runtime:
 
 ```bash
 uv build --wheel
 python -m pip install --force-reinstall dist/hermes_agent-*.whl
+python -m pip install 'hermes-agent[nemo-relay]'
 hermes plugins enable observability/nemo_relay
 ```
 
-The plugin remains opt-in even though the runtime dependency is installed by
-default. Enabling this plugin controls rich observability and adaptive
-behavior; it does not control Hermes shared client metrics.
+The plugin remains opt-in in addition to the runtime dependency. Enabling this
+plugin controls rich observability and adaptive behavior; it does not control
+Hermes shared client metrics.
 
 ## Export Configuration
 

@@ -56,6 +56,41 @@ def test_faster_whisper_is_not_a_base_dependency():
     assert any(dep.startswith("faster-whisper") for dep in voice_extra)
 
 
+def test_nemo_relay_is_not_a_base_dependency():
+    """Regression for #74592.
+
+    PEP 508 has no libc marker, so a base-dependency marker of
+    ``sys_platform == 'linux' and platform_machine == 'x86_64'`` also matches
+    ``musllinux_1_2_x86_64``. nemo-relay publishes no musllinux wheel and no
+    sdist for any release, so declaring it in ``[project.dependencies]`` makes
+    Hermes itself unresolvable on Alpine instead of degrading. The runtime
+    already handles absence via ``NoopRelayRuntime`` ("Explicit
+    reduced-capability host for platforms without Relay wheels") and the Relay
+    tests ``importorskip`` it, so Relay must stay opt-in.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    deps = data["project"]["dependencies"]
+    names = {_distribution_name(dep) for dep in deps}
+
+    assert "nemo-relay" not in names, (
+        "nemo-relay must not be a base dependency: it publishes no musllinux "
+        "wheel or sdist, and PEP 508 markers cannot exclude musl, so a base "
+        "dependency makes Hermes uninstallable on Alpine — see #74592"
+    )
+
+    relay_extra = data["project"]["optional-dependencies"]["nemo-relay"]
+    assert any(dep.startswith("nemo-relay") for dep in relay_extra)
+
+    # scripts/install.sh installs '.[all]' on non-Termux platforms, so pulling
+    # Relay in through [all] would reintroduce the Alpine install failure even
+    # with the base dependency removed.
+    all_extra = data["project"]["optional-dependencies"]["all"]
+    assert not any("nemo-relay" in dep for dep in all_extra), (
+        "[all] must not pull nemo-relay: scripts/install.sh installs '.[all]' "
+        "on non-Termux platforms, which would break musl installs again"
+    )
+
+
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
 # 1.0.1. Anything below that lets a malformed Host header desync
 # ``request.url.path`` from the dispatched ASGI path, bypassing path-based
