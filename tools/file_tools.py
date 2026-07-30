@@ -1590,22 +1590,34 @@ _TRUNCATION_SIGNATURES: tuple[str, ...] = (
 def _check_truncation_signatures(content: str, original: str | None = None) -> str | None:
     """Return an error message if content contains AI truncation placeholders.
 
-    Only flags signatures absent from the original file so legitimate comments
-    are not blocked. When original is None the check is unconditional.
+    Only flags a signature whose occurrence count in `content` EXCEEDS its
+    count in `original` -- so a legitimate pre-existing comment (already in
+    the original file, unchanged) is never blocked, but adding a NEW
+    occurrence (even when one already existed) is. A plain membership check
+    (`sig in original`) is not sufficient here: if the original already
+    contains one literal occurrence of a signature, that would let content
+    retain it AND introduce any number of additional (genuinely truncated)
+    occurrences undetected, since the check only asked "is this signature
+    present in original at all", not "how many are there". When original is
+    None the check is unconditional (count must be 0).
     Must be called through the backend-aware file_ops pipeline so docker/modal/
     SSH environments see the same file as the eventual write.
     """
     content_lower = content.lower()
+    original_lower = original.lower() if original is not None else None
     for sig in _TRUNCATION_SIGNATURES:
         sig_lower = sig.lower()
-        if sig_lower in content_lower:
-            if original is None or sig_lower not in original.lower():
-                return (
-                    f"Refusing to write: content contains AI truncation placeholder "
-                    f"{sig!r}. This indicates the content is incomplete — "
-                    "re-read the file fully and reconstruct the complete content "
-                    "before writing."
-                )
+        content_count = content_lower.count(sig_lower)
+        if content_count == 0:
+            continue
+        original_count = original_lower.count(sig_lower) if original_lower is not None else 0
+        if content_count > original_count:
+            return (
+                f"Refusing to write: content contains AI truncation placeholder "
+                f"{sig!r}. This indicates the content is incomplete — "
+                "re-read the file fully and reconstruct the complete content "
+                "before writing."
+            )
     return None
 
 

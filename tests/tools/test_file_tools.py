@@ -904,6 +904,33 @@ class TestTruncationSignatureGuard:
         result = _check_truncation_signatures("def foo():\n    return 42\n")
         assert result is None
 
+    def test_check_truncation_signatures_blocks_added_occurrence_beyond_original(self):
+        """Regression (review of #68512): count-based comparison. original
+        has exactly ONE occurrence; content has TWO -- must be blocked, even
+        though a plain 'is this signature present in original' membership
+        check would have let it through."""
+        from tools.file_tools import _check_truncation_signatures
+        original = "def foo():\n    // ... unchanged ...\n    pass"
+        content = (
+            "def foo():\n    // ... unchanged ...\n    pass\n\n"
+            "def bar():\n    // ... unchanged ...\n    pass"
+        )
+        result = _check_truncation_signatures(content, original)
+        assert result is not None, (
+            "Adding a second occurrence beyond what original had must be blocked"
+        )
+
+    def test_check_truncation_signatures_allows_same_count_as_original(self):
+        """Sanity: content retaining EXACTLY the same count as original
+        (not more) must still pass -- this is the case the fix must not
+        regress (e.g. a placeholder-like literal moved to a different line,
+        same total count)."""
+        from tools.file_tools import _check_truncation_signatures
+        original = "def foo():\n    // ... unchanged ...\n    pass"
+        content = "// ... unchanged ...\ndef foo():\n    pass"
+        result = _check_truncation_signatures(content, original)
+        assert result is None
+
     def test_write_file_blocks_on_truncation_placeholder(self, tmp_path, monkeypatch):
         import tools.file_tools as ft
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -959,6 +986,34 @@ class TestTruncationSignatureGuard:
         result = json.loads(patch_tool(mode="replace", path="/tmp/f.py", old_string=old, new_string=new))
         assert not result.get("error"), result
         mock_ops.patch_replace.assert_called_once()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_blocks_added_duplicate_of_preexisting_placeholder(self, mock_get):
+        """Regression (review of #68512): the guard used a boolean membership
+        check ('is this signature present in old_string at all'), which
+        incorrectly let new_string retain the one pre-existing occurrence AND
+        introduce a genuinely truncated second occurrence undetected. Count
+        occurrences instead -- new_string must not have MORE than old_string."""
+        from tools.file_tools import patch_tool
+        mock_get.return_value = MagicMock()
+
+        old = "def foo():\n    // ... unchanged ...\n    pass"
+        # Retains the one pre-existing placeholder AND adds a second,
+        # genuinely-omitted section -- must be blocked even though the
+        # signature was already present once in old_string.
+        new = (
+            "def foo():\n    // ... unchanged ...\n    pass\n\n"
+            "def bar():\n    // ... unchanged ...\n    pass"
+        )
+        result = json.loads(patch_tool(
+            mode="replace", path="/tmp/f.py", old_string=old, new_string=new,
+        ))
+        assert result.get("error"), (
+            "Adding a second occurrence of a placeholder that already "
+            "existed once must still be blocked: " + str(result)
+        )
+        assert "truncation" in str(result.get("error", "")).lower()
+        mock_get.return_value.patch_replace.assert_not_called()
 
     # -- V4A patch mode ---------------------------------------------------
 
