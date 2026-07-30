@@ -3809,10 +3809,16 @@ def run_conversation(
                     agent.api_mode == "codex_responses"
                     and agent.provider in {"openai-codex", "xai-oauth"}
                     # xAI often returns 403 bad-credentials for a stale access
-                    # token (not only 401). Refresh on both when the classifier
-                    # says auth (spending-limit 403 is billing and is excluded).
+                    # token. Keep the unconditional 401 recovery, but only
+                    # refresh a 403 when the classifier found that stale-token
+                    # signal. Subscription entitlement 403s are also auth
+                    # failures, but refreshing cannot repair them.
                     and status_code in {401, 403}
                     and classified.reason == FailoverReason.auth
+                    and (
+                        status_code == 401
+                        or classified.should_rotate_credential
+                    )
                     and not _retry.codex_auth_retry_attempted
                 ):
                     _retry.codex_auth_retry_attempted = True

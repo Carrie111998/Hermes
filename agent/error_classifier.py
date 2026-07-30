@@ -666,6 +666,10 @@ def classify_api_error(
                                 _metadata_msg = str(_inner_err.get("message") or "").lower()
                     except (json.JSONDecodeError, TypeError):
                         pass
+        elif _err_obj:
+            # xAI OAuth uses a top-level string ``error`` field for both
+            # entitlement and stale-token 403 responses.
+            _body_msg = str(_err_obj).lower()
         if not _body_msg:
             _body_msg = str(body.get("message") or "").lower()
     # Combine all message sources for pattern matching
@@ -1012,12 +1016,13 @@ def _classify_by_status(
             )
         # Default: auth without rotate — preserve historical behaviour for
         # generic providers (see test_non_xai_403_generic_billing_code_remains_auth).
-        # OAuth providers that return 403 for stale access tokens (xAI
-        # ``bad-credentials``, etc.) need rotate/refresh like 401 so long-lived
-        # ACP sessions recover. Billing shapes above already returned.
+        # OAuth providers that return 403 for stale access tokens need
+        # rotate/refresh like 401 so long-lived ACP sessions recover. Gate
+        # rotation on the provider's stale-token body, not provider identity:
+        # xAI also returns auth-classified 403s for subscription entitlement
+        # failures, which a token refresh cannot repair.
         _stale_oauth_403 = (
-            provider in {"xai-oauth", "openai-codex", "nous"}
-            or "bad-credentials" in error_msg
+            "bad-credentials" in error_msg
             or "oauth2 access token could not be validated" in error_msg
             or "wke=unauthenticated" in error_msg
         )

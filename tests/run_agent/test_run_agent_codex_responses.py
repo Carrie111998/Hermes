@@ -775,6 +775,79 @@ def _build_xai_oauth_agent(monkeypatch):
     return agent
 
 
+class _XAIForbiddenError(RuntimeError):
+    status_code = 403
+
+    def __init__(self, message):
+        self.body = {
+            "code": "The caller does not have permission to execute the specified operation",
+            "error": message,
+        }
+        super().__init__(f"Error code: 403 - {self.body!r}")
+
+
+def test_xai_stale_token_403_refreshes_singleton_and_retries(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0, "refresh": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _XAIForbiddenError(
+                "OAuth2 access token could not be validated. "
+                "[WKE=unauthenticated:bad-credentials]"
+            )
+        return _codex_message_response("Recovered after refresh")
+
+    def _refresh(*, force):
+        calls["refresh"] += 1
+        assert force is True
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(
+        agent,
+        "_recover_with_credential_pool",
+        lambda **_kwargs: (False, False),
+    )
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+
+    result = agent.run_conversation("Say OK")
+
+    assert calls == {"api": 2, "refresh": 1}
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered after refresh"
+
+
+def test_xai_entitlement_403_does_not_refresh_singleton(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    calls = {"api": 0, "refresh": 0}
+
+    def _api_call(_api_kwargs):
+        calls["api"] += 1
+        raise _XAIForbiddenError(
+            "You have either run out of available resources or do not have "
+            "an active Grok subscription. Manage at https://grok.com"
+        )
+
+    def _refresh(*, force):
+        calls["refresh"] += 1
+        return True
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+    monkeypatch.setattr(
+        agent,
+        "_recover_with_credential_pool",
+        lambda **_kwargs: (False, False),
+    )
+    monkeypatch.setattr(agent, "_try_refresh_codex_client_credentials", _refresh)
+
+    result = agent.run_conversation("Say OK")
+
+    assert calls == {"api": 1, "refresh": 0}
+    assert result["completed"] is False
+
+
 def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
     """xai-oauth + codex_responses must route prompt caching via the
     ``prompt_cache_key`` body field on /v1/responses (xAI's documented
@@ -1729,7 +1802,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
 
 
 

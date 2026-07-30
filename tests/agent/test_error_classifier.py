@@ -197,7 +197,34 @@ class TestClassifyApiError:
         e = MockAPIError("Forbidden", status_code=403)
         result = classify_api_error(e, provider="anthropic")
         assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is False
         assert result.should_fallback is True
+
+    def test_xai_generic_403_does_not_rotate_credential(self):
+        e = MockAPIError(
+            "Forbidden",
+            status_code=403,
+            body={"code": "permission_denied", "error": "Forbidden"},
+        )
+        result = classify_api_error(e, provider="xai-oauth")
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is False
+
+    def test_xai_stale_token_403_rotates_credential(self):
+        e = MockAPIError(
+            "Forbidden",
+            status_code=403,
+            body={
+                "code": "permission_denied",
+                "error": (
+                    "OAuth2 access token could not be validated. "
+                    "[WKE=unauthenticated:bad-credentials]"
+                ),
+            },
+        )
+        result = classify_api_error(e, provider="xai-oauth")
+        assert result.reason == FailoverReason.auth
+        assert result.should_rotate_credential is True
 
 
 
@@ -1047,6 +1074,5 @@ class TestExpandedOverflowPatterns:
         )
         result = classify_api_error(e, provider="openrouter", model="m")
         assert result.reason == FailoverReason.context_overflow
-
 
 
