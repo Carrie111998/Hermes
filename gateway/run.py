@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Union, cast
+from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -5361,7 +5361,9 @@ class TurnRunner:
                         effective_session_id,
                         title,
                     )
-                elif self._runner._is_discord_auto_thread_lane(ctx.source):
+                elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
+                    self._runner._relay_auto_thread_info(ctx.source) is not None
+                ):
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
@@ -12533,11 +12535,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             served = [active] + sorted(self._profile_adapters.keys())
             # Per-profile PairingStores so authz_mixin can route pairing
             # checks to the right whitelist. The active profile gets a store
-            # at its HERMES_HOME; additional served profiles get one under
-            # profiles/<name>/pairing/. See gateway.pairing.PairingStore.
+            # at its HERMES_HOME; additional served profiles resolve from
+            # their own profile homes. See gateway.pairing.PairingStore.
             for name in served:
                 if name and name not in self.pairing_stores:
-                    self.pairing_stores[name] = PairingStore(profile=name)
+                    self.pairing_stores[name] = (
+                        self.pairing_store
+                        if name == active
+                        else PairingStore(profile=name)
+                    )
             write_runtime_status(served_profiles=served)
         except Exception:
             logger.debug("could not record served_profiles", exc_info=True)
@@ -14032,23 +14038,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 == "pair"
             ):
                 platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                if pairing_store is None:
+                    logger.error(
+                        "Cannot offer pairing code on %s: no pairing store",
+                        platform_name,
+                    )
+                    return None
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if pairing_store._is_rate_limited(platform_name, source.user_id):
                     return None
-                code = self.pairing_store.generate_code(
+                code = pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
                     adapter = self._adapter_for_source(source)
                     if adapter:
+                        store_profile = getattr(pairing_store, "profile", None)
+                        profile_arg = (
+                            f"-p {store_profile} "
+                            if isinstance(store_profile, str)
+                            and store_profile
+                            and store_profile != "default"
+                            else ""
+                        )
                         await adapter.send(
                             source.chat_id,
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`"
+                            f"`hermes {profile_arg}pairing approve "
+                            f"{platform_name} {code}`"
                         )
                 else:
                     adapter = self._adapter_for_source(source)
@@ -14059,7 +14081,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
         # Intercept messages that are responses to a pending /update prompt.
@@ -17645,7 +17667,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
-                            history_media_paths=_collect_history_media_paths(history),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -18748,7 +18769,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
-        history_media_paths: Optional[set] = None,
     ) -> None:
         """Extract explicit MEDIA: tags from a response and deliver them.
 
@@ -18786,15 +18806,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # require validated local files before upload.
             if event.source.platform != Platform.VOICE_SERVER:
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            # Deduplicate against media already delivered in prior turns —
-            # the model may echo a previous turn's MEDIA: tag in a later
-            # response; without this guard the same file is re-sent.
-            if history_media_paths:
-                media_files = [
-                    (path, is_voice)
-                    for path, is_voice in media_files
-                    if path not in history_media_paths
-                ]
+            # Do NOT deduplicate explicit MEDIA tags against prior turns here
+            # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
+            # a MEDIA: directive in the final streamed reply is the model
+            # deliberately attaching a file — including a user-requested
+            # resend. Stale auto-appended tags are deduped upstream in
+            # _collect_auto_append_media_tags with history_media_paths.
+            # Mirrors the same filter removal on the non-streaming path in
+            # gateway/platforms/base.py.
             # Strip image URLs from the cleaned text for parity with the
             # non-streaming chain, but do NOT run extract_local_files here:
             # post-stream delivery is explicit-only (#20834). Bare local paths
@@ -19221,6 +19240,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
+    def _relay_auto_thread_info(
+        self, source: SessionSource
+    ) -> Optional[Tuple[str, str]]:
+        """(thread_id, initial_name) when the RELAY connector auto-threaded our
+        reply to this source's chat — the title-turn sibling of
+        _is_discord_auto_thread_lane.
+
+        The marker-based check above only lights up for events ARRIVING IN an
+        auto-created thread (turn 2+). The auto-title fires on the FIRST
+        exchange, whose source is the PARENT channel event — the thread did
+        not exist at ingest, so no markers can be present and the native lane
+        check never matches on the relay title turn (staging repro
+        2026-07-29: initial titles fine, semantic renames never happened).
+        The connector reports where the reply actually landed on the send
+        result (contract §SendResult thread_id/auto_thread_name); the relay
+        adapter caches it per chat and this reads it back.
+        """
+        if source.platform != Platform.DISCORD or not source.chat_id:
+            return None
+        if not getattr(source, "delivered_via_upstream_relay", False):
+            return None
+        adapter = self._adapter_for_source(source)
+        info_fn = getattr(adapter, "auto_thread_info_for_chat", None)
+        if not callable(info_fn):
+            return None
+        try:
+            info = info_fn(str(source.chat_id))
+            if (
+                isinstance(info, tuple)
+                and len(info) == 2
+                and all(isinstance(x, str) for x in info)
+            ):
+                return cast(Tuple[str, str], info)
+            return None
+        except Exception:
+            return None
+
     def _sanitize_discord_thread_title(self, title: str) -> str:
         """Return a Discord-safe semantic thread title from a session title.
 
@@ -19240,9 +19296,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        relay_info: Optional[Tuple[str, str]] = None,
     ) -> None:
-        """Best-effort semantic rename of a newly auto-created Discord thread."""
-        if not await asyncio.to_thread(self._is_discord_auto_thread_lane, source):
+        """Best-effort semantic rename of a newly auto-created Discord thread.
+
+        ``relay_info`` is the (thread_id, initial_name) pair from the relay
+        connector's send-result feedback — supplied on the title turn, where
+        the source is the parent-channel event and carries no auto-thread
+        markers (see _relay_auto_thread_info). When absent, the native
+        marker-based lane supplies thread identity from the source itself.
+        """
+        if relay_info is None and not await asyncio.to_thread(
+            self._is_discord_auto_thread_lane, source
+        ):
             return
         adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
         if adapter is None:
@@ -19250,12 +19316,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         rename_thread = getattr(adapter, "rename_thread", None)
         if rename_thread is None:
             return
+        target_thread_id = relay_info[0] if relay_info else str(source.thread_id)
+        guard_name = (
+            relay_info[1]
+            if relay_info
+            else getattr(source, "auto_thread_initial_name", None)
+        )
         thread_name = self._sanitize_discord_thread_title(title)
         try:
             await rename_thread(
-                str(source.thread_id),
+                target_thread_id,
                 thread_name,
-                only_if_current_name=getattr(source, "auto_thread_initial_name", None),
+                only_if_current_name=guard_name,
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
@@ -19267,8 +19339,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Schedule Discord auto-thread rename from the auto-title background thread."""
-        if not title or not self._is_discord_auto_thread_lane(source):
+        relay_info = None
+        if not title:
             return
+        if not self._is_discord_auto_thread_lane(source):
+            # Relay title turn: the source is the PARENT channel event (the
+            # thread didn't exist at ingest, so no auto-thread markers). The
+            # connector's send-result feedback tells us where the reply landed.
+            relay_info = self._relay_auto_thread_info(source)
+            if relay_info is None:
+                return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -19280,7 +19360,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
-            self._rename_discord_auto_thread_for_session_title(copied_source, session_id, title),
+            self._rename_discord_auto_thread_for_session_title(
+                copied_source, session_id, title, relay_info=relay_info
+            ),
             loop,
             logger=logger,
             log_message="Discord semantic thread rename failed to schedule",
