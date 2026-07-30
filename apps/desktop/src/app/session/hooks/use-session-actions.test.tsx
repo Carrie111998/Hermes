@@ -513,7 +513,12 @@ async function createWith(
 }
 
 describe('startFreshSessionDraft', () => {
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    setActiveSessionId(null)
+    setSelectedStoredSessionId(null)
+    setSessions([])
+  })
 
   it('can reset machine-bound session state without closing the current overlay route', async () => {
     const navigate = vi.fn()
@@ -552,6 +557,50 @@ describe('startFreshSessionDraft', () => {
 
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
     expect($terminalTakeover.get()).toBe(true)
+  })
+
+  it('closes the old live runtime so the backend commits the session boundary', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId="runtime-old"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-old"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => handle!.startFreshSessionDraft())
+
+    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-old' }))
+    expect($activeSessionId.get()).toBeNull()
+    expect($selectedStoredSessionId.get()).toBeNull()
+  })
+
+  it('closes an archived session runtime before hiding its durable row', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        activeSessionId="runtime-old"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-old"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('stored-old')
+    })
+
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-old' })
   })
 })
 
