@@ -1487,7 +1487,8 @@ export const en: Translations = {
       title: 'Automatic reply policy',
       description: 'Decide which messages may reach the agent before any reply is generated or sent.',
       categoriesTitle: 'Message categories',
-      categoriesDescription: 'These high-risk or machine-generated categories stay blocked unless you explicitly allow them.',
+      categoriesDescription:
+        'Category filtering uses approximate heuristic regexes. Disabling a category does not guarantee its messages will never reach the Agent; only local regex matches are blocked first.',
       allowCategory: 'Allow automatic replies',
       promotions: 'Promotions',
       newsletters: 'Newsletters and digests',
@@ -1497,7 +1498,8 @@ export const en: Translations = {
       calendar: 'Calendar notices',
       reports: 'Recurring reports',
       keywordsTitle: 'Keyword rules',
-      keywordsDescription: 'Rules are checked before the agent. Put one group on each line.',
+      keywordsDescription:
+        'Manual keyword groups use local literal matching and are not added to the Agent prompt.',
       neverReply: 'Never reply',
       neverReplyDescription: 'Matching messages are always blocked, even when another rule asks for a reply.',
       mustReply: 'Must reply',
@@ -1505,6 +1507,9 @@ export const en: Translations = {
       keywordPlaceholder: 'One keyword group per line',
       keywordSyntax: 'Use + when every term must match. Separate lines are alternatives.',
       clearKeywords: 'Clear keyword rules',
+      keywordConflictTitle: 'Conflicting keyword rule',
+      keywordConflictDescription: group =>
+        `"${group}" cannot be both must-reply and never-reply. Remove it from one list.`,
       decisionTitle: 'Agent decision',
       strictDecision: 'Require a structured reply decision',
       strictDecisionDescription: 'Only send when the model returns valid structured output with need_response: true.',

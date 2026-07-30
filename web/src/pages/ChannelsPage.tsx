@@ -95,6 +95,29 @@ const EMAIL_POLICY_KEYS = new Set([
   "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
 ]);
 
+function normalizedKeywordGroups(raw: string): Map<string, string> {
+  const groups = new Map<string, string>();
+  for (const rawGroup of raw.split(/[\n;]+/)) {
+    const terms = rawGroup
+      .split(/\s*(?:\+|&&)\s*/)
+      .map((term) => term.trim().toLocaleLowerCase())
+      .filter(Boolean)
+      .sort();
+    if (terms.length > 0) {
+      groups.set(terms.join("\u0000"), terms.join("+"));
+    }
+  }
+  return groups;
+}
+
+function replyKeywordConflict(forceReply: string, neverReply: string) {
+  const denyGroups = normalizedKeywordGroups(neverReply);
+  for (const [key, label] of normalizedKeywordGroups(forceReply)) {
+    if (denyGroups.has(key)) return label;
+  }
+  return null;
+}
+
 function validateMessagingEnvField(field: MessagingPlatformEnvVar, value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
@@ -234,6 +257,19 @@ export default function ChannelsPage() {
 
   const handleSave = async () => {
     if (!editing) return;
+    if (editing.id === "email") {
+      const conflict = replyKeywordConflict(
+        draftEnv.EMAIL_FORCE_REPLY_KEYWORDS || "",
+        draftEnv.EMAIL_NO_REPLY_KEYWORDS || "",
+      );
+      if (conflict) {
+        showToast(
+          `${emailCopy.neverReply} ↔ ${emailCopy.mustReply}: "${conflict}"`,
+          "error",
+        );
+        return;
+      }
+    }
     // Only send fields the user touched. Untouched blanks preserve existing
     // secrets, while clearing a touched keyword field removes that rule.
     const env: Record<string, string> = {};
@@ -663,9 +699,13 @@ export default function ChannelsPage() {
                         <h4 className="text-xs font-medium">
                           {emailCopy.categoriesTitle}
                         </h4>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          {emailCopy.categoriesDescription}
-                        </p>
+                        <div
+                          className="mt-2 flex items-start gap-2 border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-800 dark:text-amber-200"
+                          role="note"
+                        >
+                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                          <p>{emailCopy.categoriesDescription}</p>
+                        </div>
                       </div>
                       <div className="grid gap-2 sm:grid-cols-2">
                         {EMAIL_CATEGORY_FIELDS.map(([key, labelKey]) => {

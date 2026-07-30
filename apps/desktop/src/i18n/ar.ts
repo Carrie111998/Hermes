@@ -1297,7 +1297,8 @@ export const ar = defineLocale({
       title: 'سياسة الرد التلقائي',
       description: 'حدّد الرسائل التي يمكنها الوصول إلى الوكيل قبل إنشاء أي رد أو إرساله.',
       categoriesTitle: 'فئات الرسائل',
-      categoriesDescription: 'تُحظر الرسائل الترويجية والآلية افتراضيا ولا يُسمح بالرد عليها إلا عند تفعيلها صراحة.',
+      categoriesDescription:
+        'يستخدم ترشيح الفئات تعبيرات نمطية استدلالية تقريبية. تعطيل فئة لا يضمن عدم وصول محتواها إلى الوكيل؛ لا يُحظر مسبقا إلا التطابق المحلي.',
       allowCategory: 'السماح بالرد التلقائي',
       promotions: 'العروض الترويجية',
       newsletters: 'النشرات والملخصات',
@@ -1307,7 +1308,8 @@ export const ar = defineLocale({
       calendar: 'إشعارات التقويم',
       reports: 'التقارير الدورية',
       keywordsTitle: 'قواعد الكلمات المفتاحية',
-      keywordsDescription: 'تُفحص القواعد قبل الوكيل. ضع مجموعة واحدة في كل سطر.',
+      keywordsDescription:
+        'تُطابق مجموعات الكلمات اليدوية محليا فقط ولا تُضاف إلى مطالبة الوكيل.',
       neverReply: 'عدم الرد أبدا',
       neverReplyDescription: 'تُحظر الرسائل المطابقة دائما حتى إذا طلبت قاعدة أخرى الرد.',
       mustReply: 'يجب الرد',
@@ -1315,6 +1317,9 @@ export const ar = defineLocale({
       keywordPlaceholder: 'مجموعة كلمات في كل سطر',
       keywordSyntax: 'استخدم + لاشتراط تطابق جميع الكلمات؛ والأسطر بدائل مستقلة.',
       clearKeywords: 'مسح قواعد الكلمات',
+      keywordConflictTitle: 'تعارض في قاعدة الكلمات',
+      keywordConflictDescription: group =>
+        `لا يمكن تعيين «${group}» للرد الإلزامي وعدم الرد معا. احذفها من إحدى القائمتين.`,
       decisionTitle: 'قرار الوكيل',
       strictDecision: 'اشتراط قرار رد منظّم',
       strictDecisionDescription: 'لا يُرسل الرد إلا عند إرجاع بنية صالحة تحتوي need_response: true.',

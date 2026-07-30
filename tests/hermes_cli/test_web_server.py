@@ -911,6 +911,8 @@ class TestWebServerEndpoints:
         )
 
     def test_email_reply_keywords_round_trip_unicode(self):
+        must_reply_input = "紧急+发票\n\n请尽快回复"
+        no_reply_input = "推广\r\n验证码"
         must_reply = "紧急+发票;请尽快回复"
         no_reply = "推广;验证码"
 
@@ -918,8 +920,8 @@ class TestWebServerEndpoints:
             "/api/messaging/platforms/email",
             json={
                 "env": {
-                    "EMAIL_FORCE_REPLY_KEYWORDS": must_reply,
-                    "EMAIL_NO_REPLY_KEYWORDS": no_reply,
+                    "EMAIL_FORCE_REPLY_KEYWORDS": must_reply_input,
+                    "EMAIL_NO_REPLY_KEYWORDS": no_reply_input,
                 }
             },
         )
@@ -933,6 +935,39 @@ class TestWebServerEndpoints:
         }
         assert fields["EMAIL_FORCE_REPLY_KEYWORDS"]["current_value"] == must_reply
         assert fields["EMAIL_NO_REPLY_KEYWORDS"]["current_value"] == no_reply
+
+    def test_email_reply_keywords_reject_semantic_cross_list_duplicates(self):
+        saved = self.client.put(
+            "/api/messaging/platforms/email",
+            json={
+                "env": {
+                    "EMAIL_FORCE_REPLY_KEYWORDS": "Invoice + Overdue;urgent",
+                },
+                "clear_env": ["EMAIL_NO_REPLY_KEYWORDS"],
+            },
+        )
+        assert saved.status_code == 200
+
+        rejected = self.client.put(
+            "/api/messaging/platforms/email",
+            json={
+                "env": {
+                    "EMAIL_NO_REPLY_KEYWORDS": " overdue && invoice ",
+                }
+            },
+        )
+        assert rejected.status_code == 400
+        assert "cannot be both" in rejected.json()["detail"]
+
+        resp = self.client.get("/api/messaging/platforms")
+        platforms = {row["id"]: row for row in resp.json()["platforms"]}
+        fields = {
+            field["key"]: field for field in platforms["email"]["env_vars"]
+        }
+        assert fields["EMAIL_FORCE_REPLY_KEYWORDS"]["current_value"] == (
+            "Invoice + Overdue;urgent"
+        )
+        assert fields["EMAIL_NO_REPLY_KEYWORDS"]["current_value"] == ""
 
 
 

@@ -23,7 +23,7 @@ import {
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { openExternalLink } from '@/lib/external-link'
-import { ExternalLink, Save, Trash2 } from '@/lib/icons'
+import { AlertTriangle, ExternalLink, Save, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { $changeEventsAvailable, $pairingChangeTick, $platformsChangeTick } from '@/store/live-sync'
@@ -87,6 +87,32 @@ const trimEdits = (edits: Record<string, string>): Record<string, string> =>
       ])
       .filter(([, v]) => v)
   )
+
+function normalizedKeywordGroups(raw: string): Map<string, string> {
+  const groups = new Map<string, string>()
+  for (const rawGroup of raw.split(/[\n;]+/)) {
+    const terms = rawGroup
+      .split(/\s*(?:\+|&&)\s*/)
+      .map(term => term.trim().toLocaleLowerCase())
+      .filter(Boolean)
+      .sort()
+    if (terms.length > 0) {
+      groups.set(terms.join('\u0000'), terms.join('+'))
+    }
+  }
+  return groups
+}
+
+function replyKeywordConflict(forceReply: string, neverReply: string): string | null {
+  const forceGroups = normalizedKeywordGroups(forceReply)
+  const denyGroups = normalizedKeywordGroups(neverReply)
+  for (const [key, label] of forceGroups) {
+    if (denyGroups.has(key)) {
+      return label
+    }
+  }
+  return null
+}
 
 /** Stable row identity: a user id is only unique within its platform. */
 const pairingKey = (user: PairingUser) => `${user.platform}:${user.user_id}`
@@ -328,7 +354,26 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   }
 
   async function handleSave(platform: MessagingPlatformInfo) {
-    const env = trimEdits(edits[platform.id] || {})
+    const platformEdits = edits[platform.id] || {}
+    if (platform.id === 'email') {
+      const effectiveValue = (key: string) => {
+        if (Object.hasOwn(platformEdits, key)) {
+          return platformEdits[key]
+        }
+        const field = platform.env_vars.find(candidate => candidate.key === key)
+        return field?.current_value || field?.default_value || ''
+      }
+      const conflict = replyKeywordConflict(
+        effectiveValue('EMAIL_FORCE_REPLY_KEYWORDS'),
+        effectiveValue('EMAIL_NO_REPLY_KEYWORDS')
+      )
+      if (conflict) {
+        notifyError(new Error(m.emailPolicy.keywordConflictDescription(conflict)), m.emailPolicy.keywordConflictTitle)
+        return
+      }
+    }
+
+    const env = trimEdits(platformEdits)
 
     if (Object.keys(env).length === 0) {
       return
@@ -809,7 +854,13 @@ function EmailReplyPolicy({
       <div className="space-y-5 p-4">
         <div>
           <h5 className="text-xs font-medium text-foreground">{copy.categoriesTitle}</h5>
-          <p className="mt-1 text-xs leading-5 text-(--ui-text-tertiary)">{copy.categoriesDescription}</p>
+          <div
+            className="mt-2 flex items-start gap-2 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-800 dark:text-amber-200"
+            role="note"
+          >
+            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+            <p>{copy.categoriesDescription}</p>
+          </div>
           <div className="mt-3 grid gap-2 sm:grid-cols-2">
             {EMAIL_CATEGORY_FIELDS.map(([key, labelKey]) => {
               const field = fieldMap.get(key)
