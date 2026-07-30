@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -845,6 +846,83 @@ class TestSkillDirectoryHeader:
         assert "scripts/safe.py" in msg
         assert "redirected/payload.py" not in msg
         assert str(external / "payload.py") not in msg
+
+    def test_fallback_keeps_directory_symlink_within_skill_root(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_dir = _make_skill(skills_root, "internal-link")
+        internal = skill_dir / "internal"
+        internal.mkdir()
+        (internal / "ok.py").write_text("print('safe')")
+        try:
+            (skill_dir / "scripts").symlink_to(internal, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+        loaded = {
+            "success": True,
+            "name": "internal-link",
+            "content": "Do the thing.",
+            "skill_dir": str(skill_dir),
+            "linked_files": {},
+        }
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch("tools.skills_tool.skill_view", return_value=json.dumps(loaded)),
+        ):
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/internal-link")
+
+        assert msg is not None
+        assert "scripts/ok.py" in msg or "scripts\\ok.py" in msg
+        assert str(skill_dir / "scripts" / "ok.py") in msg
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="Windows junction support required",
+    )
+    def test_redirected_junctions_stay_out_of_discovery_and_invocation(
+        self, tmp_path
+    ):
+        external = tmp_path / "external"
+        external_scripts = external / "scripts"
+        external_references = external / "references"
+        external_scripts.mkdir(parents=True)
+        external_references.mkdir()
+        (external_scripts / "payload.py").write_text("PRIVATE_KEY = 'MATERIAL'")
+        (external_references / "secret.md").write_text("secret")
+
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        skill_dir = _make_skill(skills_root, "junctions")
+        for name, target in (
+            ("scripts", external_scripts),
+            ("references", external_references),
+        ):
+            subprocess.run(
+                [
+                    "cmd.exe",
+                    "/c",
+                    "mklink",
+                    "/J",
+                    str(skill_dir / name),
+                    str(target),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_root):
+            loaded = json.loads(skills_tool_module.skill_view("junctions"))
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/junctions")
+
+        linked_files = json.dumps(loaded["linked_files"])
+        assert "payload.py" not in linked_files
+        assert "secret.md" not in linked_files
+        assert msg is not None
+        assert "payload.py" not in msg
+        assert "secret.md" not in msg
 
 
 class TestTemplateVarSubstitution:

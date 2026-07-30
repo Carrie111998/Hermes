@@ -292,13 +292,9 @@ def _build_skill_message(
     if not supporting and skill_dir:
         for subdir in ("references", "templates", "scripts", "assets"):
             subdir_path = skill_dir / subdir
-            # Skip missing/redirected dirs so rglob cannot walk host paths
-            # via a malicious scripts/ (etc.) directory symlink or junction.
             if not subdir_path.exists():
                 continue
-            if subdir_path.is_symlink() or (
-                hasattr(subdir_path, "is_junction") and subdir_path.is_junction()
-            ):
+            if validate_within_dir(subdir_path, skill_dir):
                 continue
             for f in sorted(subdir_path.rglob("*")):
                 if not f.is_file() or f.is_symlink():
