@@ -122,3 +122,49 @@ class TestLocalReplayStripAndPreserve:
         src = {"role": "user", "content": "hi", "reasoning_content": "junk"}
         api_msg = _replay(agent, src)
         assert api_msg["reasoning_content"] == "junk"
+
+
+class TestCustomProviderResolution:
+    """Named custom endpoints resolve to runtime provider == "custom"
+    (hermes_cli/runtime_provider.py), never the config key. The flag must be
+    recovered through the configured base_url. Regression for the sweeper
+    finding on the initial revision of this fix.
+    """
+
+    CFG = {"llamacpp-k3": {"base_url": "http://127.0.0.1:8091/v1",
+                           "reasoning_replay": True}}
+
+    def test_custom_runtime_label_matches_by_base_url(self, monkeypatch) -> None:
+        _patch_config(monkeypatch, dict(self.CFG))
+        agent = _make_agent(provider="custom",
+                            base_url="http://127.0.0.1:8091/v1")
+        assert agent._provider_reasoning_replay_configured() is True
+
+    def test_base_url_normalization_trailing_slash(self, monkeypatch) -> None:
+        _patch_config(monkeypatch, dict(self.CFG))
+        agent = _make_agent(provider="custom",
+                            base_url="http://127.0.0.1:8091/v1/")
+        assert agent._provider_reasoning_replay_configured() is True
+
+    def test_custom_no_base_url_match_stays_off(self, monkeypatch) -> None:
+        _patch_config(monkeypatch, dict(self.CFG))
+        agent = _make_agent(provider="custom",
+                            base_url="http://127.0.0.1:9999/v1")
+        assert agent._provider_reasoning_replay_configured() is False
+
+    def test_custom_match_without_flag_stays_off(self, monkeypatch) -> None:
+        _patch_config(monkeypatch, {"llamacpp-k3":
+                                    {"base_url": "http://127.0.0.1:8091/v1"}})
+        agent = _make_agent(provider="custom",
+                            base_url="http://127.0.0.1:8091/v1")
+        assert agent._provider_reasoning_replay_configured() is False
+
+    def test_custom_replay_preserved_end_to_end(self, monkeypatch) -> None:
+        _patch_config(monkeypatch, dict(self.CFG))
+        agent = _make_agent(provider="custom",
+                            base_url="http://127.0.0.1:8091/v1")
+        src = {"role": "assistant", "content": "calling a tool",
+               "reasoning_content": "chain of thought"}
+        api_msg = dict(src)
+        copy_reasoning_content_for_api(agent, src, api_msg)
+        assert api_msg["reasoning_content"] == "chain of thought"

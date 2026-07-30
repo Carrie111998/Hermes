@@ -6639,10 +6639,28 @@ class AIAgent:
             cfg = load_config_readonly() or {}
         except Exception:
             return False
-        entry = (cfg.get("providers") or {}).get(self.provider)
-        if not isinstance(entry, dict):
+        providers_cfg = cfg.get("providers")
+        if not isinstance(providers_cfg, dict):
             return False
-        return bool(entry.get("reasoning_replay", False))
+        # Direct name match covers built-in named providers (e.g. "ollama"),
+        # whose runtime provider label equals the config key.
+        entry = providers_cfg.get(self.provider)
+        if isinstance(entry, dict):
+            return bool(entry.get("reasoning_replay", False))
+        # Named custom endpoints resolve to runtime provider == "custom"
+        # (hermes_cli/runtime_provider.py), which never equals the config key.
+        # Recover the selected entry by matching the configured base_url
+        # against the agent's active base_url instead. No match keeps the
+        # strip-by-default behavior.
+        def _norm(url):
+            return url.strip().rstrip("/").lower() if isinstance(url, str) else ""
+        base = _norm(getattr(self, "base_url", ""))
+        if not base:
+            return False
+        for e in providers_cfg.values():
+            if isinstance(e, dict) and _norm(e.get("base_url")) == base:
+                return bool(e.get("reasoning_replay", False))
+        return False
 
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
