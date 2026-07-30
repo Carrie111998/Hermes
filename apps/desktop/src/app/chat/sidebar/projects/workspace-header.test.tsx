@@ -1,9 +1,15 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { StartWorkButton, WorkspaceAddButton, WorkspaceMenu, WorkspaceShowMoreButton } from './workspace-header'
 
+const isDesktopFsRemoteMode = vi.hoisted(() => vi.fn(() => false))
+
 afterEach(cleanup)
+
+beforeEach(() => {
+  isDesktopFsRemoteMode.mockReturnValue(false)
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -27,6 +33,10 @@ vi.mock('@/store/projects', () => ({
   revealPath: vi.fn()
 }))
 
+vi.mock('@/lib/desktop-fs', () => ({
+  isDesktopFsRemoteMode
+}))
+
 // StartWorkButton renders the full WorktreeDialog (branch picker, git combobox,
 // etc.) as soon as it's open — none of that is relevant to the tooltip fix, so
 // stub it to keep this test focused on the trigger button.
@@ -35,6 +45,12 @@ vi.mock('./worktree-dialog', () => ({
 }))
 
 const tipTrigger = (button: HTMLElement) => button.closest('[data-slot="tooltip-trigger"]')
+
+const openTriggerMenu = (trigger: HTMLElement) => {
+  fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+  fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+  fireEvent.click(trigger)
+}
 
 describe('WorkspaceAddButton', () => {
   it('wraps the "+" button in a Tip', () => {
@@ -68,6 +84,25 @@ describe('WorkspaceMenu', () => {
 
     const button = screen.getByRole('button', { name: 'Actions' })
     expect(tipTrigger(button)).toBeNull()
+  })
+
+  it('keeps reveal and copy path actions in local mode', async () => {
+    render(<WorkspaceMenu onRemove={vi.fn()} path="/repo/lane" />)
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(await screen.findByRole('menuitem', { name: 'Reveal in file manager' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Copy path' })).toBeTruthy()
+  })
+
+  it('hides reveal but keeps copy path in remote mode', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    render(<WorkspaceMenu onRemove={vi.fn()} path="/repo/lane" />)
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(await screen.findByRole('menuitem', { name: 'Copy path' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Reveal in file manager' })).toBeNull()
   })
 })
 

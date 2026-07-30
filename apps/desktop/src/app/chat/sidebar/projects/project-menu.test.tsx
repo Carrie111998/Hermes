@@ -1,10 +1,16 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ProjectMenu } from './project-menu'
 import type { SidebarProjectTree } from './workspace-groups'
 
+const isDesktopFsRemoteMode = vi.hoisted(() => vi.fn(() => false))
+
 afterEach(cleanup)
+
+beforeEach(() => {
+  isDesktopFsRemoteMode.mockReturnValue(false)
+})
 
 // jsdom doesn't implement ResizeObserver; Radix's PopoverContent/Arrow use it
 // (via @radix-ui/react-use-size) to measure the arrow once the popover is
@@ -55,6 +61,10 @@ vi.mock('@/store/layout', () => ({
     }
   },
   dismissAutoProject: vi.fn()
+}))
+
+vi.mock('@/lib/desktop-fs', () => ({
+  isDesktopFsRemoteMode
 }))
 
 vi.mock('@/store/projects', () => ({
@@ -115,4 +125,23 @@ describe('ProjectMenu', () => {
     // chain rather than getting silently dropped on an intermediate wrapper.
     expect(await screen.findByRole('button', { name: 'No color' })).toBeTruthy()
   }, 15000)
+
+  it('keeps reveal and copy path actions in local mode', async () => {
+    render(<ProjectMenu isActive={false} project={project} />)
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(await screen.findByRole('menuitem', { name: 'Reveal in file manager' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'Copy path' })).toBeTruthy()
+  })
+
+  it('hides reveal but keeps copy path in remote mode', async () => {
+    isDesktopFsRemoteMode.mockReturnValue(true)
+    render(<ProjectMenu isActive={false} project={project} />)
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(await screen.findByRole('menuitem', { name: 'Copy path' })).toBeTruthy()
+    expect(screen.queryByRole('menuitem', { name: 'Reveal in file manager' })).toBeNull()
+  })
 })

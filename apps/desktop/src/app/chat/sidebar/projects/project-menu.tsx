@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { useI18n } from '@/i18n'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { cn } from '@/lib/utils'
 import { $panesFlipped, dismissAutoProject } from '@/store/layout'
 import {
@@ -56,6 +57,7 @@ function useProjectActions({
   const p = t.sidebar.projects
   const target = { id: project.id, name: project.label }
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
+  const localFs = !isDesktopFsRemoteMode()
 
   const removeAuto = () => {
     dismissAutoProject(project.id)
@@ -96,13 +98,17 @@ function useProjectActions({
       ]
 
   const pathItems: ActionItemSpec[] = [
-    {
-      disabled: !project.path,
-      icon: 'folder-opened',
-      key: 'reveal',
-      label: p.reveal,
-      onSelect: () => void revealPath(project.path)
-    },
+    ...(localFs
+      ? [
+          {
+            disabled: !project.path,
+            icon: 'folder-opened' as const,
+            key: 'reveal',
+            label: p.reveal,
+            onSelect: () => void revealPath(project.path)
+          }
+        ]
+      : []),
     {
       disabled: !project.path,
       icon: 'copy',

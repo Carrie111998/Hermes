@@ -6,6 +6,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
+import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { cn } from '@/lib/utils'
 import { copyPath, revealPath } from '@/store/projects'
 
@@ -83,16 +84,18 @@ export function WorkspaceShowMoreButton({
 function useWorkspaceItems({ path, onRemove }: { path: null | string; onRemove: () => void }) {
   const { t } = useI18n()
   const p = t.sidebar.projects
+  const localFs = !isDesktopFsRemoteMode()
 
   return (kit: MenuKit) => (
     <>
-      {renderActionItem(kit, {
-        disabled: !path,
-        icon: 'folder-opened',
-        key: 'reveal',
-        label: p.reveal,
-        onSelect: () => void revealPath(path)
-      })}
+      {localFs &&
+        renderActionItem(kit, {
+          disabled: !path,
+          icon: 'folder-opened',
+          key: 'reveal',
+          label: p.reveal,
+          onSelect: () => void revealPath(path)
+        })}
       {renderActionItem(kit, {
         disabled: !path,
         icon: 'copy',
