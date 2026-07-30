@@ -2,7 +2,7 @@
 name: hermes-ngit
 description: Work with Nostr Git repos via ngit and gitworkshop.
 version: 1.1.0
-author: Joey Stanford
+author: Joey Stanford (@rinchen)
 license: CC-BY-SA-4.0
 platforms: [linux, macos]
 compatibility: "ngit installed (gitworkshop.dev/ngit) with git-remote-nostr on PATH; an identity configured via `git config --global nostr.nsec` or a bunker reference. No daemon required. Optional: `gh` CLI for GitHub mirroring."
@@ -10,7 +10,6 @@ metadata:
   hermes:
     tags: [Nostr, Git, ngit, Decentralized, gitworkshop]
     category: devops
-    related_skills: [hermes-radicle]
     requires_toolsets: [terminal]
 ---
 

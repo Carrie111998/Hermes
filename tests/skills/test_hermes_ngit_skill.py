@@ -11,7 +11,6 @@ import re
 from pathlib import Path
 
 import pytest
-import yaml
 
 SKILL_DIR = (
     Path(__file__).resolve().parents[2]
@@ -32,16 +31,32 @@ REQUIRED_SECTIONS = (
 )
 
 
+def _frontmatter_block(skill_text: str) -> str:
+    m = re.search(r"^---\n(.*?)\n---", skill_text, re.DOTALL)
+    assert m, "SKILL.md missing YAML frontmatter"
+    return m.group(1)
+
+
+def _fm_scalar(frontmatter: str, key: str) -> str:
+    m = re.search(rf"^{re.escape(key)}:\s*(.+)$", frontmatter, re.MULTILINE)
+    assert m, f"missing frontmatter field: {key}"
+    return m.group(1).strip().strip('"').strip("'")
+
+
+def _fm_list(frontmatter: str, key: str) -> list[str]:
+    m = re.search(rf"^{re.escape(key)}:\s*\[([^\]]*)\]", frontmatter, re.MULTILINE)
+    assert m, f"missing frontmatter list field: {key}"
+    return [item.strip().strip('"').strip("'") for item in m.group(1).split(",") if item.strip()]
+
+
 @pytest.fixture(scope="module")
 def skill_text() -> str:
     return SKILL_MD.read_text(encoding="utf-8")
 
 
 @pytest.fixture(scope="module")
-def frontmatter(skill_text: str) -> dict:
-    m = re.search(r"^---\n(.*?)\n---", skill_text, re.DOTALL)
-    assert m, "SKILL.md missing YAML frontmatter"
-    return yaml.safe_load(m.group(1))
+def frontmatter(skill_text: str) -> str:
+    return _frontmatter_block(skill_text)
 
 
 def test_skill_dir_exists() -> None:
@@ -57,34 +72,37 @@ def test_license_and_notice_present() -> None:
     assert (SKILL_DIR / "NOTICE").is_file()
 
 
-def test_description_under_60_chars(frontmatter: dict) -> None:
-    desc = frontmatter["description"]
-    assert isinstance(desc, str)
+def test_description_under_60_chars(frontmatter: str) -> None:
+    desc = _fm_scalar(frontmatter, "description")
     assert desc.endswith("."), f"description must end with a period: {desc!r}"
     assert len(desc) <= 60, f"description is {len(desc)} chars (limit ≤60): {desc!r}"
 
 
-def test_name_matches_dir(frontmatter: dict) -> None:
-    assert frontmatter["name"] == "hermes-ngit"
+def test_name_matches_dir(frontmatter: str) -> None:
+    assert _fm_scalar(frontmatter, "name") == "hermes-ngit"
 
 
-def test_has_required_frontmatter_fields(frontmatter: dict) -> None:
+def test_has_required_frontmatter_fields(frontmatter: str) -> None:
     for field in ("name", "description", "version", "author", "license", "platforms"):
-        assert field in frontmatter, f"missing required field: {field}"
+        assert re.search(rf"^{re.escape(field)}:", frontmatter, re.MULTILINE), (
+            f"missing required field: {field}"
+        )
 
 
-def test_platforms_are_posix_desktop(frontmatter: dict) -> None:
-    platforms = frontmatter["platforms"]
+def test_platforms_are_posix_desktop(frontmatter: str) -> None:
+    platforms = _fm_list(frontmatter, "platforms")
     assert set(platforms) == {"linux", "macos"}
     assert "windows" not in platforms
 
 
-def test_license_cc_by_sa(frontmatter: dict) -> None:
-    assert frontmatter["license"] == "CC-BY-SA-4.0"
+def test_license_cc_by_sa(frontmatter: str) -> None:
+    assert _fm_scalar(frontmatter, "license") == "CC-BY-SA-4.0"
 
 
-def test_author_credits_contributor(frontmatter: dict) -> None:
-    assert "Joey Stanford" in frontmatter["author"]
+def test_author_credits_contributor(frontmatter: str) -> None:
+    author = _fm_scalar(frontmatter, "author")
+    assert "Joey Stanford" in author
+    assert "@rinchen" in author
 
 
 def test_credits_dan_conway(skill_text: str) -> None:
