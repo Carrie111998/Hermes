@@ -1116,6 +1116,7 @@ class Attachment:
     content_type: Optional[str]
     size: int
     uploaded_by: Optional[str]
+    content_sha256: Optional[str]
     created_at: int
 
 
@@ -1249,6 +1250,31 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS telemetry_review_runs (
+    review_id               TEXT PRIMARY KEY,
+    board_slug              TEXT NOT NULL,
+    window_end              INTEGER NOT NULL,
+    event_id_low_exclusive  INTEGER NOT NULL,
+    event_id_high_inclusive INTEGER NOT NULL,
+    generated_at            INTEGER NOT NULL,
+    status                  TEXT NOT NULL,
+    json_path               TEXT,
+    markdown_path           TEXT
+);
+
+CREATE TABLE IF NOT EXISTS telemetry_review_findings (
+    finding_key       TEXT PRIMARY KEY,
+    rule_id           TEXT NOT NULL,
+    board_slug        TEXT NOT NULL,
+    subject_json      TEXT NOT NULL,
+    first_observed_at INTEGER NOT NULL,
+    last_observed_at  INTEGER NOT NULL,
+    severity          TEXT NOT NULL,
+    evidence_state    TEXT NOT NULL,
+    state             TEXT NOT NULL,
+    report_json       TEXT NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -1292,6 +1318,7 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     content_type TEXT,
     size         INTEGER NOT NULL DEFAULT 0,
     uploaded_by  TEXT,
+    content_sha256 TEXT,
     created_at   INTEGER NOT NULL
 );
 
@@ -1319,8 +1346,11 @@ CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_created        ON task_events(created_at, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_review_runs_boundary  ON telemetry_review_runs(board_slug, window_end);
+CREATE INDEX IF NOT EXISTS idx_review_findings_board ON telemetry_review_findings(board_slug, last_observed_at);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2398,6 +2428,22 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # creation path that doesn't set the env var (CLI, dashboard).
         _add_column_if_missing(
             conn, "tasks", "session_id", "session_id TEXT"
+        )
+
+    attachment_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_attachments'"
+    ).fetchone()
+    if attachment_table_exists:
+        attachment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_attachments)")
+        }
+        if "content_sha256" not in attachment_cols:
+            _add_column_if_missing(
+                conn, "task_attachments", "content_sha256", "content_sha256 TEXT"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_attachments_content "
+            "ON task_attachments(task_id, content_sha256)"
         )
 
     if "block_kind" not in cols:
@@ -3663,6 +3709,13 @@ def store_attachment_bytes(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
     safe_name = _safe_attachment_name(filename)
+    content_sha256 = hashlib.sha256(data).hexdigest()
+    existing = conn.execute(
+        "SELECT id FROM task_attachments WHERE task_id = ? AND content_sha256 = ? LIMIT 1",
+        (task_id, content_sha256),
+    ).fetchone()
+    if existing:
+        return int(existing["id"])
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
@@ -3676,6 +3729,7 @@ def store_attachment_bytes(
             content_type=content_type,
             size=len(data),
             uploaded_by=uploaded_by,
+            content_sha256=content_sha256,
         )
     except Exception:
         # Don't leave an orphan blob if the metadata insert fails (most
@@ -3696,6 +3750,7 @@ def add_attachment(
     content_type: Optional[str] = None,
     size: int = 0,
     uploaded_by: Optional[str] = None,
+    content_sha256: Optional[str] = None,
 ) -> int:
     """Record a file attachment for a task. Returns the new attachment id.
 
@@ -3713,10 +3768,17 @@ def add_attachment(
             "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
+        if content_sha256:
+            existing = conn.execute(
+                "SELECT id FROM task_attachments WHERE task_id = ? AND content_sha256 = ? LIMIT 1",
+                (task_id, content_sha256),
+            ).fetchone()
+            if existing:
+                return int(existing["id"])
         cur = conn.execute(
             "INSERT INTO task_attachments "
-            "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "(task_id, filename, stored_path, content_type, size, uploaded_by, content_sha256, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 task_id,
                 filename.strip(),
@@ -3724,6 +3786,7 @@ def add_attachment(
                 content_type,
                 int(size),
                 uploaded_by,
+                content_sha256,
                 now,
             ),
         )
@@ -3750,6 +3813,7 @@ def list_attachments(conn: sqlite3.Connection, task_id: str) -> list[Attachment]
             content_type=r["content_type"],
             size=r["size"] or 0,
             uploaded_by=r["uploaded_by"],
+            content_sha256=(r["content_sha256"] if "content_sha256" in r.keys() else None),
             created_at=r["created_at"],
         )
         for r in rows
@@ -3770,6 +3834,7 @@ def get_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[Att
         content_type=r["content_type"],
         size=r["size"] or 0,
         uploaded_by=r["uploaded_by"],
+        content_sha256=(r["content_sha256"] if "content_sha256" in r.keys() else None),
         created_at=r["created_at"],
     )
 
@@ -4183,7 +4248,16 @@ def recompute_ready(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
                         (task_id,),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                parent_rows = conn.execute(
+                    "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                    (task_id,),
+                ).fetchall()
+                _append_event(conn, task_id, "promoted", {
+                    "from_status": cur_status,
+                    "to_status": "ready",
+                    "trigger": "parents_terminal",
+                    "satisfied_parent_ids": [p["parent_id"] for p in parent_rows],
+                })
                 promoted += 1
     return promoted
 
@@ -6285,7 +6359,9 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {"by": author or "decomposer", "from_decompose_of": task_id,
+                 "domain": child.get("domain") or "UNKNOWN",
+                 "created_by": author or "decomposer"},
             )
             _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
             child_ids.append(new_id)
@@ -7250,7 +7326,7 @@ def heartbeat_worker(
             )
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            {"note": note, "activity_kind": "worker_liveness"},
             run_id=run_id,
         )
         heartbeat_source_id = f"run:{run_id}:heartbeat:{time.time_ns()}"
