@@ -60,11 +60,20 @@ type FullscreenEventWindow = { on: (event: string, handler: () => void) => unkno
 // instance builder kept it. That is the same failure mode as the
 // chatWindowWebPreferences note above, where the copy silently lost
 // `backgroundThrottling: false`. One wiring path, so the two cannot drift again.
+//
+// All FOUR events, matching mainWindow's own wiring. Electron fires the `will-`
+// pair at the START of the fullscreen transition and the bare pair at the END,
+// so a window that only listens to the bare pair keeps its old titlebar inset
+// for the whole animation and then snaps. The primary window has always wired
+// both; wiring them here is what makes a pop-out or instance window's chrome
+// transition look the same as the primary's rather than lagging it.
 function wireChatWindowFullscreenState(
   win: FullscreenEventWindow,
   send: (isFullscreen: boolean, target: FullscreenEventWindow) => void
 ) {
+  win.on('will-enter-full-screen', () => send(true, win))
   win.on('enter-full-screen', () => send(true, win))
+  win.on('will-leave-full-screen', () => send(false, win))
   win.on('leave-full-screen', () => send(false, win))
 }
 
