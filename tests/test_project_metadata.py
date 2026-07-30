@@ -168,6 +168,22 @@ def test_dingtalk_extra_includes_qrcode_for_qr_auth():
 
 
 
+def test_sherpa_wake_dependencies_include_text2token_imports():
+    """sherpa_onnx.text2token imports these at runtime for custom phrases."""
+    from tools.lazy_deps import LAZY_DEPS
+
+    optional_dependencies = _load_optional_dependencies()
+
+    wake_extra = optional_dependencies["wake"]
+    lazy_sherpa = LAZY_DEPS["wake.sherpa"]
+
+    for package in ("sentencepiece", "pypinyin"):
+        assert any(dep.startswith(f"{package}==") for dep in wake_extra)
+        assert any(dep.startswith(f"{package}==") for dep in lazy_sherpa)
+
+
+
+
 
 
 def _uv_lock_version(package: str) -> str:
