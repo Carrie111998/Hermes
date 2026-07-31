@@ -99,7 +99,7 @@ class TestDetectToolFailureStructured:
 
     def test_web_extract_empty_error_field_is_success(self):
         result = json.dumps({
-            "results": [{"url": "https://example.com", "content": "Example", "error": ""}],
+            "results": [{"url": "https://example.com", "content": "Example", "error": None}],
         })
         assert _detect_tool_failure("web_extract", result) == (False, "")
 

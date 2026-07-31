@@ -17,7 +17,10 @@ from typing import Any
 
 from utils import safe_json_loads
 from agent.redact import redact_sensitive_text
-from agent.tool_result_classification import file_mutation_result_landed
+from agent.tool_result_classification import (
+    classify_web_extract_failure,
+    file_mutation_result_landed,
+)
 
 # ANSI escape codes for coloring tool failure indicators
 _RED = "\033[31m"
@@ -1305,15 +1308,13 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         # web_extract returns an ``error`` field for every URL, including an
         # empty one on success. Judge the result values instead of matching
         # the serialized key name below.
-        if tool_name == "web_extract" and isinstance(data.get("results"), list):
-            results = data["results"]
-            failed = [
-                item for item in results
-                if isinstance(item, dict) and item.get("error") and not item.get("content")
-            ]
-            if results and len(failed) == len(results):
-                return True, f" [{_trim_error(str(failed[0]['error']))}]"
-            return False, ""
+        if tool_name == "web_extract":
+            classification = classify_web_extract_failure(data)
+            if classification is not None:
+                failed, error = classification
+                if failed:
+                    return True, f" [{_trim_error(error)}]"
+                return False, ""
 
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
@@ -1519,4 +1520,3 @@ def get_cute_tool_message(
 # =========================================================================
 # Honcho session line (one-liner with clickable OSC 8 hyperlink)
 # =========================================================================
-
