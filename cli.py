@@ -5353,7 +5353,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             snapshot["session_cache_rate"] = None
 
         # Cost estimation for the status bar (only when show_cost is enabled)
-        if self._show_cost:
+        if getattr(self, '_show_cost', False):
             try:
                 total_tok = snapshot["session_total_tokens"]
                 if total_tok > 0:
@@ -5410,7 +5410,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         
         Returns e.g. \"$0.02 · ↓105K ↑7.5K · 95.6% cache\" or empty string.
         """
-        if not self._show_cost:
+        if not getattr(self, '_show_cost', False):
             return ""
         parts = []
         cost_label = snapshot.get("session_cost_label", "")
@@ -5971,7 +5971,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if width < 76:
                 # Show provider alongside model name when show_cost is on
                 provider = snapshot.get("session_provider", "")
-                if provider and self._show_cost:
+                if provider and getattr(self, '_show_cost', False):
                     model_label = f"⚕ {provider} · {snapshot['model_short']}"
                 else:
                     model_label = f"⚕ {snapshot['model_short']}"
@@ -6013,7 +6013,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             compressions = snapshot.get("compressions", 0)
             # Show provider alongside model name when show_cost is on
             provider = snapshot.get("session_provider", "")
-            if provider and self._show_cost:
+            if provider and getattr(self, '_show_cost', False):
                 model_label = f"⚕ {provider} · {snapshot['model_short']}"
             else:
                 model_label = f"⚕ {snapshot['model_short']}"
@@ -6097,7 +6097,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
                     # Show provider alongside model name
                     provider = snapshot.get("session_provider", "")
-                    if provider and self._show_cost:
+                    if provider and getattr(self, '_show_cost', False):
                         model_short = f"{provider} · {snapshot['model_short']}"
                     else:
                         model_short = snapshot["model_short"]
@@ -6153,7 +6153,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
                     # Show provider alongside model name
                     provider = snapshot.get("session_provider", "")
-                    if provider and self._show_cost:
+                    if provider and getattr(self, '_show_cost', False):
                         model_short = f"{provider} · {snapshot['model_short']}"
                     else:
                         model_short = snapshot["model_short"]
