@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import stat
 import sys
 from pathlib import Path
@@ -304,6 +305,7 @@ class TestUpdateManagedUv:
     def test_self_update_success(self, tmp_path):
         _make_executable(_uv_path(tmp_path))
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
+             patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
              patch("hermes_cli.managed_uv.subprocess.run") as mock_run:
             # uv self update succeeds
             mock_run.return_value = MagicMock(returncode=0, stdout="uv 0.2.0")
@@ -320,7 +322,7 @@ class TestUpdateManagedUv:
         vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
         from hermes_cli.managed_uv import RuntimeRepairResult, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = _uv_path(tmp_path)
         _make_executable(uv)
         # Fresh stamp under the isolated HERMES_HOME.
         import hermes_constants
@@ -347,7 +349,7 @@ class TestUpdateManagedUv:
 
         from hermes_cli.managed_uv import UV_SELF_UPDATE_INTERVAL_SECONDS, update_managed_uv
 
-        uv = tmp_path / "bin" / "uv"
+        uv = _uv_path(tmp_path)
         _make_executable(uv)
         import hermes_constants
         stamp = hermes_constants.get_hermes_home() / "cache" / ".uv_self_update_stamp"
@@ -1186,9 +1188,16 @@ class TestDefaultLiveVenv:
         root.mkdir()
         (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
         for d in dirs:
-            bin_dir = root / d / "bin"
+            # Match the platform layout _venv_python() actually probes --
+            # bin/python on POSIX, Scripts/python.exe on Windows. A POSIX-only
+            # layout here would make _venv_python(...).is_file() false on
+            # Windows for BOTH venv and .venv, silently degrading every test
+            # in this class to "neither layout present" regardless of what
+            # dirs were actually requested.
+            bin_dir = root / d / ("Scripts" if platform.system() == "Windows" else "bin")
             bin_dir.mkdir(parents=True)
-            (bin_dir / "python").write_text("py", encoding="utf-8")
+            interp_name = "python.exe" if platform.system() == "Windows" else "python"
+            (bin_dir / interp_name).write_text("py", encoding="utf-8")
         return root
 
     def test_dot_venv_only_is_targeted(self, tmp_path):

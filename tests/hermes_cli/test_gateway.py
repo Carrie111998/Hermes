@@ -268,7 +268,12 @@ class TestContainerSystemdSupport:
         assert gateway.supports_systemd_services() is True
 
 
-
+def test_gateway_install_in_container_with_operational_systemd_uses_systemd(monkeypatch):
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "is_wsl", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_managed", lambda: False)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     calls = []
     monkeypatch.setattr(gateway, "prompt_yes_no", lambda question, default=True: calls.append(("prompt", question, default)) or True)
