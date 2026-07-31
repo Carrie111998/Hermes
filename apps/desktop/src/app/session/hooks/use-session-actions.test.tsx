@@ -48,7 +48,6 @@ import { sessionRoute } from '../../routes'
 import type { ClientSessionState } from '../../types'
 
 import { useSessionActions } from './use-session-actions'
-import { applyRuntimeInfo } from './use-session-actions/utils'
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -85,7 +84,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'createBackendSessionForSend' | 'openNewSessionTile' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -1699,7 +1698,8 @@ describe('selectSidebarItem', () => {
 //
 // The fix is ownership, not emptiness: $currentCwd is deliberately NEVER cleared
 // on a switch (clearing collapses the workspace/review panes and drops file-tree
-// state), it is merely marked as not-yet-owned so probes withhold. These tests
+// state), it is merely marked as not-yet-owned so the primary workspace slices
+// hide. These tests
 // pin the ownership TRANSITIONS at the resume boundary — entry, settle, warm
 // switch, and fresh draft — because that is where the window opens and closes.
 describe('resumeSession workspace cwd ownership', () => {
@@ -1877,7 +1877,7 @@ describe('resumeSession workspace cwd ownership', () => {
   it('claims ownership when the resume settles with an authoritative cwd', async () => {
     // Entry had nothing to seed from (cwd-less row), so ownership was released;
     // the settled runtime report is what hands it back. Without this the rail
-    // would stay withheld for the rest of the session.
+    // would stay hidden for the rest of the session.
     setCurrentCwd('/repo-a')
     setSessions([storedSession({ cwd: null })])
 
@@ -1979,10 +1979,9 @@ describe('resumeSession workspace cwd ownership', () => {
 // is the stored id. If ownership keeps naming the rotated-out id while selection
 // moves to the tip, the mismatch is permanent and cannot self-heal — $currentCwd
 // never changes (so its subscription never fires), the owner is never written
-// again (so the re-arm never fires), and every other refresh trigger ($busy
-// settling, a workspace tick, window focus) probes with no target and re-enters
-// the withhold branch. The coding rail and worktree menu then stay blank for the
-// life of the session, which is worse than the stale-facts bug ownership fixes.
+// again, and every primary read still sees a mismatch. The coding rail and
+// worktree menu then stay blank for the life of the session, which is worse than
+// the stale-facts bug ownership fixes.
 describe('stored-id rotation workspace cwd ownership', () => {
   afterEach(() => {
     cleanup()
@@ -2035,9 +2034,9 @@ describe('stored-id rotation workspace cwd ownership', () => {
 
     // Same conversation, same folder — the rotation must not move the workspace.
     expect($currentCwd.get()).toBe('/repo-a')
-    // Ownership followed the rename, so the gate that withholds probes stays
-    // open. Asserting the predicate (with the rotated selection above) is what
-    // pins owner === tip: the predicate IS what refreshRepoStatus consults.
+    // Ownership followed the rename, so the primary visibility gate stays open.
+    // Asserting the predicate (with the rotated selection above) is what pins
+    // owner === tip.
     expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })
 })
@@ -2051,10 +2050,8 @@ describe('stored-id rotation workspace cwd ownership', () => {
 // backend whose session.create omits `info` therefore left the marker on the
 // draft (null) while the selection named a real conversation, and that mismatch
 // does not self-heal: $currentCwd never moves (so its subscription never fires)
-// and the owner is never written again (so the ownership edge never re-arms), so
-// every later trigger re-enters refreshRepoStatus's withhold branch and CLEARS
-// $repoStatus/$repoWorktrees — a permanently blank coding rail rather than a
-// brief pause.
+// and the owner is never written again, so every later primary read still sees
+// the mismatch — a permanently blank coding rail rather than a brief pause.
 describe('createBackendSessionForSend workspace cwd ownership', () => {
   afterEach(() => {
     cleanup()
@@ -2104,8 +2101,8 @@ describe('createBackendSessionForSend workspace cwd ownership', () => {
     // ...the draft's folder carried over unchanged (this is the same workspace,
     // not a switch)...
     expect($currentCwd.get()).toBe('/repo-draft')
-    // ...and the conversation now on screen owns it, so the coding rail's probe
-    // runs instead of being withheld and blanked.
+    // ...and the conversation now on screen owns it, so the coding rail is
+    // visible instead of remaining blank.
     expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })
 })
@@ -2116,8 +2113,8 @@ describe('createBackendSessionForSend workspace cwd ownership', () => {
 // the session.delete RPC then FAILS, the catch block puts the selection back —
 // and it has to put the owner back with it. Otherwise the restored conversation
 // is selected while the marker still names the draft, which is a permanent
-// mismatch: refreshRepoStatus withholds every defaulted probe AND clears
-// $repoStatus/$repoWorktrees, and nothing on this path re-arms ownership.
+// mismatch: the primary repo/worktree slices remain hidden, and nothing on this
+// path restores ownership.
 // use-route-resume is not a backstop here — its gate is
 // (gatewayBecameOpen || !alreadyActive) && shouldResume, and the failure branch
 // restores activeSessionIdRef while leaving runtimeIdByStoredSessionIdRef
@@ -2181,7 +2178,7 @@ describe('removeSession workspace cwd ownership on delete failure', () => {
 
   it('restores workspace ownership with the selection when session.delete rejects', async () => {
     // The doomed conversation is the open one and legitimately owns /repo-doomed,
-    // so probes are running before the delete.
+    // so primary workspace state is visible before the delete.
     setSessions([storedSession({ cwd: '/repo-doomed', id: 'stored-doomed' })])
     setSelectedStoredSessionId('stored-doomed')
     setCurrentCwd('/repo-doomed')
@@ -2214,21 +2211,61 @@ describe('removeSession workspace cwd ownership on delete failure', () => {
     // to null, and only the failure path puts it back.
     expect(deleteSession).toHaveBeenCalledWith('stored-doomed', undefined)
     expect($selectedStoredSessionId.get()).toBe('stored-doomed')
-    // And the conversation that is selected again owns the workspace, so a
-    // defaulted probe can run for it. Left on the draft's null, the mismatch is
-    // permanent and the rail stays blank for the rest of the session.
+    // And the conversation that is selected again owns the workspace. Left on
+    // the draft's null, the mismatch is permanent and the rail stays blank for
+    // the rest of the session.
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
+  })
+})
+
+// ── Workspace cwd ownership across a split tile / create (#71254) ─────────────
+describe('openNewSessionTile workspace cwd ownership', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    $sessionTiles.set([])
+    setSelectedStoredSessionId(null)
+    setCurrentCwd('')
+    setWorkspaceCwdOwner(null)
+    vi.restoreAllMocks()
+  })
+
+  it('does not replace a fresh draft workspace with the new tile workspace', async () => {
+    setSelectedStoredSessionId(null)
+    setCurrentCwd('/repo-draft')
+    setWorkspaceCwdOwner(null)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.create') {
+        return {
+          info: { cwd: '/repo-tile' },
+          session_id: 'tile-runtime',
+          stored_session_id: 'tile-stored'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.openNewSessionTile('right', { cwd: '/repo-tile-requested' })
+    })
+
+    expect($selectedStoredSessionId.get()).toBeNull()
+    expect($currentCwd.get()).toBe('/repo-draft')
     expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })
 })
 
 // ── Workspace cwd ownership across a fork / create (#71254) ───────────────────
-// applyRuntimeInfo decides "is this info the selected conversation's?" from the
-// stored id, but session.create reports that id NEXT TO `info`, not inside it, so
-// a create response carries none where the guard looks. Read as "no id ⇒ the
-// selected one", every create claimed ownership for whoever was selected — and a
-// fork deliberately keeps the PARENT selected while minting a child in a
-// different repo. The create sites therefore name the conversation their response
-// describes, which is what makes the not-selected branch reachable at all.
+// A fork deliberately keeps the PARENT selected while minting a child in a
+// different repo. Its runtime info must remain background-scoped: the returned
+// patch still seeds the child session, but the main workspace and ownership stay
+// with the parent.
 describe('forkBranch workspace cwd ownership', () => {
   afterEach(() => {
     cleanup()
@@ -2284,10 +2321,9 @@ describe('forkBranch workspace cwd ownership', () => {
     // The fork opened as its own tab and left the parent chat selected...
     expect($selectedStoredSessionId.get()).toBe('stored-parent')
     // ...and the live workspace never moved. A report for a conversation the user
-    // is NOT looking at must not touch $currentCwd at all: the cwd subscription
-    // re-probes with an EXPLICIT target, and an explicit target bypasses the
-    // ownership gate, so writing the branch's folder here republished the BRANCH
-    // repo's Git facts under the parent chat — #71254 from the other direction.
+    // is NOT looking at must not touch $currentCwd at all: doing so re-keys the
+    // primary rail onto the branch's cached Git facts under the parent chat —
+    // #71254 from the other direction.
     expect($currentCwd.get()).toBe('/repo-previous')
     // The path is still recorded where a background session actually needs it:
     // the branch's own row (the applier returns it on the patch, which the fork
@@ -2305,98 +2341,10 @@ describe('forkBranch workspace cwd ownership', () => {
   })
 })
 
-// The explicit id must stay a "whose info is this" hint, NOT a blanket "a named
-// response never claims" — the two directions live in one branch, so pin both.
-// Turning the hint into a refusal would trade #71254's stale rail for a
-// permanently withheld one on the paths where the guard IS the only claim
-// (openNewSessionTile has no second claim behind it): refreshRepoStatus withholds
-// AND clears $repoStatus on every later trigger, and nothing re-arms ownership
-// while the path does not move.
-describe('applyRuntimeInfo described stored session id', () => {
-  afterEach(() => {
-    setSessions([])
-    setSelectedStoredSessionId(null)
-    // setCurrentCwd('') also drops the persisted workspace key, so the seeded
-    // path cannot leak into another test's assertions.
-    setCurrentCwd('')
-    setWorkspaceCwdOwner(null)
-  })
-
-  it('claims when the named conversation is the selected one', () => {
-    setSelectedStoredSessionId('stored-A')
-    setCurrentCwd('/repo-old')
-    releaseWorkspaceCwdOwner()
-
-    applyRuntimeInfo({ cwd: '/repo-a' }, 'stored-A')
-
-    expect($currentCwd.get()).toBe('/repo-a')
-    expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
-  })
-
-  it('claims for a lineage tip whose selection is still the pre-compression root', () => {
-    // Auto-compression rotates the live id while the selection keeps the id the
-    // switch was routed on. A literal comparison reads one conversation as two
-    // and refuses a legitimate claim, blanking the rail for the rest of the chat.
-    setSessions([storedSession({ _lineage_root_id: 'stored-root', id: 'stored-tip' })])
-    setSelectedStoredSessionId('stored-root')
-    releaseWorkspaceCwdOwner()
-
-    applyRuntimeInfo({ cwd: '/repo-rotated' }, 'stored-tip')
-
-    expect($currentCwd.get()).toBe('/repo-rotated')
-    expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
-  })
-
-  it('does not claim when the named conversation is a different one', () => {
-    setSelectedStoredSessionId('stored-A')
-    setCurrentCwd('/repo-old')
-    releaseWorkspaceCwdOwner()
-    const ownerBefore = $workspaceCwdOwner.get()
-
-    const patch = applyRuntimeInfo({ cwd: '/repo-b' }, 'stored-B')
-
-    // The path is still recorded on the returned patch, which the caller folds
-    // into the OTHER conversation's own per-session cache.
-    expect(patch?.cwd).toBe('/repo-b')
-    expect($workspaceCwdOwner.get()).toBe(ownerBefore)
-    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
-  })
-
-  it('still treats an omitted id as the selected conversation (cold lazy resume)', () => {
-    // `_lazy_resume_info` genuinely carries no stored id; a strict rule would
-    // leave the coding rail blank on the most common switch.
-    setSelectedStoredSessionId('stored-A')
-    releaseWorkspaceCwdOwner()
-
-    applyRuntimeInfo({ cwd: '/repo-lazy' })
-
-    expect($currentCwd.get()).toBe('/repo-lazy')
-    expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
-  })
-
-  it('prefers the caller-named id over a stale one carried inside info', () => {
-    // Precedence, not just presence: the create response's `info` is assembled
-    // from the runtime, so any id it happens to carry describes the runtime the
-    // gateway built — not necessarily the stored conversation the caller routed
-    // on. The caller knows whose response this is, so its id has to win; reading
-    // `info` first re-opens the fork claim whenever both are present.
-    setSelectedStoredSessionId('stored-A')
-    setCurrentCwd('/repo-old')
-    releaseWorkspaceCwdOwner()
-    const ownerBefore = $workspaceCwdOwner.get()
-
-    applyRuntimeInfo({ cwd: '/repo-b', stored_session_id: 'stored-A' } as never, 'stored-B')
-
-    expect($workspaceCwdOwner.get()).toBe(ownerBefore)
-    expect(workspaceCwdBelongsToSelectedSession()).toBe(false)
-  })
-})
-
-// The mirror-image guard for the fix above: a create whose session genuinely
-// BECOMES the selection must keep claiming. Tightening the guard into "a create
-// response never claims" would trade #71254's stale rail for a permanently
-// withheld one on every new chat, since nothing later re-arms ownership when the
-// path does not move (refreshRepoStatus withholds AND clears on each trigger).
+// The mirror-image guard for background tile/branch scoping: a create whose
+// session genuinely BECOMES the foreground selection must claim its workspace.
+// Otherwise the selected id changes while the owner stays on the draft, hiding
+// the primary coding rail even though the new conversation kept the same path.
 describe('createBackendSessionForSend workspace cwd ownership with runtime info', () => {
   afterEach(() => {
     cleanup()
@@ -2444,7 +2392,7 @@ describe('createBackendSessionForSend workspace cwd ownership with runtime info'
     expect($selectedStoredSessionId.get()).toBe('stored-created')
     expect($currentCwd.get()).toBe('/repo-draft-resolved')
     // This create's session IS the new selection, so ownership moves with it and
-    // the coding rail probes immediately.
+    // the coding rail is visible immediately.
     expect($workspaceCwdOwner.get()).toBe('stored-created')
     expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })

@@ -18,7 +18,7 @@ import {
 } from '@/store/session'
 import { $stalledSessionIds } from '@/store/session-states'
 
-import { $repoStatus, $repoWorktrees, refreshRepoStatus } from './coding-status'
+import { $repoStatus, $repoStatusByCwd, $repoWorktreesByCwd, refreshRepoStatus } from './coding-status'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from './gateway-switch'
 import {
   $currentCwd,
@@ -73,9 +73,9 @@ describe('wipeSessionListsForGatewaySwitch', () => {
 
 // A soft switch de-selects the conversation but deliberately leaves $currentCwd
 // alone (the user stays where they were, e.g. mid-Gateway settings). Workspace
-// probes gate on "does the SELECTED conversation own $currentCwd", and the
-// withheld branch CLEARS the coding rail — so a wipe that stranded the owner
-// naming the previous backend's conversation would blank the rail forever:
+// the primary rail gates on "does the SELECTED conversation own $currentCwd".
+// A wipe that stranded the owner naming the previous backend's conversation
+// would hide that rail forever:
 // nothing in this path re-selects a conversation, and seedDefaultCwd is gated on
 // an empty cwd (#71254).
 describe('wipeSessionListsForGatewaySwitch workspace ownership', () => {
@@ -83,8 +83,8 @@ describe('wipeSessionListsForGatewaySwitch workspace ownership', () => {
 
   beforeEach(() => {
     vi.useFakeTimers()
-    $repoStatus.set(null)
-    $repoWorktrees.set([])
+    $repoStatusByCwd.set({})
+    $repoWorktreesByCwd.set({})
     $currentCwd.set('')
     setSelectedStoredSessionId(null)
     setWorkspaceCwdOwner(null)
@@ -94,7 +94,8 @@ describe('wipeSessionListsForGatewaySwitch workspace ownership', () => {
   afterEach(() => {
     vi.clearAllTimers()
     vi.useRealTimers()
-    $repoStatus.set(null)
+    $repoStatusByCwd.set({})
+    $repoWorktreesByCwd.set({})
     $currentCwd.set('')
     setSelectedStoredSessionId(null)
     setWorkspaceCwdOwner(null)
@@ -128,8 +129,7 @@ describe('wipeSessionListsForGatewaySwitch workspace ownership', () => {
 
     // The wipe keeps the path on purpose, so this is the state every later
     // DEFAULTED edge (turn settle, window focus, worktree token) runs in. It has
-    // to probe: a withheld refresh here clears the rail with nothing left to
-    // re-arm it.
+    // to probe so the draft sees current facts rather than a stale cached entry.
     expect($currentCwd.get()).toBe('/repo-a')
     await refreshRepoStatus()
 

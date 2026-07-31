@@ -6,11 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import {
+  $currentCwd,
   $currentModel,
   $currentProvider,
+  setCurrentCwd,
   setCurrentModel,
   setCurrentModelSource,
-  setCurrentProvider
+  setCurrentProvider,
+  setSelectedStoredSessionId,
+  setWorkspaceCwdOwner,
+  workspaceCwdBelongsToSelectedSession
 } from '@/store/session'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -95,5 +100,36 @@ describe('session.info does not clobber composer model selection', () => {
 
     expect($currentModel.get()).toBe('deepseek-v4-flash')
     expect($currentProvider.get()).toBe('deepseek')
+  })
+})
+
+describe('session.info workspace ownership', () => {
+  beforeEach(() => {
+    handleEvent = null
+    setCurrentCwd('/repo-draft')
+    setSelectedStoredSessionId(null)
+    setWorkspaceCwdOwner(null)
+  })
+
+  afterEach(() => {
+    cleanup()
+    setCurrentCwd('')
+    setSelectedStoredSessionId(null)
+    setWorkspaceCwdOwner(null)
+    vi.restoreAllMocks()
+  })
+
+  it('does not let a named background session re-home a fresh draft', async () => {
+    await mountStream(null)
+
+    act(() =>
+      handleEvent!({
+        payload: { cwd: '/repo-tile', stored_session_id: 'tile-stored' },
+        type: 'session.info'
+      })
+    )
+
+    expect($currentCwd.get()).toBe('/repo-draft')
+    expect(workspaceCwdBelongsToSelectedSession()).toBe(true)
   })
 })

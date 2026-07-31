@@ -95,7 +95,17 @@ function sessionInfoDescribesSelectedSession(storedSessionId: string | undefined
   const infoStoredSessionId = storedSessionId?.trim() || null
   const selected = $selectedStoredSessionId.get() ?? null
 
-  if (!infoStoredSessionId || !selected || infoStoredSessionId === selected) {
+  if (!infoStoredSessionId) {
+    return true
+  }
+
+  // A named session cannot describe a fresh draft. Treating null selection as a
+  // wildcard lets a background tile/session.info overwrite the draft workspace.
+  if (!selected) {
+    return false
+  }
+
+  if (infoStoredSessionId === selected) {
     return true
   }
 
@@ -404,7 +414,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // Active-session model/provider still flows through the session state
           // cache via updateSessionState → syncRuntimeMetadataToView below.
 
-          if (typeof payload?.cwd === 'string') {
+          if (typeof payload?.cwd === 'string' && sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
             // The active session's agent can relocate itself (new repo/worktree
             // via the terminal). When the SAME active session's cwd actually
             // moves, follow it — refresh the project tree + scope so the sidebar
@@ -420,8 +430,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             // so the selected conversation owns the path we just wrote. Without
             // the claim the marker keeps naming whoever owned the cwd before —
             // including the unowned state a detached resume leaves behind — and
-            // the next workspace-derived refresh is withheld, blanking the rail
-            // against a folder the backend has just confirmed (#71254).
+            // the primary workspace-derived surfaces stay hidden against a folder
+            // the backend has just confirmed (#71254).
             //
             // An id that names a DIFFERENT conversation is never claimable (a
             // background session's info must not re-home the foreground). An
@@ -433,10 +443,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             // compression rotates to the continuation tip, while a selection made
             // from a pinned row holds the stable lineage root. Comparing those
             // literally reads the same conversation as a stranger, refuses the
-            // claim, and leaves the withheld rail blank for the rest of the chat.
-            if (sessionInfoDescribesSelectedSession(payload.stored_session_id)) {
-              setWorkspaceCwdOwner($selectedStoredSessionId.get())
-            }
+            // claim, and leaves the primary rail blank for the rest of the chat.
+            setWorkspaceCwdOwner($selectedStoredSessionId.get())
 
             if (cwdMoved && sameSession) {
               void followActiveSessionCwd(payload.cwd)

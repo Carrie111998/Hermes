@@ -868,8 +868,8 @@ export function applyStoredSessionPreviewRuntimeInfo(
   } else {
     // A row with no cwd (the common shape for a bare ⌘N session, detached by
     // design) says nothing about the workspace, while $currentCwd still holds the
-    // previous conversation's folder. Release so probes hold off until the resume
-    // reports the truth; clearing the path instead would collapse the
+    // previous conversation's folder. Release so the primary workspace-derived
+    // surfaces hide until resume reports the truth; clearing the path would collapse the
     // workspace/review panes and drop file-tree state on every switch.
     releaseWorkspaceCwdOwner()
   }

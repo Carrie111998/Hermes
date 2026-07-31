@@ -273,8 +273,8 @@ export function useSessionActions({
     // Compression re-keys the SAME conversation onto its continuation tip, so the
     // workspace it owns is unchanged and only its id moved. Re-keying the owner
     // with it keeps the two in agreement; leaving it on the rotated-out id would
-    // strand a mismatch mid-conversation, and workspace-derived surfaces would go
-    // blank for the rest of the session (#71254).
+    // strand a mismatch mid-conversation and hide workspace-derived surfaces for
+    // the rest of the session (#71254).
     setWorkspaceCwdOwner(nextId)
 
     // A route overlay/page has no routed session id, but the underlying selected
@@ -349,8 +349,8 @@ export function useSessionActions({
 
       // A fresh draft resolves its own workspace right here, so it owns it. The
       // selected stored id is null for a draft, and so is the owner — they match,
-      // which is what keeps the coding rail live on a new chat instead of
-      // withholding it as an un-re-homed switch (#71254).
+      // which keeps the coding rail visible on a new chat instead of treating the
+      // draft as an un-re-homed switch (#71254).
       setWorkspaceCwdOwner(null)
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
@@ -430,18 +430,17 @@ export function useSessionActions({
         setSelectedStoredSessionId(stored)
         setSessionStartedAt(Date.now())
         const yoloArmed = $yoloActive.get()
-        // `stored` is the conversation this create response describes AND the one
-        // just selected above, so the claim below is for the chat on screen. The
-        // id has to be passed explicitly because session.create reports it beside
-        // `info`, not inside it (#71254).
-        const runtimeInfo = applyRuntimeInfo(created.info, stored)
+        // This create becomes the foreground selection above, so its runtime
+        // state may publish into the main composer's atoms. Tile/branch creates
+        // pass `{ foreground: false }` at their own call sites.
+        const runtimeInfo = applyRuntimeInfo(created.info)
 
         // The draft's workspace carries over to the conversation it just became,
         // so ownership moves with the selection. applyRuntimeInfo above claims it
         // whenever the create response reports a cwd, but `info` is optional on
         // the contract — an older backend that omits it would leave the marker on
         // the draft while the selection names a real conversation, and the coding
-        // rail would sit withheld until the next heartbeat (#71254).
+        // rail would remain hidden until the next heartbeat (#71254).
         setWorkspaceCwdOwner(stored)
 
         if (runtimeInfo) {
@@ -720,7 +719,7 @@ export function useSessionActions({
           // switch is already re-homed here and probes may run immediately. Note
           // this claim cannot wait for session.activate: its missing-RPC compat
           // branch returns before applyRuntimeInfo, which would otherwise leave
-          // the rail withheld for the life of the session (#71254).
+          // the rail hidden for the life of the session (#71254).
           setWorkspaceCwdOwner(storedSessionId)
           setSessionStartedAt(Date.now())
 
@@ -1399,7 +1398,7 @@ export function useSessionActions({
           // The draft this rollback undoes released the workspace; restoring the
           // selection has to restore its owner too, or the marker stays on the
           // draft while a real conversation is selected and the coding rail sits
-          // withheld with nothing left to re-arm it (#71254).
+          // hidden with nothing left to re-home it (#71254).
           setWorkspaceCwdOwner(storedSessionId)
           const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
 

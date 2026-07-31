@@ -410,7 +410,7 @@ export const $selectedStoredSessionId = atom<string | null>(null)
 // workspace only arrives when the resume settles, so for that whole window
 // `$currentCwd` still holds the PREVIOUS conversation's folder. Without a way to
 // say "this path is not this conversation's yet", workspace-derived surfaces
-// treat the leftover path as authoritative and re-derive the old repo's Git
+// treat the leftover path as authoritative and display the old repo's cached Git
 // facts under the newly selected chat (#71254).
 //
 // Ownership, not emptiness, is what makes the switch atomic: clearing the path
@@ -603,16 +603,16 @@ const WORKSPACE_CWD_UNOWNED = 'desktop:workspace-cwd-unowned'
  *
  *  Call this wherever a cwd is established for a conversation (resume settling,
  *  a warm switch, an explicit folder pick). Until it is called for the newly
- *  selected conversation, workspace-derived probes know the path they can see is
- *  the previous conversation's and hold off rather than publishing it (#71254).
+ *  selected conversation, primary workspace-derived selectors hide the previous
+ *  conversation's path and cached facts rather than publishing them (#71254).
  */
 export const setWorkspaceCwdOwner = (storedSessionId: null | string) => updateAtom($workspaceCwdOwner, storedSessionId)
 
 /** Declare that no conversation owns the live workspace path.
  *
  *  For a conversation that reports no workspace of its own: the path on screen is
- *  provably still the previous conversation's, so probes must hold off rather
- *  than adopt it.
+ *  provably still the previous conversation's, so primary workspace-derived
+ *  surfaces must hide it rather than adopt it.
  */
 export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WORKSPACE_CWD_UNOWNED)
 
@@ -621,8 +621,8 @@ export const releaseWorkspaceCwdOwner = () => updateAtom($workspaceCwdOwner, WOR
  *  The single primitive for "this path IS the selected conversation's" — a folder
  *  pick, a project entry, the agent relocating itself. Prefer it over a bare
  *  `setCurrentCwd`, which moves the path while leaving ownership naming whatever
- *  held it before; the next workspace-derived refresh is then withheld and the
- *  rail blanks even though the path is correct (#71254).
+ *  held it before; the primary workspace-derived slices then stay hidden even
+ *  though the path is correct (#71254).
  */
 export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
   setCurrentCwd(cwd)

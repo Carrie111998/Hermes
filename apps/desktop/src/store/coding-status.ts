@@ -38,11 +38,13 @@ export const $repoWorktreesByCwd = atom<Record<string, HermesGitWorktree[]>>({})
 // The PRIMARY (main pane) view — the active session's slice of the per-cwd
 // truth. Existing consumers (keybind gate, base-branch picker, file tree) keep
 // reading these; only surfaces that can live in ANOTHER worktree (tile rails)
-// need the per-cwd accessors below.
+// need the per-cwd accessors below. During a conversation switch `$currentCwd`
+// temporarily still names the previous conversation's path, so ownership hides
+// only this primary slice; the per-cwd cache stays available to any tile that
+// genuinely owns that worktree (#71254).
 export const $repoStatus: ReadableAtom<HermesRepoStatus | null> = computed(
   [$repoStatusByCwd, $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner],
-  (byCwd, cwd) =>
-    workspaceCwdBelongsToSelectedSession() ? (byCwd[normalizeCwd(cwd) ?? ''] ?? null) : null
+  (byCwd, cwd) => (workspaceCwdBelongsToSelectedSession() ? (byCwd[normalizeCwd(cwd) ?? ''] ?? null) : null)
 )
 
 export const $repoStatusLoading = atom(false)
@@ -377,17 +379,16 @@ function scheduleRepoStatusRefresh(cwd?: null | string): void {
 // Wired once at module load (mirrors projects.ts's module-scope subscriptions).
 // Each is a structural edge where a working tree may have changed under us.
 
-// The active session's cwd changed (session switch / new chat) → the primary
-// computed re-keys instantly (a keyboard action in the switch-to-probe gap can
-// only ever see the NEW repo's last-known facts, never the previous
-// worktree's), then the debounced probe refreshes that repo's truth.
+// The active session's cwd changed (resume settled / new chat) → the primary
+// computed re-keys instantly, then the debounced probe refreshes that repo's
+// truth. The selection edge below can precede this cwd update; ownership hides
+// the old primary slice during that gap.
 $currentCwd.subscribe(cwd => scheduleRepoStatusRefresh(cwd))
 
-// Switching sessions can land on the same cwd but a different checked-out
-// branch (the agent ran `git checkout` in another session's terminal). The cwd
-// subscription above won't fire when the path is identical, so the branch label
-// would stay stale until a window focus or turn-settle triggers a refresh.
-// Treat the stored-session id as a structural edge in its own right.
+// Selection moves synchronously, before resume supplies the new cwd. The primary
+// computed reacts through its ownership dependencies and hides the old slice at
+// once. Scheduling here also covers two sessions that share one cwd: the cwd
+// subscription does not fire, but the checked-out branch may have changed.
 $selectedStoredSessionId.subscribe(() => scheduleRepoStatusRefresh())
 
 // A worktree add/remove (desktop op, or the agent's out-of-band git in a settled

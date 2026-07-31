@@ -785,14 +785,13 @@ export function ChatSidebar({
       // Entering a project IS the user choosing this workspace for what they are
       // looking at, exactly like a folder pick, so ownership moves with the path.
       // Repointing without it leaves the marker describing the folder we just
-      // navigated away from: probes then either run against a path the selected
-      // conversation doesn't own (the stale Git state in #71254) or stay withheld,
-      // blanking the rail this entry just repointed.
+      // navigated away from, so the primary workspace-derived surfaces remain
+      // hidden even though this entry just established the correct path.
       //
       // Claimed outside the move guard on purpose. An entry that lands on the
       // path already on screen still needs the claim — resuming a detached
       // conversation leaves the workspace unowned, and skipping the claim because
-      // nothing moved would keep that blank rail while showing the project.
+      // nothing moved would keep those surfaces blank while showing the project.
       setWorkspaceCwdOwner($selectedStoredSessionId.get())
     },
     [currentCwd]
