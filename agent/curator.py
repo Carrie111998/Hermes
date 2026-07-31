@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -1839,7 +1838,6 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
 
     Never raises; callers get a structured failure instead.
     """
-    import contextlib
     result_meta: Dict[str, Any] = {
         "final": "",
         "summary": "",

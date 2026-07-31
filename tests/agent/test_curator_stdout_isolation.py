@@ -99,27 +99,62 @@ def test_thread_scoped_silence_leaves_stdout_usable():
     assert "silenced chatter" not in captured
 
 
-def test_curator_llm_pass_does_not_use_global_redirect():
-    """Source-level guard on the exact call site that caused the outage.
+def test_run_llm_review_does_not_poison_other_threads_stdout():
+    """Behavioral guard on the exact call site that caused the outage.
 
-    A behavioural test would need a real forked AIAgent + credentials; instead
-    we assert the invariant that matters: the curator's review call is wrapped
-    in ``thread_scoped_silence()``, not a process-global redirect.
+    Runs ``_run_llm_review()`` on a worker thread with a stubbed review agent
+    that blocks mid-conversation, and asserts an unrelated thread's print
+    still reaches the real stream while the review is executing — and that
+    stdout is still usable afterwards.  Fails on the pre-fix implementation,
+    which wrapped the conversation in a process-global ``redirect_stdout``.
     """
-    import inspect
+    from unittest.mock import patch
 
     import agent.curator as curator
 
-    src = inspect.getsource(curator)
+    in_review = threading.Event()
+    unrelated_done = threading.Event()
 
-    # Find the block that runs the forked agent's conversation.
-    assert "run_conversation(user_message=prompt)" in src
-    idx = src.index("run_conversation(user_message=prompt)")
-    window = src[max(0, idx - 600):idx]
-    assert "thread_scoped_silence()" in window, (
-        "curator LLM pass must silence output per-thread; a process-global "
-        "redirect_stdout here poisons sys.stdout for every other thread"
-    )
-    assert "redirect_stdout" not in window, (
-        "process-global redirect_stdout found at the curator LLM call site"
-    )
+    class _StubReviewAgent:
+        """Stands in for the forked AIAgent; blocks inside the review pass."""
+
+        def __init__(self, *args, **kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, user_message=""):
+            # Chatter the real agent would emit — must be silenced.
+            print("review agent chatter")
+            in_review.set()
+            assert unrelated_done.wait(timeout=5)
+            return {"final_response": "review done"}
+
+    def body():
+        results = {}
+
+        def run_review():
+            results["meta"] = curator._run_llm_review("review prompt")
+
+        def unrelated_writer():
+            assert in_review.wait(timeout=5)
+            print("unrelated write during review")
+            unrelated_done.set()
+
+        reviewer = threading.Thread(target=run_review)
+        writer = threading.Thread(target=unrelated_writer)
+        with patch("run_agent.AIAgent", _StubReviewAgent):
+            reviewer.start()
+            writer.start()
+            reviewer.join(timeout=10)
+            writer.join(timeout=10)
+
+        meta = results.get("meta") or {}
+        assert meta.get("error") is None, meta
+        assert meta.get("final") == "review done"
+
+        # stdout must not be poisoned once the review pass finishes.
+        print("survivor")
+
+    captured = _drain(body)
+    assert "unrelated write during review" in captured
+    assert "survivor" in captured
+    assert "review agent chatter" not in captured
