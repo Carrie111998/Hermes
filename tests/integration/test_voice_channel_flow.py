@@ -271,6 +271,94 @@ class TestRealNaClWithDAVE:
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         assert receiver.check_silence() == []
 
+    def test_dave_late_speaking_replays_passthrough_utterance(self):
+        """DAVE + passthrough + late SPEAKING → the whole utterance survives.
+
+        Upstream supports unencrypted passthrough inside a DAVE session, so
+        an unattributable payload is not necessarily ciphertext.  Frames that
+        arrive before SPEAKING must be held rather than discarded, then
+        replayed in order once the SSRC resolves — otherwise the fix for
+        first-turn garbage trades it for a first turn that is simply missing.
+        """
+        key = _make_secret_key()
+        dave = MagicMock()
+        # Passthrough: DAVE refuses to decrypt, NaCl bytes are already Opus.
+        dave.decrypt.side_effect = Exception(
+            "Failed to decrypt: DecryptionFailed(UnencryptedWhenPassthroughDisabled)"
+        )
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Bob"),  # two humans → no inference
+        ]
+        receiver = _make_voice_receiver(key, dave_session=dave, members=members)
+
+        # Start of the utterance arrives before Discord sends SPEAKING.
+        _send_opus_tone(receiver, key, ssrc=100, frame_count=15, seq_start=1)
+        # Still unattributable, so nothing may have been decoded yet.
+        assert len(receiver._buffers.get(100, b"")) == 0, "decoded before mapping"
+
+        # SPEAKING lands, the rest of the utterance follows.
+        receiver.map_ssrc(100, 42)
+        _send_opus_tone(receiver, key, ssrc=100, frame_count=15, seq_start=16)
+
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+        completed = receiver.check_silence()
+        assert len(completed) == 1
+        user_id, pcm = completed[0]
+        assert user_id == 42
+        # The whole utterance, not just its tail: the 15 pre-SPEAKING frames
+        # were replayed ahead of the 15 live ones.  Before the hold-and-replay
+        # fix this returned 15 frames — the phrase lost its opening.
+        expected_bytes = 30 * discord.opus.Encoder.SAMPLES_PER_FRAME * 2 * 2
+        assert len(pcm) == expected_bytes
+        has_speech, _ = VoiceReceiver._pcm_speech_activity(pcm)
+        assert has_speech
+
+    def test_dave_pending_ring_is_bounded(self):
+        """An SSRC that never resolves cannot grow the hold ring without end."""
+        key = _make_secret_key()
+        dave = MagicMock()
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Bob"),
+        ]
+        receiver = _make_voice_receiver(key, dave_session=dave, members=members)
+        cap = VoiceReceiver.DAVE_PENDING_MAX_FRAMES
+
+        _send_opus_tone(receiver, key, ssrc=100, frame_count=cap + 50)
+
+        assert len(receiver._dave_pending[100]) == cap
+        # The overflow is counted, content-free, and nothing was decoded.
+        assert receiver._dave_unresolved_drops[100] == 50
+        dave.decrypt.assert_not_called()
+        assert 100 not in receiver._decoders
+
+    def test_dave_pending_ring_expires_when_ssrc_goes_quiet(self):
+        """A phantom SSRC releases its ring instead of holding it until stop()."""
+        key = _make_secret_key()
+        dave = MagicMock()
+        members = [
+            SimpleNamespace(id=9999, name="Bot"),
+            SimpleNamespace(id=42, name="Alice"),
+            SimpleNamespace(id=43, name="Bob"),
+        ]
+        receiver = _make_voice_receiver(key, dave_session=dave, members=members)
+
+        _send_opus_tone(receiver, key, ssrc=100, frame_count=5)
+        assert len(receiver._dave_pending[100]) == 5
+
+        # Age the ring past its TTL, then run the periodic janitor.
+        held_at, payload = receiver._dave_pending[100][-1]
+        receiver._dave_pending[100][-1] = (
+            held_at - VoiceReceiver.DAVE_PENDING_TTL - 1.0, payload,
+        )
+        receiver.check_silence()
+
+        assert 100 not in receiver._dave_pending
+        assert 100 not in receiver._dave_unresolved_drops
+
     def test_dave_unknown_ssrc_inferred_first_utterance_preserved(self):
         """DAVE + unknown SSRC + sole allowed member → first utterance kept.
 

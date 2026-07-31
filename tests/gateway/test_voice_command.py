@@ -1774,8 +1774,26 @@ class TestVoiceReception:
         assert len(receiver._buffers.get(100, b"")) == 0
         assert 100 not in receiver._decoders
 
-    def test_on_packet_dave_unknown_ssrc_drop_logged_content_free(self, caplog):
-        """The unknown-SSRC drop is instrumented without user ID or payload."""
+    def test_on_packet_dave_unknown_ssrc_eviction_logged_content_free(self, caplog):
+        """Ring eviction is instrumented without user ID or payload."""
+        dave = MagicMock()
+        receiver = self._make_receiver_with_nacl(dave_session=dave)
+        overflow = receiver.DAVE_PENDING_MAX_FRAMES + 1
+
+        with caplog.at_level("INFO"), patch("nacl.secret.Aead") as mock_aead:
+            mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
+            for seq in range(overflow):
+                receiver._on_packet(self._build_rtp_packet(ssrc=100, seq=seq))
+
+        evict_lines = [r.getMessage() for r in caplog.records
+                       if "unresolved sender" in r.getMessage()]
+        assert evict_lines, "expected a content-free eviction log line"
+        for line in evict_lines:
+            assert "42" not in line  # no user ID
+            assert "f8fffe" not in line  # no payload bytes
+
+    def test_on_packet_dave_unknown_ssrc_holds_without_logging_each_frame(self, caplog):
+        """Holding a payload is silent — only eviction is worth a log line."""
         dave = MagicMock()
         receiver = self._make_receiver_with_nacl(dave_session=dave)
 
@@ -1783,12 +1801,9 @@ class TestVoiceReception:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
             receiver._on_packet(self._build_rtp_packet(ssrc=100))
 
-        drop_lines = [r.getMessage() for r in caplog.records
-                      if "unresolved sender" in r.getMessage()]
-        assert drop_lines, "expected a content-free drop log line"
-        for line in drop_lines:
-            assert "42" not in line  # no user ID
-            assert "f8fffe" not in line  # no payload bytes
+        assert len(receiver._dave_pending[100]) == 1
+        assert not [r for r in caplog.records
+                    if "unresolved sender" in r.getMessage()]
 
     def test_on_packet_dave_unknown_ssrc_inferred_user_decrypts(self):
         """Unknown SSRC + DAVE + sole allowed member → infer at packet time.
@@ -1819,24 +1834,38 @@ class TestVoiceReception:
         assert len(receiver._buffers[100]) > 0
 
     def test_on_packet_dave_unknown_ssrc_recovers_after_speaking(self):
-        """Packets dropped while unresolved; SPEAKING maps → normal decrypt."""
+        """Packets held while unresolved; SPEAKING maps → held frames replayed.
+
+        Regression for the late-mapping hole: the frames that arrive before
+        SPEAKING are the start of the first utterance.  They must not reach
+        the decoder while the sender is unknown, and they must not be lost
+        once it becomes known.
+        """
         dave = MagicMock()
         dave.decrypt.return_value = b"\xf8\xff\xfe"
         receiver = self._make_receiver_with_nacl(dave_session=dave)
 
         with patch("nacl.secret.Aead") as mock_aead:
             mock_aead.return_value.decrypt.return_value = b"\xf8\xff\xfe"
-            # First packet: unresolved → dropped, no decoder created.
+            # First packet: unresolved → held, never decrypted or decoded.
             receiver._on_packet(self._build_rtp_packet(ssrc=100, seq=1))
             assert len(receiver._buffers.get(100, b"")) == 0
+            assert 100 not in receiver._decoders
+            dave.decrypt.assert_not_called()
+            assert len(receiver._dave_pending[100]) == 1
 
             # SPEAKING event arrives late.
             receiver.map_ssrc(100, 42)
-            self._inject_mock_decoder(receiver, 100)
+            decoder = self._inject_mock_decoder(receiver, 100)
             receiver._on_packet(self._build_rtp_packet(ssrc=100, seq=2))
 
-        dave.decrypt.assert_called_once()
+        # Held frame replayed, then the current one: both attributed to 42.
+        assert dave.decrypt.call_count == 2
+        assert all(call.args[0] == 42 for call in dave.decrypt.call_args_list)
+        assert decoder.decode.call_count == 2
         assert len(receiver._buffers[100]) > 0
+        # Ring emptied by the replay — no frame can be decoded twice.
+        assert 100 not in receiver._dave_pending
 
     def test_on_packet_dave_unencrypted_error_passthrough(self):
         """DAVE decrypt 'Unencrypted' error → use data as-is, don't drop."""
