@@ -3096,7 +3096,29 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # differing path is listed regardless), so the set of files that
         # still differ after ignoring CRLF-at-EOL is read from ``--numstat``
         # records, which drop files whose only change is CRLF-at-EOL.
-        return {t.split("\t", 2)[2] for t in out.stdout.split("\0") if "\t" in t}
+        if not out.stdout:
+            return set()
+        if not out.stdout.endswith("\0"):
+            return None
+        records = out.stdout.split("\0")[:-1]
+        dirty = set()
+        i = 0
+        while i < len(records):
+            fields = records[i].split("\t", 2)
+            if len(fields) != 3:
+                return None
+            if fields[2]:
+                dirty.add(fields[2])
+                i += 1
+                continue
+            # With ``-z``, a rename/copy has an empty path field followed by
+            # separate NUL-framed preimage and postimage paths. ``--name-only``
+            # reports the postimage, so retain that path for the set difference.
+            if i + 2 >= len(records) or not records[i + 1] or not records[i + 2]:
+                return None
+            dirty.add(records[i + 2])
+            i += 3
+        return dirty
 
     def _eol_only():
         all_dirty, real_dirty = _dirty(), _real_dirty()
