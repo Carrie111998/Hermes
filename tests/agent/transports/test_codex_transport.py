@@ -418,7 +418,7 @@ class TestCodexBuildKwargs:
 
         monkeypatch.setattr(
             "agent.codex_responses_adapter._normalize_codex_response",
-            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+            lambda resp, **kwargs: (msg, "tool_calls"),
         )
         normalized = transport.normalize_response(response)
 

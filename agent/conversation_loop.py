@@ -2523,6 +2523,7 @@ def run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
+                        base_url=agent.base_url,
                     )
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
@@ -2683,6 +2684,7 @@ def run_conversation(
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
+                            base_url=agent.base_url,
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
@@ -6075,6 +6077,12 @@ def run_conversation(
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
+            elif agent.api_mode == "codex_responses":
+                # Mantle response normalization needs the endpoint URL for
+                # capability detection and the current api_request_id as the
+                # remint seed for response-local indexed pairing IDs (#75471).
+                _normalize_kwargs["base_url"] = agent.base_url
+                _normalize_kwargs["request_scope"] = api_request_id
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
             finish_reason = normalized.finish_reason
