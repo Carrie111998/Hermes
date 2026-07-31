@@ -754,7 +754,7 @@ def test_marketplace_existing_listing_crosspost_uses_bound_state_machine(
 
     blocked = click_ref("@e0", "button", "Share")
     assert blocked["success"] is False
-    assert "only More options" in blocked["error"]
+    assert "listing-bound More options / List in more places" in blocked["error"]
     assert calls == []
 
     first_result = click_ref(
@@ -779,7 +779,7 @@ def test_marketplace_existing_listing_crosspost_uses_bound_state_machine(
 
     assert [call["crosspost_stage"] for call in calls] == [
         "open_menu",
-        "open_dialog",
+        "open_dialog_from_menu",
         "submit",
         "select_group",
         "submit",
@@ -811,6 +811,120 @@ def test_marketplace_existing_listing_crosspost_uses_bound_state_machine(
     ])
     assert all(effect["state"] == "create_started" for effect in effects)
     assert "browser-crosspost" not in browser_tool._facebook_crosspost_contexts
+
+
+def test_marketplace_crosspost_accepts_listing_bound_selling_direct_entry(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    listing_id = "37276725125275496"
+    group_id = "1333742673375089"
+    live_url = "https://www.facebook.com/marketplace/you/selling"
+    page_identity = f"{live_url}|790.0"
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"external_targets":['
+        f'"https://www.facebook.com/marketplace/item/{listing_id}/",'
+        f'"https://www.facebook.com/groups/{group_id}/"],'
+        '"facebook_crosspost":{'
+        f'"marketplace_listing_id":"{listing_id}",'
+        f'"group_ids":["{group_id}"]}},'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, run = _execution_task(conn, body=body)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.current_run_id))
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    current_page = {"url": live_url, "identity": page_identity}
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_page_identity",
+        lambda *_args: (
+            current_page["url"],
+            current_page["identity"],
+            None,
+        ),
+    )
+    browser_task_id = "browser-crosspost-selling"
+    browser_tool._facebook_crosspost_contexts.pop(browser_task_id, None)
+    calls = []
+
+    class FakeSupervisor:
+        def guarded_dom_action(self, **kwargs):
+            calls.append(kwargs)
+            result = {"ok": True, "action": "click"}
+            if kwargs.get("crosspost_stage") == "select_group":
+                result["crosspost_group_id"] = group_id
+            return {"ok": True, "result": result}
+
+    monkeypatch.setattr(
+        browser_supervisor.SUPERVISOR_REGISTRY,
+        "get",
+        lambda _task_id: FakeSupervisor(),
+    )
+
+    def click_ref(ref, role, name, *, checked=None):
+        metadata = {
+            "role": role,
+            "name": name,
+            "backend_node_id": len(calls) + 200,
+            "captured_session_id": "captured-session",
+        }
+        if checked is not None:
+            metadata["checked"] = checked
+        monkeypatch.setitem(
+            browser_tool._snapshot_ref_contexts,
+            browser_task_id,
+            {
+                "page_identity": current_page["identity"],
+                "kanban_task_id": task_id,
+                "kanban_run_id": run.current_run_id,
+                "refs": {ref.lstrip("@"): metadata},
+            },
+        )
+        return json.loads(browser_tool.browser_click(ref, task_id=browser_task_id))
+
+    descendant_url = f"{live_url}/edit/{listing_id}"
+    current_page.update({
+        "url": descendant_url,
+        "identity": f"{descendant_url}|790.0",
+    })
+    descendant = click_ref("@e0a", "button", "List in more places")
+    assert descendant["success"] is False
+    assert "neither an authorized numeric group destination" in descendant["error"]
+    assert calls == []
+    current_page.update({"url": live_url, "identity": page_identity})
+
+    blocked = click_ref("@e0", "button", "Edit")
+    assert blocked["success"] is False
+    assert calls == []
+
+    assert click_ref(
+        "@e1", "button", "List in more places"
+    )["success"] is True
+    assert calls[-1]["crosspost_stage"] == "open_dialog_direct"
+    assert calls[-1]["required_marketplace_listing_id"] == listing_id
+
+    assert click_ref(
+        "@e2", "checkbox", "Authorized group", checked=False
+    )["success"] is True
+    assert click_ref("@e3", "button", "Post")["success"] is True
+    assert [call["crosspost_stage"] for call in calls] == [
+        "open_dialog_direct",
+        "select_group",
+        "submit",
+    ]
+    with kb.connect_closing(db_path) as conn:
+        effects = kb.list_external_effects(conn, task_id)
+    assert [effect["effect_key"] for effect in effects] == [
+        f"group:{group_id}",
+    ]
+    assert effects[0]["state"] == "create_started"
+    assert browser_task_id not in browser_tool._facebook_crosspost_contexts
 
 
 def test_crosspost_group_reservations_are_all_or_nothing(tmp_path):

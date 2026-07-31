@@ -116,6 +116,26 @@ def test_grace_bodies_require_durable_external_effect_handoff():
     assert "external-effect ledger" in review
 
 
+def test_facebook_crosspost_guidance_allows_bound_selling_fallback():
+    contract = _contract()
+    contract["external_targets"] = [
+        "https://www.facebook.com/marketplace/item/111/",
+        "https://www.facebook.com/groups/222/",
+    ]
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    body = render_execution_body(contract)
+
+    assert "Marketplace Selling / Your listings" in body
+    assert "atomically bound to that same listing ID" in body
+    assert "listing-bound direct List in more places" in body
+    assert "Do not use Marketplace Selling-list controls" not in body
+    assert "Share, Sell Something, Edit, Boost" in body
+
+
 @pytest.mark.parametrize(
     "external_target",
     [

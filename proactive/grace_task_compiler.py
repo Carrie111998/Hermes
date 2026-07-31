@@ -74,12 +74,18 @@ def _render_facebook_crosspost_guidance(
             "Marketplace mutation controls.",
         ]
     return [
-        "Facebook existing-listing cross-post path (authoritative): navigate "
-        f"to https://www.facebook.com/marketplace/item/{listing_id} and use "
-        "More options → List in more places.",
-        "Do not use Marketplace Selling-list controls, Sell Something, Share, "
-        "or a create-item route. The guarded dialog may select only these "
-        f"group ids: {', '.join(group_ids)}.",
+        "Facebook existing-listing cross-post scope (authoritative): use only "
+        f"Marketplace listing {listing_id}. First inspect "
+        f"https://www.facebook.com/marketplace/item/{listing_id}; if that "
+        "page does not expose List in more places, inspect Marketplace "
+        "Selling / Your listings and use only a control atomically bound to "
+        "that same listing ID.",
+        "More options → List in more places and a listing-bound direct List "
+        "in more places control are equivalent authorized entry paths. "
+        "Read-only navigation and snapshots may locate either path, but Share, "
+        "Sell Something, Edit, Boost, stock changes, and create-item routes "
+        "remain forbidden. The guarded dialog may select only these group "
+        f"ids: {', '.join(group_ids)}.",
     ]
 
 

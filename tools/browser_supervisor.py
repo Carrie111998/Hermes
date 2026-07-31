@@ -1035,14 +1035,21 @@ class CDPSupervisor:
                       let crosspostPreselectedGroupIds = [];
                       if (requiredListingId) {
                         const listingMatch = location.pathname.match(
-                          /^\\/marketplace\\/item\\/([0-9]+)(?:\\/|$)/
+                          /^\\/marketplace\\/item\\/([0-9]+)\\/?$/
+                        );
+                        const sellingRoute = (
+                          /^\\/marketplace\\/you\\/selling\\/?$/
+                            .test(location.pathname)
                         );
                         if (
-                          !listingMatch
-                          || listingMatch[1] !== String(requiredListingId)
+                          (!listingMatch && !sellingRoute)
+                          || (
+                            listingMatch
+                            && listingMatch[1] !== String(requiredListingId)
+                          )
                         ) {
                           fail(
-                            "Current route is not the authorized Marketplace listing"
+                            "Current route is not an authorized Marketplace listing source"
                           );
                         }
                         const allowedIds = new Set(
@@ -1053,7 +1060,9 @@ class CDPSupervisor:
                         );
                         if (
                           ![
-                            "open_menu", "open_dialog", "select_group", "submit"
+                            "open_menu", "open_dialog_from_menu",
+                            "open_dialog_direct",
+                            "select_group", "submit"
                           ].includes(crosspostStage)
                         ) fail("Unsupported Marketplace cross-post stage");
                         if (!crosspostSourceToken) {
@@ -1085,7 +1094,7 @@ class CDPSupervisor:
                         };
                         const flow = this.ownerDocument.__hermesCrosspostFlow;
                         let sourceControl = null;
-                        if (crosspostStage === "open_menu") {
+                        const bindSourceControl = () => {
                           const listingContainerSelector = [
                             "[data-listing-id]",
                             "[data-marketplace-listing-id]",
@@ -1105,13 +1114,13 @@ class CDPSupervisor:
                             const sourceIds = listingIdsIn(listingNode);
                             if (sourceIds.size > 1) {
                               fail(
-                                "More options belongs to a shared listing container"
+                                "Cross-post control belongs to a shared listing container"
                               );
                             }
                             if (sourceIds.size === 1) {
                               if (!sourceIds.has(String(requiredListingId))) {
                                 fail(
-                                  "More options belongs to a different listing"
+                                  "Cross-post control belongs to a different listing"
                                 );
                               }
                               sourceBound = true;
@@ -1120,9 +1129,16 @@ class CDPSupervisor:
                           }
                           if (!sourceBound) {
                             fail(
-                              "More options is not bound to the authorized listing"
+                              "Cross-post control is not bound to the authorized listing"
                             );
                           }
+                        };
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
+                          bindSourceControl();
+                          sourceControl = this;
                         } else {
                           if (
                             !flow
@@ -1134,7 +1150,8 @@ class CDPSupervisor:
                             );
                           }
                           const markedSources = [...this.ownerDocument.querySelectorAll(
-                            'button, [role="button"]'
+                            'button, a, [role="button"], [role="link"], '
+                            + '[role="menuitem"]'
                           )].filter(candidate =>
                             candidate.__hermesCrosspostSource?.token
                               === crosspostSourceToken
@@ -1148,7 +1165,7 @@ class CDPSupervisor:
                           }
                           sourceControl = markedSources[0];
                         }
-                        if (crosspostStage === "open_dialog") {
+                        if (crosspostStage === "open_dialog_from_menu") {
                           if (flow.stage !== "menu_open") {
                             fail("Marketplace source menu state changed");
                           }
@@ -1189,6 +1206,12 @@ class CDPSupervisor:
                                 "List in more places is not uniquely bound to the source menu"
                               );
                             }
+                          }
+                        } else if (crosspostStage === "open_dialog_direct") {
+                          if (flow) {
+                            fail(
+                              "Direct List in more places did not start a fresh source flow"
+                            );
                           }
                         }
                         if (
@@ -1469,7 +1492,10 @@ class CDPSupervisor:
                       guard.observer.disconnect();
                       delete this.__hermesAtomicGuard;
                       if (requiredListingId) {
-                        if (crosspostStage === "open_menu") {
+                        if (
+                          crosspostStage === "open_menu"
+                          || crosspostStage === "open_dialog_direct"
+                        ) {
                           Object.defineProperty(
                             this, "__hermesCrosspostSource", {
                               value: {
@@ -1484,13 +1510,18 @@ class CDPSupervisor:
                               value: {
                                 token: crosspostSourceToken,
                                 listingId: String(requiredListingId),
-                                stage: "menu_open"
+                                stage: (
+                                  crosspostStage === "open_menu"
+                                    ? "menu_open" : "dialog_requested"
+                                )
                               },
                               configurable: true,
                               writable: true
                             }
                           );
-                        } else if (crosspostStage === "open_dialog") {
+                        } else if (
+                          crosspostStage === "open_dialog_from_menu"
+                        ) {
                           this.ownerDocument.__hermesCrosspostFlow.stage =
                             "dialog_requested";
                         } else if (crosspostStage === "select_group") {

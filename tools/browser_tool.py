@@ -3017,7 +3017,11 @@ def _run_atomic_ref_action(
     kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
     group_match = re.match(r"^/groups/(\d+)(?:/|$)", parsed.path)
     marketplace_item_match = re.match(
-        r"^/marketplace/item/(\d+)(?:/|$)",
+        r"^/marketplace/item/(\d+)/?$",
+        parsed.path,
+    )
+    marketplace_selling_match = re.match(
+        r"^/marketplace/you/selling/?$",
         parsed.path,
     )
     normalized_host = str(parsed.hostname or "").rstrip(".").casefold()
@@ -3032,7 +3036,11 @@ def _run_atomic_ref_action(
     crosspost_listing_id: Optional[str] = None
     crosspost_group_ids: frozenset[str] = frozenset()
     crosspost_allowed = False
-    if is_facebook_host and marketplace_item_match is not None:
+    is_crosspost_source_surface = bool(
+        marketplace_item_match is not None
+        or marketplace_selling_match is not None
+    )
+    if is_facebook_host and is_crosspost_source_surface:
         try:
             with _kanban_db.connect_closing() as scope_conn:
                 (
@@ -3052,9 +3060,12 @@ def _run_atomic_ref_action(
         and not is_group_route
         and _kanban_db.external_platform_for_url(current_url) != "facebook"
         and not (
-            marketplace_item_match is not None
+            is_crosspost_source_surface
             and crosspost_allowed
-            and marketplace_item_match.group(1) == crosspost_listing_id
+            and (
+                marketplace_item_match is None
+                or marketplace_item_match.group(1) == crosspost_listing_id
+            )
         )
     ):
         return json.dumps({
@@ -3152,10 +3163,15 @@ def _run_atomic_ref_action(
     selected_crosspost_group_ids: list[str] = []
     reserved_crosspost_group_ids: list[str] = []
     crosspost_source_token: Optional[str] = None
-    if is_facebook_host and marketplace_item_match is not None:
-        live_listing_id = marketplace_item_match.group(1)
+    if is_facebook_host and is_crosspost_source_surface:
+        live_listing_id = (
+            marketplace_item_match.group(1)
+            if marketplace_item_match is not None
+            else crosspost_listing_id
+        )
         if (
             not crosspost_allowed
+            or not live_listing_id
             or crosspost_listing_id != live_listing_id
             or not crosspost_group_ids
         ):
@@ -3189,29 +3205,30 @@ def _run_atomic_ref_action(
             crosspost_source_token = secrets.token_hex(16)
         elif is_crosspost_open_dialog:
             if (
-                not context_matches
-                or crosspost_context.get("stage") != "menu_open"
+                context_matches
+                and crosspost_context.get("stage") == "menu_open"
             ):
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        "Facebook Marketplace cross-post blocked: List in "
-                        "more places was not opened from the authorized "
-                        "listing's fresh More options capability."
-                    ),
-                }, ensure_ascii=False)
-            crosspost_source_token = str(
-                crosspost_context.get("source_token") or ""
-            )
-            if not crosspost_source_token:
-                return json.dumps({
-                    "success": False,
-                    "error": (
-                        "Facebook Marketplace cross-post blocked: the "
-                        "source-listing capability token is missing."
-                    ),
-                }, ensure_ascii=False)
-            crosspost_stage = "open_dialog"
+                # This is only a candidate source-menu transition.  The CDP
+                # supervisor still proves atomically that the clicked control
+                # is inside the unique menu opened by the marked source.
+                crosspost_source_token = str(
+                    crosspost_context.get("source_token") or ""
+                )
+                if not crosspost_source_token:
+                    return json.dumps({
+                        "success": False,
+                        "error": (
+                            "Facebook Marketplace cross-post blocked: the "
+                            "source-listing capability token is missing."
+                        ),
+                    }, ensure_ascii=False)
+                crosspost_stage = "open_dialog_from_menu"
+            else:
+                # Facebook may expose this control directly on the item page
+                # or the seller's listing row.  The renderer must still bind
+                # the exact control to the approved listing before clicking.
+                crosspost_source_token = secrets.token_hex(16)
+                crosspost_stage = "open_dialog_direct"
         elif is_crosspost_group_select:
             if (
                 not context_matches
@@ -3310,9 +3327,9 @@ def _run_atomic_ref_action(
             return json.dumps({
                 "success": False,
                 "error": (
-                    "Facebook Marketplace cross-post blocked: only More "
-                    "options → List in more places → authorized group "
-                    "selection → Post controls are allowed on this listing."
+                    "Facebook Marketplace cross-post blocked: only a "
+                    "listing-bound More options / List in more places path, "
+                    "authorized group selection, and final Post are allowed."
                 ),
             }, ensure_ascii=False)
     if is_facebook_host and is_join_button and group_match is None:
@@ -3580,12 +3597,26 @@ def _run_atomic_ref_action(
                 "source_token": crosspost_source_token,
                 "stage": "menu_open",
             }
-    elif crosspost_stage == "open_dialog":
+    elif crosspost_stage in {
+        "open_dialog_from_menu", "open_dialog_direct",
+    }:
         with _snapshot_ref_lock:
-            context = _facebook_crosspost_contexts.get(browser_task_id)
-            if context is not None:
-                context["stage"] = "dialog_open"
-                context["selected_group_ids"] = []
+            if crosspost_stage == "open_dialog_direct":
+                _facebook_crosspost_contexts[browser_task_id] = {
+                    "page_identity": page_identity,
+                    "kanban_task_id": kanban_task_id,
+                    "kanban_run_id": _kanban_worker_run_id(),
+                    "listing_id": required_marketplace_listing_id,
+                    "allowed_group_ids": allowed_crosspost_group_ids,
+                    "selected_group_ids": [],
+                    "source_token": crosspost_source_token,
+                    "stage": "dialog_open",
+                }
+            else:  # open_dialog_from_menu
+                context = _facebook_crosspost_contexts.get(browser_task_id)
+                if context is not None:
+                    context["stage"] = "dialog_open"
+                    context["selected_group_ids"] = []
     elif crosspost_stage == "select_group":
         result_value = action_result.get("result")
         selected_group_id = None
