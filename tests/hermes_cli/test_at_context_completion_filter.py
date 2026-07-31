@@ -67,3 +67,12 @@ def test_at_blame_only_yields_files(tmp_path, monkeypatch):
     assert any(t == "@blame:readme.md" for t in texts)
     assert not any(t == "@blame:src/" for t in texts)
     assert not any(t == "@blame:docs/" for t in texts)
+
+
+def test_at_blame_bare_without_colon_lists_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    texts = [t for t, _ in _run(tmp_path, "@blame")]
+
+    assert any(t == "@blame:readme.md" for t in texts), texts
+    assert not any(t == "@blame:src/" for t in texts)

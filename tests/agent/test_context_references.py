@@ -78,8 +78,10 @@ def test_parse_typed_references_ignores_emails_and_handles():
 def test_blame_reference_injects_git_blame(sample_repo: Path):
     from agent.context_references import preprocess_context_references
 
+    # Prefer an unchanged committed file: staged edits on helper.py make git
+    # blame report "Not Committed Yet" and drop the configured author name.
     result = preprocess_context_references(
-        "Who wrote @blame:src/helper.py?",
+        "Who wrote @blame:README.md?",
         cwd=sample_repo,
         context_length=100_000,
     )
@@ -88,8 +90,8 @@ def test_blame_reference_injects_git_blame(sample_repo: Path):
     assert not result.blocked
     assert result.references[0].kind == "blame"
     assert "git blame" in result.message
-    assert "VALUE = 1" in result.message or "VALUE = 2" in result.message
-    assert "Hermes Tests" in result.message or "initial" in result.message.lower() or len(result.message) > 50
+    assert "Demo" in result.message
+    assert "Hermes Tests" in result.message
 
 
 def test_blame_reference_supports_line_range(sample_repo: Path):
@@ -220,7 +222,8 @@ async def test_blocks_canonical_read_denylist_credential_stores(tmp_path: Path, 
 
     result = await preprocess_context_references_async(
         "inspect @file:.hermes/auth.json and @file:.hermes/.anthropic_oauth.json "
-        "and @file:.hermes/mcp-tokens/github.json and @file:project/.env",
+        "and @file:.hermes/mcp-tokens/github.json and @file:project/.env "
+        "and @blame:.hermes/auth.json",
         cwd=tmp_path,
         allowed_root=tmp_path,
         context_length=100_000,
@@ -234,7 +237,7 @@ async def test_blocks_canonical_read_denylist_credential_stores(tmp_path: Path, 
         "ENV-SECRET",
     ):
         assert secret not in result.message
-    assert sum("sensitive credential" in warning for warning in result.warnings) == 4
+    assert sum("sensitive credential" in warning for warning in result.warnings) == 5
 
 
 @pytest.mark.asyncio

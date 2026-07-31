@@ -37,6 +37,7 @@ from typing import Mapping, Sequence
 __all__ = [
     "IS_WINDOWS",
     "resolve_node_command",
+    "resolve_git_command",
     "suppress_platform_ver_console",
     "windows_detach_flags",
     "windows_detach_flags_without_breakaway",
@@ -91,6 +92,59 @@ def resolve_node_command(name: str, argv: Sequence[str]) -> list[str]:
     if resolved:
         return [resolved, *argv]
     return [name, *argv]
+
+
+# -----------------------------------------------------------------------------
+# Git executable resolution
+# -----------------------------------------------------------------------------
+
+# Windows-only known install locations for Git, checked before falling back
+# to a bare "git" name (which relies on PATH). On Windows, the user's shell
+# (Git Bash / MSYS2) may find `git` via an MSYS mount that Python's
+# CreateProcessW cannot see — the canonical PATH search returns nothing.
+# This list mirrors the Git-for-Windows bash resolution in
+# ``tools/environments/local.py``.
+_GIT_WIN_CANDIDATES = (
+    os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd", "git.exe"),
+    os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd", "git.exe"),
+    os.path.join(os.environ.get("LocalAppData", ""), "Programs", "Git", "cmd", "git.exe") if os.environ.get("LocalAppData") else "",
+)
+
+
+def resolve_git_command(argv: Sequence[str]) -> list[str]:
+    """Resolve the ``git`` executable to an absolute path on Windows.
+
+    On Windows, ``subprocess.Popen(["git", ...])`` fails with WinError 2
+    (``FileNotFoundError``) when the Git install directory is not on the
+    process's PATH. This is common for Hermes desktop / gateway processes
+    whose PATH is set by the Electron runtime or the system, not by the
+    user's shell profile. The user's Git Bash shell finds ``git`` via an
+    MSYS mount (e.g. ``/mingw64/bin/git``) that is invisible to
+    ``CreateProcessW``.
+
+    This helper checks known Git-for-Windows install locations and falls
+    back to ``shutil.which("git")`` (which honors PATHEXT). If none match,
+    it returns the bare ``["git", *argv]`` — the subsequent Popen will
+    raise a readable ``FileNotFoundError`` that callers can surface.
+
+    On POSIX, ``shutil.which`` resolves the absolute path when git is on
+    PATH, and the bare name is returned when it isn't (identical to the
+    pre-existing behavior).
+
+    Args:
+        argv: Arguments after ``git``. Must NOT include ``git`` itself.
+
+    Returns:
+        A list suitable for passing to subprocess.Popen/run/call.
+    """
+    resolved = shutil.which("git")
+    if resolved:
+        return [resolved, *argv]
+    if IS_WINDOWS:
+        for candidate in _GIT_WIN_CANDIDATES:
+            if candidate and os.path.isfile(candidate):
+                return [candidate, *argv]
+    return ["git", *argv]
 
 
 # -----------------------------------------------------------------------------
