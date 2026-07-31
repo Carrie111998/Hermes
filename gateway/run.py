@@ -5560,6 +5560,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _bg_max_age_seconds = (
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
+        # Push the finished-process prune TTL (session_reset.
+        # finished_process_ttl_minutes) into the registry so finished jobs are
+        # pruned at the configured rate instead of the module default — each
+        # tracked process holds a pipe FD, and a long TTL lets finished jobs
+        # pile up toward the 64-process cap and block new background spawns.
+        _finished_ttl_minutes = getattr(
+            self.config.default_reset_policy, "finished_process_ttl_minutes", 10
+        )
+        if _finished_ttl_minutes and _finished_ttl_minutes > 0:
+            from tools.process_registry import set_finished_ttl_seconds
+            set_finished_ttl_seconds(_finished_ttl_minutes * 60)
         self.session_store = SessionStore(
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
