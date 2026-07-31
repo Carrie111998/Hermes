@@ -168,7 +168,7 @@ terminal:
 
 ### SSH 后端
 
-通过 SSH 在远程服务器上运行命令。使用 ControlMaster 进行连接复用（5 分钟空闲保活）。默认启用持久 shell —— 状态（cwd、环境变量）在命令之间保持。
+通过 SSH 在远程服务器上运行命令。在 Linux 和 macOS 上使用 ControlMaster 进行连接复用（5 分钟空闲保活）；Windows 上的 OpenSSH 不支持 Unix 域套接字多路复用，因此跳过 ControlMaster。默认启用持久 shell —— 状态（cwd、环境变量）在命令之间保持。
 
 ```yaml
 terminal:
