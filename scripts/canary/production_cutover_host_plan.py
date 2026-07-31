@@ -1895,7 +1895,10 @@ def collect_fixed_host_plan(
         ),
     }
     try:
-        host_authority._validate_transition_and_plan(result, initial=initial)
+        host_authority._validate_transition_and_plan(
+            {**result, "release_revision": revision},
+            initial=initial,
+        )
     except (TypeError, ValueError, RuntimeError) as exc:
         raise HostPlanProducerError("host_plan_derived_contract_invalid") from exc
     if set(result) != {

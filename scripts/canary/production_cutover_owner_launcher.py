@@ -40,6 +40,9 @@ from scripts.canary import package_production_cutover_artifacts as package
 from scripts.canary import production_cutover_host_authority as host_authority
 from scripts.canary import production_database_recovery_gate as database_recovery
 from scripts.canary import production_cutover_passkey as cutover_passkey
+from scripts.canary import (
+    production_cutover_unit_input_successor as unit_successor,
+)
 from scripts.canary import production_cutover_unit_input_rotation as unit_rotation
 from scripts.canary.production_cutover_public_stager import (
     PublicStagingError,
@@ -67,6 +70,18 @@ CONVERGENCE_SCHEMA = "muncho-owner-gate-production-convergence.v1"
 MAX_JSON = 16 * 1024 * 1024
 MAX_COLLECTOR_AGE_SECONDS = 900
 MINIMUM_V2_APPROVAL_MARGIN_SECONDS = 30
+LOCAL_RELEASE_PHASE_COMMANDS = {
+    "prepare-release-unit-inputs": "prepare-release-unit-inputs",
+    "preauthorize-release-unit-inputs": (
+        "preauthorize-release-unit-inputs"
+    ),
+    "seal-finalize-release-unit-inputs-request": (
+        "finalize-release-unit-inputs"
+    ),
+    "seal-abort-release-unit-inputs-request": (
+        "abort-release-unit-inputs"
+    ),
+}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _CUTOVER_REQUEST_ID = re.compile(r"^[0-9a-f]{64}$")
 _LEGACY_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{32}$")
@@ -326,6 +341,8 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         "activate-bridge",
         "stage-publication",
         "rotate-unit-input-authority",
+        "prepare-release-unit-inputs",
+        "preauthorize-release-unit-inputs",
         "stage-cron-continuity",
         "capture-final-tail",
         "collect-stopped",
@@ -706,6 +723,19 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "-m",
                 "scripts.canary.production_cutover_unit_input_rotation",
             )
+        if action in {
+            "prepare-release-unit-inputs",
+            "preauthorize-release-unit-inputs",
+        }:
+            return (
+                *prefix,
+                interpreter,
+                "-B",
+                "-I",
+                "-m",
+                "scripts.canary.production_cutover_unit_input_rotation",
+                action,
+            )
         if action in {"prepare-bridge", "activate-bridge"}:
             return (
                 *prefix,
@@ -766,6 +796,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
         authority_request: Mapping[str, Any] | None = None,
         initial_receipt: Mapping[str, Any] | None = None,
         bridge_bootstrap_input: Mapping[str, Any] | None = None,
+        release_rotation_request: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         account = self._owner_identity.account_for_read_only_preflight()
         self._owner_identity.require_stable()
@@ -777,6 +808,8 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
             "collect-authority",
             "prepare-bridge",
             "activate-bridge",
+            "prepare-release-unit-inputs",
+            "preauthorize-release-unit-inputs",
         }
         if action in input_actions:
             if action in {
@@ -788,6 +821,11 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 input_value = initial_receipt
             elif action == "collect-authority":
                 input_value = authority_request
+            elif action in {
+                "prepare-release-unit-inputs",
+                "preauthorize-release-unit-inputs",
+            }:
+                input_value = release_rotation_request
             else:
                 input_value = bridge_bootstrap_input
             if input_value is None:
@@ -800,6 +838,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                         authority_request,
                         initial_receipt,
                         bridge_bootstrap_input,
+                        release_rotation_request,
                     )
                 )
                 != 1
@@ -820,6 +859,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 or authority_request is not None
                 or initial_receipt is not None
                 or bridge_bootstrap_input is not None
+                or release_rotation_request is not None
             ):
                 raise OwnerCutoverError("owner_cutover_publication_unexpected")
             completed = self._run_remote(
@@ -980,7 +1020,7 @@ def _decode(raw: bytes) -> Mapping[str, Any]:
     return value
 
 
-def _read_public_json(path: Path) -> Mapping[str, Any]:
+def _read_public_bytes(path: Path) -> bytes:
     try:
         state = path.lstat()
         if (
@@ -1005,7 +1045,18 @@ def _read_public_json(path: Path) -> Mapping[str, Any]:
         != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
     ):
         raise OwnerCutoverError("owner_cutover_public_input_changed")
-    return _decode(raw)
+    return raw
+
+
+def _read_public_json(path: Path) -> Mapping[str, Any]:
+    return _decode(_read_public_bytes(path))
+
+
+def _read_public_json_line(path: Path) -> Mapping[str, Any]:
+    raw = _read_public_bytes(path)
+    if not raw.endswith(b"\n"):
+        raise OwnerCutoverError("owner_cutover_json_not_canonical")
+    return _decode(raw[:-1])
 
 
 def load_owner_private_key(path: Path) -> Ed25519PrivateKey:
@@ -1728,6 +1779,204 @@ def rotate_unit_input_authority(
         raise OwnerCutoverError(
             "owner_cutover_unit_input_rotation_invalid"
         ) from None
+
+
+def build_release_unit_input_phase_request(
+    *,
+    action: str,
+    owner_release_revision: str,
+    remote_stager_revision: str,
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    prepared_receipt: Mapping[str, Any] | None = None,
+    preauthorization_receipt: Mapping[str, Any] | None = None,
+    expected_transaction_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Build and fully validate one immutable split-phase request."""
+
+    if (
+        action not in unit_rotation.RELEASE_PHASE_ACTIONS
+        or package.REVISION.fullmatch(owner_release_revision or "") is None
+        or package.REVISION.fullmatch(remote_stager_revision or "") is None
+        or not isinstance(unit_input_publication, Mapping)
+        or not isinstance(release_update_publication, Mapping)
+        or unit_input_publication.get("release_revision")
+        != remote_stager_revision
+        or release_update_publication.get("release_revision")
+        != remote_stager_revision
+        or not isinstance(trusted_predecessor, Mapping)
+        or not isinstance(expected_predecessor_trust_sha256, str)
+        or _SHA256.fullmatch(expected_predecessor_trust_sha256)
+        is None
+    ):
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        )
+    validated_prepared: Mapping[str, Any] | None = None
+    validated_preauthorization: Mapping[str, Any] | None = None
+    try:
+        if action != "prepare-release-unit-inputs":
+            if (
+                not isinstance(prepared_receipt, Mapping)
+                or _SHA256.fullmatch(
+                    str(expected_transaction_sha256 or "")
+                )
+                is None
+            ):
+                raise unit_rotation.UnitInputRotationError(
+                    "unit_input_rotation_phase_request_invalid"
+                )
+            validated_prepared = (
+                unit_rotation.validate_release_prepared_rotation_receipt(
+                    prepared_receipt,
+                    unit_input_publication=unit_input_publication,
+                    release_update_publication=release_update_publication,
+                    trusted_predecessor=trusted_predecessor,
+                    expected_predecessor_trust_sha256=(
+                        expected_predecessor_trust_sha256
+                    ),
+                )
+            )
+            if (
+                validated_prepared["transaction_sha256"]
+                != expected_transaction_sha256
+            ):
+                raise unit_rotation.UnitInputRotationError(
+                    "unit_input_rotation_phase_request_invalid"
+                )
+        if action in {
+            "finalize-release-unit-inputs",
+            "abort-release-unit-inputs",
+        }:
+            if not isinstance(preauthorization_receipt, Mapping):
+                raise unit_rotation.UnitInputRotationError(
+                    "unit_input_rotation_phase_request_invalid"
+                )
+            validated_preauthorization = (
+                unit_rotation.validate_release_preauthorization_receipt(
+                    preauthorization_receipt,
+                    unit_input_publication=unit_input_publication,
+                    release_update_publication=release_update_publication,
+                    trusted_predecessor=trusted_predecessor,
+                    expected_predecessor_trust_sha256=(
+                        expected_predecessor_trust_sha256
+                    ),
+                    prepared_receipt=validated_prepared,
+                )
+            )
+    except unit_rotation.UnitInputRotationError as exc:
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        ) from exc
+    request: dict[str, Any] = {
+        "schema": unit_rotation.RELEASE_PHASE_REQUEST_SCHEMA,
+        "action": action,
+        "owner_release_revision": owner_release_revision,
+        "remote_stager_revision": remote_stager_revision,
+        "unit_input_publication": unit_input_publication,
+        "release_update_publication": release_update_publication,
+        "trusted_predecessor": trusted_predecessor,
+        "expected_predecessor_trust_sha256": (
+            expected_predecessor_trust_sha256
+        ),
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    if action != "prepare-release-unit-inputs":
+        request.update({
+            "prepared_receipt": validated_prepared,
+            "expected_transaction_sha256": expected_transaction_sha256,
+        })
+    if action in {
+        "finalize-release-unit-inputs",
+        "abort-release-unit-inputs",
+    }:
+        request["preauthorization_receipt"] = (
+            validated_preauthorization
+        )
+    request["request_sha256"] = _sha(_canonical(request))
+    try:
+        validated_request = (
+            unit_rotation.validate_release_unit_input_phase_request(
+                action,
+                request,
+            )
+        )
+    except unit_rotation.UnitInputRotationError as exc:
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        ) from exc
+    if validated_request != request:
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        )
+    return copy.deepcopy(dict(validated_request))
+
+
+def run_release_unit_input_phase(
+    *,
+    action: str,
+    owner_release_revision: str,
+    remote_stager_revision: str,
+    unit_input_publication: Mapping[str, Any],
+    release_update_publication: Mapping[str, Any],
+    trusted_predecessor: Mapping[str, Any],
+    expected_predecessor_trust_sha256: str,
+    transport: Any,
+    prepared_receipt: Mapping[str, Any] | None = None,
+    preauthorization_receipt: Mapping[str, Any] | None = None,
+    expected_transaction_sha256: str | None = None,
+) -> Mapping[str, Any]:
+    """Run one split release-authority phase over the fixed IAP edge."""
+
+    if (
+        action not in {
+            "prepare-release-unit-inputs",
+            "preauthorize-release-unit-inputs",
+        }
+        or not callable(getattr(transport, "invoke", None))
+    ):
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        )
+    request = build_release_unit_input_phase_request(
+        action=action,
+        owner_release_revision=owner_release_revision,
+        remote_stager_revision=remote_stager_revision,
+        unit_input_publication=unit_input_publication,
+        release_update_publication=release_update_publication,
+        trusted_predecessor=trusted_predecessor,
+        expected_predecessor_trust_sha256=(
+            expected_predecessor_trust_sha256
+        ),
+        prepared_receipt=prepared_receipt,
+        preauthorization_receipt=preauthorization_receipt,
+        expected_transaction_sha256=expected_transaction_sha256,
+    )
+    validated_prepared = request.get("prepared_receipt")
+    validated_preauthorization = request.get(
+        "preauthorization_receipt"
+    )
+    result = transport.invoke(
+        remote_stager_revision,
+        action,
+        release_rotation_request=request,
+    )
+    try:
+        validated_result = (
+            unit_rotation.validate_release_unit_input_phase_result(
+                action,
+                request,
+                result,
+            )
+        )
+    except unit_rotation.UnitInputRotationError as exc:
+        raise OwnerCutoverError(
+            "owner_cutover_release_unit_input_phase_invalid"
+        ) from exc
+    return copy.deepcopy(dict(validated_result))
 
 
 def _validate_preflight_receipt(
@@ -3591,6 +3840,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     unit.add_argument("--owner-private-key", type=Path, required=True)
     unit.add_argument("--owner-subject-sha256", required=True)
     unit.add_argument("--output", type=Path, required=True)
+    derive_unit = subparsers.add_parser("derive-unit-inputs")
+    derive_unit.add_argument("--revision", required=True)
+    derive_unit.add_argument("--predecessor-plan", type=Path, required=True)
+    derive_unit.add_argument(
+        "--predecessor-approval",
+        type=Path,
+        required=True,
+    )
+    derive_unit.add_argument(
+        "--predecessor-fixed-inputs",
+        type=Path,
+        required=True,
+    )
+    derive_unit.add_argument("--output", type=Path, required=True)
     stage_unit = subparsers.add_parser("stage-unit-inputs")
     stage_unit.add_argument("--revision", required=True)
     stage_unit.add_argument("--remote-stager-revision", required=True)
@@ -3601,6 +3864,54 @@ def main(argv: Sequence[str] | None = None) -> int:
     rotate_unit.add_argument("--remote-stager-revision", required=True)
     rotate_unit.add_argument("--publication", type=Path, required=True)
     rotate_unit.add_argument("--output", type=Path, required=True)
+    for phase_command, phase_action in sorted(
+        LOCAL_RELEASE_PHASE_COMMANDS.items()
+    ):
+        phase_parser = subparsers.add_parser(phase_command)
+        phase_parser.add_argument("--revision", required=True)
+        phase_parser.add_argument(
+            "--remote-stager-revision",
+            required=True,
+        )
+        phase_parser.add_argument(
+            "--unit-input-publication",
+            type=Path,
+            required=True,
+        )
+        phase_parser.add_argument(
+            "--release-update-publication",
+            type=Path,
+            required=True,
+        )
+        phase_parser.add_argument(
+            "--trusted-predecessor",
+            type=Path,
+            required=True,
+        )
+        phase_parser.add_argument(
+            "--expected-predecessor-trust-sha256",
+            required=True,
+        )
+        if phase_action != "prepare-release-unit-inputs":
+            phase_parser.add_argument(
+                "--prepared-receipt",
+                type=Path,
+                required=True,
+            )
+            phase_parser.add_argument(
+                "--expected-transaction-sha256",
+                required=True,
+            )
+        if phase_action in {
+            "finalize-release-unit-inputs",
+            "abort-release-unit-inputs",
+        }:
+            phase_parser.add_argument(
+                "--preauthorization-receipt",
+                type=Path,
+                required=True,
+            )
+        phase_parser.add_argument("--output", type=Path, required=True)
     os_login_preflight = subparsers.add_parser("os-login-preflight")
     os_login_preflight.add_argument("--revision", required=True)
     os_login_preflight.add_argument(
@@ -3644,6 +3955,149 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_attestation = _active_owner_runtime_attestation(
             arguments.revision
         )
+        if arguments.command == "derive-unit-inputs":
+            predecessor_paths = (
+                arguments.predecessor_plan,
+                arguments.predecessor_approval,
+                arguments.predecessor_fixed_inputs,
+            )
+            if any(not path.is_absolute() for path in predecessor_paths):
+                raise OwnerCutoverError(
+                    "owner_cutover_public_input_invalid"
+                )
+            predecessor_plan = _read_public_json(
+                arguments.predecessor_plan
+            )
+            output_value = unit_successor.derive_successor_payload(
+                predecessor_plan=predecessor_plan,
+                predecessor_approval=_read_public_json(
+                    arguments.predecessor_approval
+                ),
+                predecessor_fixed_inputs=_read_public_json_line(
+                    arguments.predecessor_fixed_inputs
+                ),
+                successor_revision=arguments.revision,
+            )
+            created = _write_public_output(arguments.output, output_value)
+            print(_canonical({
+                "schema": OWNER_WORKSPACE_SCHEMA,
+                "action": arguments.command,
+                "predecessor_revision": predecessor_plan[
+                    "release_revision"
+                ],
+                "release_revision": arguments.revision,
+                "output_path": str(arguments.output),
+                "output_sha256": _sha(_canonical(output_value)),
+                "created": created,
+                "private_key_staged": False,
+                "secret_material_recorded": False,
+            }).decode("utf-8"))
+            return 0
+        if arguments.command in LOCAL_RELEASE_PHASE_COMMANDS:
+            phase_action = LOCAL_RELEASE_PHASE_COMMANDS[arguments.command]
+            input_paths = (
+                arguments.unit_input_publication,
+                arguments.release_update_publication,
+                arguments.trusted_predecessor,
+                getattr(arguments, "prepared_receipt", None),
+                getattr(arguments, "preauthorization_receipt", None),
+            )
+            if any(
+                path is not None and not path.is_absolute()
+                for path in input_paths
+            ):
+                raise OwnerCutoverError(
+                    "owner_cutover_release_unit_input_path_invalid"
+                )
+            phase_kwargs = {
+                "action": phase_action,
+                "owner_release_revision": arguments.revision,
+                "remote_stager_revision": (
+                    arguments.remote_stager_revision
+                ),
+                "unit_input_publication": _read_public_json(
+                    arguments.unit_input_publication
+                ),
+                "release_update_publication": _read_public_json(
+                    arguments.release_update_publication
+                ),
+                "trusted_predecessor": _read_public_json(
+                    arguments.trusted_predecessor
+                ),
+                "expected_predecessor_trust_sha256": (
+                    arguments.expected_predecessor_trust_sha256
+                ),
+                "prepared_receipt": (
+                    None
+                    if getattr(arguments, "prepared_receipt", None) is None
+                    else _read_public_json(arguments.prepared_receipt)
+                ),
+                "preauthorization_receipt": (
+                    None
+                    if getattr(
+                        arguments,
+                        "preauthorization_receipt",
+                        None,
+                    )
+                    is None
+                    else _read_public_json(
+                        arguments.preauthorization_receipt
+                    )
+                ),
+                "expected_transaction_sha256": getattr(
+                    arguments,
+                    "expected_transaction_sha256",
+                    None,
+                ),
+            }
+            if phase_action in {
+                "prepare-release-unit-inputs",
+                "preauthorize-release-unit-inputs",
+            }:
+                identity, trusted, configuration = (
+                    build_production_cutover_owner_identity(
+                        arguments.revision
+                    )
+                )
+                output_value = run_release_unit_input_phase(
+                    **phase_kwargs,
+                    transport=ProductionCutoverTransport(
+                        identity,
+                        gcloud_executable=trusted,
+                        gcloud_configuration=configuration,
+                    ),
+                )
+                output_sha256 = output_value["result_sha256"]
+                receipt_summary = {
+                    "canonical_receipt_sha256": output_value[
+                        "canonical_receipt_sha256"
+                    ],
+                }
+            else:
+                output_value = build_release_unit_input_phase_request(
+                    **phase_kwargs,
+                )
+                output_sha256 = output_value["request_sha256"]
+                receipt_summary = {
+                    "sealed_request_action": phase_action,
+                    "sealed_request_sha256": output_sha256,
+                }
+            created = _write_public_output(arguments.output, output_value)
+            print(_canonical({
+                "schema": OWNER_WORKSPACE_SCHEMA,
+                "action": arguments.command,
+                "release_revision": arguments.revision,
+                "remote_stager_revision": (
+                    arguments.remote_stager_revision
+                ),
+                "output_path": str(arguments.output),
+                "output_sha256": output_sha256,
+                **receipt_summary,
+                "created": created,
+                "private_key_staged": False,
+                "secret_material_recorded": False,
+            }).decode("utf-8"))
+            return 0
         if arguments.command in {"stage-unit-inputs", "rotate-unit-inputs"}:
             if not arguments.publication.is_absolute():
                 raise OwnerCutoverError(

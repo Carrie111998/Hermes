@@ -1132,12 +1132,24 @@ class CloudSqlRecoveryProvider:
                 "production_database_recovery_provider_failed"
             ) from exc
 
-    def _pages(self, suffix: str, *, item_kind: str) -> list[Mapping[str, Any]]:
+    def _pages(
+        self,
+        suffix: str,
+        *,
+        item_kind: str,
+        operation_instance: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        if (suffix == "/operations") != (operation_instance is not None):
+            raise ProductionDatabaseRecoveryError(
+                "production_database_recovery_provider_contract_invalid"
+            )
         items: list[Mapping[str, Any]] = []
         token: str | None = None
         visited: set[str] = set()
         for _ in range(100):
             query: dict[str, Any] = {"maxResults": 500}
+            if operation_instance is not None:
+                query["instance"] = operation_instance
             if token is not None:
                 query["pageToken"] = token
             page = self._request("GET", suffix, query=query)
@@ -1179,8 +1191,12 @@ class CloudSqlRecoveryProvider:
             item_kind="sql#database",
         )
 
-    def _operations(self) -> list[Mapping[str, Any]]:
-        return self._pages("/operations", item_kind="sql#operation")
+    def _operations(self, *, target: str) -> list[Mapping[str, Any]]:
+        return self._pages(
+            "/operations",
+            item_kind="sql#operation",
+            operation_instance=target,
+        )
 
     def _wait_operation(
         self,
@@ -1225,9 +1241,21 @@ class CloudSqlRecoveryProvider:
         target: str,
         allowed_types: frozenset[str],
         backup_id: str | None = None,
+        release_revision: str | None = None,
     ) -> Mapping[str, Any] | None:
+        if target != cutover.PRODUCTION_SQL_INSTANCE:
+            if (
+                release_revision is None
+                or target
+                != cutover.database_recovery_scratch_instance(
+                    _release(release_revision)
+                )
+            ):
+                raise ProductionDatabaseRecoveryError(
+                    "production_database_recovery_provider_contract_invalid"
+                )
         matches = []
-        for operation in self._operations():
+        for operation in self._operations(target=target):
             context = operation.get("backupContext")
             observed_backup = (
                 str(context.get("backupId"))
@@ -1571,6 +1599,7 @@ class CloudSqlRecoveryProvider:
             operation = self._find_operation(
                 target=scratch,
                 allowed_types=frozenset({"CREATE"}),
+                release_revision=release_revision,
             )
             if operation is None:
                 raise ProductionDatabaseRecoveryError(
@@ -1621,6 +1650,7 @@ class CloudSqlRecoveryProvider:
             target=name,
             allowed_types=frozenset({"RESTORE_VOLUME"}),
             backup_id=backup_id,
+            release_revision=release_revision,
         )
         if operation is None:
             operation = self._request(
@@ -1692,6 +1722,7 @@ class CloudSqlRecoveryProvider:
             operation = self._find_operation(
                 target=name,
                 allowed_types=frozenset({"DELETE"}),
+                release_revision=release_revision,
             )
             if operation is None:
                 operation = self._request(
@@ -1703,6 +1734,7 @@ class CloudSqlRecoveryProvider:
             operation = self._find_operation(
                 target=name,
                 allowed_types=frozenset({"DELETE"}),
+                release_revision=release_revision,
             )
             if operation is None:
                 raise ProductionDatabaseRecoveryError(
@@ -2397,7 +2429,13 @@ def run_for_owner(
     """Run the sole production boundary with no caller-controlled target."""
 
     revision = _release(release_revision)
-    transport = FixedDatabaseRecoveryIapTransport(owner_identity)
+    transport = FixedDatabaseRecoveryIapTransport(
+        owner_identity,
+        gcloud_executable=owner_transport.TrustedGcloudExecutable(
+            release_sha=revision,
+        ),
+        gcloud_configuration=owner_identity.gcloud_configuration,
+    )
     probe = FixedPrivateReadOnlyProbe(
         revision,
         transport=transport,

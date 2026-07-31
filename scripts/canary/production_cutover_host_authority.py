@@ -131,7 +131,7 @@ def _boot_id(path: Path = BOOT_ID_PATH) -> str:
         if (
             stat.S_ISLNK(before.st_mode)
             or not stat.S_ISREG(before.st_mode)
-            or not 0 < before.st_size <= 256
+            or not 0 <= before.st_size <= 256
         ):
             raise HostAuthorityError("host_authority_boot_identity_invalid")
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
@@ -157,7 +157,8 @@ def _boot_id(path: Path = BOOT_ID_PATH) -> str:
         item.st_ctime_ns,
     )
     if (
-        len(raw) != before.st_size
+        (before.st_size != 0 and len(raw) != before.st_size)
+        or len(raw) > 256
         or identity(before) != identity(opened)
         or identity(before) != identity(after)
         or not raw.strip()

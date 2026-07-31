@@ -23,6 +23,7 @@ SYSTEM_PYTHON="/usr/bin/python3"
 SYSTEM_GIT="/usr/bin/git"
 SYSTEM_ID="/usr/bin/id"
 SYSTEM_FLOCK="/usr/bin/flock"
+SYSTEM_ENV="/usr/bin/env"
 DEPLOY_LOCK_PATH="/run/muncho-auto-deploy-release.lock"
 CUTOVER_BOOTSTRAP_RUNTIME_DIR="/run"
 CUTOVER_BOOTSTRAP_REPOSITORY_PATH="ops/muncho/cutover/production_unit_input_bootstrap.py"
@@ -2177,7 +2178,9 @@ install_target_release_wheel() {
   release_venv_site_boundary \
     prepare "$release" "$inherited_release" >/dev/null \
     || return 1
-  sudo -n -u "$OWNER" "$release/.venv/bin/python" -I -P -s -m pip \
+  sudo -n -u "$OWNER" "$SYSTEM_ENV" \
+    HERMES_SEALED_RELEASE_BUILD=muncho-legacy-production-release-v1 \
+    "$release/.venv/bin/python" -I -P -s -m pip \
     --isolated install \
     --no-index \
     --no-deps \
