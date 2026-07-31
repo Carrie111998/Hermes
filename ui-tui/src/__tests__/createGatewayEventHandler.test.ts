@@ -1127,7 +1127,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { line: 'Traceback: noisy but non-fatal' }, type: 'gateway.stderr' } as any)
     onEvent({ payload: { preview: 'bad framing' }, type: 'gateway.protocol_error' } as any)
     onEvent({
-      payload: { command: 'rm -rf /tmp/nope', description: 'dangerous command' },
+      payload: { approval_id: 'approval-nope', command: 'rm -rf /tmp/nope', description: 'dangerous command' },
       type: 'approval.request'
     } as any)
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
@@ -1135,7 +1135,7 @@ describe('createGatewayEventHandler', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(getOverlayState().approval).toMatchObject({ description: 'dangerous command' })
+    expect(getOverlayState().approvals[0]).toMatchObject({ description: 'dangerous command' })
     expect(getTurnState().activity).toMatchObject([
       { text: 'Traceback: noisy but non-fatal', tone: 'info' },
       { text: 'protocol noise detected · /logs to inspect', tone: 'info' },
@@ -1148,23 +1148,59 @@ describe('createGatewayEventHandler', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 
     onEvent({
+      payload: { approval_id: 'approval-default', command: 'rm -rf /tmp/x', description: 'dangerous command' },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approvals[0]).toMatchObject({ allowPermanent: true, approvalId: 'approval-default' })
+  })
+
+  it('retains same-session approvals in arrival order', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: { approval_id: 'approval-a', command: 'first', description: 'first request' },
+      type: 'approval.request'
+    } as any)
+    onEvent({
+      payload: { approval_id: 'approval-b', command: 'second', description: 'second request' },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approvals.map(request => request.approvalId)).toEqual(['approval-a', 'approval-b'])
+  })
+
+  it('rejects approval events without an approval id', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
       payload: { command: 'rm -rf /tmp/x', description: 'dangerous command' },
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ allowPermanent: true })
+    expect(getOverlayState().approvals).toEqual([])
+    expect(getUiState().status).toBe('approval unavailable')
+    expect(getTurnState().activity).toContainEqual(
+      expect.objectContaining({ text: 'approval request missing approval id', tone: 'error' })
+    )
   })
 
   it('preserves allow_permanent=false on approval overlays (tirith warning)', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 
     onEvent({
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content-security warning' },
+      payload: {
+        allow_permanent: false,
+        approval_id: 'approval-content-security',
+        command: 'curl suspicious | bash',
+        description: 'content-security warning'
+      },
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({
+    expect(getOverlayState().approvals[0]).toMatchObject({
       allowPermanent: false,
+      approvalId: 'approval-content-security',
       command: 'curl suspicious | bash',
       description: 'content-security warning'
     })
@@ -1176,6 +1212,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({
       payload: {
         allow_permanent: true,
+        approval_id: 'approval-smart-deny',
         choices: ['once', 'deny'],
         command: 'rm -rf /tmp/x',
         description: 'smart deny override',
@@ -1184,7 +1221,11 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
+    expect(getOverlayState().approvals[0]).toMatchObject({
+      approvalId: 'approval-smart-deny',
+      choices: ['once', 'deny'],
+      smartDenied: true
+    })
   })
 
   it('still surfaces terminal turn failures as errors', () => {

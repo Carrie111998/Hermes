@@ -7510,6 +7510,134 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_approval_respond_with_stale_id_never_falls_back_to_fifo():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    current = _ApprovalEntry(
+        {"approval_id": "approval-current", "command": "current command"}
+    )
+    server._sessions["sid"] = _session()
+    _gateway_queues["session-key"] = [current]
+
+    try:
+        stale = server.handle_request(
+            {
+                "id": "1",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "sid",
+                    "approval_id": "approval-expired",
+                    "choice": "once",
+                },
+            }
+        )
+
+        assert stale["result"]["resolved"] == 0
+        assert _gateway_queues["session-key"] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+    finally:
+        _gateway_queues.pop("session-key", None)
+        server._sessions.pop("sid", None)
+
+
+def test_approval_respond_requires_approval_id():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    current = _ApprovalEntry(
+        {"approval_id": "approval-current", "command": "current command"}
+    )
+    server._sessions["sid"] = _session()
+    _gateway_queues["session-key"] = [current]
+
+    try:
+        missing = server.handle_request(
+            {
+                "id": "1",
+                "method": "approval.respond",
+                "params": {"session_id": "sid", "choice": "once"},
+            }
+        )
+
+        assert missing["error"]["code"] == 4001
+        assert missing["error"]["message"] == "approval_id required"
+        assert _gateway_queues["session-key"] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+    finally:
+        _gateway_queues.pop("session-key", None)
+        server._sessions.pop("sid", None)
+
+
+def test_approval_respond_rejects_invalid_choice_without_resolving():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    current = _ApprovalEntry(
+        {"approval_id": "approval-current", "command": "current command"}
+    )
+    server._sessions["sid"] = _session()
+    _gateway_queues["session-key"] = [current]
+
+    try:
+        invalid = server.handle_request(
+            {
+                "id": "1",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "sid",
+                    "approval_id": "approval-current",
+                    "choice": "unexpected-choice",
+                },
+            }
+        )
+
+        assert invalid["error"]["code"] == 4004
+        assert "invalid approval choice" in invalid["error"]["message"]
+        assert _gateway_queues["session-key"] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+    finally:
+        _gateway_queues.pop("session-key", None)
+        server._sessions.pop("sid", None)
+
+
+def test_approval_respond_rejects_choice_not_offered_for_exact_request():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    current = _ApprovalEntry(
+        {
+            "approval_id": "approval-current",
+            "command": "current command",
+            "allow_session": False,
+            "allow_permanent": False,
+        }
+    )
+    server._sessions["sid"] = _session()
+    _gateway_queues["session-key"] = [current]
+
+    try:
+        invalid = server.handle_request(
+            {
+                "id": "1",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "sid",
+                    "approval_id": "approval-current",
+                    "choice": "session",
+                },
+            }
+        )
+
+        assert invalid["error"]["code"] == 4004
+        assert "approval choice not offered" in invalid["error"]["message"]
+        assert _gateway_queues["session-key"] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+    finally:
+        _gateway_queues.pop("session-key", None)
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 

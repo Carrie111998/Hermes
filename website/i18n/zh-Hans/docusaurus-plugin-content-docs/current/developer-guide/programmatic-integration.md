@@ -54,7 +54,7 @@ terminal.resize         clipboard.paste         image.attach
 
 ### 流式返回的事件
 
-`message.delta`、`message.complete`、`tool.start`、`tool.progress`、`tool.complete`、`approval.request`、`clarify.request`、`sudo.request`、`secret.request`、`gateway.ready`，以及会话生命周期和错误事件。
+`message.delta`、`message.complete`、`tool.start`、`tool.progress`、`tool.complete`、`approval.request`、`clarify.request`、`sudo.request`、`secret.request`、`gateway.ready`，以及会话生命周期和错误事件。`approval.request` 携带不透明的 `approval_id`；宿主必须在 `approval.respond` 中原样返回该 ID，并且客户端应在响应完成后只清除匹配的提示。
 
 ### Pi 风格 RPC 映射
 
@@ -88,7 +88,7 @@ POST /v1/responses               OpenAI Responses API（有状态）
 POST /v1/runs                    启动一次运行，返回 run_id（202）
 GET  /v1/runs/{id}               运行状态
 GET  /v1/runs/{id}/events        生命周期事件的 SSE 流
-POST /v1/runs/{id}/approval      解决待处理的审批
+POST /v1/runs/{id}/approval      按 approval_id 解决一项审批
 POST /v1/runs/{id}/stop          中断运行
 GET  /v1/capabilities            机器可读的功能标志
 GET  /v1/models                  列出 hermes-agent

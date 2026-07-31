@@ -33,6 +33,7 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
         command=command,
         session_key="discord:555",
         description="script execution via -c flag",
+        approval_id="approval-1",
     )
 
     assert result.success is True
@@ -46,5 +47,4 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
     assert command in prompt_text
     assert "Reason" in prompt_text
     assert "script execution via -c flag" in prompt_text
-
 

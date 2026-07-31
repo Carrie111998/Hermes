@@ -93,6 +93,7 @@ class TestTelegramExecApproval:
             command="rm -rf /important",
             session_key="agent:main:telegram:group:12345:99",
             description="dangerous deletion",
+            approval_id="approval-1",
         )
 
         assert result.success is True
@@ -122,6 +123,7 @@ class TestTelegramExecApproval:
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
             allow_permanent=False,
+            approval_id="approval-1",
         )
 
         assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
@@ -143,6 +145,7 @@ class TestTelegramExecApproval:
 
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
+            approval_id="approval-1",
         )
 
         assert captured_rows == [
@@ -169,6 +172,7 @@ class TestTelegramExecApproval:
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
             allow_permanent=False, smart_denied=True,
+            approval_id="approval-1",
         )
 
         assert captured_rows == [
@@ -205,6 +209,73 @@ class TestTelegramExecApproval:
 class TestTelegramApprovalCallback:
     """Test the approval callback handling in _handle_callback_query."""
 
+    @pytest.mark.asyncio
+    async def test_stale_button_from_prior_lifecycle_cannot_resolve_new_approval(
+        self, monkeypatch
+    ):
+        """A button issued before restart must not match a new approval."""
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+            lambda text, callback_data: SimpleNamespace(
+                text=text, callback_data=callback_data
+            ),
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
+        )
+
+        old_adapter = _make_adapter()
+        old_adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=41)
+        )
+        await old_adapter.send_exec_approval(
+            chat_id="12345",
+            command="old command",
+            session_key="old-session",
+            approval_id="approval-old",
+        )
+        old_callback = old_adapter._bot.send_message.call_args.kwargs["reply_markup"][
+            0
+        ][0].callback_data
+
+        new_adapter = _make_adapter()
+        new_adapter._bot.send_message = AsyncMock(
+            return_value=SimpleNamespace(message_id=42)
+        )
+        await new_adapter.send_exec_approval(
+            chat_id="12345",
+            command="new command",
+            session_key="new-session",
+            approval_id="approval-new",
+        )
+        new_callback = new_adapter._bot.send_message.call_args.kwargs["reply_markup"][
+            0
+        ][0].callback_data
+
+        def _approval_update(callback_data):
+            query = AsyncMock()
+            query.data = callback_data
+            query.message = MagicMock(chat_id=12345)
+            query.from_user = MagicMock(id="12345", first_name="Norbert")
+            query.answer = AsyncMock()
+            query.edit_message_text = AsyncMock()
+            return SimpleNamespace(callback_query=query)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+                await new_adapter._handle_callback_query(
+                    _approval_update(old_callback), MagicMock()
+                )
+                resolve.assert_not_called()
+
+                await new_adapter._handle_callback_query(
+                    _approval_update(new_callback), MagicMock()
+                )
+
+        resolve.assert_called_once_with(
+            "new-session", "once", approval_id="approval-new"
+        )
+
 
     @pytest.mark.asyncio
     async def test_resume_typing_after_inline_approval(self):
@@ -215,7 +286,10 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state["5"] = (
+            "agent:main:telegram:group:12345:99",
+            "approval-5",
+        )
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
@@ -234,16 +308,24 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
                 await adapter._handle_callback_query(update, context)
 
+        resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99",
+            "once",
+            approval_id="approval-5",
+        )
         assert "12345" not in adapter._typing_paused
 
 
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
         adapter = _make_adapter()
-        adapter._approval_state[3] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state["3"] = (
+            "agent:main:telegram:group:12345:99",
+            "approval-3",
+        )
 
         query = AsyncMock()
         query.data = "ea:once:3"
@@ -359,4 +441,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

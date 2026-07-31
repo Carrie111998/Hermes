@@ -6355,6 +6355,8 @@ class SlackAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """Send a Block Kit approval prompt with interactive buttons.
 
@@ -6384,13 +6386,17 @@ class SlackAdapter(BasePlatformAdapter):
             budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
             cmd_preview = command[:budget] + "..." if len(command) > budget else command
 
+            action_value = json.dumps(
+                {"approval_id": approval_id, "session_key": session_key},
+                separators=(",", ":"),
+            )
             actions = [
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Once"},
                     "style": "primary",
                     "action_id": "hermes_approve_once",
-                    "value": session_key,
+                    "value": action_value,
                 },
             ]
             if not smart_denied and allow_session:
@@ -6398,21 +6404,21 @@ class SlackAdapter(BasePlatformAdapter):
                     "type": "button",
                     "text": {"type": "plain_text", "text": "Allow Session"},
                     "action_id": "hermes_approve_session",
-                    "value": session_key,
+                    "value": action_value,
                 })
                 if allow_permanent:
                     actions.append({
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Always Allow"},
                         "action_id": "hermes_approve_always",
-                        "value": session_key,
+                        "value": action_value,
                     })
             actions.append({
                 "type": "button",
                 "text": {"type": "plain_text", "text": "Deny"},
                 "style": "danger",
                 "action_id": "hermes_deny",
-                "value": session_key,
+                "value": action_value,
             })
             blocks = [
                 {
@@ -6851,7 +6857,16 @@ class SlackAdapter(BasePlatformAdapter):
 
         team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
-        session_key = action.get("value", "")
+        try:
+            action_value = json.loads(str(action.get("value") or ""))
+        except (TypeError, ValueError):
+            return
+        if not isinstance(action_value, dict):
+            return
+        session_key = str(action_value.get("session_key") or "")
+        approval_id = str(action_value.get("approval_id") or "")
+        if not session_key or not approval_id:
+            return
         message = body.get("message", {})
         msg_ts = message.get("ts", "")
         channel_id = body.get("channel", {}).get("id", "")
@@ -6910,7 +6925,11 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                approval_id=approval_id,
+            )
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count,

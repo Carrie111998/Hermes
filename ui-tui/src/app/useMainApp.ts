@@ -20,6 +20,7 @@ import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
+  ApprovalRespondResponse,
   ClarifyRespondResponse,
   ConfigSetResponse,
   GatewayEvent,
@@ -40,6 +41,7 @@ import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
+import { approvalResponseParams, approvalStatusAfterResponse, clearApprovalById } from './approvalResponse.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
@@ -616,7 +618,7 @@ export function useMainApp(gw: GatewayClient) {
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
-  const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
+  const marker = overlay.approvals.length || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
 
   const tabCwd = ui.info?.cwd
 
@@ -689,7 +691,7 @@ export function useMainApp(gw: GatewayClient) {
             tools: [buildToolTrailLine('clarify', clarify.question)]
           })
           appendMessage({ role: 'user', text: answer })
-          patchUiState({ status: 'running…' })
+          patchUiState({ status: approvalStatusAfterResponse() })
         } else {
           // Esc / Ctrl+C cancel: persist the question + options as a system
           // line (not a transient "prompt cancelled" flash) so the prompt
@@ -924,13 +926,30 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
-        patchOverlayState({ approval: null })
-        patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
-        patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+    (choice: string) => {
+      const request = overlay.approvals[0]
+
+      if (!request || !ui.sid) {
+        return
+      }
+
+      const approvalId = request.approvalId
+
+      return rpc<ApprovalRespondResponse>('approval.respond', approvalResponseParams(request, choice, ui.sid)).then(
+        response => {
+          if (!response || !clearApprovalById(approvalId)) {
+            return
+          }
+
+          if (response.resolved) {
+            patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
+          }
+
+          patchUiState({ status: approvalStatusAfterResponse() })
+        }
+      )
+    },
+    [overlay.approvals, rpc, ui.sid]
   )
 
   const answerSudo = useCallback(

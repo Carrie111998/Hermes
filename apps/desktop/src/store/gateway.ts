@@ -132,6 +132,19 @@ export function activeGateway(): HermesGateway | null {
   return g.secondaries.get(g.activeKey)?.gateway ?? g.primaryGateway
 }
 
+/** Return an already-open profile gateway without changing the active profile. */
+export function gatewayForProfile(profile: string): HermesGateway | null {
+  const key = normKey(profile)
+
+  if (key === g.primaryProfile) {
+    return isOpen(g.primaryGateway) ? g.primaryGateway : null
+  }
+
+  const gateway = g.secondaries.get(key)?.gateway ?? null
+
+  return isOpen(gateway) ? gateway : null
+}
+
 // Mirror a backend's connection state into the global composer state, but only
 // when that backend is the one the user is currently looking at. Lets the
 // composer reflect the active profile's socket without a background reconnect

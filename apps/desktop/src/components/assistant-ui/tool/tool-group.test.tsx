@@ -2,19 +2,13 @@ import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime }
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { clearAllPrompts, setApprovalRequest } from '@/store/prompts'
-import { $activeSessionId } from '@/store/session'
 import { clearDismissedToolRows } from '@/store/tool-dismiss'
 import { $toolDisclosureStates } from '@/store/tool-view'
 
 import { Thread } from '../thread'
 
 // A run of tool calls collapses to a one-line summary once it has settled, but
-// a run with anything still pending always renders its rows. That rule is what
-// keeps the "approval must never be buried" bug fixed: an inline ApprovalBar
-// only ever exists on a pending tool, and a pending tool's run is never behind
-// a chevron. These cover both halves — the collapse itself, and the approval
-// staying in the visual flow.
+// a run with anything still pending always renders its rows.
 
 const createdAt = new Date('2026-06-03T00:00:00.000Z')
 
@@ -410,16 +404,12 @@ function GroupHarness({ message }: { message: ThreadMessage }) {
 }
 
 beforeEach(() => {
-  clearAllPrompts()
-  $activeSessionId.set('sess-1')
   $toolDisclosureStates.set({})
   clearDismissedToolRows()
 })
 
 afterEach(() => {
   cleanup()
-  clearAllPrompts()
-  $activeSessionId.set(null)
   clearDismissedToolRows()
 })
 
@@ -567,32 +557,7 @@ describe('tool run left unresolved', () => {
   })
 })
 
-describe('flat tool list approval surfacing', () => {
-  it('renders no inline approval bar when there is no live approval', async () => {
-    const { container } = render(<GroupHarness message={groupedPendingMessage()} />)
-
-    // The pending terminal row mounts immediately, but its inline ApprovalBar
-    // returns null while $approvalRequest is empty.
-    await waitFor(() => {
-      expect(container.querySelectorAll('[data-slot="tool-block"]').length).toBeGreaterThan(0)
-    })
-    expect(container.querySelector('[data-slot="tool-approval-inline"]')).toBeNull()
-  })
-
-  it('surfaces the approval inline and never under a hidden ancestor', async () => {
-    setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'dangerous command', sessionId: 'sess-1' })
-
-    const { container } = render(<GroupHarness message={groupedPendingMessage()} />)
-
-    await waitFor(() => {
-      const bar = container.querySelector('[data-slot="tool-approval-inline"]')
-      expect(bar).not.toBeNull()
-      // Flat rows live directly in the flow — nothing should ever wrap the bar
-      // in a `hidden` subtree.
-      expect(bar?.closest('[hidden]')).toBeNull()
-    })
-  })
-
+describe('flat tool list', () => {
   it('lets completed tool rows be dismissed', async () => {
     const { container } = render(<GroupHarness message={completedOnlyMessage()} />)
 

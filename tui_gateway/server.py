@@ -1597,13 +1597,12 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     platforms and the SSE/API stream fixed in #50767). Reuse the shared gateway
     seam so all approval transports redact consistently."""
     payload = dict(data or {})
-    if "choices" not in payload:
-        if payload.get("smart_denied"):
-            payload["choices"] = ["once", "deny"]
-        elif payload.get("allow_permanent") is False:
-            payload["choices"] = ["once", "session", "deny"]
-        elif "allow_permanent" in payload:
-            payload["choices"] = ["once", "session", "always", "deny"]
+    if "choices" not in payload and any(
+        key in payload for key in ("smart_denied", "allow_session", "allow_permanent")
+    ):
+        from tools.approval import gateway_approval_choices
+
+        payload["choices"] = gateway_approval_choices(payload)
     if "command" in payload:
         from gateway.run import _redact_approval_command
 

@@ -371,6 +371,34 @@ Poll the current run state. This is useful for dashboards that need status witho
 
 Statuses are retained briefly after terminal states (`completed`, `failed`, or `cancelled`) for polling and UI reconciliation.
 
+While a run is waiting, the status includes the exact pending request so a
+reconnecting client can safely restore its approval UI:
+
+```json
+{
+  "status": "waiting_for_approval",
+  "pending_approval": {
+    "approval_id": "approval_abc123",
+    "description": "Run a command?",
+    "command": "rm -rf /tmp/example",
+    "choices": ["once", "session", "always", "deny"]
+  },
+  "pending_approvals": [
+    {
+      "approval_id": "approval_abc123",
+      "description": "Run a command?",
+      "command": "rm -rf /tmp/example",
+      "choices": ["once", "session", "always", "deny"]
+    }
+  ]
+}
+```
+
+`pending_approval` is the first item for clients that handle one prompt at a
+time. `pending_approvals` contains the complete FIFO queue so concurrent tool
+calls cannot strand a hidden request. Commands pass the same forced secret
+redaction as the SSE approval event before entering either status field.
+
 ### GET /v1/runs/\{run_id\}/events
 
 Server-Sent Events stream of the run's tool-call progress, token deltas, and lifecycle events. Designed for dashboards and thick clients that want to attach/detach without losing state.
@@ -401,7 +429,22 @@ running.
 
 ### POST /v1/runs/\{run_id\}/approval
 
-Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
+Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). Copy the opaque `approval_id` from the matching `approval.request` event or `pending_approval` status; it is required so a delayed response cannot resolve a newer request in the same run.
+
+```json
+{
+  "approval_id": "approval_abc123",
+  "choice": "once"
+}
+```
+
+Valid choices are `once`, `session`, `always`, and `deny`. The response and the
+subsequent `approval.responded` event echo the same `approval_id` and selected
+`choice`. A missing ID
+returns `400`; an expired or unknown ID returns `409` without resolving another
+request. The run resumes once the exact decision is recorded. This endpoint is
+advertised in `/v1/capabilities` as the `run_approval` feature so external UIs
+can detect support before surfacing an approval prompt.
 
 ## Jobs API (background scheduled work)
 

@@ -8,8 +8,8 @@ Covers:
     triggers run.py's text fallback);
   - the pending-prompt registry: mint → consume-once → expiry;
   - _consume_prompt_response routes answers to the approval / slash-confirm /
-    clarify resolvers and CONSUMES the event; unknown/expired ids fall
-    through to normal dispatch;
+    clarify resolvers and CONSUMES the event; unknown/expired structured
+    answers are ignored rather than reinterpreted as typed commands;
   - the Discord type-3 hp1 decode (structured prompt_response replacing the
     bare-custom_id stub; foreign custom_ids keep the legacy text shape);
   - on_processing_start/complete drive react ops (👀 → ✅/❌), op-gated and
@@ -18,12 +18,13 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, Dict, Optional
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
@@ -74,7 +75,7 @@ def _event(
         text=text,
         message_type=MessageType.COMMAND,
         source=SessionSource(
-            platform="telegram", chat_id=chat_id, chat_type="dm", user_id="u1"
+            platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm", user_id="u1"
         ),
         prompt_response=prompt_response,
     )
@@ -87,7 +88,11 @@ def _event(
 async def test_exec_approval_renders_full_option_set():
     adapter, stub = _adapter()
     result = await adapter.send_exec_approval(
-        "c1", "rm -rf /tmp/x", "sess:1", description="deletes files"
+        "c1",
+        "rm -rf /tmp/x",
+        "sess:1",
+        description="deletes files",
+        approval_id="approval-1",
     )
     assert result.success is True
     assert result.message_id == "pm1"
@@ -109,12 +114,23 @@ async def test_exec_approval_renders_full_option_set():
 async def test_exec_approval_smart_denied_and_flag_gating():
     adapter, stub = _adapter()
     await adapter.send_exec_approval(
-        "c1", "cmd", "s", smart_denied=True, allow_permanent=True, allow_session=True
+        "c1",
+        "cmd",
+        "s",
+        smart_denied=True,
+        allow_permanent=True,
+        allow_session=True,
+        approval_id="approval-1",
     )
     ids = [o["id"] for o in stub.sent[-1]["options"]]
     assert ids == ["once", "deny"]  # smart-deny: no session/always
     await adapter.send_exec_approval(
-        "c1", "cmd", "s", allow_session=True, allow_permanent=False
+        "c1",
+        "cmd",
+        "s",
+        allow_session=True,
+        allow_permanent=False,
+        approval_id="approval-2",
     )
     ids = [o["id"] for o in stub.sent[-1]["options"]]
     assert ids == ["once", "session", "deny"]
@@ -196,6 +212,39 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
     assert marked == ["cl-10"]
 
 
+@pytest.mark.asyncio
+async def test_expired_structured_deny_does_not_resolve_a_newer_approval():
+    from gateway.run import GatewayRunner
+    from gateway.session import build_session_key
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    _gateway_queues.clear()
+    adapter, _stub = _adapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.session_store = None
+    runner._pending_approvals = {}
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_message_handler(runner._handle_deny_command)
+    event = _event(
+        {"prompt_id": "expired-prompt", "option_id": "deny"},
+        text="/deny",
+    )
+    session_key = build_session_key(event.source)
+    fresh = _ApprovalEntry({"command": "fresh command"})
+    _gateway_queues[session_key] = [fresh]
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    try:
+        await adapter._on_inbound(event)
+
+        assert fresh.result is None
+        assert not fresh.event.is_set()
+        assert _gateway_queues[session_key] == [fresh]
+    finally:
+        _gateway_queues.clear()
+
+
 # ── Discord type-3 hp1 decode ────────────────────────────────────────────
 
 
@@ -255,5 +304,3 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
-

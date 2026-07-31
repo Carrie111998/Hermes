@@ -283,7 +283,7 @@ export interface SubscriptionOverlayState {
 export interface OverlayState {
   agents: boolean
   agentsInitialHistoryIndex: number
-  approval: ApprovalReq | null
+  approvals: ApprovalReq[]
   billing: BillingOverlayState | null
   clarify: ClarifyReq | null
   confirm: ConfirmReq | null

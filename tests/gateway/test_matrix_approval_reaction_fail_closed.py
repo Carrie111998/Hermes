@@ -97,6 +97,7 @@ def _make_event(sender, reacts_to, key="✅"):
 def _make_prompt(chat_id="!testroom:matrix.org"):
     return _MatrixApprovalPrompt(
         session_key="session-abc",
+        approval_id="approval-abc",
         chat_id=chat_id,
         message_id="$prompt-event-1",
     )
@@ -110,7 +111,9 @@ def _run(adapter, event):
     adapter._redact_bot_approval_reactions = AsyncMock()
 
     fake_approval = types.ModuleType("tools.approval")
-    fake_approval.resolve_gateway_approval = lambda session_key, choice: 1
+    fake_approval.resolve_gateway_approval = (
+        lambda session_key, choice, *, approval_id: 1
+    )
     with patch.dict(sys.modules, {"tools.approval": fake_approval}):
         asyncio.run(adapter._on_reaction(event))
 
@@ -131,5 +134,4 @@ class TestApprovalReactionFailClosed:
         adapter = _make_adapter(allowed_user_ids=None)
         event = _make_event("@stranger:matrix.org", "$prompt-event-1")
         assert _run(adapter, event) is False
-
 

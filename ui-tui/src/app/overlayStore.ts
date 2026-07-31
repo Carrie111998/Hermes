@@ -1,11 +1,13 @@
 import { atom, computed } from 'nanostores'
 
+import type { ApprovalReq } from '../types.js'
+
 import type { OverlayState } from './interfaces.js'
 
 const buildOverlayState = (): OverlayState => ({
   agents: false,
   agentsInitialHistoryIndex: 0,
-  approval: null,
+  approvals: [],
   billing: null,
   clarify: null,
   confirm: null,
@@ -29,7 +31,7 @@ export const $isBlocked = computed(
   $overlayState,
   ({
     agents,
-    approval,
+    approvals,
     billing,
     clarify,
     confirm,
@@ -47,7 +49,7 @@ export const $isBlocked = computed(
   }) =>
     Boolean(
       agents ||
-      approval ||
+      approvals.length > 0 ||
       billing ||
       clarify ||
       confirm ||
@@ -95,3 +97,30 @@ export const resetFlowOverlays = () =>
     sessions: $overlayState.get().sessions,
     skillsHub: $overlayState.get().skillsHub
   })
+
+export const enqueueApproval = (request: ApprovalReq) =>
+  patchOverlayState(state => {
+    const existingIndex = state.approvals.findIndex(candidate => candidate.approvalId === request.approvalId)
+
+    if (existingIndex === -1) {
+      return { ...state, approvals: [...state.approvals, request] }
+    }
+
+    const approvals = [...state.approvals]
+    approvals[existingIndex] = request
+
+    return { ...state, approvals }
+  })
+
+export const clearApproval = (approvalId: string): boolean => {
+  const state = getOverlayState()
+  const approvals = state.approvals.filter(request => request.approvalId !== approvalId)
+
+  if (approvals.length === state.approvals.length) {
+    return false
+  }
+
+  patchOverlayState({ approvals })
+
+  return true
+}

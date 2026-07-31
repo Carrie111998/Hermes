@@ -104,6 +104,7 @@ class TestFeishuExecApproval:
                 command="rm -rf /important",
                 session_key="agent:main:feishu:group:oc_12345",
                 description="dangerous deletion",
+                approval_id="approval-1",
             )
 
         assert result.success is True
@@ -144,11 +145,13 @@ class TestFeishuExecApproval:
                 chat_id="oc_12345",
                 command="echo test",
                 session_key="my-session-key",
+                approval_id="approval-2",
             )
 
         assert len(adapter._approval_state) == 1
         approval_id = list(adapter._approval_state.keys())[0]
         state = adapter._approval_state[approval_id]
+        assert state["backend_approval_id"] == "approval-2"
         assert state["session_key"] == "my-session-key"
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
@@ -205,9 +208,74 @@ class TestResolveApproval:
     """Test _resolve_approval pops state and calls resolve_gateway_approval."""
 
     @pytest.mark.asyncio
+    async def test_stale_card_from_prior_lifecycle_cannot_resolve_new_approval(self):
+        """A card issued before restart must not match a new approval."""
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_old"),
+        )
+        old_adapter = _make_adapter()
+        with patch.object(
+            old_adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as old_send:
+            await old_adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="old command",
+                session_key="old-session",
+                approval_id="approval-old",
+            )
+        old_token = json.loads(old_send.call_args.kwargs["payload"])["elements"][1][
+            "actions"
+        ][0]["value"]["approval_id"]
+
+        response.data.message_id = "msg_new"
+        new_adapter = _make_adapter()
+        with patch.object(
+            new_adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as new_send:
+            await new_adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="new command",
+                session_key="new-session",
+                approval_id="approval-new",
+            )
+        new_token = json.loads(new_send.call_args.kwargs["payload"])["elements"][1][
+            "actions"
+        ][0]["value"]["approval_id"]
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await new_adapter._resolve_approval(
+                old_token,
+                "once",
+                "Norbert",
+                open_id="ou_user1",
+                chat_id="oc_12345",
+            )
+            resolve.assert_not_called()
+
+            await new_adapter._resolve_approval(
+                new_token,
+                "once",
+                "Norbert",
+                open_id="ou_user1",
+                chat_id="oc_12345",
+            )
+
+        resolve.assert_called_once_with(
+            "new-session", "once", approval_id="approval-new"
+        )
+
+    @pytest.mark.asyncio
     async def test_resolves_once(self):
         adapter = _make_adapter()
         adapter._approval_state[1] = {
+            "backend_approval_id": "approval-1",
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
             "chat_id": "oc_12345",
@@ -216,7 +284,11 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345",
+            "once",
+            approval_id="approval-1",
+        )
         assert 1 not in adapter._approval_state
 
 
@@ -225,6 +297,7 @@ class TestResolveApproval:
         adapter = _make_adapter()
         adapter._admins = {"ou_admin"}
         adapter._approval_state[5] = {
+            "backend_approval_id": "approval-5",
             "session_key": "sess-5",
             "message_id": "msg_005",
             "chat_id": "oc_12345",
@@ -311,6 +384,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_bob"}
         adapter._approval_state[1] = {
+            "backend_approval_id": "approval-1",
             "session_key": "sess-1",
             "message_id": "msg-1",
             "chat_id": "oc_12345",
@@ -339,6 +413,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_expired"}
         adapter._approval_state[4] = {
+            "backend_approval_id": "approval-4",
             "session_key": "sess-4",
             "message_id": "msg-4",
             "chat_id": "oc_12345",
@@ -362,6 +437,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_allowed"}
         adapter._approval_state[5] = {
+            "backend_approval_id": "approval-5",
             "session_key": "sess-5",
             "message_id": "msg-5",
             "chat_id": "oc_12345",
@@ -445,5 +521,3 @@ class TestResolveUpdatePrompt:
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
-
-

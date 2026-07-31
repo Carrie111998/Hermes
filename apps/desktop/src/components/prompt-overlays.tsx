@@ -24,12 +24,11 @@ import { clearSecretRequest, clearSudoRequest, sessionSecretRequest, sessionSudo
 
 // Renders the modal mid-turn prompts the gateway raises and waits on: sudo
 // password and skill secret capture. Dangerous-command / execute_code approval
-// prefers the pending tool row, but also has a chat-level fallback when no row
-// is mounted (remote gateway sessions can raise the request before the matching
-// tool call is visible). Each Python-side caller blocks the agent thread until
-// the matching `*.respond` RPC lands; without a renderer the agent stalls until
-// its timeout and the tool is BLOCKED. Any close path (Esc, backdrop
-// click) funnels through Radix's single `onOpenChange(false)` and maps to a
+// stays session-level because approval events do not carry a tool id that can
+// safely bind concurrent requests to individual rows. Each Python-side caller
+// blocks the agent thread until the matching `*.respond` RPC lands; without a
+// renderer the agent stalls until its timeout and the tool is BLOCKED. Any close
+// path (Esc, backdrop click) funnels through Radix's single `onOpenChange(false)` and maps to a
 // refusal, so silence is never mistaken for consent, matching the TUI. We
 // deliberately do NOT add onEscapeKeyDown / onInteractOutside handlers — they'd
 // fire a second `*.respond` alongside onOpenChange (double-send) or block the
@@ -245,7 +244,7 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
 export function PromptOverlays({ sessionId }: { sessionId: string | null }) {
   return (
     <>
-      <PendingApprovalFallback />
+      <PendingApprovalFallback sessionId={sessionId} />
       <SudoDialog sessionId={sessionId} />
       <SecretDialog sessionId={sessionId} />
     </>

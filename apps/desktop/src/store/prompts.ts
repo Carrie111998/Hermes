@@ -35,7 +35,12 @@ interface PromptStore<T extends KeyedPrompt> {
 // session hint it drops every entry, optionally filtered by request id.
 function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   const $all = atom<Record<string, T>>({})
-  const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId
+
+  const idOf = (value: T): string | undefined => {
+    const keyed = value as { approvalId?: string; requestId?: string }
+
+    return keyed.requestId ?? keyed.approvalId
+  }
 
   return {
     $active: computed([$all, $activeSessionId], (all, activeId) => all[keyFor(activeId)] ?? null),
@@ -67,15 +72,73 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend (one in-flight approval per session,
-// resolved via approval.respond {choice, session_id}). It carries no request_id,
-// unlike sudo/secret which are _block()-style request/response.
+function queuedPromptStore<T extends KeyedPrompt>(idOf: (request: T) => string) {
+  const $all = atom<Record<string, T[]>>({})
+
+  return {
+    $active: computed([$all, $activeSessionId], (all, activeId) => all[keyFor(activeId)]?.[0] ?? null),
+    $all,
+    reset: () => $all.set({}),
+    set: (request: T) => {
+      const all = $all.get()
+      const key = keyFor(request.sessionId)
+      const queue = all[key] ?? []
+      const existingIndex = queue.findIndex(candidate => idOf(candidate) === idOf(request))
+      const nextQueue = [...queue]
+
+      if (existingIndex === -1) {
+        nextQueue.push(request)
+      } else {
+        nextQueue[existingIndex] = request
+      }
+
+      $all.set({ ...all, [key]: nextQueue })
+    },
+    clear(sessionId?: string | null, requestId?: string) {
+      const all = $all.get()
+      const next = { ...all }
+      const keys = sessionId === undefined ? Object.keys(all) : [keyFor(sessionId)]
+      let changed = false
+
+      for (const key of keys) {
+        const queue = all[key]
+
+        if (!queue) {
+          continue
+        }
+
+        const remaining = requestId ? queue.filter(request => idOf(request) !== requestId) : []
+
+        if (remaining.length === queue.length) {
+          continue
+        }
+
+        changed = true
+
+        if (remaining.length) {
+          next[key] = remaining
+        } else {
+          delete next[key]
+        }
+      }
+
+      if (changed) {
+        $all.set(next)
+      }
+    }
+  }
+}
+
+// Approval presentation is session-keyed, while approval_id identifies the
+// exact backend request so a stale response cannot resolve or clear its successor.
 export interface ApprovalRequest extends KeyedPrompt {
+  approvalId: string
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]
   command: string
   description: string
+  profile: string
   smartDenied?: boolean
 }
 
@@ -89,13 +152,9 @@ export interface SecretRequest extends KeyedPrompt {
   requestId: string
 }
 
-const approval = keyedPromptStore<ApprovalRequest>()
+const approval = queuedPromptStore<ApprovalRequest>(request => request.approvalId)
 const sudo = keyedPromptStore<SudoRequest>()
 const secret = keyedPromptStore<SecretRequest>()
-
-// Inline approval anchors, keyed by session: a tile's inline bar mounting must
-// not suppress the PRIMARY session's floating fallback (and vice versa).
-const $approvalInlineAnchors = atom<Record<string, number>>({})
 
 export const $approvalRequest = approval.$active
 export const setApprovalRequest = approval.set
@@ -104,30 +163,13 @@ export const clearApprovalRequest = approval.clear
 /** The prompt request for one specific session — the tile counterpart of the
  *  active-session `$*Request` views (same map, fixed key). */
 export const sessionApprovalRequest = (sessionId: string | null) =>
-  computed(approval.$all, all => all[keyFor(sessionId)] ?? null)
+  computed(approval.$all, all => all[keyFor(sessionId)]?.[0] ?? null)
+export const sessionApprovalCount = (sessionId: string | null) =>
+  computed(approval.$all, all => all[keyFor(sessionId)]?.length ?? 0)
 export const sessionSudoRequest = (sessionId: string | null) =>
   computed(sudo.$all, all => all[keyFor(sessionId)] ?? null)
 export const sessionSecretRequest = (sessionId: string | null) =>
   computed(secret.$all, all => all[keyFor(sessionId)] ?? null)
-
-export function registerApprovalInlineAnchor(sessionId: string | null): () => void {
-  const key = keyFor(sessionId)
-
-  const bump = (delta: number) => {
-    const all = $approvalInlineAnchors.get()
-    const next = Math.max(0, (all[key] ?? 0) + delta)
-    $approvalInlineAnchors.set({ ...all, [key]: next })
-  }
-
-  bump(1)
-
-  return () => bump(-1)
-}
-
-/** True when session `sessionId` has an inline approval bar mounted, so its
- *  floating fallback should stand down. Per-session (not global). */
-export const sessionApprovalInlineVisible = (sessionId: string | null) =>
-  computed($approvalInlineAnchors, anchors => (anchors[keyFor(sessionId)] ?? 0) > 0)
 
 export const $sudoRequest = sudo.$active
 export const setSudoRequest = sudo.set
@@ -165,7 +207,6 @@ export function clearAllPrompts(sessionId?: string | null): void {
     approval.reset()
     sudo.reset()
     secret.reset()
-    $approvalInlineAnchors.set({})
 
     return
   }

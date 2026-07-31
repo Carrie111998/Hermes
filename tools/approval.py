@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import uuid
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2154,16 +2155,44 @@ def _denial_breaker_addendum(session_key: str) -> str:
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("approval_id", "event", "data", "result", "reason")
 
     def __init__(self, data: dict):
+        self.approval_id = str(
+            data.get("approval_id") or f"approval_{uuid.uuid4().hex}"
+        )
         self.event = threading.Event()
-        self.data = data          # command, description, pattern_keys, …
+        self.data = {**data, "approval_id": self.approval_id}
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+
+
+_GATEWAY_APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+
+
+def normalize_gateway_approval_choice(choice: object) -> str:
+    """Return a canonical gateway approval choice or reject it before mutation."""
+    normalized = str(choice or "").strip().lower()
+    if normalized not in _GATEWAY_APPROVAL_CHOICES:
+        expected = ", ".join(sorted(_GATEWAY_APPROVAL_CHOICES))
+        raise ValueError(f"invalid approval choice; expected one of: {expected}")
+    return normalized
+
+
+def gateway_approval_choices(approval: dict) -> list[str]:
+    """Return the choices offered by one gateway approval request."""
+    if approval.get("smart_denied"):
+        return ["once", "deny"]
+    choices = ["once"]
+    if approval.get("allow_session") is not False:
+        choices.append("session")
+    if approval.get("allow_permanent") is not False:
+        choices.append("always")
+    choices.append("deny")
+    return choices
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -2197,13 +2226,14 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             *, approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    When *approval_id* is provided, only that exact pending request is
+    resolved. Otherwise, *resolve_all* resolves every pending approval in the
+    session and the default behavior resolves only the oldest one (FIFO).
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2211,11 +2241,31 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    choice = normalize_gateway_approval_choice(choice)
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
-        if resolve_all:
+        if approval_id is not None:
+            target_index = next(
+                (
+                    index
+                    for index, entry in enumerate(queue)
+                    if entry.approval_id == approval_id
+                ),
+                None,
+            )
+            if target_index is None:
+                return 0
+            offered_choices = gateway_approval_choices(queue[target_index].data)
+            if choice not in offered_choices:
+                expected = ", ".join(offered_choices)
+                raise ValueError(
+                    f"approval choice not offered; expected one of: {expected}"
+                )
+            targets = [queue.pop(target_index)]
+        elif resolve_all:
             targets = list(queue)
             queue.clear()
         else:
@@ -2235,6 +2285,12 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def list_gateway_approvals(session_key: str) -> list[dict]:
+    """Return snapshots of every pending approval in FIFO order."""
+    with _lock:
+        return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -3268,6 +3324,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
     entry = _ApprovalEntry(approval_data)
+    approval_data = entry.data
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 

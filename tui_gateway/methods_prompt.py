@@ -866,19 +866,26 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    approval_id = str(params.get("approval_id") or "").strip()
+    if not approval_id:
+        return _err(rid, 4001, "approval_id required")
     try:
-        from tools.approval import resolve_gateway_approval
-
-        return _ok(
-            rid,
-            {
-                "resolved": resolve_gateway_approval(
-                    session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
-                )
-            },
+        from tools.approval import (
+            normalize_gateway_approval_choice,
+            resolve_gateway_approval,
         )
+
+        try:
+            choice = normalize_gateway_approval_choice(params.get("choice"))
+            resolved = resolve_gateway_approval(
+                session["session_key"],
+                choice,
+                approval_id=approval_id,
+            )
+        except ValueError as exc:
+            return _err(rid, 4004, str(exc))
+
+        return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))
 

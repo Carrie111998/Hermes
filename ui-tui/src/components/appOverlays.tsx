@@ -65,10 +65,12 @@ export function PromptZone({
   const overlay = useStore($overlayState)
   const theme = useStore($uiTheme)
 
-  if (overlay.approval) {
+  const approval = overlay.approvals[0]
+
+  if (approval) {
     return (
       <PromptCell cols={cols} id="approval">
-        <ApprovalPrompt cols={cols} onChoice={onApprovalChoice} req={overlay.approval} t={theme} />
+        <ApprovalPrompt cols={cols} key={approval.approvalId} onChoice={onApprovalChoice} req={approval} t={theme} />
       </PromptCell>
     )
   }

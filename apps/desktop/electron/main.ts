@@ -10210,7 +10210,11 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
   // kind+session can arrive here twice. Collapse it at this single choke point.
   // Return true (not false): a notification for the event IS being shown by the
   // first caller, so the settings "send test" success probe stays honest.
-  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? ''}`)) {
+  const approvalId = Array.isArray(payload?.actions)
+    ? (payload.actions.find(action => action?.approvalId)?.approvalId ?? '')
+    : ''
+
+  if (isDuplicateNotification(`${payload?.kind ?? ''}:${payload?.sessionId ?? ''}:${approvalId}`)) {
     return true
   }
 
@@ -10244,7 +10248,12 @@ ipcMain.handle('hermes:notify', (_event, payload) => {
     const action = actions[index]
 
     if (action?.id) {
-      mainWindow.webContents.send('hermes:notification-action', { sessionId: payload?.sessionId, actionId: action.id })
+      mainWindow.webContents.send('hermes:notification-action', {
+        actionId: action.id,
+        approvalId: action.approvalId,
+        profile: payload?.profile,
+        sessionId: payload?.sessionId
+      })
     }
   })
   notification.show()

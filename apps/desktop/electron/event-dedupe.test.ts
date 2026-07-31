@@ -17,6 +17,7 @@ test('distinct keys are independent', () => {
   assert.equal(isDup('input:s1', 0), false)
   assert.equal(isDup('approval:s1', 0), false, 'different kind')
   assert.equal(isDup('input:s2', 0), false, 'different session')
+  assert.equal(isDup('approval:s1:approval-b', 0), false, 'different approval')
 })
 
 test('re-fires once the window elapses', () => {

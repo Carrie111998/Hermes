@@ -33,20 +33,22 @@ from tools import approval as approval_mod
 
 
 @pytest.mark.parametrize(
-    ("smart_denied", "allow_permanent", "expected"),
+    ("smart_denied", "allow_permanent", "allow_session", "expected"),
     [
-        (False, True, ["once", "session", "always", "deny"]),
-        (False, False, ["once", "session", "deny"]),
-        (True, True, ["once", "deny"]),
-        (True, False, ["once", "deny"]),
+        (False, True, True, ["once", "session", "always", "deny"]),
+        (False, False, True, ["once", "session", "deny"]),
+        (False, False, False, ["once", "deny"]),
+        (True, True, True, ["once", "deny"]),
+        (True, False, False, ["once", "deny"]),
     ],
 )
 def test_approval_event_choices_follow_backend_capabilities(
-    smart_denied, allow_permanent, expected
+    smart_denied, allow_permanent, allow_session, expected
 ):
     assert _approval_event_choices(
         smart_denied=smart_denied,
         allow_permanent=allow_permanent,
+        allow_session=allow_session,
     ) == expected
 
 
@@ -333,7 +335,7 @@ class TestRunEvents:
 
 
     @pytest.mark.asyncio
-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
+    async def test_approval_is_scoped_to_target_run(self, auth_adapter):
         """Same client session_id must not let one run approve another run's queue."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -379,12 +381,16 @@ class TestRunEvents:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
-                    json={"choice": "always", "resolve_all": True},
+                    json={
+                        "approval_id": attacker_entry.approval_id,
+                        "choice": "always",
+                    },
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
 
                 assert approval_resp.status == 200
+                assert approval_data["approval_id"] == attacker_entry.approval_id
                 assert approval_data["resolved"] == 1
                 assert attacker_entry.result == "always"
                 assert attacker_entry.event.is_set()
@@ -401,6 +407,340 @@ class TestRunEvents:
                     approval_mod._gateway_queues.pop(victim_run, None)
                 victim_interrupted.set()
                 attacker_interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_delayed_approval_response_cannot_resolve_a_newer_request(self, adapter):
+        """A stale response must not approve the next request in the same run."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert start_resp.status == 202
+                run_id = (await start_resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                expired = approval_mod._ApprovalEntry({
+                    "approval_id": "approval-expired",
+                    "command": "first command",
+                })
+                current = approval_mod._ApprovalEntry({
+                    "approval_id": "approval-current",
+                    "command": "second command",
+                })
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [current]
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": expired.approval_id, "choice": "once"},
+                )
+                approval_data = await approval_resp.json()
+
+                assert approval_resp.status == 409
+                assert approval_data["error"]["code"] == "approval_not_pending"
+                assert current.result is None
+                assert not current.event.is_set()
+                with approval_mod._lock:
+                    assert approval_mod._gateway_queues[run_id] == [current]
+
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_resolving_one_approval_keeps_next_pollable_without_reemitting_it(
+        self, adapter
+    ):
+        """A queued request stays pollable without a duplicate SSE notification."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                first = approval_mod._ApprovalEntry({
+                    "description": "first command",
+                    "smart_denied": False,
+                    "allow_permanent": False,
+                })
+                second = approval_mod._ApprovalEntry({
+                    "description": "second command",
+                    "smart_denied": False,
+                    "allow_permanent": False,
+                })
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [first, second]
+                adapter._set_run_status(
+                    run_id,
+                    "waiting_for_approval",
+                    pending_approval={
+                        "approval_id": first.approval_id,
+                        "description": "first command",
+                        "choices": ["once", "deny"],
+                    },
+                )
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": first.approval_id, "choice": "deny"},
+                )
+                assert approval_resp.status == 200
+
+                responded = adapter._run_streams[run_id].get_nowait()
+                assert responded["event"] == "approval.responded"
+                assert responded["approval_id"] == first.approval_id
+                assert adapter._run_streams[run_id].empty()
+
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                assert status["status"] == "waiting_for_approval"
+                assert status["pending_approval"] == {
+                    "approval_id": second.approval_id,
+                    "description": "second command",
+                    "choices": ["once", "session", "deny"],
+                }
+                assert second.result is None
+                assert not second.event.is_set()
+
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_approval_request_id_is_pollable_and_echoed_on_response(self, adapter):
+        """Clients can recover and settle the exact pending request by ID."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                notified = threading.Event()
+
+                def _run_with_approval(*_args, **_kwargs):
+                    approval_session_key = approval_mod.get_current_session_key()
+
+                    def _notify_seen(_approval_data):
+                        notified.set()
+
+                    # The API callback remains registered; this wrapper only
+                    # records when the approval reaches that public boundary.
+                    with approval_mod._lock:
+                        api_notify = approval_mod._gateway_notify_cbs[
+                            approval_session_key
+                        ]
+
+                    def _recording_notify(approval_data):
+                        api_notify(approval_data)
+                        _notify_seen(approval_data)
+
+                    with approval_mod._lock:
+                        approval_mod._gateway_notify_cbs[
+                            approval_session_key
+                        ] = _recording_notify
+                    return approval_mod._run_approval_gate(
+                        pattern_key="shell-c",
+                        description="Run a command?",
+                        display_target="bash -c true",
+                        cron_deny_message="blocked",
+                        autoapprove_log_prefix="test",
+                    )
+
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run_with_approval
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert notified.wait(timeout=3.0)
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+                pending = status["pending_approval"]
+
+                assert status["status"] == "waiting_for_approval"
+                assert pending["approval_id"].startswith("approval_")
+                assert pending["description"] == "Run a command?"
+                assert pending["command"] == "bash -c true"
+                assert pending["choices"] == ["once", "session", "always", "deny"]
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": pending["approval_id"], "choice": "deny"},
+                )
+                approval_data = await approval_resp.json()
+
+                assert approval_resp.status == 200
+                assert approval_data["approval_id"] == pending["approval_id"]
+
+                for _ in range(40):
+                    settled = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if settled["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                assert "pending_approval" not in settled
+
+    @pytest.mark.asyncio
+    async def test_all_concurrent_approval_requests_are_pollable(self, adapter):
+        """Polling must not hide a queued approval behind the newest request."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                first = approval_mod._ApprovalEntry({
+                    "command": "first command",
+                    "description": "Run the first command?",
+                    "allow_permanent": False,
+                    "allow_session": False,
+                })
+                second = approval_mod._ApprovalEntry({
+                    "command": "second command",
+                    "description": "Run the second command?",
+                    "allow_permanent": False,
+                    "allow_session": False,
+                })
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [first, second]
+
+                status_resp = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_resp.json()
+
+                assert status["status"] == "waiting_for_approval"
+                assert status["pending_approvals"] == [
+                    {
+                        "approval_id": first.approval_id,
+                        "description": "Run the first command?",
+                        "command": "first command",
+                        "choices": ["once", "deny"],
+                    },
+                    {
+                        "approval_id": second.approval_id,
+                        "description": "Run the second command?",
+                        "command": "second command",
+                        "choices": ["once", "deny"],
+                    },
+                ]
+                assert status["pending_approval"] == status["pending_approvals"][0]
+
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_expired_approval_returns_to_running_status(self, adapter, monkeypatch):
+        """A timed-out queue entry must not leave reconnecting clients waiting."""
+        app = _create_runs_app(adapter)
+        timed_out = threading.Event()
+        release_agent = threading.Event()
+        monkeypatch.setattr(approval_mod, "_get_approval_timeout", lambda: 0)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                def _run_with_timeout(*_args, **_kwargs):
+                    result = approval_mod._run_approval_gate(
+                        pattern_key="shell-c",
+                        description="Run a command?",
+                        display_target="bash -c true",
+                        cron_deny_message="blocked",
+                        autoapprove_log_prefix="test",
+                    )
+                    assert result["approved"] is False
+                    timed_out.set()
+                    release_agent.wait(timeout=3.0)
+                    return {"final_response": "done"}
+
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run_with_timeout
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert timed_out.wait(timeout=3.0)
+
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+
+                assert status["status"] == "running"
+                assert "pending_approval" not in status
+                assert "pending_approvals" not in status
+                release_agent.set()
+
+    @pytest.mark.asyncio
+    async def test_approval_response_requires_an_approval_id(self, adapter):
+        """The runs API never falls back to resolving a request by position."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, agent_ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert agent_ready.wait(timeout=3.0)
+
+                pending = approval_mod._ApprovalEntry({"command": "dangerous"})
+                with approval_mod._lock:
+                    approval_mod._gateway_queues[run_id] = [pending]
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"choice": "once"},
+                )
+                approval_data = await approval_resp.json()
+
+                assert approval_resp.status == 400
+                assert approval_data["error"]["code"] == "missing_approval_id"
+                assert pending.result is None
+                assert not pending.event.is_set()
+
+                interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_approval_response_rejects_choice_not_offered_for_request(
+        self, adapter
+    ):
+        """A response cannot grant broader scope than the queued request offers."""
+        app = _create_runs_app(adapter)
+        run_id = "run-limited-approval"
+        pending = approval_mod._ApprovalEntry(
+            {
+                "command": "dangerous",
+                "allow_session": False,
+                "allow_permanent": False,
+            }
+        )
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [pending]
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": pending.approval_id, "choice": "always"},
+                )
+                approval_data = await approval_resp.json()
+
+            assert approval_resp.status == 400
+            assert approval_data["error"]["code"] == "invalid_approval_choice"
+            assert pending.result is None
+            assert not pending.event.is_set()
+            with approval_mod._lock:
+                assert approval_mod._gateway_queues[run_id] == [pending]
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._run_approval_sessions.pop(run_id, None)
+            adapter._run_statuses.pop(run_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -459,9 +799,10 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={"approval_id": pending.approval_id, "choice": "once"},
                 )
                 assert approval_resp.status == 200
+                assert (await approval_resp.json())["approval_id"] == pending.approval_id
                 assert pending.event.is_set()
                 assert pending.result == "once"
 
@@ -476,6 +817,42 @@ class TestRunLifecycleSweep:
 
 
 class TestStopRun:
+
+    @pytest.mark.asyncio
+    async def test_stop_rejects_a_later_approval_response(self, adapter):
+        """Once Stop wins, a delayed approval cannot release gated work."""
+        app = _create_runs_app(adapter)
+        run_id = "run-stop-approval"
+        pending = approval_mod._ApprovalEntry({"command": "dangerous"})
+        agent = MagicMock()
+        adapter._active_run_agents[run_id] = agent
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [pending]
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": pending.approval_id, "choice": "once"},
+                )
+                approval_data = await approval_resp.json()
+
+            assert stop_resp.status == 200
+            assert approval_resp.status == 409
+            assert approval_data["error"]["code"] == "approval_not_active"
+            assert pending.result is None
+            assert not pending.event.is_set()
+            agent.interrupt.assert_called_once_with("Stop requested via API")
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._active_run_agents.pop(run_id, None)
+            adapter._run_approval_sessions.pop(run_id, None)
+            adapter._run_statuses.pop(run_id, None)
+            adapter._stopping_run_ids.discard(run_id)
 
     @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):

@@ -249,7 +249,9 @@ declare global {
       signalDeepLinkReady?: () => Promise<{ ok: boolean }>
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
-      onNotificationAction?: (callback: (payload: { actionId: string; sessionId?: string }) => void) => () => void
+      onNotificationAction?: (
+        callback: (payload: { actionId: string; approvalId?: string; profile?: string; sessionId?: string }) => void
+      ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
       // Soft gateway-mode apply: primary backend was torn down without a window
@@ -760,8 +762,9 @@ export interface HermesNotification {
   body?: string
   silent?: boolean
   kind?: string
+  profile?: string
   sessionId?: string
-  actions?: { id: string; text: string }[]
+  actions?: { id: string; approvalId?: string; text: string }[]
 }
 
 export interface HermesPreviewTarget {

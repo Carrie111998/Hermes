@@ -41,12 +41,10 @@ import { normalize } from '@/lib/text'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { recordPreviewArtifact } from '@/store/preview-status'
-import { sessionApprovalRequest } from '@/store/prompts'
 import { $toolInlineDiff } from '@/store/tool-diffs'
 import { $toolRowDismissed, dismissToolRow } from '@/store/tool-dismiss'
 import { $anyToolDisclosureOpen, $toolDisclosureOpen, $toolViewMode, setToolDisclosureOpen } from '@/store/tool-view'
 
-import { APPROVAL_TOOLS, PendingToolApproval } from './approval'
 import {
   buildToolView,
   clampForDisplay,
@@ -587,7 +585,6 @@ function ToolEntry({ part }: ToolEntryProps) {
           </span>
         </DisclosureRow>
       </div>
-      {isPending && <PendingToolApproval part={part} />}
       {open && (
         <div className="relative grid w-full min-w-0 max-w-full gap-1.5 overflow-hidden p-1.5">
           {copyAction.text && (
@@ -829,8 +826,6 @@ interface ToolRunState {
   entryIds: readonly string[]
   key: string
   live: boolean
-  /** A call still awaiting a result that could be the one blocking on approval. */
-  pendingApprovalTool: boolean
   summary: string
 }
 
@@ -868,7 +863,6 @@ function useToolRun(startIndex: number, endIndex: number): ToolRunState {
           entryIds: tools.map(tool => toolEntryDisclosureId(state.message.id, tool)),
           key: tools[0]?.toolCallId ?? '',
           live,
-          pendingApprovalTool: tools.some(tool => tool.result === undefined && APPROVAL_TOOLS.has(tool.toolName)),
           summary: summarizeToolRun(tools, live)
         }
       }
@@ -898,9 +892,7 @@ const ToolRun: FC<PropsWithChildren<{ endIndex: number; startIndex: number }>> =
   startIndex
 }) => {
   const messageRunning = useAuiState(selectMessageRunning)
-  const { count, entryIds, key, live, pendingApprovalTool, summary } = useToolRun(startIndex, endIndex)
-  const sessionId = useStore(useSessionView().$runtimeId)
-  const approval = useStore(useMemo(() => sessionApprovalRequest(sessionId), [sessionId]))
+  const { count, entryIds, key, live, summary } = useToolRun(startIndex, endIndex)
   const disclosureId = `tool-run:${key}`
   const persistedOpen = useStore($toolDisclosureOpen(disclosureId))
   const rowOpen = useStore(useMemo(() => $anyToolDisclosureOpen(entryIds), [entryIds]))
@@ -912,14 +904,7 @@ const ToolRun: FC<PropsWithChildren<{ endIndex: number; startIndex: number }>> =
     return <>{children}</>
   }
 
-  // Two things a one-line window can't hold. An approval is a question the
-  // user has to answer, and expanded output is one they went looking for —
-  // both would tick straight past, or be sliced to a single line, as the run
-  // keeps going. Either one hands the run back its full height until the run
-  // settles and the row can be reached through the summary instead.
-  const blocked = Boolean(approval) && pendingApprovalTool
-  const unfurled = blocked || rowOpen
-  const expanded = live ? unfurled : (persistedOpen ?? false)
+  const expanded = live ? rowOpen : (persistedOpen ?? false)
 
   return (
     <div
@@ -934,7 +919,7 @@ const ToolRun: FC<PropsWithChildren<{ endIndex: number; startIndex: number }>> =
         open={expanded}
         summary={summary}
       />
-      {live && !unfurled && <ToolRunTicker>{children}</ToolRunTicker>}
+      {live && !expanded && <ToolRunTicker>{children}</ToolRunTicker>}
       {expanded && <div className="grid min-w-0 max-w-full gap-(--tool-row-gap)">{children}</div>}
     </div>
   )

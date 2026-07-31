@@ -52,7 +52,7 @@ import shutil
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, TypeVar
 
 try:
     from aiohttp import web
@@ -104,6 +104,8 @@ WAMID_DEDUP_CACHE_SIZE = 5000
 # Cap for the interactive-button state dicts and the per-chat last-wamid
 # cache. Generous for any realistic number of in-flight prompts / chats.
 INTERACTIVE_STATE_CACHE_SIZE = 1000
+
+_InteractiveState = TypeVar("_InteractiveState")
 
 # Per-type size caps documented by Meta for the Cloud API /media endpoint.
 # These are the hard limits; we refuse uploads above them with a clean
@@ -327,12 +329,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # fallback path, same as after a gateway restart).
         #   _clarify_state:        clarify_id → session_key (resolves via
         #                          tools.clarify_gateway.resolve_gateway_clarify)
-        #   _exec_approval_state:  approval_id → session_key (resolves via
-        #                          tools.approval.resolve_gateway_approval)
+        #   _exec_approval_state:  button id → (session key, backend approval id)
         #   _slash_confirm_state:  confirm_id → session_key (resolves via
         #                          tools.slash_confirm.resolve)
         self._clarify_state: "OrderedDict[str, str]" = OrderedDict()
-        self._exec_approval_state: "OrderedDict[str, str]" = OrderedDict()
+        self._exec_approval_state: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
         self._slash_confirm_state: "OrderedDict[str, str]" = OrderedDict()
 
         # Runtime
@@ -352,7 +353,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return f"{GRAPH_API_BASE}/{self._api_version}/{self._phone_number_id}/{path}"
 
     @staticmethod
-    def _bounded_put(cache: "OrderedDict[str, str]", key: str, value: str) -> None:
+    def _bounded_put(
+        cache: OrderedDict[str, _InteractiveState],
+        key: str,
+        value: _InteractiveState,
+    ) -> None:
         """Insert into a FIFO-capped OrderedDict, evicting oldest entries."""
         cache[key] = value
         while len(cache) > INTERACTIVE_STATE_CACHE_SIZE:
@@ -838,6 +843,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """Render a dangerous-command approval prompt with native buttons.
 
@@ -861,7 +868,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             + ("\n\nSmart DENY: owner override applies to this one operation only." if smart_denied else "")
         )
 
-        approval_id = uuid.uuid4().hex[:12]
+        button_id = uuid.uuid4().hex[:12]
         reply_to = (metadata or {}).get("reply_to_message_id") if metadata else None
 
         interactive = {
@@ -871,11 +878,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 "buttons": [
                     {
                         "type": "reply",
-                        "reply": {"id": f"appr:{approval_id}:approve", "title": "✅ Approve"},
+                        "reply": {"id": f"appr:{button_id}:approve", "title": "✅ Approve"},
                     },
                     {
                         "type": "reply",
-                        "reply": {"id": f"appr:{approval_id}:deny", "title": "❌ Deny"},
+                        "reply": {"id": f"appr:{button_id}:deny", "title": "❌ Deny"},
                     },
                 ],
             },
@@ -883,7 +890,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         result = await self._post_interactive(chat_id, interactive, reply_to=reply_to)
         if result.success:
-            self._bounded_put(self._exec_approval_state, approval_id, session_key)
+            self._bounded_put(
+                self._exec_approval_state,
+                button_id,
+                (session_key, approval_id),
+            )
         return result
 
     async def send_slash_confirm(
@@ -1655,12 +1666,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         Returns True if the tap was claimed (caller should drop the
         webhook entry without dispatching a fresh conversation turn).
-        Returns False when the id has no recognized prefix, no live
-        state entry, or the resolver itself reports no waiter — in
-        those cases the caller falls back to standard text-event
-        dispatch, which treats the button title as a normal user
-        message. That graceful fallback covers stale-tap and
-        cross-process-restart scenarios.
+        Returns False when the id has no recognized prefix or a
+        non-approval resolver cannot claim it. Approval controls are
+        always consumed once their prefix is recognized: degrading a
+        stale or malformed approval tap to its button title would turn
+        a consequential control into a fresh conversation message.
 
         Dispatch table:
           ``cl:<clarify_id>:<idx|other>``  → resolve_gateway_clarify
@@ -1783,27 +1793,33 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if button_id.startswith("appr:"):
             parts = button_id.split(":", 2)
             if len(parts) != 3:
-                return False
+                return True
             _, approval_id, choice = parts
-            session_key = self._exec_approval_state.pop(approval_id, None)
-            if not session_key:
+            approval_state = self._exec_approval_state.pop(approval_id, None)
+            if not approval_state:
                 logger.info(
                     "[whatsapp_cloud] approval tap with no matching state "
-                    "(approval_id=%s) — likely stale; falling back to text",
+                    "(approval_id=%s) — likely stale; ignoring",
                     approval_id,
                 )
-                return False
+                return True
+            session_key, backend_approval_id = approval_state
             if choice not in ("approve", "deny"):
-                self._exec_approval_state[approval_id] = session_key
-                return False
+                self._exec_approval_state[approval_id] = approval_state
+                return True
             try:
                 from tools.approval import resolve_gateway_approval
             except ImportError:
                 logger.warning(
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
-                return False
-            count = resolve_gateway_approval(session_key, choice)
+                return True
+            resolver_choice = "once" if choice == "approve" else choice
+            count = resolve_gateway_approval(
+                session_key,
+                resolver_choice,
+                approval_id=backend_approval_id,
+            )
             if not count:
                 logger.info(
                     "[whatsapp_cloud] approval resolver reported no waiter "
