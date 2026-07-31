@@ -55,6 +55,56 @@ def test_fs_read_data_url_rejects_over_cap(client, tmp_path, monkeypatch):
     assert response.status_code == 413
 
 
+def test_fs_mkdir_creates_directory(client, tmp_path):
+    target = tmp_path / "fresh"
+
+    response = client.post("/api/fs/mkdir", json={"path": str(target)})
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "path": str(target)}
+    assert target.is_dir()
+
+
+def test_fs_mkdir_rejects_existing_path(client, tmp_path):
+    existing_dir = tmp_path / "dir"
+    existing_dir.mkdir()
+    existing_file = tmp_path / "file.txt"
+    existing_file.write_text("x")
+
+    for target in (existing_dir, existing_file):
+        response = client.post("/api/fs/mkdir", json={"path": str(target)})
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == "Path already exists"
+
+
+def test_fs_mkdir_rejects_missing_parent(client, tmp_path):
+    response = client.post("/api/fs/mkdir", json={"path": str(tmp_path / "missing" / "child")})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Parent directory does not exist"
+
+
+def test_fs_mkdir_rejects_invalid_path(client, tmp_path):
+    response = client.post("/api/fs/mkdir", json={"path": "bad\x00path"})
+
+    assert response.status_code == 400
+
+
+def test_fs_mkdir_maps_mkdir_time_conflict_to_409(client, tmp_path, monkeypatch):
+    # TOCTOU: the target appears after the stat() preflight, so mkdir() itself
+    # raises FileExistsError — the endpoint must keep the 409 contract.
+    def _raise_exists(self, *args, **kwargs):
+        raise FileExistsError(17, "File exists", str(self))
+
+    monkeypatch.setattr(web_server.Path, "mkdir", _raise_exists)
+
+    response = client.post("/api/fs/mkdir", json={"path": str(tmp_path / "race")})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Path already exists"
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
@@ -63,7 +113,9 @@ def test_fs_endpoints_require_auth(tmp_path):
     list_response = client.get("/api/fs/list", params={"path": str(tmp_path)})
     read_response = client.get("/api/fs/read-text", params={"path": str(target)})
     default_response = client.get("/api/fs/default-cwd")
+    mkdir_response = client.post("/api/fs/mkdir", json={"path": str(tmp_path / "nope")})
 
     assert list_response.status_code == 401
     assert read_response.status_code == 401
     assert default_response.status_code == 401
+    assert mkdir_response.status_code == 401
