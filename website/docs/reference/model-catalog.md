@@ -103,7 +103,9 @@ model_catalog:
     - openai
 ```
 
-The exclusion is matched case-insensitively against every key a provider can surface under — the Hermes id and models.dev id (built-in mapped providers), the overlay pid and resolved Hermes slug (overlay providers), and the canonical slug (canonical providers) — so a single entry like `copilot` hides the provider regardless of which section emits it. It is honored by every `/model` picker surface: the gateway interactive/text pickers, the TUI picker, and the interactive `hermes model` CLI picker. An empty list (or omitting the key) has no effect.
+The desktop app edits this key for you: the provider switches in **Models** (the picker's *Edit Models* dialog) write `excluded_providers`, so turning a provider off there hides it from every surface, not just that app.
+
+The exclusion is matched case-insensitively against every key a provider can surface under — the Hermes id and models.dev id (built-in mapped providers), the overlay pid and resolved Hermes slug (overlay providers), and the canonical slug (canonical providers) — so a single entry like `copilot` hides the provider regardless of which section emits it. It is honored by every `/model` picker surface: the gateway interactive/text pickers, the TUI picker, the interactive `hermes model` CLI picker, and the desktop/dashboard model options payload (all of which build their catalog through the shared picker context). An empty list (or omitting the key) has no effect.
 
 ## Updating the manifest
 
