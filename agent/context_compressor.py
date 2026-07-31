@@ -4235,11 +4235,29 @@ This compaction should PRIORITISE preserving all information related to the focu
         start: int,
         end: int,
     ) -> list[tuple[int, str]]:
-        """Find handoff summaries inside a compression window."""
+        """Find handoff summaries inside a compression window.
+
+        Defensive against out-of-range or malformed inputs (see #75588): when
+        the caller hands in a ``start`` past the list tail, an ``end`` past
+        ``len(messages)``, or a row that is not a dict (corrupt transcript,
+        user-supplied list, etc.), clamp to the real transcript bounds and
+        skip non-dict rows instead of indexing out of bounds.
+        """
         summaries: list[tuple[int, str]] = []
-        for idx in range(start, end):
-            content = messages[idx].get("content")
-            if cls._is_context_summary_message(messages[idx]):
+        n = len(messages)
+        lo = max(0, start) if start is not None else 0
+        hi = min(end if end is not None else n, n)
+        if lo >= hi:
+            return summaries
+        for idx in range(lo, hi):
+            row = messages[idx]
+            if not isinstance(row, dict):
+                # Tolerate non-dict rows (None, str, object) instead of
+                # raising — the regression contract is "compression never
+                # raises for a valid message list" (#75588).
+                continue
+            if cls._is_context_summary_message(row):
+                content = row.get("content")
                 summaries.append((
                     idx,
                     cls._strip_summary_prefix(_content_text_for_contains(content)),
@@ -4253,7 +4271,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         start: int,
         end: int,
     ) -> tuple[Optional[int], str]:
-        """Find the newest handoff summary inside a compression window."""
+        """Find the newest handoff summary inside a compression window.
+
+        Defensive against out-of-range bounds: clamps ``start``/``end`` to
+        ``[0, len(messages)]`` and tolerates non-dict rows so a caller
+        passing through a stale ``compress_end`` from
+        ``_find_tail_cut_by_tokens`` cannot raise IndexError (#75588).
+        """
         summaries = cls._find_context_summaries(messages, start, end)
         if summaries:
             return summaries[-1]
@@ -4895,6 +4919,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         if token_budget is None:
             token_budget = self.tail_token_budget
         n = len(messages)
+        if head_end >= n:
+            # Nothing sits past the protected head — the entire transcript is
+            # either protected or compressed already. Returning ``n`` here
+            # lets the caller's ``compress_start >= compress_end`` guard take
+            # its existing no-compressible-window path (issue #75588).
+            # Without this, the forward-progress floor below
+            # (``max(cut_idx, head_end + 1)``) produces an exclusive end of
+            # ``len(messages) + 1``, which ``_find_context_summaries`` then
+            # indexes past the transcript and crashes with IndexError.
+            return n
         # Hard minimum: always keep a bounded recent-message floor in the tail.
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
         # preserving a whole run of bulky tool outputs on every compaction.
