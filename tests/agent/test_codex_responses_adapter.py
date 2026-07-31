@@ -146,6 +146,44 @@ def test_chat_messages_to_responses_input_keeps_short_call_id():
     assert output["call_id"] == "call_abc123"
 
 
+def test_chat_messages_to_responses_input_normalizes_legacy_tool_name():
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_legacy",
+                        "function": {
+                            "name": "mcp.notion.fetch",
+                            "arguments": "{}",
+                        },
+                    }
+                ],
+            }
+        ]
+    )
+
+    call = next(item for item in items if item.get("type") == "function_call")
+    assert call["name"] == "mcp_notion_fetch"
+
+
+def test_preflight_codex_input_items_normalizes_function_name():
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": "call_legacy",
+                "name": "mcp.notion/fetch",
+                "arguments": "{}",
+            }
+        ]
+    )
+
+    assert items[0]["name"] == "mcp_notion_fetch"
+
+
 
 
 
@@ -302,7 +340,6 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
-
 
 
 

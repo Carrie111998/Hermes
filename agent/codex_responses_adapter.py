@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.message_sanitization import deterministic_call_id
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.codex_tool_names import normalize_codex_tool_name
 
 logger = logging.getLogger(__name__)
 
@@ -570,7 +571,7 @@ def _chat_messages_to_responses_input(
                         items.append({
                             "type": "function_call",
                             "call_id": _clamp_responses_call_id(call_id),
-                            "name": fn_name,
+                            "name": normalize_codex_tool_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -657,7 +658,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": normalize_codex_tool_name(name),
                     "arguments": arguments,
                 }
             )

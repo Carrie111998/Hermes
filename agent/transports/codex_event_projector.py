@@ -11,7 +11,7 @@ Codex emits items with a discriminator field `type`:
   - reasoning           → stashed in the assistant's "reasoning" field
   - commandExecution    → assistant tool_call(name="exec") + tool result
   - fileChange          → assistant tool_call(name="apply_patch") + tool result
-  - mcpToolCall         → assistant tool_call(name=f"mcp.{server}.{tool}") + tool result
+  - mcpToolCall         → assistant tool_call(name="mcp__server__tool") + tool result
   - dynamicToolCall     → assistant tool_call(name=tool) + tool result
   - plan/hookPrompt/collabAgentToolCall → recorded as opaque assistant notes
 
@@ -32,6 +32,8 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+from agent.codex_tool_names import normalize_codex_tool_name
 
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
@@ -217,9 +219,10 @@ class CodexEventProjector:
     def _project_mcp_tool_call(self, item: dict, item_id: str) -> ProjectionResult:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
+        tool_name = normalize_codex_tool_name(f"mcp__{server}__{tool}")
         # Mirror the native MCP tool-name convention (mcp__server__tool) so the
         # deterministic call_id input stays consistent with registration names.
-        call_id = _deterministic_call_id(f"mcp__{server}__{tool}", item_id)
+        call_id = _deterministic_call_id(tool_name, item_id)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
@@ -231,7 +234,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": f"mcp.{server}.{tool}",
+                        "name": tool_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
@@ -261,7 +264,8 @@ class CodexEventProjector:
         self, item: dict, item_id: str
     ) -> ProjectionResult:
         tool = item.get("tool") or "unknown"
-        call_id = _deterministic_call_id(f"dyn_{tool}", item_id)
+        tool_name = normalize_codex_tool_name(tool)
+        call_id = _deterministic_call_id(f"dyn_{tool_name}", item_id)
         args = item.get("arguments") or {}
         if not isinstance(args, dict):
             args = {"arguments": args}
@@ -273,7 +277,7 @@ class CodexEventProjector:
                     "id": call_id,
                     "type": "function",
                     "function": {
-                        "name": tool,
+                        "name": tool_name,
                         "arguments": _format_tool_args(args),
                     },
                 }
