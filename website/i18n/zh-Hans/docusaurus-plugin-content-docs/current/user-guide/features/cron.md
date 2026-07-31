@@ -325,17 +325,17 @@ cron:
   wrap_response: false
 ```
 
-若要保留包装但自定义格式，可设置 `cron.wrap_template`。模板支持
-`{task_name}`、`{job_id}` 和 `{content}` 占位符：
+若要保留包装但自定义完整消息，可设置 `cron.wrap_template`。支持的占位符为
+`{task_name}`、`{job_id}` 和 `{content}`：
 
 ```yaml
-# ~/.hermes/config.yaml
 cron:
   wrap_response: true
-  wrap_template: "── [Cron: {task_name}] ──\n\n{content}\n"
+  wrap_template: "[{task_name}:{job_id}]\n{content}"
 ```
 
-若模板缺失或格式无效，Hermes 会回退到内置包装，避免格式错误阻止投递。
+无效模板会回退到内置包装。`wrap_response: false` 始终投递原始内容，
+其优先级高于 `wrap_template`。
 
 ### 可继续任务（回复 cron 投递）
 
