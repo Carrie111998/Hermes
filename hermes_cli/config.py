@@ -4855,6 +4855,16 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = float(value)
 
     value = coerced_value
+    # Normalize a scalar ``model`` key before writing sub-keys so that
+    # ``hermes config set model.provider openai`` doesn't silently
+    # destroy the model id when ``model`` is a bare string shorthand
+    # (e.g. ``model: gpt-4o``).  Without this _set_nested replaces the
+    # scalar with an empty dict, dropping the model id permanently.
+    _model_key = key.strip().lower()
+    if _model_key.startswith("model."):
+        _model_val = user_config.get("model")
+        if isinstance(_model_val, str) and _model_val:
+            user_config["model"] = {"default": _model_val}
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
