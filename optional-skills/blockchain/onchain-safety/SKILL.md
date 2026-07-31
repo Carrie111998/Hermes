@@ -1,6 +1,6 @@
 ---
 name: onchain-safety
-description: Pre-flight risk analysis for onchain actions before signing.
+description: Pre-flight safety check for onchain actions before signing.
 version: 0.1.0
 author: Baophan (Baophan00), Hermes Agent
 license: MIT
@@ -38,6 +38,10 @@ an executor.
 ## Prerequisites
 
 Stdlib only (`argparse`, `json`). No API key, no external packages.
+
+---
+
+## How to Run
 
 ```bash
 python3 ~/.hermes/skills/blockchain/onchain-safety/scripts/decode_action.py \
