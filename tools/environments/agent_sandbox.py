@@ -5,8 +5,10 @@ Supports persistent sandboxes: when enabled, sandboxes are stopped on cleanup
 and resumed on next creation, preserving the filesystem across sessions.
 """
 
+import io
+import tarfile
+import uuid
 import logging
-import math
 import os
 import shlex
 import threading
@@ -141,11 +143,28 @@ class AgentSandboxBackend(BaseEnvironment):
             content = fi.read()
         self._sandbox.files.write(path=remote_path, content=content)
 
-    def _agent_sandbox_bulk_upload(self, files: list[tuple[str, str]]):
+    def _agent_sandbox_bulk_upload(self, files: list[tuple[str, str]]) -> None:
+        """Upload many files in 2 network hops: 1 tar upload + 1 tar extract."""
         if not files:
             return
-        for host_path, remote_path in files:
-            self._agent_sandbox_upload(host_path, remote_path)
+
+        # 1. Create an in-memory tar.gz archive
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
+            for host_path, remote_path in files:
+                # Strip leading slash so paths are relative to root ('/app')
+                arcname = remote_path.lstrip("/")
+                tar.add(name=host_path, arcname=arcname)
+
+        # 2. Upload the single tarball to a temporary path via SDK's HTTP write
+        tmp_tar_path = f"tmp/bundle_{uuid.uuid4().hex}.tar.gz"
+        print("tmp_tar_path:", tmp_tar_path)
+        self._sandbox.files.write(path=tmp_tar_path, content=tar_buffer.getvalue())
+
+        # 3. Extract the archive from root ('/app') and clean up
+        extract_cmd = f"tar -xzf {tmp_tar_path} -C /app"
+        self._sandbox.commands.run(command=extract_cmd, timeout=self._timeout)
+        self._agent_sandbox_delete([tmp_tar_path])
 
     def _agent_sandbox_bulk_download(self, dest: Path):
         """Download remote .hermes/ dir as a tar archive."""
