@@ -35,9 +35,9 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
 # OmniRoute holds admission leases for the lifetime of a heavy streaming
-# response. Give a saturated local queue a bounded two-minute window to drain,
+# response. Give a saturated local queue a bounded six-minute window to drain,
 # while keeping each sleep short enough for useful progress and interrupts.
-_OMNIROUTE_ADMISSION_RETRY_ATTEMPTS = 8
+_OMNIROUTE_ADMISSION_RETRY_ATTEMPTS = 16
 _OMNIROUTE_ADMISSION_RETRY_AFTER_CAP = 30.0
 
 
@@ -193,7 +193,14 @@ def admission_retry_wait(attempt: int, headers: Any) -> float:
         max_delay=_OMNIROUTE_ADMISSION_RETRY_AFTER_CAP,
         jitter_ratio=0.2,
     )
-    return max(retry_after or 0.0, backoff)
+    # ``jittered_backoff`` applies jitter after capping its base delay, so its
+    # result can exceed ``max_delay``. Clamp the final admission wait as well:
+    # a hostile Retry-After value and jitter must both stay inside the bounded
+    # local-admission window.
+    return min(
+        _OMNIROUTE_ADMISSION_RETRY_AFTER_CAP,
+        max(retry_after or 0.0, backoff),
+    )
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:

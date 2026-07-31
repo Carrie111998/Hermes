@@ -239,7 +239,7 @@ class TestOmniRouteAdmissionRetry:
         )
 
     def test_extended_ceiling_outlives_default_retry_count(self):
-        assert omniroute_admission_retry_ceiling() > 3
+        assert omniroute_admission_retry_ceiling() == 16
 
     def test_retry_after_is_a_floor_but_hostile_values_are_bounded(self, monkeypatch):
         monkeypatch.setattr(

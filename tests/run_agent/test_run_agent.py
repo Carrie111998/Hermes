@@ -1657,7 +1657,9 @@ class TestOmniRouteAdmissionRetry:
         agent._try_activate_fallback = Mock(side_effect=AssertionError("activated fallback"))
         agent._try_recover_primary_transport = Mock(side_effect=AssertionError("rebuilt transport"))
 
-        with patch("agent.conversation_loop.time.sleep", return_value=None):
+        # The incremental sleeper is already covered by interrupt/activity tests.
+        # Make this policy integration test independent of wall-clock time.
+        with patch("agent.conversation_loop.admission_retry_wait", return_value=0):
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
@@ -1666,6 +1668,36 @@ class TestOmniRouteAdmissionRetry:
         agent._recover_with_credential_pool.assert_not_called()
         agent._try_activate_fallback.assert_not_called()
         agent._try_recover_primary_transport.assert_not_called()
+
+    def test_backoff_remains_interruptible(self, agent):
+        class _AdmissionError(Exception):
+            status_code = 503
+            body = {"error": {"code": "chat_admission_busy"}}
+            response = SimpleNamespace(headers={"Retry-After": "30"})
+
+        agent._interruptible_api_call = Mock(side_effect=_AdmissionError())
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        statuses = []
+        original_emit = agent._emit_status
+
+        def _capture_status(msg, *args, **kwargs):
+            statuses.append(msg)
+            if "Local gateway busy" in msg:
+                agent._interrupt_requested = True
+            return original_emit(msg, *args, **kwargs)
+
+        agent._emit_status = _capture_status
+        result = agent.run_conversation("hello")
+
+        assert result["interrupted"] is True
+        from agent.retry_utils import omniroute_admission_retry_ceiling
+
+        assert any(
+            f"attempt 2/{omniroute_admission_retry_ceiling()}" in msg
+            for msg in statuses
+        )
 
 
 
