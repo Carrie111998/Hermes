@@ -41,6 +41,7 @@ import {
   canImportHermesCli,
   execProbeSync,
   PROBE_TIMEOUT_MS,
+  quoteForShellIfNeeded,
   shouldTrustHermesOverride,
   verifyHermesCli
 } from './backend-probes'
@@ -1898,7 +1899,7 @@ function backendSupportsServe(backend) {
       // is cached for the process lifetime, silently routing a modern
       // runtime through the legacy `dashboard` form. Share the probe budget
       // and its timeout-only retry instead of a thinner local bound.
-      execProbeSync(backend.command, [...prefix, 'serve', '--help'], {
+      execProbeSync(backend.shell ? quoteForShellIfNeeded(backend.command) : backend.command, [...prefix, 'serve', '--help'], {
         cwd: backend.root || undefined,
         env: { ...process.env, HERMES_HOME, ...(backend.env || {}) },
         timeout: PROBE_TIMEOUT_MS,
@@ -8089,7 +8090,7 @@ async function spawnPoolBackend(profile, entry) {
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
 
   const child = spawn(
-    backend.command,
+    backend.shell ? quoteForShellIfNeeded(backend.command) : backend.command,
     backend.args,
     hiddenWindowsChildOptions({
       cwd: hermesCwd,
@@ -8377,7 +8378,7 @@ async function startHermes() {
     rememberLog(`Starting Hermes backend via ${backend.label}`)
 
     const hermesProcess = spawn(
-      backend.command,
+      backend.shell ? quoteForShellIfNeeded(backend.command) : backend.command,
       backend.args,
       hiddenWindowsChildOptions({
         cwd: hermesCwd,

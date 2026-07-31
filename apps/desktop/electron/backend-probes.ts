@@ -190,13 +190,32 @@ function shouldTrustHermesOverride(hermesOverride?: string) {
   return typeof hermesOverride === 'string' && hermesOverride.trim().length > 0
 }
 
+/**
+ * Quote a command path for safe use with `shell: true` on Windows.
+ *
+ * Node's `execFileSync`/`spawn` with `shell: true` joins
+ * `[command, ...args]` into `cmd.exe /d /s /c "<command> <args>"` without
+ * quoting the command token itself.  A `.cmd`/`.bat` shim under a path
+ * with spaces (e.g. `C:\Users\John Doe\AppData\...\hermes.cmd`) then
+ * executes `C:\Users\John` and fails.  Wrapping the command in double
+ * quotes when it contains whitespace prevents the split — cmd.exe's `/s`
+ * semantics keep a leading-quoted command intact.  (#74064)
+ */
+function quoteForShellIfNeeded(command: string): string {
+  if (process.platform !== 'win32' || !command) return command
+  // Already quoted or no whitespace → leave as-is
+  if (command.startsWith('"') || !/\s/.test(command)) return command
+  return `"${command}"`
+}
+
 function verifyHermesCli(hermesCommand: string, opts?: { shell?: boolean }) {
   if (!hermesCommand) {
     return false
   }
 
   try {
-    execProbeSync(hermesCommand, ['--version'], {
+    const cmd = opts?.shell ? quoteForShellIfNeeded(hermesCommand) : hermesCommand
+    execProbeSync(cmd, ['--version'], {
       stdio: 'ignore',
       timeout: PROBE_TIMEOUT_MS,
       shell: Boolean(opts?.shell),
@@ -215,6 +234,7 @@ export {
   execProbeSync,
   hermesRuntimeImportProbe,
   PROBE_TIMEOUT_MS,
+  quoteForShellIfNeeded,
   resolveProbeTimeoutMs,
   shouldTrustHermesOverride,
   verifyHermesCli

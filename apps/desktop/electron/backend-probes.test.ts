@@ -17,6 +17,7 @@ import {
   DEFAULT_PROBE_TIMEOUT_MS,
   hermesRuntimeImportProbe,
   PROBE_TIMEOUT_MS,
+  quoteForShellIfNeeded,
   resolveProbeTimeoutMs,
   shouldTrustHermesOverride,
   verifyHermesCli
@@ -124,4 +125,33 @@ test('resolveProbeTimeoutMs honours HERMES_PROBE_TIMEOUT_MS', () => {
   assert.equal(resolveProbeTimeoutMs({ HERMES_PROBE_TIMEOUT_MS: 'nope' }), DEFAULT_PROBE_TIMEOUT_MS)
   // Cap runaway values
   assert.equal(resolveProbeTimeoutMs({ HERMES_PROBE_TIMEOUT_MS: '999999' }), 120_000)
+})
+
+// --- quoteForShellIfNeeded (#74064) ---
+
+test('quoteForShellIfNeeded returns empty string unchanged', () => {
+  assert.equal(quoteForShellIfNeeded(''), '')
+})
+
+test('quoteForShellIfNeeded leaves path without spaces unchanged', () => {
+  assert.equal(quoteForShellIfNeeded('C:\\Users\\hermes\\bin\\hermes.cmd'), 'C:\\Users\\hermes\\bin\\hermes.cmd')
+})
+
+test('quoteForShellIfNeeded wraps path containing spaces in double quotes', () => {
+  assert.equal(
+    quoteForShellIfNeeded('C:\\Users\\John Doe\\AppData\\hermes\\bin\\hermes.cmd'),
+    '"C:\\Users\\John Doe\\AppData\\hermes\\bin\\hermes.cmd"'
+  )
+})
+
+test('quoteForShellIfNeeded does not double-quote an already-quoted path', () => {
+  const already = '"C:\\Users\\John Doe\\hermes.cmd"'
+  assert.equal(quoteForShellIfNeeded(already), already)
+})
+
+test('quoteForShellIfNeeded handles Program Files path', () => {
+  assert.equal(
+    quoteForShellIfNeeded('C:\\Program Files\\hermes\\Scripts\\hermes.cmd'),
+    '"C:\\Program Files\\hermes\\Scripts\\hermes.cmd"'
+  )
 })
