@@ -26,10 +26,12 @@ class _Receiver:
         self.playback_token = None
         self.pause_calls = 0
         self.resume_calls = 0
+        self._paused = False
         self.stopped = False
 
     def begin_playback_capture(self, token):
         self.playback_token = token
+        self._paused = False
 
     def end_playback_capture(self, token):
         if self.playback_token == token:
@@ -37,9 +39,11 @@ class _Receiver:
 
     def pause(self):
         self.pause_calls += 1
+        self._paused = True
 
     def resume(self):
         self.resume_calls += 1
+        self._paused = False
 
     def flush_pending(self, *, with_context=False):
         return []
@@ -196,6 +200,30 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
     }
 
 
+def test_playback_capture_reactivates_a_started_receiver_left_paused():
+    """The real receiver must pass RTP after legacy pause state, unlike mocks."""
+    from plugins.platforms.discord.adapter import VoiceReceiver
+
+    vc = MagicMock()
+    vc._connection.secret_key = [0] * 32
+    vc._connection.dave_session = None
+    vc._connection.ssrc = 9999
+    vc._connection.hook = None
+
+    receiver = VoiceReceiver(vc)
+    receiver.start()
+    receiver.pause()
+    assert receiver._running is True
+    assert receiver._paused is True
+
+    receiver.begin_playback_capture(7)
+    receiver._on_packet(b"")
+
+    assert receiver._playback_capture_token == 7
+    assert receiver._paused is False
+    assert receiver._packet_debug_count == 1
+
+
 @pytest.mark.asyncio
 async def test_ack_phrases_round_robin_deterministically_and_independently_by_kind():
     adapter = _make_adapter(
@@ -265,6 +293,7 @@ async def test_legacy_stop_only_interrupts_playback_without_model_event():
         await asyncio.wait_for(started.wait(), timeout=1)
         token = receiver.playback_token
         assert token is not None
+        assert receiver._paused is False
 
         await _process_transcript(adapter, "세린아 멈춰", token=token)
         assert await asyncio.wait_for(play_task, timeout=1) is True
@@ -310,6 +339,7 @@ async def test_mixer_stop_with_trailing_routes_one_clean_input():
             await asyncio.sleep(0)
         token = receiver.playback_token
         assert token is not None and mixer.active
+        assert receiver._paused is False
 
         await _process_transcript(
             adapter,
@@ -494,11 +524,13 @@ async def test_disabled_default_pauses_receiver_during_mixer_speech():
             await asyncio.sleep(0)
         assert mixer.active
         assert receiver.pause_calls == 1
+        assert receiver._paused is True
         assert receiver.playback_token is None
         mixer.stop_speech()
         assert await asyncio.wait_for(play_task, timeout=1) is True
 
     assert receiver.resume_calls == 1
+    assert receiver._paused is False
     adapter._voice_input_callback.assert_not_awaited()
 
 

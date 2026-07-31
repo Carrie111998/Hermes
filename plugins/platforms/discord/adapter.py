@@ -563,9 +563,13 @@ class VoiceReceiver:
         self._paused = False
 
     def begin_playback_capture(self, token: int) -> None:
-        """Tag newly received packets as belonging to one TTS playback."""
+        """Enable and tag inbound capture for one TTS playback."""
         with self._lock:
             self._playback_capture_token = token
+            # Capture mode must override any echo-prevention pause left on the
+            # real receiver. Set the token first so the SocketReader thread
+            # cannot admit an untagged playback packet during the transition.
+            self._paused = False
 
     def end_playback_capture(self, token: int) -> None:
         """Stop tagging new packets without erasing pending tagged buffers."""
