@@ -7,7 +7,9 @@ import { I18nProvider, type Locale } from '@/i18n'
 import type { MessagingPlatformInfo } from '@/types/hermes'
 
 const getMessagingPlatforms = vi.fn()
+const getEmailAutoReplyPolicy = vi.fn()
 const updateMessagingPlatform = vi.fn()
+const updateEmailAutoReplyPolicy = vi.fn()
 const getPairing = vi.fn()
 const approvePairing = vi.fn()
 const revokePairing = vi.fn()
@@ -16,9 +18,11 @@ const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
   approvePairing: (platformId: string, requestId: string) => approvePairing(platformId, requestId),
+  getEmailAutoReplyPolicy: () => getEmailAutoReplyPolicy(),
   getMessagingPlatforms: () => getMessagingPlatforms(),
   getPairing: () => getPairing(),
   revokePairing: (platformId: string, userId: string) => revokePairing(platformId, userId),
+  updateEmailAutoReplyPolicy: (body: unknown) => updateEmailAutoReplyPolicy(body),
   updateMessagingPlatform: (id: string, body: unknown) => updateMessagingPlatform(id, body)
 }))
 
@@ -51,6 +55,94 @@ function platform(patch: Partial<MessagingPlatformInfo> = {}): MessagingPlatform
 }
 
 beforeEach(() => {
+  getEmailAutoReplyPolicy.mockResolvedValue({
+    fields: [
+      {
+        advanced: false,
+        current_value: 'false',
+        default_value: 'false',
+        description: '',
+        input_type: 'boolean',
+        is_password: false,
+        is_set: false,
+        key: 'auto_reply_promotions',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'no_reply_keywords',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'skip_patterns',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: '',
+        default_value: '',
+        description: '',
+        input_type: 'textarea',
+        is_password: false,
+        is_set: false,
+        key: 'force_reply_keywords',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      },
+      {
+        advanced: false,
+        current_value: 'true',
+        default_value: 'true',
+        description: '',
+        input_type: 'boolean',
+        is_password: false,
+        is_set: false,
+        key: 'require_structured_response',
+        prompt: '',
+        redacted_value: null,
+        required: false,
+        url: null
+      }
+    ],
+    policy: {
+      auto_reply_calendar: false,
+      auto_reply_newsletters: false,
+      auto_reply_promotions: false,
+      auto_reply_reports: false,
+      auto_reply_security: false,
+      auto_reply_social: false,
+      auto_reply_transactions: false,
+      force_reply_keywords: '',
+      no_reply_keywords: '',
+      skip_patterns: '',
+      require_structured_response: true
+    }
+  })
+  updateEmailAutoReplyPolicy.mockResolvedValue({ ok: true })
   updateMessagingPlatform.mockResolvedValue({ ok: true, platform: 'teams' })
   getPairing.mockResolvedValue({ approved: [], pending: [] })
 })
@@ -97,48 +189,6 @@ describe('MessagingView email policy', () => {
               redacted_value: null,
               required: true,
               url: null
-            },
-            {
-              advanced: false,
-              current_value: 'false',
-              default_value: 'false',
-              description: 'Backend English promotion description',
-              input_type: 'boolean',
-              is_password: false,
-              is_set: false,
-              key: 'EMAIL_AUTO_REPLY_PROMOTIONS',
-              prompt: 'Backend English promotion prompt',
-              redacted_value: null,
-              required: false,
-              url: null
-            },
-            {
-              advanced: false,
-              current_value: '',
-              default_value: '',
-              description: 'Backend English keyword description',
-              input_type: 'textarea',
-              is_password: false,
-              is_set: false,
-              key: 'EMAIL_NO_REPLY_KEYWORDS',
-              prompt: 'Backend English keyword prompt',
-              redacted_value: null,
-              required: false,
-              url: null
-            },
-            {
-              advanced: false,
-              current_value: 'true',
-              default_value: 'true',
-              description: 'Backend English decision description',
-              input_type: 'boolean',
-              is_password: false,
-              is_set: true,
-              key: 'EMAIL_REQUIRE_STRUCTURED_RESPONSE',
-              prompt: 'Backend English decision prompt',
-              redacted_value: null,
-              required: false,
-              url: null
             }
           ]
         })
@@ -150,18 +200,40 @@ describe('MessagingView email policy', () => {
     expect(await screen.findByText('自动回复策略')).toBeTruthy()
     expect(screen.getByText('推广与营销')).toBeTruthy()
     expect(screen.getByText('绝不回复')).toBeTruthy()
+    expect(screen.getByText('跳过正则表达式')).toBeTruthy()
     expect(screen.getByText('要求结构化回复判定')).toBeTruthy()
     expect(screen.getByText('邮箱地址')).toBeTruthy()
     expect(screen.queryByText('Backend English promotion prompt')).toBeNull()
 
-    fireEvent.change(screen.getByPlaceholderText('每行输入一个关键词组'), {
+    fireEvent.change(screen.getByLabelText('绝不回复'), {
       target: { value: 'invoice + overdue\nvip customer' }
     })
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
 
     await waitFor(() =>
-      expect(updateMessagingPlatform).toHaveBeenCalledWith('email', {
-        env: { EMAIL_NO_REPLY_KEYWORDS: 'invoice + overdue;vip customer' }
+      expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
+        values: { no_reply_keywords: 'invoice + overdue;vip customer' },
+        clear: []
+      })
+    )
+  })
+
+  it('saves skip patterns through the dedicated policy endpoint', async () => {
+    getMessagingPlatforms.mockResolvedValue({
+      platforms: [platform({ configured: true, id: 'email', name: 'Email', env_vars: [] })]
+    })
+
+    await renderMessaging('zh')
+
+    fireEvent.change(await screen.findByLabelText('跳过正则表达式'), {
+      target: { value: '^out of office$' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
+
+    await waitFor(() =>
+      expect(updateEmailAutoReplyPolicy).toHaveBeenCalledWith({
+        values: { skip_patterns: '^out of office$' },
+        clear: []
       })
     )
   })
@@ -173,36 +245,7 @@ describe('MessagingView email policy', () => {
           configured: true,
           id: 'email',
           name: 'Email',
-          env_vars: [
-            {
-              advanced: false,
-              current_value: '',
-              default_value: '',
-              description: '',
-              input_type: 'textarea',
-              is_password: false,
-              is_set: false,
-              key: 'EMAIL_NO_REPLY_KEYWORDS',
-              prompt: '',
-              redacted_value: null,
-              required: false,
-              url: null
-            },
-            {
-              advanced: false,
-              current_value: '',
-              default_value: '',
-              description: '',
-              input_type: 'textarea',
-              is_password: false,
-              is_set: false,
-              key: 'EMAIL_FORCE_REPLY_KEYWORDS',
-              prompt: '',
-              redacted_value: null,
-              required: false,
-              url: null
-            }
-          ]
+          env_vars: []
         })
       ]
     })
@@ -218,6 +261,7 @@ describe('MessagingView email policy', () => {
     fireEvent.click(screen.getByRole('button', { name: '保存更改' }))
 
     expect(updateMessagingPlatform).not.toHaveBeenCalled()
+    expect(updateEmailAutoReplyPolicy).not.toHaveBeenCalled()
     expect(notifyError).toHaveBeenCalledWith(expect.any(Error), '关键词规则冲突')
   })
 })

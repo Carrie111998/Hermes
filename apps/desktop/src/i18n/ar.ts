@@ -1320,6 +1320,11 @@ export const ar = defineLocale({
       keywordConflictTitle: 'تعارض في قاعدة الكلمات',
       keywordConflictDescription: group =>
         `لا يمكن تعيين «${group}» للرد الإلزامي وعدم الرد معا. احذفها من إحدى القائمتين.`,
+      skipPatternsTitle: 'تعبيرات التخطي النمطية',
+      skipPatternsDescription: 'تتوقف الرسائل المطابقة قبل استدعاء الوكيل.',
+      skipPatternsPlaceholder: 'تعبير نمطي واحد في كل سطر',
+      skipPatternsSyntax: 'تطابق دون اعتبار لحالة الأحرف في الموضوع والنص.',
+      clearSkipPatterns: 'مسح تعبيرات التخطي النمطية',
       decisionTitle: 'قرار الوكيل',
       strictDecision: 'اشتراط قرار رد منظّم',
       strictDecisionDescription: 'لا يُرسل الرد إلا عند إرجاع بنية صالحة تحتوي need_response: true.',

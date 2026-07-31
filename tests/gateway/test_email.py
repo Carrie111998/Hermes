@@ -18,7 +18,7 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from unittest.mock import patch, MagicMock, AsyncMock, ANY
+from unittest.mock import patch, MagicMock, AsyncMock, ANY, call
 
 from gateway.platforms.base import SendResult
 
@@ -394,7 +394,9 @@ class TestDispatchMessage(unittest.TestCase):
 
         asyncio.run(adapter._dispatch_message(msg_data))
         self.assertEqual(len(captured_events), 1)
-        self.assertTrue(adapter._thread_context["user@test.com"]["force_reply"])
+        event_id = "<hermes-imap-44@test.com>"
+        self.assertTrue(adapter._reply_context[event_id]["force_reply"])
+        self.assertEqual(captured_events[0].message_id, event_id)
         self.assertIn("requires a reply", captured_events[0].text)
 
 
@@ -527,7 +529,7 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
+        reply_context = {
             "subject": "Project question",
             "message_id": "<original@test.com>",
         }
@@ -536,7 +538,12 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Here is the answer.", None)
+            adapter._send_email(
+                "user@test.com",
+                "Here is the answer.",
+                "<original@test.com>",
+                reply_context,
+            )
 
             # Check the sent message
             send_call = mock_server.send_message.call_args[0][0]
@@ -622,7 +629,6 @@ class TestStructuredReplySend(unittest.TestCase):
                 "EMAIL_PASSWORD": "secret",
                 "EMAIL_IMAP_HOST": "imap.test.com",
                 "EMAIL_SMTP_HOST": "smtp.test.com",
-                "EMAIL_REQUIRE_STRUCTURED_RESPONSE": "true",
             },
         ):
             return EmailAdapter(PlatformConfig(enabled=True))
@@ -631,50 +637,56 @@ class TestStructuredReplySend(unittest.TestCase):
         import asyncio
 
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
+        adapter._reply_context["<m@test.com>"] = {
             "uid": b"12",
             "force_reply": False,
         }
         adapter._send_email = MagicMock()
-        adapter._mark_as_unseen = MagicMock()
+        adapter._mark_replied_unread = MagicMock()
 
         result = asyncio.run(
             adapter.send(
                 "user@test.com",
                 '{"need_response": false, "response": ""}',
+                reply_to="<m@test.com>",
             )
         )
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "skipped-no-response-needed")
         adapter._send_email.assert_not_called()
-        adapter._mark_as_unseen.assert_not_called()
+        adapter._mark_replied_unread.assert_not_called()
 
     def test_true_json_sends_only_response_body(self):
         import asyncio
 
         adapter = self._make_adapter()
+        adapter._reply_context["<m@test.com>"] = {"uid": b"12", "force_reply": False}
         adapter._send_email = MagicMock(return_value="<reply@test.com>")
+        adapter._mark_replied_unread = MagicMock()
 
         result = asyncio.run(
             adapter.send(
                 "user@test.com",
                 '{"need_response": true, "response": "The answer."}',
+                reply_to="<m@test.com>",
             )
         )
 
         self.assertTrue(result.success)
         adapter._send_email.assert_called_once_with(
-            "user@test.com", "The answer.", None
+            "user@test.com", "The answer.", "<m@test.com>", ANY
         )
+        adapter._mark_replied_unread.assert_called_once_with(b"12")
 
     def test_invalid_strict_output_is_blocked(self):
         import asyncio
 
         adapter = self._make_adapter()
+        adapter._reply_context["<m@test.com>"] = {"uid": b"12", "force_reply": False}
         adapter._send_email = MagicMock()
 
-        result = asyncio.run(adapter.send("user@test.com", "ordinary answer"))
+        result = asyncio.run(adapter.send("user@test.com", "ordinary answer", reply_to="<m@test.com>"))
 
         self.assertEqual(result.message_id, "skipped-invalid-response-format")
         adapter._send_email.assert_not_called()
@@ -683,12 +695,14 @@ class TestStructuredReplySend(unittest.TestCase):
         import asyncio
 
         adapter = self._make_adapter()
+        adapter._reply_context["<m@test.com>"] = {"uid": b"12", "force_reply": False}
         adapter._send_email = MagicMock()
 
         result = asyncio.run(
             adapter.send(
                 "user@test.com",
                 '{"need_response": true, "response": ""}',
+                reply_to="<m@test.com>",
             )
         )
 
@@ -699,23 +713,134 @@ class TestStructuredReplySend(unittest.TestCase):
         import asyncio
 
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
+        adapter._reply_context["<m@test.com>"] = {
             "uid": b"13",
             "force_reply": True,
         }
         adapter._send_email = MagicMock(return_value="<forced@test.com>")
-        adapter._mark_as_unseen = MagicMock()
+        adapter._mark_replied_unread = MagicMock()
 
         result = asyncio.run(
             adapter.send(
                 "user@test.com",
                 '{"need_response": false, "response": ""}',
+                reply_to="<m@test.com>",
             )
         )
 
         self.assertTrue(result.success)
         adapter._send_email.assert_called_once_with(
-            "user@test.com", "Your email has been received.", None
+            "user@test.com", "Your email has been received.", "<m@test.com>", ANY
+        )
+
+    def test_generic_delivery_is_not_interpreted_as_an_agent_reply(self):
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._send_email = MagicMock(return_value="<delivery@test.com>")
+
+        result = asyncio.run(adapter.send("user@test.com", "ordinary delivery"))
+
+        self.assertTrue(result.success)
+        adapter._send_email.assert_called_once_with(
+            "user@test.com", "ordinary delivery", None, None
+        )
+
+    def test_reply_marker_is_persisted_before_restoring_unread(self):
+        adapter = self._make_adapter()
+        imap = MagicMock()
+        imap.uid.return_value = ("OK", [])
+
+        with patch("imaplib.IMAP4_SSL", return_value=imap):
+            adapter._mark_replied_unread(b"12")
+
+        self.assertEqual(
+            imap.uid.call_args_list[0].args,
+            ("store", b"12", "+FLAGS.SILENT", r"(\Answered)"),
+        )
+        self.assertEqual(
+            imap.uid.call_args_list[1].args,
+            ("store", b"12", "-FLAGS.SILENT", r"(\Seen)"),
+        )
+
+    def test_automatic_reply_sets_loop_prevention_header(self):
+        """Inbound-event replies advertise RFC 3834 auto-generation."""
+        adapter = self._make_adapter()
+        context = {"subject": "Question", "message_id": "<original@test.com>"}
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            server = MagicMock()
+            mock_smtp.return_value = server
+            adapter._send_email("user@test.com", "Answer", "<event@test.com>", context)
+
+        sent = server.send_message.call_args.args[0]
+        self.assertEqual(sent["Auto-Submitted"], "auto-replied")
+
+    def test_generic_delivery_has_no_auto_submitted_header(self):
+        """Cron and notification email remains ordinary outbound mail."""
+        adapter = self._make_adapter()
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            server = MagicMock()
+            mock_smtp.return_value = server
+            adapter._send_email("user@test.com", "Notice")
+
+        sent = server.send_message.call_args.args[0]
+        self.assertIsNone(sent["Auto-Submitted"])
+
+    def test_duplicate_external_message_ids_keep_reply_contexts_isolated(self):
+        """Mailbox UIDs, not attacker-controlled Message-IDs, own reply state."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        events = []
+
+        async def capture(event):
+            events.append(event)
+
+        adapter.handle_message = capture
+        shared = "<reused@example.test>"
+        with patch.dict(os.environ, {"EMAIL_ALLOW_ALL_USERS": "true"}, clear=False):
+            for uid, sender, subject in (
+                (b"41", "first@test.com", "First question"),
+                (b"42", "second@test.com", "Second question"),
+            ):
+                asyncio.run(adapter._dispatch_message({
+                    "uid": uid,
+                    "sender_addr": sender,
+                    "sender_name": sender,
+                    "subject": subject,
+                    "message_id": shared,
+                    "in_reply_to": "",
+                    "body": "Please reply",
+                    "attachments": [],
+                    "date": "",
+                }))
+
+        self.assertEqual(
+            {event.message_id for event in events},
+            {"<hermes-imap-41@test.com>", "<hermes-imap-42@test.com>"},
+        )
+        self.assertEqual(len(adapter._reply_context), 2)
+        adapter._send_email = MagicMock(side_effect=["<first-reply>", "<second-reply>"])
+        adapter._mark_replied_unread = MagicMock()
+
+        asyncio.run(adapter.send(
+            "first@test.com",
+            '{"need_response": true, "response": "First answer"}',
+            reply_to=events[0].message_id,
+        ))
+        asyncio.run(adapter.send(
+            "second@test.com",
+            '{"need_response": true, "response": "Second answer"}',
+            reply_to=events[1].message_id,
+        ))
+
+        self.assertEqual(adapter._send_email.call_args_list[0].args[3]["subject"], "First question")
+        self.assertEqual(adapter._send_email.call_args_list[1].args[3]["subject"], "Second question")
+        self.assertEqual(
+            adapter._mark_replied_unread.call_args_list,
+            [call(b"41"), call(b"42")],
         )
 
 
@@ -757,6 +882,33 @@ class TestConnectDisconnect(unittest.TestCase):
             adapter._running = False
             if adapter._poll_task:
                 adapter._poll_task.cancel()
+
+    def test_connect_requires_pinned_authserv_for_authenticated_allowlist(self):
+        """A valid allowlist cannot silently become unusable at first delivery."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        with patch.dict(os.environ, {"EMAIL_ALLOWED_USERS": "user@test.com"}, clear=False):
+            result = asyncio.run(adapter.connect())
+
+        self.assertFalse(result)
+        self.assertTrue(adapter.has_fatal_error)
+        self.assertEqual(adapter.fatal_error_code, "email_authserv_id_required")
+
+    def test_connect_locks_mailbox_identity_and_disconnect_releases_it(self):
+        """Profiles sharing one mailbox must not concurrently poll/reply."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        adapter._acquire_platform_lock = MagicMock(return_value=False)
+        self.assertFalse(asyncio.run(adapter.connect()))
+        adapter._acquire_platform_lock.assert_called_once_with(
+            "email", "imap.test.com:hermes@test.com", "email mailbox"
+        )
+
+        adapter._release_platform_lock = MagicMock()
+        asyncio.run(adapter.disconnect())
+        adapter._release_platform_lock.assert_called_once_with()
 
 
 class TestFetchNewMessages(unittest.TestCase):
@@ -802,6 +954,26 @@ class TestFetchNewMessages(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["sender_addr"], "user@test.com")
         self.assertIn(b"3", adapter._seen_uids)
+
+    def test_fetch_skips_automated_headers_regardless_of_spelling(self):
+        """RFC field names are case-insensitive, including loop-prevention headers."""
+        adapter = self._make_adapter()
+        raw_email = MIMEText("Hello", "plain", "utf-8")
+        raw_email["From"] = "sender@test.com"
+        raw_email["Subject"] = "Automated"
+        raw_email["auto-submitted"] = "auto-replied"
+
+        mock_imap = MagicMock()
+        mock_imap.uid.side_effect = lambda command, *args: (
+            ("OK", [b"9"])
+            if command == "search"
+            else ("OK", [(b"9", raw_email.as_bytes())])
+            if command == "fetch"
+            else ("NO", [])
+        )
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            self.assertEqual(adapter._fetch_new_messages(), [])
 
 
 class TestPollLoop(unittest.TestCase):
@@ -1142,6 +1314,7 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "Admin <admin@example.com>",
             ["mx.google.com; dmarc=pass header.from=example.com; spf=pass"],
+            authserv_id="mx.google.com",
         )
         self.assertTrue(ok, reason)
 
@@ -1150,6 +1323,7 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "admin@example.com",
             ["mx.google.com; dkim=pass header.d=example.com"],
+            authserv_id="mx.google.com",
         )
         self.assertTrue(ok, reason)
 
@@ -1158,8 +1332,27 @@ class TestSenderAuthentication(unittest.TestCase):
         ok, reason = self._verify(
             "admin@example.com",
             ["mx.google.com; spf=pass smtp.mailfrom=bounce@evil.com"],
+            authserv_id="mx.google.com",
         )
         self.assertFalse(ok, reason)
+
+    def test_authserv_id_requires_exact_host_match(self):
+        """A sender-controlled subdomain cannot impersonate the receiver."""
+        for untrusted in ("evil.mx.ourserver.com", "ourserver.com"):
+            ok, reason = self._verify(
+                "admin@example.com",
+                [f"{untrusted}; dmarc=pass header.from=example.com"],
+                authserv_id="mx.ourserver.com",
+            )
+            self.assertFalse(ok, reason)
+
+    def test_missing_authserv_id_fails_closed(self):
+        ok, reason = self._verify(
+            "admin@example.com",
+            ["mx.google.com; dmarc=pass header.from=example.com"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("authserv-id is required", reason)
 
 
     def test_injected_header_below_trusted_does_not_authenticate(self):
@@ -1177,6 +1370,19 @@ class TestSenderAuthentication(unittest.TestCase):
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+    def test_untrusted_topmost_header_cannot_defer_to_a_lower_forged_header(self):
+        """A lower matching authserv-id is sender controlled and never trusted."""
+        ok, reason = self._verify(
+            "admin@example.com",
+            [
+                "mx.other-server.example; dmarc=fail header.from=example.com",
+                "mx.ourserver.com; dmarc=pass header.from=example.com",
+            ],
+            authserv_id="mx.ourserver.com",
+        )
+        self.assertFalse(ok, reason)
+        self.assertIn("topmost", reason)
 
 
 if __name__ == "__main__":

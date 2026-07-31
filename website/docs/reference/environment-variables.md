@@ -413,16 +413,6 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `EMAIL_HOME_ADDRESS_NAME` | Display name for the email home target |
 | `EMAIL_POLL_INTERVAL` | Email polling interval in seconds |
 | `EMAIL_ALLOW_ALL_USERS` | Allow all inbound email senders |
-| `EMAIL_AUTO_REPLY_PROMOTIONS` | Allow promotional and marketing email to reach the agent (default: `false`) |
-| `EMAIL_AUTO_REPLY_NEWSLETTERS` | Allow newsletters and digests to reach the agent (default: `false`) |
-| `EMAIL_AUTO_REPLY_TRANSACTIONS` | Allow order, shipping, payment, and invoice notices (default: `false`) |
-| `EMAIL_AUTO_REPLY_SECURITY` | Allow verification and security notices (default: `false`) |
-| `EMAIL_AUTO_REPLY_SOCIAL` | Allow social-network notifications (default: `false`) |
-| `EMAIL_AUTO_REPLY_CALENDAR` | Allow calendar invitations and reminders (default: `false`) |
-| `EMAIL_AUTO_REPLY_REPORTS` | Allow recurring reports (default: `false`) |
-| `EMAIL_FORCE_REPLY_KEYWORDS` | Must-reply keyword groups (`;` between groups, `+` between required terms) |
-| `EMAIL_NO_REPLY_KEYWORDS` | No-reply keyword groups; takes precedence over must-reply rules |
-| `EMAIL_REQUIRE_STRUCTURED_RESPONSE` | Require a valid model `need_response` decision before SMTP (default: `true`) |
 | `DINGTALK_CLIENT_ID` | DingTalk bot AppKey from developer portal ([open.dingtalk.com](https://open.dingtalk.com)) |
 | `DINGTALK_CLIENT_SECRET` | DingTalk bot AppSecret from developer portal |
 | `DINGTALK_ALLOWED_USERS` | Comma-separated DingTalk user IDs allowed to message the bot |

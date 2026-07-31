@@ -124,25 +124,22 @@ Email uses fast local rules before invoking the model:
 
 Category detection is approximate. Disabling a category does not guarantee that its messages will never reach the model: a regex match is suppressed before the model, but wording outside the built-in patterns can be missed. Treat category switches as a low-cost pre-filter, not a complete semantic classifier.
 
-Configure these rules from **Dashboard → Channels → Email → Configure**, or with environment variables:
+Configure these rules from **Dashboard → Channels → Email → Configure**, or in `config.yaml`:
 
 ```bash
-# Categories are false by default
-EMAIL_AUTO_REPLY_PROMOTIONS=false
-EMAIL_AUTO_REPLY_NEWSLETTERS=false
-EMAIL_AUTO_REPLY_TRANSACTIONS=false
-EMAIL_AUTO_REPLY_SECURITY=false
-EMAIL_AUTO_REPLY_SOCIAL=false
-EMAIL_AUTO_REPLY_CALENDAR=false
-EMAIL_AUTO_REPLY_REPORTS=false
-
-# Groups are OR alternatives separated by semicolons.
-# Terms joined with + must all be present.
-EMAIL_FORCE_REPLY_KEYWORDS=urgent;invoice+overdue
-EMAIL_NO_REPLY_KEYWORDS=for your information;do+not+reply
-
-# Fail closed when the model omits or corrupts its reply decision
-EMAIL_REQUIRE_STRUCTURED_RESPONSE=true
+platforms:
+  email:
+    # Required when EMAIL_ALLOWED_USERS or GATEWAY_ALLOWED_USERS is set
+    # and sender authentication remains enabled (the default).
+    authserv_id: mx.your-mail-host.example
+    # Set false only when your receiving server does not stamp
+    # Authentication-Results and you accept that From: can be spoofed.
+    require_authenticated_sender: true
+    auto_reply_promotions: false
+    auto_reply_newsletters: false
+    force_reply_keywords: urgent;invoice+overdue
+    no_reply_keywords: for your information;do+not+reply
+    require_structured_response: true
 ```
 
 No-reply rules win if the same message matches both lists. Matching is case-insensitive and checks the combined subject and body.
@@ -230,13 +227,3 @@ Email access is stricter by default than chat-style platforms:
 | `EMAIL_ALLOWED_USERS` | No | — | Comma-separated allowed sender addresses |
 | `EMAIL_HOME_ADDRESS` | No | — | Default delivery target for cron jobs |
 | `EMAIL_ALLOW_ALL_USERS` | No | `false` | Allow all senders (not recommended) |
-| `EMAIL_AUTO_REPLY_PROMOTIONS` | No | `false` | Allow promotional and marketing messages to reach the agent |
-| `EMAIL_AUTO_REPLY_NEWSLETTERS` | No | `false` | Allow newsletters and digests to reach the agent |
-| `EMAIL_AUTO_REPLY_TRANSACTIONS` | No | `false` | Allow order, shipping, payment, invoice, and receipt notices |
-| `EMAIL_AUTO_REPLY_SECURITY` | No | `false` | Allow verification and security notices |
-| `EMAIL_AUTO_REPLY_SOCIAL` | No | `false` | Allow social-network notifications |
-| `EMAIL_AUTO_REPLY_CALENDAR` | No | `false` | Allow calendar invitations and reminders |
-| `EMAIL_AUTO_REPLY_REPORTS` | No | `false` | Allow recurring reports |
-| `EMAIL_FORCE_REPLY_KEYWORDS` | No | — | Must-reply keyword groups (`;` between groups, `+` between required terms) |
-| `EMAIL_NO_REPLY_KEYWORDS` | No | — | No-reply keyword groups; wins conflicts |
-| `EMAIL_REQUIRE_STRUCTURED_RESPONSE` | No | `true` | Block model output without a valid `need_response` decision |

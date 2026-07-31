@@ -1510,6 +1510,11 @@ export const en: Translations = {
       keywordConflictTitle: 'Conflicting keyword rule',
       keywordConflictDescription: group =>
         `"${group}" cannot be both must-reply and never-reply. Remove it from one list.`,
+      skipPatternsTitle: 'Skip regular expressions',
+      skipPatternsDescription: 'Matching messages stop before the Agent is called.',
+      skipPatternsPlaceholder: 'One regular expression per line',
+      skipPatternsSyntax: 'Patterns are case-insensitive and match the subject plus body.',
+      clearSkipPatterns: 'Clear skip regular expressions',
       decisionTitle: 'Agent decision',
       strictDecision: 'Require a structured reply decision',
       strictDecisionDescription: 'Only send when the model returns valid structured output with need_response: true.',
