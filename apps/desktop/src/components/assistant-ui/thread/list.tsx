@@ -189,6 +189,24 @@ export function liveTailStart(
   return Math.min(floor, Math.max(ceiling, start))
 }
 
+const TURN_TOP_OFFSET = 8
+
+export function scrollLatestTurnStartIntoView(viewport: HTMLElement): boolean {
+  const turns = viewport.querySelectorAll<HTMLElement>('[data-slot="aui_turn-pair"]')
+  const latestTurn = turns.item(turns.length - 1)
+
+  if (!latestTurn) {
+    return false
+  }
+
+  viewport.scrollTop = Math.max(
+    0,
+    viewport.scrollTop + latestTurn.getBoundingClientRect().top - viewport.getBoundingClientRect().top - TURN_TOP_OFFSET
+  )
+
+  return true
+}
+
 const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   clampToComposer,
   components,
@@ -209,6 +227,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   )
 
   const weightSignature = useAuiState(s => s.thread.messages.map(message => message.content?.length ?? 1).join(','))
+  const threadRunning = useAuiState(s => s.thread.isRunning)
 
   const { t } = useI18n()
   // Row structure is memoized on the STRUCTURAL signature only, so streaming
@@ -267,6 +286,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Session the settle loop last armed for, so a re-arm within the same load
   // is distinguishable from a switch to a different transcript.
   const settleKeyRef = useRef(sessionKey)
+  const runStartAnchorActiveRef = useRef(false)
+  const runStartAnchorFrameRef = useRef<number | null>(null)
 
   // Record where the view should land once a prepend has grown the content,
   // measured from the BOTTOM so the added height doesn't invalidate it. Only a
@@ -377,8 +398,91 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
   useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
   useEffect(() => () => endEditHold(), [endEditHold])
-  // New run → snap to the latest turn.
-  useAuiEvent('thread.runStart', () => void scrollToBottom())
+
+  const cancelRunStartAnchor = useCallback(() => {
+    runStartAnchorActiveRef.current = false
+
+    if (runStartAnchorFrameRef.current != null) {
+      cancelAnimationFrame(runStartAnchorFrameRef.current)
+      runStartAnchorFrameRef.current = null
+    }
+  }, [])
+
+  const revealLatestTurnStart = useCallback(() => {
+    const el = scrollRef.current
+
+    if (!el) {
+      return false
+    }
+
+    stopScroll()
+
+    return scrollLatestTurnStartIntoView(el)
+  }, [scrollRef, stopScroll])
+
+  useEffect(() => {
+    const el = scrollRef.current
+
+    if (!el) {
+      return
+    }
+
+    const cancelOnManualIntent = () => {
+      if (runStartAnchorActiveRef.current) {
+        cancelRunStartAnchor()
+      }
+    }
+
+    el.addEventListener('wheel', cancelOnManualIntent, { passive: true })
+    el.addEventListener('touchmove', cancelOnManualIntent, { passive: true })
+    el.addEventListener('pointerdown', cancelOnManualIntent, { passive: true })
+    el.addEventListener('keydown', cancelOnManualIntent)
+
+    return () => {
+      el.removeEventListener('wheel', cancelOnManualIntent)
+      el.removeEventListener('touchmove', cancelOnManualIntent)
+      el.removeEventListener('pointerdown', cancelOnManualIntent)
+      el.removeEventListener('keydown', cancelOnManualIntent)
+    }
+  }, [cancelRunStartAnchor, scrollRef])
+
+  // New run → reveal the START of the latest user/assistant turn, not the
+  // bottom of a long streamed reply. `thread.runStart` can fire before the
+  // assistant row is committed, so keep a short-lived anchor active until the
+  // structural signature or the next frame can reveal the row. Any manual
+  // scroll intent cancels the pending reveal before it can overwrite the user.
+  useAuiEvent('thread.runStart', () => {
+    cancelRunStartAnchor()
+    runStartAnchorActiveRef.current = true
+
+    if (revealLatestTurnStart()) {
+      cancelRunStartAnchor()
+
+      return
+    }
+
+    runStartAnchorFrameRef.current = requestAnimationFrame(() => {
+      runStartAnchorFrameRef.current = null
+
+      if (runStartAnchorActiveRef.current && revealLatestTurnStart()) {
+        cancelRunStartAnchor()
+      }
+    })
+  })
+
+  useLayoutEffect(() => {
+    if (!threadRunning) {
+      cancelRunStartAnchor()
+
+      return
+    }
+
+    if (runStartAnchorActiveRef.current && revealLatestTurnStart()) {
+      cancelRunStartAnchor()
+    }
+  }, [cancelRunStartAnchor, revealLatestTurnStart, structuralSignature, threadRunning])
+
+  useEffect(() => () => cancelRunStartAnchor(), [cancelRunStartAnchor])
 
   // Reset the cap and pin to bottom on mount + every session switch (messages
   // swap in place on a long-lived runtime, so sessionKey is the only signal).

@@ -6,7 +6,8 @@ import {
   LIVE_TAIL_MIN_GROUPS,
   LIVE_TAIL_PARTS,
   liveTailStart,
-  type MessageGroup
+  type MessageGroup,
+  scrollLatestTurnStartIntoView
 } from './list'
 
 // Signature rows are `${index}:${id}:${role}:${weight}` (see the useAuiState
@@ -162,5 +163,32 @@ describe('liveTailStart', () => {
 
       expect(rendered(liveTailStart(groups))).toBeLessThanOrEqual(rendered(oldStart))
     }
+  })
+})
+
+describe('scrollLatestTurnStartIntoView', () => {
+  it('scrolls the viewport to the start of the newest user/assistant turn instead of the bottom', () => {
+    const viewport = document.createElement('div')
+    const oldTurn = document.createElement('div')
+    const latestTurn = document.createElement('div')
+
+    oldTurn.setAttribute('data-slot', 'aui_turn-pair')
+    latestTurn.setAttribute('data-slot', 'aui_turn-pair')
+    viewport.append(oldTurn, latestTurn)
+    viewport.scrollTop = 500
+
+    viewport.getBoundingClientRect = () => ({ top: 100 }) as DOMRect
+    latestTurn.getBoundingClientRect = () => ({ top: 420 }) as DOMRect
+
+    expect(scrollLatestTurnStartIntoView(viewport)).toBe(true)
+    expect(viewport.scrollTop).toBe(812)
+  })
+
+  it('does nothing when no turn container has rendered yet', () => {
+    const viewport = document.createElement('div')
+    viewport.scrollTop = 250
+
+    expect(scrollLatestTurnStartIntoView(viewport)).toBe(false)
+    expect(viewport.scrollTop).toBe(250)
   })
 })
