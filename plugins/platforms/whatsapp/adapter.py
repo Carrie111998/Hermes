@@ -1337,7 +1337,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             import aiohttp
 
             async with self._http_session.post(
-                f"http://127.0.0.1:{self._bridge_port}/read",
+                f"{self._bridge_url}/read",
                 json={"key": key},
                 timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
