@@ -60,9 +60,9 @@ from gateway.platforms.base import (
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import render_blocks, render_block_batches, sanitize_blocks
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import render_blocks, render_block_batches, sanitize_blocks  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -2536,7 +2536,36 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            #
+            # A rich render can legitimately need MORE than Slack's 50-block
+            # ceiling (a long response full of headers/lists/tables — common now
+            # that rich_blocks defaults ON). Rather than truncate or degrade to
+            # plain text, ``_maybe_block_batches`` splits the render into
+            # consecutive <= 50-block batches; each batch is posted as its own
+            # ``chat.postMessage`` in the same thread below, preserving every
+            # block. In the overwhelmingly common case this is a single batch
+            # and behaves exactly like the old single-``blocks`` path.
+            block_batches = (
+                self._maybe_block_batches(content) if len(chunks) == 1 else None
+            )
+
+            client = self._get_client(chat_id, team_id=team_id)
+
+            async def _post(kwargs: dict):
+                """Post one message, retrying without blocks if Slack rejects them."""
+                try:
+                    return await client.chat_postMessage(**kwargs)
+                except Exception as e:
+                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
+                        retry_kwargs = dict(kwargs)
+                        retry_kwargs.pop("blocks", None)
+                        logger.info(
+                            "[Slack] Block Kit payload rejected; retrying send "
+                            "without blocks: %s",
+                            e,
+                        )
+                        return await client.chat_postMessage(**retry_kwargs)
+                    raise
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -2544,31 +2573,44 @@ class SlackAdapter(BasePlatformAdapter):
                     "text": chunk,
                     "mrkdwn": True,
                 }
-                if blocks and i == 0:
-                    kwargs["blocks"] = blocks
+                # The first (and, for a single-chunk message, only) chunk
+                # carries the first block batch. Any further batches are posted
+                # as continuation messages after this loop, in the same thread.
+                if block_batches and i == 0:
+                    kwargs["blocks"] = block_batches[0]
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
                     # Only broadcast the first chunk of the first reply
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
-                try:
-                    last_result = await self._get_client(
-                        chat_id, team_id=team_id
-                    ).chat_postMessage(**kwargs)
-                except Exception as e:
-                    if kwargs.get("blocks") and self._is_block_payload_rejection(e):
-                        retry_kwargs = dict(kwargs)
-                        retry_kwargs.pop("blocks", None)
-                        logger.info(
-                            "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
-                            e,
-                        )
-                        last_result = await self._get_client(
-                            chat_id, team_id=team_id
-                        ).chat_postMessage(**retry_kwargs)
-                    else:
-                        raise
+                last_result = await _post(kwargs)
+
+            # Post any remaining Block Kit batches (>50-block renders) as
+            # continuation messages threaded under the first. The first message
+            # already carried the full ``text`` fallback and any broadcast/
+            # thread semantics; continuation posts stay inside the thread, never
+            # broadcast, and carry a short continuation marker as their ``text``
+            # fallback (the human-readable content is the blocks themselves; the
+            # full plain-text was already delivered on message #1).
+            if block_batches and len(block_batches) > 1 and len(chunks) == 1:
+                # Thread continuation posts under the first message's ts when
+                # this send was not already a threaded reply, so the batches
+                # stay grouped instead of scattering as sibling top-level posts.
+                continuation_thread_ts = thread_ts or (
+                    last_result.get("ts") if last_result else None
+                )
+                total = len(block_batches)
+                for idx, batch in enumerate(block_batches[1:], start=2):
+                    cont_kwargs = {
+                        "channel": chat_id,
+                        "text": f"(continued {idx}/{total})",
+                        "mrkdwn": True,
+                        "blocks": batch,
+                    }
+                    if continuation_thread_ts:
+                        cont_kwargs["thread_ts"] = continuation_thread_ts
+                    last_result = await _post(cont_kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -3421,16 +3463,19 @@ class SlackAdapter(BasePlatformAdapter):
     def _rich_blocks_enabled(self) -> bool:
         """Whether to render outbound agent messages as Slack Block Kit blocks.
 
-        Opt-in via ``platforms.slack.extra.rich_blocks`` (config.yaml). Default
-        off: messages continue to go out as flat mrkdwn ``text``. Enabling it
-        renders the *final* agent message with real structural primitives
-        (headers, dividers, true nested lists via ``rich_text``, and native
-        Block Kit ``table`` blocks with per-column alignment); over-limit
-        tables fall back to aligned monospace.
+        Default ON: the *final* agent message is rendered with real structural
+        primitives (headers, dividers, true nested lists via ``rich_text``, and
+        native Block Kit ``table`` blocks with per-column alignment); over-limit
+        tables fall back to aligned monospace. A plain ``text`` fallback is
+        always sent alongside the blocks, so clients that can't render Block Kit
+        still get the message.
+
+        Opt OUT by setting ``slack.extra.rich_blocks: false`` in config.yaml to
+        revert to flat mrkdwn ``text`` for all outbound messages.
         """
         raw = self.config.extra.get("rich_blocks")
         if raw is None:
-            return False
+            return True
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
     def _markdown_blocks_enabled(self) -> bool:
@@ -3546,6 +3591,60 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception:  # pragma: no cover - renderer already guards itself
             logger.debug("[Slack] block render failed; using plain text", exc_info=True)
             return None
+
+    def _maybe_block_batches(self, content: str) -> Optional[List[list]]:
+        """Render ``content`` to one-or-more <= 50-block Block Kit batches.
+
+        Loss-free counterpart to :meth:`_maybe_blocks`.  Where ``_maybe_blocks``
+        collapses to ``None`` (plain-text fallback) as soon as a render needs
+        more than Slack's 50-block ceiling, this splits the full render into
+        consecutive <= 50-block batches so the send path can post each batch as
+        its own ``chat.postMessage`` in the same thread — the full Block Kit
+        rendering survives instead of truncating or degrading to text.
+
+        Returns a list of sanitized block batches (usually length 1), or
+        ``None`` when both block modes are disabled or the renderer declines.
+
+        Feedback controls (when enabled) are appended exactly ONCE, to the
+        LAST batch — they belong at the end of the response, and repeating them
+        on every batch would spray duplicate buttons through the thread and
+        risk pushing that final batch over the 50-block cap on its own.
+        """
+        batches: Optional[List[list]] = None
+        if self._markdown_blocks_enabled():
+            md_blocks = self._markdown_block_payload(content)
+            if md_blocks:
+                # The ``markdown`` block path is a single small block; it never
+                # exceeds the cap, so a single batch is correct.
+                batches = [md_blocks]
+        if batches is None:
+            if not self._rich_blocks_enabled():
+                return None
+            try:
+                batches = render_block_batches(content, mrkdwn_fn=self.format_message)
+            except Exception:  # pragma: no cover - renderer already guards itself
+                logger.debug(
+                    "[Slack] block render failed; using plain text", exc_info=True
+                )
+                return None
+        if not batches:
+            return None
+
+        # Feedback controls ride the LAST batch only (see docstring). Appending
+        # may bump a full 50-block last batch to 51; sanitize_blocks would then
+        # reject the whole batch. Guard by spilling into a fresh trailing batch.
+        if self._feedback_buttons_enabled():
+            last = batches[-1]
+            appended = self._append_feedback_block(last)
+            if appended is not None and len(appended) > len(last):
+                if len(appended) > 50:
+                    batches = [*batches[:-1], last, [self._feedback_block()]]
+                else:
+                    batches = [*batches[:-1], appended]
+
+        sanitized = [sanitize_blocks(batch) for batch in batches]
+        out = [b for b in sanitized if b]
+        return out or None
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn format.

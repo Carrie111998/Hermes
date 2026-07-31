@@ -410,14 +410,18 @@ platforms:
       # Only the first chunk of the first reply is broadcast.
       reply_broadcast: false
 
-      # Render agent messages as Slack Block Kit blocks (default: false).
-      # When true, the final agent message is sent with structured blocks —
-      # section headers, dividers, true nested lists (via rich_text), and
-      # native Block Kit tables — instead of flat mrkdwn text. A plain-text
+      # Render agent messages as Slack Block Kit blocks (default: true).
+      # The final agent message is sent with structured blocks — section
+      # headers, dividers, true nested lists (via rich_text), and native
+      # Block Kit tables — instead of flat mrkdwn text. A plain-text
       # fallback is always sent alongside for notifications/accessibility.
       # Tables exceeding Slack's limits (100 rows / 20 cols / 10k chars)
-      # gracefully fall back to aligned monospace.
-      rich_blocks: false
+      # gracefully fall back to aligned monospace. A response that renders
+      # to more than Slack's 50-block ceiling is split loss-free across
+      # multiple threaded posts (batches of <= 50 blocks) rather than being
+      # truncated. Set false to opt out and send flat mrkdwn text for all
+      # outbound messages.
+      rich_blocks: true
 
       # Append Slack-native feedback controls to final Block Kit replies.
       # Requires rich_blocks: true. Default: false.
@@ -452,7 +456,7 @@ platforms:
 | `platforms.slack.reply_to_mode` | `"first"` | Threading mode for multi-part messages: `"off"`, `"first"`, or `"all"` |
 | `platforms.slack.extra.reply_in_thread` | `true` | When `false`, channel messages get direct replies instead of threads. Messages inside existing threads still reply in-thread. |
 | `platforms.slack.extra.reply_broadcast` | `false` | When `true`, thread replies are also posted to the main channel. Only the first chunk is broadcast. |
-| `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
+| `platforms.slack.extra.rich_blocks` | `true` | Agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. Responses that exceed Slack's 50-block ceiling are split loss-free across multiple threaded posts (batches of ≤ 50 blocks) instead of being truncated. No app reinstall required — it's a send-side change only. Set `false` to revert to flat mrkdwn text. |
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
 | `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |

@@ -1,8 +1,8 @@
 """Integration tests: SlackAdapter wiring of Block Kit into send paths.
 
-Verifies the opt-in behaviour contract:
-  * rich_blocks off (default)  => no ``blocks`` kwarg, plain ``text`` only
-  * rich_blocks on             => ``blocks`` present AND ``text`` fallback set
+Verifies the behaviour contract:
+  * rich_blocks unset (default ON) => ``blocks`` present AND ``text`` fallback set
+  * rich_blocks: false             => no ``blocks`` kwarg, plain ``text`` only
   * edit_message: blocks only on finalize (streaming edits stay plain)
   * multi-chunk (>39k) messages fall back to plain text
 """
@@ -59,8 +59,18 @@ def _slack_connection_key():
 
 class TestSendMessageBlocks:
     @pytest.mark.asyncio
-    async def test_disabled_by_default_no_blocks(self):
+    async def test_enabled_by_default_emits_blocks(self):
+        # rich_blocks unset -> default ON: blocks present, text fallback kept
         adapter, client = _make_adapter()
+        await adapter.send("C1", RICH_MD)
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert "blocks" in kwargs and kwargs["blocks"]
+        assert kwargs["text"]  # plain text fallback still sent
+
+    @pytest.mark.asyncio
+    async def test_explicit_opt_out_no_blocks(self):
+        # rich_blocks: false -> revert to flat mrkdwn text, no blocks
+        adapter, client = _make_adapter({"rich_blocks": False})
         await adapter.send("C1", RICH_MD)
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
@@ -68,13 +78,19 @@ class TestSendMessageBlocks:
 
 
     @pytest.mark.asyncio
-    async def test_enabled_but_unrenderable_falls_back_to_text(self):
-        # 60 dividers -> renderer returns None -> no blocks kwarg, text stands
+    async def test_over_cap_render_batches_instead_of_falling_back_to_text(self):
+        # 60 dividers -> 60 blocks (> 50). This used to collapse to plain text
+        # (renderer returned None over the cap). It now batches loss-free: the
+        # blocks are split across multiple posts instead of being dropped.
         adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "111.222"}, {"ts": "111.999"}]
+        )
         await adapter.send("C1", "\n\n".join(["---"] * 60))
-        kwargs = client.chat_postMessage.await_args.kwargs
-        assert "blocks" not in kwargs
-        assert kwargs["text"]
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) == 2
+        assert all(c.kwargs.get("blocks") for c in calls)
+        assert all(c.kwargs["text"] for c in calls)
 
 
     @pytest.mark.asyncio
@@ -158,7 +174,9 @@ class TestMarkdownBlockMode:
 
     @pytest.mark.asyncio
     async def test_disabled_by_default(self):
-        adapter, client = _make_adapter()
+        # Isolate markdown_blocks: turn rich_blocks off so any block that
+        # appears would have to come from markdown_blocks mode.
+        adapter, client = _make_adapter({"rich_blocks": False})
         await adapter.send("C1", RICH_TABLE_MD)
         kwargs = client.chat_postMessage.await_args.kwargs
         assert "blocks" not in kwargs
@@ -183,5 +201,139 @@ class TestMarkdownBlockMode:
         kwargs = client.chat_update.await_args.kwargs
         assert kwargs["blocks"][0]["type"] == "markdown"
         assert kwargs["blocks"][0]["text"] == RICH_TABLE_MD
+
+
+# ---------------------------------------------------------------------------
+# Loss-free batching — renders over Slack's 50-block ceiling (#batch-over-50)
+# ---------------------------------------------------------------------------
+
+
+# 60 dividers render to 60 ``divider`` blocks (> MAX_BLOCKS=50). Before the
+# batching fix this collapsed to plain text (rich_blocks) or silently truncated
+# at out[:50] (sanitize_blocks). Now it must post across multiple messages.
+OVER_CAP_MD = "\n\n".join(["---"] * 60)
+
+
+class TestSendBlockBatchingOver50:
+    @pytest.mark.asyncio
+    async def test_over_cap_render_posts_multiple_messages_no_block_loss(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "111.222"}, {"ts": "111.999"}]
+        )
+
+        result = await adapter.send("C1", OVER_CAP_MD)
+
+        assert result.success is True
+        # 60 blocks -> 50 + 10 -> two chat.postMessage calls
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) == 2
+
+        first, second = calls[0].kwargs, calls[1].kwargs
+        # every batch present, none over the 50-block cap
+        assert len(first["blocks"]) == 50
+        assert len(second["blocks"]) == 10
+        assert all(len(c.kwargs["blocks"]) <= 50 for c in calls)
+        # no block loss: 50 + 10 == 60 rendered blocks
+        total = sum(len(c.kwargs["blocks"]) for c in calls)
+        assert total == 60
+        # every message carries a text fallback
+        assert first["text"]
+        assert second["text"]
+
+    @pytest.mark.asyncio
+    async def test_continuation_batches_thread_under_first_message(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "111.222"}, {"ts": "111.999"}]
+        )
+
+        # Not itself a threaded reply -> continuation threads under msg #1 ts.
+        await adapter.send("C1", OVER_CAP_MD)
+
+        calls = client.chat_postMessage.await_args_list
+        first, second = calls[0].kwargs, calls[1].kwargs
+        # first message is a top-level post (no thread_ts), no broadcast
+        assert "thread_ts" not in first
+        assert "reply_broadcast" not in first
+        # continuation is threaded under the first message and never broadcasts
+        assert second["thread_ts"] == "111.222"
+        assert "reply_broadcast" not in second
+
+    @pytest.mark.asyncio
+    async def test_over_cap_reply_keeps_thread_and_broadcasts_only_first(self):
+        adapter, client = _make_adapter(
+            {"rich_blocks": True, "reply_broadcast": True}
+        )
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "111.222"}, {"ts": "111.999"}]
+        )
+
+        # reply_to makes this a threaded reply; broadcast only on the first msg.
+        await adapter.send("C1", OVER_CAP_MD, reply_to="900.000")
+
+        calls = client.chat_postMessage.await_args_list
+        first, second = calls[0].kwargs, calls[1].kwargs
+        assert first["thread_ts"] == "900.000"
+        assert first.get("reply_broadcast") is True
+        # all batches stay in the same thread; continuation never broadcasts
+        assert second["thread_ts"] == "900.000"
+        assert "reply_broadcast" not in second
+
+    @pytest.mark.asyncio
+    async def test_feedback_block_appears_once_on_last_batch(self):
+        adapter, client = _make_adapter(
+            {"rich_blocks": True, "feedback_buttons": True}
+        )
+        client.chat_postMessage = AsyncMock(
+            side_effect=[{"ts": "111.222"}, {"ts": "111.999"}]
+        )
+
+        await adapter.send("C1", OVER_CAP_MD)
+
+        calls = client.chat_postMessage.await_args_list
+        all_blocks = [blk for c in calls for blk in c.kwargs["blocks"]]
+        feedback = [
+            b for b in all_blocks if b.get("type") == "context_actions"
+        ]
+        # feedback controls appear exactly once, across all batches
+        assert len(feedback) == 1
+        # ...and specifically on the LAST batch
+        assert calls[-1].kwargs["blocks"][-1]["type"] == "context_actions"
+
+    @pytest.mark.asyncio
+    async def test_block_rejection_retry_is_per_batch(self):
+        adapter, client = _make_adapter({"rich_blocks": True})
+        # First batch rejected -> resend without blocks; second batch fine.
+        client.chat_postMessage = AsyncMock(
+            side_effect=[
+                SlackRejectedBlocks("invalid_blocks"),
+                {"ts": "111.222"},
+                {"ts": "111.999"},
+            ]
+        )
+
+        result = await adapter.send("C1", OVER_CAP_MD)
+
+        assert result.success is True
+        # 3 calls: batch1 (reject) -> batch1 retry (no blocks) -> batch2
+        calls = client.chat_postMessage.await_args_list
+        assert len(calls) == 3
+        # the retry dropped blocks but kept the text fallback
+        assert "blocks" not in calls[1].kwargs
+        assert calls[1].kwargs["text"]
+        # the second batch still carries its blocks
+        assert calls[2].kwargs["blocks"]
+
+    @pytest.mark.asyncio
+    async def test_within_cap_still_single_post_with_blocks(self):
+        # Regression: the common single-batch case behaves exactly as before.
+        adapter, client = _make_adapter({"rich_blocks": True})
+        await adapter.send("C1", RICH_MD)
+        assert client.chat_postMessage.await_count == 1
+        kwargs = client.chat_postMessage.await_args.kwargs
+        assert kwargs["blocks"]
+        assert kwargs["text"]
+
 
 

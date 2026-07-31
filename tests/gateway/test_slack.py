@@ -2182,11 +2182,16 @@ class TestSendTyping:
         )
 
         assert result.success
-        team_client.chat_update.assert_awaited_once_with(
-            channel="D123",
-            ts="reply_ts",
-            text="done",
-        )
+        # rich_blocks defaults ON, so a finalize edit now also carries a
+        # ``blocks`` payload alongside the ``text`` fallback. This test asserts
+        # workspace-client *routing* (the per-team client is used, not the
+        # default app client), so match on the routed args without pinning the
+        # blocks kwarg.
+        team_client.chat_update.assert_awaited_once()
+        _edit_kwargs = team_client.chat_update.await_args.kwargs
+        assert _edit_kwargs["channel"] == "D123"
+        assert _edit_kwargs["ts"] == "reply_ts"
+        assert _edit_kwargs["text"] == "done"
         team_client.assistant_threads_setStatus.assert_awaited_once_with(
             channel_id="D123",
             thread_ts="parent_ts",

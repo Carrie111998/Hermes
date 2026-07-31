@@ -742,7 +742,16 @@ PLATFORM_HINTS = {
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "
-        "in markdown format ![alt](url) and they will be uploaded as attachments."
+        "in markdown format ![alt](url) and they will be uploaded as attachments. "
+        "IMPORTANT — table formatting on Slack: Slack renders markdown "
+        "tables natively. ALWAYS emit tables as standard markdown pipe tables, e.g.\n"
+        "| Header A | Header B |\n"
+        "|----------|----------|\n"
+        "| value 1  | value 2  |\n"
+        "NEVER pre-render tables as ASCII art with box-drawing characters "
+        "(┌ ┐ ├ ┤ + etc.), and do NOT wrap markdown tables in triple-backtick "
+        "code fences. Just emit the raw markdown table inline; it will be "
+        "rendered natively. This applies even for large or complex tables."
     ),
     "signal": (
         "You are on a text messaging communication platform, Signal. "

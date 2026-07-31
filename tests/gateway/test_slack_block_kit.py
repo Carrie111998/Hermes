@@ -4,6 +4,8 @@ from plugins.platforms.slack.block_kit import (
     MAX_BLOCKS,
     MAX_HEADER_TEXT,
     MAX_SECTION_TEXT,
+    batch_blocks,
+    render_block_batches,
     render_blocks,
     sanitize_blocks,
 )
@@ -112,6 +114,50 @@ class TestLimits:
         # 60 dividers => 60 blocks > MAX_BLOCKS => decline (caller uses text)
         md = "\n\n".join(["---"] * (MAX_BLOCKS + 10))
         assert render_blocks(md) is None
+
+
+class TestBatching:
+    """Loss-free batching path: >50-block renders split into <=50 batches."""
+
+    def test_batch_blocks_splits_on_cap_no_loss(self):
+        blocks = [{"type": "divider"} for _ in range(125)]
+        batches = batch_blocks(blocks)
+        # 125 -> 50 + 50 + 25, order preserved, nothing dropped
+        assert [len(b) for b in batches] == [50, 50, 25]
+        assert sum(len(b) for b in batches) == 125
+        flat = [blk for batch in batches for blk in batch]
+        assert flat == blocks
+        assert all(len(b) <= MAX_BLOCKS for b in batches)
+
+    def test_batch_blocks_within_cap_single_batch(self):
+        blocks = [{"type": "divider"} for _ in range(10)]
+        assert batch_blocks(blocks) == [blocks]
+
+    def test_batch_blocks_empty(self):
+        assert batch_blocks(None) == []
+        assert batch_blocks([]) == []
+
+    def test_render_block_batches_over_cap_preserves_all_blocks(self):
+        # 60 dividers -> render_blocks() declines (None), but render_block_batches
+        # keeps every block by splitting into <=50-block batches.
+        md = "\n\n".join(["---"] * (MAX_BLOCKS + 10))
+        assert render_blocks(md) is None
+        batches = render_block_batches(md)
+        assert batches is not None
+        assert len(batches) == 2
+        assert all(len(b) <= MAX_BLOCKS for b in batches)
+        assert sum(len(b) for b in batches) == MAX_BLOCKS + 10
+
+    def test_render_block_batches_within_cap_single_batch(self):
+        batches = render_block_batches("# Title\n\nbody")
+        assert batches is not None
+        assert len(batches) == 1
+        assert len(batches[0]) <= MAX_BLOCKS
+
+    def test_render_block_batches_empty_returns_none(self):
+        assert render_block_batches("") is None
+        assert render_block_batches("   \n ") is None
+
 
 
 class TestEmptyContentGuards:

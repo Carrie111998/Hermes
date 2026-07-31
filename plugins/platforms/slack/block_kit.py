@@ -365,22 +365,22 @@ def _render_table(rows: List[str]) -> str:
 # ----------------------------------------------------------------------------
 
 
-def render_blocks(
+def _render_all_blocks(
     markdown: str,
     mrkdwn_fn=None,
 ) -> Optional[List[Block]]:
-    """Convert agent markdown to a Slack Block Kit ``blocks`` list.
+    """Render agent markdown to a Block Kit list WITHOUT the 50-block clamp.
 
-    Args:
-        markdown: The agent's response text (standard markdown).
-        mrkdwn_fn: Optional callable converting a markdown paragraph to Slack
-            mrkdwn for ``section`` blocks (the adapter passes
-            ``format_message``).  When ``None``, the raw paragraph text is used.
+    This is the raw renderer: it produces however many blocks the content
+    needs, even past Slack's 50-block ceiling.  Callers decide how to handle
+    an over-cap result:
 
-    Returns:
-        A list of Block Kit block dicts, or ``None`` when the content is empty,
-        exceeds Slack's structural limits, or hits an unexpected shape — the
-        caller then falls back to the flat ``text`` payload.  Never raises.
+    * :func:`render_blocks` clamps to ``None`` (legacy single-post behaviour —
+      the caller falls back to plain text).
+    * :func:`render_block_batches` splits the list into <= 50-block batches for
+      the loss-free multi-post send path.
+
+    Returns ``None`` for empty content or an unexpected shape.  Never raises.
     """
     if not markdown or not markdown.strip():
         return None
@@ -525,14 +525,85 @@ def render_blocks(
 
         if not blocks:
             return None
-        if len(blocks) > MAX_BLOCKS:
-            # Too structurally complex to express safely — let the caller fall
-            # back to plain text rather than truncating and losing content.
-            return None
         return blocks
     except Exception:
         # Never let a rendering bug drop a message.
         return None
+
+
+def render_blocks(
+    markdown: str,
+    mrkdwn_fn=None,
+) -> Optional[List[Block]]:
+    """Convert agent markdown to a Slack Block Kit ``blocks`` list.
+
+    Args:
+        markdown: The agent's response text (standard markdown).
+        mrkdwn_fn: Optional callable converting a markdown paragraph to Slack
+            mrkdwn for ``section`` blocks (the adapter passes
+            ``format_message``).  When ``None``, the raw paragraph text is used.
+
+    Returns:
+        A list of Block Kit block dicts, or ``None`` when the content is empty,
+        exceeds Slack's 50-block structural limit, or hits an unexpected shape
+        — the caller then falls back to the flat ``text`` payload (or, for the
+        batching send path, to :func:`render_block_batches`).  Never raises.
+
+    This is the single-post entry point: a render that would need more than
+    :data:`MAX_BLOCKS` blocks returns ``None`` here so a caller that can only
+    make one ``chat.postMessage`` degrades to plain text rather than truncating.
+    Callers that can post multiple messages should use
+    :func:`render_block_batches` instead — it preserves every block.
+    """
+    blocks = _render_all_blocks(markdown, mrkdwn_fn=mrkdwn_fn)
+    if blocks is None:
+        return None
+    if len(blocks) > MAX_BLOCKS:
+        # Too structurally complex to express in one post — let the caller fall
+        # back to plain text rather than truncating and losing content.
+        return None
+    return blocks
+
+
+def batch_blocks(
+    blocks: Optional[List[Block]], max_blocks: int = MAX_BLOCKS
+) -> List[List[Block]]:
+    """Split ``blocks`` into consecutive batches of at most ``max_blocks``.
+
+    Order is preserved and no block is dropped: batch *k* holds blocks
+    ``[k*max_blocks : (k+1)*max_blocks]``.  A list already within the cap
+    returns as a single batch.  Empty / ``None`` input returns ``[]``.
+
+    This is the primitive behind the loss-free send path — the adapter posts
+    each returned batch as its own ``chat.postMessage`` in one thread, so a
+    message that renders to more than 50 blocks keeps its full Block Kit
+    rendering across multiple posts instead of truncating or degrading to text.
+    """
+    if not blocks:
+        return []
+    step = max(int(max_blocks), 1)
+    return [blocks[i : i + step] for i in range(0, len(blocks), step)]
+
+
+def render_block_batches(
+    markdown: str,
+    mrkdwn_fn=None,
+    max_blocks: int = MAX_BLOCKS,
+) -> Optional[List[List[Block]]]:
+    """Render agent markdown to <= ``max_blocks``-sized Block Kit batches.
+
+    Loss-free counterpart to :func:`render_blocks`: instead of returning
+    ``None`` when the content needs more than :data:`MAX_BLOCKS` blocks, the
+    full block list is split into consecutive batches (see :func:`batch_blocks`)
+    the adapter can post as separate messages in the same thread.
+
+    Returns a list of block-batches (usually one), or ``None`` when the content
+    is empty or the renderer declines.  Never raises.
+    """
+    blocks = _render_all_blocks(markdown, mrkdwn_fn=mrkdwn_fn)
+    if not blocks:
+        return None
+    return batch_blocks(blocks, max_blocks=max_blocks)
 
 
 def _split_text(text: str, limit: int) -> List[str]:
@@ -682,7 +753,15 @@ def sanitize_blocks(blocks: Optional[List[Block]]) -> Optional[List[Block]]:
 
         if not out:
             return None
-        return out[:MAX_BLOCKS]
+        if len(out) > MAX_BLOCKS:
+            # Over Slack's 50-block ceiling. Silently truncating with
+            # ``out[:MAX_BLOCKS]`` drops the tail and cuts the message off
+            # mid-content. Return None instead so the caller sends the full
+            # plain-``text`` fallback (lossless) — matching render_blocks'
+            # own >50-block behaviour. The batching send path (adapter) is
+            # the loss-free upgrade that keeps blocks across multiple posts.
+            return None
+        return out
     except Exception:
         # A sanitizer bug must never take down the send path.
         return None
