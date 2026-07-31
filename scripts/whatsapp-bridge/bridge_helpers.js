@@ -532,6 +532,14 @@ export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, file
   }
 }
 
+export async function resolveWaVersion({ fetchLiveVersion, fetchBaileysVersion }) {
+  const waWeb = await fetchLiveVersion();
+  if (waWeb.isLatest && !waWeb.error) {
+    return waWeb.version;
+  }
+  return (await fetchBaileysVersion()).version;
+}
+
 export function buildPollPayload({ question, options, selectableCount = 1 }) {
   const cleanQuestion = String(question || '').trim();
   const cleanOptions = (options || []).map(option => String(option || '').trim()).filter(Boolean);

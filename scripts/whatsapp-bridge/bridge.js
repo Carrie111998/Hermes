@@ -44,6 +44,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolveWaVersion,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -393,17 +394,12 @@ function emitPairEvent(event) {
   } catch {}
 }
 
-async function resolveWaVersion() {
-  const waWeb = await fetchLatestWaWebVersion();
-  if (waWeb.isLatest && !waWeb.error) {
-    return waWeb.version;
-  }
-  return (await fetchLatestBaileysVersion()).version;
-}
-
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const version = await resolveWaVersion();
+  const version = await resolveWaVersion({
+    fetchLiveVersion: fetchLatestWaWebVersion,
+    fetchBaileysVersion: fetchLatestBaileysVersion,
+  });
 
   sock = makeWASocket({
     version,

@@ -22,6 +22,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolveWaVersion,
 } from './bridge_helpers.js';
 
 // -- inbound read receipts ------------------------------------------------
@@ -409,6 +410,37 @@ import {
   assert.equal(event.body, 'see attached\n[document could not be downloaded]');
   assert.equal(event.mediaUrls.length, 0);
   console.log('  ✓ captioned failed download keeps caption and appends note');
+}
+
+// -- resolveWaVersion (live-success and Baileys-fallback) ------------------
+{
+  const liveVersion = [2, 3000, 1015901307];
+  const version = await resolveWaVersion({
+    fetchLiveVersion: async () => ({ version: liveVersion, isLatest: true, error: null }),
+    fetchBaileysVersion: async () => { throw new Error('should not be called'); },
+  });
+  assert.deepEqual(version, liveVersion);
+  console.log('  ✓ resolveWaVersion returns live WhatsApp Web version when isLatest');
+}
+
+{
+  const baileysVersion = [2, 2413, 1];
+  const version = await resolveWaVersion({
+    fetchLiveVersion: async () => ({ version: [2, 0, 0], isLatest: false, error: null }),
+    fetchBaileysVersion: async () => ({ version: baileysVersion }),
+  });
+  assert.deepEqual(version, baileysVersion);
+  console.log('  ✓ resolveWaVersion falls back to Baileys version when isLatest is false');
+}
+
+{
+  const baileysVersion = [2, 2413, 2];
+  const version = await resolveWaVersion({
+    fetchLiveVersion: async () => ({ version: null, isLatest: true, error: 'network timeout' }),
+    fetchBaileysVersion: async () => ({ version: baileysVersion }),
+  });
+  assert.deepEqual(version, baileysVersion);
+  console.log('  ✓ resolveWaVersion falls back to Baileys version when live fetch has error');
 }
 
 console.log('\n✅ All WhatsApp native bridge helper tests passed.');
