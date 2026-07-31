@@ -619,6 +619,15 @@ class SessionManager:
             for name, cfg in (config.get("mcp_servers") or {}).items()
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
+        # ACP clients (IntelliJ plugin, Zed, etc.) register MCP servers at
+        # session/new — those never appear in config.yaml. Union them in so
+        # enabled_toolsets doesn't silently drop live registrations.
+        try:
+            from tools.mcp_tool import get_registered_mcp_server_names
+            live_mcp_servers = set(get_registered_mcp_server_names())
+        except Exception:
+            live_mcp_servers = set()
+        configured_mcp_servers = sorted(set(configured_mcp_servers) | live_mcp_servers)
 
         kwargs = {
             "platform": "acp",

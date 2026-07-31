@@ -111,6 +111,225 @@ class TestCreateSession:
         assert state.agent.session_cwd == "/tmp/project"
 
 
+class TestMakeAgentMcpServers:
+    """Regression for #42719 (agent-rebuild gap): when ``_make_agent`` runs
+    WITHOUT a following ``_register_session_mcp_servers`` call — i.e.
+    ``fork_session``, ``_restore``, or a model-switch rebuild — it must still
+    include MCP servers that are live in the process-wide registry but absent
+    from config.yaml.
+
+    Note this is NOT the initial ``session/new`` cold-start path: there,
+    ``acp_adapter/server.py::new_session`` calls
+    ``session_manager.create_session`` (which runs ``_make_agent`` while the
+    registry is still empty) and only THEN calls
+    ``_register_session_mcp_servers``, which directly overwrites
+    ``state.agent.tools`` / ``enabled_toolsets`` on the same agent object with
+    the MCP-expanded set before any prompt is served. That path was already
+    correct before this fix. The bug is specifically that a *second*
+    ``_make_agent`` call for the same or a different session — triggered by
+    ``fork_session``, ``_restore`` (process restart / editor reconnect), or a
+    model switch — rebuilds the agent from config.yaml alone and drops any
+    server that was only ever registered live via ``session/new``."""
+
+    def _patch_make_agent_env(self, monkeypatch, config_servers, live_servers):
+        """Stub the heavy bits of _make_agent and return the kwargs the
+        FakeAgent would have been constructed with."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "acp_adapter.session.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": config_servers,
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": config_servers,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "openai_chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        monkeypatch.setattr(
+            "tools.mcp_tool.get_registered_mcp_server_names",
+            lambda: set(live_servers),
+        )
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+        return state.agent.kwargs
+
+    def test_make_agent_includes_config_mcp_servers(self, monkeypatch):
+        """Baseline: config.yaml servers alone still work (no regression)."""
+        kwargs = self._patch_make_agent_env(
+            monkeypatch,
+            config_servers={"demo-search": {"command": "/bin/true", "args": []}},
+            live_servers=set(),
+        )
+        assert "mcp-demo-search" in kwargs["enabled_toolsets"]
+
+    def test_make_agent_includes_live_mcp_servers(self, monkeypatch):
+        """A server that's live in the process-wide registry but absent from
+        config.yaml must still appear in enabled_toolsets when _make_agent
+        runs directly (e.g. via fork_session/_restore, not the session/new
+        cold-start path which patches tools on afterward regardless)."""
+        kwargs = self._patch_make_agent_env(
+            monkeypatch,
+            config_servers={},
+            live_servers={"demo-store"},
+        )
+        assert "mcp-demo-store" in kwargs["enabled_toolsets"]
+
+    def test_make_agent_unions_config_and_live_mcp_servers(self, monkeypatch):
+        kwargs = self._patch_make_agent_env(
+            monkeypatch,
+            config_servers={"demo-search": {"command": "/bin/true", "args": []}},
+            live_servers={"demo-store"},
+        )
+        enabled = set(kwargs["enabled_toolsets"])
+        assert "mcp-demo-search" in enabled
+        assert "mcp-demo-store" in enabled
+        # And the ACP base toolset is still there.
+        assert "hermes-acp" in enabled
+
+    def test_make_agent_handles_missing_live_registry_import(self, monkeypatch):
+        """If tools.mcp_tool can't be imported, _make_agent must fall back to
+        the config.yaml list (no exception, no lost ACP session)."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "tools.mcp_tool" or name.startswith("tools.mcp_tool."):
+                raise ImportError("simulated: tools.mcp_tool unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "acp_adapter.session.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": {"demo-search": {"command": "/bin/true", "args": []}},
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": {"demo-search": {"command": "/bin/true", "args": []}},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "openai_chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+
+        state = SessionManager(db=None).create_session(cwd="/tmp/project")
+        assert "mcp-demo-search" in state.agent.kwargs["enabled_toolsets"]
+
+    def test_fork_session_picks_up_server_registered_after_original_create(self, monkeypatch):
+        """Real repro for the #42719 agent-rebuild gap.
+
+        Sequence that actually happened in production: a session is created
+        while the MCP registry is still empty (like the pre-prompt window of
+        session/new), a server is then registered live into the process-wide
+        registry (like an ACP client's session/new -> register_mcp_servers,
+        or any other concurrent session doing the same), and only afterward
+        is a second agent built for a *different* session_id via
+        fork_session — the path that has no accompanying
+        _register_session_mcp_servers call to patch tools onto it directly.
+        Before this fix, the forked agent's enabled_toolsets would silently
+        miss the live server because _make_agent read only config.yaml."""
+
+        class FakeAgent:
+            model = "fake-model"
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        live_registry: set[str] = set()
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "acp_adapter.session.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": {},
+            },
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {"default": "fake-model", "provider": "fake-provider"},
+                "mcp_servers": {},
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None: {
+                "provider": requested,
+                "api_mode": "openai_chat_completions",
+                "base_url": "https://example.invalid",
+                "api_key": "test-key",
+            },
+        )
+        monkeypatch.setattr("acp_adapter.session._register_task_cwd", lambda task_id, cwd: None)
+        monkeypatch.setattr(
+            "tools.mcp_tool.get_registered_mcp_server_names",
+            lambda: set(live_registry),
+        )
+
+        manager = SessionManager(db=None)
+
+        # Registry is empty at original creation time — matches the state
+        # _make_agent sees during session/new, before ACP registration lands.
+        original = manager.create_session(cwd="/tmp/project")
+        assert "mcp-demo-store" not in original.agent.kwargs["enabled_toolsets"]
+
+        # A server registers live into the process-wide registry afterward
+        # (this is what _register_session_mcp_servers's register_mcp_servers
+        # call, or an unrelated concurrent session, does).
+        live_registry.add("demo-store")
+
+        # fork_session rebuilds a fresh agent via _make_agent directly, with
+        # no _register_session_mcp_servers call following it.
+        forked = manager.fork_session(original.session_id, cwd="/tmp/project")
+        assert forked is not None
+        assert "mcp-demo-store" in forked.agent.kwargs["enabled_toolsets"]
+
+
 
 
 # ---------------------------------------------------------------------------
