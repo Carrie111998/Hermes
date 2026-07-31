@@ -23,6 +23,26 @@ def _shared_provider_config():
     }
 
 
+def test_initial_client_construction_selects_active_provider_headers():
+    config = _shared_provider_config()
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://shared.example.com/v1",
+            model="shared-model",
+            provider="custom:selected",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent._client_kwargs["default_headers"] == {"X-Route": "selected"}
+
+
 def test_client_rebuild_selects_headers_for_active_provider():
     agent = SimpleNamespace(
         api_mode="chat_completions",
