@@ -1223,8 +1223,8 @@ class CLICommandsMixin:
                     max_title = len(t)
             title_w = max(16, min(max_title, 50))
 
-            _cprint(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<20} {'ID'}")
-            _cprint(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*20} {'─'*12}")
+            _cprint(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+            _cprint(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
             # Format tokens as human-readable (e.g. "221k/17k")
             def _fmt_tok(n):
                 if n is None:
@@ -1262,10 +1262,10 @@ class CLICommandsMixin:
                         when = f"{age // 86400}d"
                 else:
                     when = "?"
-                pv = (root_preview_cache.get(sid) or "")[:18]
-                if len(root_preview_cache.get(sid) or "") >= 18:
-                    pv = pv[:17] + "…"
-                _cprint(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<20} {sid[:12]}")
+                pv = (root_preview_cache.get(sid) or "")[:38]
+                if len(root_preview_cache.get(sid) or "") >= 38:
+                    pv = pv[:37] + "…"
+                _cprint(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
 
             _cprint("")
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")

@@ -18080,8 +18080,8 @@ def main():
                 return str(n)
 
             print(f"⚙️  sessions search {query}\n")
-            print(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<20} {'ID'}")
-            print(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*20} {'─'*12}")
+            print(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+            print(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
                 title = (meta.get("title") or "—")[:title_w]
@@ -18107,10 +18107,10 @@ def main():
                         when = f"{age // 86400}d"
                 else:
                     when = "?"
-                pv = (root_preview_cache.get(sid) or "")[:18]
-                if len(root_preview_cache.get(sid) or "") >= 18:
-                    pv = pv[:17] + "…"
-                print(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<20} {sid[:12]}")
+                pv = (root_preview_cache.get(sid) or "")[:38]
+                if len(root_preview_cache.get(sid) or "") >= 38:
+                    pv = pv[:37] + "…"
+                print(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
             print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 
