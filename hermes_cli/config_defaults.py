@@ -2624,8 +2624,10 @@ DEFAULT_CONFIG = {
         # reset guard — #29177).
         "bg_process_max_age_hours": 24,
         # How long a finished background process stays tracked before pruning.
-        # Each tracked process holds a pipe FD; a long TTL lets finished jobs
-        # pile up toward the 64-process cap and block new background spawns.
+        # Finished sessions release their pipe/PTY handles immediately, so this
+        # is a retention knob for querying finished output — not an FD-limit
+        # control (the registry never rejects spawns; it prunes oldest-finished
+        # at MAX_PROCESSES).
         "finished_process_ttl_minutes": 10,
     },
 

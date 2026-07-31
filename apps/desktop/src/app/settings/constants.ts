@@ -615,7 +615,7 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     idleMinutes: 'Minutes of inactivity before an idle reset fires.',
     notify: 'Send a notification when an auto-reset clears a session.',
     bgProcessMaxAgeHours: 'Background processes older than this no longer pin a session open against reset (they are not killed).',
-    finishedProcessTtlMinutes: 'How long finished background processes stay tracked before pruning. Each tracked process holds a file descriptor, so keep this tight if background jobs pile up.'
+    finishedProcessTtlMinutes: 'How long finished background processes stay tracked before pruning. Finished sessions release their handles immediately, so this controls how long a finished job\u2019s output stays queryable via poll/log.'
   },
   context: {
     engine: 'Strategy for managing long conversations near the context limit.'

@@ -869,9 +869,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "unit": "minutes",
         "default": 10,
         "description": (
-            "How long finished background processes stay tracked before pruning "
-            "(each tracked process holds a file descriptor; the 64-process cap "
-            "blocks new background spawns when a long TTL lets finished jobs pile up)"
+            "How long finished background processes stay tracked before pruning. "
+            "Finished sessions release their pipe/PTY handles immediately, so this "
+            "controls how long a finished job's buffered output stays queryable "
+            "via poll/log before the entry is pruned."
         ),
     },
     "terminal.backend": {

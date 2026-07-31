@@ -511,12 +511,13 @@ class SessionResetPolicy:
     bg_process_max_age_hours: int = 24
 
     # How long (minutes) a finished background process stays tracked in the
-    # gateway's process registry before being pruned. Each tracked process
-    # holds a pipe file descriptor, so a long TTL lets finished jobs pile up
-    # toward MAX_PROCESSES (64) and block new background spawns with the
-    # "file descriptor limit" error. 10 minutes is the default; raise it if
-    # you routinely need to poll/log a finished job's output later, lower it
-    # if you churn background processes faster than the registry can prune.
+    # gateway's process registry before being pruned. Finished processes are
+    # never reaped for FD reasons (the registry releases their pipe/PTY
+    # handles when they finish) — this TTL controls how long the finished
+    # job's buffered output stays queryable via poll/log before the entry is
+    # pruned. 10 minutes is the default; raise it if you routinely need to
+    # poll/log a finished job's output later, lower it if you churn
+    # background processes faster than the registry can prune.
     finished_process_ttl_minutes: int = 10
 
     def to_dict(self) -> Dict[str, Any]:
