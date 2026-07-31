@@ -334,8 +334,15 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
-def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
+def test_mark_exhausted_and_rotate_force_redacts_persisted_message(
+    tmp_path, monkeypatch
+):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    import agent.redact as redact_mod
+
+    monkeypatch.setattr(redact_mod, "_REDACT_ENABLED", False)
+    secret = "sk-ant-api03-upstream-secret-1234567890"
+    error_message = f"Request failed with API key {secret}"
     _write_auth_store(
         tmp_path,
         {
@@ -368,15 +375,71 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     pool = load_pool("anthropic")
     assert pool.select().id == "cred-1"
 
-    next_entry = pool.mark_exhausted_and_rotate(status_code=402)
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=402,
+        error_context={"message": error_message},
+    )
 
     assert next_entry is not None
     assert next_entry.id == "cred-2"
 
-    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_payload = json.loads(auth_text)
     persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert secret not in auth_text
     assert persisted["last_status"] == "exhausted"
     assert persisted["last_error_code"] == 402
+    persisted_message = persisted["last_error_message"]
+    assert isinstance(persisted_message, str)
+    assert persisted_message
+    assert persisted_message != error_message
+
+
+def test_mark_exhausted_and_rotate_omits_message_when_redaction_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-api-primary",
+                    }
+                ]
+            },
+        },
+    )
+
+    import agent.redact as redact_mod
+    from agent.credential_pool import load_pool
+
+    def fail_redaction(*_args, **_kwargs):
+        raise RuntimeError("redaction failed")
+
+    monkeypatch.setattr(redact_mod, "redact_sensitive_text", fail_redaction)
+    secret = "sk-ant-api03-upstream-secret-0987654321"
+
+    pool = load_pool("anthropic")
+    assert pool.select().id == "cred-1"
+
+    pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"message": f"Request failed with API key {secret}"},
+    )
+
+    auth_text = (tmp_path / "hermes" / "auth.json").read_text()
+    auth_payload = json.loads(auth_text)
+    persisted = auth_payload["credential_pool"]["anthropic"][0]
+    assert secret not in auth_text
+    assert persisted["last_error_message"] is None
 
 
 def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):

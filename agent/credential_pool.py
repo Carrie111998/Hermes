@@ -359,9 +359,10 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     if isinstance(message, str) and message.strip():
         try:
             from agent.redact import redact_sensitive_text
-            normalized["message"] = redact_sensitive_text(message.strip())
+            normalized["message"] = redact_sensitive_text(message.strip(), force=True)
         except Exception:
-            normalized["message"] = message.strip()
+            # Fail closed at the auth.json persistence boundary.
+            pass
     reset_at = (
         error_context.get("reset_at")
         or error_context.get("resets_at")
