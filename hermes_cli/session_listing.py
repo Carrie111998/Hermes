@@ -172,6 +172,23 @@ def search_session_listing(
             continue
         if sid not in seen:
             seen[sid] = r
+    # Title/id matches (case-insensitive substring on the surfaced row and
+    # every id in its forward chain). The gateway historically matched
+    # titles, and a title is a legitimate search handle — union them in so
+    # content and title searches agree everywhere. Ordering is by last
+    # activity either way, so mixing the two hit sets is safe.
+    title_rows = session_db.list_sessions_rich(
+        source=None,
+        limit=200,
+        search_query=query,
+        order_by_last_active=True,
+    )
+    for r in title_rows:
+        sid = r["id"]
+        if exclude_session_id and sid == exclude_session_id:
+            continue
+        if sid not in seen:
+            seen[sid] = r
     if not seen:
         return [], {}
 
