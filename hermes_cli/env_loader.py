@@ -80,8 +80,9 @@ def hydrate_profile_secret_sources(
 
     Multiplex gateways can route a first turn to a secondary profile that has
     never run the process-global dotenv startup path.  Resolve that profile's
-    sources against a private mapping seeded from its own ``.env`` and record
-    the usual per-home snapshot for ``build_profile_secret_scope()``.
+    sources against a private mapping seeded from its own ``.env`` and
+    ``.op.env`` bootstrap file, then record the usual per-home snapshot for
+    ``build_profile_secret_scope()``.
 
     Fail-open and once-per-home semantics intentionally mirror
     ``_apply_external_secret_sources``.  The returned mapping contains only
@@ -115,6 +116,12 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
             if _is_global_env(name)
         }
         local_env.update(load_env_file(home / ".env"))
+        # Mirror load_hermes_dotenv(): .op.env supplies the 1Password
+        # bootstrap token for headless/cold-profile resolution, but never
+        # overrides profile .env values.  Keep it local so neither the token
+        # nor resolved source values escape into the shared process environment.
+        for name, value in load_env_file(home / ".op.env").items():
+            local_env.setdefault(name, value)
         local_env["HERMES_HOME"] = str(home)
         report = apply_all(cfg, home, environ=local_env)
     except Exception:  # noqa: BLE001 — preserve fail-open startup behavior

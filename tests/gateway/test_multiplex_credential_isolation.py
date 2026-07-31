@@ -166,3 +166,75 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert "EXPLICIT_API_KEY" not in os.environ
 
 
+def test_cold_profile_onepassword_uses_profile_op_env_without_global_leak(
+    tmp_path, monkeypatch
+):
+    """A first routed profile gets its own .op.env bootstrap token locally."""
+    import os
+    from types import SimpleNamespace
+
+    import agent.secret_sources.onepassword as onepassword
+    from agent.secret_scope import get_secret
+    from hermes_cli import env_loader
+    from gateway.run import _profile_runtime_scope
+
+    profile = tmp_path / "profiles" / "secondary"
+    profile.mkdir(parents=True)
+    (profile / ".env").write_text(
+        "EXPLICIT_API_KEY=dotenv-wins\n", encoding="utf-8"
+    )
+    (profile / ".op.env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=profile-bootstrap\n", encoding="utf-8"
+    )
+    (profile / "config.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        "      TEST_PROVIDER_API_KEY: op://Vault/Item/credential\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("OP_SERVICE_ACCOUNT_TOKEN", raising=False)
+    monkeypatch.delenv("TEST_PROVIDER_API_KEY", raising=False)
+    monkeypatch.delenv("EXPLICIT_API_KEY", raising=False)
+    monkeypatch.setattr(onepassword, "find_op", lambda _path: Path("/fake/op"))
+
+    child_env: dict[str, str] = {}
+
+    def _fake_run(_command, **kwargs):
+        child_env.update(kwargs["env"])
+        return SimpleNamespace(
+            returncode=0, stdout="profile-provider-key\n", stderr=""
+        )
+
+    monkeypatch.setattr(onepassword.subprocess, "run", _fake_run)
+    env_loader.reset_secret_source_cache()
+    onepassword._reset_cache_for_tests(profile)
+
+    with _profile_runtime_scope(profile):
+        assert get_secret("TEST_PROVIDER_API_KEY") == "profile-provider-key"
+        assert get_secret("EXPLICIT_API_KEY") == "dotenv-wins"
+
+    assert child_env["OP_SERVICE_ACCOUNT_TOKEN"] == "profile-bootstrap"
+
+    # Match the normal loader's precedence: a profile .env token is explicit
+    # and therefore wins over the .op.env bootstrap fallback.
+    (profile / ".env").write_text(
+        "OP_SERVICE_ACCOUNT_TOKEN=dotenv-bootstrap\n"
+        "EXPLICIT_API_KEY=dotenv-wins\n",
+        encoding="utf-8",
+    )
+    child_env.clear()
+    env_loader.reset_secret_source_cache()
+    onepassword._reset_cache_for_tests(profile)
+
+    with _profile_runtime_scope(profile):
+        assert get_secret("TEST_PROVIDER_API_KEY") == "profile-provider-key"
+
+    assert child_env["OP_SERVICE_ACCOUNT_TOKEN"] == "dotenv-bootstrap"
+    assert "TEST_PROVIDER_API_KEY" not in child_env
+    assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ
+    assert "TEST_PROVIDER_API_KEY" not in os.environ
+    assert "EXPLICIT_API_KEY" not in os.environ
+
+
