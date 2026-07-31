@@ -626,6 +626,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
             f"{version}\n{mode}\n{stable}\n{turn}".encode("utf-8"),
         ).hexdigest()
         package_digest = "sha256:" + hashlib.sha256(b"complete skill bundle").hexdigest()
+        root_skill_digest = "sha256:" + hashlib.sha256(b"workflow instructions").hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_test",
             "runtime": "hermes",
@@ -712,7 +713,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "name": "skill_view",
                 "status": "completed",
                 "arguments": {
-                    "digest": package_digest,
+                    "digest": root_skill_digest,
                 },
             },
         }
@@ -723,7 +724,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         assert tool_request["type"] == "tool_request"
         expected_proof = {
             "name": "media-qa",
-            "digest": package_digest,
+            "digest": root_skill_digest,
         }
         assert tool_request["payload"]["skill"] == expected_proof
         assert tool_request["payload"]["skills"] == [expected_proof]

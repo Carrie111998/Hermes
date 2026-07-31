@@ -814,7 +814,6 @@ class RuntimeBridgeSession:
         deadline_ms: int,
         agent_session_id: str,
         allowed_skill_names: set[str] | None = None,
-        allowed_skill_digests: dict[str, str] | None = None,
         allowed_image_paths: set[str] | None = None,
         allowed_video_paths: set[str] | None = None,
     ) -> None:
@@ -829,7 +828,6 @@ class RuntimeBridgeSession:
             if allowed_skill_names is not None
             else _allowed_skill_names(definitions)
         )
-        self.allowed_skill_digests = dict(allowed_skill_digests or {})
         self.allowed_image_paths = {
             str(Path(path).resolve())
             for path in (allowed_image_paths or set())
@@ -896,11 +894,11 @@ class RuntimeBridgeSession:
             self.loaded_skills[name] = digest
 
     def loaded_skill_digest(self, name: str, args: Any, result: Any) -> str:
-        """Return the bound package digest after a successful root body load."""
+        """Return the digest of the root SKILL.md bytes actually loaded."""
         body_digest = _skill_body_digest(args, result)
         if not body_digest or not self.is_skill_allowed(name):
             return ""
-        return self.allowed_skill_digests.get(name) or body_digest
+        return body_digest
 
     def start_local_activity(self, call_id: str, name: str, args: Any) -> None:
         if not call_id or name not in _LOCAL_ACTIVITY_TOOLS:
@@ -1303,7 +1301,6 @@ class APIServerRuntimeMixin:
             int(body.get("deadline_ms") or 0),
             agent_session_id,
             allowed_skill_names=allowed_skill_names,
-            allowed_skill_digests=allowed_skill_digests,
             allowed_image_paths={str(path) for path in runtime_image_paths},
             allowed_video_paths={str(path) for path in runtime_video_paths},
         )
