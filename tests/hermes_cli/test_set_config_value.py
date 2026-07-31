@@ -347,7 +347,10 @@ class TestCronModelDriftConfigWarning:
 # ---------------------------------------------------------------------------
 
 class TestStringTypedConfigValues:
-    @pytest.mark.parametrize("value", ["off", "on", "yes", "no", "true", "false", "01"])
+    @pytest.mark.parametrize(
+        "value",
+        ["off", "on", "yes", "no", "true", "false", "01", '{"literal":true}', '["literal"]'],
+    )
     def test_string_typed_values_are_not_coerced(self, _isolated_hermes_home, value):
         """Values stay strings when DEFAULT_CONFIG declares the leaf as a string."""
         set_config_value("approvals.mode", value)
@@ -382,6 +385,58 @@ class TestStringTypedConfigValues:
         import yaml
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
         assert saved["custom"]["enabled"] is False
+
+
+# ---------------------------------------------------------------------------
+# Structured value parsing — regression tests for object-like CLI values
+# ---------------------------------------------------------------------------
+
+class TestStructuredValues:
+    """Object/list-like CLI values should persist with structured YAML types."""
+
+    def test_json_object_value_persists_as_mapping(self, _isolated_hermes_home):
+        set_config_value("foo.bar", '{"x":1,"nested":{"y":2}}', force=True)
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["foo"]["bar"] == {"x": 1, "nested": {"y": 2}}
+        assert isinstance(reloaded["foo"]["bar"], dict)
+
+    def test_provider_block_object_persists_as_mapping(self, _isolated_hermes_home):
+        set_config_value(
+            "providers.deepseek",
+            '{"base_url":"https://api.deepseek.com","key_env":"DEEPSEEK_API_KEY","api_mode":"chat_completions"}',
+        )
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["providers"]["deepseek"] == {
+            "base_url": "https://api.deepseek.com",
+            "key_env": "DEEPSEEK_API_KEY",
+            "api_mode": "chat_completions",
+        }
+        assert isinstance(reloaded["providers"]["deepseek"], dict)
+
+    def test_mcp_args_array_persists_as_list(self, _isolated_hermes_home):
+        args = '["--yes","@modelcontextprotocol/server-filesystem","/tmp"]'
+        set_config_value("mcp_servers.filesystem.args", args)
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["mcp_servers"]["filesystem"]["args"] == [
+            "--yes",
+            "@modelcontextprotocol/server-filesystem",
+            "/tmp",
+        ]
+        assert isinstance(reloaded["mcp_servers"]["filesystem"]["args"], list)
+
+    def test_invalid_object_like_string_falls_back_to_raw_string(self, _isolated_hermes_home):
+        set_config_value("foo.bar", '{not valid json}', force=True)
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["foo"]["bar"] == '{not valid json}'
+        assert isinstance(reloaded["foo"]["bar"], str)
 
 
 # ---------------------------------------------------------------------------
