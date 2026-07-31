@@ -124,14 +124,78 @@ while ($true) {
 Write-Log ("extra " + $GRACE_SECONDS + "s grace for venv shim to release")
 Start-Sleep -Seconds $GRACE_SECONDS
 
-# 4) clear any stale lock from prior failed attempts
+# 4) clear the lock only if it is ours or provably stale.
+#
+# The lock at .hermes-update-in-progress is main's cross-process update mutex
+# (see apps/desktop/electron/update-marker.ts and the Rust updater at
+# apps/bootstrap-installer/src-tauri/src/update.rs:265-268). The desktop
+# writes it with the spawned updater's PID before it quits; with our wrapper
+# in place, that PID is the parent cmd.exe that ran hermes-update-wrapper.cmd.
+# A live lock owned by a different PID is almost certainly a parallel
+# dashboard or terminal `hermes update` -- deleting it would let this install
+# race with the live one and corrupt the checkout. So:
+#   - Lock PID is in our process tree (us or parent cmd.exe) -> clear, it was ours.
+#   - Lock PID is dead (no such process)                    -> clear, stale leftover.
+#   - Lock PID is alive and not us                          -> REFUSE; exit 4.
+#   - Lock is unreadable / no PID                           -> clear, treat as stale.
 $lockFile = Join-Path $HERMES_HOME '.hermes-update-in-progress'
 if (Test-Path -LiteralPath $lockFile) {
-    try {
-        Remove-Item -LiteralPath $lockFile -Force
-        Write-Log ("cleared stale lock: " + $lockFile)
-    } catch {
-        Write-Log ("WARNING: could not clear stale lock (" + $lockFile + "): " + $_)
+    $lockContent = $null
+    try { $lockContent = Get-Content -LiteralPath $lockFile -Raw -ErrorAction Stop } catch {}
+
+    $lockPid = $null
+    if ($lockContent) {
+        $firstLine = ($lockContent -split "`n")[0].Trim()
+        if ($firstLine -match '^\d+$') {
+            $lockPid = [int]$firstLine
+        }
+    }
+
+    $clearLock = $false
+    $reason = ''
+
+    if (-not $lockPid) {
+        $clearLock = $true
+        $reason = 'unreadable lock format (no PID); treating as stale'
+    } else {
+        # Build the set of PIDs that count as 'ours': this powershell.exe (us)
+        # and the parent cmd.exe that the desktop spawned to invoke us.
+        $ourPids = @($PID)
+        $ownProc = $null
+        try {
+            $ownProc = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId=' + $PID) -ErrorAction Stop
+        } catch {}
+        if ($ownProc -and $ownProc.ParentProcessId) {
+            $ourPids += @([int]$ownProc.ParentProcessId)
+        }
+
+        $ownerAlive = $false
+        $ownerProc = $null
+        try { $ownerProc = Get-Process -Id $lockPid -ErrorAction Stop } catch {}
+        if ($ownerProc) { $ownerAlive = $true }
+
+        $isOurs = $ourPids -contains $lockPid
+        if ($isOurs) {
+            $clearLock = $true
+            $ourPidsStr = ($ourPids -join ',')
+            $reason = ('lock is owned by this handoff (pid=' + $lockPid + ' in our set [' + $ourPidsStr + '])')
+        } elseif ($ownerAlive) {
+            # Live foreign lock -- refuse. Do not delete.
+            Write-Log ('refusing to delete live foreign lock at ' + $lockFile + '; owner pid=' + $lockPid + ' is alive and not part of this handoff. exiting so the live update can complete.')
+            exit 4
+        } else {
+            $clearLock = $true
+            $reason = ('stale lock; owner pid=' + $lockPid + ' is no longer alive')
+        }
+    }
+
+    if ($clearLock) {
+        try {
+            Remove-Item -LiteralPath $lockFile -Force
+            Write-Log ('cleared lock: ' + $lockFile + ' (' + $reason + ')')
+        } catch {
+            Write-Log ('WARNING: could not clear lock (' + $lockFile + '): ' + $_)
+        }
     }
 }
 

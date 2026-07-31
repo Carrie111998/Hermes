@@ -97,11 +97,27 @@ The companion source changes are in:
 - `apps/desktop/electron/main.ts` — `resolveUpdaterBinary()` prefers
   `hermes-update-wrapper.cmd` when present
 - `apps/desktop/electron/updater-process.ts` — adds `shell: true` to spawn
-  options on Windows so `cmd.exe` interprets the `.cmd` (CreateProcessW can't
-  execute `.cmd` directly)
+  options **only for `.cmd`/`.bat` updater paths** on Windows so `cmd.exe`
+  interprets the wrapper. The default Tauri `.exe` updater continues to
+  spawn directly because `applyUpdates()` records `child.pid` in the
+  update marker and the Rust updater's self-PID adoption check expects
+  that PID to match its own.
 - `apps/desktop/electron/updater-process.test.ts` — updated for the new
-  `shell: true` default, plus a new test verifying the caller's `shell: false`
-  opt-out is respected
+  gating plus new tests for `.cmd` and `.bat` paths
+
+## Lock handling
+
+`hermes-update-wrapper.ps1` only deletes `.hermes-update-in-progress` when:
+
+- the lock's owner PID is part of this handoff (this powershell.exe or its
+  parent cmd.exe that the desktop spawned), or
+- the owner PID is no longer alive (stale leftover), or
+- the lock file is unreadable / has no PID.
+
+A live foreign lock (a PID that is alive and not us) is treated as another
+updater (dashboard or terminal `hermes update`) and the wrapper refuses to
+delete it — the script exits with code 4 so the live update can complete
+without being clobbered.
 
 ## Long-term
 
