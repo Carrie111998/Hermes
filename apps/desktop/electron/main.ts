@@ -2680,8 +2680,13 @@ function isVenvLocked(updateRoot) {
   return false
 }
 
-// Kill every process whose exe lives under venv\Scripts (hindsight daemon,
-// leftover CLIs, anything else) so the updater never races a mapped shim.
+// Kill only Hermes-OWNED venv daemons (the memory plugin's hindsight daemon:
+// exe under venv\Scripts AND cmdline containing hindsight_api.main). External
+// holders (a user terminal running `hermes`, unrelated scripts) are NOT killed
+// — scanVenvBlockers reports them and the handoff aborts, per existing design.
+// Path match is an ordinal case-insensitive prefix (PowerShell -like would
+// treat `[`/`]`/`*` as wildcards and `\*` as an escape — a literal check is
+// required, cf. tests/test_install_unmerged_index.py:171-180).
 function killVenvShimHolders(updateRoot) {
   if (!IS_WINDOWS) {
     return
@@ -2689,7 +2694,10 @@ function killVenvShimHolders(updateRoot) {
   const scriptsDir = path.join(updateRoot, 'venv', 'Scripts').replace(/'/g, "''")
   try {
     const ps =
-      `$p = Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '${scriptsDir}\\*' }; ` +
+      `$p = Get-CimInstance Win32_Process | Where-Object { ` +
+      `$_.ExecutablePath -and $_.CommandLine -and ` +
+      `$_.ExecutablePath.StartsWith('${scriptsDir}\\', [System.StringComparison]::OrdinalIgnoreCase) ` +
+      `-and $_.CommandLine -match 'hindsight_api\\.main' }; ` +
       `foreach ($x in $p) { taskkill /PID $($x.ProcessId) /T /F 2>$null | Out-Null }`
     execFileSync(
       'powershell',
