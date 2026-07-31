@@ -308,3 +308,61 @@ class TestWebSocketPublicUrlOrigin:
                 pass
 
         assert exc.value.code == 4403
+
+    def test_public_host_header_still_rejected_with_bound_origin(self, monkeypatch):
+        """The public_url relaxation applies to Origin only, per @Kinkoolino-Hermes's
+        review — Host stays gated to bound_host with no widening at all. A Host
+        header claiming to be the public host must still be rejected even when
+        Origin is the ordinary bound-loopback value, since Host reflects what the
+        server itself believes it's bound to (unlike Origin, which just reflects
+        what the browser sent) — widening that check would be a materially bigger
+        relaxation than the one this PR makes."""
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        self._patch_public_url(monkeypatch, "https://hermes.example.com:8443")
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "hermes.example.com:8443",
+                    "Origin": "http://localhost",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4403
+
+    def test_public_host_header_still_rejected_with_public_origin(self, monkeypatch):
+        """Same as above, but with Origin also set to the public host -- proves
+        rejection is driven purely by the unwidened Host check, not by Origin
+        happening to mismatch too."""
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws.app.state, "bound_host", "127.0.0.1", raising=False)
+        monkeypatch.setattr(ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        self._patch_public_url(monkeypatch, "https://hermes.example.com:8443")
+
+        client = TestClient(ws.app)
+        url = f"/api/events?token={ws._SESSION_TOKEN}&channel=security-test"
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with client.websocket_connect(
+                url,
+                headers={
+                    "Host": "hermes.example.com:8443",
+                    "Origin": "https://hermes.example.com:8443",
+                },
+            ):
+                pass
+
+        assert exc.value.code == 4403
