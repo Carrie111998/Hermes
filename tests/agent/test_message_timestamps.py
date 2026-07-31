@@ -79,6 +79,31 @@ def test_render_turn_timestamps_history_and_current_user_without_mutating_input(
     assert persisted_ts == current_ts
 
 
+def test_fresh_turn_falls_back_to_wall_clock_without_stamping_other_roles(monkeypatch):
+    current_ts = _epoch(2026, 4, 28, 13, 42, 10)
+    history = [
+        {"role": "user", "content": "legacy row without metadata"},
+        {"role": "assistant", "content": "assistant reply", "timestamp": 1.0},
+        {"role": "tool", "content": "tool output", "timestamp": 2.0},
+    ]
+    monkeypatch.setattr("agent.message_timestamps.time.time", lambda: current_ts)
+
+    rendered_history, rendered_user, persisted_ts = render_turn_with_message_timestamps(
+        history,
+        "fresh turn",
+        config={"message_timestamps": {"enabled": True}},
+        tz=BERLIN,
+    )
+
+    # Historical rows without trustworthy metadata stay unchanged; only the
+    # fresh user turn is allowed to use the current wall clock as its send time.
+    assert rendered_history[0]["content"] == "legacy row without metadata"
+    assert rendered_history[1]["content"] == "assistant reply"
+    assert rendered_history[2]["content"] == "tool output"
+    assert rendered_user == "[Tue 2026-04-28 13:42:10 CEST] fresh turn"
+    assert persisted_ts == current_ts
+
+
 def test_rendered_history_keeps_timestamp_when_api_sidecar_is_substituted():
     prior_ts = _epoch(2026, 4, 28, 13, 40, 53)
     history = [

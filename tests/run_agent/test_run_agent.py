@@ -5858,9 +5858,11 @@ class TestPersistUserMessageOverride:
         agent._persist_session(messages, [])
 
         assert messages[0]["content"] == timestamped_content
-        first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
-        assert first_db_write["content"] == "What color is this?\n[screenshot]"
-        assert first_db_write["timestamp"] == 1777376530.0
+        batch = agent._session_db.append_messages_batch.call_args_list[0].kwargs[
+            "messages"
+        ]
+        assert batch[0]["content"] == "What color is this?\n[screenshot]"
+        assert batch[0]["timestamp"] == 1777376530.0
 
 
 class TestReasoningReplayForStrictProviders:
