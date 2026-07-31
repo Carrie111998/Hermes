@@ -9622,6 +9622,9 @@ def count_notify_subs(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> int:
     """Count ``kanban_notify_subs`` rows via a read-only connection.
 
@@ -9633,8 +9636,11 @@ def count_notify_subs(
     write table content). Rows in a not-yet-checkpointed WAL are
     visible, so a freshly added subscription is never missed. A missing
     DB, or a legacy DB that predates the subscriptions table, counts as
-    zero. Path resolution matches :func:`connect` (explicit ``db_path``,
-    else ``board`` via :func:`kanban_db_path`). Raises
+    zero. Optional platform/chat/thread filters narrow the probe to one
+    notification owner without changing the unfiltered count. Platform
+    matching is case-insensitive, matching notifier routing; chat and thread
+    identifiers are exact. Path resolution matches :func:`connect` (explicit
+    ``db_path``, else ``board`` via :func:`kanban_db_path`). Raises
     :class:`sqlite3.Error` when the DB exists but cannot be read
     (locked, corrupt); callers choose their own fallback.
     """
@@ -9644,9 +9650,21 @@ def count_notify_subs(
     conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
     try:
         try:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM kanban_notify_subs"
-            ).fetchone()
+            clauses: list[str] = []
+            params: list[str] = []
+            if platform is not None:
+                clauses.append("LOWER(platform) = LOWER(?)")
+                params.append(platform)
+            if chat_id is not None:
+                clauses.append("chat_id = ?")
+                params.append(chat_id)
+            if thread_id is not None:
+                clauses.append("thread_id = ?")
+                params.append(thread_id)
+            query = "SELECT COUNT(*) FROM kanban_notify_subs"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            row = conn.execute(query, params).fetchone()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return 0
