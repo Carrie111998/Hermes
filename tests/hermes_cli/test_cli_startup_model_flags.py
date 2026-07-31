@@ -172,6 +172,62 @@ class TestStartupFlagsSurviveNewSession:
         assert switch_calls[-1]["raw_input"] == "startup/model"
         assert cli.model == "startup/model"
 
+    def test_provider_only_startup_survives(self, config_default, switch_calls):
+        """`hermes --provider X` with no --model is a complete selection.
+
+        The startup provider must not be dropped just because no model flag
+        was given — it is the whole point of that launch.
+        """
+        cli = _make_cli(
+            config_default,
+            startup_model=None,
+            startup_provider="startup-provider",
+            current_model="config/default-model",
+        )
+        cli.provider = "session-provider"
+
+        cli.new_session(silent=True)
+
+        assert switch_calls, "a provider-only startup must still re-derive"
+        assert switch_calls[-1]["explicit_provider"] == "startup-provider"
+
+    def test_provider_only_session_override_is_undone(
+        self, config_default, switch_calls,
+    ):
+        """Same model, different provider: the boundary must still reset it.
+
+        Gating the switch on the model alone let a session-scoped provider
+        change ride through /new.
+        """
+        cli = _make_cli(
+            config_default,
+            startup_model="startup/model",
+            startup_provider="startup-provider",
+            current_model="startup/model",
+        )
+        cli.provider = "session-provider"
+
+        cli.new_session(silent=True)
+
+        assert switch_calls, "a provider-only difference must trigger a reset"
+        assert switch_calls[-1]["raw_input"] == "startup/model"
+        assert switch_calls[-1]["explicit_provider"] == "startup-provider"
+
+    def test_matching_model_and_provider_still_skips_the_switch(
+        self, config_default, switch_calls,
+    ):
+        cli = _make_cli(
+            config_default,
+            startup_model="startup/model",
+            startup_provider="startup-provider",
+            current_model="startup/model",
+        )
+        cli.provider = "startup-provider"
+
+        cli.new_session(silent=True)
+
+        assert not switch_calls
+
     def test_one_turn_restore_is_still_cleared(self, config_default, switch_calls):
         cli = _make_cli(
             config_default,
@@ -184,29 +240,34 @@ class TestStartupFlagsSurviveNewSession:
 
         assert cli._pending_one_turn_model_restore is None
 
-    def test_no_switch_when_already_on_the_startup_model(
-        self, config_default, switch_calls,
-    ):
-        """Nothing to re-derive — the guard must stay a no-op."""
-        cli = _make_cli(
-            config_default,
-            startup_model="startup/model",
-            startup_provider=None,
-            current_model="startup/model",
-        )
-
-        cli.new_session(silent=True)
-
-        assert not switch_calls
-
 
 class TestStartupSelectionCapture:
-    def test_flags_are_recorded_only_when_passed(self, monkeypatch):
-        """An unflagged launch must record nothing, so config keeps winning."""
-        import inspect
+    def test_unflagged_launch_records_no_startup_selection(self, monkeypatch, tmp_path):
+        """An unflagged launch must record nothing, so config keeps winning.
 
+        Behavioral: build a real HermesCLI with no flags and check the
+        recorded selection, rather than reading the constructor's source.
+        """
         import cli as cli_mod
 
-        src = inspect.getsource(cli_mod.HermesCLI.__init__)
-        assert "self._startup_model = (model or \"\").strip() or None" in src
-        assert "self._startup_provider = (provider or \"\").strip() or None" in src
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cli = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+        cli_mod.HermesCLI._record_startup_selection(cli, None, None)
+        assert cli._startup_model is None
+        assert cli._startup_provider is None
+
+    def test_flags_are_recorded_when_passed(self, monkeypatch, tmp_path):
+        import cli as cli_mod
+
+        cli = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+        cli_mod.HermesCLI._record_startup_selection(cli, "  some/model ", " some-provider ")
+        assert cli._startup_model == "some/model"
+        assert cli._startup_provider == "some-provider"
+
+    def test_blank_flags_are_treated_as_absent(self, monkeypatch, tmp_path):
+        import cli as cli_mod
+
+        cli = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+        cli_mod.HermesCLI._record_startup_selection(cli, "   ", "")
+        assert cli._startup_model is None
+        assert cli._startup_provider is None
