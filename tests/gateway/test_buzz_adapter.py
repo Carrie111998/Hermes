@@ -224,6 +224,17 @@ class TestMentionGating:
 
         a._dispatch_message = capture
         a._message_handler = AsyncMock()
+        # Real-channel metadata: these tests exercise the channel mention
+        # gate, so a p-tagged event must never reclassify to DM (the
+        # DM-latch path is covered by TestDmClassification).
+        a._channel_meta = {
+            CHANNEL: {
+                "channel_id": CHANNEL,
+                "name": "general",
+                "description": "General conversation and community updates.",
+            },
+        }
+        a._channel_names = {CHANNEL: "general"}
         a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
         return a
 
@@ -248,6 +259,68 @@ class TestMentionGating:
     async def test_allowlist_blocks_unauthorized(self, adapter):
         adapter._allowed_pubkeys = {"b" * 64}
         await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
+        assert adapter._dispatched == []
+
+    # ── p-tag mention disambiguation (issue #75166) ─────────────────────
+    #
+    # Buzz resolves @Name into the mentioned member's pubkey and emits it
+    # as a p-tag.  When the event p-tags another agent, the message was
+    # addressed to them — an agent whose display name merely appears in the
+    # prose must not hijack the turn.  p-tags only ever narrow the gate.
+
+    @pytest.mark.asyncio
+    async def test_mention_of_another_agent_is_not_hijacked(self, adapter):
+        """The reported bug: an agent named "Hermes" must not answer a
+        message p-tagged to another member, even though "hermes" appears
+        several times in the prose."""
+        adapter._display_name = "Hermes"
+        await self._poll_with(
+            adapter,
+            _tagged_event(
+                "e1", CHANNEL, p=OTHER_PUBKEY,
+                content="@ResearchBot how can i connect a Hermes Cloud agent to "
+                        "buzz? what does hermes offer?",
+            ),
+        )
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_p_tagged_mention_dispatches(self, adapter):
+        """A normal @mention resolves to our pubkey — dispatches."""
+        await self._poll_with(
+            adapter,
+            _tagged_event("e1", CHANNEL, p=SELF_PUBKEY, content="@Chip please summarize"),
+        )
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_multi_mention_including_self_dispatches(self, adapter):
+        """@Other @Chip: the p-tags include ours, so the message is for us too."""
+        event = _tagged_event(
+            "e1", CHANNEL, p=SELF_PUBKEY, content="@ResearchBot @Chip thoughts?"
+        )
+        event["tags"].append(["p", OTHER_PUBKEY])
+        await self._poll_with(adapter, event)
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_name_in_prose_without_p_tags_still_dispatches(self, adapter):
+        """No p-tags (relay/client omits them): the text gate stays the
+        authority, so name-in-prose keeps dispatching — the change only
+        narrows, never widens."""
+        adapter._display_name = "Hermes"
+        await self._poll_with(adapter, _event("e1", content="what is hermes?"))
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_p_tags_never_widen_the_gate(self, adapter):
+        """p-tag alone is not sufficient: p-tagged to us but un-mentioned in
+        a real channel must stay behind the text gate (this is exactly the
+        DM-latch discriminator of #68871, asserted here for the gate)."""
+        await self._poll_with(
+            adapter,
+            _tagged_event("e1", CHANNEL, p=SELF_PUBKEY, content="thanks everyone"),
+        )
         assert adapter._dispatched == []
 
 

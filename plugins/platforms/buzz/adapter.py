@@ -1008,8 +1008,12 @@ class BuzzAdapter(BasePlatformAdapter):
         is_dm = state["chat_type"] == "dm"
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # DMs always dispatch.  When the event p-tags another agent, the
+        # mention was resolved to them (issue #75166) — never dispatch,
+        # regardless of what the text contains.
+        if not is_dm and self.require_mention and (
+            self._event_addresses_other_agent(event) or not self._is_mentioned(content)
+        ):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
@@ -1111,6 +1115,28 @@ class BuzzAdapter(BasePlatformAdapter):
         state["chat_type"] = "dm"
         self._channel_names.setdefault(channel_id, "DM")
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
+
+    def _event_addresses_other_agent(self, event: dict) -> bool:
+        """True when the event carries p-tags but none targets our pubkey.
+
+        Buzz resolves ``@Name`` into the mentioned member's pubkey and
+        emits it as a ``p`` tag, so an event p-tagged to somebody else was
+        addressed to that agent — never to us, no matter what the text
+        contains.  This only ever narrows dispatch: events with no p-tags
+        (relays or clients that omit mention tags) return False and fall
+        through to the text gate.
+        """
+        if not self._self_pubkey:
+            return False
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        p_targets = [
+            str(tag[1]).lower()
+            for tag in tags
+            if isinstance(tag, (list, tuple)) and len(tag) > 1 and tag[0] == "p"
+        ]
+        return bool(p_targets) and self._self_pubkey not in p_targets
 
     def _is_mentioned(self, content: str) -> bool:
         """True when the message addresses this agent (npub, hex, or name)."""
