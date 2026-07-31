@@ -147,6 +147,41 @@ class TestHermesManagedNode:
         assert find_node_executable("npm") is None
         assert find_node_executable("npm") != str(path_npm)
 
+    def test_unstattable_managed_entry_is_treated_as_absent(self, tmp_path, monkeypatch):
+        """A managed entry that cannot be stat'd must not abort the probe.
+
+        ``Path.is_file()`` only swallows the winerrors in
+        ``pathlib._IGNORED_WINERRORS``; ``ERROR_CANT_ACCESS_FILE`` (1920) is not
+        one of them, so an unresolvable reparse point — a POSIX Node tarball
+        unpacked into a Windows ``HERMES_HOME`` leaves ``node/bin/npm`` as a
+        symlink Windows cannot traverse — used to raise straight through the
+        managed-Node scan and take down callers like ``hermes dashboard``
+        before they could fall back to PATH.
+        """
+        home = tmp_path / "hermes"
+        unstattable = home / "node" / "npm"
+        unstattable.parent.mkdir(parents=True)
+        bin_dir = tmp_path / "nodejs"
+        bin_dir.mkdir()
+        path_npm = bin_dir / "npm.cmd"
+        path_npm.write_text("@echo off\n")
+
+        real_is_file = Path.is_file
+
+        def raising_is_file(self):
+            if self == unstattable:
+                raise OSError(22, "The file cannot be accessed by the system")
+            return real_is_file(self)
+
+        monkeypatch.setattr(Path, "is_file", raising_is_file)
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("PATH", str(bin_dir))
+
+        assert hermes_managed_node_tree_present() is False
+        assert find_hermes_node_executable("npm") is None
+        assert find_node_executable("npm") == str(path_npm)
+
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shell stubs; Windows uses .cmd shims")

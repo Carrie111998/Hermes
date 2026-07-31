@@ -293,6 +293,24 @@ def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:
     return [bin_dir] + dirs
 
 
+def _is_probe_file(candidate: Path) -> bool:
+    """Return ``candidate.is_file()``, treating an unstattable path as "no".
+
+    ``Path.is_file()`` only swallows the Windows errors listed in
+    ``pathlib._IGNORED_WINERRORS`` (21, 123, 1921). ``ERROR_CANT_ACCESS_FILE``
+    (1920) is not among them, so an unresolvable reparse point raises
+    ``OSError`` instead of reporting "not a file" — e.g. a POSIX Node tarball
+    unpacked into a Windows ``HERMES_HOME`` leaves ``node/bin/npm`` as a symlink
+    Windows cannot traverse. Every managed-Node probe below scans directories
+    that can contain exactly that, and the raise escapes far enough to abort
+    ``hermes dashboard`` before it can fall back to PATH or self-heal.
+    """
+    try:
+        return candidate.is_file()
+    except OSError:
+        return False
+
+
 def _candidate_node_command_names(command: str) -> list[str]:
     base = Path(command).name
     if sys.platform != "win32" or "." in base:
@@ -330,7 +348,7 @@ def node_tool_runnable(path: str | None) -> bool:
         return False
     candidate = Path(path)
     if sys.platform == "win32":
-        if not candidate.is_file():
+        if not _is_probe_file(candidate):
             return False
     elif not os.path.exists(path) or not os.access(path, os.X_OK):
         return False
@@ -360,7 +378,7 @@ def hermes_managed_node_tree_present(home: Path | None = None) -> bool:
     for directory in iter_hermes_node_dirs(home):
         for name in names:
             candidate = directory / name
-            if candidate.is_file() and (
+            if _is_probe_file(candidate) and (
                 sys.platform == "win32" or os.access(candidate, os.X_OK)
             ):
                 return True
@@ -475,7 +493,7 @@ def find_hermes_node_executable(command: str) -> str | None:
     for directory in iter_hermes_node_dirs():
         for name in names:
             candidate = directory / name
-            if candidate.is_file() and (
+            if _is_probe_file(candidate) and (
                 sys.platform == "win32" or os.access(candidate, os.X_OK)
             ):
                 resolved = str(candidate)
@@ -486,7 +504,7 @@ def find_hermes_node_executable(command: str) -> str | None:
         for directory in iter_hermes_node_dirs():
             for name in names:
                 candidate = directory / name
-                if candidate.is_file() and (
+                if _is_probe_file(candidate) and (
                     sys.platform == "win32" or os.access(candidate, os.X_OK)
                 ):
                     resolved = str(candidate)
@@ -511,14 +529,14 @@ def find_node_executable_on_path(command: str) -> str | None:
         sep and sep in command_str for sep in (os.sep, os.altsep, "/", "\\")
     )
     if has_path_separator:
-        return command_str if Path(command_str).is_file() else None
+        return command_str if _is_probe_file(Path(command_str)) else None
 
     for name in _candidate_node_command_names(command_str):
         for directory in os.environ.get("PATH", "").split(os.pathsep):
             if not directory:
                 continue
             candidate = Path(directory) / name
-            if candidate.is_file():
+            if _is_probe_file(candidate):
                 return str(candidate)
     return None
 
