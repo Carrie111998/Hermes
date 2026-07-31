@@ -825,6 +825,41 @@ def test_changed_systemd_invocation_between_observations_blocks_publication(
     assert not (fixture.final / builder.MANIFEST_NAME).exists()
 
 
+def test_latched_completed_v3_builder_promotes_without_a_live_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    unit = f"muncho-release-builder-v3@{REVISION}.service"
+    fixture.roots = promoter.PromoterRoots(
+        job_root=fixture.roots.job_root,
+        release_parent=fixture.roots.release_parent,
+        builder_unit_fragment=fixture.roots.builder_unit_fragment,
+        builder_wrapper=fixture.roots.builder_wrapper,
+        promotion_interlock=fixture.roots.promotion_interlock,
+        builder_unit_prefix="muncho-release-builder-v3@",
+        cgroup_root=fixture.roots.cgroup_root,
+        proc_root=fixture.roots.proc_root,
+    )
+    fixture.systemd_properties = {
+        **fixture.systemd_properties,
+        "Id": unit,
+        "ActiveState": "active",
+        "SubState": "exited",
+        "ControlGroup": f"/system.slice/{unit}",
+    }
+
+    result = _promote(fixture)
+
+    assert result["completed"] is True
+    assert fixture.final.is_dir()
+    evidence = json.loads(
+        (fixture.final / builder.RECEIPT_NAME).read_text(encoding="utf-8")
+    )["process_free_evidence"]
+    assert evidence["initial"]["systemd_state"]["active"] == "active"
+    assert evidence["final"]["systemd_state"]["sub"] == "exited"
+
+
 def test_root_input_change_after_staging_blocks_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

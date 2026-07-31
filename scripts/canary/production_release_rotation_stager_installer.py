@@ -31,6 +31,9 @@ INSTALL_RECEIPT_SCHEMA = "muncho-production-unit-input-rotation-stager-installat
 REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA = (
     "muncho-production-unit-input-rotation-stager-installation.v2"
 )
+LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA = (
+    "muncho-production-unit-input-rotation-stager-installation.v3"
+)
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -116,6 +119,24 @@ _REVISION_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
     ),
     "ops/muncho/release-updater/muncho-release-foundation-exec-v2": (
         "libexec/muncho-release-foundation-exec-v2",
+        0o555,
+    ),
+}
+_LATCHED_REVISION_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
+    "ops/muncho/release-updater/muncho-release-builder.sysusers": (
+        "sysusers/muncho-release-builder.conf",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-builder.tmpfiles": (
+        "tmpfiles/muncho-release-builder.conf",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-builder-v3@.service": (
+        "systemd/muncho-release-builder-v3@.service",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-foundation-exec-v3": (
+        "libexec/muncho-release-foundation-exec-v3",
         0o555,
     ),
 }
@@ -390,7 +411,9 @@ def _install_for_test(
     identity_validator: Callable[[], None] = _validate_builder_identity,
     foundation_validator: Callable[[InstallerRoots], None] | None = None,
     revision_qualified: bool = False,
+    revision_qualified_v3: bool = False,
 ) -> Mapping[str, Any]:
+    revisioned = revision_qualified or revision_qualified_v3
     if (
         not isinstance(roots, InstallerRoots)
         or _REVISION.fullmatch(release_revision or "") is None
@@ -402,6 +425,8 @@ def _install_for_test(
         or ".." in source_root.parts
         or type(production) is not bool
         or type(revision_qualified) is not bool
+        or type(revision_qualified_v3) is not bool
+        or revision_qualified and revision_qualified_v3
         or (
             production
             and (
@@ -472,12 +497,16 @@ def _install_for_test(
         (f"{release_revision}:scripts/canary/production_release_candidate_promoter.py"),
     )
     builder_unit_source = (
-        "ops/muncho/release-updater/muncho-release-builder-v2@.service"
+        "ops/muncho/release-updater/muncho-release-builder-v3@.service"
+        if revision_qualified_v3
+        else "ops/muncho/release-updater/muncho-release-builder-v2@.service"
         if revision_qualified
         else "ops/muncho/release-updater/muncho-release-builder@.service"
     )
     builder_wrapper_source = (
-        "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
+        "ops/muncho/release-updater/muncho-release-foundation-exec-v3"
+        if revision_qualified_v3
+        else "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
         if revision_qualified
         else "ops/muncho/release-updater/muncho-release-builder-phase"
     )
@@ -536,12 +565,16 @@ def _install_for_test(
         ):
             _fail("rotation_stager_installer_protocol_drift")
         unit_hash_name = (
-            "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
+            "PRODUCTION_LATCHED_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
+            if revision_qualified_v3
+            else "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
             if revision_qualified
             else "PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256"
         )
         wrapper_hash_name = (
-            "PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256"
+            "PRODUCTION_LATCHED_REVISION_BUILDER_WRAPPER_SHA256"
+            if revision_qualified_v3
+            else "PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256"
             if revision_qualified
             else "PRODUCTION_BUILDER_WRAPPER_SHA256"
         )
@@ -558,11 +591,11 @@ def _install_for_test(
 
     library_root = (
         roots.library_releases / release_revision
-        if revision_qualified
+        if revisioned
         else roots.library
     )
     for root in (
-        roots.library_releases if revision_qualified else roots.library,
+        roots.library_releases if revisioned else roots.library,
         roots.sysusers,
         roots.tmpfiles,
         roots.systemd,
@@ -572,7 +605,7 @@ def _install_for_test(
             root,
             create=(
                 root
-                == (roots.library_releases if revision_qualified else roots.library)
+                == (roots.library_releases if revisioned else roots.library)
                 or not production
             ),
             production=production,
@@ -588,7 +621,9 @@ def _install_for_test(
     installed: list[Mapping[str, Any]] = []
     created_count = 0
     selected_assets = (
-        {**_REVISION_LIBRARY_ASSETS, **_REVISION_STATIC_ASSETS}
+        {**_REVISION_LIBRARY_ASSETS, **_LATCHED_REVISION_STATIC_ASSETS}
+        if revision_qualified_v3
+        else {**_REVISION_LIBRARY_ASSETS, **_REVISION_STATIC_ASSETS}
         if revision_qualified
         else _SOURCE_ASSETS
     )
@@ -602,7 +637,7 @@ def _install_for_test(
         )
         target = (
             library_root / target_relative
-            if revision_qualified and source_relative in _REVISION_LIBRARY_ASSETS
+            if revisioned and source_relative in _REVISION_LIBRARY_ASSETS
             else _target(roots, target_relative)
         )
         created = _publish_exact(
@@ -623,7 +658,7 @@ def _install_for_test(
     for selected in reversed(library_children):
         os.chmod(selected, 0o555)
     os.chmod(library_root, 0o555)
-    if revision_qualified:
+    if revisioned:
         # The root-owned namespace must remain traversable and extensible by a
         # later privileged installer so a second exact revision can coexist.
         # Individual revision directories are sealed 0555 above; unprivileged
@@ -651,7 +686,9 @@ def _install_for_test(
     ]
     unsigned = {
         "schema": (
-            REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+            LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+            if revision_qualified_v3
+            else REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
             if revision_qualified
             else INSTALL_RECEIPT_SCHEMA
         ),
@@ -688,10 +725,14 @@ def _install_for_test(
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
     }
-    if revision_qualified:
+    if revisioned:
         unsigned = {
             **unsigned,
-            "foundation_layout": "revision-qualified-v2",
+            "foundation_layout": (
+                "latched-revision-qualified-v3"
+                if revision_qualified_v3
+                else "revision-qualified-v2"
+            ),
             "foundation_asset_manifest_sha256": _sha256(
                 _canonical(deterministic_assets)
             ),
@@ -712,17 +753,32 @@ def install_revision_qualified_foundation(**kwargs: Any) -> Mapping[str, Any]:
     )
 
 
+def install_latched_revision_qualified_foundation(
+    **kwargs: Any,
+) -> Mapping[str, Any]:
+    return _install_for_test(
+        roots=InstallerRoots(),
+        production=True,
+        revision_qualified_v3=True,
+        **kwargs,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--source-remote", required=True)
     parser.add_argument("--repository-url", required=True)
     parser.add_argument("--release-revision", required=True)
-    parser.add_argument("--revision-qualified", action="store_true")
+    generation = parser.add_mutually_exclusive_group()
+    generation.add_argument("--revision-qualified", action="store_true")
+    generation.add_argument("--revision-qualified-v3", action="store_true")
     arguments = parser.parse_args(argv)
     try:
         installer = (
-            install_revision_qualified_foundation
+            install_latched_revision_qualified_foundation
+            if arguments.revision_qualified_v3
+            else install_revision_qualified_foundation
             if arguments.revision_qualified
             else install_rotation_stager_foundation
         )
@@ -748,9 +804,11 @@ if __name__ == "__main__":
 
 __all__ = [
     "INSTALL_RECEIPT_SCHEMA",
+    "LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA",
     "REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA",
     "InstallerRoots",
     "RotationStagerInstallerError",
+    "install_latched_revision_qualified_foundation",
     "install_revision_qualified_foundation",
     "install_rotation_stager_foundation",
 ]

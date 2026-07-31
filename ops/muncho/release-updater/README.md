@@ -27,6 +27,14 @@ created template can be used, and installation still never enables or starts
 it.  The original fixed-v1 foundation remains immutable audit evidence and is
 not used by the v2 rotation-stager promotion path.
 
+The v3 template is the production promotion boundary.  It uses
+`RemainAfterExit=yes` so a completed oneshot remains `active/exited` with no
+process while systemd retains the trusted invocation ID.  Promotion still
+proves `MainPID=0`, `ExecMainPID=0`, an empty cgroup, no processes under the
+builder UID, and the same invocation and state in both observations.  The v2
+template remains immutable evidence of the earlier portability discovery and
+is never overwritten.
+
 Wheel resolution is intentionally not part of the privileged author.  It
 accepts only an already-verified, self-hashed manifest declaring a complete
 transitive closure for CPython 3.11 on Linux x86_64 and revalidates the exact

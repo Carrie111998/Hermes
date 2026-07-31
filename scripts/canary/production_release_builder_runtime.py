@@ -68,7 +68,7 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_WHEEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,239}\.whl$")
 _SYSTEMD_UNIT = re.compile(
-    r"^muncho-release-builder(?:-v2)?@[A-Za-z0-9_.:@-]{1,128}\.service$"
+    r"^muncho-release-builder(?:-v[23])?@[A-Za-z0-9_.:@-]{1,128}\.service$"
 )
 _INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 _GIT_RECORD = re.compile(
@@ -1279,13 +1279,17 @@ def _normalized_systemd_properties(
             normalized[name] = item
         else:
             _error("production_release_builder_systemd_evidence_invalid")
+    completion_state = (
+        normalized["ActiveState"],
+        normalized["SubState"],
+    )
     if (
         normalized["Id"] != expected_unit
         or normalized["FragmentPath"] != str(expected_fragment)
         or normalized["DropInPaths"] != ""
         or normalized["LoadState"] != "loaded"
-        or normalized["ActiveState"] != "inactive"
-        or normalized["SubState"] != "dead"
+        or completion_state
+        not in {("inactive", "dead"), ("active", "exited")}
         or normalized["MainPID"] != "0"
         or normalized["ExecMainPID"] != "0"
         or normalized["Result"] != "success"
@@ -1744,6 +1748,28 @@ def validate_process_free_evidence_record(
     unsigned = {name: item for name, item in value.items() if name != "evidence_sha256"}
     state = value.get("systemd_state")
     inspected = value.get("inspected_cgroups")
+    allowed_states = (
+        {
+            "load": "loaded",
+            "active": "inactive",
+            "sub": "dead",
+            "result": "success",
+            "main_pid": 0,
+            "exec_main_pid": 0,
+            "exec_main_code": "exited",
+            "exec_main_status": 0,
+        },
+        {
+            "load": "loaded",
+            "active": "active",
+            "sub": "exited",
+            "result": "success",
+            "main_pid": 0,
+            "exec_main_pid": 0,
+            "exec_main_code": "exited",
+            "exec_main_status": 0,
+        },
+    )
     if (
         value.get("schema") != PROCESS_FREE_EVIDENCE_SCHEMA
         or _SYSTEMD_UNIT.fullmatch(str(value.get("unit"))) is None
@@ -1764,17 +1790,7 @@ def validate_process_free_evidence_record(
         or value.get("secret_material_recorded") is not False
         or value.get("secret_digest_recorded") is not False
         or not isinstance(state, Mapping)
-        or state
-        != {
-            "load": "loaded",
-            "active": "inactive",
-            "sub": "dead",
-            "result": "success",
-            "main_pid": 0,
-            "exec_main_pid": 0,
-            "exec_main_code": "exited",
-            "exec_main_status": 0,
-        }
+        or state not in allowed_states
         or _SHA256.fullmatch(str(value.get("evidence_sha256"))) is None
         or value.get("evidence_sha256") != _sha256_bytes(_canonical(unsigned))
     ):
@@ -1809,6 +1825,7 @@ def build_process_free_evidence_set(
         "wrapper_path",
         "wrapper_sha256",
         "invocation_id",
+        "systemd_state",
         "control_group",
         "builder_uid",
         "builder_gid",

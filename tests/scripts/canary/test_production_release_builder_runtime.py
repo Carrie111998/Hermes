@@ -185,6 +185,54 @@ def test_process_free_evidence_accepts_revision_qualified_builder_unit(
     assert evidence["unit"] == unit
 
 
+def test_process_free_evidence_accepts_latched_completed_builder_unit(
+    tmp_path: Path,
+) -> None:
+    fragment = tmp_path / "muncho-release-builder-v3@.service"
+    fragment.write_bytes(b"[Service]\nType=oneshot\nRemainAfterExit=yes\n")
+    fragment.chmod(0o444)
+    wrapper = tmp_path / "muncho-release-foundation-exec-v3"
+    wrapper.write_bytes(b"#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o555)
+    cgroup_root = tmp_path / "cgroup"
+    (cgroup_root / "system.slice").mkdir(parents=True)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    unit = "muncho-release-builder-v3@" + "a" * 40 + ".service"
+    control_group = f"/system.slice/{unit}"
+    properties = {
+        **_systemd_properties(fragment, cgroup=control_group),
+        "Id": unit,
+        "ActiveState": "active",
+        "SubState": "exited",
+    }
+
+    evidence = runtime.validate_process_free_evidence(
+        properties,
+        expected_unit=unit,
+        expected_fragment=fragment,
+        expected_fragment_sha256=_sha256(fragment),
+        expected_wrapper=wrapper,
+        expected_wrapper_sha256=_sha256(wrapper),
+        expected_control_group=control_group,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+        cgroup_root=cgroup_root,
+        proc_root=proc_root,
+        authority_uid=os.geteuid(),
+        authority_gid=_gid(fragment),
+        xattr_reader=_empty_xattrs,
+    )
+
+    assert evidence["systemd_state"]["active"] == "active"
+    assert evidence["systemd_state"]["sub"] == "exited"
+    assert runtime.validate_process_free_evidence_record(
+        evidence,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+    ) == evidence
+
+
 def test_parse_and_materialize_exact_git_tree(tmp_path: Path) -> None:
     blobs = {
         "bin/run.py": b"#!/usr/bin/env python3\nprint('ok')\n",
@@ -791,6 +839,32 @@ def test_process_evidence_set_binds_both_canonical_observations(
         runtime.build_process_free_evidence_set(
             evidence["initial"],
             tampered["final"],
+            builder_uid=BUILDER_UID,
+            builder_gid=BUILDER_GID,
+        )
+
+    changed_state = {
+        **evidence["final"],
+        "systemd_state": {
+            **evidence["final"]["systemd_state"],
+            "active": "active",
+            "sub": "exited",
+        },
+    }
+    changed_state["evidence_sha256"] = runtime._sha256_bytes(
+        runtime._canonical({
+            name: item
+            for name, item in changed_state.items()
+            if name != "evidence_sha256"
+        })
+    )
+    with pytest.raises(
+        runtime.ProductionReleaseBuilderError,
+        match="process_evidence_changed",
+    ):
+        runtime.build_process_free_evidence_set(
+            evidence["initial"],
+            changed_state,
             builder_uid=BUILDER_UID,
             builder_gid=BUILDER_GID,
         )

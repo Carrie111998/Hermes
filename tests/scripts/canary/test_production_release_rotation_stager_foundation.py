@@ -270,6 +270,8 @@ def test_root_pinned_python_accepts_standard_root_owned_0755(
 def _installer_source(tmp_path: Path) -> tuple[Path, str]:
     source_paths = set(installer._SOURCE_ASSETS) | set(
         installer._REVISION_STATIC_ASSETS
+    ) | set(
+        installer._LATCHED_REVISION_STATIC_ASSETS
     )
     files = {
         relative: (ROOT / relative).read_bytes()
@@ -461,6 +463,55 @@ def test_revision_qualified_foundation_is_create_only_and_inert(
     assert first["activation_performed"] is False
 
 
+def test_latched_revision_foundation_is_create_only_and_inert(
+    tmp_path: Path,
+) -> None:
+    source, revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    kwargs = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "release_revision": revision,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(
+            roots, calls, argv
+        ),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified_v3": True,
+    }
+
+    first = installer._install_for_test(**kwargs)
+    second = installer._install_for_test(**kwargs)
+
+    expected_assets = len(installer._REVISION_LIBRARY_ASSETS) + len(
+        installer._LATCHED_REVISION_STATIC_ASSETS
+    )
+    assert (
+        first["schema"]
+        == installer.LATCHED_REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+    )
+    assert first["foundation_layout"] == "latched-revision-qualified-v3"
+    assert first["created_asset_count"] == expected_assets
+    assert second["created_asset_count"] == 0
+    assert (
+        roots.systemd / "muncho-release-builder-v3@.service"
+    ).stat().st_mode & 0o777 == 0o444
+    unit = (
+        roots.systemd / "muncho-release-builder-v3@.service"
+    ).read_text(encoding="utf-8")
+    assert "RemainAfterExit=yes" in unit
+    assert (
+        roots.libexec / "muncho-release-foundation-exec-v3"
+    ).stat().st_mode & 0o777 == 0o555
+    assert not any("systemctl" in item for call in calls for item in call)
+    assert first["systemd_daemon_reload_performed"] is False
+    assert first["unit_started"] is False
+
+
 def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(
     tmp_path: Path,
 ) -> None:
@@ -546,8 +597,16 @@ def test_revision_qualified_foundation_rejects_divergent_same_revision_asset(
         installer._install_for_test(**kwargs)
 
 
+@pytest.mark.parametrize(
+    "wrapper_name",
+    (
+        "muncho-release-foundation-exec-v2",
+        "muncho-release-foundation-exec-v3",
+    ),
+)
 def test_revision_foundation_wrapper_preserves_python_argv_contract(
     tmp_path: Path,
+    wrapper_name: str,
 ) -> None:
     revision = "a" * 40
     library_base = tmp_path / "library-releases"
@@ -561,7 +620,7 @@ def test_revision_foundation_wrapper_preserves_python_argv_contract(
     )
     source = (
         ROOT
-        / "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
+        / f"ops/muncho/release-updater/{wrapper_name}"
     ).read_text(encoding="utf-8")
     source = source.replace(
         "/usr/lib/muncho-release-updater-releases",
