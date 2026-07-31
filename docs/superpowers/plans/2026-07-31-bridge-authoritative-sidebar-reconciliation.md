@@ -71,7 +71,7 @@ class SidebarReconciliationEvidence:
     inventory_digest: str
     marker_digest: str
     match_count: int
-    recovered_thread: VerifiedSidebarThread | None
+    recovered_thread_id: str | None
     fixed_reason: str | None
 ```
 
