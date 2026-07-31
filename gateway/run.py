@@ -19097,31 +19097,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
-        from run_agent import AIAgent
-
         media_urls = media_urls or []
         media_types = media_types or []
+        _run_generation = 0
+        try:
+            _source_session_key = self._session_key_for_source(source)
+        except Exception:
+            _source_session_key = (
+                f"{getattr(source.platform, 'value', source.platform)}:"
+                f"{source.chat_id or 'unknown-chat'}"
+            )
+        _background_session_key = f"{_source_session_key}:background:{task_id}"
+        _run_receipt_id, _run_message_ref = _gateway_run_receipt_identity(
+            session_key=_background_session_key,
+            session_id=task_id,
+            run_generation=_run_generation,
+            run_index=0,
+            platform_message_id=event_message_id,
+            reply_anchor=None,
+        )
+        from gateway.delivery_ledger import begin_run_receipt
 
-        adapter = self._adapter_for_source(source)
-        if not adapter:
-            logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
-            return
+        begin_run_receipt(
+            run_receipt_id=_run_receipt_id,
+            session_id=task_id,
+            task_id=task_id,
+            session_key=_background_session_key,
+            platform=str(
+                getattr(source.platform, "value", source.platform) or ""
+            ),
+            run_generation=_run_generation,
+            message_ref=_run_message_ref,
+        )
 
-        _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        adapter = None
+        _thread_metadata = None
+        _terminal_closed = False
+        _final_delivery_started = False
+
+        def _close_terminal(result: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal _terminal_closed
+            closed = _record_gateway_run_terminal(
+                result,
+                run_receipt_id=_run_receipt_id,
+                session_id=task_id,
+                task_id=task_id,
+                session_key=_background_session_key,
+                platform=source.platform,
+                run_generation=_run_generation,
+                message_ref=_run_message_ref,
+            )
+            _terminal_closed = True
+            return closed
+
+        async def _deliver_terminal(
+            content: str,
+            terminal: Dict[str, Any],
+        ) -> Any:
+            nonlocal _final_delivery_started
+            final_content = str(content or "").strip()
+            terminal = dict(terminal)
+            terminal["final_response"] = final_content
+            terminal["final_generated"] = bool(final_content)
+            _final_delivery_started = True
+            try:
+                delivery_result = await _send_final_with_delivery_proof(
+                    adapter=adapter,
+                    chat_id=source.chat_id,
+                    content=final_content,
+                    metadata=_thread_metadata,
+                    session_key=_background_session_key,
+                    message_ref=_run_message_ref,
+                    platform=source.platform,
+                    thread_id=source.thread_id,
+                    run_receipt_id=_run_receipt_id,
+                )
+            except BaseException as send_exc:
+                failed = _gateway_exception_terminal_fields(send_exc)
+                failed["run_end_reason"] = (
+                    "background_final_delivery_cancelled"
+                    if failed["run_terminal_state"] == "cancelled"
+                    else (
+                        "background_final_delivery_exception:"
+                        f"{type(send_exc).__name__}"
+                    )
+                )
+                failed["final_response"] = final_content
+                failed["final_generated"] = bool(final_content)
+                _close_terminal(failed)
+                raise
+            _close_terminal(terminal)
+            return delivery_result
 
         try:
+            _thread_metadata = self._thread_metadata_for_source(
+                source, event_message_id
+            )
+            adapter = self._adapter_for_source(source)
+            if not adapter:
+                logger.warning(
+                    "No adapter for platform %s in background task %s",
+                    source.platform,
+                    task_id,
+                )
+                _close_terminal(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_adapter_unavailable",
+                        "final_generated": False,
+                    }
+                )
+                return
+
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _deliver_terminal(
+                    (
+                        f"❌ Background task {task_id} failed: "
+                        "no provider credentials configured."
+                    ),
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_missing_credentials",
+                    },
                 )
                 return
+
+            from run_agent import AIAgent
 
             platform_key = _platform_config_key(source.platform)
 
@@ -19192,106 +19302,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        run_receipt_id=_run_receipt_id,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
 
-            result = await self._run_in_executor_with_context(run_sync)
+            raw_result = await self._run_in_executor_with_context(run_sync)
+            result = dict(raw_result) if isinstance(raw_result, dict) else {}
+            response = str(result.get("final_response") or "")
+            agent_error = str(result.get("error") or "")
+            if (not response or response == "(empty)") and agent_error:
+                response = f"Error: {agent_error}"
+            _agent_response_generated = bool(
+                response and response != "(empty)"
+            )
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
-
-            # Extract media files from the response
-            if response:
+            media_files = []
+            images = []
+            text_content = ""
+            if response and response != "(empty)":
                 media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
+
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+            if text_content:
+                final_content = header + text_content
+            elif images or media_files:
+                final_content = header + "(Media response attached.)"
+            else:
+                final_content = header + "(No response generated)"
 
-                if text_content:
-                    await adapter.send(
+            terminal = result
+            if not _agent_response_generated:
+                terminal.update(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_agent_empty_response",
+                    }
+                )
+            elif agent_error and terminal.get("run_terminal_state") not in {
+                "blocked",
+                "failed",
+                "cancelled",
+            }:
+                terminal.update(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_agent_error",
+                    }
+                )
+
+            await _deliver_terminal(final_content, terminal)
+
+            # Media-only responses still have the tracked final above.
+            for image_url, alt_text in (images or []):
+                try:
+                    await adapter.send_image(
                         chat_id=source.chat_id,
-                        content=header + text_content,
+                        image_url=image_url,
+                        caption=alt_text,
                         metadata=_thread_metadata,
                     )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+                except Exception:
+                    pass
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
-                    try:
-                        await adapter.send_image(
+            from gateway.platforms.base import (
+                should_send_media_as_audio as _should_send_media_as_audio,
+            )
+
+            _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+            _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+            for media_path, _is_voice in (media_files or []):
+                _ext = os.path.splitext(media_path)[1].lower()
+                try:
+                    if _should_send_media_as_audio(source.platform, _ext, _is_voice):
+                        await adapter.send_voice(
                             chat_id=source.chat_id,
-                            image_url=image_url,
-                            caption=alt_text,
+                            audio_path=media_path,
                             metadata=_thread_metadata,
                         )
-                    except Exception:
-                        pass
+                    elif _ext in _VIDEO_EXTS:
+                        await adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    elif _ext in _IMAGE_EXTS:
+                        await adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    else:
+                        await adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                except Exception:
+                    pass
 
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
-                from gateway.platforms.base import (
-                    should_send_media_as_audio as _should_send_media_as_audio,
-                )
-                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-                for media_path, _is_voice in (media_files or []):
-                    _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
-            else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
-                )
-
-        except Exception as e:
+        except BaseException as e:
             logger.exception("Background task %s failed", task_id)
-            try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
+            if not _terminal_closed:
+                terminal = _gateway_exception_terminal_fields(e)
+                terminal["run_end_reason"] = (
+                    "background_cancelled"
+                    if terminal["run_terminal_state"] == "cancelled"
+                    else f"background_exception:{type(e).__name__}"
                 )
-            except Exception:
-                pass
+                if adapter is not None and not _final_delivery_started:
+                    try:
+                        await _deliver_terminal(
+                            f"❌ Background task {task_id} failed: {e}",
+                            terminal,
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    _close_terminal(terminal)
+            if isinstance(
+                e,
+                (asyncio.CancelledError, KeyboardInterrupt, InterruptedError),
+            ) or not isinstance(e, Exception):
+                raise
 
 
 
