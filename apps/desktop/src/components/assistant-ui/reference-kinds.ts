@@ -24,6 +24,7 @@ export type ReferenceKind =
   | 'terminal'
   | 'session'
   | 'git'
+  | 'blame'
   | 'diff'
   | 'staged'
   | 'command'
@@ -101,6 +102,11 @@ export const REFERENCE_STYLES: Record<ReferenceKind, ReferenceStyle> = {
     label: 'Sessions'
   },
   git: { codicon: 'git-branch', paths: ['M7 18l0 -12', 'M7 8a2 2 0 1 0 0 -4a2 2 0 0 0 0 4'], label: 'Git' },
+  blame: {
+    codicon: 'git-commit',
+    paths: ['M12 5l0 14', 'M9 9l3 0', 'M9 15l3 0', 'M7 8a2 2 0 1 0 0 -4a2 2 0 0 0 0 4'],
+    label: 'Blame'
+  },
   diff: { codicon: 'diff', paths: ['M12 5l0 14', 'M5 12l14 0'], label: 'Changes' },
   staged: { codicon: 'diff-added', paths: ['M12 5l0 14', 'M5 12l14 0'], label: 'Staged' },
   command: { codicon: 'terminal', paths: TERMINAL_PATHS, label: 'Commands' },
@@ -135,7 +141,17 @@ export function referenceStyle(type: string | undefined): ReferenceStyle {
  * above: `command`/`skill`/`theme` arrive via `/`, and `diff`/`staged`/`emoji`
  * have no value to carry.
  */
-export const WIRE_REFERENCE_KINDS = ['file', 'folder', 'url', 'image', 'tool', 'line', 'terminal', 'session'] as const
+export const WIRE_REFERENCE_KINDS = [
+  'file',
+  'folder',
+  'url',
+  'image',
+  'tool',
+  'line',
+  'terminal',
+  'session',
+  'blame'
+] as const
 
 /**
  * The one pattern that recognises a reference in text.
@@ -144,7 +160,8 @@ export const WIRE_REFERENCE_KINDS = ['file', 'folder', 'url', 'image', 'tool', '
  * a space — so the quoted forms are tried BEFORE bare `\S+`, or a quoted value
  * would end at the first space and strand the rest as prose.
  */
-const REFERENCE_PATTERN = /@(file|folder|url|image|tool|line|terminal|session):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/
+const REFERENCE_PATTERN =
+  /@(file|folder|url|image|tool|line|terminal|session|blame):(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)/
 
 /**
  * A fresh matcher for every surface that has to find references in text: the

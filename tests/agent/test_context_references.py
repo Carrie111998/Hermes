@@ -60,16 +60,66 @@ def test_parse_typed_references_ignores_emails_and_handles():
     message = (
         "email me at user@example.com and ping @teammate "
         "but include @file:src/main.py:1-2 plus @diff and @git:2 "
-        "and @url:https://example.com/docs"
+        "and @url:https://example.com/docs and @blame:src/helper.py:1"
     )
 
     refs = parse_context_references(message)
 
-    assert [ref.kind for ref in refs] == ["file", "diff", "git", "url"]
+    assert [ref.kind for ref in refs] == ["file", "diff", "git", "url", "blame"]
     assert refs[0].target == "src/main.py"
     assert refs[0].line_start == 1
     assert refs[0].line_end == 2
     assert refs[2].target == "2"
+    assert refs[4].target == "src/helper.py"
+    assert refs[4].line_start == 1
+    assert refs[4].line_end == 1
+
+
+def test_blame_reference_injects_git_blame(sample_repo: Path):
+    from agent.context_references import preprocess_context_references
+
+    result = preprocess_context_references(
+        "Who wrote @blame:src/helper.py?",
+        cwd=sample_repo,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.blocked
+    assert result.references[0].kind == "blame"
+    assert "git blame" in result.message
+    assert "VALUE = 1" in result.message or "VALUE = 2" in result.message
+    assert "Hermes Tests" in result.message or "initial" in result.message.lower() or len(result.message) > 50
+
+
+def test_blame_reference_supports_line_range(sample_repo: Path):
+    from agent.context_references import preprocess_context_references
+
+    result = preprocess_context_references(
+        "Narrow @blame:src/main.py:1-2",
+        cwd=sample_repo,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.warnings
+    # Line-range blame should include early lines and not dump the whole file.
+    assert "def alpha" in result.message
+    assert result.message.count("\n") < 40
+
+
+def test_blame_missing_file_becomes_warning(sample_repo: Path):
+    from agent.context_references import preprocess_context_references
+
+    result = preprocess_context_references(
+        "Check @blame:nope.py",
+        cwd=sample_repo,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert len(result.warnings) == 1
+    assert "not found" in result.warnings[0].lower()
 
 
 

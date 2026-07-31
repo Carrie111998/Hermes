@@ -9,8 +9,8 @@ import { normalize } from '@/lib/text'
 import type { CompletionEntry, CompletionPayload } from './use-live-completion-adapter'
 import { useLiveCompletionAdapter } from './use-live-completion-adapter'
 
-const KIND_RE = /^@(file|folder|url|image|tool|git):(.*)$/
-const REF_STARTERS = new Set(['file', 'folder', 'url', 'image', 'tool', 'git'])
+const KIND_RE = /^@(file|folder|url|image|tool|git|blame):(.*)$/
+const REF_STARTERS = new Set(['file', 'folder', 'url', 'image', 'tool', 'git', 'blame'])
 
 const STARTER_META: Record<string, string> = {
   file: 'Attach a file reference',
@@ -18,7 +18,8 @@ const STARTER_META: Record<string, string> = {
   url: 'Attach a URL reference',
   image: 'Attach an image reference',
   tool: 'Attach a tool reference',
-  git: 'Attach git context'
+  git: 'Attach git context',
+  blame: 'Attach git blame for a file'
 }
 
 function starterEntries(query: string): CompletionEntry[] {

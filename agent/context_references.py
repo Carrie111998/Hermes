@@ -12,11 +12,11 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
-from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_cli._subprocess_compat import IS_WINDOWS, resolve_git_command, windows_hide_flags
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(
-    rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
+    rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url|blame):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
 )
 TRAILING_PUNCTUATION = ",.;!?"
 _NEEDS_QUOTING = re.compile(r"""[\s()\[\]{}<>"'`]""")
@@ -101,7 +101,7 @@ def parse_context_references(message: str) -> list[ContextReference]:
         line_end = None
         target = _strip_reference_wrappers(value)
 
-        if kind == "file":
+        if kind in ("file", "blame"):
             target, line_start, line_end = _parse_file_reference_value(value)
 
         refs.append(
@@ -254,6 +254,8 @@ async def _expand_reference(
         if ref.kind == "git":
             count = max(1, min(int(ref.target or "1"), 10))
             return _expand_git_reference(ref, cwd, ["log", f"-{count}", "-p"], f"git log -{count} -p")
+        if ref.kind == "blame":
+            return _expand_blame_reference(ref, cwd, allowed_root=allowed_root)
         if ref.kind == "url":
             content = await _fetch_url_content(ref.target, url_fetcher=url_fetcher)
             if not content:
@@ -321,11 +323,13 @@ def _expand_git_reference(
     cwd: Path,
     args: list[str],
     label: str,
+    *,
+    fence: str = "diff",
 ) -> tuple[str | None, str | None]:
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         result = subprocess.run(
-            ["git", *args],
+            resolve_git_command(args),
             cwd=cwd,
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
@@ -335,13 +339,47 @@ def _expand_git_reference(
         )
     except subprocess.TimeoutExpired:
         return f"{ref.raw}: git command timed out (30s)", None
+    except (FileNotFoundError, OSError) as exc:
+        return f"{ref.raw}: git executable not found ({exc})", None
     if result.returncode != 0:
         stderr = (result.stderr or "").strip() or "git command failed"
         return f"{ref.raw}: {stderr}", None
     content = result.stdout.strip()
     if not content:
         content = "(no output)"
-    return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```diff\n{content}\n```"
+    fence_tag = fence or ""
+    return None, f"🧾 {label} ({estimate_tokens_rough(content)} tokens)\n```{fence_tag}\n{content}\n```"
+
+
+def _expand_blame_reference(
+    ref: ContextReference,
+    cwd: Path,
+    *,
+    allowed_root: Path | None = None,
+) -> tuple[str | None, str | None]:
+    if not ref.target:
+        return f"{ref.raw}: path is required", None
+    path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
+    _ensure_reference_path_allowed(path)
+    if not path.exists():
+        return f"{ref.raw}: file not found", None
+    if not path.is_file():
+        return f"{ref.raw}: path is not a file", None
+
+    try:
+        blame_path = str(path.relative_to(cwd)).replace("\\", "/")
+    except ValueError:
+        blame_path = str(path)
+
+    args = ["blame"]
+    if ref.line_start is not None:
+        end = ref.line_end if ref.line_end is not None else ref.line_start
+        args.extend(["-L", f"{ref.line_start},{end}"])
+        label = f"git blame -L {ref.line_start},{end} -- {blame_path}"
+    else:
+        label = f"git blame -- {blame_path}"
+    args.extend(["--", blame_path])
+    return _expand_git_reference(ref, cwd, args, label, fence="")
 
 
 async def _fetch_url_content(

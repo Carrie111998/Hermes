@@ -26,7 +26,11 @@ def _run(tmp_path: Path, word: str) -> list[tuple[str, str]]:
     completer = SlashCommandCompleter.__new__(SlashCommandCompleter)
     completions: Iterable = completer._context_completions(word)
 
-    return [(c.text, c.display_meta) for c in completions if c.text.startswith(("@file:", "@folder:"))]
+    return [
+        (c.text, c.display_meta)
+        for c in completions
+        if c.text.startswith(("@file:", "@folder:", "@blame:"))
+    ]
 
 
 def test_at_folder_only_yields_directories(tmp_path, monkeypatch):
@@ -52,3 +56,14 @@ def test_at_file_bare_without_colon_lists_files(tmp_path, monkeypatch):
 
     assert any(t == "@file:readme.md" for t in texts), texts
     assert not any(t == "@file:src/" for t in texts)
+
+
+def test_at_blame_only_yields_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    texts = [t for t, _ in _run(tmp_path, "@blame:")]
+
+    assert all(t.startswith("@blame:") for t in texts), texts
+    assert any(t == "@blame:readme.md" for t in texts)
+    assert not any(t == "@blame:src/" for t in texts)
+    assert not any(t == "@blame:docs/" for t in texts)

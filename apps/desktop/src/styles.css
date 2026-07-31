@@ -633,6 +633,7 @@
 
 [data-ref='skill'],
 [data-ref='git'],
+[data-ref='blame'],
 [data-ref='diff'],
 [data-ref='staged'] {
   --ref-color: color-mix(in srgb, var(--ui-warm) 82%, var(--foreground));
