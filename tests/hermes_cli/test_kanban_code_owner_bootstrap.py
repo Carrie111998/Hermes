@@ -1063,3 +1063,146 @@ def test_real_hook_allows_owned_write_and_commit_but_blocks_foreign_commit(
         ["git", "log", "-1", "--pretty=%s"], cwd=owned, check=True,
         capture_output=True, text=True,
     ).stdout.strip() == "inside"
+
+
+# ---------------------------------------------------------------------------
+# S-B2 — an active owner must never coexist with an unarmed worker
+# ---------------------------------------------------------------------------
+
+def _spawn_with_fakes(monkeypatch, kb, captured, *, attest=None):
+    """Wire the common spawn doubles and return the captured env/cmd dict."""
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+
+    class FakeProc:
+        pid = os.getpid()
+
+        def terminate(self):
+            captured["terminated"] = True
+
+        def wait(self, timeout=None):
+            captured["waited"] = timeout
+
+    def fake_start(cmd, *, workspace, log_f, env):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(env)
+        return FakeProc()
+
+    class FakeReaper:
+        def poll(self):
+            return None
+
+    def fake_reaper(**kwargs):
+        ready_r, ready_w = os.pipe()
+        os.write(ready_w, b"R")
+        os.close(ready_w)
+        return FakeReaper(), ready_r
+
+    monkeypatch.setattr(kb, "_start_kanban_worker_process", fake_start)
+    monkeypatch.setattr(kb, "_start_worker_owner_reaper", fake_reaper)
+    if attest is not None:
+        monkeypatch.setattr(kb, "_attest_worker_admission_hook_armed", attest)
+    return captured
+
+
+@pytest.mark.parametrize("hostile", [
+    {"HERMES_SAFE_MODE": "1"},
+    {"HERMES_IGNORE_USER_CONFIG": "1"},
+    {"HERMES_SAFE_MODE": "true", "HERMES_IGNORE_USER_CONFIG": "yes"},
+])
+def test_hook_disabling_env_never_reaches_the_gated_worker(
+    monkeypatch, tmp_path, hostile,
+):
+    """A dispatcher started in safe mode must not spawn an unarmed worker."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    for key, value in hostile.items():
+        monkeypatch.setenv(key, value)
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    _spawn_with_fakes(monkeypatch, kb, captured, attest=lambda **kw: None)
+
+    kb._default_spawn(_task(kb), str(workspace))
+
+    env = captured["env"]
+    assert "HERMES_SAFE_MODE" not in env
+    assert "HERMES_IGNORE_USER_CONFIG" not in env
+
+
+def test_gate_stays_shut_and_owner_released_when_hook_is_not_armed(
+    monkeypatch, tmp_path,
+):
+    """Attestation failure must kill the wrapper and leave no active owner."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+
+    def refuse(**kwargs):
+        raise RuntimeError("worker did not arm the AI Factory admission hook")
+
+    _spawn_with_fakes(monkeypatch, kb, captured, attest=refuse)
+
+    with pytest.raises(RuntimeError, match="admission hook"):
+        kb._default_spawn(_task(kb), str(workspace))
+
+    assert captured.get("terminated") is True
+    owner_path = registry / "locks" / "HER-118" / "owner.json"
+    if owner_path.exists():
+        assert json.loads(owner_path.read_text()).get("state") != "active"
+
+
+def test_attestation_runs_the_real_worker_resolution_chain(monkeypatch, tmp_path):
+    """The armed check must exercise the profile's real hook registration."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+    # Correctly configured profile: attestation succeeds.
+    kb._attest_worker_admission_hook_armed(profile_home=profile, env=env)
+
+    # Safe mode disarms hooks at registration time — must be refused.
+    hostile = dict(env)
+    hostile["HERMES_SAFE_MODE"] = "1"
+    with pytest.raises(RuntimeError, match="admission hook"):
+        kb._attest_worker_admission_hook_armed(profile_home=profile, env=hostile)
+
+
+def test_attestation_refuses_a_profile_without_the_factory_hook(
+    monkeypatch, tmp_path,
+):
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    profile.joinpath("config.yaml").write_text(
+        "hooks:\n"
+        "  pre_tool_call:\n"
+        "    - matcher: '.*'\n"
+        "      fail_closed: true\n"
+        "      command: /bin/true\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+    with pytest.raises(RuntimeError, match="admission hook"):
+        kb._attest_worker_admission_hook_armed(profile_home=profile, env=env)

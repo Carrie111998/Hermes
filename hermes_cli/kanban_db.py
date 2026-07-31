@@ -8995,6 +8995,72 @@ def _code_owner_hook_spec(profile_home: Path) -> Optional[dict[str, str]]:
     return spec
 
 
+# Env vars that disarm user-configured shell hooks. A Code worker whose
+# admission hook is disarmed would run with an owner marked ``active`` and
+# zero admission gate — exactly the state the strict contract forbids — so
+# they are stripped from the worker env instead of being inherited from a
+# dispatcher that happened to start in safe mode.
+_HOOK_DISABLING_ENV_VARS = ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG")
+
+
+def _attest_worker_admission_hook_armed(*, profile_home: Path, env: dict) -> None:
+    """Fail closed unless the worker's real chain registers the factory hook.
+
+    The dispatcher-side config read (:func:`_code_owner_hook_spec`) proves what
+    the profile *declares*; it cannot prove what the worker process will
+    actually arm. Safe mode, a disarmed allowlist, or a malformed hooks block
+    all yield zero registered hooks at runtime while the declaration still
+    parses. This runs the worker's genuine resolution chain
+    (``load_config`` + ``register_from_config``) in a subprocess carrying the
+    exact env the worker will receive, and refuses to open the gate unless the
+    AI Factory admission hook is among the hooks that ended up registered.
+    """
+    probe = (
+        "import json,sys\n"
+        "from hermes_cli.config import load_config\n"
+        "from agent.shell_hooks import register_from_config\n"
+        "specs = register_from_config(load_config(), accept_hooks=True)\n"
+        "armed = [\n"
+        "    s.command for s in specs\n"
+        "    if s.event == 'pre_tool_call' and s.fail_closed\n"
+        "    and 'factory_admission_hook.py' in s.command\n"
+        "    and '--require-owned-git' in s.command\n"
+        "]\n"
+        "print(json.dumps({'armed': armed}))\n"
+    )
+    probe_env = dict(env)
+    for name in _HOOK_DISABLING_ENV_VARS:
+        if name in os.environ and name not in env:
+            probe_env.pop(name, None)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env=probe_env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"cannot attest the worker AI Factory admission hook: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            "worker did not arm the AI Factory admission hook "
+            f"(probe rc={result.returncode}): {result.stderr.strip()[:400]}"
+        )
+    try:
+        armed = json.loads(result.stdout.strip().splitlines()[-1])["armed"]
+    except (ValueError, KeyError, IndexError) as exc:
+        raise RuntimeError(
+            "worker AI Factory admission hook attestation returned no verdict"
+        ) from exc
+    if not armed:
+        raise RuntimeError(
+            "worker did not arm the AI Factory admission hook; refusing to "
+            f"open the owner gate for profile {profile_home.name}"
+        )
+
+
 def _worker_issue_key(task: Task) -> str:
     for source in (task.title or "", task.body or ""):
         match = _KANBAN_ISSUE_KEY_RE.search(source)
@@ -9440,6 +9506,12 @@ def _default_spawn(
         if profile_home is not None
         else None
     )
+    if owner_hook is not None:
+        # A gated Code worker must never inherit a disarming env from a
+        # dispatcher started in safe mode: an ``active`` owner with no
+        # admission hook is precisely the state the strict contract forbids.
+        for _name in _HOOK_DISABLING_ENV_VARS:
+            env.pop(_name, None)
     worker_session_id: Optional[str] = None
     if owner_hook is not None:
         worker_session_id = _kanban_worker_session_id(task)
@@ -9575,6 +9647,11 @@ def _default_spawn(
                 _wait_for_worker_owner_reaper_ready(reaper, ready_fd)
                 _ensure_kanban_worker_session(
                     profile_home, str(worker_session_id), workspace,
+                )
+                # Last gate before the worker may run its first byte: prove the
+                # admission hook actually arms under the worker's exact env.
+                _attest_worker_admission_hook_armed(
+                    profile_home=profile_home, env=env,
                 )
         gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(gate_fd)
