@@ -372,7 +372,7 @@ def _root_regular(
         state = os.lstat(path)
     except OSError as exc:
         _fail("rotation_stager_input_pinned_executable_invalid", exc)
-    allowed = {0o500, 0o550, 0o555} if executable else {0o400, 0o440, 0o444}
+    allowed = {0o500, 0o550, 0o555, 0o755} if executable else {0o400, 0o440, 0o444}
     if (
         not path.is_absolute()
         or ".." in path.parts

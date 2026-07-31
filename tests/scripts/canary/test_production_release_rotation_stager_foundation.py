@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 import pytest
@@ -229,6 +231,38 @@ def test_privileged_git_reads_trust_only_the_selected_checkout() -> None:
 
     assert author._git_command(source, "cat-file", "--batch") == expected
     assert installer._git_command(source, "cat-file", "--batch") == expected
+
+
+def test_root_pinned_python_accepts_standard_root_owned_0755(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "python3.11"
+    raw = b"exact system python bytes"
+    selected.write_bytes(raw)
+    selected.chmod(0o755)
+    real_lstat = author.os.lstat
+
+    def root_owned_lstat(path: os.PathLike[str] | str) -> SimpleNamespace:
+        state = real_lstat(path)
+        return SimpleNamespace(
+            st_mode=stat.S_IFREG | stat.S_IMODE(state.st_mode),
+            st_uid=0,
+            st_gid=0,
+            st_nlink=1,
+            st_size=state.st_size,
+        )
+
+    monkeypatch.setattr(author.os, "lstat", root_owned_lstat)
+
+    digest, size = author._root_regular(
+        selected,
+        executable=True,
+        expected_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+    assert digest == hashlib.sha256(raw).hexdigest()
+    assert size == len(raw)
 
 
 def _installer_source(tmp_path: Path) -> tuple[Path, str]:

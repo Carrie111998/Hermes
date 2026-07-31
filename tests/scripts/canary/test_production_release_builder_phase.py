@@ -235,7 +235,8 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fixture:
     python_path = tmp_path / "usr" / "bin" / "python3.11"
     python_path.parent.mkdir(parents=True)
     python_path.write_bytes(b"held python binary")
-    python_path.chmod(0o555)
+    # Production /usr/bin/python3.11 is conventionally root-owned 0755.
+    python_path.chmod(0o755)
     monkeypatch.setattr(
         phase,
         "_PYTHON_PATH",
