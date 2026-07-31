@@ -37,7 +37,7 @@ class TestCliResumeCommand:
         assert "2" in output
         assert "Coding" in output
         assert "Research" in output
-        assert "/resume 2" in output
+        assert "Use /resume <number>" in output
         assert "/resume <session title>" in output
 
     def test_show_recent_sessions_uses_prompt_toolkit_safe_print(self):

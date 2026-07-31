@@ -16501,7 +16501,23 @@ def main():
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
 
-    sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions (paginated)")
+    sessions_list = sessions_subparsers.add_parser(
+        "list",
+        help="List recent sessions (paginated)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  hermes sessions list                    page 1 (10 sessions)\n"
+            "  hermes sessions list 2                  page 2 (rows 11-20)\n"
+            "  hermes sessions list -l 50              page 1 with 50 rows\n"
+            "  hermes sessions list -l 5 3             page 3 with 5 rows/page (rows 11-15)\n"
+            "  hermes sessions list --source telegram  only telegram sessions\n"
+            "  hermes sessions list --workspace data-collector  sessions in that repo\n"
+            "\n"
+            "The # column is the session's position in the canonical list; the\n"
+            "same numbers are used by /resume <N> inside interactive sessions.\n"
+        ),
+    )
     sessions_list.add_argument(
         "--source", help="Filter by source (cli, telegram, discord, etc.)"
     )
@@ -17139,16 +17155,21 @@ def main():
                     else:
                         preview = s.get("preview", "")[:28]
                         print(f"{preview:<30} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {s['id']}")
+                from hermes_cli.session_listing import CLI_SESSIONS_LIST_FOOTER
+                print()
+                print(CLI_SESSIONS_LIST_FOOTER.rstrip())
                 return
 
             # Canonical table (same format as /sessions and /sessions search).
             # The # column shows the global position in the canonical list, so
             # page 2 renders rows limit+1..2*limit (not 1..limit) and the
             # number on screen is the number /resume <N> accepts.
-            from hermes_cli.session_listing import render_sessions_table
+            from hermes_cli.session_listing import CLI_SESSIONS_LIST_FOOTER, render_sessions_table
             for _i, _s in enumerate(sessions, 1):
                 _s["rank"] = _offset + _i
             render_sessions_table(sessions, out=print, db=db)
+            print()
+            print(CLI_SESSIONS_LIST_FOOTER.rstrip())
 
         elif action == "export":
             from hermes_cli.session_filters import (

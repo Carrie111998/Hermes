@@ -1256,10 +1256,9 @@ class CLICommandsMixin:
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
             _cprint("")
-            _cprint("  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.")
-            _cprint("  Example: /resume 13")
-            _cprint("")
-            _cprint("  More: /sessions search <query>, /sessions -l <N>")
+            from hermes_cli.session_listing import INTERACTIVE_SESSIONS_FOOTER
+            for _line in INTERACTIVE_SESSIONS_FOOTER.rstrip().split("\n"):
+                _cprint(_line)
             _cprint("")
             return
 

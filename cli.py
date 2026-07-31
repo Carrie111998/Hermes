@@ -7653,10 +7653,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cli_visible_print()
         render_sessions_table(sessions, out=_cli_visible_print, db=self._session_db)
         _cli_visible_print()
-        _cli_visible_print("  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.")
-        _cli_visible_print("  Example: /resume 2")
-        _cli_visible_print()
-        _cli_visible_print("  More: /sessions search <query>, /sessions -l <N>")
+        from hermes_cli.session_listing import INTERACTIVE_SESSIONS_FOOTER
+        for _line in INTERACTIVE_SESSIONS_FOOTER.rstrip().split("\n"):
+            _cli_visible_print(_line)
         _cli_visible_print()
         return True
 

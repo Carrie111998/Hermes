@@ -228,6 +228,17 @@ def dedup_compression_chains(
     return {sid for _, sid in best.values()}
 
 
+CLI_SESSIONS_LIST_FOOTER = """\
+  Tip: hermes sessions list [PAGE] [-l N] [--source SRC] [--workspace NEEDLE]
+  Full parameter reference and examples: hermes sessions list --help
+"""
+
+INTERACTIVE_SESSIONS_FOOTER = """\
+  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.
+  More: /sessions search <query> · /sessions list [PAGE] · /sessions -l N
+"""
+
+
 def render_sessions_table(
     sessions: list[dict[str, Any]],
     *,
