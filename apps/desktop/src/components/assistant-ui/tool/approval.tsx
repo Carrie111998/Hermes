@@ -147,9 +147,11 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
           choice,
           session_id: request.sessionId ?? undefined
         })
+
         if (response.resolved) {
           triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
         }
+
         setSubmitting(null)
         clearApprovalRequest(request.sessionId, request.approvalId)
       } catch (error) {

@@ -130,12 +130,14 @@ describe('PendingToolApproval', () => {
 
   it('keeps a newer approval usable when an older response finishes late', async () => {
     let finish: ((value: { resolved: number }) => void) | undefined
+
     const request = vi.fn(
       () =>
         new Promise(resolve => {
           finish = resolve
         })
     )
+
     $gateway.set({ request } as unknown as HermesGateway)
     setRequest('rm /tmp/a')
     render(<PendingToolApproval part={part('terminal')} />)
