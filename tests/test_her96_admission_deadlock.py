@@ -1251,3 +1251,142 @@ def test_documented_config_uses_command_matcher_and_fail_closed_only():
                and "script:" not in block and "args:" not in block for block in gate_blocks)
     code_blocks = [block for block in gate_blocks if "hermes-code-a" in block]
     assert code_blocks and all("--require-owned-git" in block for block in code_blocks)
+
+
+# ---------------------------------------------------------------------------
+# R2-B1 — quote-state desynchronization must not hide active substitutions
+# ---------------------------------------------------------------------------
+
+# A single quote inside a double-quoted region is LITERAL to the shell. A
+# scanner that flips into single-quote state there never recovers, so every
+# later ``$(...)``/backtick becomes invisible and the command is judged safe.
+QUOTE_DESYNC_PAYLOADS = [
+    'git rev-parse "it\'s $(touch pwned)"',
+    'gh pr list --search "it\'s $(touch pwned)"',
+    'git rev-parse "\'" `touch pwned`',
+    'echo "it\'s $(touch pwned)"',
+    'echo "a\'b" $(sh -c \'touch pwned\')',
+    # Same class, other shapes.
+    'git rev-parse "don\'t" $(eval "rm -rf x")',
+    'printf "it\'s" `sh -c "touch pwned"`',
+]
+
+
+def test_quote_desync_does_not_hide_variable_expansion_either():
+    """A ``'`` inside double quotes must not blind the scanner to ``$VAR``.
+
+    ``echo "it's ${HOME}"`` is not itself dangerous — ``echo`` never executes
+    its argument — so this asserts the scanner's quote state directly rather
+    than an end-to-end verdict, which is where the desync actually mattered.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import factory_admission_hook as hook
+
+    for command in [
+        'echo "it\'s ${HOME}"',
+        'echo "it\'s $HOME"',
+        'git rev-parse "don\'t" "$WT"',
+    ]:
+        assert hook._has_active_shell_expansion(command) is True, command
+    # ...while a genuinely literal single-quoted dollar stays data.
+    assert hook._has_active_shell_expansion("echo '$HOME'") is False
+
+
+@pytest.mark.parametrize("command", QUOTE_DESYNC_PAYLOADS)
+def test_quote_desync_substitution_blocked_preclaim(tmp_path, command):
+    """Pre-claim: no readonly early-return may precede substitution inspection."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    result = run_hook(tmp_path / "missing", payload("terminal", {"command": command}, outside))
+    assert decision(result)["decision"] == "block", command
+
+
+@pytest.mark.parametrize("command", QUOTE_DESYNC_PAYLOADS)
+def test_quote_desync_substitution_blocked_with_valid_owner(tmp_path, command):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(registry, payload("terminal", {"command": command}, repo))
+    assert decision(result)["decision"] == "block", command
+
+
+@pytest.mark.parametrize("command", [
+    # Literal single quotes inside double quotes, with NO active substitution,
+    # stay ordinary readonly discovery commands.
+    'git rev-parse "it\'s-a-ref"',
+    "git rev-parse 'HEAD'",
+    'gh pr list --search "it\'s mine"',
+])
+def test_literal_quotes_without_substitution_stay_readonly(tmp_path, command):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    result = run_hook(tmp_path / "missing", payload("terminal", {"command": command}, outside))
+    assert decision(result) == {"decision": "allow"}, command
+
+
+def test_shell_scanner_is_the_single_source_for_all_three_consumers():
+    """Coherence: masking, body extraction and expansion detection must all
+    derive from one scan, so they can never disagree about quote state."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import factory_admission_hook as hook
+
+    corpus = [
+        *QUOTE_DESYNC_PAYLOADS,
+        "pwd", "git rev-parse HEAD", "echo $(pwd)", "echo `pwd`",
+        "echo '$(not-active)'", 'echo "$(active)"', "echo \\$(escaped)",
+        'echo "\\$(escaped-in-dq)"', "echo $(echo $(nested))",
+        "echo $HOME", 'echo "${HOME}"', "echo 'single' \"double\"",
+        "git status 'unterminated", 'git status "unterminated',
+        "echo $(unbalanced", "echo `unbalanced", "echo trailing\\",
+        'echo "a\'b"', "echo \"it's\"", "true",
+    ]
+    for command in corpus:
+        scan = hook._scan_shell_command(command)
+        expansion = hook._has_active_shell_expansion(command)
+        masked = hook._mask_active_command_substitutions(command)
+        bodies = hook._command_substitution_bodies(command)
+        if scan is None:
+            # Ambiguous input: every consumer must fail closed together.
+            assert expansion is True, command
+            assert masked is None, command
+            assert bodies is None, command
+            continue
+        assert expansion == scan["has_active_expansion"], command
+        assert masked == scan["masked"], command
+        assert bodies == scan["bodies"], command
+        # A recorded substitution body implies an active expansion.
+        if bodies:
+            assert expansion is True, command
+
+
+def test_real_shell_oracle_confirms_blocked_payloads_would_have_executed(tmp_path):
+    """Prove the payloads are real (harmless temp-dir sentinels only).
+
+    Each command is rewritten to touch a sentinel inside an isolated temp
+    directory. The real shell creates it — so the hook's BLOCK is what stands
+    between an admitted worker and host mutation. Nothing destructive, no
+    network, no path outside ``tmp_path``.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for index, template in enumerate([
+        'git rev-parse "it\'s $(touch {s})"',
+        'echo "it\'s $(touch {s})"',
+        'git rev-parse "\'" `touch {s}`',
+        'echo "a\'b" $(sh -c \'touch {s}\')',
+    ]):
+        sandbox = tmp_path / f"oracle{index}"
+        sandbox.mkdir()
+        sentinel = sandbox / "sentinel"
+        command = template.format(s=sentinel.name)
+        # The hook must refuse it...
+        assert decision(run_hook(
+            tmp_path / "missing", payload("terminal", {"command": command}, outside),
+        ))["decision"] == "block", command
+        # ...and the real shell proves the payload was live.
+        subprocess.run(
+            ["sh", "-c", command], cwd=sandbox, capture_output=True, timeout=10,
+        )
+        assert sentinel.exists(), (
+            f"oracle did not execute the payload, test is not proving anything: {command}"
+        )

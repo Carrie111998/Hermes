@@ -489,181 +489,161 @@ def _terminal_is_readonly(command):
     return False
 
 
-def _has_active_shell_expansion(text):
-    """Detect shell expansions that survive into execution, never quoted data.
+_DYNAMIC_SUBSTITUTION_MARKER = "__HERMES_DYNAMIC_SUBSTITUTION__"
 
-    ``shlex`` deliberately removes quote context, so it cannot tell ``'$HOME'``
-    (literal) from ``"$HOME"`` (expanded). This small scanner keeps that
-    distinction and treats escaped ``$``/backticks as literal. It is a guard,
-    not a shell interpreter: uncertainty remains a reason to refuse a mutable
-    target rather than attempt expansion in the hook.
+
+def _scan_shell_region(text, index, stop, depth):
+    r"""Walk one shell region with real quote semantics.
+
+    Returns ``(end_index, masked_text, bodies, has_active_expansion)`` or
+    ``None`` when the region is malformed, unbalanced or exceeds the recursion
+    budget — every caller then fails closed.
+
+    The quote rules are the shell's, not an approximation:
+
+    * inside ``'...'`` every byte is literal, including ``\``, until the next
+      ``'``;
+    * inside ``"..."`` a ``'`` is **literal** and must not open a quote state
+      (this is the R2-B1 desynchronization bug: a scanner that flipped state
+      there never recovered and went blind to every later ``$()``/backtick);
+    * inside ``"..."`` a backslash only escapes ``$``, `` ` ``, ``"``, ``\``
+      and newline; anything else keeps the backslash literal;
+    * ``$(...)`` and backticks are scanned recursively, so nested quoting and
+      nested substitutions are accounted for rather than pattern-matched.
     """
+    if depth > _MAX_REPARSED_SHELL_DEPTH:
+        return None
+    out = []
+    bodies = []
+    expansion = False
     quote = None
-    index = 0
     while index < len(text):
         char = text[index]
-        if char == "\\":
-            index += 2
-            continue
+
         if quote == "'":
+            out.append(char)
+            index += 1
             if char == "'":
                 quote = None
-            index += 1
             continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "`":
-            return True
-        if char != "$" or index + 1 >= len(text):
-            index += 1
-            continue
-        next_char = text[index + 1]
-        if next_char == "(":
-            return True
-        if next_char == "{" or next_char == "_" or next_char.isalnum() or next_char in "?*@$#!-":
-            return True
-        index += 1
-    return False
 
+        if quote is None and stop is not None and char == stop:
+            return index + 1, "".join(out), bodies, expansion
 
-def _scan_dollar_paren_end(command, start):
-    """Return the offset after a balanced active ``$(...)`` substitution."""
-    depth = 1
-    quote = None
-    index = start + 2
-    while index < len(command):
-        char = command[index]
-        if quote:
-            if char == "\\" and quote == '"' and index + 1 < len(command):
-                index += 2
+        if char == "\\":
+            if index + 1 >= len(text):
+                return None
+            if quote == '"' and text[index + 1] not in '$`"\\\n':
+                out.append(char)
+                index += 1
                 continue
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if char == "\\" and index + 1 < len(command):
+            out.append(text[index:index + 2])
             index += 2
             continue
-        if command.startswith("$(", index):
-            depth += 1
-            index += 2
-            continue
-        if char == ")":
-            depth -= 1
+
+        if quote is None and char == "'":
+            out.append(char)
+            quote = "'"
             index += 1
-            if depth == 0:
-                return index
             continue
+
+        if char == '"':
+            out.append(char)
+            quote = None if quote == '"' else '"'
+            index += 1
+            continue
+
+        if text.startswith("$(", index):
+            inner = _scan_shell_region(text, index + 2, ")", depth + 1)
+            if inner is None:
+                return None
+            inner_end, _inner_masked, inner_bodies, _inner_expansion = inner
+            expansion = True
+            bodies.append(text[index + 2:inner_end - 1])
+            bodies.extend(inner_bodies)
+            out.append(_DYNAMIC_SUBSTITUTION_MARKER)
+            index = inner_end
+            continue
+
+        if char == "`":
+            inner = _scan_shell_region(text, index + 1, "`", depth + 1)
+            if inner is None:
+                return None
+            inner_end, _inner_masked, inner_bodies, _inner_expansion = inner
+            expansion = True
+            bodies.append(text[index + 1:inner_end - 1])
+            bodies.extend(inner_bodies)
+            out.append(_DYNAMIC_SUBSTITUTION_MARKER)
+            index = inner_end
+            continue
+
+        if char == "$" and index + 1 < len(text):
+            next_char = text[index + 1]
+            if (
+                next_char == "{" or next_char == "_"
+                or next_char.isalnum() or next_char in "?*@$#!-"
+            ):
+                expansion = True
+
+        out.append(char)
         index += 1
-    return None
+
+    if stop is not None or quote is not None:
+        # Unterminated substitution or quote: ambiguous, never "safe".
+        return None
+    return index, "".join(out), bodies, expansion
 
 
-def _scan_backtick_end(command, start):
-    """Return the offset after an active backtick substitution."""
-    index = start + 1
-    while index < len(command):
-        if command[index] == "\\" and index + 1 < len(command):
-            index += 2
-            continue
-        if command[index] == "`":
-            return index + 1
-        index += 1
-    return None
+def _scan_shell_command(command):
+    """Single source of truth every shell-inspection consumer derives from.
+
+    Returns ``{"masked", "bodies", "has_active_expansion"}`` or ``None`` when
+    the command cannot be scanned unambiguously.
+    """
+    if not isinstance(command, str):
+        return None
+    scanned = _scan_shell_region(command, 0, None, 0)
+    if scanned is None:
+        return None
+    _end, masked, bodies, expansion = scanned
+    return {"masked": masked, "bodies": bodies, "has_active_expansion": expansion}
+
+
+def _has_active_shell_expansion(text):
+    """True when an expansion survives into execution — or when unknowable.
+
+    ``shlex`` drops quote context, so it cannot tell ``'$HOME'`` (literal) from
+    ``"$HOME"`` (expanded). Malformed input answers True: uncertainty is a
+    reason to refuse, never to admit.
+    """
+    scan = _scan_shell_command(text)
+    if scan is None:
+        return True
+    return scan["has_active_expansion"]
 
 
 def _mask_active_command_substitutions(command):
     """Replace active substitution bodies before tokenizing shell syntax.
 
     ``shlex`` otherwise splits ``$(date)`` on its parentheses, losing the fact
-    that the resulting word is dynamic.  Single-quoted syntax stays untouched;
-    unmatched substitutions remain unparseable and must be rejected by callers.
+    that the resulting word is dynamic. ``None`` means unparseable input, which
+    callers must reject.
     """
-    marker = "__HERMES_DYNAMIC_SUBSTITUTION__"
-    result = []
-    quote = None
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "\\" and index + 1 < len(command):
-            result.append(command[index:index + 2])
-            index += 2
-            continue
-        if quote == "'":
-            result.append(char)
-            if char == "'":
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            result.append(char)
-            quote = char
-            index += 1
-            continue
-        if command.startswith("$(", index):
-            end = _scan_dollar_paren_end(command, index)
-            if end is None:
-                return None
-            result.append(marker)
-            index = end
-            continue
-        if char == "`":
-            end = _scan_backtick_end(command, index)
-            if end is None:
-                return None
-            result.append(marker)
-            index = end
-            continue
-        result.append(char)
-        index += 1
-    return "".join(result)
+    scan = _scan_shell_command(command)
+    if scan is None:
+        return None
+    return scan["masked"]
 
 
 def _command_substitution_bodies(command):
-    """Return every active substitution body, or ``None`` on unbalanced syntax.
+    """Return every active substitution body, or ``None`` on ambiguous syntax.
 
-    Mirrors the state machine of :func:`_mask_active_command_substitutions`
-    exactly, so the same substitutions that get masked as dynamic values are
-    the ones whose executable bodies are surfaced here.
+    Nested bodies are included: each one is code the shell executes.
     """
-    bodies = []
-    quote = None
-    index = 0
-    while index < len(command):
-        char = command[index]
-        if char == "\\" and index + 1 < len(command):
-            index += 2
-            continue
-        if quote == "'":
-            if char == "'":
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            quote = char
-            index += 1
-            continue
-        if command.startswith("$(", index):
-            end = _scan_dollar_paren_end(command, index)
-            if end is None:
-                return None
-            bodies.append(command[index + 2:end - 1])
-            index = end
-            continue
-        if char == "`":
-            end = _scan_backtick_end(command, index)
-            if end is None:
-                return None
-            bodies.append(command[index + 1:end - 1])
-            index = end
-            continue
-        index += 1
-    return bodies
+    scan = _scan_shell_command(command)
+    if scan is None:
+        return None
+    return scan["bodies"]
 
 
 def _substitution_bodies_are_readonly(command):
@@ -677,6 +657,8 @@ def _substitution_bodies_are_readonly(command):
     positive literal discovery grammar as pre-claim reads; anything dynamic,
     variable-driven, re-parsed or outside that grammar fails closed.
     """
+    if not isinstance(command, str):
+        return False
     bodies = _command_substitution_bodies(command)
     if bodies is None:
         return False
@@ -828,10 +810,11 @@ def _terminal_has_unresolved_dynamic_target(command, depth=0):
     """
     if depth >= _MAX_REPARSED_SHELL_DEPTH:
         return True
-    marker = "__HERMES_DYNAMIC_SUBSTITUTION__"
+    marker = _DYNAMIC_SUBSTITUTION_MARKER
     masked_command = _mask_active_command_substitutions(command)
     if masked_command is None:
-        return _has_active_shell_expansion(command)
+        # Unscannable input is never a proven-safe target.
+        return True
     try:
         lexer = shlex.shlex(masked_command, posix=False, punctuation_chars=";&|()<>\n")
         lexer.whitespace = " \t\r"
@@ -1029,9 +1012,20 @@ def main(argv=None):
             if not isinstance(tool_name, str) or not tool_name or not tool_input_is_valid:
                 _emit_block("unknown tool or invalid payload is mutation-capable by default")
                 return 0
-            if tool_name == "terminal" and _terminal_is_readonly(command):
-                _emit_allow()
-                return 0
+            if tool_name == "terminal":
+                # Substitution bodies execute BEFORE the outer command, so this
+                # inspection must precede any read-only early return — including
+                # the pre-claim discovery path, which answers before ownership
+                # is ever consulted.
+                if not _substitution_bodies_are_readonly(command):
+                    _emit_block(
+                        "command substitution body is not a literal read-only "
+                        "command under the strict Code gate"
+                    )
+                    return 0
+                if _terminal_is_readonly(command):
+                    _emit_allow()
+                    return 0
             if tool_name in _EXACT_WORKER_LIFECYCLE_TOOLS:
                 lifecycle_error = _exact_worker_lifecycle_error(
                     tool_name, tool_input, payload.get("session_id") or "",
