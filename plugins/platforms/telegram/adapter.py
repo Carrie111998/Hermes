@@ -753,6 +753,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
+        self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_network_error_count: int = 0
         self._polling_generation: int = 0
         self._polling_progress_event = asyncio.Event()
@@ -2097,7 +2098,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         self._polling_progress_event.set()
         self._polling_network_error_count = 0
-        self._polling_conflict_count = 0
+        if generation == self._polling_conflict_recovery_generation:
+            self._polling_conflict_recovery_generation = None
+        else:
+            self._polling_conflict_count = 0
         self._send_path_degraded = False
 
     def _observe_polling_request_result(self, request, generation, result):
@@ -3055,9 +3059,11 @@ class TelegramAdapter(BasePlatformAdapter):
             # AttributeError deep inside start_polling instead of failing fast
             # here, where the except below reschedules or escalates to fatal.
             app = self._app
+            expected_generation = self._polling_generation + 1
             try:
                 if not app:
                     raise RuntimeError("Telegram application was torn down during conflict reconnect")
+                self._polling_conflict_recovery_generation = expected_generation
                 await self._start_polling_once(
                     app,
                     drop_pending_updates=False,
@@ -3070,8 +3076,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return
             except _PollingLifecycleAbort:
+                if self._polling_conflict_recovery_generation == expected_generation:
+                    self._polling_conflict_recovery_generation = None
                 return
             except Exception as retry_err:
+                if self._polling_conflict_recovery_generation == expected_generation:
+                    self._polling_conflict_recovery_generation = None
                 if getattr(self, "_polling_teardown_started", False):
                     return
                 logger.warning(
