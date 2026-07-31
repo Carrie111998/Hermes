@@ -1,9 +1,10 @@
 import asyncio
-import sqlite3
+import logging
 from pathlib import Path
 
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -15,6 +16,7 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True)
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -116,6 +118,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": "462",
         "thread_id": "20197",
+        "kanban_notification": True,
     }
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
@@ -158,6 +161,103 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     message = adapter.sent[0]["text"]
     assert tid in message
     assert "blocked" in message
+    assert adapter.sent[0]["metadata"]["kanban_notification"] is True
+
+
+def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):
+    db_path = tmp_path / "single-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_completed_subscription()
+
+    adapter1 = RecordingAdapter()
+    adapter2 = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter1)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter2)))
+
+    assert len(adapter1.sent) == 1
+    assert adapter2.sent == []
+
+
+def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
+    db_path = tmp_path / "adapter-disconnect.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = DisconnectedAdapters({Platform.TELEGRAM: RecordingAdapter()})
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_unknown_platform_advances_without_replay(
+    tmp_path, monkeypatch,
+):
+    """An unsupported platform is bounded and cannot replay forever."""
+    db_path = tmp_path / "unknown-platform.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="unknown platform", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="future_platform",
+            chat_id="future-chat",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {"future_platform": adapter}
+    runner._kanban_sub_fail_counts = {}
+
+    for _ in range(4):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        cursor, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="future_platform",
+            chat_id="future-chat",
+            kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
+        )
+    finally:
+        conn.close()
+    assert events == []
+    assert cursor > 0
+
+
+def test_kanban_db_path_is_test_isolated_from_real_home():
+    hermes_home = Path(kb.kanban_home())
+    production_db = Path.home() / ".hermes" / "kanban.db"
+    assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+
+    assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
+    assert kb.kanban_db_path().resolve() != production_db.resolve()
 
 
 class FailingAdapter:
@@ -169,6 +269,248 @@ class FailingAdapter:
     async def send(self, chat_id, text, metadata=None):
         self.attempts += 1
         raise RuntimeError("simulated send failure")
+
+
+class SensitiveFailureResultAdapter:
+    """Adapter that returns an error which must never be copied into notifier logs."""
+
+    async def send(self, chat_id, text, metadata=None):
+        return SendResult(
+            success=False,
+            error=(
+                "https://example.invalid/retry?token=sensitive-token "
+                "sensitive response body"
+            ),
+        )
+
+
+class SensitiveFailureExceptionAdapter:
+    """Adapter that raises an error which must never be copied into notifier logs."""
+
+    async def send(self, chat_id, text, metadata=None):
+        raise RuntimeError(
+            "https://example.invalid/retry?token=sensitive-token "
+            "sensitive response body"
+        )
+
+
+def test_kanban_notifier_rewinds_claim_when_send_is_cancelled(tmp_path, monkeypatch):
+    """Cancellation during send must restore the claim before propagating."""
+    db_path = tmp_path / "cancelled-send.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    async def _exercise_cancellation():
+        started = asyncio.Event()
+
+        class BlockingAdapter:
+            async def send(self, chat_id, text, metadata=None):
+                started.set()
+                await asyncio.Future()
+
+        runner = _make_runner(BlockingAdapter())
+        watcher = asyncio.create_task(runner._kanban_notifier_watcher(interval=1))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        watcher.cancel()
+        try:
+            await watcher
+        except asyncio.CancelledError:
+            return
+        raise AssertionError("notifier cancellation was swallowed")
+
+    real_sleep = asyncio.sleep
+
+    async def _skip_initial_delay(delay):
+        if delay == 5:
+            return None
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", _skip_initial_delay)
+    asyncio.run(_exercise_cancellation())
+
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_redacts_unacknowledged_send_result_errors(
+    tmp_path, monkeypatch, caplog,
+):
+    """Adapter result errors must not be written verbatim to notifier logs."""
+    db_path = tmp_path / "sensitive-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+    caplog.set_level(logging.WARNING, logger="gateway.run")
+
+    asyncio.run(
+        _run_one_notifier_tick(monkeypatch, _make_runner(SensitiveFailureResultAdapter()))
+    )
+
+    assert "sensitive-token" not in caplog.text
+    assert "sensitive response body" not in caplog.text
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_redacts_send_exceptions(tmp_path, monkeypatch, caplog):
+    """Adapter exceptions must not be written verbatim to notifier logs."""
+    db_path = tmp_path / "sensitive-exception.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+    caplog.set_level(logging.WARNING, logger="gateway.run")
+
+    asyncio.run(
+        _run_one_notifier_tick(monkeypatch, _make_runner(SensitiveFailureExceptionAdapter()))
+    )
+
+    assert "sensitive-token" not in caplog.text
+    assert "sensitive response body" not in caplog.text
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_counts_batch_failures_across_retries(tmp_path, monkeypatch):
+    """A later failure must survive earlier successful sends in the batch."""
+    db_path = tmp_path / "batch-failure-count.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="batch failure", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "first"})
+        kb._append_event(conn, tid, kind="blocked", payload={"reason": "second"})
+    finally:
+        conn.close()
+
+    class SecondEventFailsAdapter:
+        def __init__(self):
+            self.attempts = 0
+
+        async def send(self, chat_id, text, metadata=None):
+            self.attempts += 1
+            if self.attempts % 2 == 0:
+                return SendResult(success=False, error="second event rejected")
+            return SendResult(success=True)
+
+    adapter = SecondEventFailsAdapter()
+    runner = _make_runner(adapter)
+    for _ in range(12):
+        runner._running = True
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts == 24
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_advances_silent_batch_before_later_delivery(tmp_path, monkeypatch):
+    """Silent claimed events must not abort a later claimed notification."""
+    db_path = tmp_path / "silent-before-visible.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        silent_tid = kb.create_task(conn, title="silent", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=silent_tid, platform="telegram", chat_id="chat-silent",
+        )
+        kb._append_event(conn, silent_tid, kind="unblocked")
+
+        visible_tid = kb.create_task(conn, title="visible", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=visible_tid, platform="telegram", chat_id="chat-visible",
+        )
+        kb.complete_task(conn, visible_tid, summary="delivered")
+    finally:
+        conn.close()
+
+    original_list_notify_subs = kb.list_notify_subs
+
+    def _silent_first(conn, task_id=None):
+        subs = original_list_notify_subs(conn, task_id)
+        return sorted(subs, key=lambda sub: sub["chat_id"] != "chat-silent")
+
+    monkeypatch.setattr(kb, "list_notify_subs", _silent_first)
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert visible_tid in adapter.sent[0]["text"]
+
+    conn = kb.connect()
+    try:
+        silent_subs = kb.list_notify_subs(conn, silent_tid)
+        assert len(silent_subs) == 1
+        assert int(silent_subs[0]["last_event_id"]) > 0
+        assert kb.list_notify_subs(conn, visible_tid) == []
+    finally:
+        conn.close()
+
+
+class ResultAdapter:
+    """Adapter returning a configured result without raising."""
+
+    def __init__(self, result):
+        self.result = result
+        self.attempts = 0
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        return self.result
+
+
+def _assert_unacknowledged_send_rewinds(result, tmp_path, monkeypatch):
+    db_path = tmp_path / "unacknowledged-send.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = ResultAdapter(result)
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts == 1
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_rewinds_claim_when_send_returns_none(tmp_path, monkeypatch):
+    """A missing acknowledgement must not advance the delivery cursor."""
+    _assert_unacknowledged_send_rewinds(None, tmp_path, monkeypatch)
+
+
+def test_kanban_notifier_rewinds_claim_when_send_result_fails(tmp_path, monkeypatch):
+    """An explicit failed SendResult must not advance the delivery cursor."""
+    _assert_unacknowledged_send_rewinds(
+        SendResult(success=False, error="rejected"), tmp_path, monkeypatch,
+    )
+
+
+def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
+    """A raising adapter rewinds the claim so the next tick can retry.
+
+    This is the second rewind path (distinct from the adapter-disconnect path
+    in test_kanban_notifier_rewinds_claim_if_adapter_disconnects). Here the
+    adapter is connected and the send call actually fires; the claim must
+    still rewind so the event isn't lost when send() raises mid-tick.
+    """
+    db_path = tmp_path / "send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FailingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts >= 1, "send should have been attempted at least once"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
 
 class ReportedFailureAdapter:

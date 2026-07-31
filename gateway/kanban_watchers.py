@@ -19,10 +19,16 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.platforms.base import SendResult
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _delivery_acknowledged(send_result: Any) -> bool:
+    """Return whether an adapter explicitly confirmed message delivery."""
+    return isinstance(send_result, SendResult) and send_result.success is True
 
 
 def _resolve_auto_decompose_settings(
@@ -493,6 +499,7 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        metadata["kanban_notification"] = True
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
@@ -521,20 +528,16 @@ class GatewayKanbanWatchersMixin:
                             # the self-post outcome, not by skipping the send.
                             continue
                         try:
-                            _send_res = await adapter.send(
+                            send_result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
-                            # A SendResult(success=False) without an exception
-                            # (returned by push-capable adapters on a genuine
-                            # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
-                            # event is permanently lost. Adapters returning
-                            # None (or anything non-SendResult shaped) keep
-                            # the legacy "no exception == delivered" contract.
-                            if getattr(_send_res, "success", True) is False:
+                            # Push delivery advances only after an adapter
+                            # explicitly acknowledges it. This deliberately
+                            # rejects legacy None/arbitrary return values.
+                            if not _delivery_acknowledged(send_result):
                                 raise RuntimeError(
-                                    "adapter send() reported failure: "
-                                    f"{getattr(_send_res, 'error', None) or 'unknown error'}"
+                                    "adapter send() did not explicitly "
+                                    "acknowledge delivery"
                                 )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
@@ -563,16 +566,26 @@ class GatewayKanbanWatchersMixin:
                                         "kanban notifier: artifact delivery for %s failed: %s",
                                         sub["task_id"], art_exc,
                                     )
-                            # Reset the failure counter on success.
-                            sub_fail_counts.pop(sub_key, None)
-                        except Exception as exc:
+                        except asyncio.CancelledError:
+                            # A cancellation can land while adapter.send() is
+                            # in flight. Restore the claim before propagating
+                            # it so a later watcher can retry the event.
+                            await asyncio.to_thread(
+                                self._kanban_rewind,
+                                sub,
+                                d["cursor"],
+                                d.get("old_cursor", 0),
+                                board_slug,
+                            )
+                            raise
+                        except Exception:
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
                                 "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
+                                "(attempt %d/%d)",
                                 sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                                MAX_SEND_FAILURES,
                             )
                             if fails >= MAX_SEND_FAILURES:
                                 logger.warning(
@@ -693,10 +706,10 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
-                        if not _is_push_adapter:
-                            # Nothing left to deliver on this path (the wake,
-                            # if any, already succeeded above).
-                            sub_fail_counts.pop(sub_key, None)
+                        # Reset only after the complete claimed batch succeeds;
+                        # an early event must not erase a later event's retry
+                        # history.
+                        sub_fail_counts.pop(sub_key, None)
                         # Unsubscribe only when the task has reached a truly
                         # final status (done / archived). For blocked /
                         # gave_up / crashed / timed_out the subscription is

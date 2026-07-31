@@ -29,7 +29,6 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
-    SendResult,
     is_host_excluded_by_no_proxy,
 )
 
@@ -3759,6 +3758,102 @@ class TestSlashEphemeralAck:
         )
         assert response.released is True
 
+    @pytest.mark.asyncio
+    async def test_kanban_notification_bypasses_pending_slash_context(self, adapter):
+        """Background Kanban delivery must not consume a slash response URL."""
+        from plugins.platforms.slack.adapter import _slash_user_id
+
+        adapter._slash_command_contexts[("C1", "U1")] = {
+            "response_url": "https://hooks.slack.com/commands/pending",
+            "user_id": "U1",
+            "ts": time.monotonic(),
+        }
+        adapter._app.client.chat_postMessage = AsyncMock(
+            return_value={"ts": "1234.5678", "ok": True}
+        )
+
+        token = _slash_user_id.set("U1")
+        try:
+            with patch.object(
+                adapter,
+                "_send_slash_ephemeral",
+                new=AsyncMock(return_value=SendResult(success=True)),
+            ) as slash_send:
+                result = await adapter.send(
+                    "C1",
+                    "Kanban task completed",
+                    metadata={"kanban_notification": True},
+                )
+        finally:
+            _slash_user_id.reset(token)
+
+        assert result.success is True
+        slash_send.assert_not_awaited()
+        adapter._app.client.chat_postMessage.assert_awaited_once()
+        assert ("C1", "U1") in adapter._slash_command_contexts
+
+    @pytest.mark.asyncio
+    async def test_send_slash_ephemeral_redacts_non_2xx_body(
+        self, adapter, caplog,
+    ):
+        """A rejected response_url must not expose its response body."""
+        response = AsyncMock()
+        response.status = 500
+        response.content.read = AsyncMock(return_value=b"sensitive response body")
+        response.release = MagicMock()
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+
+        session = AsyncMock()
+        session.post = MagicMock(return_value=response)
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "plugins.platforms.slack.adapter.aiohttp.ClientSession",
+            return_value=session,
+        ):
+            result = await adapter._send_slash_ephemeral(
+                {
+                    "response_url": (
+                        "https://hooks.slack.com/commands/sensitive-token"
+                    )
+                },
+                "Some response",
+            )
+
+        assert result.success is False
+        assert result.error == "Slack ephemeral response delivery failed"
+        assert "sensitive-token" not in caplog.text
+        assert "sensitive response body" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_send_slash_ephemeral_redacts_transport_exception(
+        self, adapter, caplog,
+    ):
+        """A response_url transport failure must not expose exception text."""
+        session = AsyncMock()
+        session.post = MagicMock(
+            side_effect=RuntimeError(
+                "https://example.invalid/response/sensitive-token"
+            )
+        )
+        session.__aenter__ = AsyncMock(return_value=session)
+        session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "plugins.platforms.slack.adapter.aiohttp.ClientSession",
+            return_value=session,
+        ):
+            result = await adapter._send_slash_ephemeral(
+                {"response_url": "https://hooks.slack.com/commands/timeout"},
+                "Some response",
+            )
+
+        assert result.success is False
+        assert result.error == "Slack ephemeral response delivery failed"
+        assert "sensitive-token" not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # TestThreadContextUnverifiedTagging
@@ -4526,4 +4621,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-

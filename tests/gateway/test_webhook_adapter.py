@@ -711,15 +711,8 @@ class TestWebhookSilenceSuppression:
 class TestDeliveryCleanup:
 
     @pytest.mark.asyncio
-    async def test_delivery_info_survives_multiple_sends(self):
-        """send() must NOT pop delivery_info.
-
-        Interim status messages (fallback notifications, context-pressure
-        warnings, etc.) flow through the same send() path as the final
-        response.  If the entry were popped on the first send, the final
-        response would silently downgrade to the ``log`` deliver type.
-        Regression test for that bug.
-        """
+    async def test_log_delivery_is_not_an_acknowledgement(self):
+        """Log-only delivery cannot acknowledge a response or consume its state."""
         adapter = _make_adapter()
         chat_id = "webhook:test:d-xyz"
         adapter._delivery_info[chat_id] = {
@@ -730,14 +723,71 @@ class TestDeliveryCleanup:
 
         # First send (e.g. an interim status message)
         result1 = await adapter.send(chat_id, "Status: switching to fallback")
-        assert result1.success is True
+        assert result1.success is False
+        assert result1.error == "Webhook delivery is log-only"
         # Entry must still be present so the final send can read it
         assert chat_id in adapter._delivery_info
 
         # Second send (the final agent response)
         result2 = await adapter.send(chat_id, "Final agent response")
-        assert result2.success is True
+        assert result2.success is False
+        assert result2.error == "Webhook delivery is log-only"
         assert chat_id in adapter._delivery_info
+
+    @pytest.mark.asyncio
+    async def test_missing_delivery_info_is_not_an_acknowledgement(self):
+        """A webhook response without a configured target has no delivery receipt."""
+        result = await _make_adapter().send("webhook:missing:delivery", "response")
+
+        assert result.success is False
+        assert result.error == "Webhook delivery is log-only"
+
+    @pytest.mark.asyncio
+    async def test_delivery_info_pruned_via_ttl(self):
+        """Stale delivery_info entries are dropped on the next POST."""
+        adapter = _make_adapter()
+        adapter._idempotency_ttl = 60  # short TTL for the test
+        now = time.time()
+
+        # Stale entry — older than TTL
+        adapter._delivery_info["webhook:test:old"] = {"deliver": "log"}
+        adapter._delivery_info_created["webhook:test:old"] = now - 120
+
+        # Fresh entry — should survive
+        adapter._delivery_info["webhook:test:new"] = {"deliver": "log"}
+        adapter._delivery_info_created["webhook:test:new"] = now - 5
+
+        adapter._prune_delivery_info(now)
+
+        assert "webhook:test:old" not in adapter._delivery_info
+        assert "webhook:test:old" not in adapter._delivery_info_created
+        assert "webhook:test:new" in adapter._delivery_info
+        assert "webhook:test:new" in adapter._delivery_info_created
+
+    @pytest.mark.asyncio
+    async def test_delivery_info_prune_uses_ordered_incremental_queue(self):
+        """Delivery-info TTL pruning stops at the first fresh queued entry."""
+        adapter = _make_adapter()
+        adapter._idempotency_ttl = 60
+        now = 1000.0
+        for key, created_at in (
+            ("webhook:test:old", now - 120),
+            ("webhook:test:new", now - 5),
+            ("webhook:test:newer", now),
+        ):
+            adapter._delivery_info[key] = {"deliver": "log"}
+            adapter._delivery_info_created[key] = created_at
+            adapter._delivery_info_order.append((created_at, key))
+
+        adapter._prune_delivery_info(now)
+
+        assert "webhook:test:old" not in adapter._delivery_info
+        assert "webhook:test:new" in adapter._delivery_info
+        assert "webhook:test:newer" in adapter._delivery_info
+        assert list(adapter._delivery_info_order) == [
+            (now - 5, "webhook:test:new"),
+            (now, "webhook:test:newer"),
+        ]
 
 
 # ===================================================================

@@ -1573,23 +1573,25 @@ class SlackAdapter(BasePlatformAdapter):
                         timeout=aiohttp.ClientTimeout(total=10),
                     ) as resp:
                         if resp.status != 200:
-                            body = await _read_error_text_limited(resp)
+                            # Drain at most the bounded error-body limit, but
+                            # never copy Slack's response body into logs or a
+                            # model-visible SendResult.
+                            await _read_error_text_limited(resp)
                             logger.warning(
-                                "[Slack] response_url POST returned %s: %s",
+                                "[Slack] response_url POST returned status %s",
                                 resp.status,
-                                body[:200],
                             )
                             return SendResult(
                                 success=False,
-                                error=f"response_url POST returned {resp.status}",
+                                error="Slack ephemeral response delivery failed",
                             )
             return SendResult(success=True, message_id=None)
-        except Exception as e:
-            logger.warning(
-                "[Slack] response_url POST failed: %s",
-                e,
+        except Exception:
+            logger.warning("[Slack] response_url POST failed")
+            return SendResult(
+                success=False,
+                error="Slack ephemeral response delivery failed",
             )
-            return SendResult(success=False, error=str(e))
 
     async def _post_ephemeral_fallback(
         self,
@@ -1613,7 +1615,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not user_id:
             return SendResult(
                 success=False,
-                error="no user_id in slash context for postEphemeral",
+                error="Slack postEphemeral delivery failed",
             )
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
@@ -1628,18 +1630,20 @@ class SlackAdapter(BasePlatformAdapter):
                     text=chunk,
                 )
                 if not (isinstance(result, dict) and result.get("ok")):
-                    err = (
-                        result.get("error", "unknown_error")
-                        if isinstance(result, dict)
-                        else "unexpected_response"
+                    logger.warning(
+                        "[Slack] chat.postEphemeral returned an unsuccessful response"
                     )
                     return SendResult(
                         success=False,
-                        error=f"chat.postEphemeral failed: {err}",
+                        error="Slack postEphemeral delivery failed",
                     )
             return SendResult(success=True, message_id=None)
-        except Exception as e:
-            return SendResult(success=False, error=str(e))
+        except Exception:
+            logger.warning("[Slack] chat.postEphemeral failed")
+            return SendResult(
+                success=False,
+                error="Slack postEphemeral delivery failed",
+            )
 
     def _warn_if_missing_group_dm_scopes(self, auth_response, team_name: str) -> None:
         """Nudge existing installs to reinstall when group-DM scopes are absent.
@@ -2464,7 +2468,17 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            # Background Kanban notifications share the same channel as
+            # interactive slash replies, but must not consume a pending
+            # response_url that belongs to a user's command.
+            is_kanban_notification = bool(
+                metadata and metadata.get("kanban_notification")
+            )
+            slash_ctx = (
+                None
+                if is_kanban_notification
+                else self._pop_slash_context(chat_id, team_id)
+            )
             if slash_ctx:
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
@@ -2484,9 +2498,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # expects to be ephemeral must never surface to the whole
                 # channel just because a delivery path failed.
                 logger.warning(
-                    "[Slack] response_url slash reply failed (%s); retrying "
-                    "via chat.postEphemeral",
-                    ephemeral_result.error,
+                    "[Slack] response_url slash reply failed; retrying "
+                    "via chat.postEphemeral"
                 )
                 fallback_result = await self._post_ephemeral_fallback(
                     chat_id,
@@ -2502,9 +2515,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # the gateway can react (retry surfacing happens upstream).
                 logger.error(
                     "[Slack] Ephemeral slash reply failed on both "
-                    "response_url and chat.postEphemeral (%s); dropping "
-                    "rather than posting publicly",
-                    fallback_result.error,
+                    "response_url and chat.postEphemeral; dropping rather "
+                    "than posting publicly"
                 )
                 return fallback_result
 

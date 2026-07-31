@@ -3,6 +3,7 @@ import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from gateway.platforms.base import SendResult
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -35,14 +36,6 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
-
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Regression: gateway watchers must not double-init the kanban DB.
 #
@@ -60,8 +53,6 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
 # The fix removes the `init_db()` calls in both watchers; this regression
 # test pins that behaviour so we don't reintroduce them.
 # ---------------------------------------------------------------------------
-
-
 
 
 @pytest.mark.asyncio
@@ -168,6 +159,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     async def _send(chat_id, msg, metadata=None):
         runner._running = False
+        return SendResult(success=True)
 
     async def _send_document(chat_id, file_path, metadata=None, **_kw):
         documents_uploaded.append(file_path)
