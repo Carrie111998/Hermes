@@ -7124,6 +7124,20 @@ class AIAgent:
                 relay_turn,
                 outcome=relay_outcome,
             )
+            # Cover the terminal paths that return straight out of
+            # run_conversation without reaching finalize_turn, so the
+            # turn_failed hook observes them too. No-ops when the turn already
+            # emitted, when the exit was clean, or on a user interrupt.
+            try:
+                from agent.turn_finalizer import (
+                    emit_turn_failed_for_unfinalized_exit,
+                )
+                emit_turn_failed_for_unfinalized_exit(
+                    self, result, turn_id=effective_task_id
+                )
+            except Exception:
+                logger.debug("turn_failed bypass sweep failed", exc_info=True)
+
             task_finished = True
             finish_task_run(**task_context, result=result)
             return result

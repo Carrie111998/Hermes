@@ -66,6 +66,113 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _should_emit_turn_failed(reason, last_msg_role, interrupted) -> bool:
+    """Return True when the ``turn_failed`` hook should fire for this exit.
+
+    Fire for every NON-clean turn exit:
+      * the agent stopped mid-work — ``last_msg_role == "tool"`` (the
+        protocol_violation / "breads-pc" premature-stop class), OR
+      * the reason is anything other than a healthy ``text_response(...)``
+        completion (errors, exhaustion, guardrail, etc.).
+
+    Never fire when ``interrupted`` is True: a user ``/stop`` is a deliberate,
+    clean exit, not a failure. Its exit reason (``interrupted_by_user``) is not
+    a ``text_response(...)``, so without this gate the reason-arm below would
+    raise a false-positive failure signal. Mirrors the existing
+    ``and not interrupted`` gate on the pending-tool diagnostic warning.
+
+    Do NOT fire on a healthy completion: a ``text_response(...)`` exit whose
+    last message is not a pending tool result. Mirrors the
+    ``normal_text_response`` classification used for the diagnostic log.
+    """
+    if interrupted:
+        return False
+    normal_text_response = str(reason).startswith("text_response(")
+    return last_msg_role == "tool" or not normal_text_response
+
+
+def emit_turn_failed(agent, **fields) -> bool:
+    """Fire the ``turn_failed`` hook, at most once per turn.
+
+    Idempotent via ``agent._turn_failed_emitted``, which turn setup resets per
+    turn (``agent/turn_context.py``). The flag is what lets the bypass-exit
+    sweep in :func:`emit_turn_failed_for_unfinalized_exit` run unconditionally
+    without double-firing for turns that did reach :func:`finalize_turn`.
+
+    Returns True if this call emitted. Never raises: a failing observer must
+    not break turn teardown.
+    """
+    if getattr(agent, "_turn_failed_emitted", False):
+        return False
+    agent._turn_failed_emitted = True
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        _invoke_hook("turn_failed", **fields)
+    except Exception as exc:
+        # ``logger`` is imported lazily here for the same reason the rest of
+        # this module does it: importing agent.conversation_loop at module
+        # scope would create a cycle. Kept inside its own guard so a failing
+        # observer cannot be turned into a NameError by a broken import.
+        try:
+            from agent.conversation_loop import logger as _logger
+        except Exception:  # pragma: no cover - defensive
+            import logging
+            _logger = logging.getLogger("agent.conversation_loop")
+        _logger.warning("turn_failed hook failed: %s", exc)
+    return True
+
+
+def emit_turn_failed_for_unfinalized_exit(agent, result, *, turn_id=None) -> bool:
+    """Emit ``turn_failed`` for a turn that never reached :func:`finalize_turn`.
+
+    ``run_conversation`` has ~24 terminal paths that build a result dict and
+    ``return`` it directly — invalid-response exhaustion, context overflow with
+    compaction disabled, payload-too-large, truncated tool arguments, and so
+    on. None of them reach ``finalize_turn``, so the hook fired there cannot
+    see them and the most interesting failures were the ones going unobserved.
+
+    Rather than instrument each site (and require every future site to
+    remember), this reads the terminal contract those paths already satisfy:
+    every one of them sets ``completed: False``. A future 25th path is covered
+    the moment it honours the same contract.
+
+    Deliberately silent when:
+      * ``completed`` is not exactly False — a healthy turn, or a
+        non-dict/None return from a stubbed or partial path;
+      * ``interrupted`` is True — a user ``/stop`` is a clean exit, matching
+        the gate in :func:`_should_emit_turn_failed`;
+      * the turn already emitted via :func:`finalize_turn`.
+
+    Note ``completed`` is used rather than ``failed``: only 13 of those paths
+    set ``failed``, while all of them set ``completed: False``.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("completed") is not False:
+        return False
+    if result.get("interrupted") is True:
+        return False
+
+    _reason = result.get("error") or result.get("final_response") or "unknown"
+    _messages = result.get("messages") or []
+    _last_role = None
+    if _messages and isinstance(_messages[-1], dict):
+        _last_role = _messages[-1].get("role")
+
+    return emit_turn_failed(
+        agent,
+        reason=f"direct_return({_reason})",
+        model=getattr(agent, "model", None),
+        session_id=getattr(agent, "session_id", None),
+        turn_id=turn_id,
+        last_msg_role=_last_role,
+        interrupted=False,
+        api_calls=result.get("api_calls"),
+        tool_turns=None,
+        response_len=len(str(result.get("final_response") or "")),
+    )
+
+
 def finalize_turn(
     agent,
     *,
@@ -259,6 +366,14 @@ def finalize_turn(
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
+    # Capture the turn's TRUE tail role before persist-time mutations below
+    # (scaffolding drop, interrupt-close, and the #43849/#44100 assistant-row
+    # append) rewrite the tail. The "ended with a pending tool result" signal
+    # feeds both the turn-exit diagnostic and the ``turn_failed`` hook; reading
+    # ``messages[-1]`` after the append would classify every premature stop
+    # that delivered *any* final_response as a clean assistant exit.
+    _pre_persist_last_role = messages[-1].get("role") if messages else None
+
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
@@ -358,7 +473,12 @@ def finalize_turn(
     # Always logged at INFO so agent.log captures WHY every turn ended.
     # When the last message is a tool result (agent was mid-work), log
     # at WARNING — this is the "just stops" scenario users report.
-    _last_msg_role = messages[-1].get("role") if messages else None
+    # Uses the tail role captured BEFORE persist-time mutations: the
+    # #43849/#44100 assistant-row append above makes ``messages[-1]`` always
+    # "assistant" whenever a final_response was delivered, which would hide
+    # every pending-tool premature stop from this diagnostic and the
+    # ``turn_failed`` hook.
+    _last_msg_role = _pre_persist_last_role
     _last_tool_name = None
     if _last_msg_role == "tool":
         # Walk back to find the assistant message with the tool call
@@ -397,6 +517,32 @@ def finalize_turn(
         )
     else:
         logger.info(_diag_msg, *_diag_args)
+
+    # Plugin hook: turn_failed
+    # Fired once per turn at the same point the turn-exit diagnostic is
+    # logged, reusing the exact diag fields (no new computation). Observers
+    # only — for Phase-0 agent-failure observability capture. Gated to
+    # non-clean exits via the shared classification so healthy turns stay
+    # quiet, and wrapped so a failing handler never breaks finalization.
+    if _should_emit_turn_failed(_turn_exit_reason, _last_msg_role, interrupted):
+        emit_turn_failed(
+            agent,
+            reason=str(_turn_exit_reason),
+            model=agent.model,
+            session_id=agent.session_id,
+            turn_id=turn_id,
+            last_msg_role=_last_msg_role,
+            interrupted=interrupted,
+            api_calls=api_call_count,
+            tool_turns=_turn_tool_count,
+            response_len=_resp_len,
+        )
+    else:
+        # A healthy turn still marks itself emitted-or-decided, so the
+        # bypass-exit sweep in the forwarder cannot second-guess a
+        # deliberate silence (e.g. a clean interrupt whose result dict
+        # happens to carry completed: False).
+        agent._turn_failed_emitted = True
 
     # File-mutation verifier footer.
     # If one or more ``write_file`` / ``patch`` calls failed during this
