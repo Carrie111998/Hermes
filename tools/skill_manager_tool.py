@@ -36,6 +36,7 @@ import json
 import logging
 import re
 import shutil
+import threading
 import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,9 +53,18 @@ from agent.skill_utils import (
 
 logger = logging.getLogger(__name__)
 
-_background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
-    "background_review_read_paths", default=frozenset()
-)
+# Read-before-write marks for the autonomous background-review fork.
+#
+# These MUST NOT be ContextVars. Tool dispatch runs each call inside
+# ``contextvars.copy_context().run(...)`` on a worker thread
+# (``tools.thread_context.propagate_context_to_thread``), so a
+# ContextVar ``.set()`` performed in ``skill_view`` is invisible to a later
+# ``skill_manage`` call on a different worker — the curator can never satisfy
+# the read-before-write guard (#75618). A process-visible set shared under a
+# lock is correct: marks are reset at the start of each review fork, and only
+# one background review runs at a time.
+_background_review_read_paths: set[str] = set()
+_background_review_read_paths_lock = threading.Lock()
 
 
 def mark_background_review_skill_read(path: Path) -> None:
@@ -77,9 +87,8 @@ def mark_background_review_skill_read(path: Path) -> None:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    current = set(_background_review_read_paths.get())
-    current.add(resolved)
-    _background_review_read_paths.set(frozenset(current))
+    with _background_review_read_paths_lock:
+        _background_review_read_paths.add(resolved)
 
 
 def _background_review_has_read(path: Path) -> bool:
@@ -87,12 +96,14 @@ def _background_review_has_read(path: Path) -> bool:
         resolved = str(path.resolve())
     except Exception:
         resolved = str(path)
-    return resolved in _background_review_read_paths.get()
+    with _background_review_read_paths_lock:
+        return resolved in _background_review_read_paths
 
 
 def _reset_background_review_read_marks() -> None:
-    """Test helper: clear read-before-write marks for the current context."""
-    _background_review_read_paths.set(frozenset())
+    """Clear read-before-write marks (start of review fork / test helper)."""
+    with _background_review_read_paths_lock:
+        _background_review_read_paths.clear()
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
