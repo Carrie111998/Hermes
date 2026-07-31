@@ -109,6 +109,68 @@ def test_prompt_install_choices_tty_prompt_path_preserved(monkeypatch):
     assert all(p[1] is True for p in prompts)
 
 
+def test_install_yes_bypasses_uac_prompt(monkeypatch):
+    """`install(yes=True)` must not block on the UAC prompt (--yes, #60244).
+
+    Regression coverage for the headless install path: when the user passes
+    ``--yes``, the UAC-escalation branch should fire `_launch_elevated_install`
+    *without ever calling* `prompt_yes_no` for the "Open the UAC prompt now?"
+    question. Without this test the existing helper tests cover the
+    choice-resolution logic but not the user-visible ``--yes`` behavior on
+    the UAC path itself (see hermes-sweeper review on #60435).
+    """
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: False)
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_Test")
+
+    # `_write_task_script` writes a real .cmd under %TEMP% on Windows; in CI we
+    # substitute a no-op so the test stays hermetic.
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_task_script",
+        lambda: str(Path("/tmp/hermes-test-task.cmd")),
+    )
+
+    # `_install_startup_fallback` writes to the user's Startup folder — must
+    # not run when ``yes=True`` auto-opens UAC instead.
+    startup_called = []
+
+    def fake_startup_fallback(*args, **kwargs):
+        startup_called.append((args, kwargs))
+
+    monkeypatch.setattr(gateway_windows, "_install_startup_fallback", fake_startup_fallback)
+
+    # `_launch_elevated_install` is the headless-install target on a non-admin
+    # account — it would normally shell out to `runas` / Start-Process -Verb
+    # RunAs. We assert it is called and that the gate ``yes or prompt_yes_no``
+    # short-circuits the prompt branch.
+    elevated_calls = []
+
+    def fake_launch_elevated(*args, **kwargs):
+        elevated_calls.append((args, kwargs))
+        return True
+
+    monkeypatch.setattr(
+        gateway_windows, "_launch_elevated_install", fake_launch_elevated
+    )
+
+    # Tripwire: prompt_yes_no must NEVER be reached when --yes is set. If this
+    # fires, the `--yes` plumbing regressed back to blocking on TTY.
+    def boom(*args, **kwargs):
+        raise AssertionError(
+            "install(yes=True) must short-circuit prompt_yes_no on the UAC path"
+        )
+
+    monkeypatch.setattr(setup, "prompt_yes_no", boom)
+
+    gateway_windows.install(yes=True)
+
+    assert elevated_calls, "expected --yes to auto-trigger _launch_elevated_install"
+    assert startup_called == [], (
+        "startup fallback must not run when --yes auto-opens UAC"
+    )
+
+
 def _patched_setup_prompt(monkeypatch, prompts):
     """Helper: route every prompt_yes_no through a list so tests can inspect.
 
