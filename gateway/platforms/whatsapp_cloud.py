@@ -1803,7 +1803,8 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
                 return False
-            count = resolve_gateway_approval(session_key, choice)
+            resolver_choice = "once" if choice == "approve" else choice
+            count = resolve_gateway_approval(session_key, resolver_choice)
             if not count:
                 logger.info(
                     "[whatsapp_cloud] approval resolver reported no waiter "

@@ -1121,7 +1121,7 @@ class TestDispatchInteractiveReplyApproval:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "once")]
         assert "app1" not in adapter._exec_approval_state
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert confirm_payload["type"] == "text"
@@ -1204,7 +1204,7 @@ class TestDispatchInteractiveReplyAuthorization:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "once")]
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")
@@ -1399,4 +1399,3 @@ class TestReplyContextResolution:
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
         assert event.reply_to_is_own_message is False
-

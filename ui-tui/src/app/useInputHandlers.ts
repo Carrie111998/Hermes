@@ -17,7 +17,7 @@ import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionW
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
-import { approvalResponseParams, clearApprovalById } from './approvalResponse.js'
+import { approvalResponseParams, approvalStatusAfterResponse, clearApprovalById } from './approvalResponse.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import {
   type GatewayRpc,
@@ -29,7 +29,7 @@ import {
 import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
-import { getUiState } from './uiStore.js'
+import { getUiState, patchUiState } from './uiStore.js'
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
 const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
@@ -178,8 +178,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return actions.answerClarify('')
     }
 
-    if (overlay.approval) {
-      const request = overlay.approval
+    const approval = overlay.approvals[0]
+
+    if (approval) {
+      const request = approval
       const approvalId = request.approvalId
       const sessionId = getUiState().sid
 
@@ -200,6 +202,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
           if (response.resolved) {
             patchTurnState({ outcome: 'denied' })
           }
+
+          patchUiState({ status: approvalStatusAfterResponse() })
         })
     }
 
@@ -381,7 +385,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // skip the prompt-overlay early-return for scroll keys so they fall
       // through to the wheel / PageUp / Shift+arrow handlers below.
       const promptOverlay =
-        overlay.approval || overlay.billing || overlay.clarify || overlay.confirm || overlay.subscription
+        overlay.approvals.length > 0 || overlay.billing || overlay.clarify || overlay.confirm || overlay.subscription
 
       const fallThroughForScroll = promptOverlay && shouldFallThroughForScroll(key)
 

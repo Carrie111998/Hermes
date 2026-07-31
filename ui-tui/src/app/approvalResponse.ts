@@ -1,17 +1,15 @@
 import type { ApprovalReq } from '../types.js'
 
-import { getOverlayState, patchOverlayState } from './overlayStore.js'
+import { clearApproval, getOverlayState } from './overlayStore.js'
 
 export function approvalResponseParams(request: Pick<ApprovalReq, 'approvalId'>, choice: string, sessionId: string) {
   return { approval_id: request.approvalId, choice, session_id: sessionId }
 }
 
 export function clearApprovalById(approvalId: string): boolean {
-  if (getOverlayState().approval?.approvalId !== approvalId) {
-    return false
-  }
+  return clearApproval(approvalId)
+}
 
-  patchOverlayState({ approval: null })
-
-  return true
+export function approvalStatusAfterResponse(): string {
+  return getOverlayState().approvals.length ? 'approval needed' : 'running…'
 }

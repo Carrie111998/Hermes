@@ -40,7 +40,14 @@ import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { followActiveSessionCwd } from '@/store/projects'
-import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import {
+  clearAllPrompts,
+  sessionApprovalRequest,
+  sessionAwaitingInput,
+  setApprovalRequest,
+  setSecretRequest,
+  setSudoRequest
+} from '@/store/prompts'
 import { recordAgentReaction } from '@/store/reactions-local'
 import {
   $currentCwd,
@@ -791,7 +798,10 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           // one is the clarify resolving — drop the "needs input" flag here so
           // the sidebar indicator clears as soon as it's answered, not only at
           // message.complete.
-          updateSessionState(sessionId, state => (state.needsInput ? { ...state, needsInput: false } : state))
+          const needsInput = sessionAwaitingInput(sessionId).get()
+          updateSessionState(sessionId, state =>
+            state.needsInput === needsInput ? state : { ...state, needsInput }
+          )
 
           // terminal/process tool calls are the only things that spawn or reap
           // background processes — sync the composer status stack right after.
@@ -903,6 +913,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           return
         }
 
+        const approvalWasEmpty = !sessionApprovalRequest(sessionId ?? null).get()
+
         setApprovalRequest({
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
@@ -912,6 +924,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             : undefined,
           command,
           description,
+          profile: normalizeProfileKey(event.profile),
           sessionId: sessionId ?? null,
           smartDenied: payload?.smart_denied === true
         })
@@ -920,16 +933,19 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
         }
 
-        dispatchNativeNotification({
-          actions: [
-            { approvalId, id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { approvalId, id: 'reject', text: translateNow('notifications.native.rejectAction') }
-          ],
-          body: command || description,
-          kind: 'approval',
-          sessionId,
-          title: translateNow('notifications.native.approvalTitle')
-        })
+        if (approvalWasEmpty) {
+          dispatchNativeNotification({
+            actions: [
+              { approvalId, id: 'approve', text: translateNow('notifications.native.approveAction') },
+              { approvalId, id: 'reject', text: translateNow('notifications.native.rejectAction') }
+            ],
+            body: command || description,
+            kind: 'approval',
+            profile: normalizeProfileKey(event.profile),
+            sessionId,
+            title: translateNow('notifications.native.approvalTitle')
+          })
+        }
       } else if (event.type === 'sudo.request') {
         // Sudo password capture (tools/terminal_tool.py). Blocked on
         // sudo.respond {request_id, password}.

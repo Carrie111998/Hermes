@@ -1,10 +1,11 @@
 import { atom } from 'nanostores'
 
+import { translateNow } from '@/i18n'
 import { persistString, storedString } from '@/lib/storage'
 
-import { $gateway } from './gateway'
+import { gatewayForProfile } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { type ApprovalRequest, clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -142,6 +143,7 @@ export interface NativeNotificationAction {
 
 export interface NativeNotificationInput {
   kind: NativeNotificationKind
+  profile?: string
   title: string
   body?: string
   sessionId?: null | string
@@ -153,6 +155,42 @@ export interface NativeNotificationInput {
   global?: boolean
   silent?: boolean
   actions?: NativeNotificationAction[]
+}
+
+function approvalNotificationInput(request: ApprovalRequest | null): NativeNotificationInput | null {
+  if (!request) {
+    return null
+  }
+
+  return {
+    actions: [
+      {
+        approvalId: request.approvalId,
+        id: 'approve',
+        text: translateNow('notifications.native.approveAction')
+      },
+      {
+        approvalId: request.approvalId,
+        id: 'reject',
+        text: translateNow('notifications.native.rejectAction')
+      }
+    ],
+    body: request.command || request.description,
+    kind: 'approval' as const,
+    profile: request.profile,
+    sessionId: request.sessionId,
+    title: translateNow('notifications.native.approvalTitle')
+  }
+}
+
+export function clearApprovalAndNotifyNext(sessionId: null | string, approvalId: string): void {
+  const previous = sessionApprovalRequest(sessionId).get()
+  clearApprovalRequest(sessionId, approvalId)
+  const next = approvalNotificationInput(sessionApprovalRequest(sessionId).get())
+
+  if (previous?.approvalId === approvalId && next) {
+    dispatchNativeNotification(next)
+  }
 }
 
 export function dispatchNativeNotification(input: NativeNotificationInput): void {
@@ -170,7 +208,9 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}`, Date.now())) {
+  const approvalId = input.actions?.find(action => action.approvalId)?.approvalId ?? ''
+
+  if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}:${approvalId}`, Date.now())) {
     return
   }
 
@@ -178,6 +218,7 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     actions: input.actions,
     body: input.body,
     kind: input.kind,
+    profile: input.profile,
     sessionId: input.sessionId ?? undefined,
     silent: input.silent,
     title: input.title
@@ -189,7 +230,8 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 export async function respondToApprovalAction(
   sessionId: null | string,
   approvalId: string,
-  actionId: string
+  actionId: string,
+  profile?: string
 ): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
@@ -197,7 +239,13 @@ export async function respondToApprovalAction(
     return
   }
 
-  const gateway = $gateway.get()
+  const request = sessionApprovalRequest(sessionId).get()
+
+  if (!request || request.approvalId !== approvalId || (profile && request.profile !== profile)) {
+    return
+  }
+
+  const gateway = gatewayForProfile(request.profile)
 
   if (!gateway) {
     return
@@ -209,7 +257,7 @@ export async function respondToApprovalAction(
       choice,
       session_id: sessionId ?? undefined
     })
-    clearApprovalRequest(sessionId, approvalId)
+    clearApprovalAndNotifyNext(sessionId, approvalId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

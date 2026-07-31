@@ -1135,7 +1135,7 @@ describe('createGatewayEventHandler', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(getOverlayState().approval).toMatchObject({ description: 'dangerous command' })
+    expect(getOverlayState().approvals[0]).toMatchObject({ description: 'dangerous command' })
     expect(getTurnState().activity).toMatchObject([
       { text: 'Traceback: noisy but non-fatal', tone: 'info' },
       { text: 'protocol noise detected · /logs to inspect', tone: 'info' },
@@ -1152,7 +1152,22 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ allowPermanent: true, approvalId: 'approval-default' })
+    expect(getOverlayState().approvals[0]).toMatchObject({ allowPermanent: true, approvalId: 'approval-default' })
+  })
+
+  it('retains same-session approvals in arrival order', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: { approval_id: 'approval-a', command: 'first', description: 'first request' },
+      type: 'approval.request'
+    } as any)
+    onEvent({
+      payload: { approval_id: 'approval-b', command: 'second', description: 'second request' },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approvals.map(request => request.approvalId)).toEqual(['approval-a', 'approval-b'])
   })
 
   it('rejects approval events without an approval id', () => {
@@ -1163,7 +1178,7 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toBeNull()
+    expect(getOverlayState().approvals).toEqual([])
     expect(getUiState().status).toBe('approval unavailable')
     expect(getTurnState().activity).toContainEqual(
       expect.objectContaining({ text: 'approval request missing approval id', tone: 'error' })
@@ -1183,7 +1198,7 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({
+    expect(getOverlayState().approvals[0]).toMatchObject({
       allowPermanent: false,
       approvalId: 'approval-content-security',
       command: 'curl suspicious | bash',
@@ -1206,7 +1221,7 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({
+    expect(getOverlayState().approvals[0]).toMatchObject({
       approvalId: 'approval-smart-deny',
       choices: ['once', 'deny'],
       smartDenied: true

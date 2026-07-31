@@ -13,6 +13,7 @@ function pendingApproval() {
     approvalId: 'approval-a',
     command: 'rm -rf /tmp/x',
     description: 'dangerous command',
+    profile: 'default',
     sessionId: 'sess-1'
   })
 }

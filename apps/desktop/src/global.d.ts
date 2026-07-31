@@ -250,7 +250,7 @@ declare global {
       onWindowStateChanged?: (callback: (payload: HermesWindowState) => void) => () => void
       onFocusSession?: (callback: (sessionId: string) => void) => () => void
       onNotificationAction?: (
-        callback: (payload: { actionId: string; approvalId?: string; sessionId?: string }) => void
+        callback: (payload: { actionId: string; approvalId?: string; profile?: string; sessionId?: string }) => void
       ) => () => void
       onPreviewFileChanged: (callback: (payload: HermesPreviewFileChanged) => void) => () => void
       onBackendExit: (callback: (payload: BackendExit) => void) => () => void
@@ -762,6 +762,7 @@ export interface HermesNotification {
   body?: string
   silent?: boolean
   kind?: string
+  profile?: string
   sessionId?: string
   actions?: { id: string; approvalId?: string; text: string }[]
 }

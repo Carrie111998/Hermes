@@ -186,6 +186,26 @@ class TestBlockingGatewayApproval:
         assert second.event.is_set()
         assert second.result == "deny"
 
+    def test_invalid_choice_never_dequeues_approval(self):
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, resolve_gateway_approval,
+        )
+
+        session_key = "test-invalid-choice"
+        current = _ApprovalEntry({"command": "current"})
+        _gateway_queues[session_key] = [current]
+
+        with pytest.raises(ValueError, match="invalid approval choice"):
+            resolve_gateway_approval(
+                session_key,
+                "unexpected-choice",
+                approval_id=current.approval_id,
+            )
+
+        assert _gateway_queues[session_key] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+
 
 # ------------------------------------------------------------------
 # /approve command

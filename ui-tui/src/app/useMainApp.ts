@@ -41,7 +41,7 @@ import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
-import { approvalResponseParams, clearApprovalById } from './approvalResponse.js'
+import { approvalResponseParams, approvalStatusAfterResponse, clearApprovalById } from './approvalResponse.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
@@ -618,7 +618,7 @@ export function useMainApp(gw: GatewayClient) {
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
-  const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
+  const marker = overlay.approvals.length || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
 
   const tabCwd = ui.info?.cwd
 
@@ -691,7 +691,7 @@ export function useMainApp(gw: GatewayClient) {
             tools: [buildToolTrailLine('clarify', clarify.question)]
           })
           appendMessage({ role: 'user', text: answer })
-          patchUiState({ status: 'running…' })
+          patchUiState({ status: approvalStatusAfterResponse() })
         } else {
           // Esc / Ctrl+C cancel: persist the question + options as a system
           // line (not a transient "prompt cancelled" flash) so the prompt
@@ -927,7 +927,7 @@ export function useMainApp(gw: GatewayClient) {
 
   const answerApproval = useCallback(
     (choice: string) => {
-      const request = overlay.approval
+      const request = overlay.approvals[0]
 
       if (!request || !ui.sid) {
         return
@@ -945,11 +945,11 @@ export function useMainApp(gw: GatewayClient) {
             patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
           }
 
-          patchUiState({ status: 'running…' })
+          patchUiState({ status: approvalStatusAfterResponse() })
         }
       )
     },
-    [overlay.approval, rpc, ui.sid]
+    [overlay.approvals, rpc, ui.sid]
   )
 
   const answerSudo = useCallback(

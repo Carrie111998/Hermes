@@ -2170,6 +2170,18 @@ class _ApprovalEntry:
         self.reason: Optional[str] = None
 
 
+_GATEWAY_APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
+
+
+def normalize_gateway_approval_choice(choice: object) -> str:
+    """Return a canonical gateway approval choice or reject it before mutation."""
+    normalized = str(choice or "").strip().lower()
+    if normalized not in _GATEWAY_APPROVAL_CHOICES:
+        expected = ", ".join(sorted(_GATEWAY_APPROVAL_CHOICES))
+        raise ValueError(f"invalid approval choice; expected one of: {expected}")
+    return normalized
+
+
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
@@ -2216,6 +2228,8 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    choice = normalize_gateway_approval_choice(choice)
+
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:

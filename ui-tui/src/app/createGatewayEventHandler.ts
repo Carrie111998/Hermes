@@ -27,7 +27,7 @@ import type { Msg, SubagentProgress, SubagentStatus } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import type { GatewayEventHandlerContext } from './interfaces.js'
-import { getOverlayState, patchOverlayState } from './overlayStore.js'
+import { enqueueApproval, getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
@@ -1180,15 +1180,13 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         // Only an explicit false (tirith warning) drops the permanent-allow option.
         const allowPermanent = ev.payload.allow_permanent !== false
 
-        patchOverlayState({
-          approval: {
-            allowPermanent,
-            approvalId,
-            choices: ev.payload.choices,
-            command: String(ev.payload.command ?? ''),
-            description,
-            smartDenied: ev.payload.smart_denied === true
-          }
+        enqueueApproval({
+          allowPermanent,
+          approvalId,
+          choices: ev.payload.choices,
+          command: String(ev.payload.command ?? ''),
+          description,
+          smartDenied: ev.payload.smart_denied === true
         })
         setStatus('approval needed')
 

@@ -13,10 +13,11 @@ import { useMessageStream } from './index'
 
 const ACTIVE_SID = 'session-active'
 let handleEvent: ((event: RpcEvent) => void) | null = null
+let sessionStates: Map<string, ClientSessionState>
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(ACTIVE_SID)
-  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+  const sessionStateByRuntimeIdRef = useRef(sessionStates)
   const queryClientRef = useRef(new QueryClient())
 
   const stream = useMessageStream({
@@ -45,6 +46,7 @@ function Harness() {
 describe('approval request events', () => {
   beforeEach(async () => {
     handleEvent = null
+    sessionStates = new Map()
     $activeSessionId.set(ACTIVE_SID)
     render(<Harness />)
     await waitFor(() => expect(handleEvent).not.toBeNull())
@@ -70,7 +72,28 @@ describe('approval request events', () => {
       })
     )
 
-    expect($approvalRequest.get()).toMatchObject({ approvalId: 'approval-a', command: 'rm /tmp/a' })
+    expect($approvalRequest.get()).toMatchObject({
+      approvalId: 'approval-a',
+      command: 'rm /tmp/a',
+      profile: 'default'
+    })
+  })
+
+  it('keeps the gateway profile on the approval request', () => {
+    act(() =>
+      handleEvent!({
+        payload: {
+          approval_id: 'approval-profile',
+          command: 'rm /tmp/profile',
+          description: 'delete a profile file'
+        },
+        profile: ' work ',
+        session_id: ACTIVE_SID,
+        type: 'approval.request'
+      })
+    )
+
+    expect($approvalRequest.get()?.profile).toBe('work')
   })
 
   it('does not surface an approval event without an id', () => {
@@ -83,5 +106,27 @@ describe('approval request events', () => {
     )
 
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('keeps needsInput set while another queued approval remains', () => {
+    act(() => {
+      handleEvent!({
+        payload: { approval_id: 'approval-a', command: 'first', description: 'first request' },
+        session_id: ACTIVE_SID,
+        type: 'approval.request'
+      })
+      handleEvent!({
+        payload: { approval_id: 'approval-b', command: 'second', description: 'second request' },
+        session_id: ACTIVE_SID,
+        type: 'approval.request'
+      })
+      handleEvent!({
+        payload: { name: 'terminal', tool_id: 'tool-a' },
+        session_id: ACTIVE_SID,
+        type: 'tool.complete'
+      })
+    })
+
+    expect(sessionStates.get(ACTIVE_SID)?.needsInput).toBe(true)
   })
 })
