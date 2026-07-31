@@ -45,6 +45,8 @@ APPROVAL_CHOICES = frozenset({"once", "session", "always", "deny"})
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,200}$")
 _VOICE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_DEFAULT_CALL_URL = "https://api.openai.com/v1/realtime/calls"
+_DEFAULT_SIDEBAND_URL = "wss://api.openai.com/v1/realtime"
 
 
 class RealtimeProtocolError(ValueError):
@@ -92,6 +94,41 @@ def _bounded_float(value: Any, default: float, minimum: float, maximum: float) -
     return min(maximum, max(minimum, parsed))
 
 
+def _validated_transport_url(
+    value: Any,
+    *,
+    field: str,
+    default: str,
+    required_scheme: str,
+) -> str:
+    text = _clean_string(value, field=field, default=default, max_length=2048)
+    parsed = urlparse(text)
+    try:
+        hostname = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise RealtimeProtocolError(
+            f"realtime_voice.transport.{field} is invalid",
+            code=f"invalid_{field}",
+        ) from exc
+    if (
+        parsed.scheme.lower() != required_scheme
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or bool(parsed.fragment)
+    ):
+        raise RealtimeProtocolError(
+            (
+                f"realtime_voice.transport.{field} must use "
+                f"{required_scheme} with a host and no embedded "
+                "credentials or fragment"
+            ),
+            code=f"invalid_{field}",
+        )
+    return text
+
+
 def derive_safety_identifier(server_secret: str, profile_name: str = "") -> str:
     """Derive a stable, non-reversible OpenAI safety identifier."""
 
@@ -129,6 +166,8 @@ class RealtimeVoiceConfig:
     request_timeout_seconds: float = 20.0
     connect_timeout_seconds: float = 10.0
     transcription_timeout_seconds: float = 5.0
+    call_url: str = _DEFAULT_CALL_URL
+    sideband_url: str = _DEFAULT_SIDEBAND_URL
     approval_timeout_seconds: int = 10 * 60
     control_buffer_events: int = 256
     control_subscriber_queue_events: int = 128
@@ -267,6 +306,18 @@ class RealtimeVoiceConfig:
                 cls.transcription_timeout_seconds,
                 0.5,
                 30.0,
+            ),
+            call_url=_validated_transport_url(
+                transport.get("call_url"),
+                field="call_url",
+                default=cls.call_url,
+                required_scheme="https",
+            ),
+            sideband_url=_validated_transport_url(
+                transport.get("sideband_url"),
+                field="sideband_url",
+                default=cls.sideband_url,
+                required_scheme="wss",
             ),
             approval_timeout_seconds=_bounded_int(
                 limits.get("approval_timeout_seconds"),

@@ -90,6 +90,29 @@ def _manager(db, *, call_client=None):
     return manager, sidebands
 
 
+def test_manager_wires_configured_provider_endpoints(db):
+    config = RealtimeVoiceConfig.from_config(
+        {
+            "realtime_voice": {
+                "enabled": True,
+                "transport": {
+                    "call_url": "https://proxy.example/v1/realtime/calls",
+                    "sideband_url": "wss://proxy.example/v1/realtime",
+                },
+            }
+        }
+    )
+    manager = RealtimeSessionManager(
+        config=config,
+        api_key="proxy-key",
+        agent_factory=lambda session_id: _FakeAgent(db, session_id),
+    )
+
+    assert manager._call_client._call_url == config.call_url
+    sideband = manager._sideband_factory("call_proxy", lambda _event: None)
+    assert sideband._websocket_url == config.sideband_url
+
+
 def _persist_call(db, *, state="ready", started_at=None):
     db.save_realtime_session_state(
         "voice-recovery",

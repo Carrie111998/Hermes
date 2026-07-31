@@ -746,12 +746,40 @@ Realtime behavior belongs in the top-level `realtime_voice` section of
 | `limits.provider_call_max_seconds` | `3300` | Proactive provider-call rotation age |
 | `limits.provider_call_max_input_tokens` | `24000` | Proactive input-context rotation threshold |
 | `transport.reconnect_grace_seconds` | `30` | Sideband reconnect window before renewal is required |
+| `transport.call_url` | `https://api.openai.com/v1/realtime/calls` | Exact HTTPS endpoint for WebRTC call creation |
+| `transport.sideband_url` | `wss://api.openai.com/v1/realtime` | Exact WSS endpoint for call-ID sideband attachment |
 | `limits.approval_timeout_seconds` | `600` | Structured approval/clarification wait limit |
 
 The full defaults also bound SDP and control-message sizes, replay history,
 status-speech frequency, and creation rate. Model and voice overrides in a
 session request are rejected. Change the server configuration, restart the
 gateway, and create a new logical session instead.
+
+#### OpenAI-compatible Realtime proxies
+
+Both provider connections can be routed through an OpenAI-compatible proxy:
+
+```yaml
+realtime_voice:
+  enabled: true
+  model: gpt-realtime-2.1
+  voice: marin
+  transport:
+    call_url: https://proxy.example/v1/realtime/calls
+    sideband_url: wss://proxy.example/v1/realtime
+```
+
+`call_url` must accept OpenAI's multipart `sdp` and `session` fields and return
+the raw SDP answer with a `Location` call identifier. `sideband_url` must attach
+to that same call through a `call_id` query parameter and relay Realtime events
+without rewriting them. Existing query parameters are preserved when Hermes
+adds `call_id`.
+
+Hermes sends `OPENAI_API_KEY` as a bearer credential to both configured
+endpoints. Only configure trusted HTTPS/WSS services, and keep credentials out
+of the URLs themselves. These URLs affect only the Realtime media runtime;
+configure `auxiliary.background_review` separately if retrospective
+self-improvement should use the same proxy.
 
 ### Concurrent-run cap
 

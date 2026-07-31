@@ -415,8 +415,11 @@ The HTTP route returns `204` after finalizing local resources.
   publication.
 - `transform_llm_output` cannot rewrite native audio already played to the
   listener. Post-response observation, memory sync, and review still run.
-- v1 supports OpenAI Realtime only. A provider/media failure is surfaced
-  explicitly; there is no silent fallback to text.
+- v1 supports the OpenAI Realtime protocol only. A provider/media failure is
+  surfaced explicitly; there is no silent fallback to text. OpenAI-compatible
+  call and sideband proxy endpoints may be configured under
+  `realtime_voice.transport`; they must preserve the SDP, call ID, and
+  Realtime event contracts.
 - The repository defines the server and wire contract, not an Android UI or
   WebRTC client implementation.
 

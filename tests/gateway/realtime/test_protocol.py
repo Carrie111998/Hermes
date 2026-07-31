@@ -55,6 +55,42 @@ def test_config_builds_hermes_owned_vad_session():
     assert "function" not in payload["tools"][0]
 
 
+def test_config_accepts_secure_openai_compatible_proxy_endpoints():
+    config = RealtimeVoiceConfig.from_config(
+        {
+            "realtime_voice": {
+                "transport": {
+                    "call_url": "https://proxy.example/v1/realtime/calls?route=stock",
+                    "sideband_url": "wss://proxy.example/v1/realtime?route=stock",
+                }
+            }
+        }
+    )
+
+    assert config.call_url == (
+        "https://proxy.example/v1/realtime/calls?route=stock"
+    )
+    assert config.sideband_url == (
+        "wss://proxy.example/v1/realtime?route=stock"
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("call_url", "http://proxy.example/v1/realtime/calls"),
+        ("call_url", "https://user:secret@proxy.example/v1/realtime/calls"),
+        ("sideband_url", "ws://proxy.example/v1/realtime"),
+        ("sideband_url", "wss://proxy.example/v1/realtime#fragment"),
+    ],
+)
+def test_config_rejects_insecure_or_credentialed_proxy_endpoints(field, value):
+    with pytest.raises(RealtimeProtocolError, match=field):
+        RealtimeVoiceConfig.from_config(
+            {"realtime_voice": {"transport": {field: value}}}
+        )
+
+
 def test_safety_identifier_is_stable_scoped_and_non_reversible():
     first = derive_safety_identifier("gateway-secret", "work")
     assert first == derive_safety_identifier("gateway-secret", "work")

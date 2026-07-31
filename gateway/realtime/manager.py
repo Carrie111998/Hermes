@@ -66,6 +66,7 @@ class RealtimeSessionManager:
         self._profile_name = profile_name
         self._call_client = call_client or OpenAIRealtimeCallClient(
             api_key,
+            call_url=config.call_url,
             request_timeout_seconds=config.request_timeout_seconds,
             safety_identifier=safety_identifier,
         )
@@ -74,6 +75,7 @@ class RealtimeSessionManager:
                 api_key,
                 call_id,
                 handler,
+                websocket_url=config.sideband_url,
                 connect_timeout_seconds=config.connect_timeout_seconds,
             )
         )

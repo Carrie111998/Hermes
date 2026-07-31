@@ -1509,6 +1509,10 @@ DEFAULT_CONFIG = {
             "history_message_limit": 40,
         },
         "transport": {
+            # Exact OpenAI-compatible provider endpoints. Custom proxies receive
+            # OPENAI_API_KEY as a bearer credential on both connections.
+            "call_url": "https://api.openai.com/v1/realtime/calls",
+            "sideband_url": "wss://api.openai.com/v1/realtime",
             "request_timeout_seconds": 20,
             "connect_timeout_seconds": 10,
             "reconnect_grace_seconds": 30,

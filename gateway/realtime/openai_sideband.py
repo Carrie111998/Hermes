@@ -7,7 +7,7 @@ import inspect
 import json
 import logging
 from typing import Any, Awaitable, Callable, Mapping, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote_plus, urlsplit, urlunsplit
 
 from gateway.realtime.protocol import (
     RealtimeCall,
@@ -17,6 +17,28 @@ from gateway.realtime.protocol import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _sideband_call_url(websocket_url: str, call_id: str) -> str:
+    """Add the call ID without discarding proxy-specific query parameters."""
+
+    parsed = urlsplit(websocket_url)
+    query_segments = []
+    for segment in parsed.query.split("&") if parsed.query else []:
+        encoded_name = segment.partition("=")[0]
+        try:
+            name = unquote_plus(encoded_name, errors="strict")
+        except UnicodeDecodeError:
+            name = ""
+        if name != "call_id":
+            query_segments.append(segment)
+    query = "&".join(query_segments)
+    if query and not query.endswith("&"):
+        query += "&"
+    query += f"call_id={quote(call_id, safe='')}"
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment)
+    )
 
 
 class OpenAIRealtimeError(RuntimeError):
@@ -49,6 +71,7 @@ class OpenAIRealtimeCallClient:
         api_key: str,
         *,
         base_url: str = "https://api.openai.com/v1",
+        call_url: Optional[str] = None,
         request_timeout_seconds: float = 20.0,
         safety_identifier: str = "",
         http_session: Any = None,
@@ -56,7 +79,7 @@ class OpenAIRealtimeCallClient:
         if not api_key:
             raise ValueError("api_key is required")
         self._api_key = api_key
-        self._base_url = base_url.rstrip("/")
+        self._call_url = call_url or f"{base_url.rstrip('/')}/realtime/calls"
         self._timeout = request_timeout_seconds
         self._safety_identifier = safety_identifier
         self._http_session = http_session
@@ -87,7 +110,7 @@ class OpenAIRealtimeCallClient:
         client = self._http_session or aiohttp.ClientSession(timeout=timeout)
         try:
             async with client.post(
-                f"{self._base_url}/realtime/calls",
+                self._call_url,
                 data=form,
                 headers=headers,
                 timeout=timeout,
@@ -162,7 +185,7 @@ class OpenAIRealtimeSideband:
         else:
             connect_fn = self._connect_fn
 
-        url = f"{self._websocket_url}?call_id={quote(self.call_id, safe='')}"
+        url = _sideband_call_url(self._websocket_url, self.call_id)
         headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
             self._websocket = await asyncio.wait_for(

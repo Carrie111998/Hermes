@@ -84,6 +84,37 @@ async def test_call_creation_surfaces_provider_failure_without_key():
     assert "sk-secret" not in str(caught.value)
 
 
+@pytest.mark.asyncio
+async def test_call_creation_uses_exact_custom_endpoint_and_query():
+    captured = {}
+
+    async def create_call(request):
+        captured["path"] = request.path
+        captured["route"] = request.query.get("route")
+        return web.Response(
+            text="v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            content_type="application/sdp",
+            headers={"Location": "/v1/realtime/calls/call_proxy"},
+        )
+
+    app = web.Application()
+    app.router.add_post("/proxy/realtime/calls", create_call)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        call_url = str(server.make_url("/proxy/realtime/calls?route=stock"))
+        client = OpenAIRealtimeCallClient("proxy-key", call_url=call_url)
+        result = await client.create_call(
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n",
+            {"type": "realtime"},
+        )
+    finally:
+        await server.close()
+
+    assert result.call_id == "call_proxy"
+    assert captured == {"path": "/proxy/realtime/calls", "route": "stock"}
+
+
 class _FakeSocket:
     def __init__(self):
         self.incoming = asyncio.Queue()
@@ -143,4 +174,31 @@ async def test_sideband_serializes_events_and_reconnects_same_call():
     assert all(
         details["additional_headers"]["Authorization"] == "Bearer sk-secret"
         for _url, details in connects
+    )
+
+
+@pytest.mark.asyncio
+async def test_sideband_preserves_proxy_query_and_replaces_stale_call_id():
+    connects = []
+
+    async def connect(url, **kwargs):
+        connects.append((url, kwargs))
+        return _FakeSocket()
+
+    sideband = OpenAIRealtimeSideband(
+        "proxy-key",
+        "call new/value",
+        lambda _event: None,
+        websocket_url=(
+            "wss://proxy.example/v1/realtime"
+            "?route=a%20b&flag&opaque=%FF&call_id=stale"
+        ),
+        connect_fn=connect,
+    )
+    await sideband.connect()
+    await sideband.close()
+
+    assert connects[0][0] == (
+        "wss://proxy.example/v1/realtime"
+        "?route=a%20b&flag&opaque=%FF&call_id=call%20new%2Fvalue"
     )
