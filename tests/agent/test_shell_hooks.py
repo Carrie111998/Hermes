@@ -608,6 +608,59 @@ class TestIdempotentRegistration:
 # ── Allowlist concurrency ─────────────────────────────────────────────────
 
 
+class TestEncodingHardening:
+    """Hook I/O must decode as UTF-8 with replacement, never crash or
+    fail-open, and an undecodable allowlist must fail closed to zero
+    approvals instead of raising."""
+
+    def test_spawn_survives_invalid_utf8_stdout(self, tmp_path):
+        import sys
+
+        script = _write_script(
+            tmp_path, "bad_utf8_stdout.py",
+            "import sys\n"
+            "sys.stdout.buffer.write("
+            "b'\\xff\\xfe{\"decision\": \"allow\"}\\n')\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=f"{sys.executable} {script}",
+        )
+        r = shell_hooks._spawn(spec, "{}")
+        assert r["error"] is None
+        assert r["returncode"] == 0
+        assert '{"decision": "allow"}' in r["stdout"]
+
+    def test_spawn_survives_invalid_utf8_stderr(self, tmp_path):
+        import sys
+
+        script = _write_script(
+            tmp_path, "bad_utf8_stderr.py",
+            "import sys\n"
+            "sys.stderr.buffer.write(b'diag \\xc3(\\xa9 cause\\n')\n"
+            "sys.stdout.write('{\"decision\": \"block\", "
+            "\"reason\": \"kept\"}\\n')\n",
+        )
+        spec = shell_hooks.ShellHookSpec(
+            event="pre_tool_call", command=f"{sys.executable} {script}",
+        )
+        r = shell_hooks._spawn(spec, "{}")
+        assert r["error"] is None
+        assert "diag" in r["stderr"] and "cause" in r["stderr"]
+        cb_result = shell_hooks._parse_response("pre_tool_call", r["stdout"])
+        assert cb_result == {"action": "block", "message": "kept"}
+
+    def test_load_allowlist_undecodable_content_fails_closed(
+        self, tmp_path, monkeypatch,
+    ):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        shell_hooks.allowlist_path().write_bytes(
+            b'\xff\xfe{"approvals": [{"event": "pre_tool_call"}]}'
+        )
+        assert shell_hooks.load_allowlist() == {"approvals": []}
+
+
 class TestAllowlistConcurrency:
     """Regression tests for the Codex#1 finding: simultaneous
     _record_approval() calls used to collide on a fixed tmp path and

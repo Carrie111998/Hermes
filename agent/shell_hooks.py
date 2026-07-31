@@ -490,7 +490,7 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
             input=stdin_json,
             capture_output=True,
             timeout=spec.timeout,
-            text=True,
+            text=True, encoding="utf-8", errors="replace",
             shell=False,
             **_popen_kwargs,
         )
@@ -680,8 +680,10 @@ def allowlist_path() -> Path:
 def load_allowlist() -> Dict[str, Any]:
     """Return the parsed allowlist, or an empty skeleton if absent."""
     try:
-        raw = json.loads(allowlist_path().read_text())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        raw = json.loads(allowlist_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+        # Undecodable content fails closed: zero approvals, so every hook
+        # goes back through the explicit consent path instead of crashing.
         return {"approvals": []}
     if not isinstance(raw, dict):
         return {"approvals": []}
