@@ -39,61 +39,24 @@ def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: floa
 # Fallback OpenRouter snapshot used when the live catalog is unavailable.
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
-    # Anthropic
-    ("anthropic/claude-fable-5",               ""),
-    ("anthropic/claude-opus-4.8",              ""),
-    ("anthropic/claude-opus-4.8-fast",         "2x price, higher output speed"),
-    ("anthropic/claude-sonnet-5",              ""),
-    ("anthropic/claude-haiku-4.5",             ""),
-    # OpenAI
-    ("openai/gpt-5.6-sol",                     ""),
-    ("openai/gpt-5.6-sol-pro",                 ""),
-    ("openai/gpt-5.6-terra",                   ""),
-    ("openai/gpt-5.6-terra-pro",               ""),
-    ("openai/gpt-5.6-luna",                    ""),
-    ("openai/gpt-5.6-luna-pro",                ""),
-    ("openai/gpt-5.5",                         ""),
-    ("openai/gpt-5.5-pro",                     ""),
-    ("openai/gpt-5.4-mini",                    ""),
-    # Google
-    ("google/gemini-3-pro-preview",            ""),
-    ("google/gemini-3.1-pro-preview",          ""),
-    ("google/gemini-3.5-flash",                ""),
-    # xAI
-    ("x-ai/grok-4.5",                          ""),
-    # DeepSeek
-    ("deepseek/deepseek-v4-pro",               ""),
-    ("deepseek/deepseek-v4-flash",             ""),
-    # Qwen
-    ("qwen/qwen3.7-max",                       ""),
-    ("qwen/qwen3.7-plus",                      ""),
-    ("qwen/qwen3.6-35b-a3b",                   ""),
-    # MoonshotAI
-    ("moonshotai/kimi-k3",                     "recommended"),
-    # MiniMax
-    ("minimax/minimax-m3",                     ""),
-    # Z-AI
-    ("z-ai/glm-5.2",                           "default"),
-    ("z-ai/glm-5.1",                           ""),
-    # Xiaomi
-    ("xiaomi/mimo-v2.5-pro",                   ""),
-    # Tencent
-    ("tencent/hy3",                            ""),
-    # StepFun
-    ("stepfun/step-3.7-flash",                 ""),
-    # NVIDIA
-    ("nvidia/nemotron-3-super-120b-a12b",      ""),
-    # Sakana
-    ("sakana/fugu-ultra",                      ""),
-    # OpenRouter routers
-    ("openrouter/pareto-code",                 "auto-routes to cheapest coder meeting openrouter.min_coding_score"),
-    # Free tier
-    ("openrouter/elephant-alpha",              "free"),
-    ("poolside/laguna-m.1:free",               "free"),
-    ("tencent/hy3:free",                       "free"),
-    ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
+    ("nvidia/nemotron-3-super-120b-a12b:free", "default"),
+    ("google/gemma-4-31b-it:free",              "free"),
+    ("google/gemma-4-26b-a4b-it:free",          "free"),
+    ("google/lyria-3-pro-preview",             "free"),
+    ("google/lyria-3-clip-preview",            "free"),
+    ("cohere/north-mini-code:free",            "free"),
+    ("inclusionai/ling-3.0-flash:free",        "free"),
     ("nvidia/nemotron-3-ultra-550b-a55b:free", "free"),
-    ("inclusionai/ring-2.6-1t:free",           "free"),
+    ("nvidia/nemotron-3-nano-30b-a3b:free",     "free"),
+    ("nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "free"),
+    ("nvidia/nemotron-3.5-content-safety:free", "free"),
+    ("nvidia/nemotron-nano-12b-v2-vl:free",     "free"),
+    ("nvidia/nemotron-nano-9b-v2:free",         "free"),
+    ("openai/gpt-oss-20b:free",                "free"),
+    ("poolside/laguna-m.1:free",               "free"),
+    ("poolside/laguna-s-2.1:free",             "free"),
+    ("poolside/laguna-xs-2.1:free",            "free"),
+    ("openrouter/free",                        "free"),
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
@@ -267,6 +230,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",
     ],
     "openai-codex": _codex_curated_models(),
+    "antigravity": [
+        "antigravity/default",
+        "antigravity/gemini-3.6-flash",
+        "antigravity/gemini-3.1-pro",
+    ],
     "xai-oauth": _xai_curated_models(),
     "copilot-acp": [
         "copilot-acp",
@@ -1058,6 +1026,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("lmstudio",       "LM Studio",                "LM Studio (Local desktop app with built-in model server)"),
     ProviderEntry("anthropic",      "Anthropic",                "Anthropic (Claude models via API key or Claude Code)"),
     ProviderEntry("openai-codex",   "OpenAI Codex",             "OpenAI Codex (Codex CLI via ChatGPT subscription or API key)"),
+    ProviderEntry("antigravity",    "Antigravity CLI",          "Antigravity CLI (via durable MCP Bridge)"),
     ProviderEntry("openai-api",     "OpenAI API",               "OpenAI API (api.openai.com, API key)"),
     ProviderEntry("alibaba",        "Qwen Cloud",               "Qwen Cloud / DashScope (Qwen + multi-provider)"),
     ProviderEntry("xai-oauth",      "xAI Grok OAuth (SuperGrok / Premium+)", "xAI Grok OAuth (SuperGrok / Premium+ subscription)"),
@@ -1449,7 +1418,7 @@ def fetch_openrouter_models(
         remote = get_curated_openrouter_models()
     except Exception:
         remote = None
-    fallback = list(remote) if remote else list(OPENROUTER_MODELS)
+    fallback = list(OPENROUTER_MODELS)
     preferred_ids = [mid for mid, _ in fallback]
 
     try:
@@ -1480,18 +1449,23 @@ def fetch_openrouter_models(
     for preferred_id in preferred_ids:
         live_item = live_by_id.get(preferred_id)
         if live_item is None:
+            # Fallback if live catalog omitted it temporarily
+            curated.append((preferred_id, "free"))
             continue
         # Hide models that don't advertise tool-calling support — hermes-agent
         # requires it and surfacing them leads to immediate runtime failures
         # when the user selects them. Ported from Kilo-Org/kilocode#9068.
         if not _openrouter_model_supports_tools(live_item):
             continue
+        is_free_pricing = _openrouter_model_is_free(live_item.get("pricing")) or preferred_id.endswith(":free") or ":free" in preferred_id or preferred_id == "openrouter/free"
+        if not is_free_pricing:
+            continue
         if preferred_id == silent_default:
             # Keep the silent-default badge through the live refresh so the
             # picker shows which model Hermes lands on when none is selected.
             desc = "default"
         else:
-            desc = "free" if _openrouter_model_is_free(live_item.get("pricing")) else ""
+            desc = "free"
         curated.append((preferred_id, desc))
 
     if not curated:

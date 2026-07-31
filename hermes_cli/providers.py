@@ -49,6 +49,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         auth_type="virtual",
         base_url_override="moa://local",
     ),
+    "antigravity": HermesOverlay(
+        transport="antigravity_mcp",
+        auth_type="virtual",
+        base_url_override="mcp://antigravity-cli",
+    ),
     "openrouter": HermesOverlay(
         transport="openai_chat",
         is_aggregator=True,
@@ -402,6 +407,7 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "anthropic_messages": "anthropic_messages",
     "codex_responses": "codex_responses",
     "bedrock_converse": "bedrock_converse",
+    "antigravity_mcp": "antigravity_mcp",
 }
 
 

@@ -1541,6 +1541,16 @@ def resolve_runtime_provider(
             "requested_provider": requested_provider,
         }
 
+    if requested_provider in ("antigravity", "agy", "antigravity_cli"):
+        return {
+            "provider": "antigravity",
+            "api_mode": "antigravity_mcp",
+            "base_url": "mcp://antigravity-cli",
+            "api_key": "antigravity-mcp-local",
+            "source": "antigravity-mcp-local",
+            "requested_provider": requested_provider,
+        }
+
     # Azure Anthropic short-circuit: when explicitly targeting an Azure endpoint
     # with provider="anthropic", bypass _resolve_named_custom_runtime (which would
     # return provider="custom" with chat_completions api_mode and no valid key).

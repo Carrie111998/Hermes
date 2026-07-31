@@ -437,8 +437,10 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server"}:
+    if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse", "codex_app_server", "antigravity_mcp", "antigravity"}:
         agent.api_mode = api_mode
+    elif agent.provider in {"antigravity", "antigravity_cli"}:
+        agent.api_mode = "antigravity_mcp"
     elif agent.provider == "openai-codex":
         agent.api_mode = "codex_responses"
     elif agent.provider in {"xai", "xai-oauth"}:
@@ -1001,8 +1003,13 @@ def init_agent(
                         client_kwargs["default_headers"] = dict(_ph.default_headers)
                 except Exception:
                     pass
-        else:
-            # No explicit creds — use the centralized provider router
+        if (agent.provider or "").strip().lower() in {"antigravity", "antigravity_cli"}:
+            client_kwargs = {
+                "api_key": "antigravity-mcp-local",
+                "base_url": "mcp://antigravity-cli",
+            }
+            agent._fallback_activated = True
+        elif not (has_explicit_creds or (agent.api_key and agent.base_url)):
             from agent.auxiliary_client import resolve_provider_client
             _routed_client, _ = resolve_provider_client(
                 agent.provider or "auto", model=agent.model, raw_codex=True)
@@ -1029,7 +1036,7 @@ def init_agent(
                 # but no credentials were found, fail fast with a clear
                 # message instead of silently routing through OpenRouter.
                 _explicit = (agent.provider or "").strip().lower()
-                if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+                if _explicit and _explicit not in {"auto", "openrouter", "custom", "antigravity", "antigravity_cli"}:
                     # Look up the actual env var name from the provider
                     # config — some providers use non-standard names
                     # (e.g. alibaba → DASHSCOPE_API_KEY, not ALIBABA_API_KEY).
