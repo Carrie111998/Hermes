@@ -1105,16 +1105,12 @@ class CLICommandsMixin:
                 import re as _re
                 from datetime import datetime as _dt
 
-                # Diagnostic: log what we're about to do
-                _cprint(f"  [debug] searching for: {search_query}")
-
                 raw = self._session_db.search_messages(
                     query=search_query,
                     role_filter=["user", "assistant"],
                     exclude_sources=["tool", "subagent", "cron"],
                     limit=40,
                 )
-                _cprint(f"  [debug] raw results: {len(raw)}")
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
                 return
@@ -1129,7 +1125,6 @@ class CLICommandsMixin:
                     seen[sid] = r
                 if len(seen) >= 10:
                     break
-            _cprint(f"  [debug] unique sessions (excluding current): {len(seen)}")
 
             if not seen:
                 _cprint(f"  No sessions matching \"{search_query}\".")
@@ -1141,7 +1136,21 @@ class CLICommandsMixin:
             _cprint(f"  Sessions matching \"{search_query}\":")
             _cprint("")
 
-            # Render as rich cards
+            # Strip compression children: if A → A #2 → A #3 all match,
+            # keep only the latest descendant (the one with no child in results).
+            result_ids = set(seen.keys())
+            ancestors = set()
+            for sid in result_ids:
+                meta = self._session_db.get_session(sid) or {}
+                parent_id = meta.get("parent_session_id")
+                while parent_id and parent_id in result_ids:
+                    ancestors.add(parent_id)
+                    parent_meta = self._session_db.get_session(parent_id) or {}
+                    parent_id = parent_meta.get("parent_session_id")
+            for sid in ancestors:
+                seen.pop(sid, None)
+
+            # Render as cards matching the AI's session_search output style
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = self._session_db.get_session(sid) or {}
                 title = meta.get("title") or "(no title)"
@@ -1155,6 +1164,7 @@ class CLICommandsMixin:
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
                 if len(model) > 18:
                     model = model[:17] + "…"
+                mc = meta.get("message_count", 0)
 
                 # Clean FTS5 snippet: strip >>>...<<< markers, collapse whitespace
                 snippet = r.get("snippet", "") or ""
@@ -1163,9 +1173,10 @@ class CLICommandsMixin:
                 if len(snip_short) > 80:
                     snip_short = snip_short[:77] + "..."
 
-                _cprint(f"  {idx:<3}  {when}  {source:<6} {model:<18} {title[:40]}")
+                _cprint(f"  {idx}. @session:default/{sid} — \"{title}\"")
+                _cprint(f"     {when} ({source}, {model}, {mc} msgs)")
                 if snip_short:
-                    _cprint(f"      {snip_short}")
+                    _cprint(f"     {snip_short}")
                 _cprint("")
 
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")

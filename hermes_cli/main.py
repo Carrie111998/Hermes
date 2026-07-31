@@ -17977,6 +17977,7 @@ def main():
 
         elif action == "search":
             import re as _re
+
             query = " ".join(args.query)
             raw = db.search_messages(
                 query=query,
@@ -17995,8 +17996,21 @@ def main():
                 print(f"No sessions matching \"{query}\".")
                 db.close()
                 return
+
+            # Strip compression children (keep latest descendant only)
+            result_ids = set(seen.keys())
+            ancestors = set()
+            for sid in result_ids:
+                meta = db.get_session(sid) or {}
+                parent_id = meta.get("parent_session_id")
+                while parent_id and parent_id in result_ids:
+                    ancestors.add(parent_id)
+                    parent_meta = db.get_session(parent_id) or {}
+                    parent_id = parent_meta.get("parent_session_id")
+            for sid in ancestors:
+                seen.pop(sid, None)
+
             print(f"⚙️  sessions search {query}\n")
-            print(f"Sessions matching \"{query}\":\n")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
                 title = meta.get("title") or "(no title)"
@@ -18011,17 +18025,18 @@ def main():
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
                 if len(model) > 18:
                     model = model[:17] + "…"
-                mc = meta.get("message_count")
+                mc = meta.get("message_count", 0)
                 snip_raw = r.get("snippet", "") or ""
                 snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snip_raw))
                 snip_short = snip_clean.replace("\n", " ").strip()
                 if len(snip_short) > 80:
                     snip_short = snip_short[:77] + "..."
-                print(f"{idx:<3}  {when}  {source:<6} {model:<18} {title[:40]}")
+                print(f"  {idx}. @session:default/{sid} — \"{title}\"")
+                print(f"     {when} ({source}, {model}, {mc} msgs)")
                 if snip_short:
-                    print(f"      {snip_short}")
+                    print(f"     {snip_short}")
                 print()
-            print("Use /resume <id> from an interactive Hermes session to continue.")
+            print("  Use /resume <id> from an interactive Hermes session to continue.")
 
         elif action == "stats":
             total = db.session_count()
