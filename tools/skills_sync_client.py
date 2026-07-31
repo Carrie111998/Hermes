@@ -65,6 +65,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from utils import atomic_json_write, atomic_write_text
+
 logger = logging.getLogger(__name__)
 
 # Sync protocol constants
@@ -444,9 +446,15 @@ def sync_default_opt_in() -> bool:
 # ---------------------------------------------------------------------------
 
 def _skills_dir() -> Path:
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_skills_dir
 
-    return get_hermes_home() / "skills"
+    return get_skills_dir()
+
+
+def _skills_state_dir() -> Path:
+    from hermes_constants import get_skills_state_dir
+
+    return get_skills_state_dir()
 
 
 def is_sync_eligible(skill_name: str) -> bool:
@@ -675,7 +683,7 @@ def _default_device_label() -> str:
 def stable_device_id() -> str:
     """Return a stable per-device label for commit ``author.device`` (contract
      -- advisory, never an auth input). Persisted under
-    ~/.hermes/skills/.sync_device_id.
+    ~/.hermes/state/skills/sync/device-id.
 
     New devices are seeded with a HUMAN-FRIENDLY default (short hostname + a
     short random suffix, e.g. ``bens-macbook-a1b2c3``) so the sync console shows
@@ -683,10 +691,12 @@ def stable_device_id() -> str:
     files are honored verbatim (backward-compatible — a machine keeps its id).
     Use ``set_device_name()`` / ``hermes sync device --name`` to set an explicit
     label."""
-    path = _skills_dir() / ".sync_device_id"
+    path = _skills_state_dir() / "sync" / "device-id"
+    legacy_path = _skills_dir() / ".sync_device_id"
+    read_path = path if path.exists() else legacy_path
     try:
-        if path.exists():
-            val = path.read_text(encoding="utf-8").strip()
+        if read_path.exists():
+            val = read_path.read_text(encoding="utf-8").strip()
             if val:
                 return val
     except OSError:
@@ -703,8 +713,14 @@ def stable_device_id() -> str:
     env_name = (os.environ.get("HERMES_SYNC_DEVICE_NAME") or "").strip()
     val = env_name if env_name else _default_device_label()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(val, encoding="utf-8")
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(path, legacy_path)
+        atomic_write_text(path, val)
+        note_legacy_state_write(migration)
     except OSError as e:
         logger.debug("skills_sync_client: could not persist device id: %s", e)
     return val
@@ -713,7 +729,7 @@ def stable_device_id() -> str:
 def set_device_name(name: str) -> str:
     """Set the human-friendly device label used for commit ``author.device``.
 
-    Writes the (trimmed) name to ~/.hermes/skills/.sync_device_id, overwriting
+    Writes the (trimmed) name to external profile-scoped skills state, overwriting
     any previous value. The label is advisory metadata only — never an auth
     input (contract §2.4) — so any non-empty string is accepted. Returns the
     stored value. Raises ValueError on an empty name.
@@ -721,9 +737,18 @@ def set_device_name(name: str) -> str:
     cleaned = (name or "").strip()
     if not cleaned:
         raise ValueError("device name must be a non-empty string")
-    path = _skills_dir() / ".sync_device_id"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(cleaned, encoding="utf-8")
+    path = _skills_state_dir() / "sync" / "device-id"
+    from tools.skills_policy import (
+        note_legacy_state_write,
+        prepare_legacy_state_write,
+    )
+
+    migration = prepare_legacy_state_write(
+        path,
+        _skills_dir() / ".sync_device_id",
+    )
+    atomic_write_text(path, cleaned)
+    note_legacy_state_write(migration)
     return cleaned
 
 
@@ -936,7 +961,7 @@ class SyncClient:
 # (skills_sync.py, truncated local content_hash namespace) AND from the
 # `sync-manifest` OBJECT in the sync plane (the per-skill opt-in content). This
 # is purely local reconciliation bookkeeping. Lives at
-# ~/.hermes/skills/.sync_state as JSON.
+# ~/.hermes/state/skills/sync/state.json as JSON.
 #
 # NOTE: renamed from `.sync_manifest` -> `.sync_state` to remove the collision
 # with the  plane `sync-manifest`. `read_sync_state` migrates an existing
@@ -944,11 +969,46 @@ class SyncClient:
 # ---------------------------------------------------------------------------
 
 def _sync_state_path() -> Path:
-    return _skills_dir() / ".sync_state"
+    return _skills_state_dir() / "sync" / "state.json"
 
 
 def _legacy_sync_state_path() -> Path:
+    return _skills_dir() / ".sync_state"
+
+
+def _oldest_sync_state_path() -> Path:
     return _skills_dir() / ".sync_manifest"
+
+
+def _external_legacy_sync_state_path() -> Path:
+    """External compatibility destination for the oldest local state name."""
+    return _skills_state_dir() / "sync" / "manifest.json"
+
+
+def _preserve_oldest_sync_state() -> None:
+    """Copy valid `.sync_manifest` JSON to its exact external state path."""
+    source = _oldest_sync_state_path()
+    destination = _external_legacy_sync_state_path()
+    if destination.exists() or not source.exists():
+        return
+    try:
+        data = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        atomic_json_write(
+            destination,
+            data,
+            indent=2,
+            sort_keys=True,
+        )
+        from tools.skills_policy import warn_legacy_state_migrated
+
+        warn_legacy_state_migrated(source)
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug(
+            "skills_sync_client: oldest sync state preservation failed: %s",
+            exc,
+        )
 
 
 def read_sync_state() -> Dict[str, Any]:
@@ -957,24 +1017,29 @@ def read_sync_state() -> Dict[str, Any]:
     Shape: ``{"head": "sha256:...|null", "skills": {name: {tree, commit}}}``.
     ``head`` is the last profile-root HEAD commit we reconciled with.
 
-    Migrates a legacy ``.sync_manifest`` file (pre-rename) transparently: if the
-    new ``.sync_state`` is absent but the legacy file exists, it is read and
-    rewritten to the new path so an existing device keeps its head record.
+    Reads legacy discovery metadata when external state is absent. Read-only
+    calls never migrate or remove the legacy copy.
     """
     path = _sync_state_path()
     if not path.exists():
-        legacy = _legacy_sync_state_path()
-        if legacy.exists():
+        legacy = next(
+            (
+                candidate
+                for candidate in (
+                    _external_legacy_sync_state_path(),
+                    _legacy_sync_state_path(),
+                    _oldest_sync_state_path(),
+                )
+                if candidate.exists()
+            ),
+            None,
+        )
+        if legacy is not None:
             try:
                 data = json.loads(legacy.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     data.setdefault("head", None)
                     data.setdefault("skills", {})
-                    write_sync_state(data)  # migrate to the new path
-                    try:
-                        legacy.unlink()
-                    except OSError:
-                        pass
                     return data
             except (OSError, json.JSONDecodeError) as e:
                 logger.debug("skills_sync_client: legacy sync state migrate failed: %s", e)
@@ -992,24 +1057,26 @@ def read_sync_state() -> Dict[str, Any]:
 
 def write_sync_state(data: Dict[str, Any]) -> None:
     """Write the local sync state atomically. Best-effort."""
-    import tempfile
-
     path = _sync_state_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sync_state_", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            path,
+            _legacy_sync_state_path(),
+            _oldest_sync_state_path(),
+        )
+        _preserve_oldest_sync_state()
+        atomic_json_write(
+            path,
+            data,
+            indent=2,
+            sort_keys=True,
+        )
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("skills_sync_client: sync state write failed: %s", e)
 
@@ -1027,6 +1094,9 @@ def materialize_tree(
     become subdirectories. Does NOT delete files absent from the tree -- the
     caller decides removal semantics. Refuses path traversal via entry names.
     """
+    from tools.skills_policy import require_skills_content_writable
+
+    require_skills_content_writable("materialize synchronized skill content")
     dest.mkdir(parents=True, exist_ok=True)
     tree = client.get_tree_json(tree_hash, org_scope=org_scope)
     for entry in tree.get("entries", []):
@@ -1519,6 +1589,9 @@ def pull_skills(
     materialized, so a pull never resurrects a skill the user hasn't chosen.
     Best-effort; returns a result dict.
     """
+    from tools.skills_policy import require_skills_content_writable
+
+    require_skills_content_writable("pull synchronized skills")
     if identity is None:
         identity = resolve_identity()
     owner = identity["owner"]
@@ -1815,6 +1888,9 @@ def pull_org_skills(
     is `propose_skill` (the fork lives in their personal skills, not _org/).
     Returns {ok, org_id, head, updated} (updated = skill rel-paths written).
     """
+    from tools.skills_policy import require_skills_content_writable
+
+    require_skills_content_writable("pull organization skills")
     identity = identity or resolve_org_identity()
     if "org_id" not in identity:
         raise SyncInertError("no organisation context available")
@@ -1934,14 +2010,17 @@ def _skill_dir_fingerprint(path: Path) -> str:
 
 def _org_baseline_path(org_id: str) -> Path:
     """Sidecar recording the upstream fingerprint of each mirrored skill."""
-    from agent.skill_utils import ORG_BASELINE_FILE
-
-    return _org_dir() / org_id / ORG_BASELINE_FILE
+    return _skills_state_dir() / "sync" / "org" / org_id / "baseline.json"
 
 
 def _read_org_baseline(org_id: str) -> Dict[str, Any]:
+    path = _org_baseline_path(org_id)
+    if not path.exists():
+        from agent.skill_utils import ORG_BASELINE_FILE
+
+        path = _org_dir() / org_id / ORG_BASELINE_FILE
     try:
-        return json.loads(_org_baseline_path(org_id).read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
@@ -1949,8 +2028,18 @@ def _read_org_baseline(org_id: str) -> Dict[str, Any]:
 def _write_org_baseline(org_id: str, baseline: Dict[str, Any]) -> None:
     try:
         p = _org_baseline_path(org_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(baseline, indent=2, sort_keys=True), encoding="utf-8")
+        from agent.skill_utils import ORG_BASELINE_FILE
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            p,
+            _org_dir() / org_id / ORG_BASELINE_FILE,
+        )
+        atomic_json_write(p, baseline, indent=2, sort_keys=True)
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("skills_sync_client: baseline write failed: %s", e)
 
@@ -1989,11 +2078,20 @@ def list_locally_modified_org_skills(org_id: Optional[str] = None) -> List[str]:
 def _write_active_org_marker(org_id: str) -> None:
     """Record which org's mirror may resolve (best-effort, never raises)."""
     try:
+        root = _skills_state_dir() / "sync" / "org"
         from agent.skill_utils import ORG_ACTIVE_MARKER
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
 
-        root = _org_dir()
-        root.mkdir(parents=True, exist_ok=True)
-        (root / ORG_ACTIVE_MARKER).write_text(org_id, encoding="utf-8")
+        marker = root / "active-org"
+        migration = prepare_legacy_state_write(
+            marker,
+            _org_dir() / ORG_ACTIVE_MARKER,
+        )
+        atomic_write_text(marker, org_id)
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("skills_sync_client: active-org marker write failed: %s", e)
 
@@ -2001,13 +2099,20 @@ def _write_active_org_marker(org_id: str) -> None:
 def _write_org_provenance(org_id: str, data: Dict[str, Any]) -> None:
     """Persist the org HEAD provenance sidecar (best-effort, never raises)."""
     try:
+        dest = _skills_state_dir() / "sync" / "org" / org_id
         from agent.skill_utils import ORG_PROVENANCE_FILE
-
-        dest = _org_dir() / org_id
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / ORG_PROVENANCE_FILE).write_text(
-            json.dumps(data, indent=2), encoding="utf-8"
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
         )
+
+        path = dest / "provenance.json"
+        migration = prepare_legacy_state_write(
+            path,
+            _org_dir() / org_id / ORG_PROVENANCE_FILE,
+        )
+        atomic_json_write(path, data, indent=2)
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("skills_sync_client: org provenance write failed: %s", e)
 
@@ -2172,16 +2277,24 @@ def maybe_pull_org_skills() -> Optional[Dict[str, Any]]:
 
 
 def _clear_active_org_marker() -> None:
-    """Remove the active-org marker (org skills stop resolving)."""
+    """Mask any active-org marker without modifying its legacy copy."""
     try:
         from agent.skill_utils import ORG_ACTIVE_MARKER
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
 
-        marker = _org_dir() / ORG_ACTIVE_MARKER
-        if marker.exists():
-            marker.unlink()
-            logger.info(
-                "skills_sync_client: cleared active-org marker "
-                "(token has no org workflow); org skills no longer resolve"
-            )
+        marker = _skills_state_dir() / "sync" / "org" / "active-org"
+        migration = prepare_legacy_state_write(
+            marker,
+            _org_dir() / ORG_ACTIVE_MARKER,
+        )
+        atomic_write_text(marker, "")
+        note_legacy_state_write(migration)
+        logger.info(
+            "skills_sync_client: cleared active-org marker "
+            "(token has no org workflow); org skills no longer resolve"
+        )
     except Exception as e:
         logger.debug("skills_sync_client: marker clear failed: %s", e)

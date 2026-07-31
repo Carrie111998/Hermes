@@ -957,6 +957,43 @@ class ShellFileOperations(FileOperations):
                         return user_home + suffix
         
         return path
+
+    def _mutation_policy_error(
+        self,
+        path: str,
+        operation: str,
+        *,
+        verb: str = "Write",
+    ) -> Optional[str]:
+        """Run every path-level refusal shared by backend mutators.
+
+        Generic file tools and V4A operations all converge on this backend,
+        so enforcing the policy here also covers future callers that reuse the
+        existing file-operation interface. Every implementation of a new
+        write-capable ``FileOperations`` method must enter through this
+        preflight before its first mutation.
+        """
+        from tools.skills_policy import (
+            SkillsContentPolicyError,
+            require_skills_path_writable,
+        )
+
+        policy_path = self._expand_path(path) if path.startswith("~") else path
+        denied = get_write_denied_error(policy_path, verb=verb)
+        if denied:
+            return denied
+
+        if not os.path.isabs(policy_path):
+            effective_cwd = getattr(self.env, "cwd", None) or self.cwd
+            effective_cwd = os.path.abspath(os.path.expanduser(effective_cwd))
+            policy_path = os.path.normpath(
+                os.path.join(effective_cwd, policy_path)
+            )
+        try:
+            require_skills_path_writable(policy_path, operation)
+        except SkillsContentPolicyError as exc:
+            return str(exc)
+        return None
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
@@ -1303,9 +1340,13 @@ class ShellFileOperations(FileOperations):
 
     def _python_delete(self, path: str, recursive: bool) -> WriteResult:
         path = self._expand_path(path)
-        denied = get_write_denied_error(path, verb="Delete")
-        if denied:
-            return WriteResult(error=denied)
+        policy_error = self._mutation_policy_error(
+            path,
+            "delete",
+            verb="Delete",
+        )
+        if policy_error:
+            return WriteResult(error=policy_error)
 
         # We can't shell out to ``rm`` here — it doesn't exist on Windows
         # ``cmd.exe`` or PowerShell, so this code path is what's left when
@@ -1350,9 +1391,13 @@ class ShellFileOperations(FileOperations):
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         for p in (src, dst):
-            denied = get_write_denied_error(p, verb="Move")
-            if denied:
-                return WriteResult(error=denied)
+            policy_error = self._mutation_policy_error(
+                p,
+                "move",
+                verb="Move",
+            )
+            if policy_error:
+                return WriteResult(error=policy_error)
         result = self._exec(
             f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}"
         )
@@ -1398,10 +1443,9 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
 
-        # Block writes to sensitive paths
-        denied = get_write_denied_error(path)
-        if denied:
-            return WriteResult(error=denied)
+        policy_error = self._mutation_policy_error(path, "write_file")
+        if policy_error:
+            return WriteResult(error=policy_error)
 
         # ── Fail-closed pre-write syntax gate ───────────────────────────
         # Validate the CANDIDATE content BEFORE any bytes touch disk —
@@ -1582,10 +1626,9 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
 
-        # Block writes to sensitive paths
-        denied = get_write_denied_error(path)
-        if denied:
-            return PatchResult(error=denied)
+        policy_error = self._mutation_policy_error(path, "patch")
+        if policy_error:
+            return PatchResult(error=policy_error)
 
         # Read current content
         read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
@@ -1708,9 +1751,20 @@ class ShellFileOperations(FileOperations):
         Returns:
             PatchResult with changes made
         """
-        # Import patch parser
-        from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
-        
+        # Preflight targets with the parser's shared pure extractor before
+        # parsing or applying anything. This preserves all-target atomicity
+        # even if a future parser path performs setup before returning ops.
+        from tools.patch_parser import (
+            apply_v4a_operations,
+            extract_v4a_target_paths,
+            parse_v4a_patch,
+        )
+
+        for target in extract_v4a_target_paths(patch_content):
+            policy_error = self._mutation_policy_error(target, "patch")
+            if policy_error:
+                return PatchResult(error=policy_error)
+
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")

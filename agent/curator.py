@@ -10,7 +10,7 @@ Responsibilities:
   - Auto-transition lifecycle states based on derived skill activity timestamps
   - Spawn a background review agent that can pin / archive / consolidate /
     patch agent-created skills via skill_manage
-  - Persist curator state (last_run_at, paused, etc.) in .curator_state
+  - Persist curator state (last_run_at, paused, etc.) outside skill discovery
 
 Strict invariants:
   - Only touches agent-created skills (see tools/skill_usage.is_agent_created)
@@ -30,7 +30,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_skills_state_dir
 from tools import skill_usage
 from utils import atomic_json_write
 
@@ -79,10 +79,17 @@ DEFAULT_CONSOLIDATE = False
 
 
 # ---------------------------------------------------------------------------
-# .curator_state — persistent scheduler + status
+# External curator state — persistent scheduler + status
 # ---------------------------------------------------------------------------
 
 def _state_file() -> Path:
+    return get_skills_state_dir() / "curator-state.json"
+
+
+def _state_read_file() -> Path:
+    path = _state_file()
+    if path.exists():
+        return path
     return get_hermes_home() / "skills" / ".curator_state"
 
 
@@ -99,7 +106,7 @@ def _default_state() -> Dict[str, Any]:
 
 
 def load_state() -> Dict[str, Any]:
-    path = _state_file()
+    path = _state_read_file()
     if not path.exists():
         return _default_state()
     try:
@@ -116,7 +123,17 @@ def load_state() -> Dict[str, Any]:
 def save_state(data: Dict[str, Any]) -> None:
     path = _state_file()
     try:
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            path,
+            get_hermes_home() / "skills" / ".curator_state",
+        )
         atomic_json_write(path, data, indent=2, sort_keys=True)
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("Failed to save curator state: %s", e, exc_info=True)
 
@@ -1527,6 +1544,33 @@ def run_curator_review(
     *consolidate*: when consolidation is off, the preview only reports the
     deterministic prune candidates.
     """
+    if not dry_run:
+        from tools.skills_policy import (
+            SkillsContentPolicyError,
+            require_skills_content_writable,
+        )
+
+        try:
+            require_skills_content_writable("run curator skill maintenance")
+        except SkillsContentPolicyError as exc:
+            message = str(exc)
+            if on_summary:
+                try:
+                    on_summary(f"curator: {message}")
+                except Exception:
+                    pass
+            return {
+                "started_at": None,
+                "auto_transitions": {
+                    "checked": 0,
+                    "marked_stale": 0,
+                    "archived": 0,
+                    "reactivated": 0,
+                },
+                "summary_so_far": message,
+                "refused": True,
+            }
+
     if consolidate is None:
         consolidate = get_consolidate()
     start = datetime.now(timezone.utc)

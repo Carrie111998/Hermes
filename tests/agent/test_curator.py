@@ -387,6 +387,54 @@ def test_state_atomic_write_no_tmp_leftovers(curator_env):
     assert tmp_files == []
 
 
+def test_managed_read_only_refuses_curator_before_snapshot_or_llm(
+    curator_env,
+    monkeypatch,
+):
+    c = curator_env["curator"]
+    calls = {"policy": 0, "snapshot": 0, "llm": 0}
+
+    def refuse_curator(operation):
+        from tools.skills_policy import (
+            SKILLS_CONTENT_READ_ONLY,
+            SkillsContentPolicyError,
+        )
+
+        calls["policy"] += 1
+        raise SkillsContentPolicyError(
+            SKILLS_CONTENT_READ_ONLY,
+            f"{operation} is disabled for this test",
+        )
+
+    def count_snapshot(**_kwargs):
+        calls["snapshot"] += 1
+        return None
+
+    def count_llm(_prompt):
+        calls["llm"] += 1
+        return "unexpected"
+
+    monkeypatch.setattr(
+        "tools.skills_policy.require_skills_content_writable",
+        refuse_curator,
+    )
+    monkeypatch.setattr(
+        "agent.curator_backup.snapshot_skills",
+        count_snapshot,
+    )
+    monkeypatch.setattr(
+        c,
+        "_run_llm_review",
+        count_llm,
+    )
+
+    result = c.run_curator_review(synchronous=True, consolidate=True)
+
+    assert result["refused"] is True
+    assert "SKILLS_CONTENT_READ_ONLY" in result["summary_so_far"]
+    assert calls == {"policy": 1, "snapshot": 0, "llm": 0}
+
+
 
 
 
@@ -697,5 +745,3 @@ def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch)
     assert result["error"] is None
     assert captured["model"] == "real-model-id"
     assert captured["max_tokens"] == 1234
-
-

@@ -24,6 +24,98 @@ import pytest
 import tools.skills_sync_client as ssc
 
 
+def test_pull_refuses_managed_content_before_network_or_root_creation(
+    tmp_path,
+    monkeypatch,
+):
+    skills = tmp_path / "skills"
+
+    class _ClientMustNotRun:
+        def capabilities(self):
+            raise AssertionError("read-only refusal must precede network access")
+
+    monkeypatch.setattr(ssc, "_skills_dir", lambda: skills)
+    monkeypatch.setattr(
+        "tools.skills_policy.skills_content_mode",
+        lambda: "read_only",
+    )
+
+    with pytest.raises(RuntimeError, match="SKILLS_CONTENT_READ_ONLY"):
+        ssc.pull_skills(
+            _ClientMustNotRun(),
+            identity={"owner": "managed", "api_key": "unused"},
+        )
+
+    assert not skills.exists()
+
+
+def test_materialize_tree_cannot_bypass_managed_content_policy(
+    tmp_path,
+    monkeypatch,
+):
+    destination = tmp_path / "skills" / "managed"
+
+    class _ClientMustNotRun:
+        def get_tree_json(self, _tree_hash):
+            raise AssertionError("materialization must refuse before tree fetch")
+
+    monkeypatch.setattr(
+        "tools.skills_policy.skills_content_mode",
+        lambda: "read_only",
+    )
+
+    with pytest.raises(RuntimeError, match="SKILLS_CONTENT_READ_ONLY"):
+        ssc.materialize_tree(_ClientMustNotRun(), "sha256:unused", destination)
+
+    assert not destination.exists()
+
+
+def test_legacy_sync_state_reads_without_migration_then_writes_external_state(
+    tmp_path,
+    monkeypatch,
+):
+    skills = tmp_path / "skills"
+    state = tmp_path / "state" / "skills"
+    skills.mkdir()
+    legacy = skills / ".sync_manifest"
+    legacy.write_text(
+        '{"head": "sha256:legacy", "skills": {"alpha": {"tree": "t"}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(ssc, "_skills_dir", lambda: skills)
+    monkeypatch.setattr(ssc, "_skills_state_dir", lambda: state)
+
+    loaded = ssc.read_sync_state()
+
+    assert loaded["head"] == "sha256:legacy"
+    assert not state.exists()
+    ssc.write_sync_state({**loaded, "head": "sha256:new"})
+
+    assert legacy.exists()
+    assert (state / "sync" / "manifest.json").exists()
+    assert json.loads((state / "sync" / "state.json").read_text())["head"] == (
+        "sha256:new"
+    )
+
+
+def test_external_empty_org_marker_masks_legacy_marker(tmp_path, monkeypatch):
+    from agent.skill_utils import ORG_ACTIVE_MARKER, read_active_org_id
+
+    skills = tmp_path / "skills"
+    state = tmp_path / "state" / "skills"
+    legacy_marker = skills / ssc.ORG_DIR_NAME / ORG_ACTIVE_MARKER
+    legacy_marker.parent.mkdir(parents=True)
+    legacy_marker.write_text("old-org", encoding="utf-8")
+    monkeypatch.setattr(ssc, "_skills_dir", lambda: skills)
+    monkeypatch.setattr(ssc, "_skills_state_dir", lambda: state)
+
+    assert read_active_org_id(skills) == "old-org"
+    ssc._clear_active_org_marker()
+
+    assert legacy_marker.read_text(encoding="utf-8") == "old-org"
+    assert read_active_org_id(skills) is None
+
+
 # ---------------------------------------------------------------------------
 # In-process mock sync server (read + write endpoints)
 # ---------------------------------------------------------------------------
@@ -816,6 +908,7 @@ class TestEnvConfig:
 class TestDeviceName:
     def test_default_is_hostname_seeded(self, tmp_path, monkeypatch):
         monkeypatch.setattr(ssc, "_skills_dir", lambda: tmp_path)
+        monkeypatch.setattr(ssc, "_skills_state_dir", lambda: tmp_path)
         monkeypatch.delenv("HERMES_SYNC_DEVICE_NAME", raising=False)
         monkeypatch.setattr(
             "socket.gethostname", lambda: "bens-macbook.local", raising=False
@@ -825,7 +918,7 @@ class TestDeviceName:
         assert val.startswith("bens-macbook-")
         assert val != "bens-macbook-"
         # persisted + stable across calls
-        assert (tmp_path / ".sync_device_id").read_text() == val
+        assert (tmp_path / "sync" / "device-id").read_text() == val
         assert ssc.stable_device_id() == val
 
     def test_existing_file_wins_over_default_and_env(self, tmp_path, monkeypatch):
@@ -837,10 +930,11 @@ class TestDeviceName:
     def test_env_seeds_first_use(self, tmp_path, monkeypatch):
         # Hermes Cloud path: HERMES_SYNC_DEVICE_NAME seeds the first-use label.
         monkeypatch.setattr(ssc, "_skills_dir", lambda: tmp_path)
+        monkeypatch.setattr(ssc, "_skills_state_dir", lambda: tmp_path)
         monkeypatch.setenv("HERMES_SYNC_DEVICE_NAME", "hermes-cloud-ben-1")
         assert ssc.stable_device_id() == "hermes-cloud-ben-1"
         # persisted so it stays stable even if the env later changes
-        assert (tmp_path / ".sync_device_id").read_text() == "hermes-cloud-ben-1"
+        assert (tmp_path / "sync" / "device-id").read_text() == "hermes-cloud-ben-1"
         monkeypatch.setenv("HERMES_SYNC_DEVICE_NAME", "changed")
         assert ssc.stable_device_id() == "hermes-cloud-ben-1"
 

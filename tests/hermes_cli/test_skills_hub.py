@@ -80,6 +80,65 @@ def _capture_check(monkeypatch, results, name=None) -> str:
     return sink.getvalue()
 
 
+def test_list_does_not_initialize_hub_state(three_source_env):
+    assert not three_source_env.exists()
+    _capture()
+    assert not three_source_env.exists()
+
+
+def test_check_does_not_initialize_hub_state(monkeypatch, hub_env):
+    output = _capture_check(monkeypatch, [])
+
+    assert "No hub-installed skills" in output
+    assert not hub_env.exists()
+
+
+def test_nested_update_refuses_before_remote_check(monkeypatch, tmp_path):
+    import tools.skills_hub as hub
+
+    home = tmp_path / ".hermes"
+    skill = home / "skills" / "planning" / "ticket-decomposition"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: ticket-decomposition\ndescription: Split tickets.\n---\n",
+        encoding="utf-8",
+    )
+    (home / "config.yaml").write_text(
+        "skills:\n  content_mode: read_only\n",
+        encoding="utf-8",
+    )
+    before = {
+        path.relative_to(home / "skills").as_posix(): path.read_bytes()
+        for path in (home / "skills").rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        hub,
+        "check_for_skill_updates",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("update check must not run after policy refusal")
+        ),
+    )
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+    result = do_update(
+        name="planning/ticket-decomposition",
+        console=console,
+    )
+
+    assert result is False
+    assert "SKILLS_CONTENT_READ_ONLY" in sink.getvalue()
+    after = {
+        path.relative_to(home / "skills").as_posix(): path.read_bytes()
+        for path in (home / "skills").rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert not (home / "state").exists()
+
+
 def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, bool]]]:
     import tools.skills_hub as hub
     import hermes_cli.skills_hub as cli_hub
@@ -312,4 +371,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-

@@ -5,8 +5,31 @@ from types import SimpleNamespace
 from tools.patch_parser import (
     OperationType,
     apply_v4a_operations,
+    extract_v4a_target_paths,
     parse_v4a_patch,
 )
+
+
+def test_target_extractor_uses_parser_boundaries_and_includes_move_endpoints():
+    patch = """\
+ignored before begin
+*** Delete File: ignored-before.txt
+*** Begin Patch
+***Update File: src/main.py
+*** Add File: src/new.py
+*** Delete File: src/old.py
+*** Move File: src/from.py -> src/to.py
+*** End Patch
+*** Delete File: ignored-after.txt
+"""
+
+    assert extract_v4a_target_paths(patch) == [
+        "src/main.py",
+        "src/new.py",
+        "src/old.py",
+        "src/from.py",
+        "src/to.py",
+    ]
 
 
 class TestParseUpdateFile:

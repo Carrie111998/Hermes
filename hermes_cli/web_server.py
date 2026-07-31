@@ -13004,7 +13004,7 @@ def _installed_hub_identifiers(profile: Optional[str] = None) -> dict:
     """Map identifier -> installed lock entry for hub-installed skills.
 
     Lets the UI mark search results that are already installed.  Scoped to
-    ``profile``'s skills/.hub/lock.json when provided (HubLockFile takes an
+    ``profile``'s state/skills/hub/lock.json when provided (HubLockFile takes an
     explicit path, sidestepping the import-time LOCK_FILE binding).
     Best-effort: returns an empty dict if the lock file can't be read.
     """
@@ -13014,7 +13014,10 @@ def _installed_hub_identifiers(profile: Optional[str] = None) -> dict:
         requested = (profile or "").strip()
         if requested and requested.lower() != "current":
             profile_dir = _resolve_profile_dir(requested)
-            lock = HubLockFile(profile_dir / "skills" / ".hub" / "lock.json")
+            lock_path = profile_dir / "state" / "skills" / "hub" / "lock.json"
+            if not lock_path.exists():
+                lock_path = profile_dir / "skills" / ".hub" / "lock.json"
+            lock = HubLockFile(lock_path)
         else:
             lock = HubLockFile()
         out = {}

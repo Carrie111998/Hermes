@@ -1,6 +1,6 @@
 """Skill usage telemetry + provenance tracking for the Curator feature.
 
-Tracks per-skill usage metadata in a sidecar JSON file (~/.hermes/skills/.usage.json)
+Tracks per-skill usage metadata in ``~/.hermes/state/skills/usage.json``
 keyed by skill name. Counters are bumped by the existing skill tools (skill_view,
 skill_manage); the curator orchestrator reads the derived activity timestamp to
 decide lifecycle transitions.
@@ -8,7 +8,7 @@ decide lifecycle transitions.
 Design notes:
   - Sidecar, not frontmatter. Keeps operational telemetry out of user-authored
     SKILL.md content and avoids conflict pressure for bundled/hub skills.
-  - Atomic writes via tempfile + os.replace (same pattern as .bundled_manifest).
+  - Atomic writes via tempfile + os.replace (same pattern as bundled state).
   - All counter bumps are best-effort: failures log at DEBUG and return silently.
     A broken sidecar never breaks the underlying tool call.
   - Provenance filter: curator-managed skills are explicitly marked when
@@ -33,8 +33,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_skills_state_dir
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
+from utils import atomic_json_write, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,13 @@ def _skills_dir() -> Path:
 
 
 def _usage_file() -> Path:
+    return get_skills_state_dir() / "usage.json"
+
+
+def _usage_read_file() -> Path:
+    path = _usage_file()
+    if path.exists():
+        return path
     return _skills_dir() / ".usage.json"
 
 
@@ -181,10 +189,12 @@ def activity_count(record: Dict[str, Any]) -> int:
 def _read_bundled_manifest_names() -> Set[str]:
     """Return the set of skill names that were seeded from the bundled repo.
 
-    Reads ~/.hermes/skills/.bundled_manifest (format: "name:hash" per line).
+    Reads external bundled state, with legacy discovery fallback.
     Returns empty set if the file is missing or unreadable.
     """
-    manifest = _skills_dir() / ".bundled_manifest"
+    manifest = get_skills_state_dir() / "bundled-manifest"
+    if not manifest.exists():
+        manifest = _skills_dir() / ".bundled_manifest"
     if not manifest.exists():
         return set()
     names: Set[str] = set()
@@ -204,9 +214,11 @@ def _read_bundled_manifest_names() -> Set[str]:
 def _read_hub_installed_names() -> Set[str]:
     """Return the set of skill names installed via the Skills Hub.
 
-    Reads ~/.hermes/skills/.hub/lock.json (see tools/skills_hub.py :: HubLockFile).
+    Reads external hub state, with legacy discovery fallback.
     """
-    lock_path = _skills_dir() / ".hub" / "lock.json"
+    lock_path = get_skills_state_dir() / "hub" / "lock.json"
+    if not lock_path.exists():
+        lock_path = _skills_dir() / ".hub" / "lock.json"
     if not lock_path.exists():
         return set()
     try:
@@ -269,17 +281,24 @@ def _prune_builtins_enabled() -> bool:
 
 
 def _suppressed_file() -> Path:
+    return get_skills_state_dir() / "curator-suppressed"
+
+
+def _suppressed_read_file() -> Path:
+    path = _suppressed_file()
+    if path.exists():
+        return path
     return _skills_dir() / ".curator_suppressed"
 
 
 def read_suppressed_names() -> Set[str]:
     """Built-in skills the curator pruned — the re-seeder must leave archived.
 
-    One skill name per line in ``~/.hermes/skills/.curator_suppressed``. This is
+    One skill name per line in external curator state (with legacy fallback). This is
     what makes pruning a built-in durable: without it, ``hermes update`` would
     re-copy the bundled skill on the next sync.
     """
-    path = _suppressed_file()
+    path = _suppressed_read_file()
     if not path.exists():
         return set()
     names: Set[str] = set()
@@ -296,21 +315,18 @@ def read_suppressed_names() -> Set[str]:
 def _write_suppressed_names(names: Set[str]) -> None:
     path = _suppressed_file()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            path,
+            _skills_dir() / ".curator_suppressed",
+        )
         data = "\n".join(sorted(names)) + ("\n" if names else "")
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".curator_suppressed_", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        atomic_write_text(path, data, tmp_prefix=".curator_suppressed_")
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("Failed to write curator suppression list: %s", e, exc_info=True)
 
@@ -659,7 +675,7 @@ def _empty_record() -> Dict[str, Any]:
 
 def load_usage() -> Dict[str, Dict[str, Any]]:
     """Read the entire .usage.json map. Returns empty dict on missing/corrupt."""
-    path = _usage_file()
+    path = _usage_read_file()
     if not path.exists():
         return {}
     try:
@@ -681,22 +697,17 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
     """Write the usage map atomically. Best-effort — errors are logged, not raised."""
     path = _usage_file()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".usage_", suffix=".tmp"
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
         )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, path)
-        except BaseException:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+
+        migration = prepare_legacy_state_write(
+            path,
+            _skills_dir() / ".usage.json",
+        )
+        atomic_json_write(path, data, indent=2, sort_keys=True)
+        note_legacy_state_write(migration)
     except Exception as e:
         logger.debug("Failed to write %s: %s", path, e, exc_info=True)
 
@@ -881,6 +892,16 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     when one is archived, its name is added to the suppression list so the
     update-time re-seeder leaves it archived instead of restoring it.
     """
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(f"archive skill {skill_name!r}")
+    except SkillsContentPolicyError as exc:
+        return False, str(exc)
+
     local_skill_dir = _find_skill_dir(skill_name)
     if local_skill_dir is None and _find_external_skill_dir(skill_name) is not None:
         return False, _external_read_only_message(skill_name)
@@ -945,6 +966,16 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     way to lift a prune). Restoring clears any suppression entry so future
     updates may re-seed the built-in again.
     """
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(f"restore skill {skill_name!r}")
+    except SkillsContentPolicyError as exc:
+        return False, str(exc)
+
     # Hub skills always have an external upstream owner — never shadow them.
     if is_hub_installed(skill_name):
         return False, (

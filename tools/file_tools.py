@@ -726,6 +726,49 @@ def _is_expected_write_exception(exc: Exception) -> bool:
     return False
 
 
+def _check_skills_content_write(
+    path: str,
+    task_id: str,
+    operation: str,
+) -> str | None:
+    """Preflight managed content before dispatch to any file backend."""
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_path_writable,
+    )
+
+    try:
+        resolved = str(_resolve_path_for_task(path, task_id))
+    except Exception:
+        # An absolute caller path still carries enough identity for the policy
+        # even when task/workspace resolution fails. Only unresolved relative
+        # paths must defer to the backend, which has the live environment cwd
+        # and repeats this same check before mutation.
+        candidate = _expand_tilde(path)
+        if _uses_container_paths(task_id):
+            if not posixpath.isabs(candidate):
+                return None
+            resolved = posixpath.normpath(candidate)
+        elif sys.platform == "win32":
+            import ntpath
+
+            from tools.environments.local import _msys_to_windows_path
+
+            candidate = _msys_to_windows_path(candidate)
+            if not ntpath.isabs(candidate):
+                return None
+            resolved = ntpath.normpath(candidate)
+        else:
+            if not os.path.isabs(candidate):
+                return None
+            resolved = os.path.normpath(candidate)
+    try:
+        require_skills_path_writable(resolved, operation)
+    except SkillsContentPolicyError as exc:
+        return str(exc)
+    return None
+
+
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 
@@ -1595,6 +1638,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         except Exception:
             _resolved = None
 
+        policy_error = _check_skills_content_write(
+            _resolved or path,
+            task_id,
+            "write_file",
+        )
+        if policy_error:
+            return tool_error(policy_error)
+
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
@@ -1660,8 +1711,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if path:
         _paths_to_check.append(path)
     if mode == "patch" and patch:
-        import re as _re
+        from tools.patch_parser import extract_v4a_target_paths
         from tools.path_security import has_traversal_component
+
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
@@ -1680,26 +1732,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            v4a_path = _m.group(1).strip()
+        for v4a_path in extract_v4a_target_paths(patch):
             _err = _reject_v4a_traversal(v4a_path)
             if _err:
                 return _err
             _paths_to_check.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
-                _err = _reject_v4a_traversal(v4a_path)
-                if _err:
-                    return _err
-                _paths_to_check.append(v4a_path)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -1713,12 +1750,21 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # callers lock in the same order — prevents deadlock on overlapping
         # multi-file V4A patches.
         _resolved_paths: list[str] = []
+        _path_to_resolved: dict[str, str | None] = {}
         _seen: set[str] = set()
         for _p in _paths_to_check:
             try:
                 _r = str(_resolve_path_for_task(_p, task_id))
             except Exception:
                 _r = None
+            _path_to_resolved[_p] = _r
+            policy_error = _check_skills_content_write(
+                _r or _p,
+                task_id,
+                "patch",
+            )
+            if policy_error:
+                return tool_error(policy_error)
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -1735,13 +1781,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
-                _path_to_resolved[_p] = _r
+                _r = _path_to_resolved[_p]
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
                 if not _sw and _r:

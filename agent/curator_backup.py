@@ -1,28 +1,26 @@
 """Curator snapshot + rollback.
 
-A pre-run snapshot of ``~/.hermes/skills/`` (excluding ``.curator_backups/``
-itself) is taken before any mutating curator pass. Snapshots are tar.gz
-files under ``~/.hermes/skills/.curator_backups/<utc-iso>/`` with a
+A pre-run snapshot of ``~/.hermes/skills/`` is taken before any mutating
+curator pass. Snapshots are tar.gz files under
+``~/.hermes/state/skills/curator-backups/<utc-iso>/`` with a
 companion ``manifest.json`` describing the snapshot (reason, time, size,
 counted skill files). Rollback picks a snapshot, moves the current
 ``skills/`` tree aside into another snapshot so even the rollback itself
 is undoable, then extracts the chosen snapshot into place.
 
 The snapshot does NOT include:
-  - ``.curator_backups/`` (would recurse)
+  - legacy ``.curator_backups/`` (would recurse)
   - ``.hub/`` (hub-installed skills — managed by the hub, not us)
 
 It DOES include:
   - all SKILL.md files + their directories (``scripts/``, ``references/``,
     ``templates/``, ``assets/``)
-  - ``.usage.json`` (usage telemetry — needed to rehydrate state cleanly)
   - ``.archive/`` (so rollback restores previously-archived skills too)
-  - ``.curator_state`` (so rolling back also restores the last-run-at
-    pointer — otherwise the curator would immediately re-fire on the next
-    tick)
-  - ``.bundled_manifest`` (so protection markers stay consistent)
-  - ``.curator_suppressed`` (so rollback restores the set of pruned built-ins
-    the re-seeder must leave archived)
+
+Writable usage, curator, bundled-sync, and hub metadata lives outside this
+content snapshot under ``state/skills/``. Legacy discovery-root metadata may
+still be present in an old profile and is preserved as inert compatibility
+data, but it is not the post-migration write authority.
 
 Alongside the skills tarball, each snapshot also captures a copy of
 ``~/.hermes/cron/jobs.json`` as ``cron-jobs.json`` when it exists. Cron
@@ -44,11 +42,12 @@ import logging
 import re
 import shutil
 import tarfile
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_skills_state_dir
 from agent.skill_utils import is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
@@ -68,7 +67,47 @@ _ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z(-\d{2})?$")
 
 
 def _backups_dir() -> Path:
+    return get_skills_state_dir() / "curator-backups"
+
+
+def _backups_read_dir() -> Path:
+    path = _backups_dir()
+    if path.exists():
+        return path
     return get_hermes_home() / "skills" / ".curator_backups"
+
+
+def _prepare_backups_dir_for_write() -> Path:
+    """Preserve legacy snapshots before the first external-state snapshot."""
+    backups = _backups_dir()
+    legacy = get_hermes_home() / "skills" / ".curator_backups"
+    if backups.exists() or not legacy.is_dir():
+        return backups
+
+    backups.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            dir=str(backups.parent),
+            prefix=f".{backups.name}.migration-",
+        )
+    )
+    staging.rmdir()
+    try:
+        shutil.copytree(legacy, staging, symlinks=True)
+        try:
+            staging.replace(backups)
+        except OSError:
+            if not backups.exists():
+                raise
+            shutil.rmtree(staging, ignore_errors=True)
+        else:
+            from tools.skills_policy import warn_legacy_state_migrated
+
+            warn_legacy_state_migrated(legacy)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return backups
 
 
 def _skills_dir() -> Path:
@@ -234,7 +273,7 @@ def snapshot_skills(reason: str = "manual", *, protect_ids: Optional[Set[str]] =
         logger.debug("No ~/.hermes/skills/ directory — nothing to back up")
         return None
 
-    backups = _backups_dir()
+    backups = _prepare_backups_dir_for_write()
     try:
         backups.mkdir(parents=True, exist_ok=True)
     except OSError as e:
@@ -352,7 +391,7 @@ def list_backups() -> List[Dict[str, Any]]:
     real ``skills.tar.gz`` tarball are listed — transient
     ``.rollback-staging-*`` directories created mid-rollback are
     implementation detail and not shown."""
-    backups = _backups_dir()
+    backups = _backups_read_dir()
     if not backups.exists():
         return []
     out: List[Dict[str, Any]] = []
@@ -379,7 +418,7 @@ def list_backups() -> List[Dict[str, Any]]:
 def _resolve_backup(backup_id: Optional[str]) -> Optional[Path]:
     """Return the path of the requested backup, or the newest one if
     *backup_id* is None. Returns None if no match."""
-    backups = _backups_dir()
+    backups = _backups_read_dir()
     if not backups.exists():
         return None
     if backup_id:
@@ -557,6 +596,16 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
 
     Returns ``(ok, message, snapshot_path)``.
     """
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable("rollback curator skill snapshot")
+    except SkillsContentPolicyError as exc:
+        return False, str(exc), None
+
     target = _resolve_backup(backup_id)
     if target is None:
         return (

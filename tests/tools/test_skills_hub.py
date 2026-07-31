@@ -27,6 +27,7 @@ from tools.skills_hub import (
     parallel_search_sources,
     unified_search,
     append_audit_log,
+    ensure_hub_dirs,
     quarantine_bundle,
 )
 
@@ -879,6 +880,143 @@ class TestQuarantineBundleBinaryAssets:
                 quarantine_bundle(bundle)
 
         assert not absolute_target.exists()
+
+
+def test_ensure_hub_dirs_migrates_legacy_state_without_modifying_source(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.skills_hub as hub
+
+    skills = tmp_path / "skills"
+    legacy = skills / ".hub"
+    state = tmp_path / "state" / "skills" / "hub"
+    (legacy / "quarantine" / "pending").mkdir(parents=True)
+    (legacy / "index-cache").mkdir()
+    (legacy / "lock.json").write_text(
+        '{"version": 1, "installed": {"kept": {"install_path": "kept"}}}\n',
+        encoding="utf-8",
+    )
+    (legacy / "taps.json").write_text(
+        '{"taps": [{"repo": "owner/repo", "path": "skills/"}]}\n',
+        encoding="utf-8",
+    )
+    (legacy / "audit.log").write_text("legacy audit\n", encoding="utf-8")
+    (legacy / "quarantine" / "pending" / "SKILL.md").write_text(
+        "---\nname: pending\n---\n",
+        encoding="utf-8",
+    )
+    (legacy / "index-cache" / "cached.json").write_text(
+        '{"cached": true}\n',
+        encoding="utf-8",
+    )
+    before = {
+        path.relative_to(legacy).as_posix(): path.read_bytes()
+        for path in legacy.rglob("*")
+        if path.is_file()
+    }
+    monkeypatch.setattr(hub, "SKILLS_DIR", skills)
+    monkeypatch.setattr(hub, "HUB_DIR", state)
+    monkeypatch.setattr(hub, "LOCK_FILE", state / "lock.json")
+    monkeypatch.setattr(hub, "QUARANTINE_DIR", state / "quarantine")
+    monkeypatch.setattr(hub, "AUDIT_LOG", state / "audit.log")
+    monkeypatch.setattr(hub, "TAPS_FILE", state / "taps.json")
+    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", state / "index-cache")
+
+    ensure_hub_dirs()
+
+    assert HubLockFile(state / "lock.json").get_installed("kept") is not None
+    assert TapsManager(state / "taps.json").list_taps() == [
+        {"repo": "owner/repo", "path": "skills/"}
+    ]
+    assert (state / "audit.log").read_text(encoding="utf-8") == "legacy audit\n"
+    assert (state / "quarantine" / "pending" / "SKILL.md").exists()
+    assert (state / "index-cache" / "cached.json").exists()
+    after = {
+        path.relative_to(legacy).as_posix(): path.read_bytes()
+        for path in legacy.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_audit_append_preserves_legacy_log_before_first_external_write(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.skills_hub as hub
+
+    skills = tmp_path / "skills"
+    legacy = skills / ".hub" / "audit.log"
+    state = tmp_path / "state" / "skills" / "hub"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy audit\n", encoding="utf-8")
+    monkeypatch.setattr(hub, "SKILLS_DIR", skills)
+    monkeypatch.setattr(hub, "HUB_DIR", state)
+    monkeypatch.setattr(hub, "AUDIT_LOG", state / "audit.log")
+
+    hub.append_audit_log(
+        "UNINSTALL",
+        "example",
+        "official",
+        "trusted",
+        "n/a",
+    )
+
+    assert legacy.read_text(encoding="utf-8") == "legacy audit\n"
+    external = (state / "audit.log").read_text(encoding="utf-8")
+    assert external.startswith("legacy audit\n")
+    assert "UNINSTALL example official:trusted n/a" in external
+
+
+def test_install_from_quarantine_refuses_managed_content_before_move(
+    tmp_path,
+    monkeypatch,
+):
+    import tools.skills_hub as hub
+    from tools.skills_guard import ScanResult
+
+    skills_dir = tmp_path / "skills"
+    quarantine_root = tmp_path / "state" / "skills" / "hub" / "quarantine"
+    pending = quarantine_root / "pending"
+    pending.mkdir(parents=True)
+    (pending / "SKILL.md").write_text(
+        "---\nname: managed-skill\ndescription: managed\n---\n",
+        encoding="utf-8",
+    )
+    bundle = SkillBundle(
+        name="managed-skill",
+        files={"SKILL.md": "---\nname: managed-skill\n---\n"},
+        source="official",
+        identifier="official/managed-skill",
+        trust_level="builtin",
+    )
+    result = ScanResult(
+        skill_name="managed-skill",
+        source="official",
+        trust_level="builtin",
+        verdict="safe",
+    )
+    monkeypatch.setattr(
+        "tools.skills_policy.skills_content_mode",
+        lambda: "read_only",
+    )
+
+    with (
+        patch.object(hub, "SKILLS_DIR", skills_dir),
+        patch.object(hub, "QUARANTINE_DIR", quarantine_root),
+        pytest.raises(RuntimeError, match="SKILLS_CONTENT_READ_ONLY"),
+    ):
+        hub.install_from_quarantine(
+            pending,
+            "managed-skill",
+            "",
+            bundle,
+            result,
+        )
+
+    assert pending.exists()
+    assert not (skills_dir / "managed-skill").exists()
 
 
 # ---------------------------------------------------------------------------

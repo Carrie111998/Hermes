@@ -21,13 +21,14 @@ from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS,
     ORG_ACTIVE_MARKER,
     ORG_MIRROR_DIR_NAME,
-    ORG_PROVENANCE_FILE,
     SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
+    org_active_marker_path,
+    org_provenance_path,
     org_id_of_path,
     parse_frontmatter,
     read_active_org_id,
@@ -1379,7 +1380,7 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     prefix_len = len(base)
     active_org = read_active_org_id(skills_dir)
     org_root = os.path.join(skills_dir_str, ORG_MIRROR_DIR_NAME)
-    marker_path = os.path.join(org_root, ORG_ACTIVE_MARKER)
+    marker_path = str(org_active_marker_path(skills_dir))
     try:
         st = os.stat(marker_path)
         manifest[ORG_MIRROR_DIR_NAME + "/" + ORG_ACTIVE_MARKER] = [
@@ -1492,9 +1493,7 @@ def _build_snapshot_entry(
         try:
             import json as _json
 
-            prov_path = (
-                skills_dir / ORG_MIRROR_DIR_NAME / org_id / ORG_PROVENANCE_FILE
-            )
+            prov_path = org_provenance_path(skills_dir, org_id)
             prov = _json.loads(prov_path.read_text(encoding="utf-8"))
             device = str(prov.get("author_device") or "")
             entry["org_author"] = device or str(prov.get("author_user_id") or "")

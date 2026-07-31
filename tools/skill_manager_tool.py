@@ -905,8 +905,25 @@ def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Non
         )
 
 
+def _content_write_refusal(operation: str) -> Optional[Dict[str, Any]]:
+    """Return a stable tool error when discovery content is managed read-only."""
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(operation)
+    except SkillsContentPolicyError as exc:
+        return {"success": False, "error": str(exc)}
+    return None
+
+
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
+    refusal = _content_write_refusal(f"create skill {name!r}")
+    if refusal:
+        return refusal
     # Validate name
     err = _validate_name(name)
     if err:
@@ -976,6 +993,9 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
+    refusal = _content_write_refusal(f"edit skill {name!r}")
+    if refusal:
+        return refusal
     err = _validate_frontmatter(content)
     if err:
         return {"success": False, "error": err}
@@ -1048,6 +1068,9 @@ def _patch_skill(
     Defaults to SKILL.md. Use file_path to patch a supporting file instead.
     Requires a unique match unless replace_all is True.
     """
+    refusal = _content_write_refusal(f"patch skill {name!r}")
+    if refusal:
+        return refusal
     if not old_string:
         return {"success": False, "error": "old_string is required for 'patch'."}
     if new_string is None:
@@ -1168,6 +1191,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
+    refusal = _content_write_refusal(f"delete skill {name!r}")
+    if refusal:
+        return refusal
+
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -1266,6 +1293,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
 
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
+    refusal = _content_write_refusal(f"write file in skill {name!r}")
+    if refusal:
+        return refusal
     err = _validate_file_path(file_path)
     if err:
         return {"success": False, "error": err}
@@ -1336,6 +1366,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
 
 def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     """Remove a supporting file from any skill directory."""
+    refusal = _content_write_refusal(f"remove file from skill {name!r}")
+    if refusal:
+        return refusal
     err = _validate_file_path(file_path)
     if err:
         return {"success": False, "error": err}

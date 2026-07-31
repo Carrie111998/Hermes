@@ -28,6 +28,21 @@ from agent.skill_utils import is_excluded_skill_path
 _console = Console()
 
 
+def _content_write_refused(operation: str, console: Console) -> bool:
+    """Print a stable refusal and return True when content is managed."""
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(operation)
+    except SkillsContentPolicyError as exc:
+        console.print(f"[bold red]Error:[/] {exc}\n")
+        return True
+    return False
+
+
 def _display_source(r) -> str:
     """Human-facing source label for a result row.
 
@@ -520,6 +535,10 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     registry. Skill names are not namespaced across registries, so an
     unconstrained resolve can silently change a skill's provenance.
     """
+    c = console or _console
+    if _content_write_refused(f"install skill {identifier!r}", c):
+        return
+
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
         quarantine_bundle, install_from_quarantine, HubLockFile,
@@ -527,7 +546,6 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     )
     from tools.skills_guard import scan_skill_cached, should_allow_install, format_scan_report
 
-    c = console or _console
     ensure_hub_dirs()
 
     # Resolve which source adapter handles this identifier
@@ -956,13 +974,12 @@ def do_list(source_filter: str = "all",
     ``skills.disabled`` list because ``-p`` swaps ``HERMES_HOME`` at process
     start.  No explicit profile flag needed here.
     """
-    from tools.skills_hub import HubLockFile, ensure_hub_dirs
+    from tools.skills_hub import HubLockFile
     from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
     from agent.skill_utils import get_disabled_skill_names
 
     c = console or _console
-    ensure_hub_dirs()
     lock = HubLockFile()
     hub_installed = {e["name"]: e for e in lock.list_installed()}
     builtin_names = set(_read_manifest())
@@ -1064,16 +1081,22 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
 
 
-def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
-    """Update hub-installed skills with upstream changes."""
+def do_update(
+    name: Optional[str] = None,
+    console: Optional[Console] = None,
+) -> bool:
+    """Update hub-installed skills, returning False on a policy refusal."""
     from tools.skills_hub import HubLockFile, check_for_skill_updates
 
     c = console or _console
+    target = name if name is not None else "all installed skills"
+    if _content_write_refused(f"update {target}", c):
+        return False
     lock = HubLockFile()
     updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
     if not updates:
         c.print("[dim]No updates available.[/]\n")
-        return
+        return True
 
     for entry in updates:
         installed = lock.get_installed(entry["name"])
@@ -1095,6 +1118,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
         )
 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
+    return True
 
 
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None,
@@ -1186,6 +1210,8 @@ def do_reset(name: str, restore: bool = False,
     from tools.skills_sync import reset_bundled_skill
 
     c = console or _console
+    if _content_write_refused(f"reset bundled skill {name!r}", c):
+        return
 
     if not skip_confirm and restore:
         c.print(f"\n[bold]Restore '{name}' from bundled source?[/]")
@@ -1307,6 +1333,8 @@ def do_opt_out(remove: bool = False,
     )
 
     c = console or _console
+    if remove and _content_write_refused("remove pristine bundled skills", c):
+        return
 
     # Write the marker first (the always-safe part).
     res = set_bundled_skills_opt_out(True)
@@ -1380,8 +1408,11 @@ def do_opt_in(sync: bool = False,
 
     if sync:
         synced = sync_skills(quiet=True)
-        copied = len(synced.get("copied", []))
-        c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
+        if synced.get("skipped_read_only"):
+            c.print("[dim]Bundled sync skipped: skills.content_mode is read_only.[/]")
+        else:
+            copied = len(synced.get("copied", []))
+            c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
         if invalidate_cache:
             try:
                 from agent.prompt_builder import clear_skills_system_prompt_cache
@@ -1399,6 +1430,11 @@ def do_repair_official(name: str, restore: bool = False,
     from tools.skills_sync import restore_official_optional_skill
 
     c = console or _console
+    if restore and _content_write_refused(
+        f"restore official optional skill {name!r}",
+        c,
+    ):
+        return
     if restore and not skip_confirm:
         c.print(f"\n[bold]Restore official optional skill '{name}' from repo source?[/]")
         c.print("[dim]Existing matching active copies will be moved to a restore backup before copying the official source.[/]")
@@ -1689,6 +1725,8 @@ def do_snapshot_import(input_path: str, force: bool = False,
     from tools.skills_hub import TapsManager
 
     c = console or _console
+    if _content_write_refused("import skill snapshot", c):
+        return
     inp = Path(input_path)
     if not inp.exists():
         c.print(f"[bold red]Error:[/] File not found: {inp}\n")
@@ -1734,7 +1772,7 @@ def do_snapshot_import(input_path: str, force: bool = False,
 # CLI argparse entry point
 # ---------------------------------------------------------------------------
 
-def skills_command(args) -> None:
+def skills_command(args) -> int:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     action = getattr(args, "skills_action", None)
 
@@ -1757,7 +1795,8 @@ def skills_command(args) -> None:
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
-        do_update(name=getattr(args, "name", None))
+        if not do_update(name=getattr(args, "name", None)):
+            return 2
     elif action == "audit":
         do_audit(name=getattr(args, "name", None),
                  deep=getattr(args, "deep", False))
@@ -1797,11 +1836,12 @@ def skills_command(args) -> None:
         repo = getattr(args, "repo", "") or getattr(args, "name", "")
         if not tap_action:
             _console.print("Usage: hermes skills tap [list|add|remove]\n")
-            return
+            return 0
         do_tap(tap_action, repo=repo)
     else:
         _console.print("Usage: hermes skills [browse|search|install|inspect|list|list-modified|diff|check|update|audit|uninstall|reset|opt-out|opt-in|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
+    return 0
 
 
 # ---------------------------------------------------------------------------

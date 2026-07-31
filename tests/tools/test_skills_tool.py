@@ -258,14 +258,14 @@ class TestFindAllSkills:
 
 
 class TestSkillsList:
-    def test_empty_creates_directory(self, tmp_path):
+    def test_empty_does_not_create_directory(self, tmp_path):
         skills_dir = tmp_path / "skills"
         with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
             raw = skills_list()
         result = json.loads(raw)
         assert result["success"] is True
         assert result["skills"] == []
-        assert skills_dir.exists()
+        assert not skills_dir.exists()
 
     def test_category_filter(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -277,6 +277,37 @@ class TestSkillsList:
         assert all_result["count"] == 2
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
+
+    def test_lists_nested_ticket_decomposition_without_mutation(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        nested = skills_dir / "planning" / "ticket-decomposition"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(
+            "---\n"
+            "name: ticket-decomposition\n"
+            "description: Split work into tickets.\n"
+            "---\n",
+            encoding="utf-8",
+        )
+        before = {
+            path.relative_to(skills_dir).as_posix(): path.read_bytes()
+            for path in skills_dir.rglob("*")
+            if path.is_file()
+        }
+
+        with patch("tools.skills_tool.SKILLS_DIR", skills_dir):
+            result = json.loads(skills_list())
+
+        assert [skill["name"] for skill in result["skills"]] == [
+            "ticket-decomposition"
+        ]
+        assert result["skills"][0]["category"] == "planning"
+        after = {
+            path.relative_to(skills_dir).as_posix(): path.read_bytes()
+            for path in skills_dir.rglob("*")
+            if path.is_file()
+        }
+        assert after == before
 
     def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"

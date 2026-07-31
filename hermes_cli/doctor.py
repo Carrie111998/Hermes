@@ -2560,7 +2560,12 @@ def run_doctor(args):
         check_warn("Could not check tool availability", f"({e})")
     
     _section("Skills Hub")
-    hub_dir = HERMES_HOME / "skills" / ".hub"
+    active_home = get_hermes_home()
+    hub_dir = active_home / "state" / "skills" / "hub"
+    if not hub_dir.exists():
+        legacy_hub_dir = active_home / "skills" / ".hub"
+        if legacy_hub_dir.exists():
+            hub_dir = legacy_hub_dir
     if hub_dir.exists():
         check_ok("Skills Hub directory exists")
         lock_file = hub_dir / "lock.json"
@@ -2577,7 +2582,7 @@ def run_doctor(args):
         if q_count > 0:
             check_warn(f"{q_count} skill(s) in quarantine", "(pending review)")
     else:
-        check_warn("Skills Hub directory not initialized", "(run: hermes skills list)")
+        check_ok("Skills Hub state not initialized (no persisted hub state)")
 
     from hermes_cli.config import get_env_value
 

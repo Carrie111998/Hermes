@@ -1,6 +1,8 @@
 """Tests for hermes_constants module."""
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +19,7 @@ from hermes_constants import (
     get_hermes_dir,
     get_hermes_home,
     get_process_hermes_home,
+    get_skills_state_dir,
     heal_hermes_managed_node,
     hermes_managed_node_tree_present,
     iter_hermes_node_dirs,
@@ -79,6 +82,38 @@ class TestGetHermesHome:
         monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", False)
 
         assert get_hermes_home() == local_appdata / "hermes"
+
+    def test_skills_state_dir_tracks_context_override_without_io(self, tmp_path):
+        profile = tmp_path / "profile-a"
+        token = set_hermes_home_override(profile)
+        try:
+            assert get_skills_state_dir() == profile / "state" / "skills"
+            assert not profile.exists()
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_skills_state_dir_fresh_import_is_side_effect_free(self, tmp_path):
+        profile = tmp_path / "fresh-profile"
+        env = {**os.environ, "HERMES_HOME": str(profile)}
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from hermes_constants import get_skills_state_dir; "
+                    "print(get_skills_state_dir())"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.stdout.strip() == str(profile / "state" / "skills")
+        assert not profile.exists()
 
 
 class TestGetProcessHermesHome:

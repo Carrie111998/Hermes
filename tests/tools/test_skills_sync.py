@@ -50,6 +50,41 @@ class TestReadWriteManifest:
         assert result == {"old-skill": "", "new-skill": "abc123"}
 
 
+def test_sync_read_only_skips_before_creating_content(tmp_path):
+    skills_dir = tmp_path / "skills"
+    with (
+        patch("tools.skills_sync.SKILLS_DIR", skills_dir),
+        patch("tools.skills_sync.HERMES_HOME", tmp_path),
+        patch("tools.skills_policy.skills_content_mode", return_value="read_only"),
+    ):
+        result = sync_skills(quiet=True)
+
+    assert result["skipped_read_only"] is True
+    assert not skills_dir.exists()
+
+
+def test_restore_backup_state_preserves_legacy_directory(tmp_path):
+    from tools import skills_sync
+
+    skills = tmp_path / "skills"
+    state = tmp_path / "state" / "skills"
+    legacy_file = skills / ".restore-backups" / "old" / "SKILL.md"
+    legacy_file.parent.mkdir(parents=True)
+    legacy_file.write_text("legacy backup\n", encoding="utf-8")
+
+    with (
+        patch("tools.skills_sync.SKILLS_DIR", skills),
+        patch("tools.skills_sync.get_skills_state_dir", return_value=state),
+    ):
+        destination = skills_sync._prepare_restore_backups_dir()
+
+    assert destination == state / "restore-backups"
+    assert (
+        destination / "old" / "SKILL.md"
+    ).read_text(encoding="utf-8") == "legacy backup\n"
+    assert legacy_file.read_text(encoding="utf-8") == "legacy backup\n"
+
+
 class TestDirHash:
     def test_hash_reflects_content_only(self, tmp_path):
         dir_a = tmp_path / "a"

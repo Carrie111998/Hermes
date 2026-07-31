@@ -1704,6 +1704,10 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # Whether Hermes may mutate skill discovery content. Managed
+        # deployments set read_only and keep mutable metadata under
+        # HERMES_HOME/state/skills instead.
+        "content_mode": "writable",  # writable | read_only
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -1785,7 +1789,7 @@ DEFAULT_CONFIG = {
         "prune_builtins": True,
         # Pre-run backup: before every real curator pass (dry-run is
         # skipped), snapshot ~/.hermes/skills/ into
-        # ~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz so the
+        # ~/.hermes/state/skills/curator-backups/<utc-iso>/skills.tar.gz so the
         # user can roll back with `hermes curator rollback`.
         "backup": {
             "enabled": True,

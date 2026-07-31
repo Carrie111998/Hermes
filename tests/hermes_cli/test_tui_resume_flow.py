@@ -68,6 +68,33 @@ def test_termux_skips_bundled_skill_sync_when_stamp_fresh(monkeypatch, tmp_path,
     assert calls == []
 
 
+def test_termux_stamp_reads_legacy_then_writes_external_state(
+    monkeypatch,
+    tmp_path,
+    main_mod,
+):
+    monkeypatch.setenv("TERMUX_VERSION", "1")
+    monkeypatch.setattr(main_mod, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        main_mod,
+        "_termux_bundled_skills_fingerprint",
+        lambda: "legacy-fp",
+    )
+    legacy = tmp_path / "skills" / ".termux_bundled_sync_stamp"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("legacy-fp\n", encoding="utf-8")
+
+    assert main_mod._termux_bundled_skills_sync_needed() is False
+    assert not (tmp_path / "state").exists()
+
+    main_mod._mark_termux_bundled_skills_synced()
+
+    assert legacy.read_text(encoding="utf-8") == "legacy-fp\n"
+    assert (
+        tmp_path / "state" / "skills" / "termux-bundled-sync-stamp"
+    ).read_text(encoding="utf-8") == "legacy-fp\n"
+
+
 
 
 
@@ -207,12 +234,31 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
         "hermes_cli.tools_config",
         mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: {"session_search"}),
     )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.skill_commands",
+        mod(
+            "agent.skill_commands",
+            build_preloaded_skills_prompt=lambda skills: (
+                f"preloaded:{','.join(skills)}",
+                ["ticket-decomposition"],
+                [],
+            ),
+        ),
+    )
 
-    text, result = _run_agent("recall this")
+    text, result = _run_agent(
+        "recall this",
+        skills=["planning/ticket-decomposition"],
+    )
     assert text == "ok"
     assert not result.get("failed")
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
+    assert (
+        captured["ephemeral_system_prompt"]
+        == "preloaded:planning/ticket-decomposition"
+    )
     assert captured["prompt"] == "recall this"
 
 
@@ -282,7 +328,5 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
-
 
 

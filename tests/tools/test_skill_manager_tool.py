@@ -175,6 +175,23 @@ class TestCreateSkill:
         assert "Invalid category '../escape'" in result["error"]
         assert not (tmp_path / "escape").exists()
 
+    def test_managed_read_only_refuses_before_creating_root(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        skills_dir = tmp_path / "skills"
+        monkeypatch.setattr(
+            "tools.skills_policy.skills_content_mode",
+            lambda: "read_only",
+        )
+        with _skill_dir(skills_dir):
+            result = _create_skill("managed-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False
+        assert "SKILLS_CONTENT_READ_ONLY" in result["error"]
+        assert not skills_dir.exists()
+
 
     def test_edit_long_desc_still_allowed_with_preview(self, tmp_path):
         """Edit/patch paths stay permissive so existing over-limit skills

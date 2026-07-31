@@ -170,6 +170,7 @@ def _run_and_exit_oneshot(
     model: object = None,
     provider: object = None,
     toolsets: object = None,
+    skills: object = None,
     usage_file: object = None,
 ) -> None:
     try:
@@ -180,6 +181,7 @@ def _run_and_exit_oneshot(
             model=model,
             provider=provider,
             toolsets=toolsets,
+            skills=skills,
             usage_file=usage_file,
         )
     except KeyboardInterrupt:
@@ -888,6 +890,13 @@ def _termux_bundled_skills_fingerprint() -> str:
 
 
 def _termux_bundled_skills_stamp_path() -> Path:
+    return get_hermes_home() / "state" / "skills" / "termux-bundled-sync-stamp"
+
+
+def _termux_bundled_skills_stamp_read_path() -> Path:
+    stamp = _termux_bundled_skills_stamp_path()
+    if stamp.exists():
+        return stamp
     return get_hermes_home() / "skills" / ".termux_bundled_sync_stamp"
 
 
@@ -897,7 +906,7 @@ def _termux_bundled_skills_sync_needed() -> bool:
     if os.environ.get("HERMES_TERMUX_FORCE_SKILLS_SYNC") == "1":
         return True
     try:
-        stamp = _termux_bundled_skills_stamp_path()
+        stamp = _termux_bundled_skills_stamp_read_path()
         return stamp.read_text(encoding="utf-8").strip() != _termux_bundled_skills_fingerprint()
     except OSError:
         return True
@@ -908,8 +917,19 @@ def _mark_termux_bundled_skills_synced() -> None:
         return
     try:
         stamp = _termux_bundled_skills_stamp_path()
-        stamp.parent.mkdir(parents=True, exist_ok=True)
-        stamp.write_text(_termux_bundled_skills_fingerprint() + "\n", encoding="utf-8")
+        legacy = get_hermes_home() / "skills" / ".termux_bundled_sync_stamp"
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+        from utils import atomic_write_text
+
+        migration = prepare_legacy_state_write(stamp, legacy)
+        atomic_write_text(
+            stamp,
+            _termux_bundled_skills_fingerprint() + "\n",
+        )
+        note_legacy_state_write(migration)
     except OSError:
         pass
 
@@ -10838,6 +10858,7 @@ def _try_termux_fast_cli_launch() -> bool:
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
         )
 
@@ -11076,7 +11097,7 @@ def cmd_skills(args):
     else:
         from hermes_cli.skills_hub import skills_command
 
-        skills_command(args)
+        return skills_command(args)
 
 
 def cmd_pairing(args):
@@ -12442,6 +12463,7 @@ def main():
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            skills=getattr(args, "skills", None),
             usage_file=getattr(args, "usage_file", None),
         )
 

@@ -20,12 +20,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_skills_state_dir
 from hermes_cli._subprocess_compat import windows_hide_flags
 from agent.skill_utils import is_excluded_skill_path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -71,7 +72,7 @@ def _skills_dir() -> Path:
 
 def _hub_dir() -> Path:
     forced = _override("HUB_DIR")
-    return Path(forced) if forced is not None else _skills_dir() / ".hub"
+    return Path(forced) if forced is not None else get_skills_state_dir() / "hub"
 
 
 def _lock_file() -> Path:
@@ -97,6 +98,17 @@ def _taps_file() -> Path:
 def _index_cache_dir() -> Path:
     forced = _override("INDEX_CACHE_DIR")
     return Path(forced) if forced is not None else _hub_dir() / "index-cache"
+
+
+def _legacy_hub_dir() -> Path:
+    return _skills_dir() / ".hub"
+
+
+def _index_cache_read_file(key: str) -> Path:
+    path = _index_cache_dir() / f"{key}.json"
+    if path.exists():
+        return path
+    return _legacy_hub_dir() / "index-cache" / f"{key}.json"
 
 
 _DYNAMIC_PATH_RESOLVERS = {
@@ -1137,7 +1149,7 @@ class GitHubSource(SkillSource):
 
     def _read_cache(self, key: str) -> Optional[list]:
         """Read cached index if not expired."""
-        cache_file = _index_cache_dir() / f"{key}.json"
+        cache_file = _index_cache_read_file(key)
         if not cache_file.exists():
             return None
         try:
@@ -1151,10 +1163,19 @@ class GitHubSource(SkillSource):
     def _write_cache(self, key: str, data: list) -> None:
         """Write index data to cache."""
         index_cache_dir = _index_cache_dir()
-        index_cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = index_cache_dir / f"{key}.json"
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            cache_file,
+            _legacy_hub_dir() / "index-cache" / f"{key}.json",
+        )
         try:
-            cache_file.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            _atomic_hub_json(cache_file, data)
+            note_legacy_state_write(migration)
         except OSError as e:
             logger.debug("Could not write cache: %s", e)
 
@@ -3248,7 +3269,7 @@ class OptionalSkillSource(SkillSource):
 
 def _read_index_cache(key: str) -> Optional[Any]:
     """Read cached data if not expired."""
-    cache_file = _index_cache_dir() / f"{key}.json"
+    cache_file = _index_cache_read_file(key)
     if not cache_file.exists():
         return None
     try:
@@ -3263,6 +3284,16 @@ def _read_index_cache(key: str) -> Optional[Any]:
 def _write_index_cache(key: str, data: Any) -> None:
     """Write data to cache."""
     index_cache_dir = _index_cache_dir()
+    cache_file = index_cache_dir / f"{key}.json"
+    from tools.skills_policy import (
+        note_legacy_state_write,
+        prepare_legacy_state_write,
+    )
+
+    migration = prepare_legacy_state_write(
+        cache_file,
+        _legacy_hub_dir() / "index-cache" / f"{key}.json",
+    )
     index_cache_dir.mkdir(parents=True, exist_ok=True)
     # Ensure .ignore exists so ripgrep (and tools respecting .ignore) skip
     # this directory.  Cache files contain unvetted community content that
@@ -3273,9 +3304,9 @@ def _write_index_cache(key: str, data: Any) -> None:
             ignore_file.write_text("# Exclude hub internals from search tools\n*\n", encoding="utf-8")
         except OSError:
             pass
-    cache_file = index_cache_dir / f"{key}.json"
     try:
-        cache_file.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+        _atomic_hub_json(cache_file, data, default=str)
+        note_legacy_state_write(migration)
     except OSError as e:
         logger.debug("Could not write cache: %s", e)
 
@@ -3300,22 +3331,38 @@ def _skill_meta_to_dict(meta: SkillMeta) -> dict:
 # ---------------------------------------------------------------------------
 
 class HubLockFile:
-    """Manages skills/.hub/lock.json — tracks provenance of installed hub skills."""
+    """Manage profile-scoped hub provenance outside skill discovery."""
 
     def __init__(self, path: Optional[Path] = None):
         self.path = path if path is not None else _lock_file()
 
     def load(self) -> dict:
-        if not self.path.exists():
+        path = self.path
+        if not path.exists() and path == _lock_file():
+            legacy = _skills_dir() / ".hub" / "lock.json"
+            if legacy.exists():
+                path = legacy
+        if not path.exists():
             return {"version": 1, "installed": {}}
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return {"version": 1, "installed": {}}
 
     def save(self, data: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        migration = None
+        if self.path == _lock_file():
+            from tools.skills_policy import prepare_legacy_state_write
+
+            migration = prepare_legacy_state_write(
+                self.path,
+                _legacy_hub_dir() / "lock.json",
+            )
+        _atomic_hub_json(self.path, data)
+        if migration is not None:
+            from tools.skills_policy import note_legacy_state_write
+
+            note_legacy_state_write(migration)
 
     def record_install(
         self,
@@ -3380,17 +3427,33 @@ class TapsManager:
         self.path = path if path is not None else _taps_file()
 
     def load(self) -> List[dict]:
-        if not self.path.exists():
+        path = self.path
+        if not path.exists() and path == _taps_file():
+            legacy = _skills_dir() / ".hub" / "taps.json"
+            if legacy.exists():
+                path = legacy
+        if not path.exists():
             return []
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            data = json.loads(path.read_text(encoding="utf-8"))
             return data.get("taps", [])
         except (json.JSONDecodeError, OSError):
             return []
 
     def save(self, taps: List[dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({"taps": taps}, indent=2) + "\n", encoding="utf-8")
+        migration = None
+        if self.path == _taps_file():
+            from tools.skills_policy import prepare_legacy_state_write
+
+            migration = prepare_legacy_state_write(
+                self.path,
+                _legacy_hub_dir() / "taps.json",
+            )
+        _atomic_hub_json(self.path, {"taps": taps})
+        if migration is not None:
+            from tools.skills_policy import note_legacy_state_write
+
+            note_legacy_state_write(migration)
 
     def add(self, repo: str, path: str = "skills/") -> bool:
         """Add a tap. Returns False if already exists."""
@@ -3422,7 +3485,11 @@ def append_audit_log(action: str, skill_name: str, source: str,
                      trust_level: str, verdict: str, extra: str = "") -> None:
     """Append a line to the audit log."""
     audit_log = _audit_log()
-    audit_log.parent.mkdir(parents=True, exist_ok=True)
+    if not audit_log.exists():
+        _initialize_hub_audit_log(
+            audit_log,
+            _legacy_hub_dir() / "audit.log",
+        )
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     parts = [timestamp, action, skill_name, f"{source}:{trust_level}", verdict]
     if extra:
@@ -3439,21 +3506,155 @@ def append_audit_log(action: str, skill_name: str, source: str,
 # Hub operations (high-level)
 # ---------------------------------------------------------------------------
 
+def _initialize_hub_json(
+    destination: Path,
+    legacy: Path,
+    default: dict,
+) -> None:
+    """Atomically seed a state file from valid legacy JSON or a default."""
+    if destination.exists():
+        return
+    data = default
+    migrated = False
+    if legacy != destination and legacy.exists():
+        try:
+            candidate = json.loads(legacy.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                data = candidate
+                migrated = True
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    _atomic_hub_json(destination, data)
+    if migrated:
+        from tools.skills_policy import warn_legacy_state_migrated
+
+        warn_legacy_state_migrated(legacy)
+
+
+def _atomic_hub_json(
+    destination: Path,
+    data: Any,
+    *,
+    default: Optional[Any] = None,
+) -> None:
+    """Write one hub JSON state file with replace-after-fsync semantics."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        dir=str(destination.parent),
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            dump_kwargs = {"default": default} if default is not None else {}
+            json.dump(
+                data,
+                stream,
+                indent=2,
+                ensure_ascii=False,
+                **dump_kwargs,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _initialize_hub_directory(destination: Path, legacy: Path) -> None:
+    """Atomically preserve a legacy hub directory before first state write."""
+    if destination.exists():
+        return
+    if legacy == destination or not legacy.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            dir=str(destination.parent),
+            prefix=f".{destination.name}.migration-",
+        )
+    )
+    staging.rmdir()
+    try:
+        shutil.copytree(legacy, staging, symlinks=True)
+        try:
+            staging.replace(destination)
+        except OSError:
+            if not destination.exists():
+                raise
+            shutil.rmtree(staging, ignore_errors=True)
+        else:
+            from tools.skills_policy import warn_legacy_state_migrated
+
+            warn_legacy_state_migrated(legacy)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _initialize_hub_audit_log(destination: Path, legacy: Path) -> None:
+    """Preserve the append-only legacy audit log without editing its source."""
+    if destination.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if legacy != destination and legacy.is_file():
+        fd, tmp = tempfile.mkstemp(
+            dir=str(destination.parent),
+            prefix=".audit.",
+            suffix=".tmp",
+        )
+        os.close(fd)
+        try:
+            shutil.copyfile(legacy, tmp)
+            os.replace(tmp, destination)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        from tools.skills_policy import warn_legacy_state_migrated
+
+        warn_legacy_state_migrated(legacy)
+        return
+    destination.touch()
+
+
 def ensure_hub_dirs() -> None:
-    """Create the .hub directory structure if it doesn't exist."""
+    """Create external hub state, preserving valid legacy state on first use."""
     hub_dir = _hub_dir()
     lock_file = _lock_file()
     audit_log = _audit_log()
     taps_file = _taps_file()
     hub_dir.mkdir(parents=True, exist_ok=True)
-    _quarantine_dir().mkdir(exist_ok=True)
-    _index_cache_dir().mkdir(exist_ok=True)
-    if not lock_file.exists():
-        lock_file.write_text('{"version": 1, "installed": {}}\n', encoding="utf-8")
-    if not audit_log.exists():
-        audit_log.touch()
-    if not taps_file.exists():
-        taps_file.write_text('{"taps": []}\n', encoding="utf-8")
+    legacy_hub = _legacy_hub_dir()
+    _initialize_hub_directory(
+        _quarantine_dir(),
+        legacy_hub / "quarantine",
+    )
+    _initialize_hub_directory(
+        _index_cache_dir(),
+        legacy_hub / "index-cache",
+    )
+    _initialize_hub_json(
+        lock_file,
+        legacy_hub / "lock.json",
+        {"version": 1, "installed": {}},
+    )
+    _initialize_hub_audit_log(audit_log, legacy_hub / "audit.log")
+    _initialize_hub_json(
+        taps_file,
+        legacy_hub / "taps.json",
+        {"taps": []},
+    )
 
 
 def quarantine_bundle(bundle: SkillBundle) -> Path:
@@ -3490,6 +3691,9 @@ def install_from_quarantine(
     scan_provenance: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Move a scanned skill from quarantine into the skills directory."""
+    from tools.skills_policy import require_skills_content_writable
+
+    require_skills_content_writable(f"install skill {skill_name!r}")
     safe_skill_name = _validate_skill_name(skill_name)
     safe_category = _validate_install_parent_path(category) if category else ""
     quarantine_resolved = quarantine_path.resolve()
@@ -3570,6 +3774,15 @@ def install_from_quarantine(
 
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
+    from tools.skills_policy import (
+        SkillsContentPolicyError,
+        require_skills_content_writable,
+    )
+
+    try:
+        require_skills_content_writable(f"uninstall skill {skill_name!r}")
+    except SkillsContentPolicyError as exc:
+        return False, str(exc)
     lock = HubLockFile()
     entry = lock.get_installed(skill_name)
     if not entry:
@@ -3705,6 +3918,13 @@ def _hermes_index_cache_file() -> Path:
     return _index_cache_dir() / "hermes-index.json"
 
 
+def _hermes_index_cache_read_file() -> Path:
+    path = _hermes_index_cache_file()
+    if path.exists():
+        return path
+    return _legacy_hub_dir() / "index-cache" / "hermes-index.json"
+
+
 def _load_hermes_index() -> Optional[dict]:
     """Fetch the centralized skills index, with local cache.
 
@@ -3713,7 +3933,7 @@ def _load_hermes_index() -> Optional[dict]:
     downloads within a session.
     """
     # Check local cache
-    hermes_index_cache_file = _hermes_index_cache_file()
+    hermes_index_cache_file = _hermes_index_cache_read_file()
     if hermes_index_cache_file.exists():
         try:
             age = time.time() - hermes_index_cache_file.stat().st_mtime
@@ -3771,8 +3991,18 @@ def _load_hermes_index() -> Optional[dict]:
 
     # Cache locally
     try:
-        hermes_index_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        hermes_index_cache_file.write_text(json.dumps(data), encoding="utf-8")
+        write_path = _hermes_index_cache_file()
+        from tools.skills_policy import (
+            note_legacy_state_write,
+            prepare_legacy_state_write,
+        )
+
+        migration = prepare_legacy_state_write(
+            write_path,
+            _legacy_hub_dir() / "index-cache" / "hermes-index.json",
+        )
+        _atomic_hub_json(write_path, data)
+        note_legacy_state_write(migration)
     except OSError:
         pass
 
@@ -3781,7 +4011,7 @@ def _load_hermes_index() -> Optional[dict]:
 
 def _load_stale_index_cache() -> Optional[dict]:
     """Fall back to stale cache when the network fetch fails."""
-    hermes_index_cache_file = _hermes_index_cache_file()
+    hermes_index_cache_file = _hermes_index_cache_read_file()
     if hermes_index_cache_file.exists():
         try:
             return json.loads(hermes_index_cache_file.read_text(encoding="utf-8"))
