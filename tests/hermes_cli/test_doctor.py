@@ -172,9 +172,18 @@ class TestHonchoDoctorConfigDetection:
     def test_reports_configured_when_enabled_with_api_key(self, monkeypatch):
         fake_config = SimpleNamespace(enabled=True, api_key="***")
 
+        # Patch the class attribute on the imported object directly rather than
+        # via monkeypatch's dotted-string traversal. The string form walks
+        # plugins.memory.honcho.client attribute-by-attribute, which fails with
+        # "module 'plugins.memory' has no attribute 'honcho'" when an earlier
+        # test's monkeypatch teardown has stripped the submodule binding off the
+        # parent package (import order / teardown make the string form fragile).
+        from plugins.memory.honcho.client import HonchoClientConfig
+
         monkeypatch.setattr(
-            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            lambda: fake_config,
+            HonchoClientConfig,
+            "from_global_config",
+            staticmethod(lambda: fake_config),
         )
 
         assert doctor._honcho_is_configured_for_doctor()
