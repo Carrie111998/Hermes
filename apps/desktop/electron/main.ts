@@ -2970,7 +2970,7 @@ async function applyUpdates(opts = {}) {
       env: {
         ...process.env,
         HERMES_HOME,
-        PATH: buildDesktopBackendPath({ hermesHome: HERMES_HOME, venvRoot: path.join(updateRoot, 'venv') })
+        PATH: pathWithHermesManagedNode(venvBin)
       },
       detached: true,
       stdio: 'ignore'
@@ -3045,7 +3045,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
     env: {
       ...process.env,
       HERMES_HOME,
-      PATH: buildDesktopBackendPath({ hermesHome: HERMES_HOME, venvRoot: path.join(updateRoot, 'venv') })
+      PATH: pathWithHermesManagedNode(venvBin)
     },
     detached: true,
     stdio: 'ignore'
