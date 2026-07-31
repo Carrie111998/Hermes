@@ -171,6 +171,7 @@ def handle_workflow_start(
     inputs = args.get("inputs")
     board = args.get("board", "")
     attachments = args.get("attachments")
+    delivery_target = args.get("delivery_target") or {}
 
     if not workflow or not isinstance(workflow, str):
         return _err("workflow must be a non-empty string")
@@ -197,6 +198,7 @@ def handle_workflow_start(
         inputs=inputs,
         board=board,
         attachments=attachments,
+        delivery_target=delivery_target,
     )
 def _handle_workflow_start_predefined(
     workflow: str,
@@ -208,6 +210,7 @@ def _handle_workflow_start_predefined(
     inputs: Optional[Dict[str, Any]] = None,
     board: str = "",
     attachments: Optional[list] = None,
+    delivery_target: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Predefined mode: look up YAML in docs/fleet-pipelines/, validate,
     dispatch via engine.
@@ -298,6 +301,16 @@ def _handle_workflow_start_predefined(
 
     # Capture session info and inject into context (which persists in state file)
     _sess = _capture_session_for_engine()
+    # Override session_info with explicit delivery_target (for cron-triggered workflows)
+    if delivery_target and delivery_target.get("platform") and delivery_target.get("channel"):
+        _sess = {
+            "platform": delivery_target["platform"],
+            "chat_id": delivery_target["channel"],
+            "thread_id": delivery_target.get("thread"),
+            "user_id": None,
+            "profile": delivery_target.get("profile"),
+            "session_key": "",
+        }
     _ctx = context or None
     if _sess:
         if _ctx is None:
@@ -726,6 +739,21 @@ WORKFLOW_START_SCHEMA: Dict[str, Any] = {
                     "Values are local file paths. E.g. "
                     '{"grill_artifact": "/path/to/file.md", "source_video": "/path/to/video.mp4"}'
                 ),
+            },
+            "delivery_target": {
+                "type": "object",
+                "description": (
+                    "Override delivery destination for completion notifications. "
+                    "Fields: platform (e.g. 'discord'), channel (channel ID), "
+                    "thread (optional thread/topic ID), profile (Hermes profile). "
+                    "Use for cron-triggered workflows that have no Discord session."
+                ),
+                "properties": {
+                    "platform": {"type": "string", "description": "Delivery platform (e.g. 'discord')"},
+                    "channel": {"type": "string", "description": "Channel ID for delivery"},
+                    "thread": {"type": "string", "description": "Optional thread/topic ID"},
+                    "profile": {"type": "string", "description": "Hermes profile to deliver to"},
+                },
             },
         },
         "required": ["workflow"],
