@@ -27,13 +27,15 @@ from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
-    COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
-    COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
-    PRE_API_COMPRESSION_STATUS_TEMPLATE,
+    compression_retry_context_reduced_status,
+    compression_retry_messages_status,
+    compression_retry_payload_too_large_status,
+    compression_retry_retained_vision_status,
+    compression_retry_tokens_status,
+    compression_retry_too_large_status,
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
+    pre_api_compression_status,
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
@@ -1873,8 +1875,8 @@ def run_conversation(
             _pre_api_status = automatic_compaction_status_message(
                 _compressor,
                 phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
+                default_message=pre_api_compression_status(
+                    request_pressure_tokens
                 ),
                 approx_tokens=request_pressure_tokens,
                 threshold_tokens=int(
@@ -4238,8 +4240,8 @@ def run_conversation(
                         )
                         if len(messages) < original_len or old_ctx > _reduced_ctx:
                             agent._buffer_status(
-                                COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
-                                    new_ctx=_reduced_ctx, old_ctx=old_ctx
+                                compression_retry_context_reduced_status(
+                                    _reduced_ctx, old_ctx
                                 )
                             )
                             time.sleep(2)
@@ -4480,7 +4482,12 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+                    agent._buffer_status(
+                        compression_retry_payload_too_large_status(
+                            compression_attempts,
+                            max_compression_attempts,
+                        )
+                    )
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
@@ -4514,9 +4521,17 @@ def run_conversation(
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95):
                         if len(messages) < original_len:
-                            agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            agent._buffer_status(
+                                compression_retry_messages_status(
+                                    original_len, len(messages)
+                                )
+                            )
                         else:
-                            agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            agent._buffer_status(
+                                compression_retry_tokens_status(
+                                    original_tokens, new_tokens
+                                )
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break
@@ -4526,8 +4541,7 @@ def run_conversation(
                             remember_model=False,
                         ):
                             agent._buffer_status(
-                                "📐 Compression could not reduce the request further — "
-                                "removed retained vision payloads and retrying..."
+                                compression_retry_retained_vision_status()
                             )
                             continue
 
@@ -4734,7 +4748,13 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=approx_tokens, attempt=compression_attempts, cap=max_compression_attempts))
+                    agent._buffer_status(
+                        compression_retry_too_large_status(
+                            approx_tokens,
+                            compression_attempts,
+                            max_compression_attempts,
+                        )
+                    )
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
@@ -4768,9 +4788,17 @@ def run_conversation(
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
                         if len(messages) < original_len:
-                            agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            agent._buffer_status(
+                                compression_retry_messages_status(
+                                    original_len, len(messages)
+                                )
+                            )
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
-                            agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
+                            agent._buffer_status(
+                                compression_retry_tokens_status(
+                                    original_tokens, new_tokens
+                                )
+                            )
                         time.sleep(2)  # Brief pause between compression retries
                         _retry.restart_with_compressed_messages = True
                         break

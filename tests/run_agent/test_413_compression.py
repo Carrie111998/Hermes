@@ -16,7 +16,12 @@ from unittest.mock import MagicMock, patch
 
 
 from agent.context_compressor import SUMMARY_PREFIX
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    compression_retry_payload_too_large_status,
+    compression_retry_retained_vision_status,
+)
 from run_agent import AIAgent
 import run_agent
 
@@ -157,8 +162,10 @@ class TestHTTP413Compression:
             {"role": "assistant", "content": "previous answer"},
         ]
 
+        statuses = []
         with (
             patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_buffer_status", side_effect=statuses.append),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -173,6 +180,7 @@ class TestHTTP413Compression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
         assert result["final_response"] == "Success after compression"
+        assert compression_retry_payload_too_large_status(1, 3) in statuses
 
 
 
@@ -224,8 +232,10 @@ class TestHTTP413Compression:
             },
         ]
 
+        statuses = []
         with (
             patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_buffer_status", side_effect=statuses.append),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -245,6 +255,8 @@ class TestHTTP413Compression:
         assert "data:image" not in str(retried_tool["content"])
         assert "Screenshot of the dashboard" in str(retried_tool["content"])
         assert not getattr(agent, "_no_list_tool_content_models", set())
+        assert compression_retry_payload_too_large_status(1, 3) in statuses
+        assert compression_retry_retained_vision_status() in statuses
 
     def test_413_clears_conversation_history_on_persist(self, agent):
         """After 413-triggered compression, _persist_session must receive None history.
@@ -1132,5 +1144,4 @@ class TestOverflowWithCompactionDisabled:
         assert result.get("failed") is True
         assert result.get("compaction_disabled") is True
         assert "auto-compaction is disabled" in result["error"]
-
 

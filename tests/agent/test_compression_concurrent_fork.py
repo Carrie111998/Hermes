@@ -552,6 +552,33 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
 
 
 
+def test_abort_warning_uses_active_locale(tmp_path: Path, monkeypatch) -> None:
+    from agent import i18n
+
+    monkeypatch.setenv("HERMES_LANGUAGE", "zh")
+    i18n.reset_language_cache()
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "LOCALIZED_ABORT_TEST"
+    db.create_session(parent_sid, source="discord")
+    agent = _build_agent_with_db(db, parent_sid)
+
+    def _aborting_compress(*_a, **_kw):
+        agent.context_compressor._last_compress_aborted = True
+        agent.context_compressor._last_summary_error = "summary failed"
+        return [{"role": "user", "content": "tail"}]
+
+    warnings = []
+    agent.context_compressor.compress.side_effect = _aborting_compress
+    agent._emit_warning = warnings.append
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    assert warnings == [
+        "⚠️ 压缩已中止 (summary failed)。未删除任何消息 — 对话保持不变。运行 /compress 重试，运行 /reset 开始新会话，或检查你的 auxiliary.compression 模型配置。"
+    ]
+    i18n.reset_language_cache()
 
 
 
@@ -869,7 +896,6 @@ def test_lease_refresher_failure_window_is_bounded_by_ttl() -> None:
     assert cap * interval <= ttl, (
         f"give-up window {cap * interval}s must not exceed the lease TTL {ttl}s"
     )
-
 
 
 

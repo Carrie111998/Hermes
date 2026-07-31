@@ -51,6 +51,8 @@ from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_PAYLOAD_TOO_LARGE_STATUS_TEMPLATE,
+    COMPRESSION_RETRY_RETAINED_VISION_STATUS,
     COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -93,17 +95,30 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
+    r"|正在(?:压缩|壓縮)上下文"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
+    r"|(?:空闲|閒置)\s*\d+\s*(?:秒)?后恢复|閒置\s*\d+\s*秒後恢復"
     r"|preflight\s+compression"
+    r"|预检压缩|預檢壓縮"
     r"|pre[- ]api\s+compression"
+    r"|api\s*前(?:压缩|壓縮)"
     # Buffered attempt/overflow retry chatter replayed through _emit_status
     # when a turn exhausts retries. The ", retrying"/"— compressing" anchors
     # keep manual /compress feedback ("Compressed: 30 → 12 messages") and
     # failure notices out of the match.
     r"|context\s+too\s+large\s+\(~[\d,]+\s+tokens\)\s+[—-]+\s+compressing"
+    r"|上下文过大|上下文過大"
     r"|compressed\s+\d[\d,]*\s+(?:→|->)\s+\d[\d,]*\s+messages,\s+retrying"
+    r"|已(?:压缩|壓縮)\s+\d[\d,]*\s+(?:→|->)\s+\d[\d,]*\s+(?:条消息|則訊息)"
     r"|compressed\s+~[\d,]+\s+(?:→|->)\s+~[\d,]+\s+tokens,\s+retrying"
+    r"|已(?:压缩|壓縮)约\s+[\d,]+\s+(?:→|->)\s+约\s+[\d,]+\s+tokens"
+    r"|已壓縮約\s+[\d,]+\s+(?:→|->)\s+約\s+[\d,]+\s+tokens"
     r"|context\s+reduced\s+to\s+[\d,]+\s+tokens\s+\(was\s+[\d,]+\),\s+retrying"
+    r"|上下文已(?:缩减|縮減)至\s+[\d,]+\s+tokens"
+    r"|request\s+payload\s+too\s+large\s+\(413\)\s+[—-]+\s+compression\s+attempt"
+    r"|请求负载过大|請求負載過大"
+    r"|compression\s+could\s+not\s+reduce\s+the\s+request\s+further"
+    r"|已移除保留的视觉(?:载荷|内容)|已移除保留的視覺(?:載荷|內容)"
     r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
@@ -149,6 +164,8 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
             COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
             COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE,
             COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_PAYLOAD_TOO_LARGE_STATUS_TEMPLATE,
+            COMPRESSION_RETRY_RETAINED_VISION_STATUS,
         )
     ),
     re.IGNORECASE,

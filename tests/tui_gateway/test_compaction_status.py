@@ -51,6 +51,14 @@ def test_compaction_lifecycle_is_retagged(server, monkeypatch):
     assert events == [{"kind": "compacting", "text": COMPACTION_STATUS}]
 
 
+def test_localized_compaction_lifecycle_is_retagged(server, monkeypatch):
+    from agent.conversation_compression import compaction_status
+
+    status = compaction_status(lang="zh")
+    events = _capture(server, monkeypatch)
+    server._status_update("sid", "lifecycle", status)
+
+    assert events == [{"kind": "compacting", "text": status}]
 def test_other_lifecycle_status_stays_lifecycle(server, monkeypatch):
     events = _capture(server, monkeypatch)
     server._status_update("sid", "lifecycle", "❌ Rate limited after 5 retries")
@@ -63,5 +71,4 @@ def test_manual_compressing_kind_is_preserved(server, monkeypatch):
     server._status_update("sid", "compressing", "⠋ compressing 40 messages…")
 
     assert events[0]["kind"] == "compressing"
-
 
