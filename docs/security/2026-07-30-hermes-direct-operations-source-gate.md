@@ -559,9 +559,11 @@ expanding this release:
 - Runtime logs warn that linked SQLite `3.50.4` lacks later WAL-reset
   corruption fixes. Upgrade to the supported fixed SQLite/Python build in a
   separate dependency-maintenance change with session-store regressions.
-- Existing cron deliveries reference missing Telegram thread `24049` and fall
-  back successfully to the chat root. Repair those job destinations so routine
-  messages land in the intended thread without warning noise.
+- Existing cron deliveries reference missing Telegram thread IDs `24049` and
+  `19521` and fall back successfully to the chat root. Six provider-confirmed
+  fallback deliveries were observed: five for `24049` and one for `19521`.
+  Repair those job destinations so routine messages land in the intended thread
+  without warning noise.
 - Some cron runs request arbitrary `execute_code`, which is correctly blocked
   without an attended approval. Replace those requests with the smallest
   purpose-built read or operation tool instead of weakening the boundary.
