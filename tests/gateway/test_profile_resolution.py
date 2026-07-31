@@ -236,6 +236,22 @@ class TestAdapterToSessionKeyIntegration:
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
 
+    def test_secondary_adapter_ownership_precedes_profile_routes(self, mock_runner):
+        adapter = _stub_adapter(Platform.FEISHU, mock_runner)
+        adapter._owned_profile = "reviewer"
+
+        source = adapter.build_source(
+            chat_id="oc1",
+            chat_type="dm",
+            thread_id="omt_native",
+            conversation_id="om_root",
+            user_id="u1",
+        )
+
+        assert source.profile == "reviewer"
+        assert source.thread_id == "omt_native"
+        assert source.conversation_id == "om_root"
+
 
 class TestMultiplexGate:
     """``profile_routes`` only activates under ``gateway.multiplex_profiles``.
@@ -256,5 +272,4 @@ class TestMultiplexGate:
         discord_source.profile = None
 
         assert mock_runner._profile_name_for_source(discord_source) is None
-
 

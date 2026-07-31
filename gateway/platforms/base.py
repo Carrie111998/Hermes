@@ -548,7 +548,11 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource, build_session_key
+from gateway.session import (
+    SessionSource,
+    build_session_key,
+    build_session_key_for_config,
+)
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
 
@@ -5551,11 +5555,9 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        runner = getattr(self, "gateway_runner", None)
+        key_config = getattr(runner, "config", None) or self.config
+        session_key = build_session_key_for_config(event.source, key_config)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -6560,6 +6562,7 @@ class BasePlatformAdapter(ABC):
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
         thread_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
         chat_id_alt: Optional[str] = None,
@@ -6585,9 +6588,9 @@ class BasePlatformAdapter(ABC):
             chat_topic = None
 
         # Resolve profile from configured routes (None when no match / no routes)
-        profile = None
+        profile = getattr(self, "_owned_profile", None)
         runner = getattr(self, "gateway_runner", None)
-        if runner is not None:
+        if profile is None and runner is not None:
             try:
                 profile = runner._profile_name_for_source(
                     SessionSource(
@@ -6598,6 +6601,9 @@ class BasePlatformAdapter(ABC):
                         user_id=str(user_id) if user_id else None,
                         user_name=user_name,
                         thread_id=str(thread_id) if thread_id else None,
+                        conversation_id=(
+                            str(conversation_id) if conversation_id else None
+                        ),
                         chat_topic=chat_topic.strip() if chat_topic else None,
                         user_id_alt=user_id_alt,
                         chat_id_alt=chat_id_alt,
@@ -6622,6 +6628,7 @@ class BasePlatformAdapter(ABC):
             user_id=str(user_id) if user_id else None,
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
+            conversation_id=str(conversation_id) if conversation_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt,

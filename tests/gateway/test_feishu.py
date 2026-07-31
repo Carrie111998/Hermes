@@ -2266,6 +2266,64 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertIn("[Mentioned: Alice (open_id=ou_alice), Bob (open_id=ou_bob)]", event.text)
         self.assertIn("@Alice @Bob make a group", event.text)
 
+    def test_top_level_message_uses_message_id_as_conversation_identity(self):
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps({"text": "hi"}),
+            message_type="text",
+            message_id="om_root",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id=None,
+            upper_message_id=None,
+            root_id=None,
+            thread_id=None,
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="p2p",
+                message_id="om_root",
+            )
+        )
+
+        kwargs = adapter.build_source.call_args.kwargs
+        self.assertEqual(kwargs["conversation_id"], "om_root")
+        self.assertIsNone(kwargs["thread_id"])
+        self.assertEqual(kwargs["message_id"], "om_root")
+
+    def test_thread_reply_keeps_native_thread_and_root_conversation(self):
+        adapter = self._build_adapter()
+        message = SimpleNamespace(
+            content=json.dumps({"text": "follow up"}),
+            message_type="text",
+            message_id="om_reply",
+            mentions=[],
+            chat_id="oc_chat",
+            parent_id="om_parent",
+            upper_message_id=None,
+            root_id="om_root",
+            thread_id="omt_native",
+        )
+
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="p2p",
+                message_id="om_reply",
+            )
+        )
+
+        kwargs = adapter.build_source.call_args.kwargs
+        self.assertEqual(kwargs["conversation_id"], "om_root")
+        self.assertEqual(kwargs["thread_id"], "omt_native")
+        self.assertEqual(kwargs["message_id"], "om_reply")
+
     def test_command_message_never_injects_hint(self):
         adapter = self._build_adapter()
         bot_mention = SimpleNamespace(
@@ -2465,5 +2523,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 

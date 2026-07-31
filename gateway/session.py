@@ -162,6 +162,11 @@ class SessionSource:
     user_id: Optional[str] = None
     user_name: Optional[str] = None
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
+    # Stable logical conversation identity used for session isolation.  This
+    # may differ from ``thread_id`` when a platform creates a delivery thread
+    # only after replying to a top-level message (Feishu: ``om_*`` root versus
+    # native ``omt_*`` thread).  ``thread_id`` remains the outbound routing ID.
+    conversation_id: Optional[str] = None
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
@@ -244,6 +249,7 @@ class SessionSource:
             "user_id": self.user_id,
             "user_name": self.user_name,
             "thread_id": self.thread_id,
+            "conversation_id": self.conversation_id,
             "chat_topic": self.chat_topic,
         }
         if self.user_id_alt:
@@ -280,6 +286,7 @@ class SessionSource:
             user_id=data.get("user_id"),
             user_name=data.get("user_name"),
             thread_id=data.get("thread_id"),
+            conversation_id=data.get("conversation_id"),
             chat_topic=data.get("chat_topic"),
             user_id_alt=data.get("user_id_alt"),
             chat_id_alt=data.get("chat_id_alt"),
@@ -1001,7 +1008,7 @@ def is_shared_multi_user_session(
     """
     if source.chat_type == "dm":
         return False
-    if source.thread_id:
+    if session_conversation_id(source):
         return not thread_sessions_per_user
     return not group_sessions_per_user
 
@@ -1026,6 +1033,58 @@ def _session_key_namespace(profile: Optional[str]) -> str:
     return f"agent:{profile}"
 
 
+def session_conversation_id(source: SessionSource) -> Optional[str]:
+    """Return the stable identity that partitions sessions within a chat.
+
+    ``conversation_id`` is authoritative when an adapter can distinguish the
+    logical conversation root from the platform's delivery thread ID.  The
+    ``thread_id`` fallback preserves every existing adapter's key format.
+    """
+    return getattr(source, "conversation_id", None) or getattr(source, "thread_id", None)
+
+
+def _session_config_value(config: Any, name: str, default: Any) -> Any:
+    """Read a session option from GatewayConfig or PlatformConfig.extra."""
+    if config is None:
+        return default
+    value = getattr(config, name, None)
+    if value is not None:
+        return value
+    extra = getattr(config, "extra", None)
+    if isinstance(extra, dict):
+        return extra.get(name, default)
+    return default
+
+
+def resolve_session_key_profile(
+    source: SessionSource, config: Any
+) -> Optional[str]:
+    """Resolve the profile namespace used by every gateway session-key path."""
+    if not _session_config_value(config, "multiplex_profiles", False):
+        return None
+    if source.profile:
+        return source.profile
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return None
+
+
+def build_session_key_for_config(source: SessionSource, config: Any) -> str:
+    """Build a session key using one config/profile resolution contract."""
+    return build_session_key(
+        source,
+        group_sessions_per_user=_session_config_value(
+            config, "group_sessions_per_user", True
+        ),
+        thread_sessions_per_user=_session_config_value(
+            config, "thread_sessions_per_user", False
+        ),
+        profile=resolve_session_key_profile(source, config),
+    )
+
+
 def build_session_key(
     source: SessionSource,
     group_sessions_per_user: bool = True,
@@ -1046,16 +1105,16 @@ def build_session_key(
         platforms retain their existing key format; in particular, Discord
         guild scope is intentionally not added here as a compatibility change.
       - DMs include chat_id when present, so each private conversation is isolated.
-      - thread_id further differentiates threaded DMs within the same DM chat.
-      - Without chat_id, thread_id is used as a best-effort fallback.
-      - Without thread_id or chat_id, DMs share a single session.
+      - conversation_id (falling back to thread_id) differentiates logical
+        conversations within the same DM chat.
 
     Group/channel rules:
       - Slack ``scope_id`` identifies the workspace before chat/thread ids.
       - chat_id identifies the parent group/channel.
       - user_id/user_id_alt isolates participants within that parent chat when available when
         ``group_sessions_per_user`` is enabled.
-      - thread_id differentiates threads within that parent chat.  When
+      - conversation_id (falling back to thread_id) differentiates logical
+        conversations within that parent chat.  When
         ``thread_sessions_per_user`` is False (default), threads are *shared* across all
         participants — user_id is NOT appended, so every user in the thread
         shares a single session.  This is the expected UX for threaded
@@ -1066,6 +1125,7 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    conversation_id = session_conversation_id(source)
     slack_scope_id = (
         str(source.scope_id)
         if source.platform == Platform.SLACK and source.scope_id
@@ -1081,8 +1141,8 @@ def build_session_key(
             dm_parts.append(slack_scope_id)
         if dm_chat_id:
             dm_parts.append(dm_chat_id)
-            if source.thread_id:
-                dm_parts.append(source.thread_id)
+            if conversation_id:
+                dm_parts.append(conversation_id)
             return ":".join(str(part) for part in dm_parts)
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
@@ -1098,11 +1158,11 @@ def build_session_key(
             )
         if dm_participant_id:
             dm_parts.append(str(dm_participant_id))
-            if source.thread_id:
-                dm_parts.append(source.thread_id)
+            if conversation_id:
+                dm_parts.append(conversation_id)
             return ":".join(str(part) for part in dm_parts)
-        if source.thread_id:
-            dm_parts.append(source.thread_id)
+        if conversation_id:
+            dm_parts.append(conversation_id)
         return ":".join(str(part) for part in dm_parts)
 
     participant_id = source.user_id_alt or source.user_id
@@ -1117,14 +1177,14 @@ def build_session_key(
         key_parts.append(slack_scope_id)
     if source.chat_id:
         key_parts.append(source.chat_id)
-    if source.thread_id:
-        key_parts.append(source.thread_id)
+    if conversation_id:
+        key_parts.append(conversation_id)
 
     # In threads, default to shared sessions (all participants see the same
     # conversation).  Per-user isolation only applies when explicitly enabled
     # via thread_sessions_per_user, or when there is no thread (regular group).
     isolate_user = group_sessions_per_user
-    if source.thread_id and not thread_sessions_per_user:
+    if conversation_id and not thread_sessions_per_user:
         isolate_user = False
 
     if isolate_user and participant_id:
@@ -1515,15 +1575,9 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
-            return None
-        if source is not None and source.profile:
-            return source.profile
-        try:
-            from hermes_cli.profiles import get_active_profile_name
-            return get_active_profile_name() or "default"
-        except Exception:
-            return None
+        if source is None:
+            source = SessionSource(platform=Platform.LOCAL, chat_id="cli")
+        return resolve_session_key_profile(source, self.config)
 
     @staticmethod
     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
@@ -1566,12 +1620,7 @@ class SessionStore:
 
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
-        return build_session_key(
-            source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
-            profile=self._resolve_profile_for_key(source),
-        )
+        return build_session_key_for_config(source, self.config)
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
         """Return the pre-workspace Slack key for an explicitly scoped source.
@@ -1693,6 +1742,7 @@ class SessionStore:
                 chat_id=source.chat_id if allow_peer_fallback else None,
                 chat_type=source.chat_type if allow_peer_fallback else None,
                 thread_id=source.thread_id,
+                conversation_id=source.conversation_id,
             )
         except Exception as exc:
             logger.debug(
@@ -1852,6 +1902,7 @@ class SessionStore:
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
                 thread_id=source.thread_id,
+                conversation_id=source.conversation_id,
                 display_name=display_name or source.chat_name,
                 origin_json=origin_json,
             )
@@ -2422,6 +2473,7 @@ class SessionStore:
                     "chat_id": source.chat_id,
                     "chat_type": source.chat_type,
                     "thread_id": source.thread_id,
+                    "conversation_id": source.conversation_id,
                     "profile_name": source.profile,
                 }
 
@@ -2741,6 +2793,9 @@ class SessionStore:
                 "chat_id": old_entry.origin.chat_id if old_entry.origin else None,
                 "chat_type": old_entry.origin.chat_type if old_entry.origin else None,
                 "thread_id": old_entry.origin.thread_id if old_entry.origin else None,
+                "conversation_id": (
+                    old_entry.origin.conversation_id if old_entry.origin else None
+                ),
                 "profile_name": old_entry.origin.profile if old_entry.origin else None,
             }
 

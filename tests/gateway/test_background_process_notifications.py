@@ -269,6 +269,18 @@ def test_parse_session_key_with_extra_parts():
     assert result == {"platform": "discord", "chat_type": "group", "chat_id": "chan123"}
 
 
+def test_parse_named_profile_feishu_key_never_treats_root_as_delivery_thread():
+    result = _parse_session_key("agent:coder:feishu:dm:oc1:om_root")
+
+    assert result == {
+        "platform": "feishu",
+        "chat_type": "dm",
+        "chat_id": "oc1",
+        "profile": "coder",
+        "conversation_id": "om_root",
+    }
+
+
 # ---------------------------------------------------------------------------
 # api_server (stateless) wake routing — gateway/wake.py self-post path
 # ---------------------------------------------------------------------------
