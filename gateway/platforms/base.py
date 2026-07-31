@@ -81,6 +81,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     # reply anchor, so they remain top-level messages.
     if platform == "feishu" and reply_to_message_id:
         metadata["reply_in_thread"] = True
+        # Several current-turn paths (approvals, media, TTS, and error
+        # notices) only receive metadata, not the send() ``reply_to``
+        # argument.  Keep the origin message alongside the thread intent so
+        # those paths can use Feishu's reply API instead of losing the live
+        # turn's anchor.
+        metadata["reply_to_message_id"] = str(reply_to_message_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary

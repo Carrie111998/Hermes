@@ -4968,12 +4968,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 if active_reply_to and not self._response_succeeded(response):
                     code = getattr(response, "code", None)
                     if code in _FEISHU_REPLY_FALLBACK_CODES:
-                        if (metadata or {}).get("thread_id"):
+                        if (
+                            (metadata or {}).get("thread_id")
+                            or (metadata or {}).get("reply_in_thread")
+                        ):
                             logger.warning(
-                                "[Feishu] Reply to %s failed in thread %s (code %s — message withdrawn/missing); "
+                                "[Feishu] Reply to %s failed for threaded delivery %s (code %s — message withdrawn/missing); "
                                 "skipping top-level fallback to avoid creating a new topic",
                                 active_reply_to,
-                                (metadata or {}).get("thread_id"),
+                                (metadata or {}).get("thread_id") or "live reply",
                                 code,
                             )
                             return response

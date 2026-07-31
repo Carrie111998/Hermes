@@ -1398,3 +1398,38 @@ class TestSlackReplyInThreadProgressRouting:
         ) is None
 
 
+@pytest.mark.asyncio
+async def test_feishu_status_metadata_keeps_live_origin_anchor():
+    from gateway.run import GatewayRunner, _send_or_update_status_coro
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    metadata = runner._thread_metadata_for_target(
+        Platform.FEISHU,
+        "oc_chat",
+        None,
+        chat_type="dm",
+        reply_to_message_id="om_trigger",
+    )
+    adapter = ProgressCaptureAdapter(platform=Platform.FEISHU)
+
+    await _send_or_update_status_coro(
+        adapter,
+        "oc_chat",
+        "status-key",
+        "Working…",
+        metadata,
+    )
+
+    assert metadata == {
+        "reply_in_thread": True,
+        "reply_to_message_id": "om_trigger",
+    }
+    assert adapter.sent == [
+        {
+            "chat_id": "oc_chat",
+            "content": "Working…",
+            "reply_to": "om_trigger",
+            "metadata": metadata,
+        }
+    ]
+
