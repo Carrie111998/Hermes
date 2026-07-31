@@ -539,14 +539,6 @@ class EmailAdapter(BasePlatformAdapter):
         if reply_to_msg_id and reply_to_msg_id in sender_threads:
             return sender_threads[reply_to_msg_id]
 
-        # Check if reply_to_msg_id matches the *original* message in any thread
-        # (i.e. the reply_to_msg_id is the first message in the chain, and the
-        # thread context was stored under a later message_id in that same chain).
-        if reply_to_msg_id:
-            for ctx in sender_threads.values():
-                if ctx.get("reply_target") == reply_to_msg_id:
-                    return ctx
-
         # Fall back to the most recent thread for this sender
         last_key = next(reversed(sender_threads))
         return sender_threads[last_key]
@@ -1056,7 +1048,16 @@ class EmailAdapter(BasePlatformAdapter):
         appended to the body (email adapter does not download remote
         images). No hard cap — email clients handle dozens of
         attachments fine, subject to SMTP message size limits.
+
+        When called via the gateway media delivery path, the reply anchor
+        arrives in *metadata* (``thread_id`` or ``message_id``) rather than
+        ``reply_to``. Extract it here so attachment-based responses thread
+        correctly across concurrent conversations from the same sender.
         """
+        # Extract reply anchor from metadata when not passed directly
+        if reply_to is None and metadata and isinstance(metadata, dict):
+            reply_to = metadata.get("message_id") or metadata.get("thread_id")
+
         if not images:
             return
 
@@ -1163,7 +1164,17 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
-        """Send a file as an email attachment."""
+        """Send a file as an email attachment.
+
+        When called via the gateway media delivery path, the reply anchor
+        arrives in *metadata* (via **kwargs) rather than ``reply_to``.
+        Extract it here so attachment-based responses thread correctly
+        across concurrent conversations from the same sender.
+        """
+        # Extract reply anchor from metadata when not passed directly
+        if reply_to is None and kwargs.get("metadata") and isinstance(kwargs["metadata"], dict):
+            reply_to = kwargs["metadata"].get("message_id") or kwargs["metadata"].get("thread_id")
+
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(

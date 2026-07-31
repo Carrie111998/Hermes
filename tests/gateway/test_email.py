@@ -798,7 +798,10 @@ class TestThreadContext(unittest.TestCase):
         }
 
         asyncio.run(adapter._dispatch_message(msg_data))
-        ctx = adapter._thread_context.get("user@test.com")
+        sender_ctx = adapter._thread_context.get("user@test.com")
+        self.assertIsNotNone(sender_ctx)
+        # _store_thread_context stores in nested dict: message_id → {subject, message_id}
+        ctx = sender_ctx.get("<original@test.com>")
         self.assertIsNotNone(ctx)
         self.assertEqual(ctx["subject"], "Project question")
         self.assertEqual(ctx["message_id"], "<original@test.com>")
@@ -806,10 +809,13 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
-            "subject": "Project question",
-            "message_id": "<original@test.com>",
-        }
+        from collections import OrderedDict
+        adapter._thread_context["user@test.com"] = OrderedDict({
+            "<original@test.com>": {
+                "subject": "Project question",
+                "message_id": "<original@test.com>",
+            },
+        })
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -827,10 +833,13 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_does_not_double_re(self):
         """If subject already has Re:, don't add another."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
-            "subject": "Re: Project question",
-            "message_id": "<reply@test.com>",
-        }
+        from collections import OrderedDict
+        adapter._thread_context["user@test.com"] = OrderedDict({
+            "<reply@test.com>": {
+                "subject": "Re: Project question",
+                "message_id": "<reply@test.com>",
+            },
+        })
 
         with patch("smtplib.SMTP") as mock_smtp:
             mock_server = MagicMock()
@@ -965,7 +974,10 @@ class TestSendMethods(unittest.TestCase):
         """get_chat_info should return email address as chat info."""
         import asyncio
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {"subject": "Test", "message_id": "<m@t>"}
+        from collections import OrderedDict
+        adapter._thread_context["user@test.com"] = OrderedDict({
+            "<m@t>": {"subject": "Test", "message_id": "<m@t>"},
+        })
 
         info = asyncio.run(
             adapter.get_chat_info("user@test.com")
@@ -1773,6 +1785,140 @@ class TestSenderAuthentication(unittest.TestCase):
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+
+class TestConcurrentSameSenderThreads(unittest.TestCase):
+    """Regression tests: two concurrent threads from the same sender must
+    produce correctly threaded replies (text, document, and image paths).
+
+    The gateway media delivery path passes ``metadata=_thread_meta`` instead
+    of ``reply_to=...``, so :meth:`send_multiple_images` and
+    :meth:`send_document` must extract the reply anchor from metadata.
+    """
+
+    def setUp(self):
+        self._prev_allow_all = os.environ.get("EMAIL_ALLOW_ALL_USERS")
+        os.environ["EMAIL_ALLOW_ALL_USERS"] = "true"
+
+    def tearDown(self):
+        if self._prev_allow_all is None:
+            os.environ.pop("EMAIL_ALLOW_ALL_USERS", None)
+        else:
+            os.environ["EMAIL_ALLOW_ALL_USERS"] = self._prev_allow_all
+
+    def _make_adapter(self):
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def test_text_replies_separate_concurrent_threads(self):
+        """Two concurrent same-sender text threads: each reply matches its own thread."""
+        adapter = self._make_adapter()
+
+        # Simulate two concurrent incoming emails from the same sender
+        adapter._store_thread_context("user@test.com", "Project Alpha", "<alpha-1@test.com>")
+        adapter._store_thread_context("user@test.com", "Project Beta", "<beta-1@test.com>")
+
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+
+            # Reply to Beta — should use Beta's context
+            adapter._send_email("user@test.com", "Beta reply.", "<beta-1@test.com>")
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Re: Project Beta")
+            self.assertEqual(send_call["In-Reply-To"], "<beta-1@test.com>")
+
+            # Reply to Alpha — should use Alpha's context
+            adapter._send_email("user@test.com", "Alpha reply.", "<alpha-1@test.com>")
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Re: Project Alpha")
+            self.assertEqual(send_call["In-Reply-To"], "<alpha-1@test.com>")
+
+    def test_document_attachment_reply_from_metadata(self):
+        """send_document via metadata path should thread correctly.
+
+        The gateway calls send_document(chat_id, file_path, metadata=...)
+        without reply_to=... — the adapter must extract the anchor from metadata.
+        """
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+
+        # Store two concurrent threads
+        adapter._store_thread_context("user@test.com", "Thread A", "<a-msg@test.com>")
+        adapter._store_thread_context("user@test.com", "Thread B", "<b-msg@test.com>")
+
+        # Create a temp file to attach
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False, mode="w") as f:
+            f.write("test content")
+            tmp_path = f.name
+
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                # Send a document with metadata containing thread_id (simulating
+                # the gateway's post-stream delivery call pattern)
+                result = asyncio.run(adapter.send_document(
+                    chat_id="user@test.com",
+                    file_path=tmp_path,
+                    caption="Document for Thread B",
+                    metadata={"thread_id": "<b-msg@test.com>"},
+                ))
+
+                self.assertTrue(result.success)
+                send_call = mock_server.send_message.call_args[0][0]
+                self.assertEqual(send_call["Subject"], "Re: Thread B")
+                self.assertEqual(send_call["In-Reply-To"], "<b-msg@test.com>")
+        finally:
+            os.unlink(tmp_path)
+
+    def test_send_multiple_images_reply_from_metadata(self):
+        """send_multiple_images via metadata path should thread correctly.
+
+        The gateway calls send_multiple_images(chat_id, images, metadata=...)
+        without reply_to=... — the adapter must extract the anchor from metadata.
+        """
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+
+        # Store two concurrent threads
+        adapter._store_thread_context("user@test.com", "Images A", "<img-a@test.com>")
+        adapter._store_thread_context("user@test.com", "Images B", "<img-b@test.com>")
+
+        # Create a temp image file
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False, mode="wb") as f:
+            f.write(b"fake png content")
+            tmp_path = f.name
+
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                # Send images with metadata containing thread_id (simulating
+                # the gateway's post-stream delivery call pattern)
+                asyncio.run(adapter.send_multiple_images(
+                    chat_id="user@test.com",
+                    images=[("file://" + tmp_path, "screenshot")],
+                    metadata={"thread_id": "<img-b@test.com>"},
+                ))
+
+                send_call = mock_server.send_message.call_args[0][0]
+                self.assertEqual(send_call["Subject"], "Re: Images B")
+                self.assertEqual(send_call["In-Reply-To"], "<img-b@test.com>")
+        finally:
+            os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
