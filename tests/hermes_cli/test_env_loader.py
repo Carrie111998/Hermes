@@ -440,3 +440,54 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
     # The other profile's .env value stands; the process config was not applied.
     assert os.getenv("TERMINAL_ENV") == "docker"
+
+
+# ---------------------------------------------------------------------------
+# interpolate=False — credentials containing $ must round-trip byte-exactly
+# ---------------------------------------------------------------------------
+
+
+def test_dollar_brace_value_not_interpolated(tmp_path, monkeypatch):
+    """A credential containing ${...} must load literally, not be rewritten
+    by dotenv interpolation — including when the referenced name exists in
+    the environment (which would splice in a different secret)."""
+    from hermes_cli.env_loader import _load_dotenv_with_fallback
+
+    monkeypatch.setenv("HOME", "/should/not/appear")
+    env_file = tmp_path / ".env"
+    env_file.write_text("MY_KEY=abc${HOME}def\n", encoding="utf-8")
+    monkeypatch.delenv("MY_KEY", raising=False)
+
+    _load_dotenv_with_fallback(env_file, override=True)
+
+    assert os.environ["MY_KEY"] == "abc${HOME}def"
+
+
+def test_bare_dollar_var_value_not_interpolated(tmp_path, monkeypatch):
+    """Boundary guard: dotenv interpolates only the *braced* form
+    ``${VAR}``; a bare ``$VAR`` is never expanded — on either side of this
+    change. Pinned so a future dotenv behavior change here is visible."""
+    from hermes_cli.env_loader import _load_dotenv_with_fallback
+
+    monkeypatch.setenv("SPLICE", "wrong-secret")
+    env_file = tmp_path / ".env"
+    env_file.write_text("MY_KEY=prefix$SPLICE\n", encoding="utf-8")
+    monkeypatch.delenv("MY_KEY", raising=False)
+
+    _load_dotenv_with_fallback(env_file, override=True)
+
+    assert os.environ["MY_KEY"] == "prefix$SPLICE"
+
+
+def test_quoted_escapes_still_decoded_with_interpolation_off(tmp_path, monkeypatch):
+    """interpolate=False only stops variable expansion; the writer's
+    double-quote escapes must still decode."""
+    from hermes_cli.env_loader import _load_dotenv_with_fallback
+
+    env_file = tmp_path / ".env"
+    env_file.write_text('QUOTED="tok\\"en\\\\x"\n', encoding="utf-8")
+    monkeypatch.delenv("QUOTED", raising=False)
+
+    _load_dotenv_with_fallback(env_file, override=True)
+
+    assert os.environ["QUOTED"] == 'tok"en\\x'

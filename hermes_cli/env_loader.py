@@ -340,10 +340,22 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    # interpolate=False: credentials must round-trip byte-exactly. dotenv's
+    # default interpolation rewrites any value containing $VAR/${VAR} —
+    # splicing in an unrelated environment value if the name collides —
+    # while every other Hermes .env reader (load_env, secret scopes) treats
+    # values as literal. ${VAR} references are a config.yaml feature, not
+    # an .env one.
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        load_dotenv(
+            dotenv_path=path, override=override, encoding="utf-8",
+            interpolate=False,
+        )
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        load_dotenv(
+            dotenv_path=path, override=override, encoding="latin-1",
+            interpolate=False,
+        )
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
