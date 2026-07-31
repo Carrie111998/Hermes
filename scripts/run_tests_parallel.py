@@ -33,6 +33,9 @@ Usage:
 Environment:
     HERMES_TEST_WORKERS  Override worker count (default: os.cpu_count())
     HERMES_TEST_PATHS    Override discovery roots (colon-sep, default: 'tests')
+    HERMES_TEST_ISOLATE_HERMES_HOME
+                         Set to 1/true/yes/on to give each test-file attempt
+                         its own temporary HERMES_HOME.
 
 Exit code: 0 if every file's pytest exited 0; 1 otherwise.
 """
@@ -44,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -98,6 +102,24 @@ _DEFAULT_FILE_RETRIES = 1
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+
+
+def _pytest_subprocess_env():
+    """Return a copied environment and optional disposable Hermes home.
+
+    Parallel files must never share an operator's live ``HERMES_HOME``: tests
+    that exercise receipts or state storage can otherwise contend with one
+    another and, worse, write test records into a real profile. Isolation is
+    opt-in so normal targeted-test behavior stays unchanged.
+    """
+    env = os.environ.copy()
+    enabled = env.get("HERMES_TEST_ISOLATE_HERMES_HOME", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        return env, None
+
+    isolated_home = tempfile.TemporaryDirectory(prefix="hermes-test-home-")
+    env["HERMES_HOME"] = isolated_home.name
+    return env, isolated_home
 
 
 def _approximately_count_tests(
@@ -306,7 +328,8 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    child_env, isolated_home = _pytest_subprocess_env()
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -315,7 +338,7 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
+        env=child_env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
@@ -352,6 +375,8 @@ def _run_one_file_once(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
+        if isolated_home is not None:
+            isolated_home.cleanup()
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -359,6 +384,9 @@ def _run_one_file_once(
         _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
+
+    if isolated_home is not None:
+        isolated_home.cleanup()
 
     if rc == 5:
         # No tests collected in THIS file — legitimate per-file: a

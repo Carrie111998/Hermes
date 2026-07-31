@@ -235,6 +235,71 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
 
 
 
+def test_parallel_files_use_distinct_disposable_hermes_homes(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "probes"
+    handoff_dir = tmp_path / "handoffs"
+    probe_dir.mkdir()
+    handoff_dir.mkdir()
+
+    for index in range(2):
+        handoff = handoff_dir / f"home-{index}.txt"
+        (probe_dir / f"test_home_{index}.py").write_text(
+            textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+
+                def test_records_hermes_home():
+                    home = os.environ.get("HERMES_HOME", "")
+                    assert home
+                    Path({str(handoff)!r}).write_text(home, encoding="utf-8")
+                """
+            ),
+            encoding="utf-8",
+        )
+
+    live_home = tmp_path / "live-profile"
+    parent_home = os.environ.get("HERMES_HOME")
+    child_env = os.environ.copy()
+    child_env["HERMES_HOME"] = str(live_home)
+    child_env["HERMES_TEST_ISOLATE_HERMES_HOME"] = "1"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+        ],
+        cwd=repo_root,
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    homes = {
+        (handoff_dir / f"home-{index}.txt").read_text(encoding="utf-8")
+        for index in range(2)
+    }
+    assert len(homes) == 2
+    assert str(live_home) not in homes
+    assert all(not Path(home).exists() for home in homes)
+    assert os.environ.get("HERMES_HOME") == parent_home
+
+
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     """``-k test_alpha`` reaches pytest as a selector, not as a path.
 
