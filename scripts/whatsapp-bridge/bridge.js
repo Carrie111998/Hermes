@@ -836,7 +836,7 @@ async function startSocket() {
           body: event.body || '',
           hasMedia: !!event.hasMedia,
           mediaType: event.mediaType || '',
-          timestamp: event.timestamp || Math.floor(Date.now() / 1000),
+          timestamp: toNumberSafe(event.timestamp),
         });
       }
 
