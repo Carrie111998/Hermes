@@ -285,18 +285,18 @@ provider health becomes degraded with a bounded fixed reason.
 
 ### Wake model
 
-When the delivery queue changes from empty to non-empty, the coordinator
-requests an immediate wake of the exact pinned broker task. A three-minute
-scheduled wake of that same task is retained only as a missed-event,
-restart, and crash-recovery watchdog.
+The installed Codex automation boundary can create and update recurring
+heartbeats for an exact task, but exposes no repository-callable operation that
+Hermes can use to trigger one immediately. The interim scheduler therefore
+runs one heartbeat every minute against the exact pinned broker task.
 
 No automation may target the currently focused task, an ordinary user task, or
 a dynamically selected task.
 
-After one lease settles, remaining pending work requests another dedicated
-wake. Lease serialization remains one native mutation per invocation while
-the follow-up mechanism prevents a backlog from waiting for the full watchdog
-interval between every item.
+Each wake processes at most one lease. Remaining pending work is processed by
+the next one-minute wake. An empty wake ends silently. Three minutes without a
+persisted broker heartbeat is stale and alerts; true queue-transition-triggered
+wakeup remains deferred until Codex exposes a supported trigger-now API.
 
 Normal end-to-end source-to-visible latency is under three minutes. An oldest
 eligible reservation older than five minutes is an operational failure and
@@ -457,7 +457,7 @@ required `scripts/run_tests.sh` wrapper.
 9. Run restart and ambiguity canaries.
 10. Observe a clean production soak and run the full Session Bridge suite.
 
-Rollback disables new leases, event wakes, and the watchdog automation while
+Rollback disables new leases and the dedicated heartbeat automation while
 preserving reservations, task bindings, mappings, enrichment state, and every
 created native task. It never deletes tasks or discards source sessions.
 
