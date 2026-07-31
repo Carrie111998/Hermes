@@ -932,6 +932,22 @@ class ShellFileOperations(FileOperations):
             numbered.append(f"{i}|{line}")
         return '\n'.join(numbered)
     
+    def _anchor_to_effective_cwd(self, path: str) -> str:
+        """Resolve a relative path against the terminal session's live cwd.
+
+        ``get_write_denied_error`` anchors relative paths to the *process*
+        cwd via ``os.path.realpath`` — but writes/deletes/moves execute
+        through ``_exec`` against the *terminal session* cwd, which
+        diverges after the agent runs ``cd``. Anchoring the guard to the
+        same cwd the shell will use closes the gap where e.g.
+        ``.ssh/authorized_keys`` escapes the credential write-deny while
+        the terminal session sits at ``$HOME``.
+        """
+        if os.path.isabs(path) or path.startswith("~"):
+            return path
+        effective_cwd = getattr(self.env, 'cwd', None) or self.cwd
+        return os.path.join(effective_cwd, path)
+
     def _expand_path(self, path: str) -> str:
         """
         Expand shell-style paths like ~ and ~user to absolute paths.
@@ -1324,7 +1340,8 @@ class ShellFileOperations(FileOperations):
 
     def _python_delete(self, path: str, recursive: bool) -> WriteResult:
         path = self._expand_path(path)
-        denied = get_write_denied_error(path, verb="Delete")
+        denied = get_write_denied_error(
+            self._anchor_to_effective_cwd(path), verb="Delete")
         if denied:
             return WriteResult(error=denied)
 
@@ -1371,7 +1388,8 @@ class ShellFileOperations(FileOperations):
         src = self._expand_path(src)
         dst = self._expand_path(dst)
         for p in (src, dst):
-            denied = get_write_denied_error(p, verb="Move")
+            denied = get_write_denied_error(
+                self._anchor_to_effective_cwd(p), verb="Move")
             if denied:
                 return WriteResult(error=denied)
         result = self._exec(
@@ -1419,8 +1437,9 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
 
-        # Block writes to sensitive paths
-        denied = get_write_denied_error(path)
+        # Block writes to sensitive paths (anchored to the terminal
+        # session's live cwd, not the process cwd)
+        denied = get_write_denied_error(self._anchor_to_effective_cwd(path))
         if denied:
             return WriteResult(error=denied)
 
@@ -1603,8 +1622,9 @@ class ShellFileOperations(FileOperations):
         # Expand ~ and other shell paths
         path = self._expand_path(path)
 
-        # Block writes to sensitive paths
-        denied = get_write_denied_error(path)
+        # Block writes to sensitive paths (anchored to the terminal
+        # session's live cwd, not the process cwd)
+        denied = get_write_denied_error(self._anchor_to_effective_cwd(path))
         if denied:
             return PatchResult(error=denied)
 
