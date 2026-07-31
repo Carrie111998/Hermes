@@ -191,6 +191,7 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
         source=source,
         media_urls=["/tmp/telegram-pending-voice.ogg"],
         media_types=["audio/ogg"],
+        message_id="pending-voice-1",
     )
     adapter._pending_messages[session_key] = event
     adapter._active_sessions[session_key] = asyncio.Event()
