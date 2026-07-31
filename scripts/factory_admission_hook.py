@@ -624,6 +624,69 @@ def _mask_active_command_substitutions(command):
     return "".join(result)
 
 
+def _command_substitution_bodies(command):
+    """Return every active substitution body, or ``None`` on unbalanced syntax.
+
+    Mirrors the state machine of :func:`_mask_active_command_substitutions`
+    exactly, so the same substitutions that get masked as dynamic values are
+    the ones whose executable bodies are surfaced here.
+    """
+    bodies = []
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if char == "\\" and index + 1 < len(command):
+            index += 2
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if command.startswith("$(", index):
+            end = _scan_dollar_paren_end(command, index)
+            if end is None:
+                return None
+            bodies.append(command[index + 2:end - 1])
+            index = end
+            continue
+        if char == "`":
+            end = _scan_backtick_end(command, index)
+            if end is None:
+                return None
+            bodies.append(command[index + 1:end - 1])
+            index = end
+            continue
+        index += 1
+    return bodies
+
+
+def _substitution_bodies_are_readonly(command):
+    """True only when every ``$(...)``/backtick body is a literal readonly call.
+
+    The shell EXECUTES a substitution body before the outer command runs, so a
+    readonly outer command (``echo``, ``printf``) is no protection at all:
+    ``echo $($C)``, ``echo $(eval "$C")`` and ``printf $(sh -c "$C")`` all run
+    arbitrary host mutations while producing an innocuous-looking value. Under
+    the strict Code gate the only executable substitution bodies are the same
+    positive literal discovery grammar as pre-claim reads; anything dynamic,
+    variable-driven, re-parsed or outside that grammar fails closed.
+    """
+    bodies = _command_substitution_bodies(command)
+    if bodies is None:
+        return False
+    for body in bodies:
+        stripped = body.strip()
+        if not stripped or not _terminal_is_readonly(stripped):
+            return False
+    return True
+
+
 def _unquote_shell_token(token):
     """Return the one shell-quoted word a re-parsing wrapper will execute."""
     if len(token) >= 2 and token[0] == token[-1] and token[0] in {"'", '"'}:
@@ -960,8 +1023,8 @@ def main(argv=None):
     tool_input = raw_tool_input if tool_input_is_valid else {}
     command = tool_input.get("command")
     exact_worker_lifecycle = False
+    strict_code_gate = bool(args.only_mutating and args.require_owned_git)
     if args.only_mutating:
-        strict_code_gate = args.require_owned_git
         if strict_code_gate:
             if not isinstance(tool_name, str) or not tool_name or not tool_input_is_valid:
                 _emit_block("unknown tool or invalid payload is mutation-capable by default")
@@ -1019,6 +1082,15 @@ def main(argv=None):
             or _reparsed_shell_programs(command) is None
         ):
             _emit_block("unresolved shell expansion can affect a worktree target")
+            return 0
+        if strict_code_gate and not _substitution_bodies_are_readonly(command):
+            # A substitution body executes before the outer command, so a
+            # readonly outer word never bounds it. Only the literal discovery
+            # grammar is admissible inside ``$(...)``/backticks.
+            _emit_block(
+                "command substitution body is not a literal read-only command "
+                "under the strict Code gate"
+            )
             return 0
 
     try:

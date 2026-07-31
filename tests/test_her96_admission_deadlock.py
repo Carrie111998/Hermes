@@ -1023,6 +1023,42 @@ def test_real_process_schema_dispatch_is_blocked_before_handler(tmp_path, monkey
     assert called is False
 
 
+@pytest.mark.parametrize("command", [
+    # PoC S-B1 exacts : substitution de commande indirecte derrière une
+    # commande externe readonly, sous owner valide.
+    "C='rm -rf ~/.hermes/hermes-agent'; echo $($C)",
+    "C='rm -rf ~/.hermes/hermes-agent'; echo $(eval \"$C\")",
+    "C='git -C ~/.hermes/hermes-agent reset --hard'; printf $(sh -c \"$C\")",
+    # Variantes de la même classe : exécution dynamique dans le corps.
+    "C='rm -rf x'; echo `$C`",
+    "echo $(sh -c 'touch pwned')",
+    "printf $(date)",
+    "echo $(echo $(touch pwned))",
+])
+def test_indirect_command_substitution_blocked_even_with_owner(tmp_path, command):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(registry, payload("terminal", {"command": command}, repo))
+    assert decision(result)["decision"] == "block", command
+
+
+@pytest.mark.parametrize("command", [
+    # Contrôles sûrs : corps littéraux de la grammaire readonly, variables
+    # simples (valeur, pas exécution), mutation littérale dans le worktree.
+    "echo $(pwd)",
+    "echo $(git rev-parse HEAD)",
+    "echo $HOME",
+    "touch marker.txt",
+])
+def test_safe_substitution_bodies_and_literals_stay_admitted(tmp_path, command):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(registry, payload("terminal", {"command": command}, repo))
+    assert decision(result) == {"decision": "allow"}, command
+
+
 @pytest.mark.parametrize("override", [
     {"session": "other"}, {"agent": "code-b"}, {"profile": "code-b"},
 ])
