@@ -2271,6 +2271,16 @@ def _provider_catalog_names(provider: str) -> tuple[str, ...]:
     return active + retired
 
 
+def _is_explicit_custom_or_local_provider(provider: str) -> bool:
+    """Return whether provider selection must outrank catalog auto-detection."""
+    keys = _provider_keys(provider)
+    return (
+        "custom" in keys
+        or "local" in keys
+        or any(key.startswith("custom:") for key in keys)
+    )
+
+
 def _model_in_provider_catalog(name_lower: str, providers: set[str]) -> bool:
     return any(
         name_lower == model.lower()
@@ -2461,6 +2471,16 @@ def detect_provider_for_model(
     """
     name = (model_name or "").strip()
     if not name:
+        return None
+
+    if _is_explicit_custom_or_local_provider(current_provider):
+        resolved_provider = _PROVIDER_ALIASES.get(name.lower(), name.lower())
+        if (
+            resolved_provider not in {"custom", "openrouter"}
+            and resolved_provider in _PROVIDER_LABELS
+            and _PROVIDER_MODELS.get(resolved_provider)
+        ):
+            return detect_static_provider_for_model(name, current_provider)
         return None
 
     static_match = detect_static_provider_for_model(name, current_provider)

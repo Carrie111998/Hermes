@@ -158,6 +158,23 @@ class TestDetectProviderForModel:
         assert detect_provider_for_model("gpt-5.4", "custom:foo") is None
 
 
+    def test_explicit_custom_or_local_provider_not_overridden_by_openrouter_catalog(self):
+        """Vendor-prefixed models may be served by an explicit custom/local endpoint."""
+        with patch("hermes_cli.models.fetch_openrouter_models", return_value=LIVE_OPENROUTER_MODELS):
+            for provider in ("custom", "custom:myproxy", "local"):
+                assert detect_provider_for_model("anthropic/claude-opus-4.6", provider) is None
+
+    def test_explicit_custom_or_local_provider_allows_bare_provider_switch_only(self):
+        """Only a documented bare-provider command may override an endpoint."""
+        for provider in ("custom:myproxy", "local"):
+            result = detect_provider_for_model("anthropic", provider)
+            assert result is not None
+            assert result[0] == "anthropic"
+            assert result[1]
+            assert detect_provider_for_model("sonnet", provider) is None
+
+    def test_local_provider_not_overridden_by_native_static_catalog(self):
+        assert detect_provider_for_model("gpt-5.4", "local") is None
 
 
 class TestIsNousFreeTier:
@@ -446,5 +463,3 @@ class TestClaudeSonnet5InCuratedLists:
     def test_anthropic_native_list_includes_sonnet_5(self):
         from hermes_cli.models import _PROVIDER_MODELS
         assert "claude-sonnet-5" in _PROVIDER_MODELS["anthropic"]
-
-

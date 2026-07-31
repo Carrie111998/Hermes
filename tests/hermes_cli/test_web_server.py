@@ -1942,6 +1942,26 @@ class TestDenormalizeProviderSwitch:
         # The old ollama-local endpoint must not carry over to openrouter.
         assert not model.get("base_url")
 
+    @pytest.mark.parametrize("provider", ["custom", "custom:myproxy", "local"])
+    def test_vendor_slug_change_preserves_explicit_custom_or_local_provider(self, provider):
+        """The config-page vendor fallback must not reroute explicit endpoints."""
+        from hermes_cli.web_server import _denormalize_config_from_web
+        from hermes_cli.config import save_config
+
+        save_config({
+            "model": {
+                "default": "vendor/model-one",
+                "provider": provider,
+                "base_url": "http://custom-endpoint.internal/v1",
+                "api_mode": "chat_completions",
+            }
+        })
+
+        result = _denormalize_config_from_web({"model": "anthropic/claude-opus-4.6"})
+        model = result["model"]
+        assert model["provider"] == provider
+        assert model["base_url"] == "http://custom-endpoint.internal/v1"
+        assert model["default"] == "anthropic/claude-opus-4.6"
 
     def test_context_length_override_survives_provider_switch(self):
         """An explicit context-length override must persist alongside a
@@ -3516,5 +3536,4 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
-
 
