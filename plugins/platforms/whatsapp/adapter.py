@@ -346,6 +346,10 @@ def _file_content_hash(path: Path) -> str:
     source hash in ``/health`` (``scriptHash``), and the adapter compares
     it against the hash of bridge.js currently on disk.  A mismatch means
     a long-lived bridge process is serving code from before an update.
+    The adapter also compares the history feature flags reported by
+    ``/health`` (``syncFullHistory``/``historyApi``) against config.yaml,
+    so a settings change restarts the bridge instead of reusing one
+    running the old behavior.
     Returns ``""`` when the file can't be read.
     """
     import hashlib
@@ -639,11 +643,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
+                                # Feature-flag fingerprint: a bridge started
+                                # with different history settings must be
+                                # restarted, otherwise a config.yaml change
+                                # would silently reuse a bridge running the
+                                # old behavior.  Bridges predating the
+                                # history flags report them as absent, which
+                                # only matches when the flags are disabled.
+                                extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+                                want_sync = bool(extra.get("sync_full_history", False))
+                                want_api = bool(extra.get("enable_history_api", False))
+                                run_sync = bool(data.get("syncFullHistory", False))
+                                run_api = bool(data.get("historyApi", False))
+                                flags_match = (want_sync == run_sync) and (want_api == run_api)
                                 if (
                                     running_hash
                                     and disk_hash
                                     and running_hash == disk_hash
                                     and config_matches
+                                    and flags_match
                                 ):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
@@ -651,11 +669,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
+                                if running_hash != disk_hash:
+                                    stale_reason = (
+                                        f"running={running_hash or 'unversioned'}, disk={disk_hash}"
+                                    )
+                                elif not config_matches:
+                                    stale_reason = "send_read_receipts config changed"
+                                else:
+                                    stale_reason = (
+                                        f"history flags changed (running {run_sync}/{run_api}, "
+                                        f"wanted {want_sync}/{want_api})"
+                                    )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")

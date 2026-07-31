@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { createHistoryStore, parseTruthyEnv } from './history_store.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -130,9 +131,7 @@ const SEND_TIMEOUT_MS = parseInt(process.env.WHATSAPP_SEND_TIMEOUT_MS || '60000'
 // will populate the in-memory contact store and per-chat message store
 // (if WHATSAPP_ENABLE_HISTORY_API is also on), and causes a one-time burst
 // of history sync traffic on first connect.
-const SYNC_FULL_HISTORY =
-  typeof process.env.WHATSAPP_SYNC_FULL_HISTORY === 'string' &&
-  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SYNC_FULL_HISTORY.toLowerCase());
+const SYNC_FULL_HISTORY = parseTruthyEnv(process.env.WHATSAPP_SYNC_FULL_HISTORY);
 
 // Opt-in: expose HTTP endpoints for message history, chat listing, and
 // contact search.  Requires WHATSAPP_SYNC_FULL_HISTORY=true to have data on
@@ -143,85 +142,27 @@ const SYNC_FULL_HISTORY =
 //   GET /chat/:id/messages?limit=N  — recent messages for a chat
 //   GET /chats                       — list all chats with activity
 //   GET /contacts?q=search           — search/list contacts
-const ENABLE_HISTORY_API =
-  typeof process.env.WHATSAPP_ENABLE_HISTORY_API === 'string' &&
-  ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_ENABLE_HISTORY_API.toLowerCase());
+const ENABLE_HISTORY_API = parseTruthyEnv(process.env.WHATSAPP_ENABLE_HISTORY_API);
 
-// Optional in-memory stores, only initialized when history API is enabled.
 const MAX_MESSAGES_PER_CHAT = 200;
 const MAX_CONTACTS = 5000;
 
-// Per-chat message store: Map<chatId, Map<messageId, message>> (data).
-// Parallel insertion-order tracker: Map<chatId, Map<messageId, true>> (order).
-// The order Map's insertion-order ensures O(1) dedup + O(1) FIFO eviction.
-const chatMessageStore = ENABLE_HISTORY_API ? new Map() : null;
-const chatOrderQueues = ENABLE_HISTORY_API ? new Map() : null;
-
-// Contact store: Map<JID, contactInfo> with bounded size.
-const contactStore = ENABLE_HISTORY_API ? new Map() : null;
-
-// Normalise a Baileys timestamp (number | protobuf Long | undefined) to
-// a plain Unix-second integer.  In Baileys `messaging-history.set`, the
-// timestamp arrives as a protobuf Long object (e.g. `{ low, high }`),
-// not a plain number; storing it raw breaks sort comparisons.
-function toNumberSafe(raw) {
-  if (raw == null) return Math.floor(Date.now() / 1000);
-  if (typeof raw === 'object' && typeof raw.toNumber === 'function') return raw.toNumber();
-  const n = Number(raw);
-  return Number.isFinite(n) ? n : Math.floor(Date.now() / 1000);
-}
-
-// O(1) store + dedup by messageId using a Map per chat.
-// Insertion order is tracked via a parallel order-Map (not an array), so
-// dedup moves the entry to the end without O(n) scan or shift.
-function storeMessage(chatId, event) {
-  if (!ENABLE_HISTORY_API || !chatId || !chatMessageStore || !chatOrderQueues) return;
-  let byMsgId = chatMessageStore.get(chatId);
-  let order = chatOrderQueues.get(chatId);
-  if (!byMsgId) {
-    byMsgId = new Map();
-    chatMessageStore.set(chatId, byMsgId);
-    order = new Map();
-    chatOrderQueues.set(chatId, order);
-  }
-  const id = event.messageId;
-  if (!id) return;
-  // Update data in O(1)
-  byMsgId.set(id, event);
-  // Touch order: delete + re-set moves this key to the newest position
-  // (JS Map preserves insertion order)
-  order.delete(id);
-  order.set(id, true);
-  // Evict oldest insertion if over cap
-  while (order.size > MAX_MESSAGES_PER_CHAT) {
-    const oldestId = order.keys().next().value;
-    if (oldestId) {
-      order.delete(oldestId);
-      byMsgId.delete(oldestId);
-    }
-  }
-}
-
-// Store a contact with bounded size.
-function storeContact(jid, info) {
-  if (!ENABLE_HISTORY_API || !jid || !contactStore) return;
-  contactStore.set(jid, info);
-  if (contactStore.size > MAX_CONTACTS) {
-    const oldest = contactStore.keys().next().value;
-    if (oldest) contactStore.delete(oldest);
-  }
-}
-
-// Get messages for a chat as an ordered array (newest first).
-function getMessages(chatId, limit) {
-  if (!chatMessageStore || !chatOrderQueues) return null;
-  const byMsgId = chatMessageStore.get(chatId);
-  const order = chatOrderQueues.get(chatId);
-  if (!byMsgId || !order || order.size === 0) return null;
-  const keys = [...order.keys()];
-  const slice = keys.slice(-limit).reverse();
-  return slice.map(id => byMsgId.get(id)).filter(Boolean);
-}
+// Bounded history/contact stores — extracted to history_store.js so the
+// unit tests exercise the same code the bridge runs in production.
+const {
+  chatMessageStore,
+  chatOrderQueues,
+  contactStore,
+  toNumberSafe,
+  storeMessage,
+  storeContact,
+  getMessages,
+  count,
+} = createHistoryStore({
+  enabled: ENABLE_HISTORY_API,
+  maxMessagesPerChat: MAX_MESSAGES_PER_CHAT,
+  maxContacts: MAX_CONTACTS,
+});
 
 // --- Send queue: serialise all sock.sendMessage() calls across concurrent
 //     HTTP handlers so a single Baileys socket never has overlapping sends.
@@ -1281,7 +1222,7 @@ if (ENABLE_HISTORY_API) {
     if (!msgs) {
       return res.json({ messages: [], total: 0 });
     }
-    res.json({ messages: msgs, total: chatOrderQueues?.get(chatId)?.size || 0 });
+    res.json({ messages: msgs, total: count(chatId) });
   });
 
   // GET /chats — List all chats that have stored messages
@@ -1345,6 +1286,11 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    // Feature-flag fingerprint: the adapter refuses to reuse a running
+    // bridge whose flags differ from config.yaml, so a setting change
+    // forces a restart instead of silently serving stale behavior.
+    syncFullHistory: SYNC_FULL_HISTORY,
+    historyApi: ENABLE_HISTORY_API,
   });
 });
 

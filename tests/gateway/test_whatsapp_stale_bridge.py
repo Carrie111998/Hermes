@@ -116,7 +116,6 @@ class TestFileContentHash:
 
 class TestStaleBridgeHandshake:
 
-
     @pytest.mark.asyncio
     async def test_restarts_bridge_when_read_receipt_config_changed(self, tmp_path):
         from plugins.platforms.whatsapp.adapter import _file_content_hash
@@ -150,6 +149,76 @@ class TestStaleBridgeHandshake:
             await adapter.connect()
 
         mock_popen.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reuses_bridge_when_history_flags_match(self, tmp_path):
+        """History flags on /health equal to config.extra → reuse."""
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter.config.extra = {"sync_full_history": True, "enable_history_api": True}
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sendReadReceipts": False,
+            "syncFullHistory": True,
+            "historyApi": True,
+        })
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task") as mock_task, \
+             patch("subprocess.Popen") as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True), \
+             patch.object(adapter, "_mark_connected", create=True):
+            result = await adapter.connect()
+
+        assert result is True
+        mock_popen.assert_not_called()  # reused — flags agree with config.yaml
+        mock_task.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_restarts_bridge_on_history_flag_mismatch(self, tmp_path):
+        """config.yaml enables history flags but running bridge lacks them → restart."""
+        from plugins.platforms.whatsapp.adapter import _file_content_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        # User turned the flags ON in config.yaml, but the running bridge
+        # predates them (or was started with them off).
+        adapter.config.extra = {"sync_full_history": True, "enable_history_api": True}
+        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        mock_client = _mock_health({
+            "status": "connected",
+            "scriptHash": disk_hash,
+            "sendReadReceipts": False,
+            "syncFullHistory": False,
+            "historyApi": False,
+        })
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        mock_popen.assert_called_once()  # stale flags → replaced, not reused
 
 
 class TestDepRefreshStamp:
