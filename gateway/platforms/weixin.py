@@ -13,6 +13,7 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import base64
 import hashlib
 import json
@@ -2378,15 +2379,48 @@ async def send_weixin_direct(
         logger.info(
             "send_weixin_direct: live adapter on different loop; scheduling via run_coroutine_threadsafe"
         )
-        future = asyncio.run_coroutine_threadsafe(
-            _send_via_live(live_adapter, chat_id, message, media_files),
-            adapter_loop,
-        )
-        try:
-            return future.result(timeout=60)
-        except Exception as e:
-            logger.warning("send_weixin_direct: cross-loop send failed, falling back to one-shot: %s", e)
+        # Guard: adapter loop may have been shut down (review comment #1)
+        if not adapter_loop.is_running():
+            logger.warning(
+                "send_weixin_direct: adapter loop is not running, falling back to one-shot"
+            )
             # Fall through to one-shot below
+        else:
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _send_via_live(live_adapter, chat_id, message, media_files),
+                    adapter_loop,
+                )
+            except RuntimeError as e:
+                logger.warning(
+                    "send_weixin_direct: failed to schedule coroutine on adapter loop: %s", e
+                )
+                # Fall through to one-shot below
+            else:
+                try:
+                    return future.result(timeout=60)
+                except concurrent.futures.TimeoutError:
+                    # The coroutine may still be executing on the gateway's event loop.
+                    # Returning a timeout error is safer than falling through to the
+                    # one-shot path, which would duplicate the delivery (review comment #2).
+                    logger.error(
+                        "send_weixin_direct: cross-loop send timed out after 60s "
+                        "(coroutine may still be executing on gateway loop; "
+                        "not falling back to avoid duplicate delivery)"
+                    )
+                    return {"error": "Weixin cross-loop send timed out"}
+                except concurrent.futures.CancelledError:
+                    logger.warning(
+                        "send_weixin_direct: cross-loop send was cancelled, "
+                        "falling back to one-shot"
+                    )
+                    # Safe to fallback: the coroutine was cancelled and won't deliver
+                except Exception as e:
+                    logger.warning(
+                        "send_weixin_direct: cross-loop send failed, "
+                        "falling back to one-shot: %s", e
+                    )
+                    # Fall through to one-shot below
     # --- End Plan B ---
 
     async with aiohttp.ClientSession(trust_env=True, connector=_make_ssl_connector()) as session:
