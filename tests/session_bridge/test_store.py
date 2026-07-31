@@ -9497,6 +9497,7 @@ def test_sidebar_terminal_resolution_becomes_ineffective_after_materialization(
     )
     status = store.sidebar_delivery_status(now=220.0)
     assert status["blocking_failed_count"] == 1
+    assert status["counts"]["needs_attention"] == 1
     assert status["terminally_resolved_failed_count"] == 0
     assert status["terminal_resolutions"] == {
         "total": 1,
@@ -9991,15 +9992,20 @@ def test_sidebar_delivery_status_counts_only_verified_current_generation(
     verified = _sidebar_candidate(db, native_id="placement-verified")
     store.enqueue_sidebar_job(verified)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
-    _seed_sidebar_codex_target(store, verified, "placement-verified-thread")
-    store.commit_sidebar_job_with_lineage(
+    store.commit_sidebar_job(
         lease_token=lease["lease_token"],
         codex_thread_id="placement-verified-thread",
-        source_session_id=verified.source_session_id,
-        bridge_id=verified.bridge_id,
-        placement_generation=1,
         now=200.0,
     )
+    with db._lock:
+        assert db._conn is not None
+        db._conn.execute(
+            """UPDATE session_sidebar_jobs
+               SET placement_generation = ?, placement_verified_at = ?
+               WHERE source_session_id = ?""",
+            (1, 200.0, verified.source_session_id),
+        )
+        db._conn.commit()
 
     legacy = _sidebar_candidate(db, native_id="placement-legacy")
     legacy_job = store.enqueue_sidebar_job(legacy)
@@ -10041,6 +10047,7 @@ def test_sidebar_delivery_status_counts_only_verified_current_generation(
         "mismatch_count": 1,
         "canary": {"status": "passed", "verified_at": 230.0},
     }
+    assert status["counts"]["projectless_legacy_count"] == 1
     raw_state = store.get_state("session-bridge:sidebar:placement-canary:v1")
     assert raw_state is not None
     assert set(raw_state) == {
@@ -10310,7 +10317,7 @@ def test_sidebar_delivery_status_counts_ambiguity_attention_and_projectless_lega
     status = store.sidebar_delivery_status(now=240.0)
     assert status["counts"]["ambiguous"] == 1
     assert status["counts"]["needs_attention"] == 0
-    assert status["counts"]["projectless_legacy_count"] == 0
+    assert status["counts"]["projectless_legacy_count"] == 1
 
 
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(

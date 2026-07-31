@@ -8198,41 +8198,19 @@ class SessionBridgeStore:
                            END) AS ambiguous,
                        SUM(CASE
                                WHEN job.state = ?
-                                AND COALESCE(
-                                    terminal.resolution_code,
-                                    precreate.resolution_code,
-                                    unbound.resolution_code
-                                ) IS NULL
-                               THEN 1 ELSE 0
-                           END) AS needs_attention,
-                       SUM(CASE
-                               WHEN job.state = ?
                                 AND job.codex_thread_id IS NOT NULL
-                                AND NOT EXISTS (
-                                    SELECT 1
-                                      FROM external_sessions AS target_external
-                                      JOIN sessions AS target
-                                        ON target.id = target_external.session_id
-                                     WHERE target_external.provider = ?
-                                       AND target_external.native_id = job.codex_thread_id
-                                       AND target.cwd IS NOT NULL
-                                       AND trim(target.cwd) != ''
+                                AND (
+                                    job.placement_generation IS NULL
+                                    OR job.placement_generation < 1
+                                    OR job.placement_verified_at IS NULL
                                 )
                                THEN 1 ELSE 0
                            END) AS projectless_legacy_count
-                     FROM session_sidebar_jobs AS job
-                     LEFT JOIN session_sidebar_terminal_resolutions AS terminal
-                       ON terminal.job_id = job.id
-                     LEFT JOIN session_sidebar_precreate_resolutions AS precreate
-                       ON precreate.job_id = job.id
-                     LEFT JOIN session_sidebar_unbound_resolutions AS unbound
-                       ON unbound.job_id = job.id""",
+                     FROM session_sidebar_jobs AS job""",
                 (
                     SidebarJobState.FAILED.value,
                     "native_create_ambiguous",
-                    SidebarJobState.FAILED.value,
                     SidebarJobState.VISIBLE.value,
-                    Provider.CODEX.value,
                 ),
             ).fetchone()
 
@@ -8240,7 +8218,7 @@ class SessionBridgeStore:
         counts[SidebarJobState.LEASED.value] -= expired_leases
         counts[SidebarJobState.RETRY.value] += expired_leases
         counts["ambiguous"] = int(health_counts["ambiguous"] or 0)
-        counts["needs_attention"] = int(health_counts["needs_attention"] or 0)
+        counts["needs_attention"] = resolution_stats["blocking_failed_count"]
         counts["projectless_legacy_count"] = int(
             health_counts["projectless_legacy_count"] or 0
         )
