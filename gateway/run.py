@@ -155,6 +155,29 @@ _COMPRESSION_PROGRESS_STATUS_RE = re.compile(
 )
 
 
+def hygiene_warn_token_threshold(
+    context_length: int, compress_token_threshold: int
+) -> int:
+    """Token count above which a *post-compression* session is worth warning about.
+
+    Pre-agent session hygiene compresses at its fixed 0.85 safety threshold,
+    then warns if the result is still large. Pinning that warning at 0.95 of
+    the window made it unreachable: on a 500K window hygiene fires at ~425K
+    but the warning still needed ~475K.
+
+    The reachable, actionable condition is "compression did not clear the
+    trigger point": the session re-compresses on the next turn, paying LLM
+    summarisation repeatedly for no lasting reduction. Cap the warning at the
+    compression trigger so it fires on that treadmill, while keeping the
+    original 0.95 ceiling for the (rarer) case of a threshold set above it.
+    """
+    ceiling = int(max(0, context_length) * 0.95)
+    trigger = max(0, compress_token_threshold)
+    if not trigger:
+        return ceiling
+    return min(ceiling, trigger) if ceiling else trigger
+
+
 def _gateway_compression_progress_notices_enabled() -> bool:
     """True when the user opted into routine compression progress notices.
 
@@ -15999,7 +16022,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct
                 )
-                _warn_token_threshold = int(_hyg_context_length * 0.95)
+                _warn_token_threshold = hygiene_warn_token_threshold(
+                    _hyg_context_length, _compress_token_threshold
+                )
 
                 _msg_count = len(history)
 
