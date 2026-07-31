@@ -1087,7 +1087,7 @@ class CLICommandsMixin:
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        # Extract --limit N (default 10, capped 100) from anywhere in the
+        # Extract --limit/-l N (default 10, capped 100) from anywhere in the
         # args, then hand the rest to the shared arg parser.
         import shlex as _shlex
         limit = 10
@@ -1095,7 +1095,7 @@ class CLICommandsMixin:
         _clean = []
         _i = 0
         while _i < len(_tokens):
-            if _tokens[_i] == "--limit" and _i + 1 < len(_tokens):
+            if _tokens[_i] in ("--limit", "-l") and _i + 1 < len(_tokens):
                 try:
                     limit = min(int(_tokens[_i + 1]), 100)
                 except ValueError:
@@ -1110,13 +1110,11 @@ class CLICommandsMixin:
         _, _, _, search_query = parse_session_listing_args(arg)
         if search_query is not None:
             if search_query == "":
-                _cprint("  Usage: /sessions search <query> [--limit <N>]")
-                _cprint("  Example: /sessions search deploy --limit 5")
+                _cprint("  Usage: /sessions search <query> [-l <N>]")
+                _cprint("  Example: /sessions search deploy -l 5")
                 _cprint("")
                 _cprint("  /sessions            list recent sessions")
-                _cprint("  /sessions all        include all sources")
-                _cprint("  /sessions full       include unnamed sessions")
-                _cprint("  /sessions --limit N  show N sessions (max 100)")
+                _cprint("  /sessions -l N       show N sessions (max 100)")
                 _cprint("  /sessions search Q   full-text search session messages")
                 _cprint("  /sessions <id>       resume a session")
                 return
@@ -1232,7 +1230,7 @@ class CLICommandsMixin:
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
             _cprint("  Example: /resume 2")
             _cprint("")
-            _cprint("  More: /sessions search <query>, /sessions all, /sessions full, /sessions --limit <N>")
+            _cprint("  More: /sessions search <query>, /sessions -l <N>")
             _cprint("")
             return
 
@@ -1243,7 +1241,7 @@ class CLICommandsMixin:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
-            if not self._show_recent_sessions(reason="sessions"):
+            if not self._show_recent_sessions(reason="sessions", limit=limit):
                 _cprint("  (._.) No previous sessions yet.")
             return
 

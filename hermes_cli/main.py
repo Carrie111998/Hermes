@@ -16506,7 +16506,7 @@ def main():
         "--source", help="Filter by source (cli, telegram, discord, etc.)"
     )
     sessions_list.add_argument(
-        "--limit", type=int, default=20, help="Max sessions to show"
+        "-l", "--limit", type=int, default=20, help="Max sessions to show"
     )
     sessions_list.add_argument(
         "--workspace",
@@ -16526,7 +16526,7 @@ def main():
     )
     sessions_search.add_argument("query", nargs="+", help="Search terms (pass as multiple words)")
     sessions_search.add_argument(
-        "--limit", type=int, default=10, help="Max sessions to show (default 10, max 100)"
+        "-l", "--limit", type=int, default=10, help="Max sessions to show (default 10, max 100)"
     )
 
     def _add_session_filter_args(p, default_older_help):
