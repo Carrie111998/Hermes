@@ -68,7 +68,6 @@ Usage:
 
 import json
 import logging
-import threading
 import time
 
 from hermes_constants import get_hermes_home, display_hermes_home
@@ -175,8 +174,6 @@ _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona"}
 )
 _secret_capture_callback = None
-_secret_capture_callbacks: dict[str, Any] = {}
-_secret_capture_callbacks_lock = threading.RLock()
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -244,39 +241,9 @@ _INJECTION_PATTERNS: list = [
 ]
 
 
-def set_secret_capture_callback(callback, *, session_id: str | None = None) -> None:
+def set_secret_capture_callback(callback) -> None:
     global _secret_capture_callback
-    if session_id:
-        with _secret_capture_callbacks_lock:
-            _secret_capture_callbacks[session_id] = callback
-        return
     _secret_capture_callback = callback
-
-
-def clear_secret_capture_callback(session_id: str) -> None:
-    with _secret_capture_callbacks_lock:
-        _secret_capture_callbacks.pop(session_id, None)
-
-
-def _get_secret_capture_callback():
-    """Return the callback bound to the current UI session, when available.
-
-    Keep the module attribute as a compatibility seam for existing callers and
-    tests that patch it directly. Gateway sessions use the session ID from the
-    current gateway context so wiring one session cannot replace another.
-    """
-    try:
-        from gateway.session_context import get_session_env
-
-        session_id = get_session_env("HERMES_UI_SESSION_ID", "")
-    except Exception:
-        session_id = ""
-    if session_id:
-        with _secret_capture_callbacks_lock:
-            callback = _secret_capture_callbacks.get(session_id)
-        if callback is not None:
-            return callback
-    return _secret_capture_callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -460,8 +427,7 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    secret_capture_callback = _get_secret_capture_callback()
-    if secret_capture_callback is None:
+    if _secret_capture_callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -479,7 +445,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = secret_capture_callback(
+            callback_result = _secret_capture_callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
