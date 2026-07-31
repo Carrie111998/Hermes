@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
@@ -266,9 +268,12 @@ def test_root_pinned_python_accepts_standard_root_owned_0755(
 
 
 def _installer_source(tmp_path: Path) -> tuple[Path, str]:
+    source_paths = set(installer._SOURCE_ASSETS) | set(
+        installer._REVISION_STATIC_ASSETS
+    )
     files = {
         relative: (ROOT / relative).read_bytes()
-        for relative in installer._SOURCE_ASSETS
+        for relative in source_paths
     }
     files["scripts/canary/production_cutover_unit_input_rotation.py"] = (
         ROOT / "scripts/canary/production_cutover_unit_input_rotation.py"
@@ -285,6 +290,9 @@ def _installer_roots(tmp_path: Path) -> installer.InstallerRoots:
         libexec=tmp_path / "usr/libexec",
         job_root=tmp_path / "var/lib/muncho-release-updates",
         promotion_lock=(tmp_path / "run/lock/muncho-release-builder-promotion.lock"),
+        library_releases=(
+            tmp_path / "usr/lib/muncho-release-updater-releases"
+        ),
     )
 
 
@@ -399,6 +407,185 @@ def test_installer_rejects_divergent_existing_asset(tmp_path: Path) -> None:
         match="rotation_stager_installer_target_conflict",
     ):
         installer._install_for_test(**kwargs)
+
+
+def test_revision_qualified_foundation_is_create_only_and_inert(
+    tmp_path: Path,
+) -> None:
+    source, revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    kwargs = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "release_revision": revision,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(
+            roots, calls, argv
+        ),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified": True,
+    }
+
+    first = installer._install_for_test(**kwargs)
+    second = installer._install_for_test(**kwargs)
+
+    library = roots.library_releases / revision
+    expected_assets = len(installer._REVISION_LIBRARY_ASSETS) + len(
+        installer._REVISION_STATIC_ASSETS
+    )
+    assert first["schema"] == installer.REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+    assert first["foundation_layout"] == "revision-qualified-v2"
+    assert first["foundation_asset_manifest_sha256"] == second[
+        "foundation_asset_manifest_sha256"
+    ]
+    assert first["created_asset_count"] == expected_assets
+    assert second["created_asset_count"] == 0
+    assert (roots.library_releases.stat().st_mode & 0o777) == 0o755
+    assert (library.stat().st_mode & 0o777) == 0o555
+    assert (
+        library / "scripts/canary/production_release_builder_phase.py"
+    ).is_file()
+    assert (
+        roots.systemd / "muncho-release-builder-v2@.service"
+    ).stat().st_mode & 0o777 == 0o444
+    assert (
+        roots.libexec / "muncho-release-foundation-exec-v2"
+    ).stat().st_mode & 0o777 == 0o555
+    assert not any("systemctl" in item for call in calls for item in call)
+    assert first["systemd_daemon_reload_performed"] is False
+    assert first["unit_started"] is False
+    assert first["activation_performed"] is False
+
+
+def test_revision_qualified_foundation_keeps_two_revisions_side_by_side(
+    tmp_path: Path,
+) -> None:
+    source, first_revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    marker = source / "revision-marker.txt"
+    marker.write_text("second exact revision\n", encoding="utf-8")
+    _run("git", "add", "revision-marker.txt", cwd=source)
+    _run("git", "commit", "-qm", "second fixture revision", cwd=source)
+    second_revision = _run("git", "rev-parse", "HEAD", cwd=source)
+    assert second_revision != first_revision
+
+    common = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(
+            roots, calls, argv
+        ),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified": True,
+    }
+    first = installer._install_for_test(
+        **common,
+        release_revision=first_revision,
+    )
+    second = installer._install_for_test(
+        **common,
+        release_revision=second_revision,
+    )
+
+    first_library = roots.library_releases / first_revision
+    second_library = roots.library_releases / second_revision
+    assert first_library.is_dir()
+    assert second_library.is_dir()
+    assert first_library != second_library
+    assert first["foundation_asset_manifest_sha256"] != second[
+        "foundation_asset_manifest_sha256"
+    ]
+    for library in (first_library, second_library):
+        assert (library.stat().st_mode & 0o777) == 0o555
+        assert (
+            library / "scripts/canary/production_release_builder_phase.py"
+        ).is_file()
+
+
+def test_revision_qualified_foundation_rejects_divergent_same_revision_asset(
+    tmp_path: Path,
+) -> None:
+    source, revision = _installer_source(tmp_path)
+    roots = _installer_roots(tmp_path)
+    kwargs = {
+        "source_root": source,
+        "source_remote": "fork",
+        "repository_url": REMOTE_URL,
+        "release_revision": revision,
+        "roots": roots,
+        "production": False,
+        "command_runner": lambda argv: _fake_foundation_command(roots, [], argv),
+        "identity_validator": lambda: None,
+        "foundation_validator": _validate_test_foundation,
+        "revision_qualified": True,
+    }
+    installer._install_for_test(**kwargs)
+    target = (
+        roots.library_releases
+        / revision
+        / "scripts/canary/production_release_builder_phase.py"
+    )
+    target.chmod(0o644)
+    target.write_bytes(b"divergent exact-revision bytes\n")
+    target.chmod(0o444)
+
+    with pytest.raises(
+        installer.RotationStagerInstallerError,
+        match="rotation_stager_installer_target_conflict",
+    ):
+        installer._install_for_test(**kwargs)
+
+
+def test_revision_foundation_wrapper_preserves_python_argv_contract(
+    tmp_path: Path,
+) -> None:
+    revision = "a" * 40
+    library_base = tmp_path / "library-releases"
+    module_root = library_base / revision / "scripts/canary"
+    module_root.mkdir(parents=True)
+    (module_root.parent / "__init__.py").write_text("", encoding="utf-8")
+    (module_root / "__init__.py").write_text("", encoding="utf-8")
+    (module_root / "production_release_rotation_stager_input_author.py").write_text(
+        "import json,sys\nprint(json.dumps(sys.argv))\n",
+        encoding="utf-8",
+    )
+    source = (
+        ROOT
+        / "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
+    ).read_text(encoding="utf-8")
+    source = source.replace(
+        "/usr/lib/muncho-release-updater-releases",
+        str(library_base),
+    ).replace(
+        "python=/usr/bin/python3",
+        f"python={shlex.quote(sys.executable)}",
+    )
+    wrapper = tmp_path / "foundation-exec-v2"
+    wrapper.write_text(source, encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    completed = subprocess.run(
+        (str(wrapper), revision, "input-author", "--sentinel"),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == [
+        "muncho-release-rotation-stager-input-author",
+        "--sentinel",
+    ]
 
 
 def test_launcher_verifies_promoted_release_before_exact_exec(tmp_path: Path) -> None:

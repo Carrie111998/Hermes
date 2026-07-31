@@ -16,6 +16,17 @@ release; the stager wrapper verifies that whole release before using its
 pinned interpreter.  Neither authoring, installation, building, nor promotion
 changes a release symlink, gateway, application data, or credentials.
 
+Foundation code is revision-qualified.  Each exact source revision is
+published create-only below
+`/usr/lib/muncho-release-updater-releases/<40-hex-revision>/`; the shared v2
+wrapper and v2 builder template select only that exact directory through
+protocol enums.  A newer foundation therefore never overwrites or silently
+changes the bytes that built an older job.  The installer remains inert: a
+separate, explicit `systemctl daemon-reload` is required before a newly
+created template can be used, and installation still never enables or starts
+it.  The original fixed-v1 foundation remains immutable audit evidence and is
+not used by the v2 rotation-stager promotion path.
+
 Wheel resolution is intentionally not part of the privileged author.  It
 accepts only an already-verified, self-hashed manifest declaring a complete
 transitive closure for CPython 3.11 on Linux x86_64 and revalidates the exact

@@ -333,7 +333,7 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
     """Pinned IAP transport for the fixed production cutover entry points."""
 
     _ROTATION_STAGER_WRAPPER = (
-        "/usr/libexec/muncho-release-unit-input-rotation-stager"
+        "/usr/libexec/muncho-release-foundation-exec-v2"
     )
     _ROTATION_STAGER_ACTIONS = frozenset({
         "rotate-unit-input-authority",

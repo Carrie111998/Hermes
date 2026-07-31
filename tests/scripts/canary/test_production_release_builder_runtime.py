@@ -145,6 +145,46 @@ def _process_free_evidence(
     )
 
 
+def test_process_free_evidence_accepts_revision_qualified_builder_unit(
+    tmp_path: Path,
+) -> None:
+    fragment = tmp_path / "muncho-release-builder-v2@.service"
+    fragment.write_bytes(b"[Service]\nType=oneshot\n")
+    fragment.chmod(0o444)
+    wrapper = tmp_path / "muncho-release-foundation-exec-v2"
+    wrapper.write_bytes(b"#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o555)
+    cgroup_root = tmp_path / "cgroup"
+    (cgroup_root / "system.slice").mkdir(parents=True)
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    unit = "muncho-release-builder-v2@" + "a" * 40 + ".service"
+    control_group = f"/system.slice/{unit}"
+    properties = {
+        **_systemd_properties(fragment, cgroup=control_group),
+        "Id": unit,
+    }
+
+    evidence = runtime.validate_process_free_evidence(
+        properties,
+        expected_unit=unit,
+        expected_fragment=fragment,
+        expected_fragment_sha256=_sha256(fragment),
+        expected_wrapper=wrapper,
+        expected_wrapper_sha256=_sha256(wrapper),
+        expected_control_group=control_group,
+        builder_uid=BUILDER_UID,
+        builder_gid=BUILDER_GID,
+        cgroup_root=cgroup_root,
+        proc_root=proc_root,
+        authority_uid=os.geteuid(),
+        authority_gid=_gid(fragment),
+        xattr_reader=_empty_xattrs,
+    )
+
+    assert evidence["unit"] == unit
+
+
 def test_parse_and_materialize_exact_git_tree(tmp_path: Path) -> None:
     blobs = {
         "bin/run.py": b"#!/usr/bin/env python3\nprint('ok')\n",

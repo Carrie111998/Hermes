@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  exit 2
+fi
+
+revision=$1
+operation=$2
+shift 2
+
+if [ "${#revision}" -ne 40 ]; then
+  exit 2
+fi
+case "$revision" in
+  *[!0-9a-f]*) exit 2 ;;
+esac
+
+library="/usr/lib/muncho-release-updater-releases/$revision"
+python=/usr/bin/python3
+
+case "$operation" in
+  builder-phase)
+    exec /usr/bin/flock --exclusive --no-fork \
+      /run/lock/muncho-release-builder-promotion.lock \
+      "$python" -I -c \
+      'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_module("scripts.canary.production_release_builder_phase",run_name="__main__")' \
+      "$library" muncho-release-builder-phase "$@"
+    ;;
+  input-author)
+    exec "$python" -I -c \
+      'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_module("scripts.canary.production_release_rotation_stager_input_author",run_name="__main__")' \
+      "$library" muncho-release-rotation-stager-input-author "$@"
+    ;;
+  candidate-promoter)
+    exec "$python" -I -c \
+      'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_module("scripts.canary.production_release_rotation_stager_promoter",run_name="__main__")' \
+      "$library" muncho-release-candidate-promoter "$revision" "$@"
+    ;;
+  rotate-unit-input-authority|prepare-release-unit-inputs|preauthorize-release-unit-inputs|finalize-release-unit-inputs|abort-release-unit-inputs)
+    exec "$python" -I -c \
+      'import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_module("scripts.canary.production_release_rotation_stager_launcher",run_name="__main__")' \
+      "$library" muncho-release-unit-input-rotation-stager "$revision" "$operation"
+    ;;
+  *)
+    exit 2
+    ;;
+esac

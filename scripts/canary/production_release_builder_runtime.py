@@ -67,7 +67,9 @@ _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SAFE_WHEEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,239}\.whl$")
-_SYSTEMD_UNIT = re.compile(r"^muncho-release-builder@[A-Za-z0-9_.:@-]{1,128}\.service$")
+_SYSTEMD_UNIT = re.compile(
+    r"^muncho-release-builder(?:-v2)?@[A-Za-z0-9_.:@-]{1,128}\.service$"
+)
 _INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 _GIT_RECORD = re.compile(
     rb"^(?P<mode>[0-9]{6}) (?P<type>[a-z]+) "

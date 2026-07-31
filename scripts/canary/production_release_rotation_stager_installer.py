@@ -28,6 +28,9 @@ from scripts.canary import production_release_builder_phase as phase
 
 
 INSTALL_RECEIPT_SCHEMA = "muncho-production-unit-input-rotation-stager-installation.v1"
+REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA = (
+    "muncho-production-unit-input-rotation-stager-installation.v2"
+)
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -93,6 +96,29 @@ _SOURCE_ASSETS: Mapping[str, tuple[str, int]] = {
         0o555,
     ),
 }
+_REVISION_LIBRARY_ASSETS: Mapping[str, tuple[str, int]] = {
+    source: (target.removeprefix("library/"), mode)
+    for source, (target, mode) in _SOURCE_ASSETS.items()
+    if target.startswith("library/")
+}
+_REVISION_STATIC_ASSETS: Mapping[str, tuple[str, int]] = {
+    "ops/muncho/release-updater/muncho-release-builder.sysusers": (
+        "sysusers/muncho-release-builder.conf",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-builder.tmpfiles": (
+        "tmpfiles/muncho-release-builder.conf",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-builder-v2@.service": (
+        "systemd/muncho-release-builder-v2@.service",
+        0o444,
+    ),
+    "ops/muncho/release-updater/muncho-release-foundation-exec-v2": (
+        "libexec/muncho-release-foundation-exec-v2",
+        0o555,
+    ),
+}
 
 
 class RotationStagerInstallerError(RuntimeError):
@@ -143,6 +169,7 @@ class InstallerRoots:
     libexec: Path = Path("/usr/libexec")
     job_root: Path = phase.PRODUCTION_JOB_ROOT
     promotion_lock: Path = Path("/run/lock/muncho-release-builder-promotion.lock")
+    library_releases: Path = Path("/usr/lib/muncho-release-updater-releases")
 
 
 def _target(roots: InstallerRoots, relative: str) -> Path:
@@ -362,6 +389,7 @@ def _install_for_test(
     command_runner: Callable[[Sequence[str]], None] = _system_command,
     identity_validator: Callable[[], None] = _validate_builder_identity,
     foundation_validator: Callable[[InstallerRoots], None] | None = None,
+    revision_qualified: bool = False,
 ) -> Mapping[str, Any]:
     if (
         not isinstance(roots, InstallerRoots)
@@ -373,6 +401,7 @@ def _install_for_test(
         or not source_root.is_absolute()
         or ".." in source_root.parts
         or type(production) is not bool
+        or type(revision_qualified) is not bool
         or (
             production
             and (
@@ -390,6 +419,7 @@ def _install_for_test(
                 roots.libexec,
                 roots.job_root,
                 roots.promotion_lock,
+                roots.library_releases,
             )
         )
     ):
@@ -441,20 +471,27 @@ def _install_for_test(
         "blob",
         (f"{release_revision}:scripts/canary/production_release_candidate_promoter.py"),
     )
+    builder_unit_source = (
+        "ops/muncho/release-updater/muncho-release-builder-v2@.service"
+        if revision_qualified
+        else "ops/muncho/release-updater/muncho-release-builder@.service"
+    )
+    builder_wrapper_source = (
+        "ops/muncho/release-updater/muncho-release-foundation-exec-v2"
+        if revision_qualified
+        else "ops/muncho/release-updater/muncho-release-builder-phase"
+    )
     builder_unit_raw = _git(
         source_root,
         "cat-file",
         "blob",
-        (
-            f"{release_revision}:"
-            "ops/muncho/release-updater/muncho-release-builder@.service"
-        ),
+        f"{release_revision}:{builder_unit_source}",
     )
     builder_wrapper_raw = _git(
         source_root,
         "cat-file",
         "blob",
-        (f"{release_revision}:ops/muncho/release-updater/muncho-release-builder-phase"),
+        f"{release_revision}:{builder_wrapper_source}",
     )
     try:
         rotation_tree = ast.parse(rotation_raw.decode("utf-8", errors="strict"))
@@ -498,19 +535,34 @@ def _install_for_test(
             launcher_tree, "_PHASE_ACTIONS"
         ):
             _fail("rotation_stager_installer_protocol_drift")
+        unit_hash_name = (
+            "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256"
+            if revision_qualified
+            else "PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256"
+        )
+        wrapper_hash_name = (
+            "PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256"
+            if revision_qualified
+            else "PRODUCTION_BUILDER_WRAPPER_SHA256"
+        )
         if literal_string(
             promoter_tree,
-            "PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256",
+            unit_hash_name,
         ) != _sha256(builder_unit_raw) or literal_string(
             promoter_tree,
-            "PRODUCTION_BUILDER_WRAPPER_SHA256",
+            wrapper_hash_name,
         ) != _sha256(builder_wrapper_raw):
             _fail("rotation_stager_installer_asset_binding_invalid")
     except (SyntaxError, UnicodeError, ValueError, TypeError) as exc:
         _fail("rotation_stager_installer_protocol_drift", exc)
 
+    library_root = (
+        roots.library_releases / release_revision
+        if revision_qualified
+        else roots.library
+    )
     for root in (
-        roots.library,
+        roots.library_releases if revision_qualified else roots.library,
         roots.sysusers,
         roots.tmpfiles,
         roots.systemd,
@@ -518,27 +570,41 @@ def _install_for_test(
     ):
         _ensure_directory(
             root,
-            create=(root == roots.library or not production),
+            create=(
+                root
+                == (roots.library_releases if revision_qualified else roots.library)
+                or not production
+            ),
             production=production,
         )
     library_children = (
-        roots.library / "scripts",
-        roots.library / "scripts/canary",
+        library_root,
+        library_root / "scripts",
+        library_root / "scripts/canary",
     )
     for selected in library_children:
         _ensure_directory(selected, create=True, production=production)
 
     installed: list[Mapping[str, Any]] = []
     created_count = 0
-    for source_relative in sorted(_SOURCE_ASSETS):
-        target_relative, mode = _SOURCE_ASSETS[source_relative]
+    selected_assets = (
+        {**_REVISION_LIBRARY_ASSETS, **_REVISION_STATIC_ASSETS}
+        if revision_qualified
+        else _SOURCE_ASSETS
+    )
+    for source_relative in sorted(selected_assets):
+        target_relative, mode = selected_assets[source_relative]
         raw = _git(
             source_root,
             "cat-file",
             "blob",
             f"{release_revision}:{source_relative}",
         )
-        target = _target(roots, target_relative)
+        target = (
+            library_root / target_relative
+            if revision_qualified and source_relative in _REVISION_LIBRARY_ASSETS
+            else _target(roots, target_relative)
+        )
         created = _publish_exact(
             target,
             raw,
@@ -556,7 +622,13 @@ def _install_for_test(
         })
     for selected in reversed(library_children):
         os.chmod(selected, 0o555)
-    os.chmod(roots.library, 0o555)
+    os.chmod(library_root, 0o555)
+    if revision_qualified:
+        # The root-owned namespace must remain traversable and extensible by a
+        # later privileged installer so a second exact revision can coexist.
+        # Individual revision directories are sealed 0555 above; unprivileged
+        # identities still cannot create, replace, or mutate entries here.
+        os.chmod(roots.library_releases, 0o755)
 
     sysusers_path = roots.sysusers / "muncho-release-builder.conf"
     tmpfiles_path = roots.tmpfiles / "muncho-release-builder.conf"
@@ -573,8 +645,16 @@ def _install_for_test(
     else:
         foundation_validator(roots)
 
+    deterministic_assets = [
+        {name: item[name] for name in ("source_relative_path", "target_path", "mode", "sha256")}
+        for item in installed
+    ]
     unsigned = {
-        "schema": INSTALL_RECEIPT_SCHEMA,
+        "schema": (
+            REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA
+            if revision_qualified
+            else INSTALL_RECEIPT_SCHEMA
+        ),
         "repository_url": repository_url,
         "source_remote": source_remote,
         "release_revision": release_revision,
@@ -608,11 +688,28 @@ def _install_for_test(
         "secret_material_recorded": False,
         "secret_digest_recorded": False,
     }
+    if revision_qualified:
+        unsigned = {
+            **unsigned,
+            "foundation_layout": "revision-qualified-v2",
+            "foundation_asset_manifest_sha256": _sha256(
+                _canonical(deterministic_assets)
+            ),
+        }
     return {**unsigned, "receipt_sha256": _sha256(_canonical(unsigned))}
 
 
 def install_rotation_stager_foundation(**kwargs: Any) -> Mapping[str, Any]:
     return _install_for_test(roots=InstallerRoots(), production=True, **kwargs)
+
+
+def install_revision_qualified_foundation(**kwargs: Any) -> Mapping[str, Any]:
+    return _install_for_test(
+        roots=InstallerRoots(),
+        production=True,
+        revision_qualified=True,
+        **kwargs,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -621,9 +718,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source-remote", required=True)
     parser.add_argument("--repository-url", required=True)
     parser.add_argument("--release-revision", required=True)
+    parser.add_argument("--revision-qualified", action="store_true")
     arguments = parser.parse_args(argv)
     try:
-        receipt = install_rotation_stager_foundation(
+        installer = (
+            install_revision_qualified_foundation
+            if arguments.revision_qualified
+            else install_rotation_stager_foundation
+        )
+        receipt = installer(
             source_root=arguments.source_root,
             source_remote=arguments.source_remote,
             repository_url=arguments.repository_url,
@@ -645,7 +748,9 @@ if __name__ == "__main__":
 
 __all__ = [
     "INSTALL_RECEIPT_SCHEMA",
+    "REVISION_QUALIFIED_INSTALL_RECEIPT_SCHEMA",
     "InstallerRoots",
     "RotationStagerInstallerError",
+    "install_revision_qualified_foundation",
     "install_rotation_stager_foundation",
 ]

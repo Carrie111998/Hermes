@@ -60,6 +60,18 @@ PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256 = (
 PRODUCTION_BUILDER_WRAPPER_SHA256 = (
     "6fcbeaf6a30ad5afee5b0beef3a22633c19d68a1758c2c02e33e627d395e2585"
 )
+PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT = Path(
+    "/etc/systemd/system/muncho-release-builder-v2@.service"
+)
+PRODUCTION_REVISION_BUILDER_WRAPPER = Path(
+    "/usr/libexec/muncho-release-foundation-exec-v2"
+)
+PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256 = (
+    "821bc34ffbdce9ff1d2c4631277eb154feaaf7bf8f57fc7824f19b4119589ab4"
+)
+PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256 = (
+    "5af9bc0826f436e2ae4951bc23dca4b0b90f55f0712c4c92a782d1744328861c"
+)
 SYSTEMCTL = Path("/usr/bin/systemctl")
 MAX_JSON_BYTES = 64 * 1024 * 1024
 MAX_SYSTEMCTL_BYTES = 1024 * 1024
@@ -180,6 +192,7 @@ class PromoterRoots:
     builder_unit_fragment: Path
     builder_wrapper: Path
     promotion_interlock: Path
+    builder_unit_prefix: str = "muncho-release-builder@"
     cgroup_root: Path = Path("/sys/fs/cgroup")
     proc_root: Path = Path("/proc")
 
@@ -220,6 +233,17 @@ def production_roots() -> PromoterRoots:
         builder_unit_fragment=PRODUCTION_BUILDER_UNIT_FRAGMENT,
         builder_wrapper=PRODUCTION_BUILDER_WRAPPER,
         promotion_interlock=PRODUCTION_PROMOTION_INTERLOCK,
+    )
+
+
+def production_revision_roots() -> PromoterRoots:
+    return PromoterRoots(
+        job_root=phase.PRODUCTION_JOB_ROOT,
+        release_parent=PRODUCTION_RELEASE_PARENT,
+        builder_unit_fragment=PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT,
+        builder_wrapper=PRODUCTION_REVISION_BUILDER_WRAPPER,
+        promotion_interlock=PRODUCTION_PROMOTION_INTERLOCK,
+        builder_unit_prefix="muncho-release-builder-v2@",
     )
 
 
@@ -336,6 +360,7 @@ def _validate_roots(
             builder_unit_fragment=Path(roots.builder_unit_fragment),
             builder_wrapper=Path(roots.builder_wrapper),
             promotion_interlock=Path(roots.promotion_interlock),
+            builder_unit_prefix=str(roots.builder_unit_prefix),
             cgroup_root=Path(roots.cgroup_root),
             proc_root=Path(roots.proc_root),
         )
@@ -355,13 +380,16 @@ def _validate_roots(
         or "\x00" in str(path)
         or any(part in {"", ".", ".."} for part in path.parts[1:])
         for path in paths
-    ):
+    ) or normalized.builder_unit_prefix not in {
+        "muncho-release-builder@",
+        "muncho-release-builder-v2@",
+    }:
         _fail("candidate_promoter_roots_invalid")
     if (
         production
-        and normalized != production_roots()
+        and normalized not in {production_roots(), production_revision_roots()}
         or not production
-        and normalized == production_roots()
+        and normalized in {production_roots(), production_revision_roots()}
     ):
         _fail("candidate_promoter_roots_invalid")
     return normalized
@@ -1884,7 +1912,7 @@ def _process_free_evidence(
     process_uid: Callable[[Path, os.stat_result], int | None] | None,
     xattr_reader: Callable[[int], Sequence[str | bytes]],
 ) -> Mapping[str, Any]:
-    unit = f"muncho-release-builder@{revision}.service"
+    unit = f"{roots.builder_unit_prefix}{revision}.service"
     control_group = f"/system.slice/{unit}"
     try:
         systemd_properties = systemd_reader(unit)
@@ -2169,8 +2197,12 @@ def _promote_candidate_for_test(
         rename = _rename_no_replace_linux
         validated_identities = _derive_production_release_identities()
         systemd_reader = _systemctl_show
-        fragment_sha256 = PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256
-        wrapper_sha256 = PRODUCTION_BUILDER_WRAPPER_SHA256
+        if normalized_roots == production_revision_roots():
+            fragment_sha256 = PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT_SHA256
+            wrapper_sha256 = PRODUCTION_REVISION_BUILDER_WRAPPER_SHA256
+        else:
+            fragment_sha256 = PRODUCTION_BUILDER_UNIT_FRAGMENT_SHA256
+            wrapper_sha256 = PRODUCTION_BUILDER_WRAPPER_SHA256
     else:
         authority_uid = (
             _read_posix_identity("geteuid")
@@ -2554,7 +2586,7 @@ def promote_rotation_stager_candidate(
         expected_builder_terminal_receipt_sha256=(
             expected_builder_terminal_receipt_sha256
         ),
-        roots=production_roots(),
+        roots=production_revision_roots(),
         binding=_UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
         production=True,
     )
@@ -2563,11 +2595,14 @@ def promote_rotation_stager_candidate(
 __all__ = [
     "PROMOTION_RESULT_SCHEMA",
     "PRODUCTION_BUILDER_UNIT_FRAGMENT",
+    "PRODUCTION_REVISION_BUILDER_UNIT_FRAGMENT",
+    "PRODUCTION_REVISION_BUILDER_WRAPPER",
     "PRODUCTION_RELEASE_PARENT",
     "ProductionReleaseCandidatePromoterError",
     "canonical_bytes",
     "promote_candidate",
     "promote_rotation_stager_candidate",
+    "production_revision_roots",
     "sha256_bytes",
     "validate_promotion_result",
 ]
