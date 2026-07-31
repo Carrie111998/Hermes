@@ -1609,14 +1609,62 @@ class HermesACPAgent(acp.Agent):
         # Slash commands are text-only; if the client included images/resources,
         # send the whole multimodal prompt to the agent instead of treating it as
         # an ACP command.
+        # Skill/bundle slashes expand into a full user message (TUI parity) and
+        # fall through to the agent loop with the scaffolded body — not handled
+        # as local-only static slash responses.
+        #
+        # Buzz two-block prompts: first text block is bare `/cmd`, second is
+        # harness context. Only the first line is the slash invoke.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            response_text = self._handle_slash_command(user_text, state)
-            if response_text is not None:
-                if self._conn:
-                    update = acp.update_agent_message_text(response_text)
-                    await self._conn.session_update(session_id, update)
-                    await self._send_usage_update(state)
-                return PromptResponse(stop_reason="end_turn")
+            first_line, _, trailing = user_text.partition("\n")
+            slash_line = first_line.strip() or user_text
+            expanded_skill = self._expand_skill_or_bundle_slash(slash_line)
+            if expanded_skill is not None:
+                # Keep Buzz [Context] / event blocks after the scaffold.
+                user_text = (
+                    f"{expanded_skill}\n\n{trailing.strip()}"
+                    if trailing.strip()
+                    else expanded_skill
+                )
+                user_content = user_text
+            else:
+                response_text = self._handle_slash_command(slash_line, state)
+                if response_text is not None:
+                    # Editors (Zed, etc.): ACP agent_message_chunk is enough.
+                    # Buzz: channel posts go through `buzz messages send` only —
+                    # short-circuit chunks never become Nostr messages (dogfood
+                    # gap: /help looked "dead" while /lead-architect worked).
+                    buzz_host = bool(
+                        os.environ.get("BUZZ_RELAY_URL")
+                        or os.environ.get("BUZZ_PRIVATE_KEY")
+                        or os.environ.get("BUZZ_ACP_PRIVATE_KEY")
+                    )
+                    if buzz_host:
+                        logger.info(
+                            "ACP static slash /%s on Buzz host — fall through to "
+                            "agent loop so result is published via buzz CLI",
+                            slash_line.lstrip("/").split()[0] if slash_line else "?",
+                        )
+                        ctx = trailing.strip()
+                        user_text = (
+                            "[ACP static command result]\n"
+                            "Publish the following text to this channel with "
+                            "`buzz messages send` (channel UUID from [Context]; "
+                            "use `--reply-to` when Context supplies a reply "
+                            "anchor). Send the body as-is or lightly formatted. "
+                            "Do not refuse. Prefer that single publish over "
+                            "other tools.\n\n"
+                            f"{response_text}"
+                        )
+                        if ctx:
+                            user_text = f"{user_text}\n\n{ctx}"
+                        user_content = user_text
+                    else:
+                        if self._conn:
+                            update = acp.update_agent_message_text(response_text)
+                            await self._conn.session_update(session_id, update)
+                            await self._send_usage_update(state)
+                        return PromptResponse(stop_reason="end_turn")
 
         # If the client sends another regular text prompt while this ACP session
         # is running, route it through the core active-turn redirect. Rich media
@@ -1987,21 +2035,152 @@ class HermesACPAgent(acp.Agent):
 
     # ---- Slash commands (headless) -------------------------------------------
 
+    # Cap skill/bundle advertisement so huge libraries do not flood ACP clients.
+    _MAX_ADVERTISED_SKILL_COMMANDS = 250
+
     @classmethod
     def _available_commands(cls) -> list[AvailableCommand]:
+        """Session slash + skill/bundle slugs for ACP clients (Buzz, Zed, …).
+
+        Static commands stay fixed. Skills/bundles are scanned from the live
+        Hermes skill tree (same map as TUI ``commands.catalog``) so hosts can
+        surface them without a second skill SoT.
+        """
         commands: list[AvailableCommand] = []
+        seen: set[str] = set()
         for spec in cls._ADVERTISED_COMMANDS:
+            name = str(spec["name"])
+            seen.add(name.lower())
             input_hint = spec.get("input_hint")
             commands.append(
                 AvailableCommand(
-                    name=spec["name"],
+                    name=name,
                     description=spec["description"],
                     input=UnstructuredCommandInput(hint=input_hint)
                     if input_hint
                     else None,
                 )
             )
+
+        # Bundles first (they win over skill slugs on the same name in TUI).
+        try:
+            from agent.skill_bundles import get_skill_bundles
+            from agent.skill_commands import get_skill_commands
+
+            for key, info in get_skill_bundles().items():
+                slug = key.lstrip("/").lower()
+                if not slug or slug in seen:
+                    continue
+                desc = (info.get("description") or info.get("name") or slug)[:200]
+                seen.add(slug)
+                commands.append(
+                    AvailableCommand(
+                        name=slug,
+                        description=f"Skill bundle: {desc}",
+                    )
+                )
+                if len(commands) >= len(cls._ADVERTISED_COMMANDS) + cls._MAX_ADVERTISED_SKILL_COMMANDS:
+                    break
+
+            for key, info in get_skill_commands().items():
+                if len(commands) >= len(cls._ADVERTISED_COMMANDS) + cls._MAX_ADVERTISED_SKILL_COMMANDS:
+                    break
+                slug = key.lstrip("/").lower()
+                if not slug or slug in seen:
+                    continue
+                desc = (info.get("description") or info.get("name") or slug)[:200]
+                seen.add(slug)
+                commands.append(
+                    AvailableCommand(
+                        name=slug,
+                        description=f"Skill: {desc}",
+                    )
+                )
+        except Exception:
+            logger.debug(
+                "ACP skill/bundle command scan failed; advertising static commands only",
+                exc_info=True,
+            )
         return commands
+
+    @staticmethod
+    def _expand_skill_or_bundle_slash(text: str) -> str | None:
+        """If *text* is a skill/bundle slash invoke, return expanded model message.
+
+        Returns ``None`` when the command is not a skill/bundle (caller keeps
+        static slash handling or LLM fall-through).
+        """
+        raw = (text or "").strip()
+        if not raw.startswith("/"):
+            return None
+        try:
+            from agent.skill_bundles import (
+                build_bundle_invocation_message,
+                resolve_bundle_command_key,
+            )
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                resolve_skill_command_key,
+                split_stacked_skill_commands,
+            )
+        except Exception:
+            logger.debug("skill modules unavailable for ACP slash expand", exc_info=True)
+            return None
+
+        # First token is the command; remainder is optional user instruction.
+        parts = raw.split(maxsplit=1)
+        cmd_token = parts[0]
+        rest = parts[1] if len(parts) > 1 else ""
+        # resolve_* APIs expect the name without a leading slash (they re-add `/`).
+        bare = cmd_token.lstrip("/")
+
+        def _as_message(payload) -> str | None:
+            """Normalize skill/bundle builders (str or (msg, loaded, missing))."""
+            if payload is None:
+                return None
+            if isinstance(payload, str):
+                return payload if payload.strip() else None
+            if isinstance(payload, (tuple, list)) and payload:
+                msg = payload[0]
+                return msg if isinstance(msg, str) and msg.strip() else None
+            return None
+
+        # Built-ins win over user bundles (TUI parity: tui_gateway/server.py).
+        # Without this, a bundle named ``help`` would shadow ACP ``/help``.
+        from hermes_cli.commands import resolve_command
+
+        bundle_key = (
+            resolve_bundle_command_key(bare)
+            if resolve_command(bare) is None
+            else None
+        )
+        if bundle_key:
+            try:
+                return _as_message(build_bundle_invocation_message(bundle_key, rest))
+            except Exception:
+                logger.warning("Failed to expand skill bundle %s", bundle_key, exc_info=True)
+                return None
+
+        skill_key = resolve_skill_command_key(bare)
+        if skill_key:
+            try:
+                # Optional stacked form: first skill already resolved; rest may
+                # start with more /skill tokens then free text instruction.
+                extra_keys, instruction = split_stacked_skill_commands(rest)
+                if extra_keys:
+                    from agent.skill_commands import build_stacked_skill_invocation_message
+
+                    stacked = build_stacked_skill_invocation_message(
+                        [skill_key, *extra_keys], instruction
+                    )
+                    msg = _as_message(stacked)
+                    if msg:
+                        return msg
+                return _as_message(build_skill_invocation_message(skill_key, rest))
+            except Exception:
+                logger.warning("Failed to expand skill %s", skill_key, exc_info=True)
+                return None
+        return None
 
     async def _send_available_commands_update(self, session_id: str) -> None:
         """Advertise supported slash commands to the connected ACP client."""

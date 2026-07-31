@@ -349,6 +349,34 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
+# Buzz managed-agent identity for `buzz messages send` / CLI. When Desktop
+# spawns hermes-acp under buzz-acp it sets BUZZ_MANAGED_AGENT + signing key.
+# Those vars are in OPTIONAL_ENV_VARS category=messaging so they hit the
+# provider blocklist — correct for *gateway* bot tokens, wrong for the
+# agent *being* a Buzz peer (terminal strip made every publish exit 3).
+_BUZZ_MANAGED_AGENT_PASSTHROUGH: frozenset[str] = frozenset({
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_RELAY_URL",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_MANAGED_AGENT",
+    "BUZZ_MANAGED_AGENT_START_NONCE",
+    "BUZZ_CLI_PATH",
+    "BUZZ_TRANSPORT",
+})
+
+
+def _buzz_managed_agent_active(env: dict | None = None) -> bool:
+    """True when this process is a Buzz Desktop managed agent (not gateway)."""
+    src = env if env is not None else os.environ
+    val = str(src.get("BUZZ_MANAGED_AGENT") or "").strip()
+    return bool(val)
+
+
+def _is_buzz_managed_passthrough(key: str, env: dict | None = None) -> bool:
+    """Allow Buzz CLI identity vars through terminal sanitize for managed agents."""
+    return key in _BUZZ_MANAGED_AGENT_PASSTHROUGH and _buzz_managed_agent_active(env)
+
+
 def _is_hermes_internal_secret(key: str) -> bool:
     """Return True for Hermes-internal secrets injected under *dynamic* names.
 
@@ -461,11 +489,17 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
         _is_passthrough = lambda _: False  # noqa: E731
 
     sanitized: dict[str, str] = {}
+    # Merge first so BUZZ_MANAGED_AGENT in either base or extra enables passthrough.
+    probe = dict(base_env or {})
+    probe.update(extra_env or {})
 
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
         if _is_hermes_internal_secret(key):
+            continue
+        if _is_buzz_managed_passthrough(key, probe):
+            sanitized[key] = value
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
@@ -478,6 +512,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
+        elif _is_buzz_managed_passthrough(key, probe):
+            sanitized[key] = value
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
             sanitized[key] = value
 
@@ -1233,6 +1269,8 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
+        elif _is_buzz_managed_passthrough(k, merged):
+            run_env[k] = v
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
             run_env[k] = v
     path_key = _path_env_key(run_env)
