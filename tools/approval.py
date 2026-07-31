@@ -17,7 +17,6 @@ import os
 import re
 import shlex
 import sys
-import tempfile
 import threading
 import time
 import unicodedata
@@ -603,8 +602,13 @@ def _sudo_stdin_block_result(description: str) -> dict:
 # Dangerous command patterns
 # =========================================================================
 
+_ROOT_PATH_APPROVAL_DESCRIPTION = "delete in root path"
+_PROTECTED_RM_ROOT_DIRS = frozenset({
+    "bin", "boot", "dev", "etc", "lib", "lib64", "opt", "proc", "root",
+    "run", "sbin", "srv", "sys", "usr", "var",
+})
+
 DANGEROUS_PATTERNS = [
-    (r'\brm\s+(-[^\s]*\s+)*/(?:\*(?=$|[\s;&|`)<>])|(?=$|[\s;&|`)<>]))', "delete in root path"),
     (r'\brm\s+-[^\s]*r', "recursive delete"),
     (r'\brm\s+--recursive\b', "recursive delete (long flag)"),
     # GNU rm permutes options, so a recursive flag group may legally FOLLOW
@@ -885,6 +889,21 @@ for _pattern, _description in DANGEROUS_PATTERNS:
     _PATTERN_KEY_ALIASES.setdefault(_canonical_key, set()).update({_canonical_key, _legacy_key})
     _PATTERN_KEY_ALIASES.setdefault(_legacy_key, set()).update({_legacy_key, _canonical_key})
 
+# Retain approvals saved under the replaced root-path regex keys.
+_ROOT_PATH_LEGACY_PATTERN_KEYS = (
+    _legacy_pattern_key(r'\brm\s+(-[^\s]*\s+)*/'),
+    _legacy_pattern_key(
+        r'\brm\s+(-[^\s]*\s+)*/(?:\*(?=$|[\s;&|`)<>])|(?=$|[\s;&|`)<>]))'
+    ),
+)
+for _legacy_key in _ROOT_PATH_LEGACY_PATTERN_KEYS:
+    _PATTERN_KEY_ALIASES.setdefault(_ROOT_PATH_APPROVAL_DESCRIPTION, set()).update(
+        {_ROOT_PATH_APPROVAL_DESCRIPTION, _legacy_key}
+    )
+    _PATTERN_KEY_ALIASES.setdefault(_legacy_key, set()).update(
+        {_legacy_key, _ROOT_PATH_APPROVAL_DESCRIPTION}
+    )
+
 # Preserve approvals stored under the removed interpreter regex rules.
 _REMOVED_PATTERN_KEY_ALIASES = {
     "script execution via -e/-c flag": "(python[23]?|perl|ruby|node)\\s+-[ec]\\s+",
@@ -955,8 +974,10 @@ def _normalize_command_for_detection(command: str) -> str:
     # first would eat the prefix the Hermes-home fold needs.
     command = _rewrite_resolved_hermes_home(command)
     command = _rewrite_resolved_user_home(command)
-    # Strip shell backslash-escapes: r\m → rm. Prevents \-injection bypass.
-    command = re.sub(r'\\([^\n])', r'\1', command)
+    # Keep escaped backticks until command-position parsing. Bash permits them
+    # as nested substitution delimiters, while the parser must still collapse
+    # every other escaped character before its pattern pass.
+    command = re.sub(r'\\([^`\n])', r'\1', command)
     # Strip empty-string literals that split tokens: r''m → rm, r"\"m → rm.
     command = re.sub(r"''|\"\"", '', command)
     # Collapse $IFS / ${IFS} word-separator expansions to a literal space.
@@ -1096,13 +1117,51 @@ _COMMAND_WRAPPER_WORDS = {
     "command",
     "builtin",
 }
-_SUDO_OPTIONS_WITH_ARG = {
-    "-c", "--close-from",
-    "-g", "--group",
-    "-h", "--host",
-    "-p", "--prompt",
-    "-u", "--user",
+_COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
+    "sudo": {
+        "-c", "--close-from",
+        "-g", "--group",
+        "-h", "--host",
+        "-p", "--prompt",
+        "-u", "--user",
+    },
+    "env": {
+        "-a", "--argv0",
+        "-C", "--chdir",
+        "-S", "--split-string",
+        "-u", "--unset",
+    },
+    "exec": {"-a"},
+    "time": {"-f", "--format", "-o", "--output"},
 }
+_ENV_SPLIT_STRING_OPTIONS = frozenset({"-S", "--split-string"})
+
+
+def _command_word_basename(word: str) -> str:
+    """Return a command word's basename across POSIX and Windows separators."""
+    return os.path.basename(
+        word.replace("/", os.path.sep).replace("\\", os.path.sep)
+    ).lower()
+
+
+def _wrapper_option_takes_next_arg(
+    wrapper_word: str,
+    option_name: str,
+    has_attached_value: bool,
+) -> bool:
+    """Return whether a wrapper option owns the following shell word."""
+    if has_attached_value:
+        return False
+    options_with_arg = _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper_word, set())
+    if option_name in options_with_arg:
+        return True
+    if option_name.startswith("--"):
+        return False
+    return any(
+        f"-{option_char}" in options_with_arg
+        and option_index == len(option_name) - 1
+        for option_index, option_char in enumerate(option_name[1:], start=1)
+    )
 
 _INTERPRETER_EXEC_FLAGS = {
     "python": {"-c"},
@@ -1589,6 +1648,66 @@ def _execution_flag_findings(command: str):
                     yield (f"arbitrary program execution via {tool} {option}", payload)
 
 
+def _env_split_string_payloads(args: list[str]):
+    """Yield the executable command line owned by each ``env -S`` form."""
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            return
+        if _ENV_ASSIGNMENT_RE.fullmatch(token):
+            index += 1
+            continue
+        if not token.startswith("-"):
+            return
+
+        option_name, attached_value = _split_option(token)
+        if option_name == "-S" and len(token) > 2 and attached_value is None:
+            attached_value = token[2:]
+        if option_name in _ENV_SPLIT_STRING_OPTIONS:
+            if attached_value is None:
+                if index + 1 >= len(args):
+                    return
+                payload = args[index + 1]
+                remaining = args[index + 2:]
+            else:
+                payload = attached_value
+                remaining = args[index + 1:]
+            if remaining:
+                payload = " ".join((payload, *(shlex.quote(arg) for arg in remaining)))
+            if payload:
+                yield payload
+            return
+
+        index += 1 + int(
+            _wrapper_option_takes_next_arg(
+                "env",
+                option_name,
+                attached_value is not None,
+            )
+        )
+
+
+def _iter_wrapper_executable_payloads(command: str):
+    """Yield executable command lines carried by registered wrapper options."""
+    for segment in _iter_top_level_shell_segments(command):
+        for start, _, word in _iter_shell_command_word_spans(segment):
+            executable = _deobfuscate_shell_word_for_detection(word)
+            if _command_word_basename(executable) != "env":
+                continue
+            tokens = _shell_segment_tokens(segment, start)
+            if tokens is not None:
+                yield from _env_split_string_payloads(tokens[1:])
+
+
+def _iter_executable_payloads(command: str):
+    """Yield recursively executable payloads from every supported parser entry."""
+    for _, payload in _execution_flag_findings(command):
+        if payload:
+            yield payload
+    yield from _iter_wrapper_executable_payloads(command)
+
+
 def _skip_shell_whitespace(command: str, pos: int) -> int:
     while pos < len(command) and command[pos].isspace():
         pos += 1
@@ -1834,6 +1953,15 @@ def _iter_shell_command_starts(command: str):
                 starts.append(i + 2)
                 i += 2
                 continue
+            if ch == "`":
+                end = _scan_backtick_end(command, i)
+                if end is not None:
+                    starts.extend(
+                        i + 1 + start
+                        for start in _iter_shell_command_starts(command[i + 1:end - 1])
+                    )
+                    i = end
+                    continue
             i += 1
             continue
         if ch in ("'", '"'):
@@ -1847,6 +1975,15 @@ def _iter_shell_command_starts(command: str):
             starts.append(i + 2)
             i += 2
             continue
+        if ch == "`":
+            end = _scan_backtick_end(command, i)
+            if end is not None:
+                starts.extend(
+                    i + 1 + start
+                    for start in _iter_shell_command_starts(command[i + 1:end - 1])
+                )
+                i = end
+                continue
         # Bare subshell `(cmd)` and brace group `{ cmd; }` openers begin a new
         # command context, just like `;` or `$(`. We only reach this branch
         # OUTSIDE any quote (the quote arms above `continue` first), so a `(`
@@ -1882,6 +2019,37 @@ def _iter_shell_command_starts(command: str):
             starts.append(i + 1)
         i += 1
 
+    # Escaped delimiters can nest a backtick substitution. Consider every
+    # overlapping pair outside single quotes so an inner executable command
+    # reaches the same parser path as its enclosing substitution.
+    quote = None
+    i = 0
+    while i + 1 < len(command):
+        ch = command[i]
+        if quote == "'":
+            if ch == "'":
+                quote = None
+            i += 1
+            continue
+        if ch == '"':
+            quote = None if quote == '"' else '"'
+            i += 1
+            continue
+        if ch == "'":
+            quote = "'"
+            i += 1
+            continue
+        if ch == "\\" and command[i + 1] == "`":
+            end = command.find("\\`", i + 2)
+            if end != -1:
+                starts.extend(
+                    i + 2 + start
+                    for start in _iter_shell_command_starts(command[i + 2:end])
+                )
+            i += 2
+            continue
+        i += 1
+
     seen: set[int] = set()
     for start in starts:
         start = _skip_shell_whitespace(command, start)
@@ -1901,10 +2069,13 @@ def _mark_command_starts(command: str) -> str:
     produced by ``_iter_shell_command_starts``, so quoted arguments such as
     ``--title "block (reboot)"`` are left exactly as-is.
     """
-    # Collect the (whitespace-skipped) start offsets, drop 0 (already anchored
-    # by ``^``), and splice a newline in front of each — right-to-left so the
-    # earlier offsets stay valid as we mutate.
-    offsets = sorted(o for o in _iter_shell_command_starts(command) if o > 0)
+    # Collect every command start plus each executable span the wrapper-aware
+    # tokenizer reaches. Drop 0 (already anchored by ``^``), then splice a
+    # newline right-to-left so earlier offsets stay valid as we mutate.
+    offsets = sorted({
+        *(o for o in _iter_shell_command_starts(command) if o > 0),
+        *(start for start, _, _ in _iter_shell_command_word_spans(command) if start > 0),
+    })
     if not offsets:
         return command
     # Build once instead of repeatedly slicing and copying the full command for
@@ -1923,6 +2094,7 @@ def _iter_shell_command_word_spans(command: str):
     for command_start in _iter_shell_command_starts(command):
         pos = command_start
         prefix_words = 0
+        wrapper_word: str | None = None
         skip_wrapper_options = False
         skip_next_wrapper_arg = False
         while prefix_words < 12:
@@ -1931,16 +2103,23 @@ def _iter_shell_command_word_spans(command: str):
                 break
             deobfuscated = _deobfuscate_shell_word_for_detection(word)
             lower_word = deobfuscated.lower()
+            command_word = _command_word_basename(deobfuscated)
             if skip_next_wrapper_arg:
                 skip_next_wrapper_arg = False
                 pos = word_end
                 prefix_words += 1
                 continue
-            if skip_wrapper_options and lower_word.startswith("-"):
-                option_name = lower_word.split("=", 1)[0]
-                skip_next_wrapper_arg = (
-                    "=" not in lower_word
-                    and option_name in _SUDO_OPTIONS_WITH_ARG
+            if skip_wrapper_options and lower_word == "--":
+                skip_wrapper_options = False
+                pos = word_end
+                prefix_words += 1
+                continue
+            if skip_wrapper_options and deobfuscated.startswith("-"):
+                option_name, attached_value = _split_option(deobfuscated)
+                skip_next_wrapper_arg = _wrapper_option_takes_next_arg(
+                    wrapper_word or "",
+                    option_name,
+                    attached_value is not None,
                 )
                 pos = word_end
                 prefix_words += 1
@@ -1949,15 +2128,62 @@ def _iter_shell_command_word_spans(command: str):
             yield (word_start, word_end, word)
             prefix_words += 1
 
-            if lower_word in _COMMAND_WRAPPER_WORDS:
-                skip_wrapper_options = lower_word in {"sudo", "env"}
+            if command_word in _COMMAND_WRAPPER_WORDS:
+                wrapper_word = command_word
+                skip_wrapper_options = True
                 pos = word_end
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
+                wrapper_word = None
                 skip_wrapper_options = False
                 pos = word_end
                 continue
             break
+
+
+def _rm_requires_root_path_approval(command: str) -> bool:
+    """Return whether a real rm command targets a root or protected path."""
+    for _, command_end, command_word in _iter_shell_command_word_spans(command):
+        command_name = _deobfuscate_shell_word_for_detection(command_word)
+        command_basename = _command_word_basename(command_name)
+        if command_basename != "rm":
+            continue
+
+        options_ended = False
+        pos = command_end
+        while True:
+            word_start, word_end, word = _read_shell_word(command, pos)
+            if word_start == word_end:
+                break
+            pos = word_end
+            operand = _strip_shell_word_syntax(word).rstrip(")}")
+            if not options_ended and operand == "--":
+                options_ended = True
+                continue
+            if not options_ended and operand.startswith("-"):
+                continue
+            if not operand.startswith("/"):
+                continue
+
+            components: list[str] = []
+            for component in operand.split("/"):
+                if component in {"", "."}:
+                    continue
+                if component == "..":
+                    if components:
+                        components.pop()
+                    continue
+                components.append(component)
+
+            if not components or components in (["*"], [".*"]):
+                return True
+            if components[0] in _PROTECTED_RM_ROOT_DIRS:
+                return True
+            if components[0] == "home" and (
+                len(components) == 1 or components[1:] in (["*"], [".*"])
+            ):
+                return True
+    return False
 
 
 def _command_detection_variants(command: str):
@@ -1973,7 +2199,7 @@ def _command_detection_variants(command: str):
     pending = [normalized]
     while pending:
         variant = pending.pop()
-        for _, payload in _execution_flag_findings(variant):
+        for payload in _iter_executable_payloads(variant):
             if payload and payload not in seen:
                 seen.add(payload)
                 yield payload
@@ -2000,6 +2226,10 @@ def _command_detection_variants(command: str):
     if marked != grep_safe and marked not in seen:
         seen.add(marked)
         yield marked
+    deescaped_backticks = marked.replace(r"\`", "`")
+    if deescaped_backticks != marked and deescaped_backticks not in seen:
+        seen.add(deescaped_backticks)
+        yield deescaped_backticks
     # Shell quoting/escaping can spell a dangerous executable name in pieces
     # (for example r\m or r''m). Keep that deobfuscation scoped to command
     # words so similarly shaped arguments do not become false positives.
@@ -2014,27 +2244,6 @@ def _command_detection_variants(command: str):
         yield variant
 
 
-def _is_verification_artifact_cleanup(command: str) -> bool:
-    """Return whether *command* only removes one Hermes ad-hoc temp script."""
-    try:
-        argv = shlex.split(command, posix=True)
-    except ValueError:
-        return False
-    if len(argv) != 3 or argv[0] != "rm" or argv[1] != "-f":
-        return False
-
-    operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
-    basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
-        return False
-
-    target = os.path.realpath(operand)
-    if os.path.dirname(target) != temp_dir:
-        return False
-    return re.fullmatch(r"hermes-(?:verify|ad-hoc)-[A-Za-z0-9_.-]+", basename) is not None
-
-
 def detect_dangerous_command(command: str) -> tuple:
     """Check if a command matches any dangerous patterns.
 
@@ -2043,10 +2252,14 @@ def detect_dangerous_command(command: str) -> tuple:
     """
     if _command_parser_limit_exceeded(command):
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
-    if _is_verification_artifact_cleanup(command):
-        return (False, None, None)
 
     for command_variant in _command_detection_variants(command):
+        if _rm_requires_root_path_approval(command_variant):
+            return (
+                True,
+                _ROOT_PATH_APPROVAL_DESCRIPTION,
+                _ROOT_PATH_APPROVAL_DESCRIPTION,
+            )
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):

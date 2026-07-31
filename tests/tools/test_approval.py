@@ -99,48 +99,186 @@ class TestDetectDangerousRm:
             assert "delete" in desc.lower()
 
 
-    def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
-            for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
-                    False,
-                    None,
-                    None,
-                )
-
-    def test_symlinked_temp_dir_only_exempts_canonical_target(self, tmp_path):
-        real_temp = tmp_path / "real-temp"
-        real_temp.mkdir()
-        linked_temp = tmp_path / "linked-temp"
-        linked_temp.symlink_to(real_temp, target_is_directory=True)
-        basename = "hermes-verify-example.py"
-
-        with mock_patch("tempfile.gettempdir", return_value=str(linked_temp)):
-            assert detect_dangerous_command(f"rm -f {linked_temp / basename}")[0] is True
-            assert detect_dangerous_command(f"rm -f {real_temp / basename}") == (
-                False,
-                None,
-                None,
+    def test_root_equivalents_globs_and_protected_paths_use_root_key(self):
+        commands = (
+            "rm /",
+            "rm //",
+            "rm ///",
+            "rm /./",
+            "rm /..",
+            "rm /tmp/..",
+            'rm -f "/"',
+            "rm -f '/*'",
+            'rm -f "/.*"',
+            "rm -f /etc",
+            "rm -f /etc/hermes.conf",
+            "rm -f /home",
+            "rm -f /home/*",
+        )
+        for command in commands:
+            assert detect_dangerous_command(command) == (
+                True,
+                "delete in root path",
+                "delete in root path",
             )
 
-    def test_verification_cleanup_exemption_rejects_broader_deletions(self):
-        commands = (
-            "rm -rf /tmp/hermes-verify-example.py",
-            "rm -f /tmp/hermes-verify-example.py /tmp/other.py",
-            "rm -f /tmp/nested/../hermes-verify-example.py",
-            "rm -f /tmp/a/../../tmp/hermes-verify-example.py",
-            "rm -f /var/tmp/hermes-verify-example.py",
-            "rm -f /tmp/hermes-verify-*",
-            "rm -f /tmp/hermes-verify-$(touch>/tmp/pwned).py",
-            "rm -f /tmp/hermes-ad-hoc-`touch>/tmp/pwned`.py",
-            "rm -f /tmp/hermes-verify-example.py; touch /tmp/pwned",
+    def test_ordinary_nonrecursive_absolute_paths_are_safe(self):
+        for command in (
+            "rm -f /tmp/file",
+            "rm -f /mnt/work/file",
+            "rm -f /home/user/file",
+            "rm -f /.config",
+        ):
+            assert detect_dangerous_command(command) == (False, None, None)
+
+    def test_ordinary_verifier_cleanup_uses_the_shared_safe_path(self):
+        assert detect_dangerous_command("rm -f /tmp/hermes-verify-example.py") == (
+            False,
+            None,
+            None,
         )
-        with mock_patch("tempfile.gettempdir", return_value="/tmp"):
-            for command in commands:
-                is_dangerous, key, desc = detect_dangerous_command(command)
-                assert is_dangerous is True, command
-                assert key is not None, command
-                assert "delete" in desc.lower(), command
+
+    def test_protected_verifier_cleanup_uses_normal_root_path_approval(self):
+        assert detect_dangerous_command("rm -f /var/tmp/hermes-verify-example.py") == (
+            True,
+            "delete in root path",
+            "delete in root path",
+        )
+
+    def test_executable_qualified_wrappers_reach_the_root_classifier(self):
+        commands = (
+            "/bin/rm -f /etc/passwd",
+            "/usr/bin/rm -f /var/tmp/hermes-verify-example.py",
+            "/usr/bin/env rm -f /",
+            "/usr/bin/env -C /tmp rm -f /etc/passwd",
+            "/usr/bin/sudo -u root rm -f /etc/passwd",
+        )
+        for command in commands:
+            assert detect_dangerous_command(command) == (
+                True,
+                "delete in root path",
+                "delete in root path",
+            )
+
+    def test_backtick_substitutions_reach_the_root_classifier(self):
+        for command in (
+            "echo `rm -f /etc/passwd`",
+            'echo "`/bin/rm -f /var/tmp/hermes-verify-example.py`"',
+            r"echo \`echo \`rm -f /etc/passwd\`\`",
+            r'echo "\`echo \`rm -f /etc/passwd\`\`"',
+        ):
+            assert detect_dangerous_command(command) == (
+                True,
+                "delete in root path",
+                "delete in root path",
+            )
+
+    def test_env_options_and_split_strings_reach_the_root_classifier(self):
+        commands = (
+            "env -C /tmp rm -f /",
+            "env --chdir=/tmp rm -f /etc/passwd",
+            "env -S 'rm -f /etc/passwd'",
+            'env --split-string="rm -f /var/tmp/hermes-verify-example.py"',
+            "env -S rm -f /",
+        )
+        for command in commands:
+            assert detect_dangerous_command(command) == (
+                True,
+                "delete in root path",
+                "delete in root path",
+            )
+
+        # GNU env treats -C and -S as distinct uppercase options. The lowercase
+        # spelling is invalid and must not consume its next token as an option.
+        assert detect_dangerous_command("env -c /tmp rm -f /") == (False, None, None)
+
+    def test_every_registered_wrapper_reaches_the_root_classifier(self):
+        commands = (
+            "sudo -u root rm -f /etc/passwd",
+            "env -u HOME rm -f /etc/passwd",
+            "exec -a cleanup rm -f /etc/passwd",
+            "nohup -- rm -f /etc/passwd",
+            "setsid --fork rm -f /etc/passwd",
+            "time -p rm -f /etc/passwd",
+            "time -o /tmp/time.log rm -f /etc/passwd",
+            "time -f%E rm -f /etc/passwd",
+            "command -- rm -f /etc/passwd",
+            "builtin -- rm -f /etc/passwd",
+        )
+        for command in commands:
+            assert detect_dangerous_command(command) == (
+                True,
+                "delete in root path",
+                "delete in root path",
+            )
+
+    def test_qualified_wrappers_keep_hardline_precedence_under_yolo(self, monkeypatch):
+        commands = (
+            "/usr/bin/env rm -rf /",
+            "/usr/bin/sudo -u root rm -rf /etc",
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for command in commands:
+            assert detect_hardline_command(command)[0] is True, command
+            result = approval_module.check_all_command_guards(command, "local")
+            assert result["approved"] is False, command
+            assert result.get("hardline") is True, command
+
+    def test_qualified_sudo_matches_unqualified_hardline_boundary(self):
+        pairs = (
+            ("sudo -u root rm -rf /etc", "/usr/bin/sudo -u root rm -rf /etc"),
+            (
+                "sudo -u root rm -rf /etc/passwd",
+                "/usr/bin/sudo -u root rm -rf /etc/passwd",
+            ),
+        )
+        for unqualified, qualified in pairs:
+            assert detect_dangerous_command(qualified) == (
+                True,
+                "delete in root path",
+                "delete in root path",
+            )
+            assert detect_hardline_command(qualified) == detect_hardline_command(unqualified)
+
+    def test_parser_entry_forms_keep_hardline_precedence_under_yolo(self, monkeypatch):
+        commands = (
+            "env -C /tmp rm -rf /",
+            'env --split-string="rm -rf /"',
+            r"echo \`echo \`rm -rf /\`\`",
+            r'echo "\`echo \`rm -rf /\`\`"',
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for command in commands:
+            assert detect_hardline_command(command)[0] is True, command
+            result = approval_module.check_all_command_guards(command, "local")
+            assert result["approved"] is False, command
+            assert result.get("hardline") is True, command
+
+    def test_recursive_ordinary_absolute_paths_keep_recursive_reasons(self):
+        cases = (
+            ("rm -rf /tmp/file", {"recursive delete"}),
+            # `--recursive` also satisfies the existing short-flag matcher.
+            ("rm --recursive /mnt/work/file", {
+                "recursive delete",
+                "recursive delete (long flag)",
+            }),
+            ("rm /tmp/file -rf", {"recursive delete (flags after operands)"}),
+        )
+        for command, expected_reasons in cases:
+            is_dangerous, key, description = detect_dangerous_command(command)
+            assert is_dangerous is True
+            assert key == description
+            assert key in expected_reasons
+
+    def test_root_paths_have_a_regular_key_before_hardline_execution(self):
+        for command in ("rm -rf /", "rm -rf /*", 'rm -rf "/"', "rm -rf /etc"):
+            assert detect_dangerous_command(command)[1:] == (
+                "delete in root path",
+                "delete in root path",
+            )
+            result = approval_module.check_all_command_guards(command, "local")
+            assert result["approved"] is False
+            assert result["hardline"] is True
 
 
 class TestWindowsShellDestructiveCommands:
@@ -179,43 +317,6 @@ class TestWindowsShellDestructiveCommands:
         assert dangerous is False
         assert key is None
         assert desc is None
-
-    def test_root_delete_commands_keep_root_path_reason(self):
-        for command in [
-            "rm /",
-            "rm -rf /",
-            "rm -rf -- /",
-            "rm -rf /*",
-            "rm -- /",
-            "sudo rm -rf /",
-            "$(rm /)",
-        ]:
-            is_dangerous, key, desc = detect_dangerous_command(command)
-            assert is_dangerous is True, f"{command!r} should be dangerous"
-            assert key == "delete in root path"
-            assert desc == "delete in root path"
-
-    def test_ordinary_absolute_paths_do_not_match_root_delete(self):
-        for command in [
-            "rm /tmp/file",
-            "rm /home/me/file",
-            "rm /mnt/work/file",
-        ]:
-            is_dangerous, key, desc = detect_dangerous_command(command)
-            assert is_dangerous is False, f"{command!r} should be safe, got: {desc}"
-            assert key is None
-            assert desc is None
-
-    def test_recursive_ordinary_absolute_paths_use_recursive_reason(self):
-        for command in [
-            "rm -rf /tmp/file",
-            "rm -rf /home/me/file",
-            "rm --recursive /mnt/work/file",
-        ]:
-            is_dangerous, key, desc = detect_dangerous_command(command)
-            assert is_dangerous is True, f"{command!r} should be dangerous"
-            assert key in {"recursive delete", "recursive delete (long flag)"}
-            assert desc in {"recursive delete", "recursive delete (long flag)"}
 
 
 class TestDetectDangerousSudo:
