@@ -229,3 +229,181 @@ class TestMigrationCollapsesExistingDuplicates:
                 assert live_after == 1
             finally:
                 db.close()
+
+
+class TestNullActiveMigrationOrdering:
+    """Regression for review thread on hermes_state_schema.py:L355.
+
+    Legacy DBs may carry rows with ``active IS NULL`` (older reconciler
+    builds omitted the NOT NULL DEFAULT 1).  If the v24 duplicate-cleanup
+    DELETE runs BEFORE those NULL rows are normalised to active=1, the
+    DELETE misses them (it only targets active=1).  Later the NULL→1
+    UPDATE would then collide with the already-created unique index.
+
+    The fix normalises NULL active → 1 BEFORE the cleanup DELETE so the
+    DELETE sees and collapses the formerly-NULL duplicates too.
+    """
+
+    def test_null_active_duplicates_collapsed_before_index_creation(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            sid = "20260730_170159_f8432a"
+            db.create_session(sid, "cli", model="test/model")
+            db.close()
+
+            # Recreate pre-upgrade dirty state: two NULL-active rows with
+            # the same (session_id, role, content, timestamp) — the legacy
+            # double-write that the NULL→1 repair would later turn into
+            # colliding active=1 rows.
+            #
+            # Legacy DBs had ``active`` added by the reconciler WITHOUT a
+            # NOT NULL constraint (#51646), so we relax the column before
+            # inserting NULLs.  PRAGMA writable_schema requires a reconnect
+            # for the change to take effect.
+            raw = sqlite3.connect(db_path)
+            try:
+                raw.execute("DROP INDEX IF EXISTS idx_messages_active_dedupe")
+                raw.execute("PRAGMA writable_schema = 1")
+                raw.execute(
+                    "UPDATE sqlite_master SET sql = REPLACE(sql, "
+                    "'active INTEGER NOT NULL DEFAULT 1', 'active INTEGER') "
+                    "WHERE type = 'table' AND name = 'messages'"
+                )
+                raw.execute("PRAGMA writable_schema = 0")
+                raw.commit()
+            finally:
+                raw.close()
+
+            # Reopen — the relaxed schema is now active.
+            raw = sqlite3.connect(db_path)
+            try:
+                for _ in range(2):
+                    raw.execute(
+                        "INSERT INTO messages (session_id, role, content, "
+                        "timestamp, active, compacted) VALUES "
+                        "(?, 'assistant', ?, ?, NULL, 0)",
+                        (sid, CONTENT, TS),
+                    )
+                raw.commit()
+            finally:
+                raw.close()
+
+            # Re-opening runs the migration: NULL→1 first, then DELETE
+            # duplicates, then create index.  If the ordering is wrong,
+            # the unique-index creation will raise IntegrityError.
+            db = SessionDB(db_path=db_path)
+            try:
+                live = db._conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE content = ? AND active = 1 AND timestamp = ?",
+                    (CONTENT, TS),
+                ).fetchone()[0]
+                assert live == 1, (
+                    f"NULL-active duplicates not collapsed: {live} live rows"
+                )
+                # Index must exist — migration completed without error.
+                assert db._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                    "AND name = 'idx_messages_active_dedupe'"
+                ).fetchone() is not None
+            finally:
+                db.close()
+
+
+class TestNullContentBoundary:
+    """Documented limitation for review thread on hermes_state_common.py:L317.
+
+    SQLite UNIQUE indexes treat NULL as distinct, so the
+    idx_messages_active_dedupe index does NOT deduplicate rows with
+    content = NULL.  The migration cleanup (GROUP BY, which collapses NULL
+    into one group) handles EXISTING NULL-content duplicates, but NEW
+    NULL-content duplicate inserts bypass the runtime guard.
+
+    This is an explicit, documented boundary — NULL-content messages are
+    rare (tool-call-only rows with no text body) and typically carry
+    distinct tool_call_id values, so true duplicates are unlikely in
+    practice.
+    """
+
+    def test_null_content_duplicate_insert_is_not_guarded(self):
+        """Two append_message calls with content=None and the same timestamp
+        create two rows — the index does not block this.  This test
+        documents the known limitation; if a future fix adds a null-safe
+        key (e.g. COALESCE(content, '') generated column), this test
+        should be updated to assert deduplication."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            try:
+                sid = "20260730_170159_f8432a"
+                db.create_session(sid, "cli", model="test/model")
+
+                db.append_message(
+                    session_id=sid, role="assistant",
+                    content=None, timestamp=TS,
+                )
+                db.append_message(
+                    session_id=sid, role="assistant",
+                    content=None, timestamp=TS,
+                )
+
+                # Known limitation: both rows persist (NULL is distinct in
+                # SQLite UNIQUE indexes).  The guard does NOT fire here.
+                count = db._conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE content IS NULL AND active = 1 AND timestamp = ?",
+                    (TS,),
+                ).fetchone()[0]
+                assert count == 2, (
+                    f"expected 2 unguarded NULL-content rows, found {count}"
+                )
+            finally:
+                db.close()
+
+    def test_null_content_existing_duplicates_collapsed_on_migration(self):
+        """The migration cleanup DELETE uses GROUP BY, which treats NULL as
+        a single group.  Existing NULL-content duplicate rows ARE cleaned
+        up on upgrade, even though the runtime index does not guard them
+        going forward."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db = SessionDB(db_path=db_path)
+            sid = "20260730_170159_f8432a"
+            db.create_session(sid, "cli", model="test/model")
+            db.close()
+
+            # Pre-upgrade: two NULL-content active duplicates.
+            raw = sqlite3.connect(db_path)
+            try:
+                raw.execute("DROP INDEX IF EXISTS idx_messages_active_dedupe")
+                for _ in range(2):
+                    raw.execute(
+                        "INSERT INTO messages (session_id, role, content, "
+                        "timestamp, active, compacted) VALUES "
+                        "(?, 'assistant', NULL, ?, 1, 0)",
+                        (sid, TS),
+                    )
+                raw.commit()
+            finally:
+                raw.close()
+
+            db = SessionDB(db_path=db_path)
+            try:
+                count = db._conn.execute(
+                    "SELECT COUNT(*) FROM messages "
+                    "WHERE content IS NULL AND active = 1 AND timestamp = ?",
+                    (TS,),
+                ).fetchone()[0]
+                assert count == 1, (
+                    f"migration should collapse NULL-content duplicates to "
+                    f"1 row, found {count}"
+                )
+            finally:
+                db.close()

@@ -466,6 +466,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
 -- class, where a duplicate can only be a residual double-write. The
 -- columns here are exactly the conflict target of the ON CONFLICT clause
 -- on the messages INSERTs in hermes_state.py.
+-- LIMITATION: SQLite UNIQUE indexes treat NULL as distinct, so rows with
+-- content = NULL are NOT deduplicated by this index.  The v24 migration
+-- DELETE (in hermes_state_schema.py) uses GROUP BY, which collapses NULL
+-- into one group, so existing NULL-content duplicates are cleaned up on
+-- upgrade.  New NULL-content messages (rare: tool-call-only rows with no
+-- text) are outside the runtime guard — see
+-- test_state_db_duplicate_messages.py::TestNullContentBoundary.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_active_dedupe
     ON messages(session_id, role, content, timestamp)
     WHERE active = 1;
