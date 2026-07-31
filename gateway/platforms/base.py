@@ -3012,6 +3012,10 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Secondary multiplex adapters must stamp their owning profile before
+        # the active-session guard can queue an event without calling the
+        # profile wrapper. Profile routes may still override this fallback.
+        self._inbound_profile_name: Optional[str] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3629,18 +3633,9 @@ class BasePlatformAdapter(ABC):
         """
         self._message_handler = handler
 
-    def set_platform_event_handler(
-        self,
-        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
-    ) -> None:
-        """Install the gateway-owned normalized platform-event boundary.
-
-        Adapters normalize SDK updates and pass only stable dictionaries plus an
-        internal ``SessionSource`` to this callback. The runner owns the final
-        authorization decision and plugin dispatch; an adapter with no callback
-        therefore fails closed instead of exposing pre-auth events.
-        """
-        self._platform_event_handler = handler
+    def set_inbound_profile_name(self, profile_name: Optional[str]) -> None:
+        """Set the fallback profile stamped at transport ingress."""
+        self._inbound_profile_name = profile_name or None
 
     def set_topic_recovery_fn(
         self,
@@ -6008,8 +6003,14 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        if event.allow_gateway_control:
-            coerce_plaintext_gateway_command(event)
+        if (
+            getattr(event, "source", None) is not None
+            and not event.source.profile
+            and getattr(self, "_inbound_profile_name", None)
+        ):
+            event.source.profile = self._inbound_profile_name
+
+        coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
         # not submit a no-op check for group/forum/channel traffic to the
@@ -7129,6 +7130,9 @@ class BasePlatformAdapter(ABC):
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
+
+        if not profile:
+            profile = getattr(self, "_inbound_profile_name", None)
 
         source = SessionSource(
             platform=self.platform,

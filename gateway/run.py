@@ -14980,10 +14980,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
-        # Runtime status is process-scoped even while message/config work is
-        # profile-scoped.  Preserve both dimensions in the key so dashboard
-        # and NAS health aggregation can see which secondary profile failed.
-        adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
+        _set_inbound_profile = getattr(adapter, "set_inbound_profile_name", None)
+        if callable(_set_inbound_profile):
+            _set_inbound_profile(profile_name)
+        else:
+            # Compatibility for test doubles and legacy duck-typed adapters.
+            setattr(adapter, "_inbound_profile_name", profile_name)
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
