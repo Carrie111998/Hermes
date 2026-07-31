@@ -22,7 +22,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Mapping, Never, Sequence
+from typing import Any, Callable, Literal, Mapping, Never, Sequence
 
 from scripts.canary import production_release_builder_phase as phase
 
@@ -102,6 +102,19 @@ class RotationStagerInstallerError(RuntimeError):
 def _fail(code: str, cause: BaseException | None = None) -> Never:
     del cause
     raise RotationStagerInstallerError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("rotation_stager_installer_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("rotation_stager_installer_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("rotation_stager_installer_posix_identity_unavailable")
+    return value
 
 
 def _canonical(value: Any) -> bytes:
@@ -252,8 +265,8 @@ def _ensure_directory(path: Path, *, create: bool, production: bool) -> None:
         state = os.lstat(path)
     except OSError as exc:
         _fail("rotation_stager_installer_directory_invalid", exc)
-    expected_uid = 0 if production else os.geteuid()
-    expected_gid = 0 if production else os.getegid()
+    expected_uid = 0 if production else _read_posix_identity("geteuid")
+    expected_gid = 0 if production else _read_posix_identity("getegid")
     if (
         not path.is_absolute()
         or ".." in path.parts
@@ -349,7 +362,13 @@ def _install_for_test(
         or not source_root.is_absolute()
         or ".." in source_root.parts
         or type(production) is not bool
-        or (production and (os.geteuid() != 0 or not sys.platform.startswith("linux")))
+        or (
+            production
+            and (
+                not sys.platform.startswith("linux")
+                or _read_posix_identity("geteuid") != 0
+            )
+        )
         or any(
             not path.is_absolute() or ".." in path.parts
             for path in (
@@ -513,8 +532,8 @@ def _install_for_test(
             target,
             raw,
             mode=mode,
-            expected_uid=0 if production else os.geteuid(),
-            expected_gid=0 if production else os.getegid(),
+            expected_uid=(0 if production else _read_posix_identity("geteuid")),
+            expected_gid=(0 if production else _read_posix_identity("getegid")),
         )
         created_count += int(created)
         installed.append({
@@ -556,7 +575,11 @@ def _install_for_test(
         "builder_identity_installed": True,
         "job_root": str(roots.job_root),
         "job_root_owner": (
-            "root:root" if production else f"{os.geteuid()}:{os.getegid()}"
+            "root:root"
+            if production
+            else (
+                f"{_read_posix_identity('geteuid')}:{_read_posix_identity('getegid')}"
+            )
         ),
         "job_root_mode": "0755",
         "job_root_installed": True,

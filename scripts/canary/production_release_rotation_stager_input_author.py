@@ -29,7 +29,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Never, Sequence
+from typing import Any, Literal, Mapping, Never, Sequence
 
 from scripts.canary import production_release_builder_phase as phase
 from scripts.canary import production_release_builder_runtime as builder
@@ -77,6 +77,19 @@ class RotationStagerInputAuthorError(RuntimeError):
 def _fail(code: str, cause: BaseException | None = None) -> Never:
     del cause
     raise RotationStagerInputAuthorError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("rotation_stager_input_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("rotation_stager_input_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("rotation_stager_input_posix_identity_unavailable")
+    return value
 
 
 def canonical_bytes(value: Any) -> bytes:
@@ -664,7 +677,13 @@ def _author_for_test(
             )
         )
         or type(production) is not bool
-        or (production and (os.geteuid() != 0 or not sys.platform.startswith("linux")))
+        or (
+            production
+            and (
+                not sys.platform.startswith("linux")
+                or _read_posix_identity("geteuid") != 0
+            )
+        )
     ):
         _fail("rotation_stager_input_contract_invalid")
     if production and roots.job_root != phase.PRODUCTION_JOB_ROOT:

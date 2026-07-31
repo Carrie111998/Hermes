@@ -15,7 +15,7 @@ import re
 import stat
 import sys
 from pathlib import Path
-from typing import Callable, Mapping, Never, Sequence
+from typing import Callable, Literal, Mapping, Never, Sequence
 
 from scripts.canary import production_release_builder_phase as phase
 from scripts.canary import production_release_builder_runtime as builder
@@ -41,6 +41,19 @@ class RotationStagerLauncherError(RuntimeError):
 def _fail(code: str, cause: BaseException | None = None) -> Never:
     del cause
     raise RotationStagerLauncherError(code) from None
+
+
+def _read_posix_identity(name: Literal["geteuid", "getegid"]) -> int:
+    reader = getattr(os, name, None)
+    if not callable(reader):
+        _fail("rotation_stager_launcher_posix_identity_unavailable")
+    try:
+        value = reader()
+    except (OSError, TypeError, ValueError) as exc:
+        _fail("rotation_stager_launcher_posix_identity_unavailable", exc)
+    if type(value) is not int or value < 0:
+        _fail("rotation_stager_launcher_posix_identity_unavailable")
+    return value
 
 
 def _validate_stager_purpose(
@@ -95,7 +108,7 @@ def _launch_for_test(
     ),
     execve: Callable[[str, Sequence[str], Mapping[str, str]], object] = os.execve,
 ) -> Never:
-    uid = os.geteuid() if effective_uid is None else effective_uid
+    uid = _read_posix_identity("geteuid") if effective_uid is None else effective_uid
     if (
         _REVISION.fullmatch(revision or "") is None
         or action not in _ACTIONS
