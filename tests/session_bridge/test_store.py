@@ -7405,9 +7405,18 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
         codex_thread_id=seeded["codex_thread_id"],
         now=128.0,
     )
+    fixed_error_code = failed["error_code"]
+    assert fixed_error_code in {
+        "marker_conflict",
+        "source_identity_mismatch",
+        "source_cwd_missing",
+        "native_task_not_indexed",
+        "hydration_send_ambiguous",
+    }
     assert failed["state"] == SidebarHydrationState.RETRY.value
     assert failed["send_reserved_at"] == 126.0
-    assert store.sidebar_hydration_status(now=128.0)["health_counts"] == {
+    public_status = store.sidebar_hydration_status(now=128.0)
+    assert public_status["health_counts"] == {
         "pending": 0,
         "leased": 0,
         "retry": 0,
@@ -7415,6 +7424,8 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
         "ambiguous": 1,
         "failed": 0,
     }
+    assert "HERMES_SESSION_BRIDGE_V1:" not in repr(public_status)
+    assert "HERMES_SESSION_HYDRATION_V1:" not in repr(public_status)
 
     assert store.claim_sidebar_hydration_jobs(now=129.0, limit=1) == []
     reclaimed = store.claim_sidebar_hydration_jobs(now=143.0, limit=1)[0]
@@ -8249,6 +8260,10 @@ def test_sidebar_enqueue_rejects_a_conflicting_source_bridge_identity(db) -> Non
     with pytest.raises(ValueError, match="bridge ID"):
         store.enqueue_sidebar_job(conflicting)
     assert _rows(db, "SELECT * FROM session_sidebar_jobs") == []
+    links_for_source = store.get_bridge_summaries([candidate.source_session_id])[
+        candidate.source_session_id
+    ]["bridge_links"]
+    assert len(links_for_source) <= 1
 
 
 def test_sidebar_claims_are_ordered_bounded_and_serialize_active_batches_at_rest(

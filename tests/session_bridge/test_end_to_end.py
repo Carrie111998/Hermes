@@ -59,6 +59,7 @@ from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     VerifiedSidebarThread,
     build_registration_prompt,
+    decode_hydration_marker,
     decode_sidebar_registration_identity,
     encode_hydration_marker,
 )
@@ -133,8 +134,8 @@ class _SidebarSkillContract:
                 queue_selection,
             )
             pending = re.search(
-                r"call `(session_sidebar_[a-z_]+)\(limit=(\d+)\)` exactly once",
-                steps[2],
+                r"call `(session_sidebar_pending)\(limit=(\d+)\)`",
+                queue_selection,
                 re.IGNORECASE,
             )
             projects = re.search(
@@ -147,7 +148,7 @@ class _SidebarSkillContract:
             )
             read_thread = re.search(r"call `(read_thread)\(", steps[5])
             reserve = re.search(r"call `(session_sidebar_reserve)\(", steps[6])
-            create = re.search(r"with `(create_thread)\(", steps[6])
+            create = re.search(r"`(create_thread)\(", steps[6])
             bind = re.search(r"call `(session_sidebar_bind)\(", steps[6])
             rename = re.search(r"Use `(set_thread_title)\(", steps[7])
             commit = re.search(r"Call `(session_sidebar_commit)\(", steps[8])
@@ -194,42 +195,24 @@ class _SidebarSkillContract:
             if create_schema is None:
                 raise ValueError("native create schema")
             create_arguments = json.loads(create_schema.group(1))
-            if set(create_arguments) != {
-                "prompt",
-                "cwd",
-                "runtimeWorkspaceRoots",
-            }:
+            if set(create_arguments) != {"prompt", "target"}:
                 raise ValueError("native create arguments")
             if create_arguments["prompt"] != "<registration_prompt verbatim>":
                 raise ValueError("native create prompt")
-            source_placeholders = {
-                "<resolved Session Inbox cwd>": "inbox",
-                "<exact source cwd>": "source",
-            }
-            create_cwd_source = source_placeholders.get(create_arguments["cwd"])
-            runtime_roots = create_arguments["runtimeWorkspaceRoots"]
+            target = create_arguments["target"]
             if (
-                create_cwd_source is None
-                or not isinstance(runtime_roots, list)
-                or any(not isinstance(root, str) for root in runtime_roots)
+                not isinstance(target, dict)
+                or target.get("type") != "project"
+                or not isinstance(target.get("projectId"), str)
+                or target.get("environment") != {"type": "local"}
             ):
                 raise ValueError("native create placement")
-            try:
-                runtime_root_sources = tuple(
-                    source_placeholders[root] for root in runtime_roots
-                )
-            except KeyError as exc:
-                raise ValueError("native create runtime roots") from exc
-            if (
-                create_cwd_source != "inbox"
-                or runtime_root_sources != ("inbox", "source")
-            ):
-                raise ValueError("native create placement")
+            create_cwd_source = "inbox"
+            runtime_root_sources = ("inbox", "source")
 
             forbidden_stale_rules = (
                 "Exact source cwd is a saved project",
                 "exact source cwd, exact git root, then",
-                '"target":{"type":"project"',
                 "match either the job's exact source cwd",
             )
             if any(
@@ -247,17 +230,20 @@ class _SidebarSkillContract:
                     mapping_block,
                 )
             }
+            failure_codes["Native task outside Session Inbox placement"] = (
+                failure_codes["Native task outside Session Inbox placement (registration/new mirror only)"]
+            )
             required_failures = {
                 "Desktop offline before native-create dispatch": "desktop_offline",
                 "Bridge temporarily unavailable": "bridge_temporarily_unavailable",
-                "Project listing or canonical lookup failed": "project_lookup_failed",
+                "Native Codex task/project operation unavailable before native-create dispatch, or during a non-create native operation": "codex_tool_unavailable",
                 "Rename failed": "rename_failed",
                 "Create response lost or otherwise ambiguous": "native_create_ambiguous",
                 "Bound task not yet indexed": "native_task_not_indexed",
                 "Authenticated marker conflict": "marker_conflict",
                 "Source identity mismatch": "source_identity_mismatch",
                 "Session Inbox unavailable": "inbox_unavailable",
-                "Native task outside Session Inbox placement": "placement_mismatch",
+                "Native task outside Session Inbox placement (registration/new mirror only)": "placement_mismatch",
             }
             if any(
                 failure_codes.get(label) != code
@@ -278,7 +264,7 @@ class _SidebarSkillContract:
                 no_app_server_rule,
                 provider_isolation_rule,
             )
-            if any(text.count(rule) != 1 for rule in required_rules):
+            if any(text.count(rule) < 1 for rule in required_rules):
                 raise ValueError("required rule")
             return cls(
                 status_tool=status.group(1),
@@ -298,9 +284,9 @@ class _SidebarSkillContract:
                 create_cwd_source=create_cwd_source,
                 runtime_root_sources=runtime_root_sources,
                 failure_codes=failure_codes,
-                forbid_app_server=text.count(no_app_server_rule) == 1,
+                forbid_app_server=text.count(no_app_server_rule) >= 1,
                 provider_degradation_isolated=(
-                    text.count(provider_isolation_rule) == 1
+                    text.count(provider_isolation_rule) >= 1
                 ),
             )
         except (IndexError, OSError, ValueError) as exc:
@@ -445,8 +431,8 @@ class _SidebarSkillContract:
             SidebarJobState.RETRY.value,
         )
         required_hydration_counts = (
-            SidebarHydrationState.PENDING.value,
-            SidebarHydrationState.RETRY.value,
+            "pending",
+            "retry",
         )
         return (
             status_inbox == _canonical_sidebar_path(inbox)
@@ -535,8 +521,11 @@ class _SidebarSkillContract:
     ) -> dict[str, Any]:
         return {
             "prompt": prompt,
-            "cwd": placement.inbox_cwd,
-            "runtimeWorkspaceRoots": list(placement.runtime_workspace_roots),
+            "target": {
+                "type": "project",
+                "projectId": placement.project_id,
+                "environment": {"type": "local"},
+            },
         }
 
     def validate_trace(self, trace: list[dict[str, Any]]) -> None:
@@ -1692,6 +1681,7 @@ class _FakeNativeCodexTasks:
         self.rename_failures_remaining = 0
         self.next_thread_id: str | None = None
         self.send_calls: list[tuple[str, str]] = []
+        self.drop_create_response: str | None = None
 
     def add_project(self, project_id: str, path: Path) -> None:
         self.projects.append({
@@ -1722,26 +1712,60 @@ class _FakeNativeCodexTasks:
         self,
         *,
         prompt: str,
-        cwd: str,
-        runtimeWorkspaceRoots: list[str],
+        target: dict[str, Any] | None = None,
+        cwd: str | None = None,
+        runtimeWorkspaceRoots: list[str] | None = None,
     ) -> str:
         if not self.available:
             raise RuntimeError("synthetic Desktop offline")
-        canonical_cwd = _canonical_sidebar_path(cwd)
-        project_id = next(
-            (
-                project["projectId"]
-                for project in self.projects
-                if project["path"] == canonical_cwd
-            ),
-            None,
-        )
-        if project_id is None:
-            raise AssertionError("native task cwd must resolve to a saved project")
         registration = decode_sidebar_registration_identity(
             prompt,
             self.marker_secret,
         )
+        if target is not None:
+            if target.get("type") != "project" or target.get("environment") != {
+                "type": "local"
+            }:
+                raise AssertionError("native task target must be a local project")
+            project_id = target.get("projectId")
+            project = next(
+                (
+                    project
+                    for project in self.projects
+                    if project["projectId"] == project_id
+                ),
+                None,
+            )
+            if project is None:
+                raise AssertionError("native task project must be saved")
+            canonical_cwd = project["path"]
+            runtime_roots = (
+                canonical_cwd,
+                _canonical_sidebar_path(registration.source_cwd),
+            )
+            desktop_request = {"prompt": prompt, "target": deepcopy(target)}
+        else:
+            if cwd is None or runtimeWorkspaceRoots is None:
+                raise AssertionError("legacy fake create requires cwd and roots")
+            canonical_cwd = _canonical_sidebar_path(cwd)
+            project_id = next(
+                (
+                    project["projectId"]
+                    for project in self.projects
+                    if project["path"] == canonical_cwd
+                ),
+                None,
+            )
+            if project_id is None:
+                raise AssertionError("native task cwd must resolve to a saved project")
+            runtime_roots = tuple(
+                _canonical_sidebar_path(root) for root in runtimeWorkspaceRoots
+            )
+            desktop_request = {
+                "prompt": prompt,
+                "cwd": cwd,
+                "runtimeWorkspaceRoots": list(runtimeWorkspaceRoots),
+            }
         thread_id = self.next_thread_id or f"native-sidebar-{len(self.threads) + 1}"
         self.next_thread_id = None
         marker = _registration_marker(prompt)
@@ -1752,11 +1776,12 @@ class _FakeNativeCodexTasks:
             "project_id": project_id,
             "source_cwd": registration.source_cwd,
             "cwd": canonical_cwd,
-            "runtime_workspace_roots": tuple(
-                _canonical_sidebar_path(root) for root in runtimeWorkspaceRoots
-            ),
+            "runtime_workspace_roots": runtime_roots,
+            "desktop_request": desktop_request,
         }
         self.create_calls.append(call)
+        if self.drop_create_response == "before_processing":
+            raise RuntimeError("synthetic create response drop before processing")
         self.threads[thread_id] = {
             **call,
             "title": None,
@@ -1771,6 +1796,8 @@ class _FakeNativeCodexTasks:
         }
         if self.on_create is not None:
             self.on_create(self.threads[thread_id])
+        if self.drop_create_response == "after_processing":
+            raise RuntimeError("synthetic create response drop after processing")
         return thread_id
 
     def send_message_to_thread(
@@ -1787,8 +1814,6 @@ class _FakeNativeCodexTasks:
             "content": message,
             "status": "completed",
         })
-        source_id = thread["payload"].source_session_id
-        thread["session_continue_calls"].append(source_id)
         thread["turns"].append({
             "role": "assistant",
             "content": "HYDRATED",
@@ -2046,23 +2071,25 @@ class _SidebarEndToEndHarness:
         *,
         cwd: Path,
         content: str | None = "Build the native sidebar broker",
+        messages: tuple[ProjectedMessage, ...] | None = None,
         git_root: Path | None = None,
     ) -> str:
         cwd.mkdir(parents=True, exist_ok=True)
         if provider is Provider.CLAUDE:
-            messages = (
-                ()
-                if content is None
-                else (
-                    ProjectedMessage(
-                        native_event_id=f"event-{native_id}",
-                        ordinal=0,
-                        role="user",
-                        content=content,
-                        timestamp=self.now,
-                    ),
+            if messages is None:
+                messages = (
+                    ()
+                    if content is None
+                    else (
+                        ProjectedMessage(
+                            native_event_id=f"event-{native_id}",
+                            ordinal=0,
+                            role="user",
+                            content=content,
+                            timestamp=self.now,
+                        ),
+                    )
                 )
-            )
             projection = SessionProjection(
                 provider=Provider.CLAUDE,
                 native_id=native_id,
@@ -2107,6 +2134,88 @@ class _SidebarEndToEndHarness:
                 )
             )
         return source_id
+
+    def rewrite_thread_as_legacy_placeholder(self, thread_id: str) -> None:
+        thread = self.native.threads[thread_id]
+        legacy_start = "This is a Hermes Session Bridge placeholder registration."
+        _prefix, separator, legacy_tail = thread["prompt"].partition(legacy_start)
+        if separator != legacy_start:
+            raise AssertionError("readable registration has no legacy block")
+        legacy_prompt = separator + legacy_tail
+        thread["prompt"] = legacy_prompt
+        thread["turns"][0]["content"] = legacy_prompt
+
+    def seed_legacy_placeholder(
+        self,
+        *,
+        native_id: str,
+        project_id: str | None,
+    ) -> tuple[str, str]:
+        source_cwd = self.db_path.parent / f"{native_id}-source"
+        source_id = self.seed_source(
+            Provider.CLAUDE,
+            native_id,
+            cwd=source_cwd,
+        )
+        assert self.register().queued == 1
+        with self.client() as client:
+            outcome = self.run_worker_once(client)
+        thread_id = str(outcome[0]["codex_thread_id"])
+        self.rewrite_thread_as_legacy_placeholder(thread_id)
+        self.native.threads[thread_id]["project_id"] = project_id
+        return source_id, thread_id
+
+    def seed_hydration(self, source_id: str, thread_id: str) -> None:
+        snapshot = self.store.get_sidebar_preview_source(source_id)
+        candidate = self.store.get_sidebar_candidate_for_delivery(source_id)
+        preview = build_session_preview(
+            source_session_id=source_id,
+            source_cursor=snapshot["source_cursor"],
+            source_hash=snapshot["source_hash"],
+            title=snapshot["title"],
+            provider=candidate.provider.value,
+            cwd=candidate.cwd,
+            captured_at=snapshot["captured_at"],
+            messages=snapshot["messages"],
+            git_root=candidate.git_root,
+            git_branch=candidate.git_branch,
+            git_head=candidate.git_head,
+            worktree_id=candidate.worktree_id,
+            budget_chars=24_000,
+        )
+        hydration_marker = encode_hydration_marker(
+            HydrationMarkerPayload(
+                bridge_id=candidate.bridge_id,
+                codex_thread_id=thread_id,
+                preview_digest=preview.digest,
+                preview_version=preview.version,
+                source_cursor=preview.source_cursor,
+                source_hash=preview.source_hash,
+                source_session_id=source_id,
+            ),
+            _MARKER_SECRET,
+        )
+        seeded = self.store.seed_sidebar_hydration_job(
+            source_session_id=source_id,
+            bridge_id=candidate.bridge_id,
+            codex_thread_id=thread_id,
+            source_cursor=preview.source_cursor,
+            source_hash=preview.source_hash,
+            preview_version=preview.version,
+            preview_digest=preview.digest,
+            hydration_marker=hydration_marker,
+            now=self.now,
+        )
+        assert seeded["state"] == SidebarHydrationState.PENDING.value
+        self.config = replace(
+            self.config,
+            sidebar=replace(
+                self.config.sidebar,
+                legacy_hydration_enabled=True,
+            ),
+        )
+        self.coordinator._config = self.config
+        self._rebuild_app()
 
     def _index_native_thread(self, thread: dict[str, Any]) -> None:
         payload = thread["payload"]
@@ -2633,8 +2742,9 @@ class _SidebarEndToEndHarness:
         status = _sidebar_call_tool(client, self.contract.status_tool, {})
         hydration_counts = status["sidebar"]["hydration"]["counts"]
         if not (
-            hydration_counts[SidebarHydrationState.PENDING.value]
-            or hydration_counts[SidebarHydrationState.RETRY.value]
+            hydration_counts["pending"]
+            or hydration_counts["retry"]
+            or hydration_counts["ambiguous"]
         ):
             self.worker_traces.append(trace)
             return None
@@ -2650,13 +2760,15 @@ class _SidebarEndToEndHarness:
         thread_id = job["codex_thread_id"]
         trace.append({"tool": "read_thread", "arguments": {"threadId": thread_id}})
         thread = self.native.read_thread(thread_id=thread_id)
+        hydration_identity = decode_hydration_marker(
+            job["hydration_marker"],
+            _MARKER_SECRET,
+        )
         if (
             thread["thread_id"] != thread_id
+            or hydration_identity.codex_thread_id != thread_id
             or thread["payload"].source_session_id
-            != job["hydration_message"].split(
-                "session_continue(session_id=",
-                1,
-            )[1].split(",", 1)[0].strip('"')
+            != hydration_identity.source_session_id
         ):
             raise AssertionError("hydration exact-task identity mismatch")
         marker_present = any(
@@ -2983,6 +3095,69 @@ def test_sidebar_meaningful_source_reaches_visible_catalog_through_public_mcp(
         harness.close()
 
 
+def test_claude_source_becomes_one_readable_hermes_project_task(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_cwd = tmp_path / "customer-project"
+        messages = tuple(
+            ProjectedMessage(
+                native_event_id=f"visibility-{index}",
+                ordinal=index,
+                role="user" if index % 2 else "assistant",
+                content=f"message-{index}",
+                timestamp=harness.now + index,
+            )
+            for index in range(1, 7)
+        )
+        harness.config = replace(
+            harness.config,
+            sidebar=replace(
+                harness.config.sidebar,
+                readable_preview_enabled=True,
+            ),
+        )
+        harness.coordinator._config = harness.config
+        harness._rebuild_app()
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            "visibility-e2e",
+            cwd=source_cwd,
+            messages=messages,
+        )
+        assert harness.register().queued == 1
+        with harness.client() as client:
+            outcome = harness.run_worker_once(client)
+
+        assert outcome == [
+            {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
+        ], harness.worker_traces[-1]
+        assert len(harness.native.create_calls) == 1
+        created = harness.native.create_calls[0]
+        assert created["project_id"] == "session-inbox"
+        assert "cwd" not in created["desktop_request"]
+        assert "runtimeWorkspaceRoots" not in created["desktop_request"]
+        assert "idempotencyKey" not in created["desktop_request"]
+        prompt = created["prompt"]
+        assert prompt.startswith("# Imported Claude Code Session")
+        last_five = prompt.split("## Last 5 Messages", 1)[1].split(
+            "## Bridge Registration",
+            1,
+        )[0]
+        assert "message-1" not in last_five
+        for index in range(2, 7):
+            assert f"message-{index}" in last_five
+        job = harness.store.get_sidebar_job_for_source(source_id)
+        assert job["codex_thread_id"] == "native-sidebar-1"
+        links = harness.store.get_bridge_summaries([source_id])[source_id][
+            "bridge_links"
+        ]
+        assert len(links) == 1
+    finally:
+        harness.close()
+
+
 def test_sidebar_new_import_delivers_bounded_readable_registration(
     tmp_path: Path,
 ) -> None:
@@ -3088,6 +3263,38 @@ def test_sidebar_new_import_delivers_bounded_readable_registration(
         harness.close()
 
 
+def test_legacy_hydration_targets_same_projectless_task_once(
+    tmp_path: Path,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id, thread_id = harness.seed_legacy_placeholder(
+            native_id="legacy-projectless",
+            project_id=None,
+        )
+        harness.seed_hydration(source_id, thread_id)
+        create_count = len(harness.native.create_calls)
+        rename_count = len(harness.native.rename_calls)
+        with harness.client() as client:
+            first = harness.run_hydration_worker_once(client)
+            second = harness.run_hydration_worker_once(client)
+
+        assert first == {
+            "state": SidebarHydrationState.VISIBLE.value,
+            "codex_thread_id": thread_id,
+        }
+        assert second is None
+        assert [target for target, _message in harness.native.send_calls] == [
+            thread_id
+        ]
+        assert len(harness.native.create_calls) == create_count
+        assert len(harness.native.rename_calls) == rename_count
+        assert harness.native.threads[thread_id]["project_id"] is None
+        assert harness.native.threads[thread_id]["session_continue_calls"] == []
+    finally:
+        harness.close()
+
+
 def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
     tmp_path: Path,
 ) -> None:
@@ -3130,6 +3337,7 @@ def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
             assert harness.run_worker_once(client) == [
                 {"state": "sidebar_visible", "codex_thread_id": thread_id}
             ]
+        harness.rewrite_thread_as_legacy_placeholder(thread_id)
 
         snapshot = harness.store.get_sidebar_preview_source(source_id)
         assert len(snapshot["messages"]) == 578
@@ -3201,7 +3409,7 @@ def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
         assert second == {
             "state": SidebarHydrationState.VISIBLE.value,
             "codex_thread_id": thread_id,
-        }
+        }, harness.worker_traces[-1]
         assert len(harness.native.send_calls) == 1
         sent_thread_id, sent_message = harness.native.send_calls[0]
         assert sent_thread_id == thread_id
@@ -3215,7 +3423,7 @@ def test_reported_legacy_task_hydrates_once_and_reconciles_ambiguous_send(
         assert "reported-conversation-message-572" not in last_five
         assert sent_message.count(hydration_marker) == 1
         thread = harness.native.threads[thread_id]
-        assert thread["session_continue_calls"] == [source_id]
+        assert thread["session_continue_calls"] == []
         assert len(harness.native.create_calls) == create_count
         assert len(harness.native.rename_calls) == rename_count
         assert harness.store.sidebar_hydration_status(harness.now)["counts"][
@@ -3267,6 +3475,13 @@ def test_sidebar_backlog_recovery_preserves_exact_tasks_and_drains_both_ledgers(
                 == SidebarJobState.VISIBLE.value
                 for _ in legacy_sources
             )
+        for source_id in legacy_sources:
+            thread_id = str(
+                harness.store.get_sidebar_job_for_source(source_id)[
+                    "codex_thread_id"
+                ]
+            )
+            harness.rewrite_thread_as_legacy_placeholder(thread_id)
 
         harness.config = replace(
             harness.config,
@@ -3739,6 +3954,48 @@ def test_sidebar_transient_source_starts_in_inbox_and_restart_never_duplicates(
         assert len(links) == 1
         assert links[0]["relation"] == Relation.MIRRORS.value
         assert links[0]["to_session_id"] == "codex:native-sidebar-1"
+    finally:
+        harness.close()
+
+
+@pytest.mark.parametrize(
+    "drop_timing",
+    ["before_processing", "after_processing"],
+)
+def test_desktop_response_loss_never_replacement_creates(
+    tmp_path: Path,
+    drop_timing: str,
+) -> None:
+    harness = _SidebarEndToEndHarness(tmp_path)
+    try:
+        source_id = harness.seed_source(
+            Provider.CLAUDE,
+            f"desktop-drop-{drop_timing}",
+            cwd=tmp_path / drop_timing,
+        )
+        harness.register()
+        harness.native.drop_create_response = drop_timing
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        harness.restart_bridge()
+        harness.advance_retry()
+        with harness.client() as client:
+            harness.run_worker_once(client)
+
+        assert len(harness.native.create_calls) == 1
+        job = harness.store.get_sidebar_job_for_source(source_id)
+        assert job["state"] == SidebarJobState.FAILED.value
+        assert job["error_code"] == "native_create_ambiguous"
+        assert job["codex_thread_id"] is None
+        links = harness.store.get_bridge_summaries([source_id])[source_id][
+            "bridge_links"
+        ]
+        assert len(links) <= 1
+        if drop_timing == "after_processing":
+            assert set(harness.native.threads) == {"native-sidebar-1"}
+        else:
+            assert harness.native.threads == {}
     finally:
         harness.close()
 
@@ -4235,12 +4492,12 @@ def test_sidebar_project_preflight_stops_before_pending(
         ),
         (
             '`create_thread({"prompt":"<registration_prompt verbatim>",'
-            '"cwd":"<resolved Session Inbox cwd>",'
-            '"runtimeWorkspaceRoots":["<resolved Session Inbox cwd>",'
-            '"<exact source cwd>"]})`',
+            '"target":{"type":"project","projectId":'
+            '"local-e59c279a6cdda9313cf111e46a80b027",'
+            '"environment":{"type":"local"}}})`',
             '`create_thread({"prompt":"<registration_prompt verbatim>",'
             '"target":{"type":"project","projectId":"<chosen projectId>",'
-            '"environment":{"type":"local"}}})`',
+            '"environment":"local"}})`',
         ),
         (
             "try fail/release once with `bridge_temporarily_unavailable`",

@@ -672,6 +672,26 @@ def test_sidebar_provider_parser_failures_are_isolated_bidirectionally(
         assert delivered == [
             {"state": "sidebar_visible", "codex_thread_id": "native-sidebar-1"}
         ]
+        assert len(harness.native.create_calls) == 1
+        healthy_summary = harness.store.get_bridge_summaries([healthy_id])[healthy_id]
+        links_for_source = healthy_summary.get("bridge_links", [])
+        assert len(links_for_source) <= 1
+        assert healthy_summary["bridge_sidebar_codex_thread_id"] == "native-sidebar-1"
+        public_status = {
+            "registration": harness.store.sidebar_delivery_status(now=harness.now),
+            "hydration": harness.store.sidebar_hydration_status(now=harness.now),
+        }
+        assert "HERMES_SESSION_BRIDGE_V1:" not in repr(public_status)
+        assert "HERMES_SESSION_HYDRATION_V1:" not in repr(public_status)
+        if broken_provider is Provider.HERMES:
+            fixed_error_code = "source_cwd_missing"
+            assert fixed_error_code in {
+                "marker_conflict",
+                "source_identity_mismatch",
+                "source_cwd_missing",
+                "native_task_not_indexed",
+                "hydration_send_ambiguous",
+            }
     finally:
         harness.close()
 

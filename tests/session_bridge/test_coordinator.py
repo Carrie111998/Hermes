@@ -1996,6 +1996,10 @@ async def test_claude_bounded_scan_isolates_one_parse_failure_and_retries_it(
         adapters={Provider.CLAUDE: adapter},
         scan_batch_size=3,
     )
+    fingerprint_before_failure = store.get_state(_CLAUDE_FINGERPRINT_KEY)
+    provider_cursor_before_failure = (
+        fingerprint_before_failure or {"sessions": {}}
+    )["sessions"].get("claude-failing")
 
     summary = await coordinator.scan_once(Provider.CLAUDE)
 
@@ -2014,6 +2018,12 @@ async def test_claude_bounded_scan_isolates_one_parse_failure_and_retries_it(
     assert set(store.get_state(_CLAUDE_STAGED_KEY)["sessions"]) == {
         "claude-failing",
     }
+    fingerprint_after_failure = store.get_state(_CLAUDE_FINGERPRINT_KEY)
+    provider_cursor_after_failure = fingerprint_after_failure["sessions"].get(
+        "claude-failing"
+    )
+    assert provider_cursor_after_failure == provider_cursor_before_failure is None
+    assert {"claude-new", "claude-old"}.issubset(store.upsert_attempts)
     health = coordinator.health()
     assert health["providers"]["claude"]["degraded_reason"] == "scan_failed"
     assert health["recent_error_codes"] == ["claude_scan_failed"]
@@ -3405,6 +3415,14 @@ async def test_sidebar_backfill_preview_matches_apply_exclusions(
     assert preview.failed == 0
     assert preview.excluded == 1
     assert preview.excluded_by_reason == {"source_cwd_missing": 1}
+    fixed_error_code = next(iter(preview.excluded_by_reason))
+    assert fixed_error_code in {
+        "marker_conflict",
+        "source_identity_mismatch",
+        "source_cwd_missing",
+        "native_task_not_indexed",
+        "hydration_send_ambiguous",
+    }
     assert store.sidebar_job_counts()[SidebarJobState.PENDING.value] == 0
     assert store.sidebar_exclusion_counts()["total"] == 0
 
