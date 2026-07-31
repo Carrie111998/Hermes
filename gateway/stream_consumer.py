@@ -19,6 +19,7 @@ import asyncio
 import inspect
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -121,6 +122,55 @@ def ensure_closed_code_fences(text: str) -> str:
     if without_fences.count("`") % 2 == 1:
         text = text + "`"
 
+    return text
+
+
+# ── Defensive think-tag scrubber ─────────────────────────────────────────
+# Jun 9 2026: added to plug the /think msg leak.  The stateful scrubber
+# upstream (_filter_and_accumulate) and the agent-level strip_think_blocks
+# both have hardcoded tag lists that miss model-name-prefixed variants
+# (e.g. </M2_7think>, </deepseek_thought>) — and the orphan-pass regex
+# requires trailing whitespace, so an orphan close glued to surrounding
+# text slips through.  This module-level scrubber runs on the *visible*
+# text right before each platform send, catches anything tag-shaped that
+# the upstream paths missed, and is idempotent.
+_THINK_KW = r'(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)'
+_THINK_CLOSED_PAIR_RE = re.compile(
+    rf'<[^>]*{_THINK_KW}[^>]*>.*?</[^>]*{_THINK_KW}[^>]*>',
+    re.DOTALL | re.IGNORECASE,
+)
+_THINK_TAG_RE = re.compile(
+    rf'<[^>]*{_THINK_KW}[^>]*>',
+    re.IGNORECASE,
+)
+
+
+def scrub_thinking_tags_in_prose(text: str) -> str:
+    """Remove any residual think-tag characters from user-visible prose.
+
+    Defensive safety-net pass: runs AFTER all upstream stateful scrubbing
+    and the agent-level strip_think_blocks.  Catches three classes of leak:
+
+      1. Model-prefixed tag variants the hardcoded tag lists miss
+         (e.g. </M2_7think>, </deepseek_thought>).
+      2. Orphan close tags attached to surrounding text without trailing
+         whitespace (the upstream orphan-pass regex requires ``\\s*``).
+      3. Anything else that ends up looking like a think-tag in the
+         final visible text, regardless of why.
+
+    The pattern is intentionally permissive — any tag whose name
+    contains a known reasoning keyword as a substring, case-insensitive —
+    and runs without block-boundary checks.  False positives (a model
+    legitimately using ``<thinkful>``-style names in prose) are vastly
+    less harmful than false negatives (a literal think-tag close
+    leaking raw reasoning to the user).
+
+    Idempotent: running twice produces the same output as running once.
+    """
+    if not text:
+        return ""
+    text = _THINK_CLOSED_PAIR_RE.sub("", text)
+    text = _THINK_TAG_RE.sub("", text)
     return text
 
 
@@ -1138,6 +1188,8 @@ class GatewayStreamConsumer:
         Returns the message_id so callers can thread subsequent chunks.
         """
         text = self._clean_for_display(text)
+        # Defensive think-tag scrub — see scrub_thinking_tags_in_prose.
+        text = scrub_thinking_tags_in_prose(text)
         if not text.strip():
             return reply_to_id
         try:
@@ -1248,6 +1300,8 @@ class GatewayStreamConsumer:
         Retries each chunk once on flood-control failures with a short delay.
         """
         final_text = self._clean_for_display(text)
+        # Defensive think-tag scrub — see scrub_thinking_tags_in_prose.
+        final_text = scrub_thinking_tags_in_prose(final_text)
         # Ensure balanced code fences before computing continuation,
         # so the closing fence reaches the user even when the fallback
         # only delivers the tail after mid-stream edits failed.
@@ -1669,6 +1723,8 @@ class GatewayStreamConsumer:
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
         text = self._clean_for_display(text)
+        # Defensive think-tag scrub — see scrub_thinking_tags_in_prose.
+        text = scrub_thinking_tags_in_prose(text)
         if not text.strip():
             return False
         try:
@@ -1925,6 +1981,10 @@ class GatewayStreamConsumer:
         # Media files are delivered as native attachments after the stream
         # finishes (via _deliver_media_from_response in gateway/run.py).
         text = self._clean_for_display(text)
+        # Defensive: scrub any think-tag characters the upstream scrubbers
+        # missed (model-prefixed variants, orphan closes glued to text, …).
+        # Jun 9 2026 — see scrub_thinking_tags_in_prose docstring.
+        text = scrub_thinking_tags_in_prose(text)
         # Ensure code fences are balanced before send/edit.  Model output
         # truncated mid-code-block (e.g. finish_reason="length") leaves an
         # orphaned ``` which, on Discord/Slack/Matrix, causes the entire
