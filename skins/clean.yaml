@@ -38,16 +38,16 @@ tool_prefix: " "
 spinner:
   tool_prefix: " "
 
-  # Map all tool emojis to blank — no emoji decoration in clean mode
-  tool_emojis:
-    terminal: " "
-    web_search: " "
-    file_read: " "
-    file_write: " "
-    bash: " "
-    memory: " "
-    search: " "
-    browser: " "
-    image: " "
-    think: " "
-    cron: " "
+# Map all tool emojis to empty — no emoji decoration in clean mode
+tool_emojis:
+  terminal: ""
+  web_search: ""
+  file_read: ""
+  file_write: ""
+  bash: ""
+  memory: ""
+  search: ""
+  browser: ""
+  image: ""
+  think: ""
+  cron: ""

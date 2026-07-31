@@ -1453,7 +1453,11 @@ def _get_cute_tool_message(
     if tool_name == "skills_list":
         return _wrap(f"┊ {emoji_field}skills    list {args.get('category', 'all')}  {dur}")
     if tool_name == "skill_view":
-        return _wrap(f"┊ {emoji_field}skill     {_trunc(args.get('name', ''), 30)}  {dur}")
+        label = args.get("name", "")
+        file_path = args.get("file_path")
+        if file_path:
+            label = f"{label} → {file_path}" if label else str(file_path)
+        return _wrap(f"┊ {emoji_field}skill     {_trunc(label, 44)}  {dur}")
     if tool_name == "image_generate":
         return _wrap(f"┊ {emoji_field}create    {_trunc(args.get('prompt', ''), 35)}  {dur}")
     if tool_name == "text_to_speech":

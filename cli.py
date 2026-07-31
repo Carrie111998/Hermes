@@ -12706,7 +12706,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         title_align="left",
                         border_style=_resp_color,
                         style=_resp_text,
-                        box=rich_box.SIMPLE,
+                        box=rich_box.HORIZONTALS,
                         padding=(1, 4),
                         width=self._scrollback_box_width(),
                     ))
@@ -12739,7 +12739,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             title="[#CD7F32 bold]⚡ Out of credits[/]",
                             title_align="left",
                             border_style="#CD7F32",
-                            box=rich_box.SIMPLE,
+                            box=rich_box.HORIZONTALS,
                             padding=(1, 4),
                             width=self._scrollback_box_width(),
                         ))

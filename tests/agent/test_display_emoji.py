@@ -121,3 +121,23 @@ class TestSkinConfigToolEmojis:
         data = {"name": "minimal"}
         skin = _build_skin_config(data)
         assert skin.tool_emojis == {}
+
+
+class TestCleanSkinEmojiOverride:
+    """Verify clean skin's empty tool_emojis correctly suppress emojis."""
+
+    def test_clean_skin_empty_override_returns_empty(self):
+        """Clean skin's empty string overrides should return empty, not fall through."""
+        skin = MagicMock()
+        skin.tool_emojis = {"terminal": ""}
+        # With the fix (override is not None), empty string should be returned
+        with mock_patch("agent.display._get_skin", return_value=skin):
+            result = get_tool_emoji("terminal")
+            assert result == ""
+
+    def test_clean_skin_loads_from_builtin(self):
+        """Verify clean skin can be loaded from _BUILTIN_SKINS."""
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("clean")
+        assert skin.name == "clean"
+        assert skin.tool_emojis.get("terminal") == ""

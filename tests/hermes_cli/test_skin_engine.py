@@ -393,3 +393,37 @@ class TestCliBrandingHelpers:
         overrides = get_prompt_toolkit_style_overrides()
         assert overrides["status-bar"] == f"bg:{skin.get_color('status_bar_bg')} {skin.get_color('banner_text')}"
         assert overrides["voice-status"] == f"bg:{skin.get_color('voice_status_bg')} {skin.get_color('ui_label')}"
+
+
+class TestCleanSkin:
+    """Verify the clean skin loads and behaves correctly."""
+
+    def test_clean_skin_loads(self):
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("clean")
+        assert skin.name == "clean"
+        assert skin.tool_prefix == " "
+
+    def test_clean_skin_tool_emojis_empty(self):
+        """Clean skin should have empty tool_emojis to suppress decorations."""
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("clean")
+        assert skin.tool_emojis == {
+            "terminal": "",
+            "web_search": "",
+            "file_read": "",
+            "file_write": "",
+            "bash": "",
+            "memory": "",
+            "search": "",
+            "browser": "",
+            "image": "",
+            "think": "",
+            "cron": "",
+        }
+
+    def test_clean_skin_branding(self):
+        from hermes_cli.skin_engine import load_skin
+        skin = load_skin("clean")
+        assert skin.branding["prompt_symbol"] == ">"
+        assert skin.branding["agent_name"] == "Hermes Agent"
