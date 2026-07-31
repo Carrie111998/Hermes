@@ -3452,6 +3452,7 @@ class SessionBridgeCoordinator:
 
     def health(self) -> dict[str, Any]:
         now = float(self._clock())
+        recent_error_codes = list(self._recent_error_codes)
         providers: dict[str, _ProviderHealth] = {}
         for provider, state in self._provider_health.items():
             last_success = state["last_success"]
@@ -3475,8 +3476,8 @@ class SessionBridgeCoordinator:
                         for state in MirrorJobState
                     }
             except Exception:
-                self._recent_error_codes.append("mirror_queue_health_failed")
-                del self._recent_error_codes[:-_RECENT_ERROR_LIMIT]
+                recent_error_codes.append("mirror_queue_health_failed")
+                del recent_error_codes[:-_RECENT_ERROR_LIMIT]
         return {
             "running": self._running,
             "providers": providers,
@@ -3493,7 +3494,7 @@ class SessionBridgeCoordinator:
             "registration_turn_fallback": self._registration_turn_fallback,
             "sidebar_registration_counts": dict(self._sidebar_registration_counts),
             "provider_calls_inflight": len(self._provider_tasks),
-            "recent_error_codes": list(self._recent_error_codes),
+            "recent_error_codes": recent_error_codes,
         }
 
     def _mirror_policy(self) -> MirrorPolicy:

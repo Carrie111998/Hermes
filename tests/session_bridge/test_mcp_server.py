@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
@@ -29,6 +30,7 @@ from session_bridge.mcp_server import (
     EXPECTED_TOOLS,
     _claude_visibility_status_payload,
     _sidebar_status,
+    _status_payload,
     _validate_windows_token_acl,
     create_app,
     resolve_bearer_token,
@@ -2773,6 +2775,295 @@ def test_sidebar_status_sanitizes_negative_canary_verified_at() -> None:
     assert "-0.001" not in json.dumps(status)
 
 
+def test_session_status_adds_evidence_from_one_sequential_composite_observation(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=bridge_id, source_id=source_id, target_id=target_id
+    )
+    config = BridgeConfig(
+        service=replace(BridgeConfig().service, catalog_scan_seconds=17),
+        claude_visibility=ClaudeVisibilityConfig(enabled=True, continuous=True),
+    )
+    catalog = UnifiedCatalog(db, store)
+    observed_sources: list[str] = []
+    raw_health = {
+        "running": True,
+        "providers": {
+            "claude": {
+                "last_success": 99.0,
+                "lag_seconds": 50.0,
+                "degraded_reason": None,
+            },
+        },
+        "watcher_state": "running",
+        "queue_counts": {
+            "queued": 0,
+            "running": 0,
+            "retry": 0,
+            "succeeded": 0,
+            "manual_failure": 0,
+        },
+        "mirror_mode": "manual",
+        "recent_error_codes": [],
+    }
+    raw_catalog = {
+        "providers": {
+            "claude": {"sessions": 1, "degraded": 0},
+            "codex": {"sessions": 1, "degraded": 0},
+            "hermes": {"sessions": 0, "degraded": 0},
+        },
+        "total_sessions": 2,
+    }
+    raw_sidebar = store.sidebar_delivery_status(
+        inbox_cwd=config.sidebar.inbox_cwd,
+        placement_generation=config.sidebar.placement_generation,
+    )
+    raw_hydration = store.sidebar_hydration_status(100.0)
+    raw_visibility = {
+        "counts": {
+            "claude_pending": 0,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_visible": 0,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [],
+        "usage": {"local_day": None, "attempts": 0, "reserved_cost_usd": "0"},
+    }
+
+    class Hostile:
+        def __str__(self) -> str:
+            raise AssertionError("evidence builder must never stringify unknown objects")
+
+    privacy_canaries: dict[str, object] = {
+        "transcript": "PRIVATE_TRANSCRIPT_CANARY",
+        "token": "PRIVATE_TOKEN_CANARY",
+        "path": "C:\\private\\path-canary",
+        "repository": "PRIVATE_REPOSITORY_CANARY",
+        "branch": "PRIVATE_BRANCH_CANARY",
+        "session_id": "PRIVATE_SESSION_CANARY",
+        "native_id": "PRIVATE_NATIVE_CANARY",
+        "thread_id": "PRIVATE_THREAD_CANARY",
+        "lease_token": "PRIVATE_LEASE_CANARY",
+        "hydration_marker": "PRIVATE_MARKER_CANARY",
+        "pack": "PRIVATE_PACK_CANARY",
+        "idempotency_key": "PRIVATE_IDEMPOTENCY_CANARY",
+        "traceback": "PRIVATE_TRACEBACK_CANARY",
+        "sql": "PRIVATE_SQL_CANARY",
+        "hostile": Hostile(),
+    }
+    for raw_source in (
+        raw_health,
+        raw_catalog,
+        raw_sidebar,
+        raw_hydration,
+        raw_visibility,
+    ):
+        raw_source.update(privacy_canaries)
+
+    def health() -> dict[str, Any]:
+        observed_sources.append("health")
+        return deepcopy(raw_health)
+
+    def catalog_status() -> dict[str, Any]:
+        observed_sources.append("catalog")
+        return deepcopy(raw_catalog)
+
+    def sidebar_status(**_kwargs: object) -> dict[str, Any]:
+        observed_sources.append("sidebar")
+        return deepcopy(raw_sidebar)
+
+    def hydration_status(_now: float) -> dict[str, Any]:
+        observed_sources.append("hydration")
+        return deepcopy(raw_hydration)
+
+    def visibility_status(_now: float) -> dict[str, Any]:
+        observed_sources.append("visibility")
+        return deepcopy(raw_visibility)
+
+    coordinator.health = health  # type: ignore[method-assign]
+    monkeypatch.setattr(catalog, "status", catalog_status)
+    monkeypatch.setattr(store, "sidebar_delivery_status", sidebar_status)
+    monkeypatch.setattr(store, "sidebar_hydration_status", hydration_status)
+    monkeypatch.setattr(store, "claude_visibility_status", visibility_status)
+    timestamps = iter(float(value) for value in range(100, 113))
+    monkeypatch.setattr("session_bridge.mcp_server.time.time", lambda: next(timestamps))
+    app = create_app(
+        catalog=catalog,
+        coordinator=coordinator,
+        store=store,
+        config=config,
+        token=TOKEN,
+        marker_key=MARKER_KEY,
+    )
+
+    with _test_client(app) as client:
+        status = _call_tool(client, "session_status", {})
+
+    expected_legacy = _status_payload(
+        raw_health,
+        raw_catalog,
+        raw_sidebar,
+        raw_hydration,
+        hydration_enabled=config.sidebar.legacy_hydration_enabled,
+    )
+    assert observed_sources == [
+        "health",
+        "catalog",
+        "sidebar",
+        "hydration",
+        "visibility",
+    ]
+    assert status["health"] == expected_legacy["health"]
+    assert status["catalog"] == expected_legacy["catalog"]
+    assert status["sidebar"] == expected_legacy["sidebar"]
+    evidence = status["evidence_v1"]
+    assert evidence["schema_version"] == 1
+    assert evidence["catalog"]["providers"]["claude"]["freshness"] == {
+        "state": "healthy",
+        "code": "within_freshness_limit",
+    }
+    started = evidence["observation_started_at"]
+    completed = evidence["observation_completed_at"]
+    assert started < completed
+    observed_times = [
+        evidence["service"]["observed_at"],
+        evidence["catalog"]["aggregate"]["observed_at"],
+        evidence["queues"]["sidebar_registration"]["work_state"]["observed_at"],
+        evidence["queues"]["sidebar_hydration"]["work_state"]["observed_at"],
+        evidence["queues"]["claude_visibility"]["work_state"]["observed_at"],
+    ]
+    assert observed_times == sorted(observed_times)
+    assert len(set(observed_times)) == len(observed_times)
+    for observed_at in (
+        evidence["service"]["observed_at"],
+        evidence["catalog"]["aggregate"]["observed_at"],
+        evidence["queues"]["sidebar_registration"]["work_state"]["observed_at"],
+        evidence["queues"]["sidebar_hydration"]["work_state"]["observed_at"],
+        evidence["queues"]["claude_visibility"]["work_state"]["observed_at"],
+    ):
+        assert started <= observed_at <= completed
+    serialized_evidence = json.dumps(evidence)
+    for canary in privacy_canaries.values():
+        if type(canary) is str:
+            assert canary not in serialized_evidence
+
+
+def test_session_status_is_read_only_across_sqlite_memory_and_mutation_seams(
+    db: SessionDB,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, bridge_id, source_id, target_id = _seed_linked_pair(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=bridge_id, source_id=source_id, target_id=target_id
+    )
+    config = BridgeConfig(
+        claude_visibility=ClaudeVisibilityConfig(enabled=True, continuous=True)
+    )
+    raw_visibility = {
+        "counts": {
+            "claude_pending": 1,
+            "claude_leased": 0,
+            "claude_retry": 0,
+            "claude_visible": 2,
+            "claude_failed": 0,
+        },
+        "retry_codes": {},
+        "failed_codes": {},
+        "fatal": [],
+        "usage": {"local_day": "2026-07-31", "attempts": 2, "reserved_cost_usd": "0"},
+        "lineage": {
+            "unlinked_visible": 0,
+            "repairable": 0,
+            "blocked": 0,
+            "blocker_codes": {},
+        },
+    }
+    monkeypatch.setattr(
+        store, "claude_visibility_status", lambda _now: deepcopy(raw_visibility)
+    )
+    assert db._conn is not None
+    before_changes = db._conn.total_changes
+    before_tables = [
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall()
+    ]
+    before_rows = {
+        table[0]: tuple(
+            tuple(row)
+            for row in db._conn.execute(f'SELECT * FROM "{table[0]}"').fetchall()
+        )
+        for table in before_tables
+        if not table[0].startswith("fts_") and not table[0].startswith("sqlite_")
+    }
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("session_status invoked a write-capable seam")
+
+    for name in (
+        "claim_sidebar_jobs",
+        "claim_sidebar_hydration_jobs",
+        "reserve_sidebar_creation",
+        "reserve_sidebar_hydration",
+        "bind_sidebar_thread",
+        "commit_sidebar_job",
+        "fail_sidebar_job",
+        "enqueue_sidebar_job",
+        "enqueue_sidebar_hydration",
+    ):
+        if hasattr(store, name):
+            monkeypatch.setattr(store, name, forbidden)
+    for name in (
+        "continue_session",
+        "claim_sidebar_jobs_for_delivery",
+        "claim_sidebar_hydration_for_delivery",
+        "commit_sidebar_job",
+        "bind_sidebar_thread",
+    ):
+        if hasattr(coordinator, name):
+            monkeypatch.setattr(coordinator, name, forbidden)
+
+    protected_memory = {
+        key: deepcopy(value)
+        for key, value in coordinator.__dict__.items()
+        if key not in {"started", "stopped"}
+    }
+    app = create_app(
+        catalog=UnifiedCatalog(db, store),
+        coordinator=coordinator,
+        store=store,
+        config=config,
+        token=TOKEN,
+        marker_key=MARKER_KEY,
+    )
+    with _test_client(app) as client:
+        status = _call_tool(client, "session_status", {})
+
+    assert status["evidence_v1"]["schema_version"] == 1
+    assert db._conn.total_changes == before_changes
+    assert {
+        key: value
+        for key, value in coordinator.__dict__.items()
+        if key in protected_memory
+    } == protected_memory
+    after_rows = {
+        table[0]: tuple(
+            tuple(row)
+            for row in db._conn.execute(f'SELECT * FROM "{table[0]}"').fetchall()
+        )
+        for table in before_tables
+        if not table[0].startswith("fts_") and not table[0].startswith("sqlite_")
+    }
+    assert after_rows == before_rows
+
+
 def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,
@@ -2836,7 +3127,7 @@ def test_session_status_uses_explicit_schemas_and_never_stringifies_unknowns(
     with _test_client(app) as client:
         status = _call_tool(client, "session_status", {})
 
-    assert set(status) == {"health", "catalog", "sidebar"}
+    assert set(status) == {"health", "catalog", "sidebar", "evidence_v1"}
     assert status["health"] == {
         "running": True,
         "providers": {

@@ -641,6 +641,62 @@ async def test_continuation_reconcile_cursor_reaches_second_page(
     assert store.after_calls == [None, "bridge:0004"]
 
 
+class _FailingHealthStore:
+    def __init__(self) -> None:
+        self.state = {"sentinel": "unchanged"}
+
+    def mirror_job_counts(self) -> dict[str, int]:
+        raise RuntimeError("fixed mirror queue query failure")
+
+
+def retained_coordinator_snapshot(
+    coordinator: SessionBridgeCoordinator,
+) -> dict[str, Any]:
+    return {
+        "provider_health": deepcopy(coordinator._provider_health),
+        "recent_error_codes": list(coordinator._recent_error_codes),
+        "backfill_progress": deepcopy(coordinator._backfill_progress),
+        "sidebar_registration_counts": deepcopy(
+            coordinator._sidebar_registration_counts
+        ),
+        "watcher_state": (
+            coordinator._watcher_state,
+            coordinator._watcher_error_code,
+        ),
+        "store_state": deepcopy(vars(coordinator._store)),
+    }
+
+
+def test_health_queue_query_failure_is_response_local_and_read_only() -> None:
+    store = _FailingHealthStore()
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={},
+        clock=lambda: 100.0,
+    )
+    coordinator._provider_health[Provider.CLAUDE]["last_success"] = 90.0
+    coordinator._recent_error_codes.append("catalog_scan_loop_failed")
+    coordinator._backfill_progress[Provider.CODEX] = {
+        "state": "continuous",
+        "indexed": 3,
+    }
+    coordinator._sidebar_registration_counts["examined"] = 2
+    coordinator._watcher_state = "degraded"
+    coordinator._watcher_error_code = "claude_watcher_failed"
+    before = retained_coordinator_snapshot(coordinator)
+
+    first = coordinator.health()
+    second = coordinator.health()
+
+    assert first["recent_error_codes"] == [
+        *before["recent_error_codes"],
+        "mirror_queue_health_failed",
+    ]
+    assert second["recent_error_codes"] == first["recent_error_codes"]
+    assert retained_coordinator_snapshot(coordinator) == before
+
+
 @pytest.mark.asyncio
 async def test_background_scan_failure_is_reported_and_next_cycle_runs(
     monkeypatch: pytest.MonkeyPatch,
