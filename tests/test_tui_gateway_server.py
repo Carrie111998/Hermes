@@ -7381,6 +7381,28 @@ def test_session_compress_sync_failure_discards_lcm_notification(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_get_usage_prefers_configured_context_length_for_status_denominator():
+    agent = types.SimpleNamespace(
+        _config_context_length=200_000,
+        context_compressor=types.SimpleNamespace(
+            compression_count=0,
+            context_length=128_000,
+            last_prompt_tokens=40_000,
+        ),
+        model="local-model",
+        session_api_calls=1,
+        session_input_tokens=40_000,
+        session_output_tokens=1_000,
+        session_total_tokens=41_000,
+    )
+
+    usage = server._get_usage(agent)
+
+    assert usage["context_used"] == 40_000
+    assert usage["context_max"] == 200_000
+    assert usage["context_percent"] == 20
+
+
 def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
     class _ExplodingWorker:
         def __init__(self, *args, **kwargs):

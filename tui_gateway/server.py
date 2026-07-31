@@ -4591,7 +4591,13 @@ def _get_usage(agent) -> dict:
         last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
         if last_prompt < 0:
             last_prompt = 0
-        ctx_max = getattr(comp, "context_length", 0) or 0
+        configured_ctx = getattr(agent, "_config_context_length", 0) or 0
+        configured_ctx = (
+            configured_ctx
+            if isinstance(configured_ctx, int) and not isinstance(configured_ctx, bool) and configured_ctx > 0
+            else 0
+        )
+        ctx_max = configured_ctx or getattr(comp, "context_length", 0) or 0
         if ctx_max and last_prompt:
             usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
