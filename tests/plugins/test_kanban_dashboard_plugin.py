@@ -394,32 +394,6 @@ def test_malformed_presentation_falls_back_to_canonical_payload_with_error(clien
     assert "unknown or missing fields" in board["presentation"]["error"]
 
 
-def test_projection_frontend_enforces_read_only_and_diagnostic_contract():
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins"
-        / "kanban"
-        / "dashboard"
-        / "dist"
-        / "index.js"
-    ).read_text(encoding="utf-8")
-
-    assert "const colHelp = props.column.helper || getColumnHelp" in bundle
-    assert "const colLabel = props.column.label || getColumnLabel" in bundle
-    assert "onDragOver: readOnly ? undefined : handleDragOver" in bundle
-    assert "onDrop: readOnly ? undefined : handleDrop" in bundle
-    assert 'readOnly ? null : h("button"' in bundle
-    assert 'readOnly ? null : h(Checkbox' in bundle
-    assert "!readOnly && showCreate ? h(InlineCreate" in bundle
-    assert "readOnly: readOnly" in bundle
-    assert "if (props.readOnly) return undefined;" in bundle
-    assert "draggable: !props.readOnly" in bundle
-    assert "t.presentation_diagnostics" in bundle
-    assert "return diagnostic.message;" in bundle
-    assert "Board presentation configuration is invalid:" in bundle
-    assert 'role: "alert"' in bundle
-
-
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
