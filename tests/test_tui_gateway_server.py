@@ -7601,6 +7601,43 @@ def test_approval_respond_rejects_invalid_choice_without_resolving():
         server._sessions.pop("sid", None)
 
 
+def test_approval_respond_rejects_choice_not_offered_for_exact_request():
+    from tools.approval import _ApprovalEntry, _gateway_queues
+
+    current = _ApprovalEntry(
+        {
+            "approval_id": "approval-current",
+            "command": "current command",
+            "allow_session": False,
+            "allow_permanent": False,
+        }
+    )
+    server._sessions["sid"] = _session()
+    _gateway_queues["session-key"] = [current]
+
+    try:
+        invalid = server.handle_request(
+            {
+                "id": "1",
+                "method": "approval.respond",
+                "params": {
+                    "session_id": "sid",
+                    "approval_id": "approval-current",
+                    "choice": "session",
+                },
+            }
+        )
+
+        assert invalid["error"]["code"] == 4004
+        assert "approval choice not offered" in invalid["error"]["message"]
+        assert _gateway_queues["session-key"] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+    finally:
+        _gateway_queues.pop("session-key", None)
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 

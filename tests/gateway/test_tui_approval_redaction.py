@@ -33,5 +33,27 @@ class TestTuiApprovalEmitRedaction:
         assert "ghp_01...6789" not in emitted["payload"]["command"]
         assert emitted["payload"]["description"] == "x"
         assert "github.com" in emitted["payload"]["command"]
+        assert "choices" not in emitted["payload"]
 
+    def test_emit_approval_request_uses_exact_request_choices(self, monkeypatch):
+        from tui_gateway import server as tui_server
 
+        emitted = {}
+        monkeypatch.setattr(
+            tui_server,
+            "_emit",
+            lambda event, sid, payload=None: emitted.update(
+                {"event": event, "sid": sid, "payload": payload}
+            ),
+        )
+
+        tui_server._emit_approval_request(
+            "sess-1",
+            {
+                "command": "dangerous",
+                "allow_session": False,
+                "allow_permanent": False,
+            },
+        )
+
+        assert emitted["payload"]["choices"] == ["once", "deny"]

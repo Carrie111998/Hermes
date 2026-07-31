@@ -206,6 +206,32 @@ class TestBlockingGatewayApproval:
         assert current.result is None
         assert not current.event.is_set()
 
+    def test_exact_id_rejects_choice_not_offered_by_approval(self):
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, resolve_gateway_approval,
+        )
+
+        session_key = "test-offered-choice"
+        current = _ApprovalEntry(
+            {
+                "command": "current",
+                "allow_session": False,
+                "allow_permanent": False,
+            }
+        )
+        _gateway_queues[session_key] = [current]
+
+        with pytest.raises(ValueError, match="approval choice not offered"):
+            resolve_gateway_approval(
+                session_key,
+                "session",
+                approval_id=current.approval_id,
+            )
+
+        assert _gateway_queues[session_key] == [current]
+        assert current.result is None
+        assert not current.event.is_set()
+
 
 # ------------------------------------------------------------------
 # /approve command

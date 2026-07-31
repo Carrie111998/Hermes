@@ -71,15 +71,15 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
 def _approval_event_choices(
     *, smart_denied: bool, allow_permanent: bool, allow_session: bool = True
 ) -> list[str]:
-    if smart_denied:
-        return ["once", "deny"]
-    choices = ["once"]
-    if allow_session:
-        choices.append("session")
-    if allow_permanent:
-        choices.append("always")
-    choices.append("deny")
-    return choices
+    from tools.approval import gateway_approval_choices
+
+    return gateway_approval_choices(
+        {
+            "smart_denied": smart_denied,
+            "allow_permanent": allow_permanent,
+            "allow_session": allow_session,
+        }
+    )
 
 
 def _public_run_approval(approval: dict) -> dict:

@@ -877,14 +877,14 @@ def _(rid, params: dict) -> dict:
 
         try:
             choice = normalize_gateway_approval_choice(params.get("choice"))
+            resolved = resolve_gateway_approval(
+                session["session_key"],
+                choice,
+                approval_id=approval_id,
+            )
         except ValueError as exc:
             return _err(rid, 4004, str(exc))
 
-        resolved = resolve_gateway_approval(
-            session["session_key"],
-            choice,
-            approval_id=approval_id,
-        )
         return _ok(rid, {"resolved": resolved})
     except Exception as e:
         return _err(rid, 5004, str(e))

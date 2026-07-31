@@ -2182,6 +2182,19 @@ def normalize_gateway_approval_choice(choice: object) -> str:
     return normalized
 
 
+def gateway_approval_choices(approval: dict) -> list[str]:
+    """Return the choices offered by one gateway approval request."""
+    if approval.get("smart_denied"):
+        return ["once", "deny"]
+    choices = ["once"]
+    if approval.get("allow_session") is not False:
+        choices.append("session")
+    if approval.get("allow_permanent") is not False:
+        choices.append("always")
+    choices.append("deny")
+    return choices
+
+
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
@@ -2245,6 +2258,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
             )
             if target_index is None:
                 return 0
+            offered_choices = gateway_approval_choices(queue[target_index].data)
+            if choice not in offered_choices:
+                expected = ", ".join(offered_choices)
+                raise ValueError(
+                    f"approval choice not offered; expected one of: {expected}"
+                )
             targets = [queue.pop(target_index)]
         elif resolve_all:
             targets = list(queue)
