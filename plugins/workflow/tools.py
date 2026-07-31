@@ -239,6 +239,15 @@ def _handle_workflow_start_predefined(
             # Validate provided inputs and attachments against declarations
             try:
                 wf_def = engine.load_workflow(workflow)
+                # Check for unknown inputs
+                declared_inputs = {inp["name"] for inp in getattr(wf_def, "inputs", [])}
+                if inputs and declared_inputs:
+                    unknown = set(inputs.keys()) - declared_inputs
+                    if unknown:
+                        return _err(
+                            f"Unknown input(s): {', '.join(sorted(unknown))}",
+                            hint=f"Declared inputs: {', '.join(sorted(declared_inputs))}",
+                        )
                 for inp in getattr(wf_def, "inputs", []):
                     if inp.get("required", False):
                         if not inputs or inp["name"] not in inputs:
@@ -246,6 +255,15 @@ def _handle_workflow_start_predefined(
                                 f"Missing required input: '{inp['name']}'",
                                 hint=inp.get("description", ""),
                             )
+                # Check for unknown attachments
+                declared_atts = {att["name"] for att in getattr(wf_def, "attachments", [])}
+                if attachments and declared_atts:
+                    unknown_att = set(attachments.keys()) - declared_atts
+                    if unknown_att:
+                        return _err(
+                            f"Unknown attachment(s): {', '.join(sorted(unknown_att))}",
+                            hint=f"Declared attachments: {', '.join(sorted(declared_atts))}",
+                        )
                 for att in getattr(wf_def, "attachments", []):
                     if att.get("required", False):
                         if not attachments or att["name"] not in attachments:
