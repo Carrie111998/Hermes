@@ -20,6 +20,7 @@ const ref = <T>(current: T) => ({ current })
 const buildCtx = (appended: Msg[]) =>
   ({
     composer: {
+      clearPendingSteer: vi.fn(),
       dequeue: () => undefined,
       queueEditRef: ref<null | number>(null),
       sendQueued: vi.fn(),

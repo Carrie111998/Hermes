@@ -1,5 +1,6 @@
 import type { GatewayClient } from '../gatewayClient.js'
-import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
+import type { InputDetectDropResponse, PromptSubmitResponse, SessionSteerResponse } from '../gatewayTypes.js'
+import { asRpcResult } from '../lib/rpc.js'
 import type { Msg } from '../types.js'
 
 import { turnController } from './turnController.js'
@@ -123,4 +124,27 @@ export function submitPrompt(
       startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)
     })
     .catch(() => startSubmit(text, deps.expand(text), showUserMessage))
+}
+
+export interface SubmitSteerDeps {
+  gw: GatewayClient
+  onQueued: () => void
+  onRejected: (note: string) => void
+}
+
+// Fire the mid-run steer RPC and dispatch the outcome by callback. Kept as a
+// pure function (mirroring submitPrompt) so the accepted/rejected/error paths
+// are unit-testable without a React harness; useSubmission wires the UI side.
+export function submitSteer(sid: string, text: string, deps: SubmitSteerDeps): void {
+  deps.gw
+    .request<SessionSteerResponse>('session.steer', { session_id: sid, text })
+    .then(raw => {
+      const r = asRpcResult<SessionSteerResponse>(raw)
+      if (r?.status !== 'queued') {
+        deps.onRejected('steer rejected — message queued for next turn')
+      } else {
+        deps.onQueued()
+      }
+    })
+    .catch(() => deps.onRejected('steer failed — message queued for next turn'))
 }

@@ -380,6 +380,8 @@ export interface ComposerActions {
   setHistoryIdx: StateSetter<null | number>
   setInput: StateSetter<string>
   setInputBuf: StateSetter<string[]>
+  pushPendingSteer: (text: string) => void
+  clearPendingSteer: () => void
   setQueueEdit: (index: null | number) => void
   syncQueue: () => void
   /** Reconcile attached payloads against tokens still present in the text. */
@@ -402,6 +404,7 @@ export interface ComposerState {
   historyIdx: null | number
   input: string
   inputBuf: string[]
+  pendingSteer: string[]
   queueEditIdx: null | number
   queuedDisplay: string[]
   tokens: ComposerToken[]
@@ -462,6 +465,7 @@ export interface InputHandlerResult {
 
 export interface GatewayEventHandlerContext {
   composer: {
+    clearPendingSteer: () => void
     setInput: StateSetter<string>
   }
   gateway: GatewayServices
@@ -568,6 +572,7 @@ export interface AppLayoutComposerProps {
   input: string
   inputBuf: string[]
   pagerPageSize: number
+  pendingSteer: string[]
   queueEditIdx: null | number
   queuedDisplay: string[]
   submit: (value: string) => void

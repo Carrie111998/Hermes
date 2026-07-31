@@ -4,13 +4,13 @@ import { TYPING_IDLE_MS } from '../config/timing.js'
 import { expandTokens } from '../domain/attachments.js'
 import { completionToApplyOnSubmit, looksLikeSlashCommand } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { SessionSteerResponse, ShellExecResponse } from '../gatewayTypes.js'
+import type { ShellExecResponse } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
 import type { Msg } from '../types.js'
 
 import type { ComposerActions, ComposerRefs, ComposerState } from './interfaces.js'
-import { submitPrompt } from './submissionCore.js'
+import { submitPrompt, submitSteer } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
 
@@ -180,16 +180,19 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       if (mode === 'steer' && live.sid) {
-        gw.request<SessionSteerResponse>('session.steer', { session_id: live.sid, text: full })
-          .then(raw => {
-            const r = asRpcResult<SessionSteerResponse>(raw)
-
-            if (r?.status !== 'queued') {
-              fallback('steer rejected — message queued for next turn')
-            }
-          })
-          .catch(() => fallback('steer failed — message queued for next turn'))
-
+        submitSteer(live.sid, full, {
+          gw,
+          onQueued: () => {
+            // Accepted into the live turn: surface the steered text in the
+            // composer-adjacent pending strip (always visible at the bottom,
+            // unlike the transcript tail, which the live turn scrolls past).
+            // Multiple steers accumulate; the strip clears when the next
+            // Multiple steers accumulate; the strip clears when the backend
+            // injects them (next tool batch drain) or the turn ends.
+            composerActions.pushPendingSteer(full)
+          },
+          onRejected: fallback
+        })
         return
       }
 

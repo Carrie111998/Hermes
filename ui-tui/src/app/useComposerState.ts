@@ -114,6 +114,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   // of truth for "what is in the composer right now".
   const inputRef = useRef('')
   const tokensRef = useRef<ComposerToken[]>([])
+  const [pendingSteer, setPendingSteer] = useState<string[]>([])
 
   const setInput = useCallback<StateSetter<string>>(next => {
     inputRef.current = typeof next === 'function' ? next(inputRef.current) : next
@@ -230,6 +231,11 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     [attachImageToken, gw, sys]
   )
 
+  const pushPendingSteer = useCallback(
+    (text: string) => setPendingSteer(prev => [...prev, text]),
+    []
+  )
+  const clearPendingSteer = useCallback(() => setPendingSteer([]), [])
   const handleResolvedPaste = useCallback(
     async ({ bracketed, cursor, text, value }: Omit<PasteEvent, 'hotkey'>): Promise<ComposerPasteResult | null> => {
       const cleanedText = stripTrailingPasteNewlines(text)
@@ -443,6 +449,8 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       setHistoryIdx,
       setInput,
       setInputBuf,
+      pushPendingSteer,
+      clearPendingSteer,
       setQueueEdit,
       syncQueue,
       syncTokens
@@ -462,6 +470,9 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       setComposerTokens,
       setHistoryIdx,
       setInput,
+      setInputBuf,
+      pushPendingSteer,
+      clearPendingSteer,
       setQueueEdit,
       syncQueue,
       syncTokens
@@ -488,11 +499,12 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
       historyIdx,
       input,
       inputBuf,
+      pendingSteer,
       queueEditIdx,
       queuedDisplay,
       tokens
     }),
-    [compIdx, compReplace, completions, historyIdx, input, inputBuf, queueEditIdx, queuedDisplay, tokens]
+    [compIdx, compReplace, completions, historyIdx, input, inputBuf, pendingSteer, queueEditIdx, queuedDisplay, tokens]
   )
 
   return {
