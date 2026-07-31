@@ -155,6 +155,9 @@ export function FloatingPet() {
     // via hasPetSpriteForMeta + mergePetInfoMeta.
     if (changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
       setPetInfo({ enabled: false })
+      // A successful disable (including from Hide via setPetEnabled) clears
+      // the dismiss flag so a later re-enable isn't blocked.
+      $petDismissed.set(false)
 
       return
     }
@@ -477,7 +480,7 @@ export function FloatingPet() {
         }}
       />
       {bubble && (
-        <div style={{ marginBottom: 4, position: 'relative', zIndex: 2 }}>
+        <div style={{ bottom: '100%', left: '50%', marginBottom: 4, position: 'absolute', transform: 'translateX(-50%)', zIndex: 2 }}>
           <PetBubble />
         </div>
       )}
