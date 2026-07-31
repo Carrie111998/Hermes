@@ -2219,6 +2219,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                             judge_exc,
                             exc_info=True,
                         )
+                        # A transport/API failure (e.g. GeminiAPIError) is an
+                        # INFRASTRUCTURE fault, not a work-quality signal. Do NOT
+                        # let it burn the block-recurrence budget or wedge the
+                        # worker: classify it as an unreachable judge and report
+                        # accurately instead of crashing on an unbound `verdict`.
+                        verdict = "rejected"
+                        reason = (
+                            f"goal judge unreachable (transport/API error): "
+                            f"{type(judge_exc).__name__}; operator evidence required"
+                        )
                     if verdict != "done":
                         print(
                             f"kanban: goal completion of {tid} rejected by judge: {reason}. "
@@ -2236,7 +2246,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)
-                print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)
+                # Surface the ACTUAL status instead of the factually false
+                # "unknown id or terminal state" string. A card in `triage`
+                # (parked by the block-loop breaker) is neither unknown nor
+                # terminal; report its real status so the operator can decide.
+                cur_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?", (tid,)
+                ).fetchone()
+                real_status = cur_row["status"] if cur_row else "gone"
+                print(
+                    f"cannot complete {tid}: current status is '{real_status}'; "
+                    f"complete accepts running|ready|blocked|triage",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Completed {tid}")
     return 0 if not failed else 1
