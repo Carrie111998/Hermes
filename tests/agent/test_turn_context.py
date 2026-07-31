@@ -208,6 +208,22 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_false_recall_policy_keeps_lifecycle_and_skips_prefetch():
+    agent = _FakeAgent()
+    agent._auto_inject_recall = False
+    manager = MagicMock()
+    manager.prefetch_all.return_value = "operator recall"
+    agent._memory_manager = manager
+
+    ctx = _build(agent)
+
+    manager.on_turn_start.assert_called_once()
+    assert manager.on_turn_start.call_args.args[1] == "hello"
+    manager.prefetch_all.assert_not_called()
+    assert ctx.ext_prefetch_cache == ""
+    assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]

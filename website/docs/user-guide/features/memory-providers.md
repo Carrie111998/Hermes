@@ -25,6 +25,25 @@ memory:
   provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
 ```
 
+## Control Automatic Recall Injection
+
+External provider recall is injected automatically by default. Set `memory.auto_inject_recall` to control the global default, then use a boolean platform override when a customer-facing gateway needs different treatment:
+
+```yaml
+memory:
+  auto_inject_recall: true
+
+gateway:
+  platforms:
+    whatsapp:
+      memory:
+        auto_inject_recall: false
+```
+
+The platform value wins when it is `true` or `false`; every other value keeps the global setting. Disabling automatic recall injection skips only the provider prefetch that adds recalled context to an API request. It leaves built-in `MEMORY.md` and `USER.md`, provider system-prompt blocks, provider synchronization, lifecycle callbacks, and explicit memory tools available.
+
+Gateway sessions resolve this setting when constructing their agent. A changed effective value rebuilds a cached agent before its next request.
+
 ## How It Works
 
 When a memory provider is active, Hermes automatically:

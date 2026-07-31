@@ -169,6 +169,13 @@ _INTERNAL_NOTE_RE = re.compile(
     r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*',
     re.IGNORECASE,
 )
+_MANAGER_RECALL_FRAME_RE = re.compile(
+    r'<\s*memory-context\s*>\s*'
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*'
+    r'Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*'
+    r'[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
 
 
 def sanitize_context(text: str) -> str:
@@ -177,6 +184,11 @@ def sanitize_context(text: str) -> str:
     text = _INTERNAL_NOTE_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
     return text
+
+
+def render_api_content_without_manager_recall(api_content: str) -> str:
+    """Remove manager-signed recall frames from a copied outbound sidecar."""
+    return _MANAGER_RECALL_FRAME_RE.sub('', api_content)
 
 
 class StreamingContextScrubber:
