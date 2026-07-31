@@ -1220,7 +1220,7 @@ def test_failed_tool_result_projection_fails_closed(transport):
 
 
 @pytest.mark.asyncio
-async def test_runtime_bridge_halts_immediately_on_terminal_platform_error():
+async def test_runtime_bridge_preserves_terminal_platform_error_code():
     queue = asyncio.Queue()
     session = RuntimeBridgeSession(
         "run_terminal",
@@ -1261,7 +1261,7 @@ async def test_runtime_bridge_halts_immediately_on_terminal_platform_error():
     })
     result = json.loads(await call)
     assert result["error"]["code"] == "tool_not_implemented"
-    assert decisions[0].code == "terminal_platform_error"
+    assert decisions[0].code == "tool_not_implemented"
     assert decisions[0].count == 1
 
 

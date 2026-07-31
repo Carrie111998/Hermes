@@ -51,6 +51,7 @@ _TERMINAL_PLATFORM_ERROR_CODES = {
     "model_not_allowed",
     "provider_unavailable",
     "scope_denied",
+    "tool_call_limit_exceeded",
     "tool_not_allowed",
     "tool_not_implemented",
     "unsupported_capability",
@@ -1026,7 +1027,7 @@ class RuntimeBridgeSession:
                 self.non_retryable_failures[signature_key] = code
             if code in _TERMINAL_PLATFORM_ERROR_CODES:
                 message = str(error.get("message") or f"{name} failed with {code}")
-                self._halt_tool_loop(name, args, "terminal_platform_error", message, 1)
+                self._halt_tool_loop(name, args, code, message, 1)
         return json.dumps(failure, ensure_ascii=False, separators=(",", ":"))
 
     def submit_result(self, result: dict[str, Any]) -> bool:
