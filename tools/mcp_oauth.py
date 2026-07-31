@@ -911,7 +911,11 @@ def _make_callback_waiter(port: int):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=server.serve_forever,
+            kwargs={"poll_interval": 0.1},
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -942,7 +946,9 @@ def _make_callback_waiter(port: int):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=1.0)
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
