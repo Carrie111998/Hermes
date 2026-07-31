@@ -1140,7 +1140,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             )
 
         file_ops = _get_file_ops(task_id)
-        workspace_only = bool(getattr(file_ops.env, "_workspace_only", False))
+        # Strict identity check: the real Docker env stores a bool; duck-typed
+        # doubles (MagicMock) must not flip reads onto the workspace-only path.
+        workspace_only = getattr(file_ops.env, "_workspace_only", False) is True
         _resolved = Path(path) if workspace_only else _resolve_path_for_task(path, task_id)
 
         # ── Structured-document extraction ────────────────────────────
