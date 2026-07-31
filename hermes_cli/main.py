@@ -18016,41 +18016,98 @@ def main():
             for sid in ancestors:
                 seen.pop(sid, None)
 
-            print(f"⚙️  sessions search {query}\n")
+            import os as _os
+            import time as _time
             from datetime import datetime as _dt
-            print(f"  {'#':>2}  {'Title':<26} {'Model':<12} {'Msgs':>4}  {'Source':<6} {'Preview':<30} {'Last Active':<12} {'ID'}")
-            print(f"  {'─'*2}  {'─'*26} {'─'*12} {'─'*4}  {'─'*6} {'─'*30} {'─'*12} {'─'*24}")
 
-            # Batch-fetch previews (first 60 chars of first user message per session)
-            sids = list(seen.keys())
-            placeholders = ",".join("?" for _ in sids)
+            # Sort by last_active descending (most recent first)
+            sids_sorted = list(seen.keys())
             conn = db._conn
+            ph_sorted = ",".join("?" for _ in sids_sorted)
             cur = conn.execute(
-                f"SELECT session_id, substr(content, 1, 60) FROM messages "
-                f"WHERE session_id IN ({placeholders}) AND role = 'user' "
-                f"GROUP BY session_id ORDER BY MIN(id)",
-                sids,
+                f"SELECT id, COALESCE(ended_at, started_at, 0) FROM sessions WHERE id IN ({ph_sorted})",
+                sids_sorted,
             )
-            preview_map = {row[0]: row[1] for row in cur.fetchall()}
+            sid_latest = {row[0]: row[1] for row in cur.fetchall()}
+            sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
+            seen = {sid: seen[sid] for sid in sids_sorted}
 
+            # Batch-fetch root ancestor previews
+            root_preview_cache = {}
+            for sid in seen:
+                current = sid
+                while current:
+                    m = db.get_session(current) or {}
+                    parent = m.get("parent_session_id")
+                    if parent:
+                        current = parent
+                    else:
+                        break
+                root_id = current
+                cur = conn.execute(
+                    "SELECT substr(content, 1, 60) FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
+                    (root_id,),
+                )
+                row = cur.fetchone()
+                root_preview_cache[sid] = row[0] if row else ""
+
+            # Batch-fetch user/assistant message counts
+            cur = conn.execute(
+                f"SELECT session_id, role, COUNT(*) FROM messages WHERE session_id IN ({ph_sorted}) GROUP BY session_id, role",
+                sids_sorted,
+            )
+            role_counts = {}
+            for sid, role, cnt in cur.fetchall():
+                if sid not in role_counts:
+                    role_counts[sid] = {}
+                role_counts[sid][role] = cnt
+
+            # Detect terminal width for dynamic title sizing
+            import shutil as _shutil
+            term_w = _shutil.get_terminal_size((80, 24)).columns
+            fixed_w = 3 + 7 + 10 + 10 + 14 + 10
+            title_w = max(20, term_w - fixed_w)
+
+            print(f"⚙️  sessions search {query}\n")
+            print(f"  {'#':>2}  {'Title':<{title_w}} {'U/A':>7}  {'Created':<10} {'Last Active':<10} {'ID'}")
+            print(f"  {'─'*2}  {'─'*title_w} {'─'*7}  {'─'*10} {'─'*10} {'─'*14}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
-                title = (meta.get("title") or "—")[:24]
-                if len(meta.get("title") or "") >= 24:
-                    title = title[:23] + "…"
+                title = (meta.get("title") or "—")[:title_w]
                 started = meta.get("started_at")
-                when = _dt.fromtimestamp(started).strftime("%b %d") if started else "?"
-                source = r.get("source", "?")[:6]
-                model_raw = (r.get("model") or "—")
-                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 12:
-                    model = model[:11] + "…"
-                mc = meta.get("message_count")
-                msgs_str = str(mc) if mc is not None else "—"
-                preview = (preview_map.get(sid) or "")[:28]
-                if len(preview) >= 28:
-                    preview = preview[:27] + "…"
-                print(f"  {idx:>2}  {title:<26} {model:<12} {msgs_str:>4}  {source:<6} {preview:<30} {when:<12} {sid}")
+                created = _dt.fromtimestamp(started).strftime("%Y-%m-%d") if started else "?"
+                last_active_ts = sid_latest.get(sid)
+                if last_active_ts:
+                    age = int(_time.time() - last_active_ts)
+                    if age < 60:
+                        when = f"{age}s ago"
+                    elif age < 3600:
+                        when = f"{age // 60}m ago"
+                    elif age < 86400:
+                        when = f"{age // 3600}h ago"
+                    else:
+                        when = f"{age // 86400}d ago"
+                else:
+                    when = "?"
+                cwd = meta.get("cwd") or ""
+                if cwd:
+                    home = _os.environ.get("HOME", "")
+                    if cwd.startswith(home):
+                        cwd = "~" + cwd[len(home):]
+                    if len(cwd) > 10:
+                        cwd = "…" + cwd[-(9):]
+                else:
+                    cwd = "—"
+                rc = role_counts.get(sid, {})
+                u = rc.get("user", 0)
+                a = rc.get("assistant", 0)
+                ua_str = f"{u}u/{a}a" if u or a else "—"
+                pv = (root_preview_cache.get(sid) or "")[:28]
+                if len(root_preview_cache.get(sid) or "") >= 28:
+                    pv = pv[:27] + "…"
+                print(f"  {idx:>2}  {title:<{title_w}} {ua_str:>7}  {created:<10} {when:<10} {sid[:14]}")
+                if pv:
+                    print(f"     {pv}")
             print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 
