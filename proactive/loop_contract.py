@@ -16,44 +16,61 @@ class LoopContractError(ValueError):
     """Raised when Grace has not supplied an executable contract."""
 
 
+_DISPLAY_ID_END = r"(?![0-9A-Za-z_-]|\.(?=[0-9A-Za-z_]))"
 _FACEBOOK_MARKETPLACE_TARGET_PATTERNS = (
     re.compile(
         r"Facebook\s+Marketplace\s+item\s+(?P<id>[0-9]+)"
-        r"(?![0-9A-Za-z])",
+        + _DISPLAY_ID_END,
         flags=re.IGNORECASE,
     ),
     re.compile(
         r"Facebook\s+Marketplace\s+(?:listing\s+)?ID\s*[:：]?\s*"
-        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
+        r"(?P<id>[0-9]+)" + _DISPLAY_ID_END,
         flags=re.IGNORECASE,
     ),
     re.compile(
         r"Facebook\s+(?:市集項目|市集刊登)(?:\s*ID)?\s*[:：]?\s*"
-        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"https://(?:(?:www|m)\.)?facebook\.com/marketplace/item/"
-        r"(?P<id>[0-9]+)(?:[/?#]|$)",
+        r"(?P<id>[0-9]+)" + _DISPLAY_ID_END,
         flags=re.IGNORECASE,
     ),
 )
 _FACEBOOK_GROUP_TARGET_PATTERNS = (
     re.compile(
         r"Facebook\s+Group(?:\s+ID)?\s*[:：]?\s*(?P<id>[0-9]+)"
-        r"(?![0-9A-Za-z])",
+        + _DISPLAY_ID_END,
         flags=re.IGNORECASE,
     ),
     re.compile(
         r"Facebook\s+(?:社團|群組)(?:\s*ID)?\s*[:：]?\s*"
-        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
+        r"(?P<id>[0-9]+)" + _DISPLAY_ID_END,
+        flags=re.IGNORECASE,
+    ),
+)
+_FACEBOOK_MARKETPLACE_EXACT_TARGET_PATTERNS = (
+    re.compile(
+        r"(?:https://)?(?:(?:www|m)\.)?facebook\.com/marketplace/item/"
+        r"(?P<id>[0-9]+)(?:[/?#][^\s]*)?",
         flags=re.IGNORECASE,
     ),
     re.compile(
-        r"https://(?:(?:www|m)\.)?facebook\.com/groups/"
-        r"(?P<id>[0-9]+)(?:[/?#]|$)",
+        r"facebook:marketplace:(?P<id>[0-9]+)",
         flags=re.IGNORECASE,
     ),
+)
+_FACEBOOK_GROUP_EXACT_TARGET_PATTERNS = (
+    re.compile(
+        r"(?:https://)?(?:(?:www|m)\.)?facebook\.com/groups/"
+        r"(?P<id>[0-9]+)(?:[/?#][^\s]*)?",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"facebook:group:(?P<id>[0-9]+)",
+        flags=re.IGNORECASE,
+    ),
+)
+_EXPLICIT_TARGET_TOKEN_SPLIT_RE = re.compile(r"[\s→]+")
+_EXPLICIT_TARGET_TOKEN_WRAPPERS = (
+    "()[]{}<>\"'，,。；;「」.!?！？（）【】《》"
 )
 
 
@@ -79,6 +96,19 @@ def facebook_crosspost_target_ids(
         for pattern in _FACEBOOK_GROUP_TARGET_PATTERNS
         for match in pattern.finditer(target_text)
     }
+    for target in targets:
+        for raw_token in _EXPLICIT_TARGET_TOKEN_SPLIT_RE.split(str(target)):
+            token = raw_token.strip(_EXPLICIT_TARGET_TOKEN_WRAPPERS)
+            if not token:
+                continue
+            for pattern in _FACEBOOK_MARKETPLACE_EXACT_TARGET_PATTERNS:
+                match = pattern.fullmatch(token)
+                if match is not None:
+                    listing_ids.add(match.group("id"))
+            for pattern in _FACEBOOK_GROUP_EXACT_TARGET_PATTERNS:
+                match = pattern.fullmatch(token)
+                if match is not None:
+                    group_ids.add(match.group("id"))
     return frozenset(listing_ids), frozenset(group_ids)
 
 
