@@ -3432,6 +3432,33 @@ class TurnRunner:
                         mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
             except Exception as _hint_err:
                 logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
+
+        if event_type == "tool.completed":
+            # The callback stays wired when only thinking_progress is on,
+            # so honor the tool_progress gate here too: with tool_progress
+            # off there is no todo started preview to replace and no todo
+            # status bubble should be appended.
+            if (
+                tool_name == "todo"
+                and ctx.tool_progress_enabled
+                and not kwargs.get("is_error")
+            ):
+                try:
+                    from agent.display import format_todo_result_for_progress, get_tool_verb
+                    todo_progress = format_todo_result_for_progress(kwargs.get("result") or "")
+                    if todo_progress:
+                        # Replace the transient todo started preview (for
+                        # example `📋 todo: "updating 2 task(s)"`, or the
+                        # friendly-label form `📋 Updating tasks ...`) with
+                        # the final status block in the same editable
+                        # progress bubble. Match by prefix so parallel
+                        # tool-start lines queued after todo are not
+                        # overwritten.
+                        _todo_verb = get_tool_verb("todo")
+                        _todo_prefix = f"📋 {_todo_verb}" if _todo_verb else "📋 todo"
+                        ctx.progress_queue.put(("__replace_last_matching__", _todo_prefix, todo_progress))
+                except Exception as _todo_err:
+                    logger.debug("todo progress formatting failed: %s", _todo_err)
             return
 
         # "_thinking" is assistant scratch text between tool calls.  It
@@ -3828,6 +3855,24 @@ class TurnRunner:
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
                     continue
+                elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__replace_last_matching__":
+                    # Replace the newest line that starts with `prefix` (for
+                    # example the transient todo started preview) with the
+                    # final status block, editing in place so parallel tool
+                    # lines queued after it are not overwritten.
+                    _, prefix, replacement = raw
+                    msg = str(replacement)
+                    replace_idx = None
+                    for idx in range(len(progress_lines) - 1, -1, -1):
+                        if str(progress_lines[idx]).startswith(str(prefix)):
+                            replace_idx = idx
+                            break
+                    if replace_idx is not None:
+                        progress_lines[replace_idx] = msg
+                    else:
+                        progress_lines.append(msg)
+                    ctx.last_progress_msg[0] = msg
+                    ctx.repeat_count[0] = 0
                 else:
                     msg = raw
                     progress_lines.append(msg)
@@ -3951,6 +3996,18 @@ class TurnRunner:
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__replace_last_matching__":
+                            _, prefix, replacement = raw
+                            replace_idx = None
+                            for idx in range(len(progress_lines) - 1, -1, -1):
+                                if str(progress_lines[idx]).startswith(str(prefix)):
+                                    replace_idx = idx
+                                    break
+                            if replace_idx is not None:
+                                progress_lines[replace_idx] = str(replacement)
+                            else:
+                                progress_lines.append(str(replacement))
+                            await _roll_progress_overflow_if_needed()
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
