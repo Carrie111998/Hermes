@@ -2145,7 +2145,15 @@ class HermesACPAgent(acp.Agent):
                 return msg if isinstance(msg, str) and msg.strip() else None
             return None
 
-        bundle_key = resolve_bundle_command_key(bare)
+        # Built-ins win over user bundles (TUI parity: tui_gateway/server.py).
+        # Without this, a bundle named ``help`` would shadow ACP ``/help``.
+        from hermes_cli.commands import resolve_command
+
+        bundle_key = (
+            resolve_bundle_command_key(bare)
+            if resolve_command(bare) is None
+            else None
+        )
         if bundle_key:
             try:
                 return _as_message(build_bundle_invocation_message(bundle_key, rest))
