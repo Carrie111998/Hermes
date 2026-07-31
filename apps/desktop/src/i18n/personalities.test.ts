@@ -1,29 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
-// We test the catalogue directly (not via the React provider) so the
-// assertions are cheap and survive unrelated changes to context plumbing.
-// Mirrors the builtin set declared in `lib/chat-runtime.ts:BUILTIN_PERSONALITIES`,
-// kept verbatim here so a missing translation is caught at test time even
-// before the dropdown ever renders.
-const BUILTIN_PERSONALITIES = [
-  'helpful',
-  'concise',
-  'technical',
-  'creative',
-  'teacher',
-  'kawaii',
-  'catgirl',
-  'pirate',
-  'shakespeare',
-  'surfer',
-  'noir',
-  'uwu',
-  'philosopher',
-  'hype'
-] as const
+// Source of truth for builtin personality IDs is the same array the
+// settings picker renders from — import it directly so a future rename
+// or addition breaks the test instead of silently shipping stale IDs.
+import { BUILTIN_PERSONALITIES } from '@/app/settings/constants'
 
 import { TRANSLATIONS } from './catalog'
 import type { Locale } from './types'
+
+// All locales the type system promises. The catalog completeness test
+// iterates over this so adding a new locale (e.g. `fr`, `ko`) automatically
+// gets the personalities-map assertion for free.
+const ALL_LOCALES: Locale[] = ['en', 'zh', 'zh-hant', 'ja', 'ar']
 
 describe('desktop i18n — builtin personality labels', () => {
   // Every builtin ID the renderer can show in the `display.personality`
@@ -61,9 +49,7 @@ describe('desktop i18n — builtin personality labels', () => {
   it('every locale exposes the personalities map (may be empty for fallback)', () => {
     // Catalog completeness: the type system guarantees this, but assert at
     // runtime so a future locale addition can't ship without the field.
-    const locales: Locale[] = ['en', 'zh', 'zh-hant', 'ja']
-
-    for (const locale of locales) {
+    for (const locale of ALL_LOCALES) {
       const labels = TRANSLATIONS[locale].settings.personalities
       expect(labels, `${locale} missing settings.personalities`).toBeDefined()
       expect(typeof labels).toBe('object')
