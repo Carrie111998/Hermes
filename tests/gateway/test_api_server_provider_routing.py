@@ -49,9 +49,9 @@ def _create_adapter(
         "_load_reasoning_config",
         staticmethod(lambda: None),
     )
-    # The messaging gateway reads routing via _load_provider_routing(), which
-    # parses raw yaml. api_server must use the runtime loader instead so
-    # profile-scoped configs and ${VAR} refs resolve; fail loudly if it doesn't.
+    # Both gateway paths use runtime config. Keep the api_server path direct so
+    # profile-scoped configs and ${VAR} refs resolve without relying on the
+    # messaging gateway's _load_provider_routing() helper.
     monkeypatch.setattr(
         GatewayRunner,
         "_load_provider_routing",
