@@ -18,7 +18,6 @@ import pytest
 import pytest_asyncio
 
 from gateway.dispatcher_client import (
-    DEFAULT_DISPATCHER_SOCKET,
     DispatcherClient,
     DispatcherConnectionError,
 )
@@ -307,20 +306,16 @@ async def test_context_manager_closes_on_exit(
     assert not client.is_connected
 
 
-def test_default_socket_path_uses_constant(
-    monkeypatch,
-) -> None:
-    """No socket_path and no env var -> DEFAULT_DISPATCHER_SOCKET."""
-    monkeypatch.delenv("HERMES_DISPATCHER_SOCKET", raising=False)
-    client = DispatcherClient()
-    assert client.socket_path == DEFAULT_DISPATCHER_SOCKET
+def test_socket_path_is_required() -> None:
+    """DispatcherClient() without socket_path raises TypeError."""
+    with pytest.raises(TypeError):
+        DispatcherClient()  # type: ignore[call-arg]
 
 
-def test_env_var_overrides_default(monkeypatch) -> None:
-    """HERMES_DISPATCHER_SOCKET overrides DEFAULT_DISPATCHER_SOCKET."""
-    monkeypatch.setenv("HERMES_DISPATCHER_SOCKET", "/tmp/custom.sock")
-    client = DispatcherClient()
-    assert client.socket_path == "/tmp/custom.sock"
+def test_socket_path_stored() -> None:
+    """Explicit socket_path is stored and accessible."""
+    client = DispatcherClient(socket_path="/tmp/test.sock")
+    assert client.socket_path == "/tmp/test.sock"
 
 
 # --- Format helper tests (sync) -----------------------------------
@@ -480,3 +475,50 @@ async def test_forward_returns_none_on_dispatcher_down(
         get_command_args=lambda: "",
     )
     assert await runner._forward_to_dispatcher(event, "echo") is None
+
+
+class TestDispatcherConfig:
+    """GatewayConfig stores dispatcher_socket and dispatcher_commands."""
+
+    def test_config_stores_dispatcher_socket(self):
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig(dispatcher_socket="/run/test/dispatcher.sock")
+        assert cfg.dispatcher_socket == "/run/test/dispatcher.sock"
+
+    def test_config_stores_dispatcher_commands(self):
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig(dispatcher_commands=["echo", "forge"])
+        assert cfg.dispatcher_commands == ["echo", "forge"]
+
+    def test_config_defaults_to_none(self):
+        from gateway.config import GatewayConfig
+
+        cfg = GatewayConfig()
+        assert cfg.dispatcher_socket is None
+        assert cfg.dispatcher_commands is None
+
+
+class TestDispatcherClientInit:
+    """DispatcherClient requires socket_path (no env var fallback)."""
+
+    def test_socket_path_required(self):
+        """Constructor requires socket_path — no default, no env var."""
+        client = DispatcherClient(socket_path="/tmp/test.sock")
+        assert client._path == "/tmp/test.sock"
+
+    def test_no_env_var_fallback(self):
+        """HERMES_DISPATCHER_SOCKET env var is no longer used."""
+        import os
+
+        old = os.environ.get("HERMES_DISPATCHER_SOCKET")
+        try:
+            os.environ["HERMES_DISPATCHER_SOCKET"] = "/env/should/not/use"
+            client = DispatcherClient(socket_path="/explicit/path.sock")
+            assert client._path == "/explicit/path.sock"
+        finally:
+            if old is None:
+                os.environ.pop("HERMES_DISPATCHER_SOCKET", None)
+            else:
+                os.environ["HERMES_DISPATCHER_SOCKET"] = old

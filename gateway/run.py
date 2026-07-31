@@ -5673,7 +5673,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # HANDLER that doesn't shadow a local hermes command.
     # (Phase 2.6: dispatcher-unique commands only; /status,
     # /health, /help stay hermes-local to avoid behavior drift.)
-    _DISPATCHER_FORWARD_COMMANDS = frozenset({
+    _DISPATCHER_FORWARD_COMMANDS: frozenset[str] = frozenset({
         "echo", "research", "forge", "ashare", "replay", "log",
     })
     _draining: bool = False
@@ -5974,6 +5974,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # gateway starts (e.g. dispatcher service is down). Each
         # forward call opens/closes the connection lazily.
         self._dispatcher_client: Optional[DispatcherClient] = None
+        # Dispatcher socket path and commands come from config.yaml
+        # (dispatcher: section). When configured, eagerly create the
+        # client so the forward path is ready at first slash-command.
+        _disp_socket = getattr(self.config, "dispatcher_socket", None)
+        if _disp_socket:
+            self._dispatcher_client = DispatcherClient(
+                socket_path=_disp_socket,
+            )
+            _disp_cmds = getattr(self.config, "dispatcher_commands", None)
+            if _disp_cmds and isinstance(_disp_cmds, list):
+                self._DISPATCHER_FORWARD_COMMANDS = frozenset(_disp_cmds)
 
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
@@ -15704,10 +15715,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _get_dispatcher_client(self) -> DispatcherClient:
         """Return the lazy-initialized dispatcher client. Creates
-        one on first call. Always returns the same instance for
-        the lifetime of this GatewayRunner."""
+        one on first call from the configured socket path. Always
+        returns the same instance for the lifetime of this
+        GatewayRunner."""
         if self._dispatcher_client is None:
-            self._dispatcher_client = DispatcherClient()
+            _disp_socket = getattr(self.config, "dispatcher_socket", None)
+            if not _disp_socket:
+                raise DispatcherConnectionError(
+                    "dispatcher not configured: set dispatcher.socket "
+                    "in config.yaml"
+                )
+            self._dispatcher_client = DispatcherClient(
+                socket_path=_disp_socket,
+            )
         return self._dispatcher_client
 
     async def _forward_to_dispatcher(
