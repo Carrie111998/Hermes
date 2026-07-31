@@ -113,6 +113,11 @@ def _(rid, params: dict) -> dict:
         return err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
+    # A child-watch session mirrors the delegated run as `running` for sync
+    # snapshots. Reject input before the generic busy-submit path can interpret
+    # that synthetic liveness as a steer/queue-capable local agent turn.
+    if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        return _err(rid, 4009, "subagent still running — wait for it to finish")
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -143,10 +148,10 @@ def _(rid, params: dict) -> dict:
                     CONVERSATION_CONTROL_SCOPE,
                 )
                 if t is not None and allow_control:
-                    session["transport"] = t
+                    _set_session_transport_locked(session, t)
             else:
                 if t is not None:
-                    session["transport"] = t
+                    _set_session_transport_locked(session, t)
                 break
         busy_response = _handle_busy_submit(
             rid,
@@ -172,7 +177,7 @@ def _(rid, params: dict) -> dict:
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         if t is not None:
-            session["transport"] = t
+            _set_session_transport_locked(session, t)
         if truncate_user_ordinal is not None:
             try:
                 ordinal = int(truncate_user_ordinal)
@@ -228,6 +233,7 @@ def _(rid, params: dict) -> dict:
             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
+            _mark_snapshot_mutation(session)
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
@@ -237,6 +243,7 @@ def _(rid, params: dict) -> dict:
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
+        _mark_snapshot_mutation(session)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
@@ -274,6 +281,8 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+                _mark_snapshot_mutation(session)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -295,6 +304,7 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                _mark_snapshot_mutation(session)
                 return
         _run_prompt_submit(rid, sid, session, text)
 
