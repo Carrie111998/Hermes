@@ -89,6 +89,51 @@ def test_refresh_active_memory_provider_dependencies_reinstalls_active_provider(
     assert recorded == [("mem0", True)]
 
 
+def test_refresh_reinstalls_all_active_providers_in_priority_order(monkeypatch):
+    """#5688 regression: multi-provider users must get EVERY active provider's
+    deps reinstalled, in priority order — not zero.
+
+    The canonical setter blanks the legacy singular ``memory.provider`` field
+    whenever 2+ providers are active, so the old singular read resolved
+    provider="" and refreshed dependencies for NO providers, silently
+    stripping mem0ai/hindsight-embed on every core update.
+    """
+    recorded = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        # Realistic multi-provider config as the canonical setter writes it:
+        # ordered ``providers`` list governs, singular ``provider`` blanked.
+        lambda: {"memory": {"providers": ["mem0", "hindsight"], "provider": ""}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.memory_setup._install_dependencies",
+        lambda provider_name, force=False: recorded.append((provider_name, force)),
+    )
+
+    hermes_main._refresh_active_memory_provider_dependencies()
+
+    assert recorded == [("mem0", True), ("hindsight", True)]
+
+
+def test_refresh_skips_when_no_active_providers(monkeypatch):
+    """Built-in only (empty list, blank singular) reinstalls nothing."""
+    recorded = []
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"providers": [], "provider": ""}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.memory_setup._install_dependencies",
+        lambda provider_name, force=False: recorded.append((provider_name, force)),
+    )
+
+    hermes_main._refresh_active_memory_provider_dependencies()
+
+    assert recorded == []
+
+
 
 
 def test_reload_updated_runtime_modules_restores_new_hermes_constants_symbol(monkeypatch):

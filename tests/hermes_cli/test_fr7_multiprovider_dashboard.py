@@ -170,3 +170,64 @@ class TestMemoryStatusReportsList:
         assert body["active_providers"] == ["honcho", "mem0"]
         # Legacy singular ``active`` remains the first (back-compat).
         assert body["active"] == "honcho"
+
+
+class TestProviderConfigValuesEditDoesNotClobberActivation:
+    """FINDING 2 (#5688): saving a provider's connection VALUES must route the
+    activation write through the canonical setter and must NOT clobber an
+    existing multi-provider active list.
+
+    The old code wrote ``memory_config["provider"] = name`` directly (a
+    var-alias write that bypassed the setter), which for a multi-provider user
+    set singular=name while the plural list still governed — a writer≠reader
+    split identical to the original backup.py incident.
+    """
+
+    def test_values_edit_preserves_existing_multiprovider_list(self, monkeypatch, tmp_path):
+        from hermes_cli import web_server
+        from hermes_cli.config import (
+            get_active_memory_providers,
+            load_config,
+            save_config,
+            set_active_memory_providers,
+        )
+
+        # Two providers already active, honcho highest priority.
+        cfg = load_config()
+        set_active_memory_providers(cfg, ["honcho", "mem0"])
+        save_config(cfg)
+
+        # Editing mem0's connection values must NOT reorder or drop honcho,
+        # and must NOT leave singular=mem0 while the plural list still governs.
+        monkeypatch.setattr(web_server, "_write_provider_flat", lambda provider, values: None)
+        monkeypatch.setattr(web_server, "_write_provider_honcho", lambda provider, values: None)
+
+        class _Schema:
+            name = "mem0"
+            storage = "flat"
+
+        web_server._update_memory_provider_config(_Schema(), {"api_key": "x"})
+
+        # honcho still first, mem0 still present, order intact, no clobber.
+        assert get_active_memory_providers(load_config()) == ["honcho", "mem0"]
+
+    def test_values_edit_activates_a_not_yet_active_provider(self, monkeypatch, tmp_path):
+        from hermes_cli import web_server
+        from hermes_cli.config import get_active_memory_providers, load_config, save_config, set_active_memory_providers
+
+        cfg = load_config()
+        set_active_memory_providers(cfg, ["honcho"])
+        save_config(cfg)
+
+        monkeypatch.setattr(web_server, "_write_provider_flat", lambda provider, values: None)
+        monkeypatch.setattr(web_server, "_write_provider_honcho", lambda provider, values: None)
+
+        class _Schema:
+            name = "mem0"
+            storage = "flat"
+
+        web_server._update_memory_provider_config(_Schema(), {"api_key": "x"})
+
+        # Configuring a new provider appends it (activate-on-configure UX),
+        # preserving the existing one's priority.
+        assert get_active_memory_providers(load_config()) == ["honcho", "mem0"]

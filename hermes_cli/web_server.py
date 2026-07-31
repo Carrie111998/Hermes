@@ -70,6 +70,7 @@ from hermes_cli.config import (
     load_env,
     read_raw_config,
     save_config,
+    get_active_memory_providers,
     set_active_memory_providers,
     save_env_value,
     remove_env_value,
@@ -5087,13 +5088,19 @@ def _update_memory_provider_config(provider: ProviderConfigSchema, values: Dict[
     else:
         _write_provider_flat(provider, values)
 
+    # Saving a provider's connection values also ensures it's active (the
+    # original configure→activate UX). Route that activation through the
+    # canonical setter instead of writing the singular ``memory.provider``
+    # field directly: a direct write leaves singular=X while the plural
+    # ``memory.providers`` list still governs (the resolver is plural-first),
+    # producing the exact writer≠reader inconsistency #5688 exists to kill.
+    # Preserve any already-active providers and their priority order; only
+    # append this one if it isn't already in the list, so a values-edit never
+    # reorders or drops another active provider.
     config = load_config()
-    memory_config = config.get("memory")
-    if not isinstance(memory_config, dict):
-        memory_config = {}
-        config["memory"] = memory_config
-    if memory_config.get("provider") != provider.name:
-        memory_config["provider"] = provider.name
+    active = get_active_memory_providers(config)
+    if provider.name not in active:
+        set_active_memory_providers(config, [*active, provider.name])
         save_config(config)
 
 
