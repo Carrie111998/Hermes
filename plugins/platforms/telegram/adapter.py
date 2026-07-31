@@ -8546,8 +8546,17 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         self._attach_staged_location(event)
         await self._cache_replied_media(msg, event)
+        # Group-observation attribution deliberately replaces the sender with
+        # a shared chat/topic source. In stage-next mode, preserve the
+        # sender-scoped key while the original source is still available so
+        # adjacent messages from different users cannot share a text batch.
+        batch_key = (
+            self._text_batch_key(event)
+            if self._location_pin_staging_enabled()
+            else None
+        )
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        self._enqueue_text_event(event, batch_key=batch_key)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8720,7 +8729,12 @@ class TelegramAdapter(BasePlatformAdapter):
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(
+        self,
+        event: MessageEvent,
+        *,
+        batch_key: Optional[str] = None,
+    ) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8732,7 +8746,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
 
-        key = self._text_batch_key(event)
+        key = batch_key if batch_key is not None else self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:

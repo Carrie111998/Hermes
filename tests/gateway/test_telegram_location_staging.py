@@ -72,6 +72,7 @@ def _adapter(*, mode: str = "stage_next", ttl: float = 300.0):
                     else None
                 ),
             ),
+            raw_message=msg,
         )
     )
     return adapter
@@ -86,6 +87,7 @@ def _message(
     thread_id=None,
     latitude=12.3456,
     longitude=65.4321,
+    text="message",
 ):
     return SimpleNamespace(
         chat=SimpleNamespace(id=chat_id, type=chat_type),
@@ -97,6 +99,7 @@ def _message(
             longitude=longitude,
             live_period=live_period,
         ),
+        text=text,
         reply_text=AsyncMock(),
     )
 
@@ -476,3 +479,74 @@ def test_stage_mode_text_batches_are_always_sender_scoped():
     )
 
     assert adapter._text_batch_key(alice) != adapter._text_batch_key(bob)
+
+
+@pytest.mark.asyncio
+async def test_stage_mode_observed_group_text_batches_preserve_sender_scope(monkeypatch):
+    adapter = _adapter()
+    adapter._text_batch_key = adapter.__class__._text_batch_key.__get__(adapter)
+    adapter._apply_telegram_group_observe_attribution = (
+        adapter.__class__._apply_telegram_group_observe_attribution.__get__(adapter)
+    )
+    adapter._apply_topic_recovery = lambda event: None
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
+    adapter._text_batch_delay_seconds = 60.0
+    adapter._text_batch_split_delay_seconds = 60.0
+    adapter._clean_bot_trigger_text = lambda text: text
+    adapter._cache_replied_media = AsyncMock()
+    adapter._ensure_forum_commands = AsyncMock()
+    adapter._bot = SimpleNamespace(username="hermes_bot", id=999)
+    adapter.config.extra.update(
+        observe_unmentioned_group_messages=True,
+        group_allowed_chats=["-1001"],
+        group_sessions_per_user=False,
+        thread_sessions_per_user=False,
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.time.monotonic", lambda: 100.0
+    )
+
+    staged_for_alice = _event(
+        "",
+        chat_id="-1001",
+        user_id="2002",
+        chat_type="group",
+    )
+    stage_key = adapter._location_stage_key(staged_for_alice)
+    adapter._pending_location_context[stage_key] = (
+        object(),
+        100.0,
+        "[Alice's staged location]",
+    )
+
+    alice = _message(
+        chat_id=-1001,
+        user_id=2002,
+        chat_type="group",
+        text="Find a cafe nearby",
+    )
+    bob = _message(
+        chat_id=-1001,
+        user_id=3003,
+        chat_type="group",
+        text="What is the weather?",
+    )
+
+    await adapter._handle_text_message(_update(alice), None)
+    await adapter._handle_text_message(_update(bob), None)
+
+    assert len(adapter._pending_text_batches) == 2
+    pending = list(adapter._pending_text_batches.values())
+    assert all(event.source.user_id is None for event in pending)
+    assert sum("Alice's staged location" in (event.text or "") for event in pending) == 1
+    assert not any(
+        "Find a cafe nearby" in (event.text or "")
+        and "What is the weather?" in (event.text or "")
+        for event in pending
+    )
+
+    tasks = list(adapter._pending_text_batch_tasks.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
