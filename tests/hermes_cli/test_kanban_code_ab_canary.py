@@ -229,6 +229,10 @@ def test_code_a_and_code_b_canary_lanes_run_without_collision(monkeypatch, tmp_p
     monkeypatch.setattr(
         kb, "_resolve_hermes_argv", lambda: [sys.executable, str(probe)],
     )
+    # The armed attestation demands that the worker resolve the dispatcher's
+    # Hermes tree. In a worktree checkout that means pinning PYTHONPATH; a
+    # matched install resolves it on its own.
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
 
     names = list(lanes)
     with kb.connect() as conn:

@@ -5527,6 +5527,7 @@ def _terminate_worker_for_block(
     return _terminate_reclaimed_worker(
         pid, row["claim_lock"], signal_fn=signal_fn,
         process_start_time=row["worker_start_time"],
+        require_identity=True,
     )
 
 
@@ -6951,12 +6952,51 @@ def _pid_alive(pid: Optional[int]) -> bool:
     return True
 
 
+def _terminate_worker_without_identity(
+    pid: int, info: dict[str, Any], *, kill=None,
+) -> dict[str, Any]:
+    """Historical PID-only termination for rows predating the identity column.
+
+    Kept only for the reclaim paths that shipped before ``worker_start_time``
+    existed. It cannot distinguish a recycled PID, which is exactly why the
+    controller-block path refuses to use it.
+    """
+    import signal
+
+    kill = kill if kill is not None else (os.kill if hasattr(os, "kill") else None)
+    if kill is None:
+        return info
+    info["termination_attempted"] = True
+    try:
+        kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        info["terminated"] = True
+        return info
+    except OSError:
+        return info
+    for _ in range(10):
+        if not _pid_alive(pid):
+            info["terminated"] = True
+            return info
+        time.sleep(0.5)
+    if _pid_alive(pid):
+        try:
+            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+            kill(pid, _sigkill)
+            info["sigkill"] = True
+        except (ProcessLookupError, OSError):
+            return info
+    info["terminated"] = not _pid_alive(pid)
+    return info
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
     *,
     signal_fn=None,
     process_start_time: Optional[str] = None,
+    require_identity: bool = False,
 ) -> dict[str, Any]:
     """Best-effort host-local worker termination for reclaim paths.
 
@@ -6985,12 +7025,18 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     if not process_start_time:
-        # No captured identity means no proof of what this PID currently is.
-        # Signalling anyway would be a blind kill of whatever inherited the
-        # number (legacy pre-migration rows, or a failed ``ps`` capture).
-        # Falls through to the normal release path via termination_attempted.
+        # No captured identity: we cannot prove what this PID currently is.
+        # ``require_identity`` (the controller-block path added by HER-118)
+        # refuses outright rather than blind-kill whatever inherited the
+        # number. The pre-existing reclaim paths keep their historical
+        # PID-only contract — breaking it would strand live legacy workers and
+        # let the dispatcher spawn duplicates beside them — but the diagnostic
+        # is recorded either way. Rows written since the identity migration
+        # always carry a fingerprint, so this is a shrinking legacy surface.
         info["identity_unproven"] = True
-        return info
+        if require_identity:
+            return info
+        return _terminate_worker_without_identity(int(pid), info, kill=signal_fn)
 
     if not _worker_identity_is_alive(int(pid), process_start_time):
         # Either the worker exited (nothing to signal) or this PID now belongs
@@ -9119,19 +9165,23 @@ def _attest_worker_admission_hook_armed(
     dispatcher_tree = str(Path(__file__).resolve().parents[1])
     probe = (
         "import json\n"
-        "import hermes_cli\n"
         "from pathlib import Path\n"
-        "from hermes_cli.config import load_config\n"
-        "from agent.shell_hooks import register_from_config\n"
-        "specs = register_from_config(load_config(), accept_hooks=True)\n"
-        "armed = [\n"
-        "    s.command for s in specs\n"
-        "    if s.event == 'pre_tool_call' and s.fail_closed\n"
-        "    and 'factory_admission_hook.py' in s.command\n"
-        "    and '--require-owned-git' in s.command\n"
-        "]\n"
-        "tree = str(Path(hermes_cli.__file__).resolve().parents[1])\n"
-        "print(json.dumps({'armed': armed, 'tree': tree}))\n"
+        "verdict = {'tree': None, 'armed': [], 'error': None}\n"
+        "try:\n"
+        "    import hermes_cli\n"
+        "    verdict['tree'] = str(Path(hermes_cli.__file__).resolve().parents[1])\n"
+        "    from hermes_cli.config import load_config\n"
+        "    from agent.shell_hooks import register_from_config\n"
+        "    specs = register_from_config(load_config(), accept_hooks=True)\n"
+        "    verdict['armed'] = [\n"
+        "        s.command for s in specs\n"
+        "        if s.event == 'pre_tool_call' and getattr(s, 'fail_closed', False)\n"
+        "        and 'factory_admission_hook.py' in s.command\n"
+        "        and '--require-owned-git' in s.command\n"
+        "    ]\n"
+        "except Exception as exc:\n"
+        "    verdict['error'] = f'{type(exc).__name__}: {exc}'\n"
+        "print(json.dumps(verdict))\n"
     )
     try:
         result = subprocess.run(
@@ -9147,24 +9197,28 @@ def _attest_worker_admission_hook_armed(
         raise RuntimeError(
             f"cannot attest the worker AI Factory admission hook: {exc}"
         ) from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            "worker did not arm the AI Factory admission hook "
-            f"(probe rc={result.returncode}): {result.stderr.strip()[:400]}"
-        )
     try:
         verdict = json.loads(result.stdout.strip().splitlines()[-1])
         armed = verdict["armed"]
         worker_tree = verdict["tree"]
     except (ValueError, KeyError, IndexError) as exc:
         raise RuntimeError(
-            "worker AI Factory admission hook attestation returned no verdict"
+            "worker AI Factory admission hook attestation returned no verdict "
+            f"(probe rc={result.returncode}): {result.stderr.strip()[:400]}"
         ) from exc
-    if Path(worker_tree).resolve() != Path(dispatcher_tree).resolve():
+    # Tree first: a divergent install makes every other signal meaningless,
+    # and its import errors would otherwise surface as a confusing arming
+    # failure against code the worker never runs.
+    if not worker_tree or Path(worker_tree).resolve() != Path(dispatcher_tree).resolve():
         raise RuntimeError(
             "worker resolves a different Hermes tree than the dispatcher "
             f"({worker_tree} != {dispatcher_tree}); the admission hook this "
             "dispatcher validated is not the code the worker would run"
+        )
+    if verdict.get("error"):
+        raise RuntimeError(
+            "worker AI Factory admission hook attestation failed: "
+            f"{verdict['error']}"
         )
     if not armed:
         raise RuntimeError(

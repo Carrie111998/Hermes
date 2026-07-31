@@ -343,20 +343,38 @@ def test_missing_start_time_capture_refuses_to_signal(kanban_home, monkeypatch):
         proc.wait(timeout=5)
 
 
-def test_legacy_null_identity_rows_are_conservative_on_reclaim(kanban_home):
-    """Pre-migration rows carry no identity: reclaim must not blind-signal."""
+def test_legacy_null_identity_is_refused_on_the_controller_block_path(kanban_home):
+    """The block path (new) refuses; the historical reclaim path is unchanged.
+
+    Rows predating the identity migration carry no fingerprint. Blind-killing
+    is unacceptable for the controller-block path added by HER-118, while the
+    pre-existing reclaim contract is preserved so live legacy workers are not
+    stranded — both record the ``identity_unproven`` diagnostic.
+    """
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
-    sent: list = []
+    host_lock = f"{kb._claimer_id().split(':', 1)[0]}:x"
     try:
+        refused: list = []
         info = kb._terminate_reclaimed_worker(
-            proc.pid, f"{kb._claimer_id().split(':', 1)[0]}:x",
-            signal_fn=lambda p, s: sent.append(s),
+            proc.pid, host_lock,
+            signal_fn=lambda p, s: refused.append(s),
+            process_start_time=None,
+            require_identity=True,
+        )
+        assert refused == [], f"block path must not blind-signal: {refused}"
+        assert info["termination_attempted"] is False
+        assert info["identity_unproven"] is True
+        assert proc.poll() is None
+
+        legacy: list = []
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, host_lock,
+            signal_fn=lambda p, s: legacy.append(s),
             process_start_time=None,
         )
-        assert sent == [], f"legacy NULL identity must not be signalled: {sent}"
-        assert info["termination_attempted"] is False
-        assert info.get("identity_unproven") is True
-        assert proc.poll() is None
+        assert legacy, "reclaim keeps its historical PID-only contract"
+        assert info["termination_attempted"] is True
+        assert info["identity_unproven"] is True
     finally:
         if proc.poll() is None:
             proc.kill()
