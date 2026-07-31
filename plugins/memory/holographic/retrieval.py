@@ -272,7 +272,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self.store.record_retrievals([f["fact_id"] for f in results])
+        return results
 
     def reason(
         self,
@@ -350,7 +352,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self.store.record_retrievals([f["fact_id"] for f in results])
+        return results
 
     def contradict(
         self,
@@ -493,7 +497,9 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        results = scored[:limit]
+        self.store.record_retrievals([f["fact_id"] for f in results])
+        return results
 
     def _fts_candidates(
         self,

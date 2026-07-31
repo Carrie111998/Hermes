@@ -406,7 +406,10 @@ class MemoryStore:
                 LIMIT ?
             """
             rows = self._conn.execute(sql, params).fetchall()
-            return [self._row_to_dict(r) for r in rows]
+            facts = [self._row_to_dict(r) for r in rows]
+        # Outside the read lock: record_retrievals takes the same RLock and commits.
+        self.record_retrievals([f["fact_id"] for f in facts])
+        return facts
 
     def record_feedback(self, fact_id: int, helpful: bool) -> dict:
         """Record user feedback and adjust trust asymmetrically.

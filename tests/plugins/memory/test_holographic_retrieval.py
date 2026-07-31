@@ -300,3 +300,91 @@ def test_record_retrievals_empty_list_is_noop(retriever_with_facts):
     before = _counts(store)
     store.record_retrievals([])
     assert _counts(store) == before
+
+
+def test_related_increments_retrieval_count(retriever_with_facts):
+    """related() returns facts to the caller, so it counts them too."""
+    store = retriever_with_facts.store
+    results = retriever_with_facts.related("deployment")
+    assert len(results) >= 1
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] >= 1
+    returned = {f["fact_id"] for f in results}
+    assert all(c == 0 for fid, c in after.items() if fid not in returned)
+
+
+def test_reason_increments_retrieval_count(retriever_with_facts):
+    """reason() is a live fact_store read path — its results count."""
+    store = retriever_with_facts.store
+    results = retriever_with_facts.reason(["deployment", "migration"])
+    assert len(results) >= 1
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] >= 1
+
+
+def test_probe_category_bank_branch_increments(retriever_with_facts):
+    """The category-bank branch of probe() returns via _score_facts_by_vector.
+
+    That helper has its own return path, which was previously uncounted even
+    though probe()'s direct-scoring branch was fixed.
+    """
+    store = retriever_with_facts.store
+    results = retriever_with_facts.probe("compaction", category="tool")
+    assert len(results) >= 1
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] >= 1
+
+
+def test_score_facts_by_vector_increments_directly(retriever_with_facts):
+    """_score_facts_by_vector counts whatever it hands back."""
+    import numpy as np
+
+    from plugins.memory.holographic import holographic as hrr
+
+    store = retriever_with_facts.store
+    target = hrr.encode_text("compaction", retriever_with_facts.hrr_dim)
+    results = retriever_with_facts._score_facts_by_vector(target, limit=2)
+    assert len(results) >= 1
+
+    after = _counts(store)
+    for fact in results:
+        assert after[fact["fact_id"]] >= 1
+    assert isinstance(target, np.ndarray)
+
+
+def test_list_facts_increments_retrieval_count(retriever_with_facts):
+    """fact_store(action='list') surfaces facts, so list_facts() counts them."""
+    store = retriever_with_facts.store
+    assert set(_counts(store).values()) == {0}
+
+    facts = store.list_facts()
+    assert len(facts) == 3
+
+    after = _counts(store)
+    for fact in facts:
+        assert after[fact["fact_id"]] == 1
+
+
+def test_list_facts_respects_limit_when_counting(retriever_with_facts):
+    """Only the truncated result set is counted, not every scanned row."""
+    store = retriever_with_facts.store
+    facts = store.list_facts(limit=1)
+    assert len(facts) == 1
+
+    after = _counts(store)
+    assert after[facts[0]["fact_id"]] == 1
+    assert sum(after.values()) == 1
+
+
+def test_list_facts_empty_result_records_nothing(retriever_with_facts):
+    """A filter that matches nothing must leave every counter alone."""
+    store = retriever_with_facts.store
+    before = _counts(store)
+    assert store.list_facts(min_trust=99.0) == []
+    assert _counts(store) == before
