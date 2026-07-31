@@ -1262,6 +1262,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # agent with model="" that 400s every call until manual retry.
         self._last_resolved_model: Dict[str, str] = {}
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
+        # Coordinates rewind admission with /v1/runs queued registration and
+        # session-chat turns so a run cannot slip in between the rewind busy
+        # check and SessionDB.rewind_to_message.
+        self._session_rewind_admission_lock = asyncio.Lock()
+        self._sessions_rewinding: set[str] = set()
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1379,6 +1384,92 @@ class APIServerAdapter(BasePlatformAdapter):
             if status.get("status") in self._ACTIVE_RUN_STATUSES:
                 return True
         return False
+
+    @staticmethod
+    def _session_ids_for_rewind_guard(session_id: str, resolved_id: str) -> tuple[str, ...]:
+        """Distinct non-empty session ids that share one rewind admission slot."""
+        ids: list[str] = []
+        for raw in (session_id, resolved_id):
+            sid = str(raw or "").strip()
+            if sid and sid not in ids:
+                ids.append(sid)
+        return tuple(ids)
+
+    async def _begin_session_rewind_guard(
+        self,
+        session_ids: tuple[str, ...],
+    ) -> Optional["web.Response"]:
+        """Reserve *session_ids* for rewind; reject active runs or concurrent rewind."""
+        async with self._session_rewind_admission_lock:
+            for sid in session_ids:
+                if self._session_has_active_run(sid):
+                    return web.json_response(
+                        _openai_error(
+                            "Session has an active run; stop or wait before rewind",
+                            code="session_busy",
+                        ),
+                        status=409,
+                    )
+                if sid in self._sessions_rewinding:
+                    return web.json_response(
+                        _openai_error(
+                            "Session rewind is already in progress",
+                            code="session_rewind_in_progress",
+                        ),
+                        status=409,
+                    )
+            for sid in session_ids:
+                self._sessions_rewinding.add(sid)
+        return None
+
+    async def _end_session_rewind_guard(self, session_ids: tuple[str, ...]) -> None:
+        async with self._session_rewind_admission_lock:
+            for sid in session_ids:
+                self._sessions_rewinding.discard(sid)
+
+    async def _session_rewind_blocked_response(self, session_id: str) -> Optional["web.Response"]:
+        """409 when a rewind mutation is in flight for *session_id*."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return None
+        async with self._session_rewind_admission_lock:
+            if session_id not in self._sessions_rewinding:
+                return None
+        return web.json_response(
+            _openai_error(
+                "Session rewind is in progress",
+                code="session_rewind_in_progress",
+            ),
+            status=409,
+        )
+
+    async def _admit_run_for_session(
+        self,
+        run_id: str,
+        session_id: str,
+        *,
+        created_at: float,
+        model: str,
+    ) -> Optional["web.Response"]:
+        """Register a queued /v1/runs job without racing session rewind."""
+        session_id = str(session_id or "").strip()
+        async with self._session_rewind_admission_lock:
+            if session_id and session_id in self._sessions_rewinding:
+                return web.json_response(
+                    _openai_error(
+                        "Session rewind is in progress",
+                        code="session_rewind_in_progress",
+                    ),
+                    status=409,
+                )
+            self._set_run_status(
+                run_id,
+                "queued",
+                created_at=created_at,
+                session_id=session_id,
+                model=model,
+            )
+        return None
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -3315,7 +3406,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ``POST /v1/runs`` with the same ``session_id`` and user input.
 
         Body: ``{"target_message_id": <int>}`` — id from GET .../messages.
-        Rejects with 409 when a /v1/runs job for this session is still active.
+        Rejects with 409 when a /v1/runs job for this session is still active
+        or a rewind mutation is already in flight for this session.
         This endpoint only mutates SessionDB; it does not sync in-memory
         Desktop/TUI live history.
         """
@@ -3360,32 +3452,31 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=404,
             )
 
-        if self._session_has_active_run(resolved_id) or self._session_has_active_run(session_id):
-            return web.json_response(
-                _openai_error(
-                    "Session has an active run; stop or wait before rewind",
-                    code="session_busy",
-                ),
-                status=409,
-            )
+        guard_ids = self._session_ids_for_rewind_guard(session_id, resolved_id)
+        guard_err = await self._begin_session_rewind_guard(guard_ids)
+        if guard_err:
+            return guard_err
 
         try:
-            result = await asyncio.to_thread(db.rewind_to_message, resolved_id, target_message_id)
-        except ValueError as exc:
-            return web.json_response(_openai_error(str(exc), code="invalid_rewind_target"), status=400)
+            try:
+                result = await asyncio.to_thread(db.rewind_to_message, resolved_id, target_message_id)
+            except ValueError as exc:
+                return web.json_response(_openai_error(str(exc), code="invalid_rewind_target"), status=400)
 
-        target_message = result.get("target_message") or {}
-        if isinstance(target_message, dict):
-            target_message = self._message_response(target_message)
+            target_message = result.get("target_message") or {}
+            if isinstance(target_message, dict):
+                target_message = self._message_response(target_message)
 
-        return web.json_response({
-            "object": "hermes.session.rewind",
-            "ok": True,
-            "session_id": resolved_id,
-            "rewound_count": result.get("rewound_count", 0),
-            "target_message": target_message,
-            "new_head_id": result.get("new_head_id"),
-        })
+            return web.json_response({
+                "object": "hermes.session.rewind",
+                "ok": True,
+                "session_id": resolved_id,
+                "rewound_count": result.get("rewound_count", 0),
+                "target_message": target_message,
+                "new_head_id": result.get("new_head_id"),
+            })
+        finally:
+            await self._end_session_rewind_guard(guard_ids)
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
@@ -3504,6 +3595,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             if selection_error:
                 return web.json_response(_openai_error(selection_error), status=400)
+        rewind_err = await self._session_rewind_blocked_response(session_id)
+        if rewind_err is not None:
+            return rewind_err
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
@@ -3619,6 +3713,10 @@ class APIServerAdapter(BasePlatformAdapter):
             route_source=runtime_request.get("route_source") or "global",
             model_lock=("accepted" if lock_active else ""),
         )
+
+        rewind_err = await self._session_rewind_blocked_response(session_id)
+        if rewind_err is not None:
+            return rewind_err
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -6308,13 +6406,17 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
-        self._set_run_status(
+        admit_err = await self._admit_run_for_session(
             run_id,
-            "queued",
+            session_id,
             created_at=created_at,
-            session_id=session_id,
             model=body.get("model", self._model_name),
         )
+        if admit_err is not None:
+            self._run_streams.pop(run_id, None)
+            self._run_streams_created.pop(run_id, None)
+            self._run_approval_sessions.pop(run_id, None)
+            return admit_err
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.

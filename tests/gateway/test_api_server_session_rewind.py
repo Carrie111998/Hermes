@@ -6,6 +6,10 @@ Complements web_server PR #60443 — same primitive, api_server surface.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -186,3 +190,81 @@ async def test_capabilities_advertise_session_rewind(adapter_with_db):
         assert body["endpoints"]["session_rewind"]["path"] == (
             "/api/sessions/{session_id}/rewind"
         )
+
+
+@pytest.mark.asyncio
+async def test_rewind_guard_blocks_run_admission_while_rewind_in_flight(adapter_with_db):
+    """A /v1/runs queued registration cannot slip in during rewind_to_message."""
+    adapter, ids, _db_path = adapter_with_db
+    q2_id = ids[2]
+    rewind_gate = threading.Event()
+    rewind_entered = threading.Event()
+    original_rewind = adapter._session_db.rewind_to_message
+
+    def hooked_rewind(session_id: str, target_message_id: int):
+        rewind_entered.set()
+        if not rewind_gate.wait(timeout=2):
+            raise AssertionError("rewind gate timed out")
+        return original_rewind(session_id, target_message_id)
+
+    adapter._session_db.rewind_to_message = hooked_rewind
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        rewind_task = asyncio.create_task(
+            cli.post(
+                "/api/sessions/s1/rewind",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"target_message_id": q2_id},
+            )
+        )
+        await asyncio.to_thread(rewind_entered.wait, 2)
+
+        admit_err = await adapter._admit_run_for_session(
+            "run_race",
+            "s1",
+            created_at=0.0,
+            model="test-model",
+        )
+        assert admit_err is not None
+        body = json.loads(admit_err.text)
+        assert body["error"]["code"] == "session_rewind_in_progress"
+        assert "s1" not in adapter._run_statuses
+
+        rewind_gate.set()
+        resp = await rewind_task
+        assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_rewind_rejects_queued_run_registered_under_guard(adapter_with_db):
+    adapter, ids, _db_path = adapter_with_db
+    admit_err = await adapter._admit_run_for_session(
+        "run_busy",
+        "s1",
+        created_at=0.0,
+        model="test-model",
+    )
+    assert admit_err is None
+
+    app = _create_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/api/sessions/s1/rewind",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={"target_message_id": ids[2]},
+        )
+        assert resp.status == 409
+        body = await resp.json()
+        assert body["error"]["code"] == "session_busy"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_rejects_rewind_in_progress(adapter_with_db):
+    adapter, ids, _db_path = adapter_with_db
+    adapter._sessions_rewinding.add("s1")
+
+    rewind_err = await adapter._session_rewind_blocked_response("s1")
+    assert rewind_err is not None
+    body = json.loads(rewind_err.text)
+    assert body["error"]["code"] == "session_rewind_in_progress"
