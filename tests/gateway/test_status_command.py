@@ -488,3 +488,42 @@ async def test_context_all_appends_expanded_listings():
     assert "Use /context all" not in result
 
 
+
+@pytest.mark.asyncio
+async def test_status_falls_back_to_gateway_runtime_when_billing_provider_empty(
+    monkeypatch,
+):
+    """When billing_provider is NULL, /status should read the active provider
+    from model_config.gateway_runtime instead of falling back to the config
+    default."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._session_db._db.get_session.return_value = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "model": "deepseek-v4-flash-free",
+        "billing_provider": None,
+        "model_config": '{"gateway_runtime": {"provider": "custom:freellmapi", "base_url": "http://localhost:3001/v1/"}}',
+    }
+
+    # Config default provider differs from gateway_runtime.provider
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"model": {"provider": "opencode-go", "model": "deepseek-v4-flash"}},
+    )
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "custom:freellmapi" in result
+    assert "opencode-go" not in result
