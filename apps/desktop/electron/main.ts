@@ -9276,7 +9276,13 @@ function createWindow({ startHidden = false }: { startHidden?: boolean } = {}) {
   mainWindow.on('unmaximize', schedulePersistWindowState)
   mainWindow.on('close', () => schedulePersistWindowState.flush())
   mainWindow.on('close', event => {
-    if (shouldHideMainWindowOnClose({ platform: process.platform, isQuitting: isFinalQuitRequested })) {
+    if (
+      shouldHideMainWindowOnClose({
+        platform: process.platform,
+        isQuitting: isFinalQuitRequested,
+        trayAvailable: Boolean(windowsTray)
+      })
+    ) {
       event.preventDefault()
       mainWindow?.hide()
     }
@@ -9408,9 +9414,9 @@ function restoreMainWindow() {
   })
 }
 
-function createWindowsTray() {
+function createWindowsTray(): boolean {
   if (!shouldCreateWindowsTray(process.platform) || windowsTray) {
-    return
+    return Boolean(windowsTray)
   }
 
   const icon = getAppIconPath()
@@ -9418,19 +9424,31 @@ function createWindowsTray() {
   if (!icon) {
     rememberLog('[tray] app icon not found; Windows tray unavailable')
 
-    return
+    return false
   }
 
-  windowsTray = new Tray(icon)
-  windowsTray.setToolTip('Hermes')
-  windowsTray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label: 'Open Hermes', click: restoreMainWindow },
-      { type: 'separator' },
-      { label: 'Quit Hermes', click: () => app.quit() }
-    ])
-  )
-  windowsTray.on('double-click', restoreMainWindow)
+  let tray: Tray | null = null
+
+  try {
+    tray = new Tray(icon)
+    tray.setToolTip('Hermes')
+    tray.setContextMenu(
+      Menu.buildFromTemplate([
+        { label: 'Open Hermes', click: restoreMainWindow },
+        { type: 'separator' },
+        { label: 'Quit Hermes', click: () => app.quit() }
+      ])
+    )
+    tray.on('double-click', restoreMainWindow)
+    windowsTray = tray
+
+    return true
+  } catch (error) {
+    tray?.destroy()
+    rememberLog(`[tray] Windows tray creation failed: ${error?.message || error}`)
+
+    return false
+  }
 }
 
 ipcMain.handle('hermes:connection', async (_event, profile) => ensureBackend(profile))
@@ -11762,9 +11780,13 @@ app.whenReady().then(() => {
   // it without the renderer visiting Settings. A failed registration is logged
   // here and surfaced in Settings via the IPC state (never silent).
   applyQuickEntrySettings(readQuickEntrySettings())
-  createWindowsTray()
+  const trayAvailable = createWindowsTray()
   createWindow({
-    startHidden: shouldStartMainWindowHidden({ platform: process.platform, argv: process.argv })
+    startHidden: shouldStartMainWindowHidden({
+      platform: process.platform,
+      argv: process.argv,
+      trayAvailable
+    })
   })
 
   // Win/Linux cold start: the launching hermes:// URL is in our own argv.

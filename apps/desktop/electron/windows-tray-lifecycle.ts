@@ -6,20 +6,24 @@ export function shouldCreateWindowsTray(platform: Platform): boolean {
 
 export function shouldHideMainWindowOnClose({
   platform,
-  isQuitting
+  isQuitting,
+  trayAvailable
 }: {
   platform: Platform
   isQuitting: boolean
+  trayAvailable: boolean
 }): boolean {
-  return platform === 'win32' && !isQuitting
+  return platform === 'win32' && trayAvailable && !isQuitting
 }
 
 export function shouldStartMainWindowHidden({
   platform,
-  argv
+  argv,
+  trayAvailable
 }: {
   platform: Platform
   argv: readonly string[]
+  trayAvailable: boolean
 }): boolean {
-  return platform === 'win32' && argv.includes('--hidden')
+  return platform === 'win32' && trayAvailable && argv.includes('--hidden')
 }
