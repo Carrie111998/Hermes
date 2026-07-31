@@ -908,6 +908,21 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+### Turn tracing (`agent.turn_trace`)
+
+Opt-in per-turn waterfall tracing for latency diagnosis. When enabled, every turn appends one JSON line of timing spans (gateway ingress, prologue, per-iteration model calls, tool batches, finalize, delivery) to `logs/turn_traces.jsonl` under the active Hermes home (default `~/.hermes`, per-profile under `HERMES_HOME`), 64 MB single rotation, rendered with `python -m agent.turn_trace_render`.
+
+```yaml
+agent:
+  turn_trace: true              # shorthand — enable with the default sink
+  # or the full form:
+  turn_trace:
+    enabled: true
+    file: /var/log/hermes/turn_traces.jsonl   # optional sink override
+```
+
+Disabled by default; when off, every instrumentation site is a no-op and tracing can never raise into a turn. The `HERMES_TURN_TRACE` / `HERMES_TURN_TRACE_FILE` environment variables act as process-level overrides for service managers, mirroring the other config bridges.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

@@ -46,6 +46,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
+from agent import turn_trace
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
@@ -2025,6 +2026,14 @@ if _config_path.exists():
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
                     _agent_cfg["gateway_startup_restore_drain_timeout"]
                 )
+            if "turn_trace" in _agent_cfg:
+                _tt_cfg = _agent_cfg["turn_trace"]
+                if isinstance(_tt_cfg, dict):
+                    os.environ["HERMES_TURN_TRACE"] = str(_tt_cfg.get("enabled", False))
+                    if _tt_cfg.get("file"):
+                        os.environ["HERMES_TURN_TRACE_FILE"] = str(_tt_cfg["file"])
+                else:
+                    os.environ["HERMES_TURN_TRACE"] = str(_tt_cfg)
         # config-authoritative knobs for the session-search index; same
         # bridge semantics as the agent settings above.
         _sessions_cfg = _cfg.get("sessions", {})
@@ -4075,6 +4084,13 @@ class TurnRunner:
         # writes `ctx.message`, so the outer `_run_agent_inner` body observes
         # the updated value exactly as it did through the closure cell.
 
+        # Executor-thread entry: make the turn trace this thread's current
+        # so same-thread instrumentation resolves it before the agent is
+        # bound.  (Executor threads are pooled; a previous turn's trace is
+        # already finished and therefore inert.)
+        if ctx.turn_trace_obj is not None:
+            turn_trace.adopt(ctx.turn_trace_obj)
+
         # session_key is propagated via contextvars in _set_session_env()
         # (_SESSION_KEY) and via set_current_session_key() (_approval_session_key)
         # below — both concurrency-safe and inherited by tool worker threads.
@@ -4235,6 +4251,7 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
+        _t_setup = time.time() if ctx.turn_trace_obj is not None else 0.0
         turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
 
         # Check agent cache — reuse the AIAgent from the previous message
@@ -4496,6 +4513,12 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        if ctx.turn_trace_obj is not None:
+            ctx.turn_trace_obj.add_span(
+                "gateway.agent_setup", _t_setup, time.time(),
+                rebuild=not reused_cached_agent,
+            )
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -5035,6 +5058,13 @@ class TurnRunner:
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
+            # Bind the trace to the agent instance so agent-side spans
+            # resolve it (run_conversation sees a bound trace and does not
+            # begin/finish its own).  Cached agents outlive the turn, so
+            # the finally below MUST clear the binding — a stale trace
+            # must not leak into the next turn.
+            if ctx.turn_trace_obj is not None:
+                turn_trace.bind(agent, ctx.turn_trace_obj)
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -5094,6 +5124,8 @@ class TurnRunner:
             except Exception:
                 pass
             reset_current_session_key(_approval_session_token)
+            if ctx.turn_trace_obj is not None:
+                turn_trace.bind(agent, None)
         ctx.result_holder[0] = result
 
         # Signal the stream consumer that the agent is done
@@ -11392,7 +11424,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # adapter.handle_message would spawn a background task and we'd
         # lose synchronous error visibility; calling _handle_message inline
         # keeps the success/failure path observable for the watcher.
-        response_text = await self._handle_message(synthetic_event)
+        try:
+            response_text = await self._handle_message(synthetic_event)
+        finally:
+            # Inline dispatch bypasses the adapter's
+            # _process_message_background — the only place turn traces begun
+            # in _handle_message_with_agent are normally finished — so this
+            # caller owns finish() (idempotent) for the bound trace.
+            try:
+                _handoff_trace = turn_trace.get_bound(synthetic_event)
+                if _handoff_trace is None:
+                    # Pre-dispatch hooks may have replaced the runner's event
+                    # copy; the shared SessionSource still carries the binding.
+                    _handoff_trace = turn_trace.get_bound(
+                        getattr(synthetic_event, "source", None)
+                    )
+                if _handoff_trace is not None:
+                    _handoff_trace.finish(status="ok")
+                    turn_trace.bind(getattr(synthetic_event, "source", None), None)
+            except Exception:
+                pass
         if not response_text:
             # Streaming may have already delivered the response inline.
             # Either way, agent ran without raising — count as success.
@@ -15509,6 +15560,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
 
+        # Turn trace: gateway owns begin(); finish() happens in the adapter's
+        # _process_message_background after delivery (bound to the event so it
+        # is reachable there).  None when HERMES_TURN_TRACE is unset — every
+        # use below is guarded.  Carried in locals/bound objects, never via
+        # thread-local: this coroutine shares the event loop thread with
+        # concurrent sessions.
+        _trace = turn_trace.begin(
+            key=_quick_key, started_at=_msg_start_time, platform=_platform_name,
+        )
+        if _trace is not None:
+            turn_trace.bind(event, _trace)
+            # The pre-dispatch hook loop may swap `event` for a copy
+            # (dataclasses.replace on prepend/rewrite directives), but the
+            # adapter's finish site still holds the ORIGINAL event.  The
+            # SessionSource object survives the replace, so bind it as the
+            # durable carrier; adapters resolve event-then-source and clear
+            # both after finish.
+            turn_trace.bind(source, _trace)
+            try:
+                _dbnc_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
+                if _dbnc_ts:
+                    _trace.mark("transport.inbound_debounce", at=float(_dbnc_ts))
+                    _trace.tag(debounce_ms=round(
+                        (_msg_start_time - float(_dbnc_ts)) * 1000.0, 1,
+                    ))
+            except Exception:
+                pass
+        _t_span = time.time() if _trace is not None else 0.0
+
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
         # last-active topic so a cross-topic Reply or stripped plain reply
@@ -15596,6 +15676,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        if _trace is not None:
+            _trace.add_span("gateway.session_resolve", _t_span, time.time())
+            _trace.tag(session_key=session_key)
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -15816,8 +15899,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state.lease_generation = run_generation
 
         # Load conversation history from transcript
+        _t_span = time.time() if _trace is not None else 0.0
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
+        if _trace is not None:
+            _trace.add_span("gateway.transcript_load", _t_span, time.time())
+            _t_span = time.time()
+
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
         #
@@ -16454,6 +16541,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+        if _trace is not None:
+            _trace.add_span("gateway.hygiene", _t_span, time.time())
+
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
@@ -16668,7 +16758,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                turn_trace_obj=_trace,
             )
+            _t_persist = time.time() if _trace is not None else 0.0
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -17219,6 +17311,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if _trace is not None:
+                _trace.add_span("gateway.persist", _t_persist, time.time())
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -17303,6 +17398,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
             logger.exception("Agent error in session %s", session_key)
+            if _trace is not None:
+                _trace.tag(gateway_error=type(e).__name__)
             # Crash-resilience for failures that happen before AIAgent enters
             # run_conversation() (for example: provider/httpx client init
             # failures). In that path the agent cannot persist the current
@@ -22977,6 +23074,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -22996,6 +23094,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_trace_obj=turn_trace_obj,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23008,6 +23107,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_trace_obj=turn_trace_obj,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23130,6 +23230,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23145,6 +23246,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23414,6 +23521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            turn_trace_obj=turn_trace_obj,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -23922,6 +24030,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _agent_warning_raw = _float_env("HERMES_AGENT_TIMEOUT_WARNING", 900)
             _agent_warning = _agent_warning_raw if _agent_warning_raw > 0 else None
             _warning_fired = False
+            # gateway.ingest envelope: message ingress up to the run_sync
+            # dispatch.  (gateway.agent_setup happens inside the worker and
+            # renders as a sibling — interval containment, not a stack.)
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(run_sync)
             )
