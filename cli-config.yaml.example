@@ -1007,9 +1007,18 @@ platform_toolsets:
 #       - "세린아 멈춰"
 #       - "세린아 잠깐"
 #     min_trailing_characters: 2      # Shorter tail is treated as noise/filler and not sent to model
-#   # Example: "세린아 멈춰, 다음 질문에 답해줘" stops current TTS and routes
-#   # only "다음 질문에 답해줘" as the next voice input. Audio without one of
-#   # the configured prefix phrases is discarded while TTS is playing.
+#     ack_enabled: false              # Independently opt in to spoken barge-in acknowledgements
+#     stop_ack_phrases:               # Round-robin after stop-only/noisy matches; no model event
+#       - "네, 멈출게요."
+#       - "알겠어요."
+#     follow_up_ack_phrases:          # Independent round-robin before a clean tail is routed once
+#       - "네, 말씀하세요."
+#       - "좋아요, 이어서 들을게요."
+#   # Example: "세린아 멈춰, 다음 질문에 답해줘" stops current TTS, plays the
+#   # next follow-up ACK when enabled, then routes only "다음 질문에 답해줘".
+#   # A stop-only match can play a stop ACK but creates no model event. ACK
+#   # synthesis/playback failure never blocks a valid tail. Audio without one
+#   # of the configured prefix phrases is discarded while TTS is playing.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

@@ -65,7 +65,14 @@ class _Mixer:
         return self.active
 
 
-def _make_adapter(*, enabled=True, phrases=KOREAN_PHRASES):
+def _make_adapter(
+    *,
+    enabled=True,
+    phrases=KOREAN_PHRASES,
+    ack_enabled=False,
+    stop_ack_phrases=(),
+    follow_up_ack_phrases=(),
+):
     from gateway.config import Platform, PlatformConfig
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -90,10 +97,14 @@ def _make_adapter(*, enabled=True, phrases=KOREAN_PHRASES):
         "enabled": enabled,
         "phrases": tuple(phrases),
         "min_trailing_characters": 2,
+        "ack_enabled": ack_enabled,
+        "stop_ack_phrases": tuple(stop_ack_phrases),
+        "follow_up_ack_phrases": tuple(follow_up_ack_phrases),
     }
     adapter._voice_playback_states = {}
     adapter._voice_playback_serial = 0
     adapter._voice_barge_in_claims = set()
+    adapter._voice_barge_in_ack_indices = {"stop": 0, "follow_up": 0}
     adapter._playback_timeout_for_audio = AsyncMock(return_value=30.0)
     adapter._cancel_voice_timeout = MagicMock()
     adapter._reset_voice_timeout = MagicMock()
@@ -145,6 +156,9 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         "enabled": False,
         "phrases": (),
         "min_trailing_characters": 2,
+        "ack_enabled": False,
+        "stop_ack_phrases": (),
+        "follow_up_ack_phrases": (),
     }
 
     with patch(
@@ -155,6 +169,18 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
                     "enabled": True,
                     "phrases": [" 세린아 멈춰 ", "", 123, "세린아 잠깐"],
                     "min_trailing_characters": 3,
+                    "ack_enabled": "yes",
+                    "stop_ack_phrases": [
+                        " 네, 멈출게요. ",
+                        "",
+                        123,
+                        "네, 멈출게요.",
+                    ],
+                    "follow_up_ack_phrases": [
+                        " 말씀하세요. ",
+                        None,
+                        "이어갈게요.",
+                    ],
                 }
             }
         },
@@ -164,12 +190,54 @@ def test_config_is_opt_in_and_keeps_only_nonempty_string_phrases():
         "enabled": True,
         "phrases": KOREAN_PHRASES,
         "min_trailing_characters": 3,
+        "ack_enabled": True,
+        "stop_ack_phrases": ("네, 멈출게요.",),
+        "follow_up_ack_phrases": ("말씀하세요.", "이어갈게요."),
     }
 
 
 @pytest.mark.asyncio
+async def test_ack_phrases_round_robin_deterministically_and_independently_by_kind():
+    adapter = _make_adapter(
+        ack_enabled=True,
+        stop_ack_phrases=("stop one", "stop two"),
+        follow_up_ack_phrases=("follow one", "follow two"),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+
+    for kind in ("stop", "follow_up", "stop", "stop", "follow_up"):
+        assert await adapter._play_voice_barge_in_ack(111, kind) is True
+
+    assert [call.args for call in adapter.play_ack_in_voice.await_args_list] == [
+        (111, "stop one"),
+        (111, "follow one"),
+        (111, "stop two"),
+        (111, "stop one"),
+        (111, "follow two"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ack_config_is_independently_opt_in():
+    adapter = _make_adapter(
+        ack_enabled=False,
+        stop_ack_phrases=("stop one",),
+        follow_up_ack_phrases=("follow one",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
+
+    assert await adapter._play_voice_barge_in_ack(111, "stop") is False
+    assert await adapter._play_voice_barge_in_ack(111, "follow_up") is False
+    adapter.play_ack_in_voice.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_legacy_stop_only_interrupts_playback_without_model_event():
-    adapter = _make_adapter()
+    adapter = _make_adapter(
+        ack_enabled=True,
+        stop_ack_phrases=("네, 멈출게요.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
     receiver = _Receiver()
     adapter._voice_receivers[111] = receiver
 
@@ -202,6 +270,7 @@ async def test_legacy_stop_only_interrupts_playback_without_model_event():
         assert await asyncio.wait_for(play_task, timeout=1) is True
 
     vc.stop.assert_called_once()
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 멈출게요.")
     adapter._voice_input_callback.assert_not_awaited()
     assert receiver.pause_calls == 0
     assert receiver.playback_token is None
@@ -210,7 +279,21 @@ async def test_legacy_stop_only_interrupts_playback_without_model_event():
 
 @pytest.mark.asyncio
 async def test_mixer_stop_with_trailing_routes_one_clean_input():
-    adapter = _make_adapter()
+    adapter = _make_adapter(
+        ack_enabled=True,
+        follow_up_ack_phrases=("네, 말씀하세요.",),
+    )
+    events = []
+
+    async def _ack(*_args):
+        events.append("ack")
+        return True
+
+    async def _route(**_kwargs):
+        events.append("route")
+
+    adapter.play_ack_in_voice = AsyncMock(side_effect=_ack)
+    adapter._voice_input_callback = AsyncMock(side_effect=_route)
     receiver = _Receiver()
     mixer = _Mixer()
     vc = MagicMock()
@@ -236,12 +319,46 @@ async def test_mixer_stop_with_trailing_routes_one_clean_input():
         assert await asyncio.wait_for(play_task, timeout=1) is True
 
     mixer.stop_speech.assert_called_once()
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 말씀하세요.")
     adapter._voice_input_callback.assert_awaited_once_with(
         guild_id=111,
         user_id=42,
         transcript="다음 질문에 답해줘",
     )
+    assert events == ["ack", "route"]
     vc.stop.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ack_result", [False, RuntimeError("TTS failed")])
+async def test_follow_up_ack_failure_fails_open_for_clean_tail(ack_result):
+    adapter = _make_adapter(
+        ack_enabled=True,
+        follow_up_ack_phrases=("네, 말씀하세요.",),
+    )
+    mixer = _Mixer()
+    mixer.active = True
+    adapter._voice_mixers[111] = mixer
+    state = adapter._begin_voice_playback(111)
+    if isinstance(ack_result, Exception):
+        ack_mock = AsyncMock(side_effect=ack_result)
+    else:
+        ack_mock = AsyncMock(return_value=ack_result)
+    adapter.play_ack_in_voice = ack_mock
+
+    await _process_transcript(
+        adapter,
+        "세린아 잠깐, 다음 질문에 답해줘",
+        token=state.token,
+    )
+
+    assert state.interrupted.is_set()
+    ack_mock.assert_awaited_once_with(111, "네, 말씀하세요.")
+    adapter._voice_input_callback.assert_awaited_once_with(
+        guild_id=111,
+        user_id=42,
+        transcript="다음 질문에 답해줘",
+    )
 
 
 @pytest.mark.asyncio
@@ -276,7 +393,11 @@ async def test_short_trailing_fragment_stops_but_is_not_forwarded():
 
 @pytest.mark.asyncio
 async def test_duplicate_barge_for_same_playback_routes_trailing_once():
-    adapter = _make_adapter()
+    adapter = _make_adapter(
+        ack_enabled=True,
+        follow_up_ack_phrases=("네, 말씀하세요.",),
+    )
+    adapter.play_ack_in_voice = AsyncMock(return_value=True)
     mixer = _Mixer()
     mixer.active = True
     adapter._voice_mixers[111] = mixer
@@ -287,6 +408,7 @@ async def test_duplicate_barge_for_same_playback_routes_trailing_once():
     await _process_transcript(adapter, transcript, token=state.token)
 
     mixer.stop_speech.assert_called_once()
+    adapter.play_ack_in_voice.assert_awaited_once_with(111, "네, 말씀하세요.")
     adapter._voice_input_callback.assert_awaited_once_with(
         guild_id=111,
         user_id=42,
@@ -403,10 +525,9 @@ async def test_queued_playback_does_not_start_after_disconnect():
 
 
 @pytest.mark.asyncio
-async def test_mixer_ack_uses_shared_barge_in_playback_path():
+async def test_explicit_ack_uses_shared_playback_path_without_tool_ack_or_mixer():
     adapter = _make_adapter()
-    adapter._voice_fx_cfg["ack_enabled"] = True
-    adapter._voice_mixers[111] = _Mixer()
+    adapter._voice_fx_cfg["ack_enabled"] = False
     adapter.play_in_voice_channel = AsyncMock(return_value=True)
 
     def _tts(*, text, output_path):
@@ -414,10 +535,7 @@ async def test_mixer_ack_uses_shared_barge_in_playback_path():
         Path(output_path).write_bytes(b"audio")
         return json.dumps({"success": True, "file_path": output_path})
 
-    with (
-        patch("tools.tts_tool.text_to_speech_tool", side_effect=_tts),
-        _patch_mixer_decode(),
-    ):
+    with patch("tools.tts_tool.text_to_speech_tool", side_effect=_tts):
         assert await adapter.play_ack_in_voice(111, "잠깐 볼게요") is True
 
     adapter.play_in_voice_channel.assert_awaited_once()

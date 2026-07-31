@@ -1026,6 +1026,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_playback_states: Dict[int, _VoicePlaybackState] = {}
         self._voice_playback_serial = 0
         self._voice_barge_in_claims: set[Tuple[int, int]] = set()
+        self._voice_barge_in_ack_indices: Dict[str, int] = {
+            "stop": 0,
+            "follow_up": 0,
+        }
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
         # the bot in the channel when the user deliberately picked text-only
@@ -3871,14 +3875,18 @@ class DiscordAdapter(BasePlatformAdapter):
         """Read the opt-in conservative TTS interruption policy.
 
         ``discord.voice_barge_in`` is disabled by default and has no default
-        phrases. This preserves the existing privacy boundary: Discord does not
-        keep broad-capture enabled during bot speech unless the user explicitly
-        supplies strong phrases such as ``세린아 멈춰``.
+        phrases. Barge-in acknowledgements are a separate opt-in and also have
+        no defaults. This preserves the existing privacy boundary: Discord does
+        not keep broad-capture enabled during bot speech unless the user
+        explicitly supplies strong phrases such as ``세린아 멈춰``.
         """
         defaults: Dict[str, Any] = {
             "enabled": False,
             "phrases": (),
             "min_trailing_characters": 2,
+            "ack_enabled": False,
+            "stop_ack_phrases": (),
+            "follow_up_ack_phrases": (),
         }
         try:
             from hermes_cli.config import read_raw_config
@@ -3893,13 +3901,27 @@ class DiscordAdapter(BasePlatformAdapter):
             if not isinstance(raw, dict):
                 return defaults
 
-            enabled_raw = raw.get("enabled", False)
-            if isinstance(enabled_raw, bool):
-                enabled = enabled_raw
-            elif isinstance(enabled_raw, str):
-                enabled = enabled_raw.strip().lower() in {"1", "true", "yes", "on"}
-            else:
-                enabled = False
+            def _as_bool(value: Any) -> bool:
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    return value.strip().lower() in {"1", "true", "yes", "on"}
+                return False
+
+            def _ack_phrases(key: str) -> Tuple[str, ...]:
+                values = raw.get(key, ())
+                cleaned: list[str] = []
+                if isinstance(values, (list, tuple)):
+                    for value in values:
+                        if not isinstance(value, str):
+                            continue
+                        phrase = value.strip()
+                        if phrase and phrase not in cleaned:
+                            cleaned.append(phrase)
+                return tuple(cleaned)
+
+            enabled = _as_bool(raw.get("enabled", False))
+            ack_enabled = _as_bool(raw.get("ack_enabled", False))
 
             phrases_raw = raw.get("phrases", ())
             phrases: list[str] = []
@@ -3922,6 +3944,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 "enabled": enabled,
                 "phrases": tuple(phrases),
                 "min_trailing_characters": min(100, max(1, min_chars)),
+                "ack_enabled": ack_enabled,
+                "stop_ack_phrases": _ack_phrases("stop_ack_phrases"),
+                "follow_up_ack_phrases": _ack_phrases("follow_up_ack_phrases"),
             }
         except Exception as e:
             logger.debug("Could not load discord.voice_barge_in config: %s", e)
@@ -4039,6 +4064,46 @@ class DiscordAdapter(BasePlatformAdapter):
             claims.clear()
             claims.update(newest)
         return True
+
+    async def _play_voice_barge_in_ack(self, guild_id: int, kind: str) -> bool:
+        """Play the next configured barge-in ACK without blocking tail routing.
+
+        Stop-only and follow-up acknowledgements keep independent deterministic
+        round-robin positions. Selection advances per attempt; synthesis or
+        playback failure is intentionally fail-open so a valid follow-up tail
+        can still reach the existing voice-input callback.
+        """
+        cfg = getattr(self, "_voice_barge_in_cfg", None) or {}
+        if not cfg.get("ack_enabled"):
+            return False
+
+        phrase_key = {
+            "stop": "stop_ack_phrases",
+            "follow_up": "follow_up_ack_phrases",
+        }.get(kind)
+        if phrase_key is None:
+            return False
+        phrases = cfg.get(phrase_key) or ()
+        if not isinstance(phrases, (list, tuple)) or not phrases:
+            return False
+
+        indices = getattr(self, "_voice_barge_in_ack_indices", None)
+        if not isinstance(indices, dict):
+            indices = {"stop": 0, "follow_up": 0}
+            self._voice_barge_in_ack_indices = indices
+        index = int(indices.get(kind, 0) or 0)
+        phrase = phrases[index % len(phrases)]
+        indices[kind] = index + 1
+
+        try:
+            return bool(await self.play_ack_in_voice(guild_id, phrase))
+        except Exception:
+            logger.debug(
+                "Discord voice barge-in %s acknowledgement failed",
+                kind,
+                exc_info=True,
+            )
+            return False
 
     def _interrupt_voice_playback(self, guild_id: int, playback_token: int) -> bool:
         """Interrupt only the playback that produced this captured utterance."""
@@ -4167,21 +4232,27 @@ class DiscordAdapter(BasePlatformAdapter):
         return b"\x00" * (BYTES_PER_MS * lead_ms)
 
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
-        """Speak a short acknowledgement over the ambient bed.
+        """Synthesize an acknowledgement on the shared voice playback path.
 
-        Called from the gateway's tool-progress hook on the first tool call of
-        a turn, so the user hears "let me look into that" before the bot goes
-        quiet to work.  No-op unless the mixer is installed and acks enabled.
+        The no-phrase tool-progress form remains gated by ``voice_fx`` and the
+        continuous mixer. An explicit phrase is already gated by its caller
+        (for example, opt-in barge-in ACK config), so it can use either mixer or
+        legacy playback while preserving serialization, cancellation, and
+        receiver capture boundaries.
         """
-        if not self._voice_fx_cfg.get("ack_enabled"):
-            return False
-        mixer = self._voice_mixers.get(guild_id)
-        if mixer is None:
-            return False
         if phrase is None:
+            if not self._voice_fx_cfg.get("ack_enabled"):
+                return False
+            mixer = self._voice_mixers.get(guild_id)
+            if mixer is None:
+                return False
             import random
+
             phrases = self._voice_fx_cfg.get("ack_phrases") or ["One moment."]
             phrase = random.choice(phrases)
+        if not isinstance(phrase, str) or not phrase.strip():
+            return False
+        phrase = phrase.strip()
 
         # Synthesise the ack via the configured TTS provider, then layer it.
         import uuid as _uuid
@@ -4737,7 +4808,9 @@ class DiscordAdapter(BasePlatformAdapter):
                     or usable_characters < min_characters
                     or is_whisper_hallucination(trailing)
                 ):
+                    await self._play_voice_barge_in_ack(guild_id, "stop")
                     return
+                await self._play_voice_barge_in_ack(guild_id, "follow_up")
                 transcript = trailing
             elif is_whisper_hallucination(transcript):
                 return
