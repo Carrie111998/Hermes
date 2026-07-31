@@ -9,7 +9,7 @@ import stat
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values, load_dotenv
+from dotenv import load_dotenv
 from utils import atomic_replace, fast_safe_load
 
 
@@ -475,6 +475,8 @@ def _cwd_env_key_allowed(name: str) -> bool:
 
 def _read_trusted_cwd_dotenv(path: Path) -> dict[str, str | None]:
     """Read a regular non-symlink dotenv file without interpolation."""
+    from dotenv import dotenv_values
+
     before = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(before.st_mode):
         raise OSError(f"not a regular file: {path}")
@@ -535,6 +537,8 @@ def _load_trusted_cwd_dotenv(
 
 def _dotenv_names(path: Path) -> set[str]:
     """Return case-normalized names declared by a trusted user dotenv file."""
+    from dotenv import dotenv_values
+
     try:
         values = dotenv_values(dotenv_path=path, encoding="utf-8")
     except UnicodeDecodeError:
