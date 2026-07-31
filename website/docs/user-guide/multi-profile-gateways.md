@@ -97,11 +97,15 @@ gateway:
 ```
 
 (The flag is also accepted as a top-level `multiplex_profiles: true` for
-convenience.) On the next start the default gateway enumerates every profile,
-brings up each profile's enabled platforms under that profile's own
-credentials, and routes each inbound message to the profile it belongs to. Each
-turn resolves the routed profile's config, skills, memory, SOUL, **and provider
-keys** — credentials are never shared across profiles.
+convenience.) On the next start, the default gateway owns the shared inbound
+transports and routes each inbound message to the profile it belongs to. A
+named profile starts a secondary adapter only when that profile explicitly
+declares the platform in its own `config.yaml` (for example, with a distinct
+bot credential). Inherited default-platform settings remain available while
+that profile runs a routed turn, but do **not** cause it to poll or connect a
+second transport. Each turn resolves the routed profile's config, skills,
+memory, SOUL, **and provider keys** — credentials are never shared across
+profiles.
 
 You do **not** run `hermes gateway start` for the secondary profiles — the
 default gateway serves them. See the contract changes below.
@@ -181,14 +185,19 @@ configuration errors remain fatal: for example, an `open` own-policy platform
 without `GATEWAY_ALLOW_ALL_USERS` or its platform-specific allow-all opt-in
 still aborts gateway startup rather than silently dropping the unsafe profile.
 
-#### 3. Per-credential platforms still need their own token per profile
+#### 3. Explicit per-profile transports need their own token
 
-Polling/connection platforms (Telegram, Discord, Slack, Matrix, Signal, …) work
-fine multiplexed, but each profile that enables one must supply its **own** bot
+Polling/connection platforms (Telegram, Discord, Slack, Matrix, Signal, …) can
+run as a secondary adapter only when the named profile explicitly declares that
+platform in its local `config.yaml`. That profile must supply its **own** bot
 token — the same token cannot be polled by two profiles at once. If two profiles
-configure the same `(platform, token)`, startup fails fast naming both profiles
-(see [Token-conflict safety](#token-conflict-safety) — the rule is unchanged,
-it's just enforced inside the one process now).
+explicitly configure the same `(platform, token)`, startup fails fast naming
+both profiles (see [Token-conflict safety](#token-conflict-safety)).
+
+For several communities sharing one bot credential, configure the transport only
+on the default profile and use [`profile_routes`](#routing-shared-bot-chats-to-profiles-profile_routes)
+to select the profile after the shared adapter receives a message. Do not copy
+the default transport configuration into each routed profile.
 
 #### 4. Session keys are namespaced by profile
 

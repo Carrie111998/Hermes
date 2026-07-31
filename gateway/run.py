@@ -3347,6 +3347,58 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _local_profile_platforms(
+    profile_home: Union[Path, str],
+) -> Optional[frozenset[str]]:
+    """Return platforms explicitly declared by a named profile's config.
+
+    A secondary profile inherits the default configuration for its routed agent
+    turn, but inherited transport configuration must not create another inbound
+    adapter. ``None`` is reserved for synthetic/nonexistent homes used by older
+    callers that cannot provide config provenance.
+    """
+    profile_home = Path(profile_home)
+    if not profile_home.exists():
+        return None
+
+    config_path = profile_home / "config.yaml"
+    if not config_path.is_file():
+        return frozenset()
+
+    try:
+        import yaml
+    except ImportError:
+        logger.warning(
+            "PyYAML is unavailable; skipping secondary adapter ownership lookup"
+        )
+        return frozenset()
+
+    try:
+        raw_config = yaml.safe_load(config_path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        logger.warning(
+            "Could not read profile config while determining adapter ownership: %s",
+            config_path,
+            exc_info=True,
+        )
+        return frozenset()
+
+    if not isinstance(raw_config, dict):
+        return frozenset()
+
+    platform_maps = [raw_config.get("platforms")]
+    gateway = raw_config.get("gateway")
+    if isinstance(gateway, dict):
+        platform_maps.append(gateway.get("platforms"))
+    return frozenset(
+        str(platform)
+        for platform_map in platform_maps
+        if isinstance(platform_map, dict)
+        for platform, platform_config in platform_map.items()
+        if isinstance(platform_config, dict)
+    )
+
+
 class TurnRunner:
     """Per-turn collaborator carrying the tool-progress callbacks that used to
     be nested closures inside ``GatewayRunner._run_agent_inner``.
@@ -12520,7 +12572,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         with _profile_runtime_scope(profile_home):
             profile_cfg = load_gateway_config()
-            violation = _own_policy_open_startup_violation(profile_cfg)
+        local_platforms = _local_profile_platforms(profile_home)
+        if local_platforms is not None:
+            profile_cfg = dataclasses.replace(
+                profile_cfg,
+                platforms={
+                    platform: platform_config
+                    for platform, platform_config in profile_cfg.platforms.items()
+                    if platform.value in local_platforms
+                },
+            )
+        violation = _own_policy_open_startup_violation(profile_cfg)
         if violation:
             raise MultiplexConfigError(
                 f"Profile '{profile_name}' enables {violation}. "

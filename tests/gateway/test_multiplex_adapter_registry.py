@@ -241,6 +241,80 @@ class TestSecondaryProfileFatalRecovery:
 class TestSecondaryProfileConfigHandling:
     """Secondary config errors degrade only when the profile is safe to skip."""
 
+    def test_secondary_skips_inherited_platforms_not_declared_locally(
+        self, tmp_path, monkeypatch
+    ):
+        """A routed profile must not connect adapters it merely inherits."""
+        profile_home = tmp_path / "profiles" / "life"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text("agent:\n  name: life\n")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+
+        inherited_cfg = GatewayConfig(multiplex_profiles=True)
+        inherited_cfg.platforms = {
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="inherited"),
+            Platform.WHATSAPP: PlatformConfig(enabled=True),
+            Platform.WEBHOOK: PlatformConfig(enabled=True),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: inherited_cfg
+        )
+        created = []
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda platform, config: created.append(platform),
+        )
+
+        connected = asyncio.run(
+            runner._start_one_profile_adapters("life", profile_home, {})
+        )
+
+        assert connected == 0
+        assert created == []
+        assert runner._profile_adapters["life"] == {}
+
+    def test_secondary_starts_platform_explicitly_declared_locally(
+        self, tmp_path, monkeypatch
+    ):
+        """A named profile may still own a distinct explicitly configured adapter."""
+        profile_home = tmp_path / "profiles" / "research"
+        profile_home.mkdir(parents=True)
+        (profile_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "gateway:\n"
+            "  platforms:\n"
+            "    whatsapp:\n"
+            "      enabled: true\n"
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+        profile_cfg = GatewayConfig(multiplex_profiles=True)
+        profile_cfg.platforms = {
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="distinct"),
+            Platform.WHATSAPP: PlatformConfig(enabled=True),
+        }
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+        created = []
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda platform, config: created.append(platform),
+        )
+
+        asyncio.run(
+            runner._start_one_profile_adapters("research", str(profile_home), {})
+        )
+
+        assert created == [Platform.TELEGRAM, Platform.WHATSAPP]
+
 
     @pytest.mark.asyncio
     async def test_secondary_reports_all_port_binding_platforms(self, monkeypatch):
