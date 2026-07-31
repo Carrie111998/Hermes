@@ -116,7 +116,7 @@ def _run_deterministic_smoke(
     root: Path,
 ) -> None:
     command = [
-        str(hermes_repo / ".venv" / "bin" / "python"),
+        sys.executable,
         str(hermes_repo / "scripts" / "smoke_nemo_relay_shared_metrics.py"),
         "--hermes-repo",
         str(hermes_repo),
