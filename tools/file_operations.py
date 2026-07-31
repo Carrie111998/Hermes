@@ -975,8 +975,25 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _escape_shell_arg_native(self, arg: str) -> str:
+        """Quote *arg* for shell use WITHOUT the Git Bash ``/c/`` rewrite.
+
+        ``_escape_shell_arg`` rewrites ``C:\\...`` to ``/c/...`` for bash
+        builtins and MSYS/Cygwin binaries. Native Windows executables (e.g.
+        rg installed via WinGet/MSVC builds) cannot resolve ``/c/...`` when
+        ``MSYS2_ARG_CONV_EXCL=*`` disables MSYS argument auto-conversion:
+        they treat it as a root-relative path (``C:\\c\\...``) and fail with
+        "os error 3: The system cannot find the path specified". Single
+        quotes preserve backslashes verbatim, so the native ``C:\\...``
+        form survives bash untouched and works with both native and
+        MSYS binaries.
+        """
+        from tools.environments.local import _msys_to_windows_path
+        arg = _msys_to_windows_path(arg)  # /c/Users/x -> C:\Users\x; no-op otherwise
+        return "'" + arg.replace("'", "'\"'\"'") + "'"
+
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
-        """Write ``content`` to ``path`` atomically via temp-file + rename.
+        """Write ``content`` to ``path`` atomically via tempfile + rename.
 
         Streams ``content`` over stdin into a temp file in the SAME
         directory as ``path`` (so the final ``mv`` is a real rename on the
@@ -2231,7 +2248,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_shell_arg_native(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2242,7 +2259,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_shell_arg_native(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2298,7 +2315,10 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        # Path must stay in native Windows form (no /c/ rewrite): native
+        # rg.exe cannot resolve /c/... when MSYS2_ARG_CONV_EXCL=* disables
+        # MSYS argument auto-conversion.
+        cmd_parts.append(self._escape_shell_arg_native(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -2428,7 +2448,9 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        # Same native-path treatment as the rg variant: keep the Windows
+        # form so the path resolves regardless of which grep is on PATH.
+        cmd_parts.append(self._escape_shell_arg_native(path))
         
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)
