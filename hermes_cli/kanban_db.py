@@ -89,7 +89,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -335,6 +335,14 @@ _FACEBOOK_GROUP_TARGET_RE = re.compile(
     r"(?P<url_group_id>[0-9]+)/?)?",
     flags=re.IGNORECASE,
 )
+_FACEBOOK_GROUP_MENTION_RE = re.compile(
+    r"Facebook Group (?P<group_id>[0-9]+)",
+    flags=re.IGNORECASE,
+)
+_FACEBOOK_MARKETPLACE_ITEM_MENTION_RE = re.compile(
+    r"Facebook Marketplace item (?P<listing_id>[0-9]+)",
+    flags=re.IGNORECASE,
+)
 
 
 def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
@@ -366,6 +374,42 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
     targets = contract.get("external_targets")
     if not isinstance(targets, list):
         return frozenset()
+    crosspost = contract.get("facebook_crosspost")
+    if isinstance(crosspost, Mapping):
+        listing_id = str(
+            crosspost.get("marketplace_listing_id") or ""
+        ).strip()
+        raw_group_ids = crosspost.get("group_ids")
+        if (
+            not listing_id.isdigit()
+            or not isinstance(raw_group_ids, list)
+            or not raw_group_ids
+        ):
+            return frozenset()
+        structured_group_ids = [
+            str(group_id or "").strip() for group_id in raw_group_ids
+        ]
+        if (
+            any(not group_id.isdigit() for group_id in structured_group_ids)
+            or len(set(structured_group_ids)) != len(structured_group_ids)
+        ):
+            return frozenset()
+        display_text = " ".join(str(target or "") for target in targets)
+        mentioned_group_ids = {
+            match.group("group_id")
+            for match in _FACEBOOK_GROUP_MENTION_RE.finditer(display_text)
+        }
+        if mentioned_group_ids != set(structured_group_ids):
+            return frozenset()
+        mentioned_listing_ids = {
+            match.group("listing_id")
+            for match in _FACEBOOK_MARKETPLACE_ITEM_MENTION_RE.finditer(
+                display_text
+            )
+        }
+        if mentioned_listing_ids != {listing_id}:
+            return frozenset()
+        return frozenset(structured_group_ids)
     group_ids: set[str] = set()
     for target in targets:
         normalized = str(target or "").strip()
@@ -379,6 +423,38 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
         elif normalized.casefold().startswith("facebook group"):
             return frozenset()
     return frozenset(group_ids)
+
+
+def grace_facebook_crosspost_scope(
+    body: str,
+) -> tuple[Optional[str], frozenset[str]]:
+    """Return the fingerprint-bound listing and groups for an exact cross-post."""
+    contract = _grace_compiled_contract(body)
+    if contract is None:
+        return None, frozenset()
+    crosspost = contract.get("facebook_crosspost")
+    if not isinstance(crosspost, Mapping):
+        return None, frozenset()
+    listing_id = str(
+        crosspost.get("marketplace_listing_id") or ""
+    ).strip()
+    raw_group_ids = crosspost.get("group_ids")
+    if (
+        not listing_id.isdigit()
+        or not isinstance(raw_group_ids, list)
+        or not raw_group_ids
+    ):
+        return None, frozenset()
+    group_ids = frozenset(
+        str(group_id or "").strip() for group_id in raw_group_ids
+    )
+    if (
+        len(group_ids) != len(raw_group_ids)
+        or any(not group_id.isdigit() for group_id in group_ids)
+        or grace_external_group_ids(body) != group_ids
+    ):
+        return None, frozenset()
+    return listing_id, group_ids
 
 
 def _grace_contract_has_legacy_human_approval(
@@ -412,7 +488,11 @@ def grace_allows_facebook_group_posting(body: str) -> bool:
     if _grace_loop_stage_header(str(body or "")) != "execution":
         return False
     contract = _grace_compiled_contract(body)
-    if contract is None or not grace_external_group_ids(body):
+    if (
+        contract is None
+        or isinstance(contract.get("facebook_crosspost"), Mapping)
+        or not grace_external_group_ids(body)
+    ):
         return False
     return (
         _grace_contract_has_legacy_human_approval(contract)
@@ -420,31 +500,30 @@ def grace_allows_facebook_group_posting(body: str) -> bool:
     )
 
 
-def grace_task_facebook_group_permissions(
+def _grace_task_approved_contract(
     conn: sqlite3.Connection,
     task_id: str,
-) -> tuple[frozenset[str], bool]:
-    """Return challenge-bound group targets and group-post authority."""
+) -> tuple[Optional[Mapping[str, Any]], str]:
+    """Return the exact contract bound to one consumed owner challenge."""
     task = conn.execute(
         "SELECT body FROM tasks WHERE id = ?",
         (str(task_id or "").strip(),),
     ).fetchone()
     if task is None:
-        return frozenset(), False
+        return None, ""
     body = str(task["body"] or "")
     if _grace_loop_stage_header(body) != "execution":
-        return frozenset(), False
+        return None, ""
     contract = _grace_compiled_contract(body)
-    group_ids = grace_external_group_ids(body)
-    if contract is None or not group_ids:
-        return frozenset(), False
+    if contract is None:
+        return None, ""
     provenance = contract.get("approval_provenance")
     if not isinstance(provenance, Mapping):
-        return frozenset(), False
+        return None, ""
     try:
         from proactive.loop_contract import contract_fingerprint
     except (ImportError, TypeError, ValueError):
-        return frozenset(), False
+        return None, ""
     rows = conn.execute(
         """
         SELECT d.challenge_token, d.contract_fingerprint,
@@ -471,16 +550,16 @@ def grace_task_facebook_group_permissions(
         (str(task_id or "").strip(),),
     ).fetchall()
     if len(rows) != 1:
-        return frozenset(), False
+        return None, ""
     approval = rows[0]
     try:
         delegation_args = json.loads(
             str(approval["delegation_args"] or "")
         )
     except (TypeError, ValueError, json.JSONDecodeError):
-        return frozenset(), False
+        return None, ""
     if not isinstance(delegation_args, Mapping):
-        return frozenset(), False
+        return None, ""
     original_request = str(
         delegation_args.get("original_request") or ""
     )
@@ -492,7 +571,7 @@ def grace_task_facebook_group_permissions(
         or audit.get("original_request_sha256")
         != hashlib.sha256(original_request.encode("utf-8")).hexdigest()
     ):
-        return frozenset(), False
+        return None, ""
     fingerprint_contract = json.loads(json.dumps(dict(contract)))
     fingerprint_contract.pop("audit", None)
     fingerprint_contract.pop("authorization", None)
@@ -523,6 +602,26 @@ def grace_task_facebook_group_permissions(
         ).hexdigest()
     )
     if not approval_valid:
+        return None, ""
+    return contract, body
+
+
+def grace_task_facebook_group_permissions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[frozenset[str], bool]:
+    """Return challenge-bound direct group-post targets and authority."""
+    contract, body = _grace_task_approved_contract(
+        conn,
+        task_id,
+    )
+    if (
+        contract is None
+        or isinstance(contract.get("facebook_crosspost"), Mapping)
+    ):
+        return frozenset(), False
+    group_ids = grace_external_group_ids(body)
+    if not group_ids:
         return frozenset(), False
     return group_ids, _grace_contract_is_browser_publish(contract)
 
@@ -537,6 +636,32 @@ def grace_task_allows_facebook_group_posting(
         task_id,
     )
     return posting_allowed
+
+
+def grace_task_facebook_crosspost_permissions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[Optional[str], frozenset[str], bool]:
+    """Return a challenge-bound existing-listing cross-post capability."""
+    contract, body = _grace_task_approved_contract(
+        conn,
+        task_id,
+    )
+    if (
+        contract is None
+        or not isinstance(contract.get("facebook_crosspost"), Mapping)
+        or not _grace_contract_is_browser_publish(contract)
+    ):
+        return None, frozenset(), False
+    listing_id, crosspost_group_ids = grace_facebook_crosspost_scope(
+        body
+    )
+    if (
+        listing_id is None
+        or not crosspost_group_ids
+    ):
+        return None, frozenset(), False
+    return listing_id, crosspost_group_ids, True
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -4269,10 +4394,36 @@ def reserve_external_group_post(
     expected_run_id: Optional[int],
 ) -> Optional[str]:
     """Durably reserve one contract-scoped group post before final dispatch."""
-    normalized_group_id = str(group_id or "").strip()
-    if not normalized_group_id.isdigit():
-        return "Facebook group post blocked: group id must be numeric."
-    effect_key = f"group:{normalized_group_id}"
+    return reserve_external_group_posts(
+        conn,
+        task_id,
+        [group_id],
+        expected_run_id=expected_run_id,
+        allow_crosspost=False,
+    )
+
+
+def reserve_external_group_posts(
+    conn: sqlite3.Connection,
+    task_id: str,
+    group_ids: Sequence[str],
+    *,
+    expected_run_id: Optional[int],
+    allow_crosspost: bool = False,
+) -> Optional[str]:
+    """Atomically reserve an exact cross-post destination set."""
+    normalized_group_ids = tuple(
+        str(group_id or "").strip() for group_id in group_ids
+    )
+    if (
+        not normalized_group_ids
+        or any(not group_id.isdigit() for group_id in normalized_group_ids)
+        or len(set(normalized_group_ids)) != len(normalized_group_ids)
+    ):
+        return (
+            "Facebook group post blocked: group ids must be unique numeric "
+            "values."
+        )
     now = int(time.time())
     with write_txn(conn):
         task = conn.execute(
@@ -4289,66 +4440,93 @@ def reserve_external_group_post(
                 "Facebook group post blocked: caller is not the active "
                 "worker run."
             )
-        allowed_group_ids, posting_allowed = (
-            grace_task_facebook_group_permissions(conn, task_id)
-        )
-        if normalized_group_id not in allowed_group_ids or not posting_allowed:
+        if allow_crosspost:
+            _, allowed_group_ids, posting_allowed = (
+                grace_task_facebook_crosspost_permissions(conn, task_id)
+            )
+        else:
+            allowed_group_ids, posting_allowed = (
+                grace_task_facebook_group_permissions(conn, task_id)
+            )
+        if (
+            allow_crosspost
+            and set(normalized_group_ids) != set(allowed_group_ids)
+        ):
+            return (
+                "Facebook cross-post blocked: selected groups must equal the "
+                "exact approved destination set."
+            )
+        if (
+            not posting_allowed
+            or not set(normalized_group_ids).issubset(allowed_group_ids)
+        ):
             return (
                 "Facebook group post blocked: target or browser_publish "
                 "authority is absent from the compiled Loop Contract."
             )
-        prior = conn.execute(
-            "SELECT state, details FROM task_external_effects "
-            "WHERE task_id = ? AND platform = 'facebook' AND effect_key = ?",
-            (task_id, effect_key),
-        ).fetchone()
-        if prior is not None:
-            try:
-                prior_details = json.loads(prior["details"] or "{}")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                prior_details = {}
-            retryable_failed_probe = (
-                prior["state"] == "failed"
-                and prior_details.get("posting_status")
-                == "not_created_guarded_ref_unavailable"
-            )
-            if not retryable_failed_probe:
-                return (
-                    "Facebook group post blocked: durable state is already "
-                    f"{prior['state']}; reconcile the visible post instead of "
-                    "retrying."
+        priors: dict[str, tuple[Optional[sqlite3.Row], dict[str, Any]]] = {}
+        for normalized_group_id in normalized_group_ids:
+            effect_key = f"group:{normalized_group_id}"
+            prior = conn.execute(
+                "SELECT state, details FROM task_external_effects "
+                "WHERE task_id = ? AND platform = 'facebook' "
+                "AND effect_key = ?",
+                (task_id, effect_key),
+            ).fetchone()
+            prior_details: dict[str, Any] = {}
+            if prior is not None:
+                try:
+                    prior_details = json.loads(prior["details"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    prior_details = {}
+                retryable_failed_probe = (
+                    prior["state"] == "failed"
+                    and prior_details.get("posting_status")
+                    == "not_created_guarded_ref_unavailable"
                 )
-        _upsert_external_effect(
-            conn,
-            task_id=task_id,
-            platform="facebook",
-            effect_key=effect_key,
-            state="create_started",
-            external_id=normalized_group_id,
-            details={
-                "reservation": "before_final_post_dispatch",
-                "prior_state": prior["state"] if prior is not None else None,
-                "prior_posting_status": (
-                    prior_details.get("posting_status")
-                    if prior is not None
-                    else None
-                ),
-            },
-            run_id=int(expected_run_id),
-            now=now,
-        )
-        _append_event(
-            conn,
-            task_id,
-            "external_effect_reserved",
-            {
-                "platform": "facebook",
-                "effect_key": effect_key,
-                "state": "create_started",
-                "external_id": normalized_group_id,
-            },
-            run_id=int(expected_run_id),
-        )
+                if not retryable_failed_probe:
+                    return (
+                        "Facebook group post blocked: durable state is already "
+                        f"{prior['state']} for group {normalized_group_id}; "
+                        "reconcile the visible post instead of retrying."
+                    )
+            priors[normalized_group_id] = (prior, prior_details)
+        for normalized_group_id in normalized_group_ids:
+            effect_key = f"group:{normalized_group_id}"
+            prior, prior_details = priors[normalized_group_id]
+            _upsert_external_effect(
+                conn,
+                task_id=task_id,
+                platform="facebook",
+                effect_key=effect_key,
+                state="create_started",
+                external_id=normalized_group_id,
+                details={
+                    "reservation": "before_final_post_dispatch",
+                    "prior_state": (
+                        prior["state"] if prior is not None else None
+                    ),
+                    "prior_posting_status": (
+                        prior_details.get("posting_status")
+                        if prior is not None
+                        else None
+                    ),
+                },
+                run_id=int(expected_run_id),
+                now=now,
+            )
+            _append_event(
+                conn,
+                task_id,
+                "external_effect_reserved",
+                {
+                    "platform": "facebook",
+                    "effect_key": effect_key,
+                    "state": "create_started",
+                    "external_id": normalized_group_id,
+                },
+                run_id=int(expected_run_id),
+            )
     return None
 
 

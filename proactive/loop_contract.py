@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from typing import Any, Mapping
 
@@ -90,6 +91,76 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
         required_list(path)
     if "external_targets" in value:
         required_list("external_targets")
+    if "facebook_crosspost" in value:
+        crosspost = value.get("facebook_crosspost")
+        if not isinstance(crosspost, Mapping):
+            errors.append("facebook_crosspost must be an object")
+        else:
+            listing_id = crosspost.get("marketplace_listing_id")
+            group_ids = crosspost.get("group_ids")
+            if not isinstance(listing_id, str) or not listing_id.isdigit():
+                errors.append(
+                    "facebook_crosspost.marketplace_listing_id must be a "
+                    "numeric string"
+                )
+            if (
+                not isinstance(group_ids, list)
+                or not group_ids
+                or any(
+                    not isinstance(group_id, str) or not group_id.isdigit()
+                    for group_id in group_ids
+                )
+                or len(set(group_ids)) != len(group_ids)
+            ):
+                errors.append(
+                    "facebook_crosspost.group_ids must contain unique numeric "
+                    "strings"
+                )
+            targets = value.get("external_targets")
+            target_text = (
+                " ".join(str(target) for target in targets)
+                if isinstance(targets, list)
+                else ""
+            )
+            folded_targets = target_text.casefold()
+            if not (
+                "facebook" in folded_targets
+                and "marketplace" in folded_targets
+                and ("group" in folded_targets or "社團" in target_text)
+            ):
+                errors.append(
+                    "facebook_crosspost requires Facebook Marketplace and "
+                    "group destinations in external_targets"
+                )
+            if isinstance(group_ids, list) and all(
+                isinstance(group_id, str) for group_id in group_ids
+            ):
+                mentioned_group_ids = set(re.findall(
+                    r"Facebook Group ([0-9]+)",
+                    target_text,
+                    flags=re.IGNORECASE,
+                ))
+                if mentioned_group_ids != set(group_ids):
+                    errors.append(
+                        "facebook_crosspost.group_ids must match group ids "
+                        "shown in external_targets"
+                    )
+            mentioned_listing_ids = set(re.findall(
+                r"Facebook Marketplace item ([0-9]+)",
+                target_text,
+                flags=re.IGNORECASE,
+            ))
+            if (
+                not mentioned_listing_ids
+                or (
+                    not isinstance(listing_id, str)
+                    or mentioned_listing_ids != {listing_id}
+                )
+            ):
+                errors.append(
+                    "facebook_crosspost.marketplace_listing_id must match "
+                    "the listing id shown in external_targets"
+                )
 
     max_iterations = value.get("stop_rules", {}).get("max_iterations")
     if not isinstance(max_iterations, int) or not 1 <= max_iterations <= 20:

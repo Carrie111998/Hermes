@@ -935,6 +935,76 @@ def test_model_visible_schema_exposes_required_nested_parameters():
     validate(_nested_args(), CLAWOPS_DELEGATE_PARAMETERS)
 
 
+def test_facebook_marketplace_crosspost_requires_structured_exact_ids(
+    tmp_path,
+    monkeypatch,
+):
+    values = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_THREAD_ID": "2",
+        "HERMES_SESSION_USER_ID": "kj",
+        "HERMES_SESSION_OWNER_USER_ID": "kj",
+        "HERMES_SESSION_KEY": "agent:main:telegram:group:chat-1:2",
+        "HERMES_SESSION_ID": "grace-session-1",
+        "HERMES_SESSION_MESSAGE_ID": "msg-crosspost",
+        "HERMES_SESSION_MESSAGE_TEXT": "請準備跨貼",
+        "HERMES_SESSION_INTERNAL": "false",
+    }
+    _configure_secondhand_context(tmp_path, monkeypatch, values)
+    args = _nested_args()
+    args.update({
+        "task_type": "browser_publish",
+        "risk_level": "medium",
+        "external_targets": [
+            "Facebook Marketplace existing listing → "
+            "Facebook group 1333742673375089",
+        ],
+    })
+    args["goal"]["objective"] = "將既有 Marketplace 刊登跨貼到指定社團"
+    from plugins.openclaw_bridge.clawops_delegate import handle_clawops_delegate
+
+    rejected = json.loads(handle_clawops_delegate(args))
+
+    assert rejected["status"] == "rejected"
+    assert "facebook_crosspost" in rejected["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    args["external_targets"] = [
+        "Facebook 市集項目 915975414881937 → 社團 "
+        "https://www.facebook.com/groups/1333742673375089",
+    ]
+    localized_rejected = json.loads(handle_clawops_delegate(args))
+    assert localized_rejected["status"] == "rejected"
+    assert "facebook_crosspost" in localized_rejected["reason"]
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM grace_approval_challenges"
+        ).fetchone()[0] == 0
+
+    args["facebook_crosspost"] = {
+        "marketplace_listing_id": "915975414881937",
+        "group_ids": ["1333742673375089"],
+    }
+    args["external_targets"] = [
+        "Facebook Marketplace item 915975414881937 → "
+        "Facebook Group 1333742673375089",
+    ]
+    approved_shape = json.loads(handle_clawops_delegate(args))
+
+    assert approved_shape["status"] == "approval_required"
+    with kb.connect_closing(tmp_path / "kanban.db") as conn:
+        challenge = kb.get_grace_approval_challenge(
+            conn,
+            approved_shape["approval_token"],
+        )
+    persisted = json.loads(challenge["delegation_args"])
+    assert persisted["facebook_crosspost"] == args["facebook_crosspost"]
+
+
 def test_callback_outcome_requires_active_internal_callback(
     tmp_path,
     monkeypatch,
