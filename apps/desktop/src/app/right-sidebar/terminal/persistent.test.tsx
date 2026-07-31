@@ -244,6 +244,50 @@ describe('PersistentTerminal rect tracking', () => {
     expect(raf.pending()).toBe(0)
   })
 
+  it('hides the overlay while the slot sits inside a hidden pane layer (data-pane-hidden)', () => {
+    const raf = installRaf()
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
+
+    render(
+      <div data-pane-hidden="">
+        <Harness />
+      </div>
+    )
+
+    // Initial measure: slot rect is non-zero, but the slot lives under a
+    // hidden pane layer — the overlay must stay collapsed (visibility:hidden,
+    // zero-sized) instead of painting over the active tab. No RAF is ever
+    // scheduled because the very first measure already reports invisible.
+    const wrapper = container!.firstElementChild as HTMLElement
+    const overlay = wrapper.lastElementChild as HTMLElement
+    expect(overlay.style.visibility).toBe('hidden')
+    expect(overlay.style.width).toBe('0px')
+    expect(raf.request).not.toHaveBeenCalled()
+
+    // Un-hide the pane layer: the overlay must come back with the slot rect.
+    wrapper.removeAttribute('data-pane-hidden')
+
+    act(() => {
+      mutationObserverCallback?.([], {} as MutationObserver)
+    })
+
+    expect(raf.pending()).toBe(1)
+
+    act(() => {
+      raf.runNext()
+    })
+
+    // First remeasure lands the rect; the settle frame then quiesces.
+    act(() => {
+      raf.runNext()
+    })
+
+    expect(overlay.style.visibility).toBe('visible')
+    expect(overlay.style.top).toBe('10px')
+    expect(overlay.style.left).toBe('20px')
+    expect(raf.pending()).toBe(0)
+  })
+
   it('does not schedule rect RAFs while the Electron window is paused, then resumes when visible', () => {
     const raf = installRaf()
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))

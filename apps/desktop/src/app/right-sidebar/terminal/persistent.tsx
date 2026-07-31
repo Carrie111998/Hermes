@@ -4,6 +4,8 @@ import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from
 
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 
+import { PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
+
 import { $terminalTakeover } from '../store'
 
 import { ensureTerminal } from './terminals'
@@ -102,6 +104,23 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
         return false
       }
 
+      // A kept-alive pane layer hides with `visibility: hidden` — its layout
+      // box (and therefore its rect) survives, so an inactive tab's slot still
+      // measures non-zero and the overlay would keep painting the terminal
+      // over whatever tab IS active (sessions ghosting the terminal). Treat a
+      // slot inside a hidden pane layer as zero-size — same policy as
+      // queryVisible in pane-visibility.ts.
+      if (slot.closest(`[${PANE_HIDDEN_ATTR}]`)) {
+        if (prev !== null) {
+          prev = null
+          setRect(null)
+
+          return true
+        }
+
+        return false
+      }
+
       const r = slot.getBoundingClientRect()
       // floor top/left + ceil right/bottom: overlay always covers the slot's
       // full pixel footprint, so half-pixel rects can't leak page bg through.
@@ -171,7 +190,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
     for (let node: HTMLElement | null = slot; node; node = node.parentElement) {
       positionObserver?.observe(node, {
-        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
+        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state', PANE_HIDDEN_ATTR],
         attributes: true,
         childList: true,
         subtree: true
