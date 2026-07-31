@@ -2480,10 +2480,12 @@ def _run_job_script_with_claim_heartbeat(
         heartbeat_thread.start()
     except Exception:
         logger.debug(
-            "Job '%s': could not start script run_claim heartbeat",
+            "Job '%s': could not start script claim heartbeat",
             job_id,
             exc_info=True,
         )
+        if fire_claim_incarnation:
+            return False, "Script execution skipped: external fire-claim heartbeat could not start"
         return _run_job_script(script_path, workdir=workdir)
 
     try:

@@ -244,6 +244,77 @@ def test_externally_fired_script_refreshes_its_matching_fire_claim(
     assert refreshed_claim["at"] != original_claim["at"]
 
 
+@pytest.mark.parametrize("no_agent", [True, False], ids=("no-agent", "pre-agent"))
+def test_externally_claimed_script_does_not_run_without_heartbeat(
+    tmp_path, monkeypatch, no_agent,
+):
+    """A failed fire-claim heartbeat startup rejects both script entry paths."""
+    import cron.jobs as jobs
+    import cron.scheduler as scheduler
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    job = {
+        "id": "externally-claimed-script",
+        "name": "externally claimed script",
+        "prompt": "inspect the script output",
+        "script": "watchdog.py",
+        "no_agent": no_agent,
+        "schedule": {"kind": "interval", "seconds": 600},
+    }
+    with jobs.use_cron_store(profile_home):
+        jobs.save_jobs([job])
+        assert jobs.claim_job_for_fire(job["id"]) is True
+        claimed_job = jobs.get_job(job["id"])
+        original_claim = dict(claimed_job["fire_claim"])
+
+    script_runs = []
+    prerun_results = []
+    real_thread_start = threading.Thread.start
+
+    def _fail_script_heartbeat_start(thread):
+        if thread.name == "cron-script-claim-heartbeat":
+            raise RuntimeError("heartbeat startup failed")
+        return real_thread_start(thread)
+
+    def _unexpected_script(*_args, **_kwargs):
+        script_runs.append(True)
+        raise AssertionError("externally claimed script ran without a heartbeat")
+
+    monkeypatch.setattr(threading.Thread, "start", _fail_script_heartbeat_start)
+    monkeypatch.setattr(scheduler, "_run_job_script", _unexpected_script)
+    if not no_agent:
+        def _capture_failed_prerun(_job, *, prerun_script):
+            prerun_results.append(prerun_script)
+            return None
+
+        monkeypatch.setattr(scheduler, "_build_job_prompt", _capture_failed_prerun)
+
+    with (
+        jobs.use_cron_store(profile_home),
+        patch("hermes_state.SessionDB", return_value=MagicMock()),
+    ):
+        success, _doc, _response, error = scheduler.run_job(claimed_job)
+        stored_claim = jobs.get_job(job["id"])["fire_claim"]
+
+    assert script_runs == []
+    assert stored_claim == original_claim
+    if no_agent:
+        assert success is False
+        assert error == (
+            "Script execution skipped: external fire-claim heartbeat could not start"
+        )
+    else:
+        assert success is True
+        assert error is None
+        assert prerun_results == [
+            (
+                False,
+                "Script execution skipped: external fire-claim heartbeat could not start",
+            )
+        ]
+
+
 def test_script_heartbeat_does_not_refresh_a_replaced_fire_claim(tmp_path, monkeypatch):
     """A stale externally fired script cannot extend a later incarnation."""
     import cron.jobs as jobs
