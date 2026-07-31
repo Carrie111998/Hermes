@@ -2617,7 +2617,7 @@ def run_doctor(args):
     except Exception:
         pass
 
-    if not _active_memory_provider:
+    if _active_memory_provider in ("", "builtin"):
         check_ok("Built-in memory active", "(no external provider configured — this is fine)")
     elif _active_memory_provider == "honcho":
         try:
