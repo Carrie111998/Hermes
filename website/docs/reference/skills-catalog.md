@@ -103,7 +103,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocode, POIs, routes, timezones via OpenStreetMap/OSRM. | `productivity/maps` |
 | [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edit text in existing PDFs via natural-language prompts. | `productivity/nano-pdf` |
 | [`notion`](/docs/user-guide/skills/bundled/productivity/productivity-notion) | Notion API + ntn CLI: pages, databases, markdown, Workers. | `productivity/notion` |
-| [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extract text from PDFs/scans (pymupdf, marker-pdf). | `productivity/ocr-and-documents` |
+| [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extract text and Markdown from PDFs/scans with pymupdf, LiteParse, or marker-pdf. | `productivity/ocr-and-documents` |
 | [`pdf`](/docs/user-guide/skills/bundled/productivity/productivity-pdf) | Create, merge, split, fill, and secure PDF files. | `productivity/pdf` |
 | [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Create, read, edit .pptx decks, slides, notes, templates. | `productivity/powerpoint` |
 | [`teams-meeting-pipeline`](/docs/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | Teams meeting summaries, job replay, Graph subscriptions. | `productivity/teams-meeting-pipeline` |

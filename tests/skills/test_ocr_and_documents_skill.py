@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = (
@@ -98,7 +100,26 @@ def test_liteparse_helper_reports_missing_dependency(monkeypatch, tmp_path, caps
     monkeypatch.delitem(sys.modules, "liteparse", raising=False)
 
     assert module.main([str(pdf)]) == 1
-    assert "uv pip install liteparse" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert "uv add 'liteparse==2.10.1'" in error
+    assert "uv venv && uv pip install 'liteparse==2.10.1'" in error
+
+
+def test_liteparse_helper_reports_constructor_failure(monkeypatch, tmp_path, capsys):
+    module = load_script()
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    class FakeLiteParse:
+        def __init__(self, **kwargs):
+            raise RuntimeError("cannot initialize")
+
+    fake_module = ModuleType("liteparse")
+    fake_module.LiteParse = FakeLiteParse
+    monkeypatch.setitem(sys.modules, "liteparse", fake_module)
+
+    assert module.main([str(pdf)]) == 1
+    assert "liteparse failed: cannot initialize" in capsys.readouterr().err
 
 
 def test_liteparse_helper_reports_parse_failure(monkeypatch, tmp_path, capsys):
@@ -121,13 +142,60 @@ def test_liteparse_helper_reports_parse_failure(monkeypatch, tmp_path, capsys):
     assert "liteparse failed: bad pdf" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "result",
+    [SimpleNamespace(), SimpleNamespace(text=None), SimpleNamespace(text="  \n")],
+)
+def test_liteparse_helper_rejects_missing_or_empty_text(
+    monkeypatch, tmp_path, capsys, result
+):
+    module = load_script()
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+
+    class FakeLiteParse:
+        def __init__(self, **kwargs):
+            pass
+
+        def parse(self, path):
+            return result
+
+    fake_module = ModuleType("liteparse")
+    fake_module.LiteParse = FakeLiteParse
+    monkeypatch.setitem(sys.modules, "liteparse", fake_module)
+
+    assert module.main([str(pdf)]) == 1
+    assert "liteparse returned no text" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-a-number"])
+def test_liteparse_helper_rejects_invalid_max_pages(value, capsys):
+    module = load_script()
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.parse_args(["document.pdf", "--max-pages", value])
+
+    assert exc_info.value.code == 2
+    assert "--max-pages: must be a positive integer" in capsys.readouterr().err
+
+
 def test_ocr_skill_docs_use_realistic_liteparse_guidance():
     for text in (
         SKILL_MD.read_text(encoding="utf-8"),
         DOC_MD.read_text(encoding="utf-8"),
     ):
         assert "samples/controlled_agent_brief_table_layout.pdf" not in text
-        assert "plain text despite output_format" not in text
+        assert "LiteParse 2.10.1" in text
         assert 'output_format="markdown"' in text
-        assert "lightweight markdown-style text" in text
+        assert "reconstruction quality varies with document complexity" in text
         assert "path/to/text.pdf" in text
+        assert "uv add 'liteparse==2.10.1'" in text
+        assert "uv venv && uv pip install 'liteparse==2.10.1'" in text
+
+
+def test_ocr_skill_description_is_discoverable():
+    skill_text = SKILL_MD.read_text(encoding="utf-8")
+    description = skill_text.split("---", 2)[1]
+
+    for term in ("PDF", "scan", "pymupdf", "LiteParse", "marker-pdf"):
+        assert term.casefold() in description.casefold()

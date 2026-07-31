@@ -7,14 +7,14 @@ as the default for agent-ready markdown; use marker-pdf for scanned/OCR-heavy
 docs.
 
 Install:
-    uv pip install liteparse
-    # or: pip install liteparse
+    uv add 'liteparse==2.10.1'                         # existing uv project
+    uv venv && uv pip install 'liteparse==2.10.1'      # standalone virtual environment
 
 Usage:
     python extract_liteparse.py document.pdf
     python extract_liteparse.py document.pdf --pages 1-3
     python extract_liteparse.py document.pdf --max-pages 5
-    python extract_liteparse.py document.pdf --ocr       # slower; for light OCR attempts only
+    python extract_liteparse.py document.pdf --ocr       # enable OCR (slower)
 """
 
 from __future__ import annotations
@@ -22,6 +22,17 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+
+
+def positive_int(value: str) -> int:
+    """Return a positive integer for argparse options."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,7 +49,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-pages",
-        type=int,
+        type=positive_int,
         help="Stop after this many pages, useful for quick reading-order checks.",
     )
     parser.add_argument(
@@ -64,29 +75,33 @@ def main(argv: list[str] | None = None) -> int:
         from liteparse import LiteParse
     except ImportError:
         print(
-            "liteparse is not installed. Install it with: uv pip install liteparse",
+            "liteparse is not installed. In a uv project, run: "
+            "uv add 'liteparse==2.10.1'\n"
+            "For a standalone environment, run: "
+            "uv venv && uv pip install 'liteparse==2.10.1'",
             file=sys.stderr,
         )
         return 1
 
-    parser = LiteParse(
-        ocr_enabled=args.ocr,
-        target_pages=args.pages,
-        max_pages=args.max_pages,
-        output_format="markdown",
-        quiet=not args.verbose,
-    )
     try:
+        parser = LiteParse(
+            ocr_enabled=args.ocr,
+            target_pages=args.pages,
+            max_pages=args.max_pages,
+            output_format="markdown",
+            quiet=not args.verbose,
+        )
         result = parser.parse(args.pdf)
     except Exception as exc:
         print(f"liteparse failed: {exc}", file=sys.stderr)
         return 1
 
-    if not hasattr(result, "text"):
+    text = getattr(result, "text", None)
+    if not isinstance(text, str) or not text.strip():
         print("liteparse returned no text", file=sys.stderr)
         return 1
 
-    print(result.text)
+    print(text)
     return 0
 
 

@@ -1,14 +1,14 @@
 ---
-title: "Ocr And Documents — Extract text from PDFs/scans (pymupdf, marker-pdf)"
+title: "Ocr And Documents — Extract text and Markdown from PDFs/scans with pymupdf, LiteParse, or marker-pdf"
 sidebar_label: "Ocr And Documents"
-description: "Extract text from PDFs/scans (pymupdf, marker-pdf)"
+description: "Extract text and Markdown from PDFs/scans with pymupdf, LiteParse, or marker-pdf"
 ---
 
 {/* This page is auto-generated from the skill's SKILL.md by website/scripts/generate-skill-docs.py. Edit the source SKILL.md, not this page. */}
 
 # Ocr And Documents
 
-Extract text from PDFs/scans (pymupdf, marker-pdf).
+Extract text and Markdown from PDFs/scans with pymupdf, LiteParse, or marker-pdf.
 
 ## Skill metadata
 
@@ -54,21 +54,21 @@ Only use local extraction when: the file is local, web_extract fails, or you nee
 | Feature | pymupdf (~25MB) | liteparse (optional) | marker-pdf (~3-5GB) |
 |---------|-----------------|----------------------|---------------------|
 | **Text-based PDF** | ✅ | ✅ | ✅ |
-| **Scanned PDF (OCR)** | ❌ | ⚠️ optional/light OCR, slower | ✅ (90+ languages) |
-| **Tables** | ✅ (basic) | ⚠️ weak markdown/table fidelity | ✅ (high accuracy) |
+| **Scanned PDF (OCR)** | ❌ | ✅ optional Tesseract or HTTP OCR | ✅ (90+ languages) |
+| **Tables** | ✅ (basic) | ✅ reconstructed; quality varies with layout | ✅ (high accuracy) |
 | **Equations / LaTeX** | ❌ | ❌ | ✅ |
 | **Code blocks** | ❌ | ❌ | ✅ |
-| **Forms** | ❌ | ❌ | ✅ |
-| **Headers/footers removal** | ❌ | ❌ | ✅ |
+| **Forms** | ❌ | ⚠️ optional structured AcroForm extraction | ✅ |
+| **Headers/footers removal** | ❌ | ✅ for repeated page bands in Markdown | ✅ |
 | **Reading order detection** | ❌ | ✅ useful fast check | ✅ |
-| **Images extraction** | ✅ (embedded) | ❌ | ✅ (with context) |
-| **Images → text (OCR)** | ❌ | ⚠️ optional/light OCR | ✅ |
+| **Images extraction** | ✅ (embedded) | ✅ optional bytes and metadata | ✅ (with context) |
+| **Images → text (OCR)** | ❌ | ✅ optional OCR | ✅ |
 | **EPUB** | ✅ | ❌ | ✅ |
-| **Markdown output** | ✅ (via pymupdf4llm) | ⚠️ markdown-style text, limited structure | ✅ (native, higher quality) |
-| **Install size** | ~25MB | small optional package | ~3-5GB (PyTorch + models) |
-| **Speed** | Instant | fastest for text when OCR is disabled | ~1-14s/page (CPU), ~0.2s/page (GPU) |
+| **Markdown output** | ✅ (via pymupdf4llm) | ✅ headings, tables, lists, images, and links; quality varies | ✅ (native, higher quality) |
+| **Install size** | ~25MB | lightweight optional package | ~3-5GB (PyTorch + models) |
+| **Speed** | Instant | fast native parser; OCR adds cost | ~1-14s/page (CPU), ~0.2s/page (GPU) |
 
-**Decision**: Use pymupdf/pymupdf4llm unless you need OCR, equations, forms, or complex layout analysis. Use optional `liteparse` only for local text PDFs where speed or reading-order checks matter more than markdown fidelity.
+**Decision**: Use pymupdf/pymupdf4llm as the safe default for text PDFs. Use optional `liteparse` for fast local extraction, spatial reading-order reconstruction, or OCR without a large ML stack. Prefer marker-pdf when equations, code blocks, difficult OCR, or complex layout fidelity matter most.
 
 If the user needs marker capabilities but the system lacks ~5GB free disk:
 > "This document needs OCR/advanced extraction (marker-pdf), which requires ~5GB for PyTorch and models. Your system has [X]GB free. Options: free up space, provide a URL so I can use web_extract, or I can try pymupdf which works for text-based PDFs but not scanned documents or equations."
@@ -105,12 +105,14 @@ for page in doc:
 
 ## liteparse (optional fast text fallback)
 
-Use `liteparse` only for **local text PDFs** when you need a fast text pass or a quick reading-order check and can tolerate weak markdown/table fidelity. The helper requests `output_format="markdown"`, but treat the result as lightweight markdown-style text, not agent-ready structured Markdown. Do **not** replace `pymupdf4llm` with it for markdown chunking unless the output is good enough for the specific document.
+LiteParse 2.10.1 renders headings, tables, lists, images, and links into `result.text` when `output_format="markdown"`. Its own documentation cautions that reconstruction quality varies with document complexity, so inspect the output before using it for agent-ready chunking. Keep `pymupdf4llm` as the safe default and use marker-pdf for difficult OCR, equations, or complex layouts.
 
 ```bash
-uv pip install liteparse
-# or, inside an existing non-PEP-668 environment:
-pip install liteparse
+# Add to an existing uv project:
+uv add 'liteparse==2.10.1'
+
+# Or create a standalone virtual environment:
+uv venv && uv pip install 'liteparse==2.10.1'
 ```
 
 **Via helper script**:
@@ -118,7 +120,7 @@ pip install liteparse
 python scripts/extract_liteparse.py document.pdf
 python scripts/extract_liteparse.py document.pdf --pages 1-3
 python scripts/extract_liteparse.py document.pdf --max-pages 5
-python scripts/extract_liteparse.py document.pdf --ocr       # slower; only for light OCR attempts
+python scripts/extract_liteparse.py document.pdf --ocr       # enable OCR (slower)
 ```
 
 **Smoke test against a local text PDF**:
@@ -126,7 +128,7 @@ python scripts/extract_liteparse.py document.pdf --ocr       # slower; only for 
 python scripts/extract_liteparse.py path/to/text.pdf --max-pages 1 | head
 ```
 
-Expected result: the command prints first-page text quickly. If `liteparse` is missing, install it with `uv pip install liteparse`. If the output needs reliable headings, pipe tables, OCR quality, or complex layout semantics, switch back to `pymupdf4llm` or `marker-pdf`.
+Expected result: the command prints first-page Markdown. If `liteparse` is missing, use one of the project/virtual-environment commands above. If the output needs more reliable structure, OCR quality, equation handling, or complex layout semantics, switch back to `pymupdf4llm` or `marker-pdf`.
 
 ---
 
@@ -211,7 +213,7 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 
 - `web_extract` is always first choice for URLs
 - pymupdf/pymupdf4llm is the safe default — instant, no models, works everywhere, and gives better markdown for text PDFs
-- liteparse is optional for speed-first local text-PDF extraction; keep OCR disabled unless explicitly testing it, because OCR can make it much slower
+- LiteParse 2.10.1 is optional for fast local extraction and spatially reconstructed Markdown; keep OCR disabled for text PDFs to avoid unnecessary work
 - marker-pdf is for OCR, scanned docs, equations, complex layouts — install only when needed
 - Helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use
