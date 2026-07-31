@@ -25,7 +25,13 @@ import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
-import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  chatMessageText,
+  mergePersistedTodoProvenance,
+  preserveLocalAssistantErrors,
+  toChatMessages
+} from '@/lib/chat-messages'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
 import { isMessagingSource } from '@/lib/session-source'
 import { latestSessionTodos } from '@/lib/todos'
@@ -316,7 +322,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     async (
       attempts = 1,
       storedSessionId = selectedStoredSessionIdRef.current,
-      runtimeSessionId = activeSessionIdRef.current
+      runtimeSessionId = activeSessionIdRef.current,
+      options: { preserveLocalScrollback?: boolean } = {}
     ) => {
       if (!storedSessionId || !runtimeSessionId) {
         return
@@ -328,11 +335,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
         try {
           const latest = await getSessionMessages(storedSessionId, storedProfile)
           const messages = toChatMessages(latest.messages)
+          let provenanceMerged = !options.preserveLocalScrollback
+
           updateSessionState(
             runtimeSessionId,
-            state => ({ ...state, messages: preserveLocalAssistantErrors(messages, state.messages) }),
+            state => {
+              const nextMessages = options.preserveLocalScrollback
+                ? mergePersistedTodoProvenance(state.messages, messages)
+                : preserveLocalAssistantErrors(messages, state.messages)
+
+              provenanceMerged = provenanceMerged || nextMessages !== state.messages
+
+              return { ...state, messages: nextMessages }
+            },
             storedSessionId
           )
+
+          if (!provenanceMerged) {
+            if (index < attempts - 1) {
+              await new Promise(resolve => window.setTimeout(resolve, 250))
+
+              continue
+            }
+
+            return
+          }
 
           const restored = todosForHydration(latestSessionTodos(messages))
 

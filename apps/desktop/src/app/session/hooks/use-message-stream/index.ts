@@ -37,7 +37,8 @@ interface MessageStreamOptions {
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
-    runtimeSessionId?: string | null
+    runtimeSessionId?: string | null,
+    options?: { preserveLocalScrollback?: boolean }
   ) => Promise<void>
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
@@ -188,7 +189,8 @@ export function useMessageStream({
   // flush floor in scheduleDeltaFlush so multi-stream load yields to input.
   const lastFlushCostRef = useRef<number>(0)
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
-  // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
+  // Turns that auto-compacted: avoid replacing live scrollback at turn end.
+  // A completed todo still fetches persisted provenance and merges only that metadata.
   const compactedTurnRef = useRef<Set<string>>(new Set())
   // Last session we applied a session.info cwd for — lets us tell an agent
   // relocating the SAME session (follow it) from a session switch (don't yank).
@@ -465,6 +467,7 @@ export function useMessageStream({
   const completeAssistantMessage = useCallback(
     (sessionId: string, text: string, responsePreviewed?: boolean, failure?: { error: string; partial: boolean }) => {
       let shouldHydrate = false
+      let requiresTodoHydration = false
 
       const completedState = updateSessionState(sessionId, state => {
         // Late completion from an already-cancelled turn: cancelRun has
@@ -580,11 +583,29 @@ export function useMessageStream({
           }
         }
 
-        const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
+        const lastUserIndex = nextMessages.findLastIndex(message => message.role === 'user' && !message.hidden)
+        const currentTurnMessages = nextMessages.slice(lastUserIndex + 1)
+
+        const hasInlineError = currentTurnMessages.some(
+          message => message.role === 'assistant' && message.error && !message.hidden
+        )
+
+        const hasCompletedTodoResult = currentTurnMessages.some(
+          message =>
+            !message.hidden &&
+            message.parts.some(
+              part => part.type === 'tool-call' && part.toolName === 'todo' && 'result' in part && parseTodos(part.result) !== null
+            )
+        )
+
+        requiresTodoHydration = hasCompletedTodoResult
         shouldHydrate =
-          !completionError && !hasInlineError && !unresolvedUserTail && (!state.sawAssistantPayload || !finalText)
+          !completionError &&
+          !hasInlineError &&
+          !unresolvedUserTail &&
+          (hasCompletedTodoResult || !state.sawAssistantPayload || !finalText)
 
         return {
           ...state,
@@ -601,12 +622,20 @@ export function useMessageStream({
 
       scheduleSessionsRefresh()
 
-      if (compactedTurnRef.current.delete(sessionId)) {
+      const compactedTurn = compactedTurnRef.current.delete(sessionId)
+
+      if (compactedTurn && !requiresTodoHydration) {
         shouldHydrate = false
       }
 
       if (shouldHydrate) {
-        void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
+        if (compactedTurn && requiresTodoHydration) {
+          void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId, {
+            preserveLocalScrollback: true
+          })
+        } else {
+          void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
+        }
       }
 
       dispatchNativeNotification({

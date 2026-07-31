@@ -1816,6 +1816,32 @@ export const ar = defineLocale({
       worktrees: 'أشجار العمل'
     }
   },
+  currentPlan: {
+    title: 'الخطة الحالية',
+    toggle: (expanded, status, completion) =>
+      `${expanded ? 'طي' : 'توسيع'} الخطة الحالية، ${status}، ${completion}`,
+    completion: (done, total) => `اكتمل ${done}/${total}`,
+    turn: number => `الدور ${number}`,
+    statuses: {
+      active: 'نشطة',
+      paused: 'متوقفة مؤقتا',
+      completed: 'مكتملة',
+      superseded: 'استُبدلت',
+      historical: 'تاريخية'
+    },
+    itemStatuses: {
+      pending: 'معلقة',
+      in_progress: 'كانت قيد التنفيذ',
+      completed: 'مكتملة',
+      cancelled: 'ملغاة'
+    },
+    provenance: (turn, session) => `${turn} · الجلسة ${session}`,
+    unknownTurn: 'دور غير معروف',
+    updated: time => `حُدّثت ${time}`,
+    unknownUpdateTime: 'وقت التحديث غير متاح',
+    newerTurn: 'يوجد دور أحدث دون تحديث لقائمة المهام. قد لا تصف هذه الخطة الطلب الحالي.',
+    livenessNotice: 'سجل جلسة للقراءة فقط. لا تثبت قائمة التحقق هذه أن عاملا أو عملية أو تفويضا قيد التشغيل.'
+  },
   updates: {
     stages: {
       idle: 'جار التحضير...',

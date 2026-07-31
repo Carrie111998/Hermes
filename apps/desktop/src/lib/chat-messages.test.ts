@@ -9,6 +9,7 @@ import {
   chatMessageText,
   collectUnspokenTurnSpeech,
   mergeFinalAssistantText,
+  mergePersistedTodoProvenance,
   preserveLocalAssistantErrors,
   reasoningPart,
   renderMediaTags,
@@ -32,6 +33,116 @@ describe('toChatMessages', () => {
     expect(messages).toHaveLength(1)
     expect(messages[0].parts.map(p => p.type)).toEqual(['text', 'tool-call', 'text'])
     expect(chatMessageText(messages[0])).toBe('Planning.Done.')
+  })
+
+  it('preserves the exact persisted todo-result timestamp for Current Plan provenance', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'make a plan', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        timestamp: 2,
+        tool_calls: [
+          {
+            id: 'todo-1',
+            function: {
+              name: 'todo',
+              arguments: '{"todos":[{"id":"a","content":"First","status":"in_progress"}]}'
+            }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'todo-1',
+        tool_name: 'todo',
+        content: '{"todos":[{"id":"a","content":"First","status":"completed"}]}',
+        timestamp: 3
+      },
+      { role: 'assistant', content: 'Done.', timestamp: 4 }
+    ])
+
+    const todo = messages
+      .flatMap(message => message.parts)
+      .find(part => part.type === 'tool-call' && part.toolName === 'todo') as
+      | (Extract<ChatMessagePart, { type: 'tool-call' }> & { todoUpdatedAt?: number })
+      | undefined
+
+    expect(todo?.todoUpdatedAt).toBe(3)
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['mismatched', 'todo-other']
+  ])('does not establish Current Plan provenance from a %s tool-call id', (_label, resultId) => {
+    const toolResult = {
+      role: 'tool' as const,
+      ...(resultId ? { tool_call_id: resultId } : {}),
+      tool_name: 'todo',
+      content: '{"todos":[{"id":"a","content":"First","status":"completed"}]}',
+      timestamp: 3
+    }
+
+    const messages = toChatMessages([
+      { role: 'user', content: 'make a plan', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        timestamp: 2,
+        tool_calls: [
+          {
+            id: 'todo-expected',
+            function: {
+              name: 'todo',
+              arguments: '{"todos":[{"id":"a","content":"First","status":"in_progress"}]}'
+            }
+          }
+        ]
+      },
+      toolResult
+    ])
+
+    const todoParts = messages
+      .flatMap(message => message.parts)
+      .filter(part => part.type === 'tool-call' && part.toolName === 'todo') as Array<
+      Extract<ChatMessagePart, { type: 'tool-call' }> & { todoUpdatedAt?: number }
+    >
+
+    expect(todoParts.length).toBeGreaterThan(0)
+    expect(todoParts.every(part => part.todoUpdatedAt === undefined)).toBe(true)
+  })
+
+  it('clears earlier provenance when a later missing-id todo result overwrites the same call by name', () => {
+    const messages = toChatMessages([
+      { role: 'user', content: 'make a plan', timestamp: 1 },
+      {
+        role: 'assistant',
+        content: '',
+        timestamp: 2,
+        tool_calls: [{ id: 'todo-1', function: { name: 'todo', arguments: '{"todos":[]}' } }]
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'todo-1',
+        tool_name: 'todo',
+        content: '{"todos":[{"id":"a","content":"Exact","status":"completed"}]}',
+        timestamp: 3
+      },
+      {
+        role: 'tool',
+        tool_name: 'todo',
+        content: '{"todos":[{"id":"b","content":"Ambiguous","status":"completed"}]}',
+        timestamp: 4
+      }
+    ])
+
+    const todoPart = messages
+      .flatMap(message => message.parts)
+      .find(part => part.type === 'tool-call' && part.toolCallId === 'todo-1') as
+      | (Extract<ChatMessagePart, { type: 'tool-call' }> & { todoUpdatedAt?: number })
+      | undefined
+
+    expect(todoPart?.todoUpdatedAt).toBeUndefined()
   })
 
   it('keeps assistant tool-call iterations in one loaded assistant bubble', () => {
@@ -569,6 +680,69 @@ describe('preserveLocalAssistantErrors', () => {
   })
 })
 
+describe('mergePersistedTodoProvenance', () => {
+  it('adds exact hydrated todo provenance without replacing compacted live scrollback', () => {
+    const todo = {
+      type: 'tool-call' as const,
+      toolCallId: 'todo-1',
+      toolName: 'todo',
+      args: { todos: [{ content: 'Done', id: 'done', status: 'completed' }] } as never,
+      result: { todos: [{ content: 'Done', id: 'done', status: 'completed' }] }
+    }
+
+    const local: ChatMessage[] = [
+      { id: 'scrollback', parts: [{ type: 'text', text: 'Keep this live scrollback' }], role: 'assistant' },
+      { id: 'live-plan', parts: [todo], role: 'assistant' }
+    ]
+
+    const persisted: ChatMessage[] = [
+      {
+        id: 'stored-plan',
+        parts: [{ ...todo, todoUpdatedAt: 123 } as ChatMessagePart & { todoUpdatedAt: number }],
+        role: 'assistant'
+      }
+    ]
+
+    const merged = mergePersistedTodoProvenance(local, persisted)
+    const mergedTodo = merged[1]?.parts[0] as ChatMessagePart & { todoUpdatedAt?: number }
+
+    expect(merged).toHaveLength(2)
+    expect(chatMessageText(merged[0]!)).toBe('Keep this live scrollback')
+    expect(mergedTodo.todoUpdatedAt).toBe(123)
+  })
+
+  it('rejects an older identical persisted plan with a different tool-call identity', () => {
+    const result = { todos: [{ content: 'Same plan', id: 'same', status: 'completed' }] }
+
+    const local: ChatMessage[] = [
+      {
+        id: 'live-newer',
+        parts: [{ result, toolCallId: 'todo-newer', toolName: 'todo', type: 'tool-call' }],
+        role: 'assistant'
+      }
+    ]
+
+    const persisted: ChatMessage[] = [
+      {
+        id: 'stored-older',
+        parts: [
+          {
+            result,
+            toolCallId: 'todo-older',
+            toolName: 'todo',
+            todoUpdatedAt: 99,
+            type: 'tool-call'
+          } as ChatMessagePart & { todoUpdatedAt: number }
+        ],
+        role: 'assistant'
+      }
+    ]
+
+    expect(mergePersistedTodoProvenance(local, persisted)).toBe(local)
+    expect((local[0]?.parts[0] as ChatMessagePart & { todoUpdatedAt?: number }).todoUpdatedAt).toBeUndefined()
+  })
+})
+
 describe('upsertToolPart', () => {
   it('preserves inline diffs from tool completion events', () => {
     const parts = upsertToolPart(
@@ -652,6 +826,7 @@ describe('upsertToolPart', () => {
     const clearedResult = cleared[0] && 'result' in cleared[0] ? (cleared[0].result as Record<string, unknown>) : {}
 
     expect(completedResult.todos).toEqual([{ content: 'Boil water', id: 'boil', status: 'in_progress' }])
+    expect((completed[0] as { todoUpdatedAt?: number }).todoUpdatedAt).toBeUndefined()
     expect(clearedResult.todos).toEqual([])
   })
 

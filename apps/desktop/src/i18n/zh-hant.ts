@@ -1920,6 +1920,32 @@ export const zhHant = defineLocale({
     }
   },
 
+  currentPlan: {
+    title: '目前計畫',
+    toggle: (expanded, status, completion) => `${expanded ? '收合' : '展開'}目前計畫，${status}，${completion}`,
+    completion: (done, total) => `已完成 ${done}/${total}`,
+    turn: number => `第 ${number} 輪`,
+    statuses: {
+      active: '進行中',
+      paused: '已暫停',
+      completed: '已完成',
+      superseded: '已被取代',
+      historical: '歷史記錄'
+    },
+    itemStatuses: {
+      pending: '待處理',
+      in_progress: '先前進行中',
+      completed: '已完成',
+      cancelled: '已取消'
+    },
+    provenance: (turn, session) => `${turn} · 工作階段 ${session}`,
+    unknownTurn: '未知輪次',
+    updated: time => `更新於 ${time}`,
+    unknownUpdateTime: '無法取得更新時間',
+    newerTurn: '已有較新的輪次，但沒有 todo 更新。此計畫可能已不再描述目前的要求。',
+    livenessNotice: '唯讀工作階段歷史記錄。此檢查清單不能證明任何工作程序、處理程序或委派正在執行。'
+  },
+
   updates: {
     stages: {
       idle: '準備中…',

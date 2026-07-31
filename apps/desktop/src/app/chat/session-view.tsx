@@ -76,6 +76,22 @@ function primaryField<T>(select: (state: ClientSessionState) => T, $draft: Reada
 
 const $primaryMessages = primaryField<ChatMessage[]>(state => state.messages, $messages)
 
+export const $primaryRuntimeStoredId = computed(
+  [$activeSessionId, $sessionStates],
+  (activeSessionId, states) => (activeSessionId ? (states[activeSessionId]?.storedSessionId ?? null) : null)
+)
+
+export function routeSessionIdentityMismatch(
+  routedSessionId: string | null,
+  selectedStoredSessionId: string | null,
+  runtimeStoredSessionId: string | null
+): boolean {
+  return Boolean(
+    routedSessionId &&
+      (routedSessionId !== selectedStoredSessionId || routedSessionId !== runtimeStoredSessionId)
+  )
+}
+
 export const PRIMARY_SESSION_VIEW: SessionView = {
   kind: 'primary',
   $awaitingResponse: primaryField<boolean>(state => state.awaitingResponse, $awaitingResponse),

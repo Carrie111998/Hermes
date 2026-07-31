@@ -2335,6 +2335,32 @@ export const zh: Translations = {
     }
   },
 
+  currentPlan: {
+    title: '当前计划',
+    toggle: (expanded, status, completion) => `${expanded ? '收起' : '展开'}当前计划，${status}，${completion}`,
+    completion: (done, total) => `已完成 ${done}/${total}`,
+    turn: number => `第 ${number} 轮`,
+    statuses: {
+      active: '进行中',
+      paused: '已暂停',
+      completed: '已完成',
+      superseded: '已被取代',
+      historical: '历史记录'
+    },
+    itemStatuses: {
+      pending: '待处理',
+      in_progress: '此前进行中',
+      completed: '已完成',
+      cancelled: '已取消'
+    },
+    provenance: (turn, session) => `${turn} · 会话 ${session}`,
+    unknownTurn: '未知轮次',
+    updated: time => `更新于 ${time}`,
+    unknownUpdateTime: '更新时间不可用',
+    newerTurn: '存在更新的对话轮次，但没有新的待办更新。此计划可能已不再描述当前请求。',
+    livenessNotice: '只读会话历史。此清单不能证明工作进程、任务进程或委派当前仍在运行。'
+  },
+
   updates: {
     stages: {
       idle: '准备中…',

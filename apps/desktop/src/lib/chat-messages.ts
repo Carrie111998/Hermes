@@ -817,9 +817,20 @@ function applyStoredToolResult(messages: ChatMessage[], toolMessage: SessionMess
 
     const parts = [...message.parts]
     const existing = parts[partIndex]
+
+    const hasExactTodoProvenance =
+      toolName === 'todo' &&
+      Boolean(toolMessage.timestamp) &&
+      Boolean(toolCallId) &&
+      existing.type === 'tool-call' &&
+      existing.toolCallId === toolCallId
+
     parts[partIndex] = {
       ...existing,
       result: parseStoredToolResult(content),
+      ...(toolName === 'todo'
+        ? { todoUpdatedAt: hasExactTodoProvenance ? toolMessage.timestamp : undefined }
+        : {}),
       isError: false
     } as ChatMessagePart
     messages[i] = { ...message, parts }
@@ -847,9 +858,20 @@ function applyStoredToolResultToParts(parts: ChatMessagePart[], toolMessage: Ses
 
   const next = [...parts]
   const existing = next[partIndex]
+
+  const hasExactTodoProvenance =
+    toolName === 'todo' &&
+    Boolean(toolMessage.timestamp) &&
+    Boolean(toolCallId) &&
+    existing.type === 'tool-call' &&
+    existing.toolCallId === toolCallId
+
   next[partIndex] = {
     ...existing,
     result: parseStoredToolResult(content),
+    ...(toolName === 'todo'
+      ? { todoUpdatedAt: hasExactTodoProvenance ? toolMessage.timestamp : undefined }
+      : {}),
     isError: false
   } as ChatMessagePart
 
@@ -869,7 +891,7 @@ function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: numbe
     argsText: Object.keys(args).length ? JSON.stringify(args) : '',
     result: context ? { context } : {},
     isError: false
-  }
+  } as ChatMessagePart
 }
 
 function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
@@ -1095,6 +1117,86 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       m => chatMessageText(m).trim() || m.parts.some(part => part.type !== 'text') || m.attachmentRefs?.length
     )
   )
+}
+
+export function mergePersistedTodoProvenance(
+  localMessages: ChatMessage[],
+  persistedMessages: ChatMessage[]
+): ChatMessage[] {
+  type TodoPartWithProvenance = Extract<ChatMessagePart, { type: 'tool-call' }> & { todoUpdatedAt?: number }
+
+  let persistedPart: TodoPartWithProvenance | null = null
+
+  for (const message of persistedMessages) {
+    if (message.hidden) {
+      continue
+    }
+
+    for (const part of message.parts) {
+      if (part.type !== 'tool-call' || part.toolName !== 'todo' || !('result' in part)) {
+        continue
+      }
+
+      const candidate = part as TodoPartWithProvenance
+
+      if (parseTodos(candidate.result) !== null && Number.isFinite(candidate.todoUpdatedAt)) {
+        persistedPart = candidate
+      }
+    }
+  }
+
+  if (!persistedPart) {
+    return localMessages
+  }
+
+  let match: { messageIndex: number; partIndex: number } | null = null
+
+  if (!persistedPart.toolCallId) {
+    return localMessages
+  }
+
+  for (let messageIndex = localMessages.length - 1; messageIndex >= 0; messageIndex -= 1) {
+    const message = localMessages[messageIndex]
+
+    if (message.hidden) {
+      continue
+    }
+
+    for (let partIndex = message.parts.length - 1; partIndex >= 0; partIndex -= 1) {
+      const part = message.parts[partIndex]
+
+      if (part.type !== 'tool-call' || part.toolName !== 'todo' || !('result' in part)) {
+        continue
+      }
+
+      if (part.toolCallId === persistedPart.toolCallId) {
+        match = { messageIndex, partIndex }
+        messageIndex = -1
+
+        break
+      }
+    }
+  }
+
+  if (!match) {
+    return localMessages
+  }
+
+  const nextMessages = [...localMessages]
+  const localMessage = nextMessages[match.messageIndex]!
+  const nextParts = [...localMessage.parts]
+  const localPart = nextParts[match.partIndex]
+
+  const updatedPart: TodoPartWithProvenance = {
+    ...(localPart as Extract<ChatMessagePart, { type: 'tool-call' }>),
+    result: persistedPart.result,
+    todoUpdatedAt: persistedPart.todoUpdatedAt
+  }
+
+  nextParts[match.partIndex] = updatedPart
+  nextMessages[match.messageIndex] = { ...localMessage, parts: nextParts }
+
+  return nextMessages
 }
 
 export function preserveLocalAssistantErrors(

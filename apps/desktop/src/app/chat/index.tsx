@@ -55,12 +55,13 @@ import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { useComposerScope } from './composer/scope'
 import type { ChatBarState } from './composer/types'
+import { RoutedCurrentPlanSurface } from './current-plan'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { ProfileTag } from './profile-tag'
 import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
-import { useSessionView } from './session-view'
+import { $primaryRuntimeStoredId, routeSessionIdentityMismatch, useSessionView } from './session-view'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
 
@@ -276,6 +277,7 @@ export function ChatView({
   const composerScope = useComposerScope()
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
+  const primaryRuntimeStoredId = useStore($primaryRuntimeStoredId)
   const storedId = useStore(view.$storedId)
   // Dock anchor for a session drop onto this surface: the workspace pane for the
   // primary, this tile's pane id for a tile. Read by the session-drop bridge.
@@ -356,11 +358,13 @@ export function ChatView({
   const routedSessionId = isPrimary ? routeSessionId(location.pathname) : selectedSessionId
   const isRoutedSessionView = Boolean(routedSessionId)
 
-  // The URL points at a session the store hasn't loaded yet (sidebar / cmd-K /
-  // direct nav). Derived in render so the swap reads instantly: the same frame
-  // the id changes we drop the old transcript and show the loader, instead of
-  // waiting for the resume effect (which paints a frame later) to clear them.
-  const routeSessionMismatch = isRoutedSessionView && routedSessionId !== selectedSessionId
+  // The URL, selected durable session, and active runtime must identify the same
+  // conversation. Navigation selects B before its async runtime resume replaces
+  // A, so comparing route and selection alone can paint A beneath B's header.
+  const routeSessionMismatch =
+    isPrimary &&
+    isRoutedSessionView &&
+    routeSessionIdentityMismatch(routedSessionId, selectedSessionId, primaryRuntimeStoredId)
 
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state.
@@ -492,6 +496,7 @@ export function ChatView({
           selectedSessionId={selectedSessionId}
         />
       )}
+      <RoutedCurrentPlanSurface />
 
       {/* Mounted for the primary AND every tile, each scoped to its own session
           so a tiled/background session's blocking prompt surfaces instead of

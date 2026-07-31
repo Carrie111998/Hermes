@@ -1793,6 +1793,32 @@ export interface Translations {
     }
   }
 
+  currentPlan: {
+    title: string
+    toggle: (expanded: boolean, status: string, completion: string) => string
+    completion: (done: number, total: number) => string
+    turn: (number: number) => string
+    statuses: {
+      active: string
+      paused: string
+      completed: string
+      superseded: string
+      historical: string
+    }
+    itemStatuses: {
+      pending: string
+      in_progress: string
+      completed: string
+      cancelled: string
+    }
+    provenance: (turn: string, session: string) => string
+    unknownTurn: string
+    updated: (time: string) => string
+    unknownUpdateTime: string
+    newerTurn: string
+    livenessNotice: string
+  }
+
   updates: {
     stages: Record<string, string>
     checking: string

@@ -1980,6 +1980,34 @@ export const ja = defineLocale({
     }
   },
 
+  currentPlan: {
+    title: '現在のプラン',
+    toggle: (expanded, status, completion) =>
+      `現在のプランを${expanded ? '折りたたむ' : '展開する'}、${status}、${completion}`,
+    completion: (done, total) => `${total} 件中 ${done} 件完了`,
+    turn: number => `ターン ${number}`,
+    statuses: {
+      active: 'アクティブ',
+      paused: '一時停止',
+      completed: '完了',
+      superseded: '更新済み',
+      historical: '履歴'
+    },
+    itemStatuses: {
+      pending: '未着手',
+      in_progress: '以前は進行中',
+      completed: '完了',
+      cancelled: 'キャンセル済み'
+    },
+    provenance: (turn, session) => `${turn} · セッション ${session}`,
+    unknownTurn: '不明なターン',
+    updated: time => `更新 ${time}`,
+    unknownUpdateTime: '更新時刻を取得できません',
+    newerTurn: 'todo の更新がない新しいターンがあります。このプランは現在の依頼を反映していない可能性があります。',
+    livenessNotice:
+      '読み取り専用のセッション履歴です。このチェックリストは、ワーカー、プロセス、委任が実行中であることを証明しません。'
+  },
+
   updates: {
     stages: {
       idle: '準備中…',

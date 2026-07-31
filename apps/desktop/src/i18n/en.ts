@@ -2143,6 +2143,34 @@ export const en: Translations = {
     }
   },
 
+  currentPlan: {
+    title: 'Current Plan',
+    toggle: (expanded, status, completion) =>
+      `${expanded ? 'Collapse' : 'Expand'} Current Plan, ${status}, ${completion}`,
+    completion: (done, total) => `${done}/${total} complete`,
+    turn: number => `Turn ${number}`,
+    statuses: {
+      active: 'Active',
+      paused: 'Paused',
+      completed: 'Completed',
+      superseded: 'Superseded',
+      historical: 'Historical'
+    },
+    itemStatuses: {
+      pending: 'Pending',
+      in_progress: 'Previously in progress',
+      completed: 'Completed',
+      cancelled: 'Cancelled'
+    },
+    provenance: (turn, session) => `${turn} · Session ${session}`,
+    unknownTurn: 'Unknown turn',
+    updated: time => `Updated ${time}`,
+    unknownUpdateTime: 'Update time unavailable',
+    newerTurn: 'A newer turn exists without a todo update. This plan may no longer describe the current request.',
+    livenessNotice:
+      'Read-only session history. This checklist does not prove that a worker, process, or delegation is running.'
+  },
+
   updates: {
     stages: {
       idle: 'Getting ready…',

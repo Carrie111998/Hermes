@@ -15,6 +15,8 @@ const SID = 'session-1'
 const todo = (id: string, status: TodoItem['status']): TodoItem => ({ content: `task ${id}`, id, status })
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
+let appendUserMessage: ((text: string) => void) | null = null
+const hydrateFromStoredSession = vi.fn(async () => undefined)
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
@@ -23,19 +25,30 @@ function Harness() {
 
   const stream = useMessageStream({
     activeSessionIdRef,
-    hydrateFromStoredSession: vi.fn(async () => undefined),
+    hydrateFromStoredSession,
     queryClient: queryClientRef.current,
     refreshHermesConfig: vi.fn(async () => undefined),
     refreshSessions: vi.fn(async () => undefined),
     sessionStateByRuntimeIdRef,
     updateSessionState: (sessionId, updater) => {
-      const current = sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState()
+      const current = sessionStateByRuntimeIdRef.current.get(sessionId) ?? createClientSessionState('stored-1')
       const next = updater(current)
       sessionStateByRuntimeIdRef.current.set(sessionId, next)
 
       return next
     }
   })
+
+  appendUserMessage = text => {
+    const current = sessionStateByRuntimeIdRef.current.get(SID) ?? createClientSessionState('stored-1')
+    sessionStateByRuntimeIdRef.current.set(SID, {
+      ...current,
+      messages: [
+        ...current.messages,
+        { id: `user-${current.messages.length}`, parts: [{ text, type: 'text' }], role: 'user' }
+      ]
+    })
+  }
 
   useEffect(() => {
     handleEvent = stream.handleGatewayEvent
@@ -54,6 +67,8 @@ const complete = () => act(() => handleEvent!({ payload: { text: 'done' }, sessi
 describe('useMessageStream turn-end todo cleanup', () => {
   beforeEach(() => {
     handleEvent = null
+    appendUserMessage = null
+    hydrateFromStoredSession.mockClear()
     clearSessionTodos(SID)
   })
 
@@ -80,6 +95,88 @@ describe('useMessageStream turn-end todo cleanup', () => {
 
     // Not cleared immediately — the finished-list linger still owns it.
     expect($todosBySession.get()[SID]).toHaveLength(1)
+  })
+
+  it('rehydrates after a completed todo result so persisted provenance replaces live state', async () => {
+    await mountStream()
+
+    act(() =>
+      handleEvent!({
+        payload: { name: 'todo', result: { todos: [todo('a', 'completed')] }, tool_id: 'todo-1' },
+        session_id: SID,
+        type: 'tool.complete'
+      })
+    )
+    complete()
+
+    await waitFor(() => expect(hydrateFromStoredSession).toHaveBeenCalledWith(3, 'stored-1', SID))
+  })
+
+  it('rehydrates when a completed todo precedes later bubbles in the same turn', async () => {
+    await mountStream()
+
+    act(() => appendUserMessage!('Run the multi-step turn'))
+    act(() => handleEvent!({ payload: {}, session_id: SID, type: 'message.start' }))
+    act(() =>
+      handleEvent!({
+        payload: { name: 'todo', result: { todos: [todo('early', 'completed')] }, tool_id: 'todo-early' },
+        session_id: SID,
+        type: 'tool.complete'
+      })
+    )
+    act(() =>
+      handleEvent!({ payload: { text: 'Todo finished; checking one more thing.' }, session_id: SID, type: 'message.interim' })
+    )
+    act(() =>
+      handleEvent!({
+        payload: { name: 'terminal', result: 'ok', tool_id: 'terminal-later' },
+        session_id: SID,
+        type: 'tool.complete'
+      })
+    )
+    complete()
+
+    await waitFor(() => expect(hydrateFromStoredSession).toHaveBeenCalledWith(3, 'stored-1', SID))
+  })
+
+  it('rehydrates a successful todo turn when an older visible assistant error exists', async () => {
+    await mountStream()
+
+    act(() =>
+      handleEvent!({ payload: { message: 'Earlier failure' }, session_id: SID, type: 'error' })
+    )
+    act(() => appendUserMessage!('Try again'))
+    act(() => handleEvent!({ payload: {}, session_id: SID, type: 'message.start' }))
+    act(() =>
+      handleEvent!({
+        payload: { name: 'todo', result: { todos: [todo('later', 'completed')] }, tool_id: 'todo-later' },
+        session_id: SID,
+        type: 'tool.complete'
+      })
+    )
+    complete()
+
+    await waitFor(() => expect(hydrateFromStoredSession).toHaveBeenCalledWith(3, 'stored-1', SID))
+  })
+
+  it('requests provenance-only hydration after a compacted todo turn', async () => {
+    await mountStream()
+
+    act(() => appendUserMessage!('Compact this turn'))
+    act(() => handleEvent!({ payload: {}, session_id: SID, type: 'message.start' }))
+    act(() => handleEvent!({ payload: { kind: 'compacting' }, session_id: SID, type: 'status.update' }))
+    act(() =>
+      handleEvent!({
+        payload: { name: 'todo', result: { todos: [todo('compacted', 'completed')] }, tool_id: 'todo-compacted' },
+        session_id: SID,
+        type: 'tool.complete'
+      })
+    )
+    complete()
+
+    await waitFor(() =>
+      expect(hydrateFromStoredSession).toHaveBeenCalledWith(3, 'stored-1', SID, { preserveLocalScrollback: true })
+    )
   })
 
   it('drops a still-active task list when the turn errors out', async () => {
