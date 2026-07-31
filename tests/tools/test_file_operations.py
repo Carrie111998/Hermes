@@ -294,6 +294,44 @@ class TestShellFileOpsHelpers:
             "C:/Users/alice/notes.txt"
         ) == "'/c/Users/alice/notes.txt'"
 
+    def test_escape_shell_arg_native_keeps_windows_drive_path(self, monkeypatch, file_ops):
+        # Native Windows binaries (rg via WinGet/MSVC) cannot resolve the
+        # /c/... form when MSYS2_ARG_CONV_EXCL=* disables MSYS conversion.
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg_native(
+            r"C:\Users\alice\notes.txt"
+        ) == r"'C:\Users\alice\notes.txt'"
+
+    def test_escape_shell_arg_native_converts_msys_back_to_native(self, monkeypatch, file_ops):
+        # MSYS-form input (e.g. from ~ expansion) is converted back to the
+        # native form before quoting.
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg_native(
+            "/c/Users/alice/notes.txt"
+        ) == r"'C:\Users\alice\notes.txt'"
+
+    def test_escape_shell_arg_native_relative_path_unchanged(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_shell_arg_native("notes.txt") == "'notes.txt'"
+
+    def test_escape_shell_arg_native_noop_off_windows(self, monkeypatch, file_ops):
+        # Non-Windows hosts keep POSIX paths untouched (CI runs Linux).
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        assert file_ops._escape_shell_arg_native(
+            "/c/Users/alice/notes.txt"
+        ) == "'/c/Users/alice/notes.txt'"
+        assert file_ops._escape_shell_arg_native(
+            "/home/alice/notes.txt"
+        ) == "'/home/alice/notes.txt'"
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 
