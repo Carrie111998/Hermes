@@ -1399,3 +1399,46 @@ async def test_compact_mode_redacts_secret_from_codex_bridge_preview(monkeypatch
     assert secret_prefix not in all_content, (
         f"Secret prefix leaked into compact-mode chat history: {all_content!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_log_mode_redacts_secret_from_codex_bridge_preview(monkeypatch, tmp_path):
+    """Log mode (display.tool_progress: log): a secret in the raw preview
+    string forwarded by the Codex bridge must not reach the persisted
+    tool-call log queue -- the sink at gateway/run.py's log-mode branch,
+    reached via ctx.log_queue.put(preview_str), BEFORE the verbose/compact
+    branches further down in progress_callback. Regression requested in
+    review of #75074: the existing verbose/compact tests don't cover this
+    sink, so a regression in the redaction's ordering (moved to run AFTER
+    this branch instead of before it) would go undetected.
+
+    Captures queue.Queue.put() calls SYNCHRONOUSLY (via a wrapped put
+    method) rather than inspecting the queue's contents after the run
+    completes: gateway/run.py spawns a background write_tool_log() task
+    (asyncio.create_task) that concurrently drains the SAME queue via
+    get_nowait() and writes to the log file, so by the time a test
+    function resumes after the turn completes, the queue may already be
+    empty -- checking put() calls directly avoids that race entirely.
+    """
+    import queue as _queue_mod
+
+    captured_puts: list[str] = []
+    _real_put = _queue_mod.Queue.put
+
+    def _capturing_put(self, item, *a, **kw):
+        captured_puts.append(item)
+        return _real_put(self, item, *a, **kw)
+
+    monkeypatch.setattr(_queue_mod.Queue, "put", _capturing_put)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, CodexLikeAgent,
+        session_id="sess-codex-log-redact",
+        config_data={"display": {"tool_progress": "log"}},
+    )
+    assert result["final_response"] == "done"
+
+    joined = " ".join(str(item) for item in captured_puts)
+    assert CodexLikeAgent.SECRET not in joined, (
+        f"Secret leaked into the tool-call log queue: {captured_puts!r}"
+    )
