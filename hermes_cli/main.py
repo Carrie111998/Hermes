@@ -2708,6 +2708,13 @@ def cmd_gateway(args):
     """Gateway management commands."""
     _sync_bundled_skills_quietly()
 
+    # Clear stale bytecode before gateway restart so the new process
+    # compiles fresh .pyc from source.  Without this, source edits between
+    # updates (manual cherry-picks, hotfixes) can leave .pyc newer than
+    # .py — Python trusts the stale bytecode and the restart runs old code.
+    if getattr(args, 'gateway_command', None) == 'restart':
+        _clear_bytecode_cache(PROJECT_ROOT)
+
     from hermes_cli.gateway import gateway_command
 
     gateway_command(args)
