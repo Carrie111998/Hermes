@@ -2612,6 +2612,7 @@ class WorkflowEngine:
                                             "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
                                             (upstream_state.kanban_card_id,)
                                         )
+                                        kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
                                         conn.commit()
                                     upstream_state.status = "ready"
                                     upstream_state.completed_at = None
@@ -3380,6 +3381,7 @@ class WorkflowEngine:
                                             "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
                                             (upstream_state.kanban_card_id,)
                                         )
+                                        kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
                                         conn.commit()
                                     upstream_state.status = "ready"
                                     upstream_state.completed_at = None
@@ -3480,6 +3482,7 @@ class WorkflowEngine:
                                                         "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
                                                         (upstream_state.kanban_card_id,)
                                                     )
+                                                    kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
                                                     conn.commit()
                                                 upstream_state.status = "ready"
                                                 upstream_state.completed_at = None
