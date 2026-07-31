@@ -122,10 +122,11 @@ def resolve_git_command(argv: Sequence[str]) -> list[str]:
     MSYS mount (e.g. ``/mingw64/bin/git``) that is invisible to
     ``CreateProcessW``.
 
-    This helper checks known Git-for-Windows install locations and falls
-    back to ``shutil.which("git")`` (which honors PATHEXT). If none match,
-    it returns the bare ``["git", *argv]`` — the subsequent Popen will
-    raise a readable ``FileNotFoundError`` that callers can surface.
+    This helper prefers ``shutil.which("git")`` (honors PATHEXT). On
+    Windows, if PATH resolution fails, it checks known Git-for-Windows
+    install locations. If none match, it returns the bare
+    ``["git", *argv]`` — the subsequent Popen will raise a readable
+    ``FileNotFoundError`` that callers can surface.
 
     On POSIX, ``shutil.which`` resolves the absolute path when git is on
     PATH, and the bare name is returned when it isn't (identical to the

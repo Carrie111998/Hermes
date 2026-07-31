@@ -339,7 +339,7 @@ def _expand_git_reference(
         )
     except subprocess.TimeoutExpired:
         return f"{ref.raw}: git command timed out (30s)", None
-    except (FileNotFoundError, OSError) as exc:
+    except FileNotFoundError as exc:
         return f"{ref.raw}: git executable not found ({exc})", None
     if result.returncode != 0:
         stderr = (result.stderr or "").strip() or "git command failed"
