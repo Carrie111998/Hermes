@@ -1865,6 +1865,107 @@ class CLICommandsMixin:
                    "Use: pending, approve <id>, reject <id>, approval <on|off>.")
         print(out)
 
+    def _handle_mem_command(self, cmd: str):
+        """Handle /holographic-memory — inspect holographic memory (tree / list / probe / search).
+
+        Mirror of gateway/slash_commands.py._handle_mem_command for
+        interactive CLI/TUI surfaces. The tree viewer renders once and exits
+        (non-interactive); subcommands list/probe/search print their output.
+        """
+        import shlex
+        import subprocess
+        from pathlib import Path
+        from plugins.memory import load_memory_provider, _get_active_memory_provider
+
+        parts = shlex.split(cmd.strip())
+        args = parts[1:] if len(parts) > 1 else []
+        subcommand = args[0] if args else "tree"
+
+        active_name = _get_active_memory_provider()
+        if active_name != "holographic":
+            print(
+                "Holographic memory is not the active memory provider. "
+                f"Active provider is '{active_name or 'none'}'. "
+                "Set memory.provider: holographic in config.yaml to use /holographic-memory."
+            )
+            return
+
+        provider = load_memory_provider("holographic")
+        if not provider:
+            print("Failed to load holographic memory provider.")
+            return
+
+        provider.initialize("cli-slash-command-session")
+        try:
+            if subcommand == "tree":
+                plugin_dir = Path(__file__).parent.parent / "plugins" / "memory" / "holographic"
+                tree_script = plugin_dir / "scripts" / "holographic_tree.py"
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, str(tree_script)],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    # The slash worker redirects stdout to a buffer and strips
+                    # ANSI at the choke point, but the child must not inherit the
+                    # worker's real fd 1 (the JSON-RPC pipe) or its output would
+                    # bypass the buffer and be dropped by the drain thread.
+                    out = proc.stdout or proc.stderr or "Tree viewer exited with no output."
+                    # Rich may emit ANSI when the child detects a TTY or
+                    # COLORTERM is set; strip so every surface gets clean text.
+                    try:
+                        from tools.ansi_strip import strip_ansi
+                        out = strip_ansi(out)
+                    except ImportError:
+                        pass
+                    print(out, end="")
+                except Exception as e:
+                    print(f"Error running tree viewer: {e}")
+                return
+
+            if subcommand == "list":
+                output_format = "table"
+                limit = 10
+                remaining = args[1:]
+                i = 0
+                while i < len(remaining):
+                    if remaining[i] in ("--limit", "-n") and i + 1 < len(remaining):
+                        limit = int(remaining[i + 1])
+                        i += 2
+                    elif remaining[i] == "--format" and i + 1 < len(remaining):
+                        output_format = remaining[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                res = provider.handle_tool_call("fact_store", {
+                    "action": "list",
+                    "output_format": output_format,
+                    "limit": limit,
+                })
+                print(res)
+                return
+
+            if subcommand == "probe" and len(args) >= 2:
+                entity = args[1]
+                res = provider.handle_tool_call("fact_store", {
+                    "action": "probe",
+                    "entity": entity,
+                })
+                print(res)
+                return
+
+            if subcommand == "search" and len(args) >= 2:
+                query = " ".join(args[1:])
+                res = provider.handle_tool_call("fact_store", {
+                    "action": "search",
+                    "query": query,
+                })
+                print(res)
+                return
+
+            print("Unknown /holographic-memory subcommand. Use: tree, list, probe <entity>, search <query>.")
+        finally:
+            provider.shutdown()
+
     def _save_write_approval(self, subsystem: str, enabled: bool):
         """Persist <subsystem>.write_approval to config (for /memory|/skills approval)."""
         from cli import save_config_value

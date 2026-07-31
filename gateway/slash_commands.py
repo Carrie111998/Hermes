@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import sys
 import time
 from datetime import datetime
@@ -3466,6 +3467,92 @@ class GatewaySlashCommandsMixin:
             out = ("Unknown /memory subcommand. Use: pending, approve <id>, "
                    "reject <id>, approval <on|off>.")
         return out
+
+    async def _handle_mem_command(self, event: MessageEvent) -> str:
+        """Handle /holographic-memory — inspect holographic memory (tree / list / probe / search).
+
+          /holographic-memory tree       Render full memory tree (one-shot, non-interactive)
+          /holographic-memory list <N>  Table of facts (default 10, use --limit N)
+          /holographic-memory probe <entity>  Probe and display facts for entity
+          /holographic-memory search <query>  Search facts matching query
+        """
+        from plugins.memory import load_memory_provider, _get_active_memory_provider
+
+        raw_args = event.get_command_args().strip()
+        args = shlex.split(raw_args) if raw_args else []
+        subcommand = args[0] if args else "tree"
+
+        active_name = _get_active_memory_provider()
+        if active_name != "holographic":
+            return (
+                "Holographic memory is not the active memory provider. "
+                f"Active provider is '{active_name or 'none'}'. "
+                "Set memory.provider: holographic in config.yaml to use /holographic-memory."
+            )
+
+        provider = load_memory_provider("holographic")
+        if not provider:
+            return "Failed to load holographic memory provider."
+
+        provider.initialize("slash-command-session")
+        try:
+            if subcommand == "tree":
+                plugin_dir = Path(__file__).parent.parent / "plugins" / "memory" / "holographic"
+                tree_script = plugin_dir / "scripts" / "holographic_tree.py"
+                proc = await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, str(tree_script)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                out = proc.stdout or proc.stderr or "Tree viewer exited with no output."
+                # Rich may emit ANSI when the child detects a TTY or
+                # COLORTERM is set; strip so every gateway surface gets
+                # clean text (the CLI slash worker strips downstream).
+                try:
+                    from tools.ansi_strip import strip_ansi
+                    out = strip_ansi(out)
+                except ImportError:
+                    pass
+                return out
+
+            if subcommand == "list":
+                output_format = "table"
+                limit = 10
+                remaining = args[1:]
+                i = 0
+                while i < len(remaining):
+                    if remaining[i] in ("--limit", "-n") and i + 1 < len(remaining):
+                        limit = int(remaining[i + 1])
+                        i += 2
+                    elif remaining[i] == "--format" and i + 1 < len(remaining):
+                        output_format = remaining[i + 1]
+                        i += 2
+                    else:
+                        i += 1
+                return provider.handle_tool_call("fact_store", {
+                    "action": "list",
+                    "output_format": output_format,
+                    "limit": limit,
+                })
+
+            if subcommand == "probe" and len(args) >= 2:
+                entity = args[1]
+                return provider.handle_tool_call("fact_store", {
+                    "action": "probe",
+                    "entity": entity,
+                })
+
+            if subcommand == "search" and len(args) >= 2:
+                query = " ".join(args[1:])
+                return provider.handle_tool_call("fact_store", {
+                    "action": "search",
+                    "query": query,
+                })
+
+            return ("Unknown /holographic-memory subcommand. Use: tree, list, probe <entity>, "
+                    "search <query>.")
+        finally:
+            provider.shutdown()
 
     async def _handle_skills_command(self, event: MessageEvent) -> str:
         """Handle /skills on the gateway — pending skill-write review only.

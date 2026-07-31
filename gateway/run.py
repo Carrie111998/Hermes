@@ -14033,6 +14033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "profile": self._handle_profile_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
+                "holographic-memory": self._handle_mem_command,
             }.get(name)
             if plain is not None:
                 return await plain(event)
@@ -14999,6 +15000,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "memory":
             return await self._handle_memory_command(event)
+
+        if canonical == "holographic-memory":
+            return await self._handle_mem_command(event)
 
         if canonical == "skills":
             return await self._handle_skills_command(event)
