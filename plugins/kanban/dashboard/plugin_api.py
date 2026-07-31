@@ -36,9 +36,11 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import socket
 import sqlite3
 import time
 from dataclasses import asdict
@@ -46,11 +48,18 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+
+# Boardd broker shim is optional in some test/standalone layouts; it is
+# vendored in hermes_cli for canonical fleet custody.
+try:
+    from hermes_cli import boardd_shim
+except Exception:
+    boardd_shim = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
@@ -180,6 +189,54 @@ def _conn(board: Optional[str] = None) -> Any:
     except Exception as exc:
         log.warning("kanban init_db failed: %s", exc)
     return kanban_db.connect(board=board)
+
+
+# ---------------------------------------------------------------------------
+# Boardd fail-closed boundary
+# ---------------------------------------------------------------------------
+
+def _boardd_unavailable_handler(request: Any, exc: Exception):
+    """Return HTTP 503 when the fleet broker is authoritative but unreachable.
+
+    This is the fail-closed boundary: an active boardd custody claim that cannot
+    be fulfilled must not degrade to a direct SQLite open of the read-only
+    mirror.
+    """
+    log.error("boardd broker unavailable for %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "boardd broker unavailable for fleet board"},
+    )
+
+
+def register_boardd_exception_handlers(app: Any) -> None:
+    """Register the 503 handler on a FastAPI app.
+
+    Called automatically when the plugin is loaded from the dashboard web
+    server; tests that mount the router into a fresh app should call this too.
+    """
+    if boardd_shim is None:
+        return
+    app.add_exception_handler(
+        boardd_shim.BoarddUnavailableError, _boardd_unavailable_handler
+    )
+    try:
+        app.add_exception_handler(
+            boardd_shim.kb_client.BoarddUnavailable, _boardd_unavailable_handler
+        )
+    except Exception:
+        pass
+
+
+# Auto-register on the production dashboard app if we are being loaded from it.
+try:
+    from hermes_cli import web_server as _web_server
+
+    _app = getattr(_web_server, "app", None)
+    if _app is not None:
+        register_boardd_exception_handlers(_app)
+except Exception:
+    pass
 
 
 # ---------------------------------------------------------------------------

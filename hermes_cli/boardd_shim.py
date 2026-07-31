@@ -80,6 +80,17 @@ def _to_sqlite_exc(err):
     return sqlite3.OperationalError(f"{etype or 'BrokerError'}: {err}")
 
 
+class BoarddUnavailableError(sqlite3.OperationalError):
+    """Raised by the shim when the boardd broker is unreachable.
+
+    Inherits from :class:`sqlite3.OperationalError` so existing
+    ``except sqlite3.OperationalError`` sites react to broker loss the same
+    way they react to a local SQLite lock.  Callers that need to distinguish
+    broker unavailability can catch this subclass directly.
+    """
+    pass
+
+
 def _x(fn, *args, **kwargs):
     """Call a kb_client method, translating broker errors into sqlite3.* so
     every ``except sqlite3.*`` site behaves identically shim-vs-native."""
@@ -88,7 +99,7 @@ def _x(fn, *args, **kwargs):
     except kb_client.BoarddError as e:
         raise _to_sqlite_exc(e) from None
     except kb_client.BoarddUnavailable as e:
-        raise sqlite3.OperationalError(f"boardd unavailable: {e}") from None
+        raise BoarddUnavailableError(f"boardd unavailable: {e}") from None
 
 
 # --------------------------------------------------------------------------- #
