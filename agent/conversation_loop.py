@@ -7670,12 +7670,8 @@ def run_conversation(
                             f"in {wait_time:.0f}s{_budget_note}"
                         )
                         sleep_end = time.time() + wait_time
-                        _empty_redirect_preserved = False
                         while time.time() < sleep_end:
                             if agent._interrupt_requested:
-                                if agent.clear_interrupt(preserve_redirect=True):
-                                    _empty_redirect_preserved = True
-                                    break
                                 agent._vprint(
                                     f"{agent.log_prefix}⚡ Interrupt during empty-response backoff, aborting.",
                                     force=True,
@@ -7701,12 +7697,6 @@ def run_conversation(
                                     f"empty response retry backoff ({agent._empty_content_retries}/{_empty_retry_budget}), "
                                     f"{int(sleep_end - time.time())}s remaining"
                                 )
-                        if _empty_redirect_preserved:
-                            # Refund the slot this empty retry consumed so the
-                            # loop re-enters and drains/applies the redirect
-                            # instead of exiting on an exhausted budget (mirrors
-                            # the 429 backoff's redirect-restart refund).
-                            agent.iteration_budget.refund()
                         continue
 
                     if _truly_empty and _deterministic_empty:
