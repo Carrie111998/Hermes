@@ -8,6 +8,7 @@ import {
   excludeProjectSessions,
   kanbanWorktreeDir,
   liveSessionProjectId,
+  mainBranchSwitchPath,
   mergeRepoWorktreeGroups,
   NO_PROJECT_ID,
   overlayLiveLanes,
@@ -49,6 +50,19 @@ const lane = (over: Partial<SidebarSessionGroup> & Pick<SidebarSessionGroup, 'id
   path: null,
   sessions: [],
   ...over
+})
+
+describe('mainBranchSwitchPath', () => {
+  it('uses the repo root instead of a stale main-lane path', () => {
+    const group = lane({ id: 'main', isMain: true, label: 'main', path: '/project/container' })
+
+    expect(mainBranchSwitchPath(group, '/actual/repo')).toBe('/actual/repo')
+  })
+
+  it('rejects branch switching without an authoritative repo root', () => {
+    expect(mainBranchSwitchPath(lane({ id: 'main', isMain: true, label: 'main', path: '/project/container' }))).toBeNull()
+    expect(mainBranchSwitchPath(lane({ id: 'feature', label: 'feature' }), '/actual/repo')).toBeNull()
+  })
 })
 
 describe('baseName', () => {

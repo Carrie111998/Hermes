@@ -13,7 +13,7 @@ import { SidebarRowStack } from '../chrome'
 import { SidebarLoadMoreRow } from '../load-more-row'
 
 import { SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
-import type { SidebarSessionGroup } from './workspace-groups'
+import { mainBranchSwitchPath, type SidebarSessionGroup } from './workspace-groups'
 import {
   WorkspaceAddButton,
   WorkspaceContextMenu,
@@ -26,12 +26,14 @@ interface SidebarWorkspaceGroupProps {
   group: SidebarSessionGroup
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
   onNewSession?: (path: null | string) => void
+  /** Authoritative Git root for main-checkout branch mutations. */
+  repoPath?: null | string
   // When set (linked worktree rows), shows a remove affordance that runs a real
   // `git worktree remove`.
   onRemove?: () => void
 }
 
-export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove }: SidebarWorkspaceGroupProps) {
+export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemove, repoPath }: SidebarWorkspaceGroupProps) {
   const { t } = useI18n()
   const s = t.sidebar
   const isProfileGroup = group.mode === 'profile'
@@ -95,9 +97,11 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
     // Main-checkout lanes are branch-labeled views over the same repo root path.
     // Clicking "+" on `main` should open on `main`, not whatever branch the root
     // currently sits on (`test0`, etc.), so explicitly switch first.
-    if (group.isMain && group.path && group.label) {
+    const switchPath = mainBranchSwitchPath(group, repoPath)
+
+    if (switchPath && group.label) {
       try {
-        await switchBranchInRepo(group.path, group.label)
+        await switchBranchInRepo(switchPath, group.label)
       } catch (err) {
         notifyError(err, t.statusStack.coding.switchFailed(group.label))
 
@@ -105,7 +109,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
       }
     }
 
-    onNewSession(group.path)
+    onNewSession(switchPath ?? group.path)
   }
 
   return (

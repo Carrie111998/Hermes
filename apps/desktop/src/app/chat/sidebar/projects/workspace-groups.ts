@@ -68,6 +68,11 @@ export interface SidebarProjectTree {
   previewSessions?: SessionInfo[]
 }
 
+/** Repository-level mutations require the repo node's authoritative root.
+ * Lane paths are session-derived and may point at a project container. */
+export const mainBranchSwitchPath = (group: SidebarSessionGroup, repoPath?: null | string): null | string =>
+  group.isMain ? repoPath?.trim() || null : null
+
 /** Path split into segments, ignoring trailing slashes and mixed separators. */
 const segments = (path: string): string[] =>
   path
