@@ -533,5 +533,60 @@ class TestStaleToolMediaLeak:
         )
 
 
+class TestMultipleMediaTagsOnOneLine:
+    """Regression tests: several ``MEDIA:`` tags on a single line must each
+    extract as an individual path.
+
+    ``MEDIA_TAG_CLEANUP_RE`` supports spaces inside a path via a lazy
+    continuation group. On a backtrack (the first token's extension check
+    failing mid-path), that group expanded token-by-token straight across any
+    following ``MEDIA:`` tag on the same line, capturing e.g.
+    ``/a/one.png MEDIA:/a/two.png MEDIA:/a/three.png`` as ONE giant path.
+    Validation then rejected the nonexistent mega-path and every attachment
+    on the line was silently dropped, while the cleanup pass still stripped
+    the tags from the visible text — the user received a bare message with
+    no images and no error. The ``(?!MEDIA:)`` guard in the continuation
+    group stops the expansion at the next tag.
+    """
+
+    def _extract(self, content):
+        from gateway.platforms.base import BasePlatformAdapter
+        media, cleaned = BasePlatformAdapter.extract_media(content)
+        return [path for path, _ in media], cleaned
+
+    def test_three_tags_same_line_extract_individually(self):
+        paths, cleaned = self._extract(
+            "Shots: MEDIA:/tmp/shot_title.png "
+            "MEDIA:/tmp/shot_play.png MEDIA:/tmp/shot_over.png"
+        )
+        assert paths == [
+            "/tmp/shot_title.png",
+            "/tmp/shot_play.png",
+            "/tmp/shot_over.png",
+        ]
+        assert cleaned == "Shots:"
+
+    def test_spaces_in_path_still_supported(self):
+        paths, _ = self._extract(
+            "MEDIA:/home/user/Pictures/Tokyo Night/Image Jun 22, 2026 PM.png"
+        )
+        assert paths == [
+            "/home/user/Pictures/Tokyo Night/Image Jun 22, 2026 PM.png"
+        ]
+
+    def test_mixed_quoted_and_bare_tags_same_line(self):
+        paths, cleaned = self._extract(
+            'MEDIA:"/tmp/my file.png" and MEDIA:/tmp/c.jpg'
+        )
+        assert paths == ["/tmp/my file.png", "/tmp/c.jpg"]
+        assert cleaned == "and"
+
+    def test_spaced_path_followed_by_second_tag(self):
+        paths, _ = self._extract(
+            "MEDIA:/tmp/dir with spaces/a.png MEDIA:/tmp/b.png"
+        )
+        assert paths == ["/tmp/dir with spaces/a.png", "/tmp/b.png"]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
