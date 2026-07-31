@@ -92,7 +92,7 @@ export function AgentsView({ onClose }: AgentsViewProps) {
 
   return (
     <Panel closeLabel={t.agents.close} onClose={onClose}>
-      <PanelHeader subtitle="Local profiles, cron jobs, and live delegated work." title={t.agents.title} />
+      <PanelHeader subtitle={t.agents.localBoardSubtitle} title={t.agents.title} />
       <div className="flex min-h-0 min-w-0 flex-1 flex-col gap-6 overflow-hidden">
         <LocalAgentsBoard />
         {tree.length === 0 ? (
@@ -103,7 +103,7 @@ export function AgentsView({ onClose }: AgentsViewProps) {
           <section className="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden">
             <div className="flex shrink-0 items-center gap-2">
               <Codicon className="text-muted-foreground/75" name="hubot" size="1rem" />
-              <h3 className="text-sm font-semibold text-foreground/90">Live subagents</h3>
+              <h3 className="text-sm font-semibold text-foreground/90">{t.agents.liveSubagentsTitle}</h3>
             </div>
             <SubagentTree tree={tree} />
           </section>
@@ -131,15 +131,17 @@ function jobPrompt(job: CronJob): string {
   return asText(job.prompt).trim()
 }
 
-function jobDeliver(job: CronJob): string {
-  return asText(job.deliver).trim() || 'local'
+function jobDeliver(job: CronJob, a: Translations['agents']): string {
+  return asText(job.deliver).trim() || a.deliveryLocal
 }
 
-function modelText(job: CronJob): string {
-  return [asText(job.provider).trim(), asText(job.model).trim()].filter(Boolean).join('/') || 'default model'
+function modelText(job: CronJob, a: Translations['agents']): string {
+  return [asText(job.provider).trim(), asText(job.model).trim()].filter(Boolean).join('/') || a.defaultModel
 }
 
 function LocalAgentsBoard() {
+  const { t } = useI18n()
+  const a = t.agents
   const [profiles, setProfiles] = useState<ProfileInfo[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -186,10 +188,10 @@ function LocalAgentsBoard() {
       <div className="flex min-h-0 min-w-0 flex-col rounded-xl border border-border/70 bg-muted/10 p-3">
         <div className="mb-3 flex items-center justify-between gap-2">
           <div>
-            <h3 className="text-sm font-semibold text-foreground/90">Local agents</h3>
-            <p className="text-[0.7rem] text-muted-foreground/70">Auto-discovered Hermes profiles</p>
+            <h3 className="text-sm font-semibold text-foreground/90">{a.localAgentsTitle}</h3>
+            <p className="text-[0.7rem] text-muted-foreground/70">{a.localAgentsDesc}</p>
           </div>
-          {loading ? <GlyphSpinner ariaLabel="Loading local agents" className="size-3.5" spinner="breathe" /> : null}
+          {loading ? <GlyphSpinner ariaLabel={a.loadingLocalAgents} className="size-3.5" spinner="breathe" /> : null}
         </div>
 
         {error ? <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">{error}</p> : null}
@@ -212,19 +214,19 @@ function LocalAgentsBoard() {
                 <span className="truncate text-sm font-medium">{profile.name}</span>
                 {profile.is_default ? (
                   <span className="rounded-full bg-muted px-1.5 py-0.5 text-[0.58rem] uppercase tracking-wide text-muted-foreground">
-                    default
+                    {a.defaultBadge}
                   </span>
                 ) : null}
               </span>
               <span className="truncate text-[0.68rem] text-muted-foreground/75">
-                {[profile.provider, profile.model].filter(Boolean).join('/') || 'model inherits default'}
+                {[profile.provider, profile.model].filter(Boolean).join('/') || a.modelInheritsDefault}
               </span>
-              <span className="text-[0.64rem] text-muted-foreground/65">{profile.skill_count} skills · {profile.path}</span>
+              <span className="text-[0.64rem] text-muted-foreground/65">{a.skillsAndPath(profile.skill_count, profile.path)}</span>
             </button>
           ))}
 
           {!loading && profiles.length === 0 ? (
-            <p className="rounded-md border border-border/60 p-3 text-xs text-muted-foreground/75">No local profiles found.</p>
+            <p className="rounded-md border border-border/60 p-3 text-xs text-muted-foreground/75">{a.noLocalProfiles}</p>
           ) : null}
         </div>
       </div>
@@ -235,6 +237,8 @@ function LocalAgentsBoard() {
 }
 
 function AgentDetail({ profile }: { profile: ProfileInfo | null }) {
+  const { t } = useI18n()
+  const a = t.agents
   const [jobs, setJobs] = useState<CronJob[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<null | string>(null)
@@ -275,7 +279,7 @@ function AgentDetail({ profile }: { profile: ProfileInfo | null }) {
   if (!profile) {
     return (
       <div className="grid place-items-center rounded-xl border border-border/70 bg-muted/10 p-6 text-center text-sm text-muted-foreground/75">
-        Select a local agent to inspect its detected jobs.
+        {a.selectAgent}
       </div>
     )
   }
@@ -286,17 +290,17 @@ function AgentDetail({ profile }: { profile: ProfileInfo | null }) {
     <div className="flex min-h-0 min-w-0 flex-col rounded-xl border border-border/70 bg-background/35 p-4">
       <div className="mb-4 flex shrink-0 items-start justify-between gap-3">
         <div className="min-w-0">
-          <p className="text-[0.66rem] font-medium uppercase tracking-wider text-muted-foreground/65">Agent detail</p>
+          <p className="text-[0.66rem] font-medium uppercase tracking-wider text-muted-foreground/65">{a.agentDetail}</p>
           <h3 className="truncate text-lg font-semibold text-foreground">{profile.name}</h3>
           <p className="truncate text-xs text-muted-foreground/75">{profile.path}</p>
         </div>
-        {loading ? <GlyphSpinner ariaLabel="Loading agent jobs" className="size-4" spinner="breathe" /> : null}
+        {loading ? <GlyphSpinner ariaLabel={a.loadingAgentJobs} className="size-4" spinner="breathe" /> : null}
       </div>
 
       <div className="mb-4 grid gap-2 sm:grid-cols-3">
-        <DetailStat label="Model" value={[profile.provider, profile.model].filter(Boolean).join('/') || 'default'} />
-        <DetailStat label="Skills" value={String(profile.skill_count)} />
-        <DetailStat label="Jobs" value={String(sorted.length)} />
+        <DetailStat label={a.statModel} value={[profile.provider, profile.model].filter(Boolean).join('/') || a.defaultModel} />
+        <DetailStat label={a.statSkills} value={String(profile.skill_count)} />
+        <DetailStat label={a.statJobs} value={String(sorted.length)} />
       </div>
 
       {error ? <p className="mb-3 rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">{error}</p> : null}
@@ -311,9 +315,9 @@ function AgentDetail({ profile }: { profile: ProfileInfo | null }) {
         ) : !loading ? (
           <div className="rounded-lg border border-dashed border-border/70 p-5 text-center">
             <Codicon className="mx-auto mb-2 text-muted-foreground/60" name="watch" size="1.3rem" />
-            <p className="text-sm font-medium text-foreground/85">No cron jobs detected</p>
+            <p className="text-sm font-medium text-foreground/85">{a.noCronJobsTitle}</p>
             <p className="mt-1 text-xs text-muted-foreground/70">
-              New jobs created for {profile.name} will appear here automatically with a default view.
+              {a.noCronJobsDesc(profile.name)}
             </p>
           </div>
         ) : null}
@@ -332,9 +336,11 @@ function DetailStat({ label, value }: { label: string; value: string }) {
 }
 
 function CronJobDefaultCard({ job }: { job: CronJob }) {
+  const { t } = useI18n()
+  const a = t.agents
   const state = jobState(job)
   const prompt = jobPrompt(job)
-  const flags = [job.no_agent ? 'script-only' : '', job.script ? 'script' : ''].filter(Boolean)
+  const flags = [job.no_agent ? a.modeScriptOnly : '', job.script ? a.modeScript : ''].filter(Boolean)
 
   return (
     <article className="grid min-w-0 gap-3 rounded-lg border border-border/60 bg-muted/10 p-3">
@@ -350,12 +356,12 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2">
-        <DetailStat label="Schedule" value={scheduleText(job)} />
-        <DetailStat label="Next run" value={formatDateTime(job.next_run_at)} />
-        <DetailStat label="Last run" value={formatDateTime(job.last_run_at)} />
-        <DetailStat label="Delivery" value={jobDeliver(job)} />
-        <DetailStat label="Model" value={modelText(job)} />
-        <DetailStat label="Mode" value={flags.join(' · ') || 'agent'} />
+        <DetailStat label={a.statSchedule} value={scheduleText(job)} />
+        <DetailStat label={a.statNextRun} value={formatDateTime(job.next_run_at)} />
+        <DetailStat label={a.statLastRun} value={formatDateTime(job.last_run_at)} />
+        <DetailStat label={a.statDelivery} value={jobDeliver(job, a)} />
+        <DetailStat label={a.statModel} value={modelText(job, a)} />
+        <DetailStat label={a.statMode} value={flags.join(' · ') || a.modeAgent} />
       </div>
 
       {prompt ? <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground/80">{prompt}</p> : null}

@@ -973,6 +973,33 @@ export interface Translations {
     close: string
     title: string
     subtitle: string
+    localBoardSubtitle: string
+    liveSubagentsTitle: string
+    localAgentsTitle: string
+    localAgentsDesc: string
+    loadingLocalAgents: string
+    defaultBadge: string
+    modelInheritsDefault: string
+    skillsAndPath: (count: number, path: string) => string
+    noLocalProfiles: string
+    selectAgent: string
+    agentDetail: string
+    loadingAgentJobs: string
+    statModel: string
+    statSkills: string
+    statJobs: string
+    statSchedule: string
+    statNextRun: string
+    statLastRun: string
+    statDelivery: string
+    statMode: string
+    deliveryLocal: string
+    defaultModel: string
+    modeAgent: string
+    modeScript: string
+    modeScriptOnly: string
+    noCronJobsTitle: string
+    noCronJobsDesc: (profile: string) => string
     emptyTitle: string
     emptyDesc: string
     running: string
