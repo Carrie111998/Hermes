@@ -569,3 +569,25 @@ def test_cua_fleet_environment_cleanup_retries_claim_release() -> None:
     environment.cleanup()
     assert attempts == 2
     assert lease.lease_id not in provider._states
+
+
+def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkeypatch):
+    from tools import terminal_tool
+    from tools.environments import desktop_lease
+
+    environment = Mock()
+    manager = Mock()
+    manager.get.return_value = SimpleNamespace(environment=environment)
+    monkeypatch.setattr(desktop_lease, "get_desktop_sandbox_manager", lambda: manager)
+
+    result = terminal_tool._create_environment(
+        "desktop",
+        "desktop:latest",
+        "/root",
+        60,
+        task_id="task-existing",
+    )
+
+    assert result is environment
+    manager.get.assert_called_once_with("task-existing")
+    manager.acquire.assert_not_called()

@@ -1670,7 +1670,12 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
     
     elif env_type == "desktop":
         from tools.environments.desktop_lease import get_desktop_sandbox_manager
-        return get_desktop_sandbox_manager().acquire(task_id, image=image).environment
+
+        manager = get_desktop_sandbox_manager()
+        managed = manager.get(task_id)
+        if managed is None:
+            managed = manager.acquire(task_id, image=image)
+        return managed.environment
 
     elif env_type == "modal":
         sandbox_kwargs = {}

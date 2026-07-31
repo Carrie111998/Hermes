@@ -433,6 +433,36 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         return ActionResult(ok=True, action="set_value")
 
 
+def get_desktop_sandbox_manager():
+    """Load the shared desktop lease manager only when desktop mode is active."""
+    from tools.environments.desktop_lease import get_desktop_sandbox_manager as get_manager
+
+    return get_manager()
+
+
+def _desktop_sandbox_enabled() -> bool:
+    """Return whether computer use should share the desktop terminal lease."""
+    try:
+        from tools.terminal_tool import _get_env_config
+
+        return _get_env_config().get("env_type") == "desktop"
+    except Exception:
+        logger.debug("desktop sandbox configuration is unavailable", exc_info=True)
+        return False
+
+
+def _get_task_desktop_backend(task_id: str | None) -> ComputerUseBackend | None:
+    """Resolve the configured task desktop without creating a local backend."""
+    if not _desktop_sandbox_enabled():
+        return None
+
+    normalized_task_id = str(task_id or "default")
+    manager = get_desktop_sandbox_manager()
+    managed = manager.get(normalized_task_id)
+    if managed is None:
+        managed = manager.acquire(normalized_task_id)
+    return managed.environment.get_computer_backend()
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -1324,6 +1354,8 @@ def check_computer_use_requirements() -> bool:
     `hermes computer-use doctor` if their session is incomplete (e.g. no
     DISPLAY set).
     """
+    if _desktop_sandbox_enabled():
+        return True
     if sys.platform not in ("darwin", "win32", "linux"):
         return False
     from tools.computer_use.cua_backend import cua_driver_binary_available
