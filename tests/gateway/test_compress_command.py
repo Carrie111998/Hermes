@@ -683,3 +683,48 @@ async def test_compress_command_skips_scope_install_when_multiplex_off(monkeypat
         await runner._handle_compress_command(_make_event())
 
     assert captured["scope_during"] is None
+
+
+@pytest.mark.asyncio
+async def test_compress_command_resets_home_override_when_secret_scope_install_fails(
+    tmp_path, monkeypatch
+):
+    """Regression for #66336 triage follow-up: if `set_secret_scope` (or
+    anything called by it during the install step) raises, the home override
+    that was installed a few lines above (set_hermes_home_override) must be
+    reset by the finally — otherwise the leaked override silently scopes every
+    subsequent /compress call to the wrong profile's HERMES_HOME until the
+    gateway turn exits."""
+    from agent import secret_scope
+    from hermes_constants import get_hermes_home_override
+
+    profile_home = tmp_path / "profileA"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text("ANTHROPIC_API_KEY=scope_value\n")
+
+    history = _make_history()
+    runner = _make_runner(history)
+    runner.config.multiplex_profiles = True
+    runner._resolve_profile_home_for_source = lambda src: profile_home
+
+    # Sanity: nothing installed before the call.
+    assert get_hermes_home_override() is None
+
+    secret_scope.set_multiplex_active(True)
+    try:
+        def _exploding_set_secret_scope(_secrets):
+            raise RuntimeError("simulated secret-scope install failure")
+
+        with patch.object(secret_scope, "set_secret_scope", side_effect=_exploding_set_secret_scope):
+            await runner._handle_compress_command(_make_event())
+
+        # A leak here means a later /compress silently reads Profile A's .env.
+        assert get_hermes_home_override() is None, (
+            f"home override leaked after secret-scope install failure: "
+            f"{get_hermes_home_override()!r}"
+        )
+        assert secret_scope.current_secret_scope() is None, (
+            "secret scope stuck around after install raised mid-acquisition"
+        )
+    finally:
+        secret_scope.set_multiplex_active(False)

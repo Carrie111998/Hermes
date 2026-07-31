@@ -3461,22 +3461,26 @@ class GatewaySlashCommandsMixin:
         # /compress builds a one-off AIAgent outside the gateway turn's
         # _profile_runtime_scope (gateway/run.py:19243). Without this scope
         # install, _resolve_session_agent_runtime raises UnscopedSecretError
-        # under multiplex (#66336). The finally below resets the tokens.
+        # under multiplex (#66336). Install lives INSIDE the try so a failed
+        # secret-scope build/install still resets the just-installed home
+        # override via the finally below instead of leaking it.
         _multiplexed = bool(getattr(self.config, "multiplex_profiles", False))
         _home_token = _secret_token = None
-        if _multiplexed:
-            from hermes_constants import set_hermes_home_override
-            from agent.secret_scope import (
-                build_profile_secret_scope,
-                set_secret_scope,
-            )
-            _profile_home = self._resolve_profile_home_for_source(source)
-            _home_token = set_hermes_home_override(str(_profile_home))
-            _secret_token = set_secret_scope(
-                build_profile_secret_scope(_profile_home)
-            )
-
         try:
+            if _multiplexed:
+                from hermes_constants import set_hermes_home_override
+                from agent.secret_scope import (
+                    build_profile_secret_scope,
+                    set_secret_scope,
+                )
+                _profile_home = self._resolve_profile_home_for_source(source)
+                # ponytail: install home BEFORE secret scope — if set_secret_scope
+                # raises, finally sees _home_token set and resets it; _secret_token
+                # stays None and reset_secret_scope is skipped (scope never installed).
+                _home_token = set_hermes_home_override(str(_profile_home))
+                _secret_token = set_secret_scope(
+                    build_profile_secret_scope(_profile_home)
+                )
             from run_agent import AIAgent
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
