@@ -3,7 +3,7 @@
 import re
 import pytest
 
-from hermes_cli.markdown_stream import MarkdownStreamProcessor, render_markdown_rich
+from hermes_cli.markdown_stream import MarkdownStreamProcessor
 
 # Helpers
 _ANSI_RE = re.compile(r"\033\[[0-9;]*m")
@@ -455,6 +455,21 @@ class TestTableRendering:
         data_lines = [l for l in lines if "│" in l and "─" not in l]
         assert len(data_lines) >= 2
 
+    def test_wide_table_falls_back_within_caller_width(self):
+        p = MarkdownStreamProcessor(max_width=32)
+        p.feed_line("| Name | Description |")
+        p.feed_line("| --- | --- |")
+        p.feed_line("| Hermes | A deliberately long description that cannot fit |")
+
+        tail = p.flush()
+        assert tail is not None
+        plain = _strip_ansi(tail)
+
+        assert "Name:" in plain
+        assert "Description:" in plain
+        assert "┌" not in plain
+        assert all(len(line) <= 32 for line in plain.splitlines())
+
     def test_table_strips_inline_markers(self):
         """Bold/italic/code markers in cells should be stripped."""
         p = MarkdownStreamProcessor()
@@ -653,22 +668,6 @@ class TestStreamingSequence:
 
         # No open block at end
         assert p.flush() is None
-
-
-# =========================================================================
-# Non-streaming helper
-# =========================================================================
-
-class TestRenderMarkdownRich:
-    def test_returns_rich_markdown(self):
-        from rich.markdown import Markdown
-        result = render_markdown_rich("# Hello\n\nWorld")
-        assert isinstance(result, Markdown)
-
-    def test_custom_theme(self):
-        result = render_markdown_rich("```python\nx=1\n```", pygments_theme="nord")
-        from rich.markdown import Markdown
-        assert isinstance(result, Markdown)
 
 
 # =========================================================================

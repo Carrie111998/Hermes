@@ -2949,7 +2949,11 @@ def _terminal_width_for_streaming() -> int:
     return max(20, cols - len(_STREAM_PAD) - 2)
 
 
-def _render_final_assistant_content(text: str, mode: str = "render"):
+def _render_final_assistant_content(
+    text: str,
+    mode: str = "render",
+    code_theme: str = "monokai",
+):
     """Render final assistant content as markdown, stripped text, or raw text."""
     from rich.markdown import Markdown
 
@@ -2984,7 +2988,7 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
     plain = _rich_text_from_ansi(text or "").plain
     plain = _preserve_windows_dot_segments_for_markdown(plain)
     plain = realign_markdown_tables(plain, panel_width)
-    return Markdown(plain)
+    return Markdown(plain, code_theme=code_theme)
 
 
 _OUTPUT_HISTORY_ENABLED = True
@@ -14138,15 +14142,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     pass
                 else:
                     _chat_console = ChatConsole()
-                    if self.final_response_markdown == "render":
-                        from hermes_cli.markdown_stream import render_markdown_rich
-
-                        content = render_markdown_rich(response, pygments_theme=self._pygments_theme)
-                    else:
-                        content = _render_final_assistant_content(
-                            response,
-                            mode=self.final_response_markdown,
-                        )
+                    content = _render_final_assistant_content(
+                        response,
+                        mode=self.final_response_markdown,
+                        code_theme=self._pygments_theme,
+                    )
                     _chat_console.print(Panel(
                         content,
                         title=f"[{_resp_color} bold]{label}[/]",

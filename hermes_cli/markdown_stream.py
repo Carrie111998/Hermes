@@ -1,10 +1,7 @@
-"""Streaming and non-streaming Markdown rendering for the Hermes CLI.
+"""Streaming Markdown rendering for the Hermes CLI.
 
-Provides:
-- ``MarkdownStreamProcessor``: stateful line-by-line markdown-to-ANSI
-  transformer for the streaming display path.
-- ``render_markdown_rich``: one-shot Rich Markdown renderable for the
-  non-streaming Panel path.
+Provides ``MarkdownStreamProcessor``, a stateful line-by-line
+Markdown-to-ANSI transformer for the streaming display path.
 """
 
 from __future__ import annotations
@@ -280,9 +277,32 @@ class MarkdownStreamProcessor:
     # -- table internals ----------------------------------------------------
 
     def _render_table(self) -> str:
-        """Render buffered pipe-table rows as a box-drawing table."""
+        """Render buffered pipe-table rows without exceeding caller width."""
         base = self._base
         rst = self._rst
+
+        # Reuse the CLI's established narrow-table decision before drawing
+        # the richer box. Its horizontal representation is two cells narrower
+        # than our indented box, so reserve those cells in the budget. If it
+        # selects the vertical fallback, preserve that width-safe layout.
+        if self._max_width is not None:
+            from agent.markdown_tables import is_table_divider, realign_markdown_tables
+
+            budget = max(int(self._max_width) - 2, 1)
+            aligned = realign_markdown_tables("\n".join(self._table_rows), budget)
+            aligned_lines = aligned.splitlines()
+            stays_horizontal = len(aligned_lines) > 1 and is_table_divider(aligned_lines[1])
+            if not stays_horizontal:
+                rendered_lines = []
+                for line in aligned_lines:
+                    plain = _strip_inline_markers(line)
+                    if plain and set(plain) == {"─"}:
+                        rendered_lines.append(f"{_DIM}{plain}{rst}")
+                    elif base:
+                        rendered_lines.append(f"{base}{plain}{rst}")
+                    else:
+                        rendered_lines.append(plain)
+                return "\n".join(rendered_lines)
 
         # Parse rows into cells
         parsed: list[list[str]] = []
@@ -451,21 +471,3 @@ class MarkdownStreamProcessor:
         if base:
             return f"{base}{line}{rst}"
         return line
-
-
-# ---------------------------------------------------------------------------
-# Non-streaming helper
-# ---------------------------------------------------------------------------
-
-def render_markdown_rich(text: str, pygments_theme: str = "monokai"):
-    """Return a Rich Markdown renderable for the non-streaming Panel path.
-
-    Args:
-        text: Complete LLM response text (plain markdown).
-        pygments_theme: Pygments style name for fenced code blocks.
-
-    Returns:
-        A ``rich.markdown.Markdown`` instance suitable for ``Panel(content)``.
-    """
-    from rich.markdown import Markdown
-    return Markdown(text, code_theme=pygments_theme)
