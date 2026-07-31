@@ -184,10 +184,14 @@ def _strip_cron_safe_constructs(prompt: str) -> str:
     The allowlist is deliberately bounded to one simple shell command.
     Consuming through ``&&``, ``||``, ``;``, ``|``, command substitution
     (``$()`` / backticks), or process substitution would erase an embedded
-    exfiltration command before the broader scanner can inspect it.
+    exfiltration command before the broader scanner can inspect it. Before the
+    auth header, accept only curl option tokens rather than transfer targets;
+    otherwise an attacker could put an arbitrary URL before the later GitHub
+    URL and have the replacement erase the credential-bearing command.
     """
     return re.sub(
-        rf'curl\s+[^\n&|;()`]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
+        rf'curl\s+(?:-{{1,2}}[A-Za-z][A-Za-z0-9-]*\s+)*(?:-H|--header)\s+'
+        rf'["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
         r'\s+["\']?https://api\.github\.com'
         r'(?:(?:/[^\s"\'&|;()`]*)|(?=["\'\s&|;]|$))["\']?',
         'curl https://api.github.com/user',
