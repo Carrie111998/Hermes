@@ -397,11 +397,13 @@ def _cwd_marker(session_id: str) -> str:
 # set), not Hermes' per-turn session identity.
 #
 # Kept in sync with gateway.session_context._VAR_MAP: every bridged name starts
-# with one of these prefixes (or is HERMES_UI_SESSION_ID). Used by unit tests
-# as the Python-side contract for the exclusion set; the dump path unsets by
-# name/prefix instead of grepping declare lines (see below / issue #71296).
+# with one of these prefixes (or is HERMES_UI_SESSION_ID). The delegated-child
+# marker is also transient per-command lineage, not shell state. Used by unit
+# tests as the Python-side contract for the exclusion set; the dump path unsets
+# by name/prefix instead of grepping declare lines (see below / issue #71296).
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
-    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
+    "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|"
+    "HERMES_CRON_AUTO_DELIVER_|HERMES_DELEGATED_CHILD_CONTEXT)"
 )
 
 
@@ -431,7 +433,7 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        "HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -677,8 +679,22 @@ class BaseEnvironment(ABC):
         # vars into every tool response (issue #15459).  Linux bash is
         # silent here, but the redirect is harmless.
         if self._snapshot_ready:
+            # ``delegate_task`` children receive the marker from their fresh
+            # subprocess env. Capture that state before sourcing so an old
+            # snapshot cannot turn a top-level command into a child, while a
+            # real child keeps its marker after the snapshot is restored.
+            parts.append(
+                "if [ -n \"${HERMES_DELEGATED_CHILD_CONTEXT+x}\" ]; then "
+                "__hermes_child_context_at_spawn=1; else "
+                "__hermes_child_context_at_spawn=0; fi"
+            )
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
+            )
+            parts.append(
+                "if [ \"$__hermes_child_context_at_spawn\" = 0 ]; then "
+                "unset HERMES_DELEGATED_CHILD_CONTEXT; fi; "
+                "unset __hermes_child_context_at_spawn"
             )
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through

@@ -50,6 +50,7 @@ def test_export_snippet_shape():
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
     assert "grep -vE" not in snippet
     assert "/tmp/snap.tmp.$BASHPID" in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -103,5 +104,45 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_does_not_leak_delegated_child_lineage(tmp_path):
+    """Child lineage is per subprocess, not persistent shell state.
+
+    ``delegate_task`` children and their parent intentionally share the
+    default LocalEnvironment. A child must retain its marker for the command
+    it runs, but neither a subsequent parent command nor a stale snapshot from
+    an older Hermes process may inherit it.
+    """
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    try:
+        # Simulate a snapshot written by an affected pre-fix Hermes process.
+        with open(env._snapshot_path, "a", encoding="utf-8") as snapshot:
+            snapshot.write('declare -x HERMES_DELEGATED_CHILD_CONTEXT="1"\n')
+
+        parent = env.execute(
+            'printf "parent=[%s]\\n" "${HERMES_DELEGATED_CHILD_CONTEXT-}"'
+        )
+        assert "parent=[]" in parent["output"], parent["output"]
+
+        with delegated_child_context():
+            child = env.execute(
+                'printf "child=[%s]\\n" "${HERMES_DELEGATED_CHILD_CONTEXT-}"'
+            )
+        assert "child=[1]" in child["output"], child["output"]
+
+        later_parent = env.execute(
+            'printf "later-parent=[%s]\\n" "${HERMES_DELEGATED_CHILD_CONTEXT-}"'
+        )
+        assert "later-parent=[]" in later_parent["output"], later_parent["output"]
+
+        with open(env._snapshot_path, encoding="utf-8") as snapshot:
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in snapshot.read()
     finally:
         env.cleanup()
