@@ -3684,15 +3684,28 @@ class GatewaySlashCommandsMixin:
             "log": t("gateway.verbose.mode_log"),
         }
 
-        # Read current effective mode for this platform via the resolver
+        # Read current effective mode via the resolver (chat-aware: honors any
+        # existing per-chat override so cycling starts from what THIS chat sees)
         from gateway.display_config import resolve_display_setting
-        current = resolve_display_setting(user_config, platform_key, "tool_progress", "all")
+        source = event.source
+        chat_id = getattr(source, "chat_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        chat_type = getattr(source, "chat_type", "dm") or "dm"
+        # In group/channel/thread chats, /verbose scopes to the chat (topic if
+        # present) instead of flipping the whole platform's verbosity.  DMs keep
+        # the historical per-platform behaviour.
+        per_chat = chat_type != "dm" and chat_id is not None
+        current = resolve_display_setting(
+            user_config, platform_key, "tool_progress", "all",
+            chat_id=chat_id, thread_id=thread_id,
+        )
         if current not in cycle:
             current = "all"
         idx = (cycle.index(current) + 1) % len(cycle)
         new_mode = cycle[idx]
 
-        # Save to display.platforms.<platform>.tool_progress
+        # Save to display.platforms.<platform>.tool_progress — or, for group
+        # chats, display.platforms.<platform>.chats.<chat_id>[:<thread_id>]
         try:
             if "display" not in user_config or not isinstance(user_config.get("display"), dict):
                 user_config["display"] = {}
@@ -3701,11 +3714,22 @@ class GatewaySlashCommandsMixin:
                 display["platforms"] = {}
             if platform_key not in display["platforms"] or not isinstance(display["platforms"].get(platform_key), dict):
                 display["platforms"][platform_key] = {}
-            display["platforms"][platform_key]["tool_progress"] = new_mode
+            plat_cfg = display["platforms"][platform_key]
+            if per_chat:
+                if "chats" not in plat_cfg or not isinstance(plat_cfg.get("chats"), dict):
+                    plat_cfg["chats"] = {}
+                chat_key = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+                if chat_key not in plat_cfg["chats"] or not isinstance(plat_cfg["chats"].get(chat_key), dict):
+                    plat_cfg["chats"][chat_key] = {}
+                plat_cfg["chats"][chat_key]["tool_progress"] = new_mode
+                scope_label = f"{platform_key} chat {chat_key}"
+            else:
+                plat_cfg["tool_progress"] = new_mode
+                scope_label = platform_key
             atomic_config_write(config_path, user_config)
             return (
                 f"{descriptions[new_mode]}\n"
-                + t("gateway.verbose.saved_suffix", platform=platform_key)
+                + t("gateway.verbose.saved_suffix", platform=scope_label)
             )
         except Exception as e:
             logger.warning("Failed to save tool_progress mode: %s", e)
