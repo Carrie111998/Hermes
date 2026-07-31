@@ -171,6 +171,21 @@ _EXTENDED_PROMPT_CACHE_MODEL_RE = re.compile(
 )
 
 
+_OPENAI_RESPONSES_REASONING_NONE_PREFIXES = (
+    "gpt-5.6",
+)
+
+
+def _openai_responses_supports_reasoning_none(model: Any) -> bool:
+    normalized = str(model or "").strip().lower()
+    if "/" in normalized:
+        normalized = normalized.rsplit("/", 1)[-1]
+    return any(
+        normalized == prefix or normalized.startswith(f"{prefix}-")
+        for prefix in _OPENAI_RESPONSES_REASONING_NONE_PREFIXES
+    )
+
+
 def _default_prompt_cache_retention_for_request(
     model: str,
     base_url: Any,
@@ -535,10 +550,16 @@ class ResponsesApiTransport(ProviderTransport):
         # Resolve reasoning effort
         reasoning_effort = "medium"
         reasoning_enabled = True
+        explicit_reasoning_none = False
         reasoning_config = params.get("reasoning_config")
         if reasoning_config and isinstance(reasoning_config, dict):
             if reasoning_config.get("enabled") is False:
-                reasoning_enabled = False
+                # This is explicit disablement, not an unset value. On OpenAI
+                # Responses models that support it, the wire representation is
+                # ``reasoning.effort: none``; omitting ``reasoning`` silently
+                # falls back to the model default. See #75227.
+                reasoning_effort = "none"
+                explicit_reasoning_none = True
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
@@ -583,6 +604,15 @@ class ResponsesApiTransport(ProviderTransport):
                 # rejected). #68365 premise confirmed.
                 _supported = codex_supported_efforts(model)
         reasoning_effort = clamp_effort(reasoning_effort, _supported)
+        if explicit_reasoning_none and (
+            is_xai_responses
+            or is_github_responses
+            or not _openai_responses_supports_reasoning_none(model)
+        ):
+            raise ValueError(
+                f"Model {model!r} does not support reasoning_effort 'none' "
+                "on the Responses API"
+            )
 
         response_tools = _responses_tools(tools)
 
@@ -720,6 +750,8 @@ class ResponsesApiTransport(ProviderTransport):
                 github_reasoning = params.get("github_reasoning_extra")
                 if github_reasoning is not None:
                     kwargs["reasoning"] = github_reasoning
+            elif explicit_reasoning_none:
+                kwargs["reasoning"] = {"effort": "none"}
             else:
                 kwargs["reasoning"] = {"effort": reasoning_effort, "summary": "auto"}
                 kwargs["include"] = (
