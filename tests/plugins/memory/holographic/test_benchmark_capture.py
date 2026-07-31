@@ -191,20 +191,27 @@ def test_compression_turn_overhead():
 
 
 def test_zero_overhead_when_disabled():
-    """When auto_capture=false, sync_turn should add no overhead.
+    """When auto_capture=false, the provider leaves capture inactive.
 
-    This simulates the 'disabled' path — CaptureEngine is never created,
-    so observe_turn is never called.
+    Behavioral assertion: the provider must not create a CaptureEngine
+    (and thus never buffers or calls the LLM) when auto_capture is off.
     """
-    # No engine created — the baseline path
-    runs = 1000
-    start = time.perf_counter()
-    for i in range(runs):
-        _ = {"role": "user", "content": "noop"}
-    elapsed = time.perf_counter() - start
-    avg_us = (elapsed / runs) * 1_000_000
+    from plugins.memory.holographic import HolographicMemoryProvider
 
-    # This is essentially Python function call overhead — should be < 1 µs
-    assert avg_us < 1.0, (
-        f"Disabled-path overhead {avg_us:.2f} µs — expected < 1 µs"
+    provider = HolographicMemoryProvider(config={"auto_capture": "false"})
+    provider.initialize(session_id="test")
+
+    assert provider._auto_capture is False
+    assert provider._capture is None
+
+    # sync_turn with a conversation must not buffer anything or construct an engine
+    provider.sync_turn(
+        "user says hello",
+        "assistant replies",
+        session_id="test",
+        messages=[_message("user", "hello"), _message("assistant", "hi")],
     )
+    assert provider._capture is None
+    assert provider._msg_cursor == 0  # nothing was consumed
+
+    provider.shutdown()

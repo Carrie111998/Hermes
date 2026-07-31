@@ -184,14 +184,32 @@ class HolographicMemoryProvider(MemoryProvider):
 
         # -- Auto-capture config --------------------------------------------------
         self._auto_capture = is_truthy_value(self._config.get("auto_capture", False))
-        self._capture_interval = int(self._config.get("capture_interval", 5))
+        self._capture_interval = 5
+        # Parse only when capture is enabled: an invalid persisted value must
+        # not prevent provider initialization while the feature is off.
+        if self._auto_capture:
+            try:
+                parsed = int(self._config.get("capture_interval", 5))
+            except (TypeError, ValueError):
+                logger.warning("Invalid capture_interval %r; defaulting to 5", self._config.get("capture_interval"))
+            else:
+                if parsed < 1:
+                    logger.warning("capture_interval %d out of range; defaulting to 5", parsed)
+                else:
+                    self._capture_interval = parsed
         self._capture = None
         self._msg_cursor = 0  # index of next message to process
 
         if self._auto_capture:
             try:
-                from agent.plugin_llm import PluginLlm
-                llm = PluginLlm(plugin_id="hermes-memory-store")
+                # Prefer the host-provided LLM facade threaded through
+                # initialize() kwargs (memory providers load via
+                # _ProviderCollector, which has no ctx.llm). Fall back to
+                # constructing PluginLlm only when the host doesn't supply one.
+                llm = kwargs.get("llm")
+                if llm is None:
+                    from agent.plugin_llm import PluginLlm
+                    llm = PluginLlm(plugin_id="hermes-memory-store")
                 from .capture import CaptureEngine
                 self._capture = CaptureEngine(
                     store=self._store,

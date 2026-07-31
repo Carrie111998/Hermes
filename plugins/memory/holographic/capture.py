@@ -52,7 +52,10 @@ class CaptureEngine:
     ):
         self._store = store
         self._llm = llm
-        self._interval = interval
+        # Clamp: interval 0 (or negative) would break the modulo in
+        # observe_turn. The provider already validates config before
+        # constructing us; this is a defensive floor for direct callers.
+        self._interval = interval if interval and interval > 0 else 5
         self._buffer: List[Dict[str, Any]] = []
         self._turn_count = 0
 
