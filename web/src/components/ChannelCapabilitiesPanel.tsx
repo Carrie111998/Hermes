@@ -60,9 +60,10 @@ function channelText(skills: Translations["skills"], key: ChannelCopyKey): strin
 export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: Props) {
   const { t } = useI18n();
   const loadFailed = channelText(t.skills, "channelCapabilitiesFailed");
+  const profileKey = profile ?? "";
   const [channels, setChannels] = useState<ChannelCapability[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loadedProfile, setLoadedProfile] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [toolsets, setToolsets] = useState<Set<string>>(new Set());
   const [mcpMode, setMcpMode] = useState<ChannelMcpPolicy["mode"]>("all");
@@ -70,34 +71,51 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
 
   useEffect(() => {
     let cancelled = false;
-    setLoading(true);
     api
       .getChannelCapabilities(profile)
       .then((rows) => {
         if (cancelled) return;
+        const first = rows[0];
         setChannels(rows);
-        setSelected(rows[0]?.platform ?? null);
+        setSelected(first?.platform ?? null);
+        setToolsets(
+          new Set(first?.toolsets.filter((row) => row.enabled).map((row) => row.name)),
+        );
+        setMcpMode(first?.mcp.mode ?? "all");
+        setMcpServers(new Set(first?.mcp.selected));
+        setLoadedProfile(profileKey);
       })
-      .catch(() => !cancelled && onError(loadFailed))
-      .finally(() => !cancelled && setLoading(false));
+      .catch(() => {
+        if (cancelled) return;
+        setChannels([]);
+        setSelected(null);
+        setToolsets(new Set());
+        setMcpMode("all");
+        setMcpServers(new Set());
+        setLoadedProfile(profileKey);
+        onError(loadFailed);
+      });
     return () => {
       cancelled = true;
     };
-  }, [loadFailed, onError, profile]);
+  }, [loadFailed, onError, profile, profileKey]);
 
   const channel = useMemo(
-    () => channels.find((row) => row.platform === selected) ?? null,
-    [channels, selected],
+    () =>
+      loadedProfile === profileKey
+        ? channels.find((row) => row.platform === selected) ?? null
+        : null,
+    [channels, loadedProfile, profileKey, selected],
   );
 
-  useEffect(() => {
-    if (!channel) return;
+  const selectChannel = (nextChannel: ChannelCapability) => {
+    setSelected(nextChannel.platform);
     setToolsets(
-      new Set(channel.toolsets.filter((row) => row.enabled).map((row) => row.name)),
+      new Set(nextChannel.toolsets.filter((row) => row.enabled).map((row) => row.name)),
     );
-    setMcpMode(channel.mcp.mode);
-    setMcpServers(new Set(channel.mcp.selected));
-  }, [channel]);
+    setMcpMode(nextChannel.mcp.mode);
+    setMcpServers(new Set(nextChannel.mcp.selected));
+  };
 
   const visibleChannels = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -153,7 +171,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
     }
   };
 
-  if (loading) {
+  if (loadedProfile !== profileKey) {
     return (
       <Card className="rounded-none">
         <CardContent className="py-12 text-center text-sm text-muted-foreground">
@@ -182,8 +200,10 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                 selected === row.platform
                   ? "bg-muted text-foreground"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                "disabled:cursor-not-allowed disabled:opacity-60",
               )}
-              onClick={() => setSelected(row.platform)}
+              disabled={saving}
+              onClick={() => selectChannel(row)}
             >
               <span className="min-w-0 flex-1 truncate">{row.label}</span>
             </button>
@@ -223,7 +243,9 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                 {channel.toolsets.map((item) => (
                   <div key={item.name} className="flex items-start gap-3 py-2.5">
                     <Switch
+                      aria-label={item.label}
                       checked={toolsets.has(item.name)}
+                      disabled={saving || (toolsets.size === 1 && toolsets.has(item.name))}
                       onCheckedChange={(checked) =>
                         updateSet(setToolsets, item.name, checked)
                       }
@@ -274,7 +296,8 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
               <h3 className="mb-2 text-sm font-medium">{channelText(t.skills, "mcpAccess")}</h3>
               <div className="flex flex-wrap gap-2">
                 {(["all", "none", "allowlist"] as const).map((mode) => (
-                  <Button
+                    <Button
+                      disabled={saving}
                     key={mode}
                     size="sm"
                     outlined={mcpMode !== mode}
@@ -298,7 +321,9 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
                     channel.mcp.available.map((server) => (
                       <label key={server} className="flex items-center gap-2 text-sm">
                         <Switch
+                          aria-label={server}
                           checked={mcpServers.has(server)}
+                          disabled={saving}
                           onCheckedChange={(checked) =>
                             updateSet(setMcpServers, server, checked)
                           }

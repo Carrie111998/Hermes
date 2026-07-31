@@ -15,6 +15,7 @@ from hermes_cli.tools_config import (
     _configure_provider,
     _reconfigure_provider,
     _get_platform_tools,
+    platform_mcp_policy,
     _platform_toolset_summary,
     _reconfigure_tool,
     _run_post_setup,
@@ -32,7 +33,7 @@ from hermes_cli.tools_config import (
 
 
 
-def test_all_invalid_platform_toolsets_logs_runtime_warning(caplog):
+def test_all_invalid_platform_toolsets_fall_back_to_the_platform_baseline(caplog):
     """#38798: an explicit platform config whose toolset names are all invalid
     (e.g. 'hermes' instead of 'hermes-cli') must warn at resolve time so an
     already-corrupted config is caught at runtime, not just during migration."""
@@ -43,10 +44,12 @@ def test_all_invalid_platform_toolsets_logs_runtime_warning(caplog):
     config = {"platform_toolsets": {"cli": ["hermes"]}}
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.tools_config"):
-        _get_platform_tools(config, "cli")
+        resolved = _get_platform_tools(config, "cli")
 
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("#38798" in m and "hermes" in m for m in warnings), warnings
+    assert resolved == _get_platform_tools({}, "cli")
+    assert resolved
 
 
 def test_valid_platform_toolsets_no_runtime_warning(caplog):
@@ -69,6 +72,123 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
         _get_platform_tools(config, "cli")
 
     assert not any("#38798" in r.getMessage() for r in caplog.records)
+
+
+def test_empty_platform_toolsets_fall_back_to_platform_baseline():
+    """A hand-written empty list must not create a zero-tool channel session."""
+    default_enabled = _get_platform_tools({}, "cli")
+    explicit_empty_enabled = _get_platform_tools(
+        {"platform_toolsets": {"cli": []}}, "cli"
+    )
+
+    assert explicit_empty_enabled == default_enabled
+    assert explicit_empty_enabled
+
+
+def test_global_disable_remains_authoritative_when_it_removes_every_toolset():
+    baseline = _get_platform_tools({}, "cli")
+    resolved = _get_platform_tools(
+        {"agent": {"disabled_toolsets": sorted(baseline)}},
+        "cli",
+    )
+
+    assert not resolved
+
+
+def test_invalid_platform_toolsets_do_not_override_global_disable():
+    """Baseline recovery must not silently revive globally disabled toolsets."""
+    baseline = _get_platform_tools({}, "cli")
+    resolved = _get_platform_tools(
+        {
+            "agent": {"disabled_toolsets": sorted(baseline)},
+            "platform_toolsets": {"cli": ["invalid-toolset"]},
+        },
+        "cli",
+    )
+
+    assert not resolved
+
+
+def test_saving_empty_toolsets_persists_the_platform_baseline():
+    config = {"platform_toolsets": {}}
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", set())
+
+    assert "hermes-cli" in config["platform_toolsets"]["cli"]
+
+
+def test_mcp_policy_is_disjoint_from_toolset_namespaces():
+    """An MCP server may share a name with a built-in toolset without shadowing it."""
+    config = {
+        "platform_toolsets": {"cli": ["web", "legacy-server"]},
+        "mcp_servers": {
+            "web": {"command": "mcp-web", "enabled": True},
+            "legacy-server": {"command": "legacy", "enabled": True},
+            "other": {"command": "other", "enabled": True},
+        },
+        "platform_mcp_policy": {
+            "cli": {"mode": "allowlist", "servers": ["web", "other"]},
+        },
+    }
+
+    mode, servers = platform_mcp_policy(config, "cli")
+    resolved = _get_platform_tools(config, "cli")
+
+    assert mode == "allowlist"
+    assert servers == {"web", "other"}
+    assert "web" in resolved
+    assert "other" in resolved
+    assert "legacy-server" not in resolved
+
+
+def test_malformed_or_disabled_mcp_policy_never_grants_mcp_access():
+    """Manual policy corruption must fail closed instead of widening a channel."""
+    config = {
+        "mcp_servers": {
+            "enabled-server": {"command": "enabled", "enabled": True},
+            "disabled-server": {"command": "disabled", "enabled": False},
+        },
+        "platform_mcp_policy": {
+            "cli": {"mode": "allowlist", "servers": ["enabled-server", "disabled-server"]},
+        },
+    }
+
+    assert platform_mcp_policy(config, "cli") == ("allowlist", {"enabled-server"})
+
+    config["platform_mcp_policy"]["cli"] = {"mode": "unexpected", "servers": ["enabled-server"]}
+    assert platform_mcp_policy(config, "cli") == ("none", set())
+
+    config["platform_mcp_policy"]["cli"] = {"mode": "allowlist", "servers": "enabled-server"}
+    assert platform_mcp_policy(config, "cli") == ("none", set())
+
+
+def test_legacy_mcp_entries_are_read_without_treating_toolsets_as_servers():
+    """Old flat configs retain their intent until the channel is next saved."""
+    config = {
+        "platform_toolsets": {"cli": ["web", "legacy-server", "no_mcp"]},
+        "mcp_servers": {
+            "web": {"command": "mcp-web", "enabled": True},
+            "legacy-server": {"command": "legacy", "enabled": True},
+        },
+    }
+
+    assert platform_mcp_policy(config, "cli") == ("none", set())
+
+
+def test_saving_toolsets_removes_legacy_mcp_entries_without_dropping_collision():
+    config = {
+        "platform_toolsets": {"cli": ["web", "legacy-server", "no_mcp"]},
+        "mcp_servers": {
+            "web": {"command": "mcp-web"},
+            "legacy-server": {"command": "legacy"},
+        },
+    }
+
+    with patch("hermes_cli.tools_config.save_config"):
+        _save_platform_tools(config, "cli", {"web"})
+
+    assert config["platform_toolsets"]["cli"] == ["web"]
 
 
 
@@ -552,8 +672,6 @@ def _fake_features(*, logged_in: bool, paid: bool = True):
 # reporting ready/needs_setup honestly. agent_browser (local browser) must
 # track the FULL local install (CLI + Chromium), the cloud-provider hook
 # ("browserbase") only the CLI, and camofox its npm package.
-
-
 # ── Toolsets that shipped after a platform's last `hermes tools` save ────────
 #
 # Saving the picker (or one toggle in the desktop Toolsets UI) replaces a

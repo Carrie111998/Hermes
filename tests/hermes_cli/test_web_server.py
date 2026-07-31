@@ -1650,8 +1650,11 @@ class TestNewEndpoints:
         config = load_config()
         assert set(config["platform_toolsets"]["email"]) == {
             "memory",
-            "no_mcp",
             "web",
+        }
+        assert config["platform_mcp_policy"]["email"] == {
+            "mode": "none",
+            "servers": [],
         }
         implicit = {row["name"] for row in channel["implicit_toolsets"]}
         assert _get_platform_tools(config, "email") == {"memory", "web"} | implicit
@@ -1686,8 +1689,70 @@ class TestNewEndpoints:
         }
 
         config = load_config()
+        assert config["platform_mcp_policy"]["qqbot"] == {
+            "mode": "allowlist",
+            "servers": ["beta"],
+        }
         assert "beta" in _get_platform_tools(config, "qqbot")
         assert "alpha" not in _get_platform_tools(config, "qqbot")
+
+    def test_channel_capabilities_keeps_toolset_when_mcp_uses_same_name(self):
+        """MCP allowlists cannot delete a same-named built-in toolset."""
+        from hermes_cli.config import load_config, save_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = load_config()
+        config["mcp_servers"] = {
+            "web": {"command": "mcp-web", "enabled": True},
+            "other": {"command": "other", "enabled": True},
+        }
+        save_config(config)
+
+        resp = self.client.put(
+            "/api/tools/channels/email",
+            json={
+                "toolsets": ["web"],
+                "mcp_mode": "allowlist",
+                "mcp_servers": ["other"],
+            },
+        )
+
+        assert resp.status_code == 200
+        config = load_config()
+        assert "web" in config["platform_toolsets"]["email"]
+        assert config["platform_mcp_policy"]["email"] == {
+            "mode": "allowlist",
+            "servers": ["other"],
+        }
+        resolved = _get_platform_tools(config, "email")
+        assert "web" in resolved
+        assert "other" in resolved
+
+    def test_channel_capabilities_rejects_empty_toolset_submission(self):
+        resp = self.client.put(
+            "/api/tools/channels/email",
+            json={"toolsets": [], "mcp_mode": "none", "mcp_servers": []},
+        )
+
+        assert resp.status_code == 400
+        assert "Select at least one toolset" in resp.json()["detail"]
+
+    def test_channel_capabilities_rejects_malformed_mcp_policy_without_saving(self):
+        """A manual scalar config must not become a partial channel update."""
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config["platform_mcp_policy"] = "not-a-mapping"
+        save_config(config)
+
+        resp = self.client.put(
+            "/api/tools/channels/email",
+            json={"toolsets": ["web"], "mcp_mode": "none", "mcp_servers": []},
+        )
+
+        assert resp.status_code == 400
+        assert "platform_mcp_policy must be a mapping" in resp.json()["detail"]
+        assert load_config()["platform_mcp_policy"] == "not-a-mapping"
 
 
     def test_get_toolset_config_returns_provider_matrix(self):
@@ -3586,5 +3651,3 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
-
-
