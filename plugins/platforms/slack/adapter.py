@@ -7195,6 +7195,31 @@ class SlackAdapter(BasePlatformAdapter):
 
         return msg_text
 
+    async def _conversations_replies_with_retry(self, client: Any, **kwargs: Any) -> Any:
+        """Call ``conversations.replies`` with bounded exponential backoff.
+
+        Retries transient failures (Tier-3 rate limits, 5xx responses, and
+        connection/socket timeouts — see
+        :meth:`_is_retryable_context_fetch_error`); the fetch is idempotent,
+        so a retried timeout can't duplicate anything. Non-transient errors
+        and the final failed attempt propagate to the caller.
+        """
+        for attempt in range(3):
+            try:
+                return await client.conversations_replies(**kwargs)
+            except Exception as exc:
+                if attempt < 2 and self._is_retryable_context_fetch_error(exc):
+                    retry_after = 1.0 * (2**attempt)  # 1s, 2s
+                    logger.warning(
+                        "[Slack] conversations.replies failed transiently (%s); retrying in %.1fs (attempt %d/3)",
+                        exc,
+                        retry_after,
+                        attempt + 1,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+                raise
+
     async def _fetch_thread_context(
         self,
         channel_id: str,
@@ -7245,31 +7270,13 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             client = self._get_client(channel_id, team_id=team_id)
 
-            # Retry with exponential backoff on transient failures: Tier-3
-            # rate limits (429), 5xx responses, and connection/socket
-            # timeouts (safe to retry — this fetch is idempotent).
-            result = None
-            for attempt in range(3):
-                try:
-                    result = await client.conversations_replies(
-                        channel=channel_id,
-                        ts=thread_ts,
-                        limit=limit + 1,  # +1 because it includes the current message
-                        inclusive=True,
-                    )
-                    break
-                except Exception as exc:
-                    if attempt < 2 and self._is_retryable_context_fetch_error(exc):
-                        retry_after = 1.0 * (2**attempt)  # 1s, 2s
-                        logger.warning(
-                            "[Slack] conversations.replies failed transiently (%s); retrying in %.1fs (attempt %d/3)",
-                            exc,
-                            retry_after,
-                            attempt + 1,
-                        )
-                        await asyncio.sleep(retry_after)
-                        continue
-                    raise
+            result = await self._conversations_replies_with_retry(
+                client,
+                channel=channel_id,
+                ts=thread_ts,
+                limit=limit + 1,  # +1 because it includes the current message
+                inclusive=True,
+            )
 
             if result is None:
                 return ""
@@ -7524,7 +7531,8 @@ class SlackAdapter(BasePlatformAdapter):
 
         try:
             client = self._get_client(channel_id, team_id=team_id)
-            result = await client.conversations_replies(
+            result = await self._conversations_replies_with_retry(
+                client,
                 channel=channel_id,
                 ts=thread_ts,
                 limit=1,

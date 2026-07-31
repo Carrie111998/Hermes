@@ -7463,7 +7463,9 @@ class _FakeSlackApiError(Exception):
 class TestThreadContextFetchRetry:
     """conversations.replies is read-only, so besides Tier-3 rate limits the
     fetch also retries connection/socket timeouts and 5xx responses —
-    transient failures where a retry can't cause duplicate delivery."""
+    transient failures where a retry can't cause duplicate delivery. Applies
+    to both _fetch_thread_context and the cold-cache fetch in
+    _fetch_thread_parent_text (shared _conversations_replies_with_retry)."""
 
     _MESSAGES = [
         {"ts": "100.0", "user": "U_BOB", "text": "kicking off"},
@@ -7540,6 +7542,39 @@ class TestThreadContextFetchRetry:
         assert content == ""
         assert adapter._app.client.conversations_replies.call_count == 3
         assert sleep_mock.await_count == 2  # backoff between attempts only
+
+    @pytest.mark.asyncio
+    async def test_parent_text_cold_fetch_retries_on_timeout(self, adapter):
+        """The cold-cache fetch in _fetch_thread_parent_text goes through the
+        same retry wrapper."""
+        adapter._thread_context_cache.clear()
+        adapter._app.client.conversations_replies = AsyncMock(
+            side_effect=[
+                asyncio.TimeoutError("timed out"),
+                {"messages": [{"ts": "100.0", "user": "U_BOB", "text": "root message"}]},
+            ]
+        )
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            text = await adapter._fetch_thread_parent_text(
+                channel_id="C1", thread_ts="100.0",
+            )
+        assert text == "root message"
+        assert adapter._app.client.conversations_replies.call_count == 2
+        sleep_mock.assert_awaited_once_with(1.0)
+
+    @pytest.mark.asyncio
+    async def test_parent_text_no_retry_on_permanent_error(self, adapter):
+        adapter._thread_context_cache.clear()
+        adapter._app.client.conversations_replies = AsyncMock(
+            side_effect=Exception("channel_not_found")
+        )
+        with patch("asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            text = await adapter._fetch_thread_parent_text(
+                channel_id="C1", thread_ts="100.0",
+            )
+        assert text == ""
+        assert adapter._app.client.conversations_replies.call_count == 1
+        sleep_mock.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
