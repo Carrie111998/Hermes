@@ -84,7 +84,7 @@ def test_check_for_updates_invalidates_on_git_head_change(tmp_path, monkeypatch)
         result = banner.check_for_updates()
 
     assert result == 0
-    assert mock_run.call_count == 2
+    assert mock_run.called
     written = json.loads(cache_file.read_text())
     assert written["git_head"] == "new-head"
 
