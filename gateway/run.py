@@ -2285,6 +2285,19 @@ from gateway.restart import (
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
 )
+from gateway.dispatcher_client import (
+    DispatcherClient,
+    DispatcherConnectionError,
+)
+from gateway.dispatcher_protocol import (
+    OP_DISPATCH,
+    STATUS_BAD_REQUEST,
+    STATUS_BUSY,
+    STATUS_INTERNAL,
+    STATUS_OK,
+    Envelope as _DispatcherEnvelope,
+    make_request as _make_dispatcher_request,
+)
 
 
 from gateway.whatsapp_identity import (
@@ -5652,6 +5665,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     _restart_after_turn_timeout: float = DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT
     _exit_code: Optional[int] = None
+
+    # Slash commands the harness dispatcher owns. These don't
+    # conflict with hermes-gateway's local command set, so we
+    # forward them via Unix socket to the dispatcher. Add a
+    # command to this set when the dispatcher gains a new
+    # HANDLER that doesn't shadow a local hermes command.
+    # (Phase 2.6: dispatcher-unique commands only; /status,
+    # /health, /help stay hermes-local to avoid behavior drift.)
+    _DISPATCHER_FORWARD_COMMANDS = frozenset({
+        "echo", "research", "forge", "ashare", "replay", "log",
+    })
     _draining: bool = False
     _external_drain_active: bool = False
     _restart_requested: bool = False
@@ -5941,6 +5965,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
         self._completion_delivery_retention = 2048
+
+        # Dispatcher client (lazy). The harness dispatcher runs as a
+        # separate service (Phase 2.0.5+) at /run/harness/dispatcher.sock;
+        # the gateway forwards certain slash commands to it via Unix
+        # socket. See _forward_to_dispatcher for the dispatch list.
+        # Lazy because the dispatcher may not be running when the
+        # gateway starts (e.g. dispatcher service is down). Each
+        # forward call opens/closes the connection lazily.
+        self._dispatcher_client: Optional[DispatcherClient] = None
+
+        # Track running agents per session for interrupt support
+        # Key: session_key, Value: AIAgent instance
+        self._running_agents: Dict[str, Any] = {}
+        self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -15275,6 +15314,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
+        # Dispatcher-forwarded slash commands (echo, research, forge,
+        # ashare, replay, log). These are commands the harness
+        # dispatcher owns (it has HANDLERS for them) and that don't
+        # conflict with hermes-gateway's local command set, so we
+        # forward them to the dispatcher before the quick-commands
+        # cascade runs. On dispatcher failure we fall through to
+        # normal message handling rather than blocking the user.
+        if command and command in self._DISPATCHER_FORWARD_COMMANDS:
+            _denied = self._check_slash_access(source, command)
+            if _denied is not None:
+                return _denied
+            return await self._forward_to_dispatcher(event, command)
+
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
             if isinstance(self.config, dict):
@@ -15647,6 +15699,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._restore_session_model_override(session_key, snapshot)
         except Exception:
             logger.debug("Failed to restore one-turn model override", exc_info=True)
+
+    # -- Dispatcher forward (Phase 2.6) ------------------------------
+
+    def _get_dispatcher_client(self) -> DispatcherClient:
+        """Return the lazy-initialized dispatcher client. Creates
+        one on first call. Always returns the same instance for
+        the lifetime of this GatewayRunner."""
+        if self._dispatcher_client is None:
+            self._dispatcher_client = DispatcherClient()
+        return self._dispatcher_client
+
+    async def _forward_to_dispatcher(
+        self, event: MessageEvent, command: str
+    ) -> Optional[str]:
+        """Forward a recognized dispatcher slash-command to the
+        harness dispatcher via Unix socket, returning formatted
+        chat text. Returns None on dispatcher unavailability so
+        the caller can fall through to normal message handling --
+        the user still gets a response, just from the agent
+        rather than from the dispatcher. The dispatcher is a
+        soft dependency: gateway stays useful even when it's
+        down."""
+        client = self._get_dispatcher_client()
+        source = event.source
+        platform_name = (
+            source.platform.value if source.platform else ""
+        )
+        args = event.get_command_args().strip()
+        # Reconstruct the slash-command text the dispatcher's
+        # router expects (it parses /cmd from content).
+        content = f"/{command}"
+        if args:
+            content = f"{content} {args}"
+        payload = {"source": platform_name, "content": content}
+        try:
+            req = _make_dispatcher_request(OP_DISPATCH, payload)
+            resp = await client.dispatch(req)
+        except (DispatcherConnectionError, ValueError) as e:
+            logger.warning(
+                "dispatcher forward for /%s failed (non-fatal): %s",
+                command,
+                e,
+            )
+            return None
+        return self._format_dispatcher_response(command, resp)
+
+    @staticmethod
+    def _format_dispatcher_response(
+        command: str, resp: _DispatcherEnvelope,
+    ) -> str:
+        """Render a dispatcher Envelope as chat text. Maps the
+        known handler result kinds (echo, status, health, help,
+        stub) to readable text and falls back to the raw payload
+        dict for anything else."""
+        status = resp.status
+        payload = resp.payload or {}
+        if status == STATUS_OK:
+            kind = payload.get("result", "")
+            if kind == "stub":
+                # Phase 3+ stubs: forward the human-readable
+                # message and tag the phase so the user knows
+                # when the real implementation lands.
+                stage = payload.get("stage", "later phase")
+                msg = payload.get("message", "stub")
+                return f"[dispatcher] {msg} (lands in {stage})"
+            if kind == "echo":
+                echoed = payload.get("echoed_payload", {})
+                content = echoed.get("content", "")
+                return f"[dispatcher] echo: {content}"
+            if kind == "health":
+                return "[dispatcher] dispatcher reports healthy"
+            if kind == "help":
+                cmds = payload.get("commands", [])
+                lines = "\n".join(f"  /{c}" for c in cmds)
+                return f"[dispatcher] available commands:\n{lines}"
+            if kind == "status":
+                up = payload.get("uptime_s", 0)
+                handlers = payload.get("handlers", [])
+                return (
+                    f"[dispatcher] alive (uptime {float(up):.1f}s, "
+                    f"{len(handlers)} handlers)"
+                )
+            # Unknown result kind -- JSON-pretty-print the payload
+            # so the user still sees something useful.
+            import json as _json
+            return (
+                "[dispatcher] "
+                + _json.dumps(payload, ensure_ascii=False, indent=2)
+            )
+        if status == STATUS_BUSY:
+            return (
+                f"[dispatcher] handler /{command} is at "
+                "max_inflight; retry in a moment"
+            )
+        if status == STATUS_INTERNAL:
+            return (
+                f"[dispatcher] handler /{command} failed "
+                "(internal error)"
+            )
+        if status == STATUS_BAD_REQUEST:
+            err = payload.get("error", "unknown")
+            return f"[dispatcher] bad request: {err}"
+        return f"[dispatcher] unexpected status {status}"
 
     async def _prepare_inbound_message_text(
         self,
