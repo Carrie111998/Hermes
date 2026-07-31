@@ -98,11 +98,7 @@ class TestPlatformHasBotCredential:
         ) is True
 
     def test_backfills_from_env_when_config_empty(self, monkeypatch):
-        """Startup-race regression: a secret source (1Password, etc.) that
-        finishes resolving the token into os.environ AFTER a platform's
-        PlatformConfig snapshot was queued for reconnect must still be
-        picked up, instead of permanently evicting the platform from the
-        retry queue on the very next check."""
+        """Non-multiplex reconnects may use a later runtime .env reload."""
         from gateway.config import PLATFORM_TOKEN_ENV_NAMES
         from gateway.run import _platform_has_bot_credential
 
@@ -110,7 +106,9 @@ class TestPlatformHasBotCredential:
         monkeypatch.setenv(env_name, "late-resolved-token")
         cfg = PlatformConfig(enabled=True, token="")
 
-        assert _platform_has_bot_credential(Platform.DISCORD, cfg) is True
+        assert _platform_has_bot_credential(
+            Platform.DISCORD, cfg, allow_env_fallback=True
+        ) is True
         # Also backfilled onto the config so the reconnect attempt actually
         # uses the recovered token instead of dropping it again next cycle.
         assert cfg.token == "late-resolved-token"
@@ -223,6 +221,17 @@ class TestPrimaryStartupSkipsEmptyTokenUnderMultiplex:
 
 
 class TestReconnectDropsEmptyToken:
+    def test_multiplex_path_does_not_borrow_process_global_token(self, monkeypatch):
+        from gateway.config import PLATFORM_TOKEN_ENV_NAMES
+        from gateway.run import _platform_has_bot_credential
+
+        env_name = PLATFORM_TOKEN_ENV_NAMES[Platform.DISCORD]
+        monkeypatch.setenv(env_name, "secondary-profile-token")
+        config = PlatformConfig(enabled=True, token="")
+
+        assert _platform_has_bot_credential(Platform.DISCORD, config) is False
+        assert config.token == ""
+
     @pytest.mark.asyncio
     async def test_empty_token_removed_from_queue(self):
         from gateway.run import GatewayRunner, _platform_has_bot_credential

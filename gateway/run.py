@@ -1590,24 +1590,19 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
         return cfg
 
 
-def _platform_has_bot_credential(platform: "Platform", platform_config: "PlatformConfig") -> bool:
+def _platform_has_bot_credential(
+    platform: "Platform",
+    platform_config: "PlatformConfig",
+    *,
+    allow_env_fallback: bool = False,
+) -> bool:
     """Return True when a token-authenticated platform has a usable bot credential.
 
     Platforms that do not use ``PlatformConfig.token`` always return True so we
     never skip them here (Signal session paths, port-binding HTTP adapters, etc.).
 
-    Also re-checks ``os.environ`` for the platform's token env var and, if
-    found, backfills it onto ``platform_config.token`` in place. This covers
-    a startup race (#69XXX) where an external secret source (1Password,
-    Bitwarden, ...) is still resolving when the initial connect attempt is
-    made — the empty-token config gets queued for reconnect, the secret
-    finishes resolving into os.environ a few seconds later, but this queued
-    ``PlatformConfig`` snapshot never got the value and the platform was
-    otherwise permanently evicted from the retry queue on the very next
-    check without ever looking at the env var again. Re-reading env here is
-    cheap (a dict lookup) and does not touch the #64674 multiplex-safety
-    behavior: a token that is genuinely never configured anywhere still
-    correctly returns False and gets dropped.
+    Non-multiplex reconnects may opt into a live environment fallback after a
+    later runtime ``.env`` reload. Multiplex callers must stay profile-scoped.
     """
     from gateway.config import PLATFORM_TOKEN_ENV_NAMES
 
@@ -1620,15 +1615,13 @@ def _platform_has_bot_credential(platform: "Platform", platform_config: "Platfor
     api_key = getattr(platform_config, "api_key", None) or ""
     if isinstance(api_key, str) and api_key.strip():
         return True
-    # Fall back to a live env re-check: a secret source (1Password, etc.)
-    # may have finished resolving the token into os.environ after this
-    # PlatformConfig snapshot was built and queued.
+    if not allow_env_fallback:
+        return False
+    # A long-running non-multiplex gateway may reload .env after this config
+    # snapshot was queued. Process-global env is unsafe in multiplex mode.
     env_token = os.environ.get(PLATFORM_TOKEN_ENV_NAMES[platform], "").strip()
     if env_token:
-        try:
-            platform_config.token = env_token
-        except Exception:
-            pass
+        platform_config.token = env_token
         return True
     return False
 
@@ -8651,7 +8644,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Empty-token primary configs can never reconnect; drop them so
                 # multiplex setups where a secondary profile owns the bot do
                 # not spin forever (#64674).
-                if not _platform_has_bot_credential(platform, platform_config):
+                if not _platform_has_bot_credential(
+                    platform,
+                    platform_config,
+                    allow_env_fallback=not bool(
+                        getattr(self.config, "multiplex_profiles", False)
+                    ),
+                ):
                     logger.warning(
                         "Reconnect %s: no bot credential on queued config, "
                         "removing from retry queue",
