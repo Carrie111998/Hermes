@@ -8,6 +8,12 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_cwd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep production chdir calls from leaking into later tests."""
+    monkeypatch.chdir(Path.cwd())
+
+
 def _session_db(workspace: Path, *, events: list[object]):
     class FakeSessionDB:
         def get_session(self, session_id):
