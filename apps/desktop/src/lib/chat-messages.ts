@@ -852,6 +852,58 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   )
 }
 
+// MCP Apps ui payloads live only on the live tool.complete event (single-use
+// pop server-side) and are never persisted. Any hydrate-from-storage rebuild
+// would otherwise replace a card-bearing tool part with a ui-less one and the
+// iframe vanishes (D1). Carry ui across by toolCallId, which is stable between
+// the live stream and the stored tool_calls.
+export function preserveMcpUiCards(
+  nextMessages: ChatMessage[],
+  currentMessages: ChatMessage[]
+): ChatMessage[] {
+  const uiByToolCallId = new Map<string, unknown>()
+
+  for (const message of currentMessages) {
+    for (const part of message.parts) {
+      if (part.type !== 'tool-call' || !part.toolCallId || !part.result) {
+        continue
+      }
+
+      const ui = (part.result as { ui?: unknown }).ui
+
+      if (ui) {
+        uiByToolCallId.set(part.toolCallId, ui)
+      }
+    }
+  }
+
+  if (!uiByToolCallId.size) {
+    return nextMessages
+  }
+
+  return nextMessages.map(message => {
+    let changed = false
+
+    const parts = message.parts.map(part => {
+      if (part.type !== 'tool-call' || !part.toolCallId) {
+        return part
+      }
+
+      const ui = uiByToolCallId.get(part.toolCallId)
+
+      if (!ui || (part.result as { ui?: unknown } | undefined)?.ui) {
+        return part
+      }
+
+      changed = true
+
+      return { ...part, result: { ...(part.result as object), ui } }
+    })
+
+    return changed ? { ...message, parts } : message
+  })
+}
+
 export function preserveLocalAssistantErrors(
   nextMessages: ChatMessage[],
   currentMessages: ChatMessage[]

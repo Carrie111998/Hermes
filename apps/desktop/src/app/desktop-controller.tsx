@@ -13,7 +13,7 @@ import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getCronJobs, getSessionMessages, listAllProfileSessions, type SessionInfo, triggerCronJob } from '../hermes'
-import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
+import { preserveLocalAssistantErrors, preserveMcpUiCards, toChatMessages } from '../lib/chat-messages'
 import {
   isMessagingSource,
   LOCAL_SESSION_SOURCE_IDS,
@@ -564,7 +564,12 @@ export function DesktopController() {
             runtimeSessionId,
             state => ({
               ...state,
-              messages: preserveLocalAssistantErrors(toChatMessages(latest.messages), state.messages)
+              // Hydrated history lacks live-only payloads: re-attach local
+              // assistant errors and MCP Apps ui cards (never persisted; D1).
+              messages: preserveMcpUiCards(
+                preserveLocalAssistantErrors(toChatMessages(latest.messages), state.messages),
+                state.messages
+              )
             }),
             storedSessionId
           )
