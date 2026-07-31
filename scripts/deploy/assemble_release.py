@@ -9,7 +9,7 @@ path, then proves console-script and import bindings before moving ``current``.
 from __future__ import annotations
 
 import argparse
-import importlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -29,10 +29,17 @@ class AssemblyError(RuntimeError):
 
 
 def _run(command: Sequence[str], *, cwd: Path | None = None) -> None:
-    subprocess.run(command, cwd=cwd, check=True)
+    # Keep stdout as a machine-readable receipt channel. Build/install detail
+    # remains visible to an operator on stderr.
+    subprocess.run(command, cwd=cwd, check=True, stdout=sys.stderr, stderr=sys.stderr)
 
 
 def _extract_archive(archive: Path, release_dir: Path) -> None:
+    if sys.version_info < (3, 11, 4):
+        raise AssemblyError(
+            "safe tar extraction requires Python 3.11.4 or newer "
+            f"(running {sys.version.split()[0]})"
+        )
     with tarfile.open(archive, "r:*") as bundle:
         # The data filter rejects absolute paths, parent traversal, devices, and
         # other members inappropriate for an application source release.
@@ -72,6 +79,7 @@ import pathlib
 import sys
 
 release = pathlib.Path(sys.argv[1]).resolve()
+venv = (release / ".venv").resolve()
 result = {}
 for name in sys.argv[2:]:
     module = importlib.import_module(name)
@@ -85,15 +93,26 @@ for name in sys.argv[2:]:
         raise RuntimeError(
             f"module {name!r} loaded from {resolved}, outside selected release {release}"
         ) from exc
+    try:
+        resolved.relative_to(venv)
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError(
+            f"module {name!r} loaded from environment copy {resolved}, "
+            f"not selected release source {release}"
+        )
     result[name] = str(resolved)
 print(json.dumps(result, sort_keys=True))
 """
     completed = subprocess.run(
         [str(python), "-c", probe, str(release_dir), *names],
-        check=True,
         capture_output=True,
         text=True,
     )
+    if completed.returncode:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise AssemblyError(f"module-origin verification failed: {detail}")
     return json.loads(completed.stdout)
 
 
@@ -130,6 +149,7 @@ def assemble_release(
 
     archive = archive.resolve(strict=True)
     app_root = app_root.resolve(strict=True)
+    archive_sha256 = hashlib.sha256(archive.read_bytes()).hexdigest()
     releases_dir = app_root / "releases"
     releases_dir.mkdir(parents=True, exist_ok=True)
     release_dir = releases_dir / release_id
@@ -141,6 +161,8 @@ def assemble_release(
     try:
         _extract_archive(archive, release_dir)
         venv_dir = release_dir / ".venv"
+        if venv_dir.exists() or venv_dir.is_symlink():
+            raise AssemblyError("source archive must not contain a .venv")
         _run([bootstrap_python, "-m", "venv", str(venv_dir)])
         bin_dir = _venv_bin(venv_dir)
         python = bin_dir / ("python.exe" if os.name == "nt" else "python")
@@ -171,6 +193,7 @@ def assemble_release(
             "release": str(release_dir),
             "current": str(current),
             "previous": previous,
+            "archive_sha256": archive_sha256,
             "python": str(python),
             "entrypoints": verified_entrypoints,
             "modules": verified_modules,
