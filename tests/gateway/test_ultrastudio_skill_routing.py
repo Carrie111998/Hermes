@@ -67,6 +67,18 @@ def test_allowed_skill_index_orders_specific_routes_before_fallbacks():
     assert "- helper: Supporting guidance." in prompt
 
 
+def test_empty_allowed_skill_index_explicitly_denies_skill_claims():
+    prompt = format_allowed_skills(set(), [
+        workflow("installed-but-not-bound", 80),
+    ])
+
+    assert "No skills are available for this run." in prompt
+    assert "Do not claim that a skill is available" in prompt
+    assert "installed-but-not-bound" not in prompt
+    assert prompt.startswith("\n\n<available_skills>\n")
+    assert prompt.endswith("\n</available_skills>")
+
+
 @pytest.fixture
 def skill_discovery(tmp_path, monkeypatch):
     """One skill root with one SKILL.md, instrumented scan counters."""

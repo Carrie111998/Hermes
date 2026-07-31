@@ -110,7 +110,13 @@ def format_allowed_skills(
 ) -> str:
     """Render an exact, deterministic model-routing index."""
     if not allowed_names:
-        return ""
+        return (
+            "\n\n<available_skills>\n"
+            "No skills are available for this run. Do not claim that a skill "
+            "is available or offer to execute one. If asked about a skill, "
+            "state that it is not available in this conversation.\n"
+            "</available_skills>"
+        )
     available = {
         str(item.get("name") or "").strip(): item
         for item in discovered
