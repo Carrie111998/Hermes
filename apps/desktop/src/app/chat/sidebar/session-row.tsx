@@ -103,9 +103,19 @@ function SidebarSessionRowImpl({
     >
       <SidebarRowShell
         actions={
-          <div className="relative z-2 grid w-[1.375rem] place-items-center" data-row-actions>
+          // Hover-revealed actions cluster. Anchored to the right edge so the
+          // track only takes layout space while the kebab or the relative-age
+          // label is actually visible — no standing 22px gutter on idle rows
+          // (#75331). `group-data` ties the slot to row hover/focus so the
+          // track has zero width when the row is idle, growing only when
+          // interaction has telegraphs it. The kebab itself owns the hit
+          // target; the slot is purely a layout spacer.
+          <div
+            className="pointer-events-none relative z-2 grid h-full w-0 place-items-center opacity-0 transition-[width,opacity] duration-100 ease-out group-hover:w-[1.375rem] group-hover:opacity-100 group-focus-within:w-[1.375rem] group-focus-within:opacity-100 group-data-[state=open]:w-[1.375rem] group-data-[state=open]:opacity-100"
+            data-row-actions
+          >
             {!isWorking && (
-              <span className="pointer-events-none absolute right-6 top-1/2 min-w-6 -translate-y-1/2 text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
+              <span className="pointer-events-none absolute right-full top-1/2 mr-1 -translate-y-1/2 whitespace-nowrap text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
                 {age}
               </span>
             )}
@@ -121,7 +131,7 @@ function SidebarSessionRowImpl({
             >
               <Button
                 aria-label={r.sessionActions}
-                className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
+                className="pointer-events-auto size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
                 size="icon"
                 variant="ghost"
               >
@@ -168,7 +178,7 @@ function SidebarSessionRowImpl({
           <span aria-hidden="true" className="arc-border arc-row" />
         )}
         <SidebarRowBody
-          className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
+          className={cn('z-0', branchStem && 'pl-3.5')}
           // Middle-click = open in a new tab (browser muscle memory).
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
