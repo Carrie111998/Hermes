@@ -17,6 +17,7 @@ import {
   deriveProviderShape,
   isRemoteConfig,
   isRemoteReauthFailure,
+  remoteTransportPayload,
   signInLabel,
   sshFailureMessage
 } from './boot-failure-reauth'
@@ -117,20 +118,22 @@ export function BootFailureOverlay() {
         return
       }
 
+      const transport = remoteTransportPayload(config)
+
       // Best-effort probe for the provider shape so the button copy matches
       // what the user will see in the login window (password form vs OAuth
       // redirect). Probe failure just keeps the generic copy.
       let shape = deriveProviderShape(null)
 
       try {
-        const probe = await desktop.probeConnectionConfig(config.remoteUrl)
+        const probe = await desktop.probeConnectionConfig(transport)
         shape = deriveProviderShape(probe?.providers)
       } catch {
         // Generic copy is fine.
       }
 
       if (!cancelled) {
-        setRemoteReauth({ url: config.remoteUrl, ...shape })
+        setRemoteReauth({ url: transport.remotePublicUrl || transport.remoteUrl || '', transport, ...shape })
       }
     })()
 
@@ -176,8 +179,8 @@ export function BootFailureOverlay() {
     setBusy('signin')
 
     try {
-      await window.hermesDesktop?.oauthLogoutConnectionConfig?.()
-      const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.url)
+      await window.hermesDesktop?.oauthLogoutConnectionConfig?.(remoteReauth.transport)
+      const result = await window.hermesDesktop?.oauthLoginConnectionConfig(remoteReauth.transport)
 
       if (result?.connected) {
         notify({ kind: 'success', title: t.boot.failure.signedInTitle, message: t.boot.failure.signedInMessage })

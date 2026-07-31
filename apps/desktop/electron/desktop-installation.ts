@@ -122,14 +122,20 @@ function loadOrCreateInstallationId(filePath, randomUUID = crypto.randomUUID) {
   throw new Error('Could not repair the desktop installation ID.')
 }
 
-function sshOwnershipId(installationId, scope) {
+function sshOwnershipId(installationId, scope, endpoint: any = {}) {
   if (!INSTALLATION_ID_RE.test(String(installationId || ''))) {
     throw new Error('Desktop installation ID is invalid.')
   }
 
+  const endpointScope = [
+    String(endpoint?.user || '').trim(),
+    String(endpoint?.host || '').trim().toLowerCase(),
+    String(endpoint?.port || 22)
+  ].join('\0')
+
   return crypto
     .createHash('sha256')
-    .update(`${installationId}\0${String(scope || '')}`)
+    .update(`${installationId}\0${String(scope || '')}\0${endpointScope}`)
     .digest('hex')
     .slice(0, 32)
 }

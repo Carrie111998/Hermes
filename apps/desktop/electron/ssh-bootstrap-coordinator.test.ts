@@ -2,7 +2,8 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
+import { normalizeSshConfig } from './connection-config'
+import { createBootstrapCoordinator, sshConfigFingerprint, sshWorkspaceIdentity } from './ssh-bootstrap-coordinator'
 
 function deferred() {
   let resolve
@@ -34,6 +35,22 @@ test('sshConfigFingerprint covers scope and every connection field', () => {
   }
 
   assert.notEqual(base, sshConfigFingerprint('profile', config))
+})
+
+test('sshWorkspaceIdentity is scoped to normalized SSH host, user, port, and profile', () => {
+  const first = normalizeSshConfig({ mode: 'ssh', host: 'alice@host-a.example.com:2222' })
+  const second = normalizeSshConfig({ mode: 'ssh', host: 'alice@host-b.example.com:2222' })
+  const sameEndpoint = normalizeSshConfig({
+    mode: 'ssh',
+    host: 'host-a.example.com',
+    port: '2222',
+    user: 'alice'
+  })
+
+  assert.equal(sshWorkspaceIdentity('profile', first), sshWorkspaceIdentity('profile', sameEndpoint))
+  assert.notEqual(sshWorkspaceIdentity('profile', first), sshWorkspaceIdentity('profile', second))
+  assert.notEqual(sshWorkspaceIdentity('profile', first), sshWorkspaceIdentity('other-profile', first))
+  assert.throws(() => sshWorkspaceIdentity('profile', null), /requires a host/)
 })
 
 test('same scope and fingerprint share one bootstrap', async () => {

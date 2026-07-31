@@ -57,21 +57,27 @@ import {
   cookiesHaveLiveSession,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  effectiveAppliedConnectionMode,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
+  normalizeRemoteTransport,
   normalizeSshConfig,
   normAuthMode,
+  oauthPartitionIdentity,
+  oauthSessionPartitionForIdentity,
   pathWithGlobalRemoteProfile,
   profileHasRemoteConnection,
   profileRemoteOverride,
   profileSshOverride,
+  remoteAuthIdentity,
   resolveAuthMode,
   resolveProfileBackendRoute,
   resolveTestWsUrl,
+  sanitizeStoredConnectionConfig,
   savedProfileSsh,
   tokenPreview
 } from './connection-config'
@@ -174,7 +180,7 @@ import {
   SESSION_WINDOW_MIN_WIDTH
 } from './session-windows'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
-import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
+import { createBootstrapCoordinator, sshConfigFingerprint, sshWorkspaceIdentity } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import {
   buildInteractiveSshArgs,
@@ -5062,8 +5068,9 @@ async function gatewayAuthProviders(baseUrl) {
 // see the 404 that identifies a backend predating /api/health (the auth gate
 // answers before the SPA catch-all). `probeIsCredentialed` tells
 // waitForHermesReady how to read a 401 — rejected session vs gated route.
-async function buildReadinessHealthProbe(baseUrl, authMode, token) {
-  const nativeAt = authMode === 'oauth' ? await ensureNativeAccessToken(baseUrl).catch(() => null) : null
+async function buildReadinessHealthProbe(baseUrl, authMode, token, authIdentityUrl = baseUrl, oauthIdentityUrl = null) {
+  const nativeAt =
+    authMode === 'oauth' ? await ensureNativeAccessToken(authIdentityUrl, baseUrl).catch(() => null) : null
   const probeAuth = resolveReadinessProbeAuth(authMode, nativeAt, token)
 
   if (probeAuth.kind === 'bearer') {
@@ -5078,7 +5085,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
 
   if (probeAuth.kind === 'cookie') {
     return {
-      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, options),
+      probeHealth: (url, options: any = {}) => fetchJsonViaOauthSession(url, { ...options, oauthIdentityUrl }),
       probeIsCredentialed: true
     }
   }
@@ -5093,8 +5100,14 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
   return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
 }
 
-async function waitForHermes(baseUrl, token, signal?, authMode?) {
-  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
+async function waitForHermes(baseUrl, token, signal?, authMode?, authIdentityUrl = baseUrl, oauthIdentityUrl = null) {
+  const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(
+    baseUrl,
+    authMode,
+    token,
+    authIdentityUrl,
+    oauthIdentityUrl
+  )
 
   return waitForHermesReady(baseUrl, {
     token,
@@ -5771,16 +5784,32 @@ function installMediaPermissions() {
 //     "is the user signed in at all?" gate / display signal.
 // ---------------------------------------------------------------------------
 
-const OAUTH_SESSION_PARTITION = 'persist:hermes-remote-oauth'
+const oauthSessions = new Map<string, Electron.Session>()
 
-function getOauthSession() {
-  if (oauthSession || !app.isReady()) {
-    return oauthSession
+function getOauthSession(identityUrl?: null | string) {
+  if (!app.isReady()) {
+    return null
   }
 
-  oauthSession = session.fromPartition(OAUTH_SESSION_PARTITION)
+  const partition = oauthSessionPartitionForIdentity(identityUrl)
+  const existing = oauthSessions.get(partition)
 
-  return oauthSession
+  if (existing) {
+    if (!identityUrl) {
+      oauthSession = existing
+    }
+
+    return existing
+  }
+
+  const created = session.fromPartition(partition)
+  oauthSessions.set(partition, created)
+
+  if (!identityUrl) {
+    oauthSession = created
+  }
+
+  return created
 }
 
 // Cold-start cookie-jar warm-up. A `persist:` partition materialized via
@@ -5798,17 +5827,19 @@ function getOauthSession() {
 // live read (which then does its own bounded re-check).
 let oauthCookieWarmup: Promise<void> | null = null
 
-function warmOauthCookieStore() {
-  if (oauthCookieWarmup) {
+function warmOauthCookieStore(identityUrl?: null | string) {
+  if (!identityUrl && oauthCookieWarmup) {
     return oauthCookieWarmup
   }
 
-  oauthCookieWarmup = (async () => {
-    const sess = getOauthSession()
+  const warmup = (async () => {
+    const sess = getOauthSession(identityUrl)
 
     if (!sess) {
       // App not ready yet — don't memoize a no-op; let a later call retry.
-      oauthCookieWarmup = null
+      if (!identityUrl) {
+        oauthCookieWarmup = null
+      }
 
       return
     }
@@ -5824,15 +5855,21 @@ function warmOauthCookieStore() {
     }
   })()
 
-  return oauthCookieWarmup
+  if (!identityUrl) {
+    oauthCookieWarmup = warmup
+
+    return oauthCookieWarmup
+  }
+
+  return warmup
 }
 
 // Bare + prefixed variants of the session cookies live in
 // connection-config.ts (cookiesHaveSession / cookiesHaveLiveSession). See
 // that module for details.
 
-async function hasOauthSessionCookie(baseUrl) {
-  const sess = getOauthSession()
+async function hasOauthSessionCookie(baseUrl, identityUrl = null) {
+  const sess = getOauthSession(identityUrl)
 
   if (!sess) {
     return false
@@ -5864,8 +5901,8 @@ async function hasOauthSessionCookie(baseUrl) {
 // the next authenticated request. Gating on the AT alone forces a needless full
 // re-login every ~15 min. Used for the Settings "connected" indicator and as a
 // cheap early-out before attempting a network round-trip in resolveRemoteBackend.
-async function hasLiveOauthSession(baseUrl) {
-  const sess = getOauthSession()
+async function hasLiveOauthSession(baseUrl, identityUrl = null) {
+  const sess = getOauthSession(identityUrl)
 
   if (!sess) {
     return false
@@ -5901,7 +5938,7 @@ async function hasLiveOauthSession(baseUrl) {
   // trusting a negative, force the store to hydrate and re-read a couple of
   // times with a short backoff. A genuinely signed-out user still resolves
   // false quickly (≤ ~180ms); a signed-in user racing the load now wins.
-  await warmOauthCookieStore()
+  await warmOauthCookieStore(identityUrl)
 
   for (const delayMs of [30, 60, 90]) {
     if (await readLive()) {
@@ -5914,8 +5951,8 @@ async function hasLiveOauthSession(baseUrl) {
   return readLive()
 }
 
-async function clearOauthSession(baseUrl) {
-  const sess = getOauthSession()
+async function clearOauthSession(baseUrl, identityUrl = null) {
+  const sess = getOauthSession(identityUrl)
 
   if (!sess) {
     return
@@ -5954,7 +5991,7 @@ async function clearOauthSession(baseUrl) {
 //     ``/auth/login`` → portal ``/oauth/authorize`` (auto-approves org members)
 //     → ``/auth/callback``, which sets the gateway cookie with NO interactive
 //     prompt. This is the per-agent cloud cascade (decisions.md Q5).
-function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
+function openOauthLoginWindow(baseUrl, { silent = false, oauthIdentityUrl = null } = {}) {
   return new Promise((resolve, reject) => {
     if (!app.isReady()) {
       reject(new Error('Desktop is not ready to start an OAuth login.'))
@@ -5962,7 +5999,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
       return
     }
 
-    const sess = getOauthSession()
+    const sess = getOauthSession(oauthIdentityUrl)
 
     if (!sess) {
       reject(new Error('OAuth session partition is unavailable.'))
@@ -6010,7 +6047,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
         return
       }
 
-      if (await hasOauthSessionCookie(baseUrl)) {
+      if (await hasOauthSessionCookie(baseUrl, oauthIdentityUrl)) {
         finish(null)
       }
     }
@@ -6091,7 +6128,7 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
   return new Promise((resolve, reject) => {
-    const sess = getOauthSession()
+    const sess = getOauthSession(options.oauthIdentityUrl)
 
     if (!sess) {
       reject(new Error('OAuth session partition is unavailable.'))
@@ -6235,16 +6272,16 @@ function _readNativeTokenStore(): Record<string, any> {
   }
 }
 
-function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
+function _persistNativeTokens(identityUrl: string, tokens: NativeTokenSet | null) {
   const store = _readNativeTokenStore()
 
   if (tokens) {
     // Encrypt the whole token set as one blob so the refresh token never
     // lands in plaintext on disk. Reuse the hardened encrypt helper.
     const secret = encryptDesktopSecret(JSON.stringify(tokens))
-    store[baseUrl] = secret
+    store[identityUrl] = secret
   } else {
-    delete store[baseUrl]
+    delete store[identityUrl]
   }
 
   try {
@@ -6255,15 +6292,15 @@ function _persistNativeTokens(baseUrl: string, tokens: NativeTokenSet | null) {
   }
 }
 
-function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
-  const cached = _nativeTokens.get(baseUrl)
+function _loadNativeTokens(identityUrl: string): NativeTokenSet | null {
+  const cached = _nativeTokens.get(identityUrl)
 
   if (cached) {
     return cached
   }
 
   const store = _readNativeTokenStore()
-  const secret = store[baseUrl]
+  const secret = store[identityUrl]
 
   if (!secret) {
     return null
@@ -6277,7 +6314,7 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
     }
 
     const tokens = parseTokenResponse(JSON.parse(plaintext))
-    _nativeTokens.set(baseUrl, tokens)
+    _nativeTokens.set(identityUrl, tokens)
 
     return tokens
   } catch {
@@ -6285,20 +6322,20 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
   }
 }
 
-function _storeNativeTokens(baseUrl: string, tokens: NativeTokenSet) {
-  _nativeTokens.set(baseUrl, tokens)
-  _persistNativeTokens(baseUrl, tokens)
+function _storeNativeTokens(identityUrl: string, tokens: NativeTokenSet) {
+  _nativeTokens.set(identityUrl, tokens)
+  _persistNativeTokens(identityUrl, tokens)
 }
 
-function _clearNativeTokens(baseUrl: string) {
-  _nativeTokens.delete(baseUrl)
-  _persistNativeTokens(baseUrl, null)
+function _clearNativeTokens(identityUrl: string) {
+  _nativeTokens.delete(identityUrl)
+  _persistNativeTokens(identityUrl, null)
 }
 
 // True when we hold native bearer tokens for this gateway (the native-flow
 // analogue of hasLiveOauthSession's cookie check).
-function hasNativeSession(baseUrl: string): boolean {
-  return _loadNativeTokens(baseUrl) !== null
+function hasNativeSession(identityUrl: string): boolean {
+  return _loadNativeTokens(identityUrl) !== null
 }
 
 // POST JSON WITHOUT the OAuth cookie partition — used for the native token +
@@ -6313,11 +6350,11 @@ function postJsonNoAuth(url: string, body: unknown, opts: any = {}) {
   return fetchJson(url, null, { method: 'POST', body: resolveJsonBody(body), ...opts })
 }
 
-// Return a valid native access token for baseUrl, refreshing via
-// /auth/native/refresh if the stored one is at/near expiry. Returns null when
-// there are no tokens or the refresh is terminally rejected (caller re-logins).
-async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> {
-  const tokens = _loadNativeTokens(baseUrl)
+// Return a valid native access token for identityUrl, refreshing through
+// requestBaseUrl if the stored one is at/near expiry. The identity URL is the
+// public gateway URL; the request URL may be a local transport proxy.
+async function ensureNativeAccessToken(identityUrl: string, requestBaseUrl: string = identityUrl): Promise<string | null> {
+  const tokens = _loadNativeTokens(identityUrl)
 
   if (!tokens) {
     return null
@@ -6329,27 +6366,27 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
 
   if (!tokens.refreshToken) {
     // Access token expired and no RT to rotate — force re-login.
-    _clearNativeTokens(baseUrl)
+    _clearNativeTokens(identityUrl)
 
     return null
   }
 
   try {
     const body = await postJsonNoAuth(
-      nativeRefreshUrl(baseUrl),
+      nativeRefreshUrl(requestBaseUrl),
       { refresh_token: tokens.refreshToken, provider: tokens.provider },
       { timeoutMs: 10_000 }
     )
 
     const rotated = parseTokenResponse(body)
-    _storeNativeTokens(baseUrl, rotated)
+    _storeNativeTokens(identityUrl, rotated)
 
     return rotated.accessToken
   } catch (error: any) {
     // A 401 means the RT is dead (session_expired) — drop tokens so the UI
     // prompts a fresh native login. A 503/transient keeps them for a retry.
     if (error && error.statusCode === 401) {
-      _clearNativeTokens(baseUrl)
+      _clearNativeTokens(identityUrl)
 
       return null
     }
@@ -6363,9 +6400,9 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
 // falling back to the OAuth cookie partition otherwise.
 // Throws (with statusCode 401) if the session cookie is missing/expired —
 // callers treat that as "needs re-login".
-async function mintGatewayWsTicket(baseUrl) {
+async function mintGatewayWsTicket(baseUrl, identityUrl = baseUrl, oauthIdentityUrl = null) {
   // Native flow: mint the ticket with the bearer token, no cookie involved.
-  const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+  const nativeAt = await ensureNativeAccessToken(identityUrl, baseUrl).catch(() => null)
 
   if (nativeAt) {
     const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
@@ -6385,6 +6422,7 @@ async function mintGatewayWsTicket(baseUrl) {
 
   const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
     method: 'POST',
+    oauthIdentityUrl,
     timeoutMs: 8_000
   })) as any
 
@@ -6413,7 +6451,12 @@ async function freshGatewayWsUrl(profile) {
   const connection = await ensureBackend(profile)
 
   if (connection.authMode === 'oauth') {
-    const ticket = await mintGatewayWsTicket(connection.baseUrl)
+    const oauthIdentityUrl = connection.transportMode === 'local_mtls_proxy' ? connection.publicUrl : null
+    const ticket = await mintGatewayWsTicket(
+      connection.baseUrl,
+      connection.publicUrl || connection.baseUrl,
+      oauthIdentityUrl
+    )
 
     return buildGatewayWsUrlWithTicket(connection.baseUrl, ticket)
   }
@@ -6754,86 +6797,6 @@ function decryptDesktopSecret(secret) {
   return value
 }
 
-// Validate + normalize the per-profile remote overrides map read from disk.
-// Drops malformed names/entries and keeps only the recognized fields so a
-// hand-edited or stale connection.json can't inject junk into resolution.
-function sanitizeConnectionProfiles(raw: Record<string, any>) {
-  if (!raw || typeof raw !== 'object') {
-    return {}
-  }
-
-  const out = {}
-
-  for (const [name, entry] of Object.entries(raw)) {
-    if (!entry || typeof entry !== 'object') {
-      continue
-    }
-
-    if (name !== 'default' && !PROFILE_NAME_RE.test(name)) {
-      continue
-    }
-
-    if (entry.mode === 'ssh') {
-      const ssh = normalizeSshConfig(entry)
-
-      if (ssh) {
-        if (entry.token && typeof entry.token === 'object') {
-          ssh.token = entry.token
-        }
-
-        out[name] = ssh
-      }
-
-      continue
-    }
-
-    const cleaned: {
-      mode: 'remote' | 'local' | 'cloud'
-      url?: string
-      authMode?: string
-      token?: object
-      org?: string
-      savedSsh?: object
-    } = {
-      mode: modeIsRemoteLike(entry.mode) ? entry.mode : 'local'
-    }
-
-    if (cleaned.mode === 'local') {
-      const savedSsh = normalizeSshConfig(entry.savedSsh)
-
-      if (savedSsh) {
-        cleaned.savedSsh = savedSsh
-      }
-    }
-
-    const url = String(entry.url || '').trim()
-
-    if (url) {
-      cleaned.url = url
-    }
-
-    cleaned.authMode = normAuthMode(entry.authMode)
-
-    if ((entry as any).token && typeof entry.token === 'object') {
-      cleaned.token = entry.token
-    }
-
-    // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
-    // reopen into the same org for a per-profile cloud connection.
-    if (cleaned.mode === 'cloud') {
-      const org = String(entry.org || '').trim()
-
-      if (org) {
-        cleaned.org = org
-      }
-    }
-
-    out[name] = cleaned
-  }
-
-  return out
-}
-
 function readDesktopConnectionConfig() {
   // Check if file changed on disk since last read (e.g. modified by another
   // process or an external tool).  Our own writes update the cache inline
@@ -6856,21 +6819,7 @@ function readDesktopConnectionConfig() {
     const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
     const parsed = JSON.parse(raw)
 
-    if (parsed && typeof parsed === 'object') {
-      const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
-      // authMode lives on the remote sub-object: 'oauth' (cookie + ws-ticket)
-      // or 'token' (legacy static session token). Default to 'token' for
-      // backward compatibility with configs written before OAuth support.
-      remote.authMode = remote.authMode === 'oauth' ? 'oauth' : 'token'
-      config = {
-        mode: parsed.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(parsed.mode) ? parsed.mode : 'local',
-        remote,
-        // Per-profile remote overrides: each profile may point at its own
-        // backend (local spawn or its own remote URL). Preserved verbatim so
-        // profileRemoteOverride() can resolve them; normalized lazily on save.
-        profiles: sanitizeConnectionProfiles(parsed.profiles)
-      }
-    }
+    config = sanitizeStoredConnectionConfig(parsed)
   } catch {
     // Missing or malformed connection settings should fall back to local.
   }
@@ -6937,20 +6886,31 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 
   const remoteToken = decryptDesktopSecret(block.token)
   const authMode = normAuthMode(block.authMode)
-  const remoteUrl = envOverride ? String(process.env.HERMES_DESKTOP_REMOTE_URL || '') : String(block.url || '')
+
+  const transport = envOverride
+    ? normalizeRemoteTransport({ url: process['env'].HERMES_DESKTOP_REMOTE_URL })
+    : normalizeRemoteTransport(block)
+
+  const remoteUrl = transport.publicUrl
+  const remoteEffectiveUrl = transport.effectiveUrl
+  const remoteTransportMode = transport.transportMode
   const mode = envOverride ? 'remote' : savedMode === 'ssh' ? 'ssh' : modeIsRemoteLike(savedMode) ? savedMode : 'local'
 
   let remoteOauthConnected = false
 
-  if (authMode === 'oauth' && remoteUrl) {
+  if (authMode === 'oauth' && remoteEffectiveUrl) {
     try {
+      const remoteIdentity = remoteAuthIdentity(transport)
+      const partitionIdentity = oauthPartitionIdentity(transport)
+
       // Display signal: treat a live RT cookie as "connected" even if the AT
       // cookie has lapsed — the gateway refreshes the AT on the next request,
-      // so the session is still usable. A stored native bearer token (cookieless
-      // RFC 8252 flow) counts as connected too — otherwise a completed native
-      // sign-in shows "not connected" in Settings. The authoritative liveness
-      // check is the ws-ticket mint in resolveRemoteBackend at actual connect time.
-      remoteOauthConnected = oauthSessionIsLive(hasNativeSession(remoteUrl), await hasLiveOauthSession(remoteUrl))
+      // so the session is still usable. A stored native bearer token counts
+      // as connected too, matching the authoritative ws-ticket check later.
+      remoteOauthConnected = oauthSessionIsLive(
+        hasNativeSession(remoteIdentity),
+        await hasLiveOauthSession(remoteEffectiveUrl, partitionIdentity)
+      )
     } catch {
       remoteOauthConnected = false
     }
@@ -6961,7 +6921,10 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     // Echo the scope back so the UI knows which profile (if any) this reflects.
     profile: key,
     remoteAuthMode: authMode,
+    remoteEffectiveUrl,
     remoteOauthConnected,
+    remotePublicUrl: remoteUrl,
+    remoteTransportMode,
     remoteUrl,
     // The persisted Hermes Cloud org (slug/id) for a cloud connection, or '' for
     // remote/local. Lets Settings → Gateway reopen into the same org.
@@ -6985,18 +6948,25 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 // `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
 // under — persisted so Settings can reopen into the same org; omitted from the
 // block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
+function buildRemoteBlock(remoteUrl, authMode, token, options: any = {}) {
   if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
     throw new Error('Remote gateway session token is required.')
   }
 
-  const block: { url: string; authMode: string; token: object; org?: string } = {
-    url: normalizeRemoteBaseUrl(remoteUrl),
+  const transport = normalizeRemoteTransport({
+    url: remoteUrl,
+    publicUrl: options.publicUrl ?? remoteUrl,
+    effectiveUrl: options.effectiveUrl ?? remoteUrl,
+    transportMode: options.transportMode
+  })
+
+  const block: any = {
+    ...transport,
     authMode,
     token
   }
 
-  const orgValue = typeof org === 'string' ? org.trim() : ''
+  const orgValue = typeof options.org === 'string' ? options.org.trim() : ''
 
   if (orgValue) {
     block.org = orgValue
@@ -7026,7 +6996,9 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   const leavingCloud = existingMode === 'cloud' && mode !== 'cloud'
   const leavingSsh = rawExistingBlock.mode === 'ssh' && mode !== 'ssh' && mode !== 'local'
   const existingBlock = leavingCloud || leavingSsh ? {} : rawExistingBlock
-  const remoteUrl = String(input.remoteUrl ?? existingBlock.url ?? '').trim()
+  const remoteUrl = String(input.remotePublicUrl ?? input.remoteUrl ?? existingBlock.publicUrl ?? existingBlock.url ?? '').trim()
+  const remoteEffectiveUrl = String(input.remoteEffectiveUrl ?? existingBlock.effectiveUrl ?? existingBlock.url ?? remoteUrl).trim()
+  const remoteTransportMode = input.remoteTransportMode ?? existingBlock.transportMode
   // authMode: explicit input wins; otherwise inherit the saved value, default 'token'.
   const authMode = resolveAuthMode(input.remoteAuthMode, existingBlock.authMode)
   // Cloud org: only meaningful for 'cloud' mode. Explicit input wins; otherwise
@@ -7064,7 +7036,14 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
     const profiles = { ...(existing.profiles || {}) }
 
     if (remoteLike) {
-      profiles[key] = { mode, ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg) }
+      profiles[key] = {
+        mode,
+        ...buildRemoteBlock(remoteUrl, authMode, nextToken, {
+          effectiveUrl: remoteEffectiveUrl,
+          transportMode: remoteTransportMode,
+          org: cloudOrg
+        })
+      }
     } else {
       const localEntry = localProfileEntry(rawExistingBlock)
 
@@ -7083,10 +7062,23 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   }
 
   const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg)
+    ? buildRemoteBlock(remoteUrl, authMode, nextToken, {
+        effectiveUrl: remoteEffectiveUrl,
+        transportMode: remoteTransportMode,
+        org: cloudOrg
+      })
     : existingMode === 'ssh'
       ? rawExistingBlock
-      : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
+      : {
+          ...normalizeRemoteTransport({
+            url: remoteUrl,
+            publicUrl: remoteUrl,
+            effectiveUrl: remoteEffectiveUrl || remoteUrl,
+            transportMode: remoteTransportMode
+          }),
+          authMode,
+          token: nextToken
+        }
 
   // Preserve per-profile overrides when saving the global connection.
   return { mode, remote: nextRemote, profiles: existing.profiles || {} }
@@ -7126,20 +7118,17 @@ function buildSshBlock(input: any, existingBlock: any = {}) {
 // and is shared by the per-profile, env, and global resolution paths. `token`
 // is the DECRYPTED static token (or null in OAuth mode). `source` is a label
 // for diagnostics ('profile' | 'env' | 'settings').
-async function buildRemoteConnection(
-  rawUrl,
-  authMode,
-  token,
-  source,
-  remoteHost?,
-  remoteKind = 'url',
-  remoteIdentity?
-) {
+async function buildRemoteConnection(rawUrl, authMode, token, source, options: any = {}) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
-  // For token/oauth remotes the meaningful host is the real backend URL; for
-  // SSH remotes the caller passes the entered/resolved host explicitly (the
-  // baseUrl is a 127.0.0.1 tunnel and would be useless in the pill).
-  const host = remoteHost || hostLabelFromBaseUrl(baseUrl)
+  const publicUrl = normalizeRemoteBaseUrl(options.publicUrl || rawUrl)
+  const effectiveUrl = baseUrl
+  const transportMode = options.transportMode === 'local_mtls_proxy' ? 'local_mtls_proxy' : 'direct'
+  const remoteHost = options.remoteHost
+  const remoteIdentity = options.remoteIdentity
+  const remoteKind = options.remoteKind || 'url'
+  const host = remoteHost || hostLabelFromBaseUrl(publicUrl)
+  const authIdentityUrl = publicUrl
+  const oauthIdentityUrl = transportMode === 'local_mtls_proxy' ? publicUrl : null
 
   if (authMode === 'oauth') {
     // OAuth gateway: auth comes from EITHER a native bearer token (cookieless
@@ -7158,7 +7147,7 @@ async function buildRemoteConnection(
     // into "not signed in" even though mintGatewayWsTicket would succeed with
     // the stored bearer.
     if (
-      !oauthSessionIsLive(hasNativeSession(baseUrl), await hasLiveOauthSession(baseUrl)) &&
+      !oauthSessionIsLive(hasNativeSession(authIdentityUrl), await hasLiveOauthSession(baseUrl, oauthIdentityUrl)) &&
       oauthGuardMayHardFail(await gatewayAuthProviders(baseUrl))
     ) {
       const err = new Error(
@@ -7173,7 +7162,7 @@ async function buildRemoteConnection(
     let ticket
 
     try {
-      ticket = await mintGatewayWsTicket(baseUrl)
+      ticket = await mintGatewayWsTicket(baseUrl, authIdentityUrl, oauthIdentityUrl)
     } catch (error) {
       throw gatewayTicketFailure(
         error,
@@ -7184,12 +7173,15 @@ async function buildRemoteConnection(
 
     return {
       baseUrl,
+      effectiveUrl,
       mode: 'remote',
+      publicUrl,
       source,
       authMode: 'oauth',
       remoteHost: host || undefined,
       remoteIdentity,
       remoteKind,
+      transportMode,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
       wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -7205,12 +7197,15 @@ async function buildRemoteConnection(
 
   return {
     baseUrl,
+    effectiveUrl,
     mode: 'remote',
+    publicUrl,
     source,
     authMode: 'token',
     remoteHost: host || undefined,
     remoteIdentity,
     remoteKind,
+    transportMode,
     token,
     wsUrl: buildGatewayWsUrl(baseUrl, token)
   }
@@ -7227,8 +7222,8 @@ function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
 }
 
-function sshOwnershipKey(profile) {
-  return sshOwnershipId(desktopInstallationId, sshScopeKey(profile))
+function sshOwnershipKey(profile, sshConfig) {
+  return sshOwnershipId(desktopInstallationId, sshScopeKey(profile), sshConfig)
 }
 
 function sshRememberLog(chunk) {
@@ -7378,7 +7373,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       { host: sshConfig.host, user: sshConfig.user, port: sshConfig.port, keyPath: sshConfig.keyPath },
       {
         rememberLog: sshRememberLog,
-        ownershipId: sshOwnershipKey(profile),
+        ownershipId: sshOwnershipKey(profile, sshConfig),
         scope,
         effectiveConfigFingerprint: sshConfig.effectiveConfigFingerprint
       }
@@ -7396,7 +7391,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       ssh,
       profile: connectionScopeKey(profile) || '',
       remoteHermesPath: sshConfig.remoteHermesPath || '',
-      ownershipId: sshOwnershipKey(profile),
+      ownershipId: sshOwnershipKey(profile, sshConfig),
       reuseToken: reuseToken || '',
       forward: (localPort, remotePort) => ssh.forward(localPort, remotePort),
       cancelForward: (localPort, remotePort) => ssh.cancelForward(localPort, remotePort),
@@ -7456,15 +7451,11 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
       `${result.hermesVersion || 'hermes (version unknown)'} at ${result.hermesPath || '?'}`
   )
 
-  const connection = await buildRemoteConnection(
-    result.baseUrl,
-    'token',
-    result.token,
-    source,
-    hostLabel,
-    'ssh',
-    result.ownershipId
-  )
+  const connection = await buildRemoteConnection(result.baseUrl, 'token', result.token, source, {
+    remoteHost: hostLabel,
+    remoteIdentity: sshWorkspaceIdentity(scope, sshConfig),
+    remoteKind: 'ssh'
+  })
 
   return { ...connection, remoteHermesVersion: result.hermesVersion || '' }
 }
@@ -7516,14 +7507,11 @@ async function resolveRemoteBackend(profile) {
   if (override) {
     const token = override.authMode === 'oauth' ? null : decryptDesktopSecret(override.token)
 
-    return buildRemoteConnection(
-      override.url,
-      override.authMode,
-      token,
-      'profile',
-      undefined,
-      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url'
-    )
+    return buildRemoteConnection(override.effectiveUrl, override.authMode, token, 'profile', {
+      publicUrl: override.publicUrl,
+      remoteKind: config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url',
+      transportMode: override.transportMode
+    })
   }
 
   // 2. Env override (global, token-auth only).
@@ -7560,16 +7548,14 @@ async function resolveRemoteBackend(profile) {
   }
 
   const authMode = normAuthMode(config.remote?.authMode)
+  const remoteTransport = normalizeRemoteTransport(config.remote)
   const token = authMode === 'oauth' ? null : decryptDesktopSecret(config.remote?.token)
 
-  return buildRemoteConnection(
-    config.remote?.url,
-    authMode,
-    token,
-    'settings',
-    undefined,
-    config.mode === 'cloud' ? 'cloud' : 'url'
-  )
+  return buildRemoteConnection(remoteTransport.effectiveUrl, authMode, token, 'settings', {
+    publicUrl: remoteTransport.publicUrl,
+    remoteKind: config.mode === 'cloud' ? 'cloud' : 'url',
+    transportMode: remoteTransport.transportMode
+  })
 }
 
 // A remote profile's sessions live on its remote host's state.db, not on a local
@@ -7624,19 +7610,33 @@ async function requestJsonForProfile(profile: string, path: string, method: stri
   if (conn.authMode === 'oauth') {
     // Native RFC 8252 flow: authenticate with the bearer token (cookieless)
     // when we hold one for this gateway; otherwise use the cookie partition.
-    const nativeAt = await ensureNativeAccessToken(conn.baseUrl).catch(() => null)
+    const oauthIdentityUrl = conn.transportMode === 'local_mtls_proxy' ? conn.publicUrl : null
+    const nativeAt = await ensureNativeAccessToken(conn.publicUrl || conn.baseUrl, conn.baseUrl).catch(() => null)
 
     if (nativeAt) {
       return fetchJson(url, null, { ...opts, bearer: nativeAt })
     }
 
-    return fetchJsonViaOauthSession(url, opts)
+    return fetchJsonViaOauthSession(url, { ...opts, oauthIdentityUrl })
   }
 
   return fetchJson(url, conn.token, opts)
 }
 
-async function probeRemoteAuthMode(rawUrl) {
+function resolveRemoteTransportInput(input) {
+  if (input && typeof input === 'object') {
+    return normalizeRemoteTransport({
+      url: input.remotePublicUrl ?? input.remoteUrl,
+      publicUrl: input.remotePublicUrl ?? input.remoteUrl,
+      effectiveUrl: input.remoteEffectiveUrl ?? input.remoteUrl,
+      transportMode: input.remoteTransportMode
+    })
+  }
+
+  return normalizeRemoteTransport({ url: input })
+}
+
+async function probeRemoteAuthMode(input) {
   // Determine how a remote gateway expects callers to authenticate, WITHOUT
   // sending any credentials. ``/api/status`` is public on every Hermes
   // gateway (it backs the portal liveness probe) and reports:
@@ -7649,7 +7649,8 @@ async function probeRemoteAuthMode(rawUrl) {
   // OAuth login button vs a session-token entry box. Network/parse failures
   // surface as ``reachable: false`` rather than throwing, so a half-typed or
   // unreachable URL degrades to "can't tell yet" instead of a hard error.
-  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
+  const transport = resolveRemoteTransportInput(input)
+  const baseUrl = transport.effectiveUrl
 
   let status
 
@@ -7658,6 +7659,9 @@ async function probeRemoteAuthMode(rawUrl) {
   } catch (error: any) {
     return {
       baseUrl,
+      effectiveUrl: baseUrl,
+      publicUrl: transport.publicUrl,
+      transportMode: transport.transportMode,
       reachable: false,
       authMode: 'unknown',
       providers: [],
@@ -7695,6 +7699,9 @@ async function probeRemoteAuthMode(rawUrl) {
 
   return {
     baseUrl,
+    effectiveUrl: baseUrl,
+    publicUrl: transport.publicUrl,
+    transportMode: transport.transportMode,
     reachable: true,
     authMode: authRequired ? 'oauth' : 'token',
     providers,
@@ -7802,11 +7809,16 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // need a base URL. For a remote config we normalize the URL from the input;
   // for local we fall back to the resolved/started backend.
   let baseUrl
+  let publicUrl = null
+  let transportMode = 'direct'
   let token = null
   let authMode = 'token'
 
   if (wantRemote && block?.url) {
-    baseUrl = normalizeRemoteBaseUrl(block.url)
+    const transport = normalizeRemoteTransport(block)
+    baseUrl = transport.effectiveUrl
+    publicUrl = transport.publicUrl
+    transportMode = transport.transportMode
     authMode = normAuthMode(block.authMode)
 
     if (authMode !== 'oauth') {
@@ -7815,6 +7827,8 @@ async function testDesktopConnectionConfig(input: any = {}) {
   } else {
     const remote = (await resolveRemoteBackend(key)) || (await startHermes())
     baseUrl = remote.baseUrl
+    publicUrl = remote.publicUrl || remote.baseUrl
+    transportMode = remote.transportMode || 'direct'
     token = remote.token
     authMode = normAuthMode(remote.authMode)
   }
@@ -7828,7 +7842,10 @@ async function testDesktopConnectionConfig(input: any = {}) {
   // false-positive "reachable" while the real boot still failed with "Could not
   // connect to Hermes gateway". Mirror the renderer's connect here so the test
   // reflects the full path the app actually uses.
-  const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, { mintTicket: mintGatewayWsTicket })
+  const wsOauthIdentityUrl = transportMode === 'local_mtls_proxy' ? publicUrl : null
+  const wsUrl = await resolveTestWsUrl(baseUrl, authMode, token, {
+    mintTicket: url => mintGatewayWsTicket(url, publicUrl || url, wsOauthIdentityUrl)
+  })
 
   // Skip the WS leg only when the runtime genuinely lacks a WebSocket (so an
   // older Electron/Node never fails the test spuriously); Electron's main
@@ -7847,6 +7864,9 @@ async function testDesktopConnectionConfig(input: any = {}) {
   return {
     ok: true,
     baseUrl,
+    effectiveUrl: baseUrl,
+    publicUrl,
+    transportMode,
     version: status?.version || null
   }
 }
@@ -8096,7 +8116,15 @@ async function spawnPoolBackend(profile, entry) {
   const remote = await resolveRemoteBackend(profile)
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+    const oauthIdentityUrl = remote.transportMode === 'local_mtls_proxy' ? remote.publicUrl : null
+    await waitForHermes(
+      remote.baseUrl,
+      remote.token,
+      undefined,
+      remote.authMode,
+      remote.publicUrl || remote.baseUrl,
+      oauthIdentityUrl
+    )
 
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
@@ -8357,7 +8385,15 @@ async function startHermes() {
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
+      const oauthIdentityUrl = remote.transportMode === 'local_mtls_proxy' ? remote.publicUrl : null
+      await waitForHermes(
+        remote.baseUrl,
+        remote.token,
+        undefined,
+        remote.authMode,
+        remote.publicUrl || remote.baseUrl,
+        oauthIdentityUrl
+      )
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -8368,13 +8404,17 @@ async function startHermes() {
 
       return {
         baseUrl: remote.baseUrl,
+        effectiveUrl: remote.effectiveUrl,
         mode: 'remote',
         source: remote.source,
         authMode: remote.authMode || 'token',
         remoteHost: remote.remoteHost,
+        remoteIdentity: remote.remoteIdentity,
         remoteKind: remote.remoteKind,
         remoteHermesVersion: remote.remoteHermesVersion,
+        publicUrl: remote.publicUrl,
         token: remote.token,
+        transportMode: remote.transportMode,
         wsUrl: remote.wsUrl,
         logs: hermesLog.slice(-80),
         ...getWindowState()
@@ -9738,25 +9778,18 @@ ipcMain.handle('hermes:ssh-config:resolve', async (_event, host) => {
   })
 })
 ipcMain.handle('hermes:connection-config:test', async (_event, payload) => testDesktopConnectionConfig(payload))
-ipcMain.handle('hermes:connection-config:probe', async (_event, rawUrl) => probeRemoteAuthMode(rawUrl))
-ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) => {
-  // Capability-gated login (RFC 8252). Probe the gateway's public /api/status:
-  //   - advertises "native_pkce" in auth_flows → run the system-browser +
-  //     loopback + PKCE flow. No embedded webview, tokens held by the app
-  //     (encrypted keychain), REST/WS authenticated by bearer — no cookies.
-  //   - older gateway without native_pkce → fall back to the legacy embedded
-  //     BrowserWindow cookie flow, preserving compatibility.
-  // This is the "observable ladder + compatibility fallback tied to an
-  // identified older runtime" the desktop guide requires.
-  const baseUrl = normalizeRemoteBaseUrl(rawUrl)
-
+ipcMain.handle('hermes:connection-config:probe', async (_event, payload) => probeRemoteAuthMode(payload))
+ipcMain.handle('hermes:connection-config:oauth-login', async (_event, payload) => {
+  const transport = resolveRemoteTransportInput(payload)
+  const baseUrl = transport.effectiveUrl
+  const identityUrl = remoteAuthIdentity(transport)
+  const oauthIdentityUrl = oauthPartitionIdentity(transport)
   let statusBody: any = null
 
   try {
     statusBody = await fetchPublicJson(`${baseUrl}/api/status`, { timeoutMs: 8_000 })
   } catch {
-    // Can't read status — fall through to the embedded flow, which has its
-    // own error handling and works against any gated gateway.
+    // Probe failures fall through to the embedded compatibility flow.
   }
 
   const strategy = resolveLoginStrategy(statusBody)
@@ -9769,51 +9802,60 @@ ipcMain.handle('hermes:connection-config:oauth-login', async (_event, rawUrl) =>
         rememberLog
       })
 
-      _storeNativeTokens(baseUrl, tokens)
-      // Confirmed sign-in — release the reauth latch so the next
-      // startHermes() re-dials instead of replaying the stale rejection.
+      _storeNativeTokens(identityUrl, tokens)
       remoteReauthFailure = null
 
-      return { ok: true, baseUrl, connected: true }
+      return {
+        ok: true,
+        baseUrl,
+        effectiveUrl: baseUrl,
+        publicUrl: transport.publicUrl,
+        transportMode: transport.transportMode,
+        connected: true
+      }
     } catch (error) {
       rememberLog(
         `[native-oauth] native login failed (${
           error instanceof Error ? error.message : String(error)
         }); falling back to embedded flow`
       )
-      // Fall through to the embedded flow so a native-flow hiccup (blocked
-      // loopback, user closed the browser) still lets the user sign in.
     }
   }
 
-  // Legacy embedded-webview cookie flow.
-  await openOauthLoginWindow(baseUrl)
+  await openOauthLoginWindow(baseUrl, { oauthIdentityUrl })
 
-  const connected = await hasOauthSessionCookie(baseUrl)
+  const connected = await hasOauthSessionCookie(baseUrl, oauthIdentityUrl)
 
-  // Only a CONFIRMED sign-in releases the latch. A cancelled/closed login
-  // window must leave it set, or the overlay's "Sign in" button starts
-  // flickering again on the next retry.
   if (connected) {
     remoteReauthFailure = null
   }
 
-  return { ok: true, baseUrl, connected }
+  return {
+    ok: true,
+    baseUrl,
+    effectiveUrl: baseUrl,
+    publicUrl: transport.publicUrl,
+    transportMode: transport.transportMode,
+    connected
+  }
 })
-ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, rawUrl) => {
-  const baseUrl = rawUrl ? normalizeRemoteBaseUrl(rawUrl) : ''
-  await clearOauthSession(baseUrl || undefined)
+ipcMain.handle('hermes:connection-config:oauth-logout', async (_event, payload) => {
+  const transport = payload ? resolveRemoteTransportInput(payload) : null
+  const baseUrl = transport?.effectiveUrl || ''
+  const identityUrl = transport ? remoteAuthIdentity(transport) : ''
+  const oauthIdentityUrl = transport ? oauthPartitionIdentity(transport) : null
+  await clearOauthSession(baseUrl || undefined, oauthIdentityUrl)
 
   // Also drop any native (RFC 8252) bearer tokens for this gateway so a
   // logout clears BOTH auth shapes.
   if (baseUrl) {
-    _clearNativeTokens(baseUrl)
+    _clearNativeTokens(identityUrl)
   }
 
   // Report against the SAME liveness notion the Settings indicator uses
   // (AT-or-RT cookie, or a native token) so a logout that left any session
   // behind is reflected as still-connected rather than silently signed-out.
-  const connected = baseUrl ? (await hasLiveOauthSession(baseUrl)) || hasNativeSession(baseUrl) : false
+  const connected = baseUrl ? (await hasLiveOauthSession(baseUrl, oauthIdentityUrl)) || hasNativeSession(identityUrl) : false
 
   return { ok: true, connected }
 })
@@ -9858,6 +9900,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
 
   const key = connectionScopeKey(payload?.profile)
   const scope = key || ''
+  const primaryMode = effectiveAppliedConnectionMode(config, payload?.profile)
 
   await applyConnectionChange({
     cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
@@ -9869,7 +9912,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
           // the local-install latch so unsupported/failure escape paths can re-home.
           bootstrapFailure = null
         },
-        mode: config.mode,
+        mode: primaryMode,
         notifyConnectionApplied: sendConnectionApplied,
         resumeFirstRunRemote: abandonFirstRunSetupChoiceForRemoteApply,
         teardownPrimaryBackend: teardownPrimaryBackendAndWait
@@ -10189,7 +10232,10 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     // Native bearer first (cookieless). ensureNativeAccessToken transparently
     // refreshes a near-expiry AT via /auth/native/refresh; a null return means
     // no native session (resolveOauthRestAuth then selects the cookie path).
-    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+    const oauthIdentityUrl = connection.transportMode === 'local_mtls_proxy' ? connection.publicUrl : null
+    const nativeAt = await ensureNativeAccessToken(connection.publicUrl || connection.baseUrl, connection.baseUrl).catch(
+      () => null
+    )
     const restAuth = resolveOauthRestAuth(nativeAt)
 
     if (restAuth.kind === 'bearer') {
@@ -10204,6 +10250,7 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     return fetchJsonViaOauthSession(url, {
       method: request?.method,
       body: request?.body,
+      oauthIdentityUrl,
       timeoutMs
     })
   }

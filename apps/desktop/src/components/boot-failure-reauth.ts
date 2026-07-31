@@ -1,4 +1,4 @@
-import type { DesktopAuthProvider, DesktopConnectionConfig } from '@/global'
+import type { DesktopAuthProvider, DesktopConnectionConfig, DesktopRemoteTransportInput } from '@/global'
 import { deriveRemoteAuthProviderShape } from '@/lib/desktop-remote-auth'
 
 // Pure helpers for the boot-failure overlay's remote-reauth branch. Kept out
@@ -8,11 +8,28 @@ import { deriveRemoteAuthProviderShape } from '@/lib/desktop-remote-auth'
 
 export interface RemoteReauth {
   url: string
+  transport: DesktopRemoteTransportInput
   // True when every advertised provider is username/password — drives the
   // button copy ("Sign in to remote gateway" vs "Sign in with <provider>"),
   // mirroring the gateway-settings page. Probe is best-effort.
   isPassword: boolean
   providerLabel: string
+}
+
+export function remoteTransportPayload(config: DesktopConnectionConfig): DesktopRemoteTransportInput {
+  const publicUrl = (config.remotePublicUrl || config.remoteUrl || '').trim()
+  const transportMode = config.remoteTransportMode ?? 'direct'
+  const effectiveUrl =
+    transportMode === 'local_mtls_proxy'
+      ? (config.remoteEffectiveUrl || config.remoteUrl || '').trim()
+      : publicUrl
+
+  return {
+    remoteEffectiveUrl: effectiveUrl,
+    remotePublicUrl: publicUrl,
+    remoteTransportMode: transportMode,
+    remoteUrl: publicUrl
+  }
 }
 
 interface SignInCopy {
