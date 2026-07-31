@@ -177,27 +177,16 @@ def session_rank(
 
     ``session_rank_lookup`` keys the map by *projected tip* ids, but search
     results are frequently roots or mid-chain sessions (FTS5 matches old
-    messages). So walk forward along continuation children (latest started_at
-    first) until an id present in the map is found — every chain's tip is in
-    the map — and return its rank. Returns None only if no mapped tip is
-    reachable within 20 hops.
+    messages). So resolve to the chain's live tip via the same canonical
+    walker the listing projection uses (``get_compression_tip`` — follows
+    only children of compression-ended parents and excludes branch,
+    delegate, and tool children) and return the tip's rank. Returns None
+    only if the tip isn't present in the map.
     """
     if rank_of is None:
         rank_of = session_rank_lookup(session_db)
-    current = sid
-    for _ in range(20):
-        rank = rank_of.get(current)
-        if rank is not None:
-            return rank
-        row = session_db._conn.execute(
-            "SELECT id FROM sessions WHERE parent_session_id = ? "
-            "ORDER BY started_at DESC LIMIT 1",
-            (current,),
-        ).fetchone()
-        if not row:
-            return None
-        current = row[0]
-    return None
+    tip = session_db.get_compression_tip(sid)
+    return rank_of.get(tip)
 
 
 def _compression_root(session_db: Any, sid: str, max_hops: int = 50) -> str:

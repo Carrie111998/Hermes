@@ -6,6 +6,8 @@ from hermes_cli.session_listing import (
     last_active_of,
     parse_session_listing_args,
     query_session_listing,
+    session_rank,
+    session_rank_lookup,
 )
 
 
@@ -335,5 +337,79 @@ class TestRenderPreviewLineage:
             rows = db.list_sessions_rich(source="cli", include_children=False)
             output = self._render(db, rows)
             assert "Standalone opener" in output
+        finally:
+            db.close()
+
+
+class TestSessionRank:
+    """`session_rank` must resolve a mid-chain search hit through the
+    chain's live tip using the same canonical edge definition as the
+    listing projection — never through a branch/delegate/tool child that
+    happens to have the latest started_at.
+    """
+
+    def test_delegate_child_does_not_hijack_rank_walk(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "rank.db")
+        db.create_session("rk_root", "cli")
+        db.end_session("rk_root", end_reason="compression")
+        db.create_session("rk_tip", "cli", parent_session_id="rk_root")
+        # A delegate child that started LATER than the tip: the unfiltered
+        # started_at-first walk would follow it and lose the chain.
+        db.create_session("rk_delegate", "cli", parent_session_id="rk_root")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_delegate_from\": \"rk_root\"}' "
+            "WHERE id='rk_delegate'"
+        )
+        conn.execute("UPDATE sessions SET started_at=9999999999 WHERE id='rk_delegate'")
+        conn.commit()
+        try:
+            rank_of = session_rank_lookup(db)
+            assert set(rank_of) == {"rk_tip"}
+            assert session_rank(db, "rk_root", rank_of) == 1
+            assert session_rank(db, "rk_tip", rank_of) == 1
+        finally:
+            db.close()
+
+    def test_rank_identical_across_generations(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "rank2.db")
+        db.create_session("rg_root", "cli")
+        db.end_session("rg_root", end_reason="compression")
+        db.create_session("rg_mid", "cli", parent_session_id="rg_root")
+        db.end_session("rg_mid", end_reason="compression")
+        db.create_session("rg_tip", "cli", parent_session_id="rg_mid")
+        try:
+            rank_of = session_rank_lookup(db)
+            assert rank_of == {"rg_tip": 1}
+            for sid in ("rg_root", "rg_mid", "rg_tip"):
+                assert session_rank(db, sid, rank_of) == 1
+        finally:
+            db.close()
+
+    def test_branch_child_has_own_rank(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "rank3.db")
+        db.create_session("rb_root", "cli")
+        db.end_session("rb_root", end_reason="compression")
+        db.create_session("rb_tip", "cli", parent_session_id="rb_root")
+        db.create_session("rb_branch", "cli", parent_session_id="rb_root")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_branched_from\": \"rb_root\"}' "
+            "WHERE id='rb_branch'"
+        )
+        conn.commit()
+        try:
+            rank_of = session_rank_lookup(db)
+            # Branch children surface as their own canonical rows.
+            assert set(rank_of) == {"rb_tip", "rb_branch"}
+            # The root resolves through the tip, never the branch.
+            assert session_rank(db, "rb_root", rank_of) == rank_of["rb_tip"]
+            assert session_rank(db, "rb_branch", rank_of) == rank_of["rb_branch"]
         finally:
             db.close()
