@@ -677,7 +677,12 @@ def _slack_reply_in_thread_for_progress(adapter: Any, chat_id: Any) -> bool:
 
         relay_mode = getattr(adapter, "_effective_reply_in_thread", None)
         if callable(relay_mode):
-            return bool(relay_mode())
+            try:
+                return bool(relay_mode(chat_id))
+            except TypeError:
+                # Compatibility with relay/plugin adapters that implemented
+                # the historical zero-argument resolver.
+                return bool(relay_mode())
 
         return bool(adapter.config.extra.get("reply_in_thread", True))
     except Exception:
