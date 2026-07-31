@@ -107,13 +107,29 @@ class TestCodexBuildKwargs:
         assert pck.startswith("pck_")
         assert pck != "cron_job42_20260624_143000"
 
-    def test_gpt_5_6_gets_explicit_cache_breakpoint(self, transport):
+    def test_gpt_5_6_gets_explicit_cache_breakpoint_on_codex_backend(self, transport):
         messages = [
             {"role": "user", "content": "first"},
             {"role": "assistant", "content": "reply"},
             {"role": "user", "content": "second"},
         ]
-        kw = transport.build_kwargs(model="gpt-5.6-sol", messages=messages, tools=[])
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_codex_backend=True,
+        )
+        first_user_item = kw["input"][0]
+        assert first_user_item["content"][-1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
+
+    def test_gpt_5_6_gets_explicit_cache_breakpoint_on_direct_openai(self, transport):
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_direct_openai=True,
+        )
         first_user_item = kw["input"][0]
         assert first_user_item["content"][-1]["prompt_cache_breakpoint"] == {"mode": "explicit"}
 
@@ -123,7 +139,10 @@ class TestCodexBuildKwargs:
             {"role": "assistant", "content": "reply"},
             {"role": "user", "content": "second"},
         ]
-        kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            is_codex_backend=True,
+        )
         for item in kw["input"]:
             if isinstance(item.get("content"), list):
                 for part in item["content"]:
@@ -142,6 +161,44 @@ class TestCodexBuildKwargs:
         kw = transport.build_kwargs(
             model="gpt-5.6-sol", messages=messages, tools=[],
             is_xai_responses=True,
+        )
+        for item in kw["input"]:
+            if isinstance(item.get("content"), list):
+                for part in item["content"]:
+                    assert "prompt_cache_breakpoint" not in part
+
+    def test_github_gpt_5_6_lookalike_gets_no_cache_breakpoint(self, transport):
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            is_github_responses=True,
+        )
+        for item in kw["input"]:
+            if isinstance(item.get("content"), list):
+                for part in item["content"]:
+                    assert "prompt_cache_breakpoint" not in part
+
+    def test_arbitrary_custom_endpoint_gets_no_cache_breakpoint(self, transport):
+        """PR #70383 review: the old gate excluded only xAI/GitHub by name,
+        so any other Responses-compatible base_url (a self-hosted proxy, a
+        third-party aggregator — anything reaching this transport via
+        agent._provider_model_requires_responses_api() without being
+        Codex/direct-OpenAI) fell through the negative check and got the
+        undocumented field anyway. None of the issuer flags are OpenAI's own
+        infra here, so the marker must never be applied even though the
+        model slug matches the gpt-5.6 family."""
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "second"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.6-sol", messages=messages, tools=[],
+            base_url="https://my-custom-responses-proxy.example.com/v1",
         )
         for item in kw["input"]:
             if isinstance(item.get("content"), list):

@@ -134,6 +134,7 @@ class ResponsesApiTransport(ProviderTransport):
             is_github_responses: bool — Copilot/GitHub models backend
             is_codex_backend: bool — chatgpt.com/backend-api/codex
             is_xai_responses: bool — xAI/Grok backend
+            is_direct_openai: bool — api.openai.com
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
         from agent.codex_responses_adapter import (
@@ -155,6 +156,7 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses") is True
         is_codex_backend = params.get("is_codex_backend") is True
         is_xai_responses = params.get("is_xai_responses") is True
+        is_direct_openai = params.get("is_direct_openai") is True
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
@@ -274,9 +276,14 @@ class ResponsesApiTransport(ProviderTransport):
         # GPT-5.6+ explicit cache breakpoint: additive to the automatic
         # implicit breakpoint OpenAI already places on the newest message,
         # so this is safe to apply unconditionally for eligible models.
-        # xAI/GitHub Copilot Responses-compatible backends aren't OpenAI's
-        # own infra and don't document this field — skip them.
-        if not is_xai_responses and not is_github_responses:
+        # Positively scoped to OpenAI's own Responses infra (Codex OAuth
+        # backend or a direct api.openai.com key) — the field is undocumented
+        # everywhere else. An earlier version of this gate excluded xAI/GitHub
+        # by name, which meant any other Responses-compatible base_url
+        # (custom endpoints routed here via
+        # agent._provider_model_requires_responses_api()) fell through and
+        # got the field anyway. See PR #70383 review.
+        if is_codex_backend or is_direct_openai:
             from agent.codex_responses_adapter import (
                 _model_supports_explicit_cache_breakpoint,
                 apply_explicit_cache_breakpoint,

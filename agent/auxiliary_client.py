@@ -1073,6 +1073,37 @@ class _CodexCompletionsAdapter:
                 "Codex auxiliary: prompt_cache_key derivation skipped", exc_info=True
             )
 
+        # GPT-5.6+ explicit prompt-cache breakpoint, mirroring
+        # agent/transports/codex.py::build_kwargs() for this sibling
+        # Responses path (auxiliary calls — context compression, MoA
+        # aggregation, skills_hub — don't go through the main transport).
+        # Positively scoped to OpenAI's own infra (Codex OAuth backend or a
+        # direct api.openai.com key), same as the main transport, so an
+        # arbitrary custom Responses-compatible base_url routed through this
+        # adapter never receives the undocumented field. See PR #70383 review.
+        try:
+            from agent.codex_responses_adapter import (
+                _model_supports_explicit_cache_breakpoint,
+                apply_explicit_cache_breakpoint,
+            )
+            from utils import base_url_hostname
+
+            _hostname_for_cache = base_url_hostname(_host_src)
+            _is_codex_backend = (
+                _hostname_for_cache == "chatgpt.com"
+                and "/backend-api/codex" in _host_src.lower()
+            )
+            _is_direct_openai = _hostname_for_cache == "api.openai.com"
+            if (
+                (_is_codex_backend or _is_direct_openai)
+                and _model_supports_explicit_cache_breakpoint(model)
+            ):
+                resp_kwargs["input"] = apply_explicit_cache_breakpoint(resp_kwargs["input"])
+        except Exception:
+            logger.debug(
+                "Codex auxiliary: explicit cache breakpoint skipped", exc_info=True
+            )
+
         # Stream and collect the response
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []

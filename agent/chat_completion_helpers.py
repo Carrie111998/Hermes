@@ -1036,6 +1036,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             )
         )
         is_xai_responses = agent.provider in {"xai", "xai-oauth"} or agent._base_url_hostname == "api.x.ai"
+        is_direct_openai = agent._is_direct_openai_url()
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
         # xAI's /responses endpoint rejects ``pattern`` and ``format`` keywords
@@ -1082,6 +1083,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
             is_xai_responses=is_xai_responses,
+            is_direct_openai=is_direct_openai,
             github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
