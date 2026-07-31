@@ -94,6 +94,7 @@ def _resolve_locale_from_request(request: Any = None) -> str:
             return "zh-CN"
         if normalized.startswith("en"):
             return "en"
+        return "en"
     for candidate in (part.split(";", 1)[0].strip() for part in header.split(",")):
         normalized = candidate.replace("_", "-").lower()
         if normalized in {"zh", "zh-cn", "zh-hans", "zh-sg"}:

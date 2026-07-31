@@ -604,7 +604,7 @@
       if (!scanInFlight) return undefined;
       const id = setInterval(refresh, 4000);
       return function () { clearInterval(id); };
-    }, [scanInFlight]);
+    }, [scanInFlight, locale]);
 
     const achievements = (data && data.achievements) || [];
     const categories = ["All"].concat(Array.from(new Set(achievements.map(function (a) { return a.category; }))));
