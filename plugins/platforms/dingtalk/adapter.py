@@ -399,6 +399,19 @@ class DingTalkAdapter(BasePlatformAdapter):
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
             self._bg_tasks.clear()
 
+        # Finalize any open streaming cards before the HTTP client closes so
+        # they don't stay stuck in streaming state on DingTalk's UI after
+        # a gateway restart.  _close_streaming_siblings handles its own
+        # per-card exceptions; the outer try is a safety net for token fetch.
+        for _chat_id in list(self._streaming_cards):
+            try:
+                await self._close_streaming_siblings(_chat_id)
+            except Exception as _exc:
+                logger.debug(
+                    "[%s] Failed to finalize streaming card on disconnect for %s: %s",
+                    self.name, _chat_id, _exc,
+                )
+
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
@@ -870,7 +883,7 @@ class DingTalkAdapter(BasePlatformAdapter):
         # dingtalk-stream does not currently map msgtype=file content into
         # a first-class SDK attribute.
         file_content = getattr(message, "file_content", None)
-        if file_content:
+        if isinstance(file_content, dict):
             dl_code = file_content.get("downloadCode") or file_content.get("download_code")
             if dl_code:
                 media_urls.append(dl_code)
@@ -1054,7 +1067,7 @@ class DingTalkAdapter(BasePlatformAdapter):
 
         payload = {
             "msgtype": "markdown",
-            "markdown": {"title": "智能院bot", "text": normalized},
+            "markdown": {"title": "Hermes", "text": normalized},
         }
 
         try:
