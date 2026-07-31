@@ -213,6 +213,79 @@ def test_masks_query_credentials_named_by_the_repository_policy():
     assert "eu-west-1" in out["fallback_providers"]
 
 
+def test_masks_credentials_carried_in_the_url_fragment():
+    # The separator does not change what the value is. OAuth implicit flow
+    # returns its token after "#", and the repository policy classifies
+    # fragment pairs exactly like query pairs.
+    for param in ("access_token", "signature", "x-amz-signature", "code", "jwt"):
+        out = dump._config_overrides(
+            {
+                "fallback_providers": [
+                    _fallback_entry(
+                        base_url=f"https://api.example.com/callback#{param}={_SK_KEY}"
+                    )
+                ]
+            }
+        )
+        rendered = out["fallback_providers"]
+        assert _SK_KEY not in rendered, param
+        assert "api.example.com" in rendered, param
+
+    # A public fragment parameter beside a secret one must survive, otherwise
+    # the assertion above would also pass on a masker that ate the fragment.
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(
+                    base_url=(
+                        f"https://api.example.com/callback#access_token={_SK_KEY}"
+                        "&state=public-xyz"
+                    )
+                )
+            ]
+        }
+    )
+    rendered = out["fallback_providers"]
+    assert _SK_KEY not in rendered
+    assert "state=public-xyz" in rendered
+
+
+def test_masks_userinfo_in_a_scheme_relative_endpoint():
+    # `//user:pass@host/v1` parses with an authority but no scheme. Requiring a
+    # scheme let that form through with the password intact.
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(base_url=f"//user:{_SK_KEY}@api.example.com/v1")
+            ]
+        }
+    )
+    rendered = out["fallback_providers"]
+    assert _SK_KEY not in rendered
+    assert "api.example.com" in rendered
+
+
+def test_hyphenated_signature_names_stay_masked():
+    # Guards the reason this path classifies names with
+    # `is_sensitive_query_param` instead of delegating wholesale to
+    # `_redact_strict_url_credentials`: that helper canonicalizes "-" to "_",
+    # so `x-amz-signature` misses the (hyphenated) set entry and survives.
+    from agent import redact
+
+    assert redact.is_sensitive_query_param("x-amz-signature")
+    for component in ("?", "#"):
+        out = dump._config_overrides(
+            {
+                "fallback_providers": [
+                    _fallback_entry(
+                        base_url=f"https://api.example.com/o{component}x-amz-signature={_SK_KEY}"
+                    )
+                ]
+            }
+        )
+        assert _SK_KEY not in out["fallback_providers"], component
+
+
 def test_debug_share_upload_never_carries_the_raw_fallback_key(monkeypatch, tmp_path):
     """The real boundary: what `hermes debug share` hands to the paste service.
 
@@ -256,6 +329,51 @@ def test_debug_share_upload_never_carries_the_raw_fallback_key(monkeypatch, tmp_
         assert _SK_KEY not in payload
     # Non-vacuous: the fallback block really is in what goes out, masked.
     assert any("sk-l...SHIP" in payload for payload in uploaded)
+
+
+def test_debug_share_upload_never_carries_a_fragment_credential(monkeypatch, tmp_path):
+    """The same boundary, for a credential that arrives after ``#``.
+
+    An endpoint field is not obviously a secret field, which is what made this
+    worth pinning at the upload call rather than one layer up.
+    """
+    from hermes_cli import debug
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model: gpt-4o\n"
+        "provider: openai\n"
+        "fallback_providers:\n"
+        "  - name: my-backup\n"
+        "    provider: openai\n"
+        "    model: gpt-4o\n"
+        f"    base_url: https://api.example.com/callback#access_token={_SK_KEY}&state=public-xyz\n",
+        encoding="utf-8",
+    )
+
+    uploaded: list[str] = []
+
+    def _capture(content: str, expiry_days: int = 7) -> str:
+        uploaded.append(content)
+        return f"https://paste.example/{len(uploaded)}"
+
+    monkeypatch.setattr(debug, "upload_to_pastebin", _capture)
+    monkeypatch.setattr(debug, "_best_effort_sweep_expired_pastes", lambda: None)
+    monkeypatch.setattr(debug, "_schedule_auto_delete", lambda urls: None)
+
+    debug.build_debug_share(log_lines=5, redact=True)
+
+    assert uploaded, "nothing was uploaded — the boundary was never reached"
+    for payload in uploaded:
+        assert _SK_KEY not in payload
+    # Non-vacuous on both sides: the masked token is there, and the public
+    # fragment parameter next to it survived the trip.
+    assert any("access_token=sk-l...SHIP" in payload for payload in uploaded)
+    assert any("state=public-xyz" in payload for payload in uploaded)
 
 
 def test_numeric_token_budgets_are_not_mistaken_for_secrets():

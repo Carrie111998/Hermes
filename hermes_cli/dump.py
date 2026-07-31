@@ -312,7 +312,15 @@ def _is_sensitive_query_param(name) -> bool:
 
 
 def _mask_url_credentials(value: str) -> str:
-    """Strip userinfo and redact secret query parameters from a URL."""
+    """Strip userinfo and redact secret parameters from a URL.
+
+    Both parameter-bearing components are masked. A credential does not care
+    which separator introduced it: OAuth implicit-flow hands back its token
+    after ``#``, and ``agent/redact.py`` classifies query and fragment pairs
+    with the same set (``_STRICT_URL_PARAM_RE`` carries ``#`` among its
+    delimiters), so a policy that stopped at ``?`` would just be a hole with a
+    good excuse.
+    """
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
     try:
@@ -324,8 +332,28 @@ def _mask_url_credentials(value: str) -> str:
     except ValueError:
         # Unparseable (e.g. a bad port) — refuse rather than guess.
         return _FALLBACK_OMITTED
-    if not parts.scheme or not parts.netloc:
+    # A scheme-relative reference (``//user:pass@host/v1``) has no scheme and
+    # still carries userinfo, so the authority — not the scheme — is what makes
+    # this a URL worth masking.
+    if not parts.netloc:
         return value
+
+    def _mask_params(component: str) -> tuple[str, bool]:
+        """Redact credential-named pairs in one parameter component."""
+        if not component:
+            return component, False
+        pairs = parse_qsl(component, keep_blank_values=True)
+        if not any(_is_sensitive_query_param(name) for name, _ in pairs):
+            return component, False
+        return (
+            urlencode(
+                [
+                    (name, _redact(val) if val and _is_sensitive_query_param(name) else val)
+                    for name, val in pairs
+                ]
+            ),
+            True,
+        )
 
     netloc = parts.netloc
     changed = False
@@ -336,21 +364,13 @@ def _mask_url_credentials(value: str) -> str:
         netloc = f"***@{host}" if host else "***"
         changed = True
 
-    query = parts.query
-    if query:
-        pairs = parse_qsl(query, keep_blank_values=True)
-        if any(_is_sensitive_query_param(name) for name, _ in pairs):
-            query = urlencode(
-                [
-                    (name, _redact(val) if val and _is_sensitive_query_param(name) else val)
-                    for name, val in pairs
-                ]
-            )
-            changed = True
+    query, query_masked = _mask_params(parts.query)
+    fragment, fragment_masked = _mask_params(parts.fragment)
+    changed = changed or query_masked or fragment_masked
 
     if not changed:
         return value
-    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+    return urlunsplit((parts.scheme, netloc, parts.path, query, fragment))
 
 
 def _mask_fallback_value(name, value, depth: int):
