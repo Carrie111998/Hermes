@@ -20,6 +20,7 @@ import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
+  ApprovalRespondResponse,
   ClarifyRespondResponse,
   ConfigSetResponse,
   GatewayEvent,
@@ -40,6 +41,7 @@ import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
+import { approvalResponseParams, clearApprovalById } from './approvalResponse.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
@@ -924,13 +926,30 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
-        patchOverlayState({ approval: null })
-        patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
-        patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+    (choice: string) => {
+      const request = overlay.approval
+
+      if (!request || !ui.sid) {
+        return
+      }
+
+      const approvalId = request.approvalId
+
+      return rpc<ApprovalRespondResponse>('approval.respond', approvalResponseParams(request, choice, ui.sid)).then(
+        response => {
+          if (!response || !clearApprovalById(approvalId)) {
+            return
+          }
+
+          if (response.resolved) {
+            patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
+          }
+
+          patchUiState({ status: 'running…' })
+        }
+      )
+    },
+    [overlay.approval, rpc, ui.sid]
   )
 
   const answerSudo = useCallback(

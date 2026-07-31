@@ -380,12 +380,14 @@ reconnecting client can safely restore its approval UI:
   "pending_approval": {
     "approval_id": "approval_abc123",
     "description": "Run a command?",
+    "command": "rm -rf /tmp/example",
     "choices": ["once", "session", "always", "deny"]
   },
   "pending_approvals": [
     {
       "approval_id": "approval_abc123",
       "description": "Run a command?",
+      "command": "rm -rf /tmp/example",
       "choices": ["once", "session", "always", "deny"]
     }
   ]
@@ -394,7 +396,8 @@ reconnecting client can safely restore its approval UI:
 
 `pending_approval` is the first item for clients that handle one prompt at a
 time. `pending_approvals` contains the complete FIFO queue so concurrent tool
-calls cannot strand a hidden request.
+calls cannot strand a hidden request. Commands pass the same forced secret
+redaction as the SSE approval event before entering either status field.
 
 ### GET /v1/runs/\{run_id\}/events
 

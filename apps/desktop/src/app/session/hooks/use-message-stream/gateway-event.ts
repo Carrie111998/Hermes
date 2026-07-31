@@ -34,7 +34,7 @@ import {
   setChangeEventsAvailable
 } from '@/store/live-sync'
 import { dispatchNativeNotification } from '@/store/native-notifications'
-import { notify } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding, requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { revealDesktopPane } from '@/store/pane-focus'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
@@ -893,10 +893,20 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+        const approvalId = typeof payload?.approval_id === 'string' ? payload.approval_id.trim() : ''
+
+        if (!approvalId) {
+          const sendFailed = translateNow('assistant.approval.sendFailed')
+
+          notifyError(new Error(sendFailed), sendFailed)
+
+          return
+        }
 
         setApprovalRequest({
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
+          approvalId,
           choices: Array.isArray(payload?.choices)
             ? payload.choices.filter(choice => typeof choice === 'string')
             : undefined,
@@ -912,8 +922,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         dispatchNativeNotification({
           actions: [
-            { id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+            { approvalId, id: 'approve', text: translateNow('notifications.native.approveAction') },
+            { approvalId, id: 'reject', text: translateNow('notifications.native.rejectAction') }
           ],
           body: command || description,
           kind: 'approval',

@@ -136,6 +136,7 @@ function shouldFire(kind: NativeNotificationKind, sessionId?: null | string, glo
 
 export interface NativeNotificationAction {
   id: string
+  approvalId?: string
   text: string
 }
 
@@ -183,12 +184,16 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
   })
 }
 
-// Resolve a pending approval from a notification button, mirroring the in-app
-// Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+// Resolve the exact pending approval captured by a notification button,
+// mirroring the in-app Run/Reject bar without letting a stale action clear its successor.
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  approvalId: string,
+  actionId: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
-  if (!choice) {
+  if (!choice || !approvalId) {
     return
   }
 
@@ -199,8 +204,12 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    await gateway.request('approval.respond', {
+      approval_id: approvalId,
+      choice,
+      session_id: sessionId ?? undefined
+    })
+    clearApprovalRequest(sessionId, approvalId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
@@ -36,7 +36,14 @@ function setRequest(
   extra: { choices?: string[]; smartDenied?: boolean } = {}
 ) {
   $activeSessionId.set('sess-1')
-  setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
+  setApprovalRequest({
+    allowPermanent,
+    approvalId: 'approval-a',
+    command,
+    description: 'dangerous command',
+    sessionId: 'sess-1',
+    ...extra
+  })
 }
 
 function mockGateway() {
@@ -83,7 +90,11 @@ describe('PendingToolApproval', () => {
     fireEvent.click(screen.getByRole('button', { name: /Run/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        approval_id: 'approval-a',
+        choice: 'once',
+        session_id: 'sess-1'
+      })
     })
     expect($approvalRequest.get()).toBeNull()
   })
@@ -109,8 +120,39 @@ describe('PendingToolApproval', () => {
     fireEvent.click(screen.getByRole('button', { name: /Reject/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        approval_id: 'approval-a',
+        choice: 'deny',
+        session_id: 'sess-1'
+      })
     })
+  })
+
+  it('keeps a newer approval usable when an older response finishes late', async () => {
+    let finish: ((value: { resolved: number }) => void) | undefined
+    const request = vi.fn(
+      () =>
+        new Promise(resolve => {
+          finish = resolve
+        })
+    )
+    $gateway.set({ request } as unknown as HermesGateway)
+    setRequest('rm /tmp/a')
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+    act(() => {
+      setApprovalRequest({
+        approvalId: 'approval-b',
+        command: 'rm /tmp/b',
+        description: 'new request',
+        sessionId: 'sess-1'
+      })
+      finish?.({ resolved: 0 })
+    })
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Run/ }).hasAttribute('disabled')).toBe(false))
+    expect($approvalRequest.get()?.approvalId).toBe('approval-b')
   })
 
   it('offers "Always allow" in the options menu by default', async () => {

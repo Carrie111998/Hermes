@@ -70,10 +70,12 @@ class TestApprovalCommandWiring:
     benign refactor doesn't cause a false failure, and so a discarded-result
     call (`_redact(cmd); send(cmd)`) does NOT pass."""
 
-    def _assert_redacts_then_uses(self, module, func_name: str, sink_substr: str):
+    def _assert_projects_then_uses(
+        self, module, func_name: str, projection_name: str, sink_substr: str
+    ):
         """Parse `module`'s full AST, locate the (possibly nested) function
         `func_name`, and assert it contains an assignment
-        `<x> = _redact_approval_command(...)` whose result is then used by a
+        `<x> = <projection_name>(...)` whose result is then used by a
         statement matching `sink_substr` on a LATER line. Walking the real AST
         (not a source slice) is refactor-robust and rejects discarded-result
         calls (the call must be an assignment, not a bare expression)."""
@@ -89,21 +91,21 @@ class TestApprovalCommandWiring:
                 break
         assert target_fn is not None, f"function {func_name} not found in {module.__name__}"
 
-        redact_line = None
+        projection_line = None
         for node in ast.walk(target_fn):
             if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
                 fn = node.value.func
-                if isinstance(fn, ast.Name) and fn.id == "_redact_approval_command":
-                    redact_line = node.lineno
-        assert redact_line is not None, (
-            f"{func_name} must assign the result of _redact_approval_command(...) "
+                if isinstance(fn, ast.Name) and fn.id == projection_name:
+                    projection_line = node.lineno
+        assert projection_line is not None, (
+            f"{func_name} must assign the result of {projection_name}(...) "
             "(a discarded-result call would still leak the raw command)"
         )
 
         sink_line = None
         for node in ast.walk(target_fn):
             seg = ast.get_source_segment(source, node)
-            if seg and sink_substr in seg and getattr(node, "lineno", 0) > redact_line:
+            if seg and sink_substr in seg and getattr(node, "lineno", 0) > projection_line:
                 sink_line = node.lineno
                 break
         assert sink_line is not None, (
@@ -113,12 +115,29 @@ class TestApprovalCommandWiring:
     def test_chat_platform_path_redacts_before_send(self):
         import gateway.run as run
 
-        self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
+        self._assert_projects_then_uses(
+            run,
+            "_approval_notify_sync",
+            "_redact_approval_command",
+            "send_exec_approval",
+        )
 
     def test_sse_api_path_redacts_before_enqueue(self):
         from gateway.platforms import api_server
 
-        self._assert_redacts_then_uses(api_server, "_approval_notify", "put_nowait")
+        projected = api_server._public_run_approval(
+            {
+                "approval_id": "approval-1",
+                "command": "curl -H 'Authorization: token " + _FAKE_GHP + "' https://api.github.com",
+            }
+        )
+        assert _FAKE_GHP not in projected["command"]
+        self._assert_projects_then_uses(
+            api_server,
+            "_approval_notify",
+            "_public_run_approval",
+            "put_nowait",
+        )
 
 
 class TestApprovalTextFallbackContract:
@@ -134,5 +153,4 @@ class TestApprovalTextFallbackContract:
         assert "`/approve`" in text
         assert "approve session" not in text
         assert "approve always" not in text
-
 

@@ -580,7 +580,12 @@ describe('flat tool list approval surfacing', () => {
   })
 
   it('surfaces the approval inline and never under a hidden ancestor', async () => {
-    setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'dangerous command', sessionId: 'sess-1' })
+    setApprovalRequest({
+      approvalId: 'approval-a',
+      command: 'rm -rf /tmp/x',
+      description: 'dangerous command',
+      sessionId: 'sess-1'
+    })
 
     const { container } = render(<GroupHarness message={groupedPendingMessage()} />)
 

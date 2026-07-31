@@ -82,6 +82,24 @@ def _approval_event_choices(
     return choices
 
 
+def _public_run_approval(approval: dict) -> dict:
+    """Project one queued approval into the redacted Runs API contract."""
+    from gateway.run import _redact_approval_command
+
+    public = {
+        "approval_id": approval["approval_id"],
+        "description": approval.get("description", ""),
+        "choices": _approval_event_choices(
+            smart_denied=bool(approval.get("smart_denied")),
+            allow_permanent=approval.get("allow_permanent") is not False,
+            allow_session=approval.get("allow_session") is not False,
+        ),
+    }
+    if "command" in approval:
+        public["command"] = _redact_approval_command(approval.get("command"))
+    return public
+
+
 try:
     from aiohttp import web
     AIOHTTP_AVAILABLE = True
@@ -6259,34 +6277,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
+                    public_approval = _public_run_approval(event)
+                    event.update(public_approval)
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                            allow_session=event.get("allow_session") is not False,
-                        ),
                     })
-                    pending_approval = {
-                        "approval_id": event["approval_id"],
-                        "description": event.get("description", ""),
-                        "choices": event["choices"],
-                    }
                     self._set_run_status(
                         run_id,
                         "waiting_for_approval",
                         last_event="approval.request",
-                        pending_approval=pending_approval,
+                        pending_approval=public_approval,
                     )
                     try:
                         loop.call_soon_threadsafe(q.put_nowait, event)
@@ -6519,15 +6521,7 @@ class APIServerAdapter(BasePlatformAdapter):
             from tools.approval import list_gateway_approvals
 
             pending_approvals = [
-                {
-                    "approval_id": approval["approval_id"],
-                    "description": approval.get("description", ""),
-                    "choices": _approval_event_choices(
-                        smart_denied=bool(approval.get("smart_denied")),
-                        allow_permanent=approval.get("allow_permanent") is not False,
-                        allow_session=approval.get("allow_session") is not False,
-                    ),
-                }
+                _public_run_approval(approval)
                 for approval in list_gateway_approvals(approval_session_key)
             ]
             if pending_approvals:
@@ -6537,6 +6531,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     pending_approvals=pending_approvals,
                 )
             else:
+                if response_status.get("status") == "waiting_for_approval":
+                    response_status["status"] = "running"
                 response_status.pop("pending_approval", None)
                 response_status.pop("pending_approvals", None)
         return web.json_response(response_status)
@@ -6657,6 +6653,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
+        current_status = self._run_statuses.get(run_id, {}).get("status")
+        if run_id in self._stopping_run_ids or current_status == "stopping":
+            return web.json_response(
+                _openai_error(
+                    f"Run has no active approval session: {run_id}",
+                    code="approval_not_active",
+                ),
+                status=409,
+            )
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -6682,21 +6687,11 @@ class APIServerAdapter(BasePlatformAdapter):
 
         remaining = list_gateway_approvals(approval_session_key)
         if remaining:
-            next_approval = remaining[0]
-            next_choices = _approval_event_choices(
-                smart_denied=bool(next_approval.get("smart_denied")),
-                allow_permanent=next_approval.get("allow_permanent") is not False,
-                allow_session=next_approval.get("allow_session") is not False,
-            )
             self._set_run_status(
                 run_id,
                 "waiting_for_approval",
                 last_event="approval.responded",
-                pending_approval={
-                    "approval_id": next_approval["approval_id"],
-                    "description": next_approval.get("description", ""),
-                    "choices": next_choices,
-                },
+                pending_approval=_public_run_approval(remaining[0]),
             )
         else:
             self._set_run_status(run_id, "running", last_event="approval.responded")

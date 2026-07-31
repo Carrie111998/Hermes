@@ -35,7 +35,12 @@ interface PromptStore<T extends KeyedPrompt> {
 // session hint it drops every entry, optionally filtered by request id.
 function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   const $all = atom<Record<string, T>>({})
-  const idOf = (value: T): string | undefined => (value as { requestId?: string }).requestId
+
+  const idOf = (value: T): string | undefined => {
+    const keyed = value as { approvalId?: string; requestId?: string }
+
+    return keyed.requestId ?? keyed.approvalId
+  }
 
   return {
     $active: computed([$all, $activeSessionId], (all, activeId) => all[keyFor(activeId)] ?? null),
@@ -67,10 +72,10 @@ function keyedPromptStore<T extends KeyedPrompt>(): PromptStore<T> {
   }
 }
 
-// Approval is session-keyed on the backend (one in-flight approval per session,
-// resolved via approval.respond {choice, session_id}). It carries no request_id,
-// unlike sudo/secret which are _block()-style request/response.
+// Approval presentation is session-keyed, while approval_id identifies the
+// exact backend request so a stale response cannot resolve or clear its successor.
 export interface ApprovalRequest extends KeyedPrompt {
+  approvalId: string
   // false when the backend won't honor a permanent allow (tirith warning) → hide "Always allow".
   allowPermanent?: boolean
   choices?: string[]

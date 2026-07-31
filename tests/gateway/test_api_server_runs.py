@@ -563,6 +563,7 @@ class TestRunEvents:
                 assert status["status"] == "waiting_for_approval"
                 assert pending["approval_id"].startswith("approval_")
                 assert pending["description"] == "Run a command?"
+                assert pending["command"] == "bash -c true"
                 assert pending["choices"] == ["once", "session", "always", "deny"]
 
                 approval_resp = await cli.post(
@@ -595,11 +596,13 @@ class TestRunEvents:
                 assert agent_ready.wait(timeout=3.0)
 
                 first = approval_mod._ApprovalEntry({
+                    "command": "first command",
                     "description": "Run the first command?",
                     "allow_permanent": False,
                     "allow_session": False,
                 })
                 second = approval_mod._ApprovalEntry({
+                    "command": "second command",
                     "description": "Run the second command?",
                     "allow_permanent": False,
                     "allow_session": False,
@@ -615,17 +618,60 @@ class TestRunEvents:
                     {
                         "approval_id": first.approval_id,
                         "description": "Run the first command?",
+                        "command": "first command",
                         "choices": ["once", "deny"],
                     },
                     {
                         "approval_id": second.approval_id,
                         "description": "Run the second command?",
+                        "command": "second command",
                         "choices": ["once", "deny"],
                     },
                 ]
                 assert status["pending_approval"] == status["pending_approvals"][0]
 
                 interrupted.set()
+
+    @pytest.mark.asyncio
+    async def test_expired_approval_returns_to_running_status(self, adapter, monkeypatch):
+        """A timed-out queue entry must not leave reconnecting clients waiting."""
+        app = _create_runs_app(adapter)
+        timed_out = threading.Event()
+        release_agent = threading.Event()
+        monkeypatch.setattr(approval_mod, "_get_approval_timeout", lambda: 0)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                def _run_with_timeout(*_args, **_kwargs):
+                    result = approval_mod._run_approval_gate(
+                        pattern_key="shell-c",
+                        description="Run a command?",
+                        display_target="bash -c true",
+                        cron_deny_message="blocked",
+                        autoapprove_log_prefix="test",
+                    )
+                    assert result["approved"] is False
+                    timed_out.set()
+                    release_agent.wait(timeout=3.0)
+                    return {"final_response": "done"}
+
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.side_effect = _run_with_timeout
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                start_resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await start_resp.json())["run_id"]
+                assert timed_out.wait(timeout=3.0)
+
+                status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+
+                assert status["status"] == "running"
+                assert "pending_approval" not in status
+                assert "pending_approvals" not in status
+                release_agent.set()
 
     @pytest.mark.asyncio
     async def test_approval_response_requires_an_approval_id(self, adapter):
@@ -732,6 +778,42 @@ class TestRunLifecycleSweep:
 
 
 class TestStopRun:
+
+    @pytest.mark.asyncio
+    async def test_stop_rejects_a_later_approval_response(self, adapter):
+        """Once Stop wins, a delayed approval cannot release gated work."""
+        app = _create_runs_app(adapter)
+        run_id = "run-stop-approval"
+        pending = approval_mod._ApprovalEntry({"command": "dangerous"})
+        agent = MagicMock()
+        adapter._active_run_agents[run_id] = agent
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [pending]
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": pending.approval_id, "choice": "once"},
+                )
+                approval_data = await approval_resp.json()
+
+            assert stop_resp.status == 200
+            assert approval_resp.status == 409
+            assert approval_data["error"]["code"] == "approval_not_active"
+            assert pending.result is None
+            assert not pending.event.is_set()
+            agent.interrupt.assert_called_once_with("Stop requested via API")
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._active_run_agents.pop(run_id, None)
+            adapter._run_approval_sessions.pop(run_id, None)
+            adapter._run_statuses.pop(run_id, None)
+            adapter._stopping_run_ids.discard(run_id)
 
     @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):

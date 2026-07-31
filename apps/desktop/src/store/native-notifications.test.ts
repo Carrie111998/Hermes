@@ -210,27 +210,54 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({ approvalId: 'approval-a', command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
 
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approval-a', 'approve')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: 'approval-a',
+      choice: 'once',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
-    await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+    await respondToApprovalAction('bg', 'approval-a', 'reject')
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: 'approval-a',
+      choice: 'deny',
+      session_id: 'bg'
+    })
   })
 
   it('ignores unknown action ids', async () => {
-    await respondToApprovalAction('bg', 'snooze')
+    await respondToApprovalAction('bg', 'approval-a', 'snooze')
     expect(request).not.toHaveBeenCalled()
   })
 
   it('no-ops without a gateway', async () => {
     $gateway.set(null)
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approval-a', 'approve')
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not clear a newer request after a stale notification action completes', async () => {
+    let finish: ((value: { resolved: number }) => void) | undefined
+    request.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          finish = resolve
+        })
+    )
+    setActiveSessionId('bg')
+    setApprovalRequest({ approvalId: 'approval-a', command: 'first', description: 'first', sessionId: 'bg' })
+
+    const response = respondToApprovalAction('bg', 'approval-a', 'approve')
+    setApprovalRequest({ approvalId: 'approval-b', command: 'second', description: 'second', sessionId: 'bg' })
+    finish?.({ resolved: 0 })
+    await response
+
+    expect($approvalRequest.get()?.approvalId).toBe('approval-b')
   })
 })

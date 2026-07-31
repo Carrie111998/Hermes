@@ -54,7 +54,7 @@ terminal.resize         clipboard.paste         image.attach
 
 ### 流式返回的事件
 
-`message.delta`、`message.complete`、`tool.start`、`tool.progress`、`tool.complete`、`approval.request`、`approval.responded`、`clarify.request`、`sudo.request`、`secret.request`、`gateway.ready`，以及会话生命周期和错误事件。审批事件携带不透明的 `approval_id`；外部宿主必须在响应中原样返回该 ID，并且只清除匹配的提示。轮询同时返回完整的 FIFO `pending_approvals` 列表，以及其中第一项的 `pending_approval` 兼容字段。
+`message.delta`、`message.complete`、`tool.start`、`tool.progress`、`tool.complete`、`approval.request`、`clarify.request`、`sudo.request`、`secret.request`、`gateway.ready`，以及会话生命周期和错误事件。`approval.request` 携带不透明的 `approval_id`；宿主必须在 `approval.respond` 中原样返回该 ID，并且客户端应在响应完成后只清除匹配的提示。
 
 ### Pi 风格 RPC 映射
 

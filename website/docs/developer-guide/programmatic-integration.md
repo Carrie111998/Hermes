@@ -58,7 +58,7 @@ terminal.resize         clipboard.paste         image.attach
 
 ### Events streamed back
 
-`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `approval.responded`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. Approval events carry an opaque `approval_id`; external hosts must return it with the decision and clear only the matching prompt. Polling exposes the complete FIFO `pending_approvals` list as well as its first item in `pending_approval`. Expiry events carry the original `{ request_id }` for the same reason.
+`message.delta`, `message.complete`, `tool.start`, `tool.progress`, `tool.complete`, `approval.request`, `clarify.request`, `sudo.request`, `sudo.expire`, `secret.request`, `secret.expire`, `gateway.ready`, plus session lifecycle and error events. `approval.request` carries an opaque `approval_id`; hosts must return it with `approval.respond`, and clients should clear only that matching prompt after the response completes. Expiry events carry the original `{ request_id }` for the same reason.
 
 ### Pi-style RPC mapping
 
