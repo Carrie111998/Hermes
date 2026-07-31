@@ -45,6 +45,12 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+_FALLBACK_API_MODES = {
+    "chat_completions",
+    "codex_responses",
+    "anthropic_messages",
+    "bedrock_converse",
+}
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -1821,11 +1827,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # An explicit per-entry api_mode takes precedence over endpoint/model
+        # heuristics. This is required for custom gateways whose URL does not
+        # identify the wire protocol they expose.
+        configured_fb_api_mode = str(fb.get("api_mode") or "").strip().lower()
+        if configured_fb_api_mode and configured_fb_api_mode not in _FALLBACK_API_MODES:
+            logger.warning(
+                "Invalid api_mode %r for fallback %s/%s; using auto-detection",
+                configured_fb_api_mode,
+                fb_provider,
+                fb_model,
+            )
+            configured_fb_api_mode = ""
+
+        # Determine api_mode from provider / base URL / model when the entry
+        # does not provide an explicit override.
+        fb_api_mode = configured_fb_api_mode or "chat_completions"
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if configured_fb_api_mode:
+            pass
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
@@ -1870,10 +1892,27 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         old_model = agent.model
         old_provider = agent.provider
 
-        # Clear the per-config context_length override so the fallback
-        # model's actual context window is resolved instead of inheriting
-        # the stale value from the previous model.  See #22387.
-        agent._config_context_length = None
+        # Replace the primary model's context override with the fallback
+        # entry's own override. Missing/invalid values intentionally clear
+        # the stale primary value so model metadata is resolved afresh.
+        configured_fb_context_length = fb.get("context_length")
+        if configured_fb_context_length is not None:
+            try:
+                if isinstance(configured_fb_context_length, bool):
+                    raise ValueError
+                configured_fb_context_length = int(configured_fb_context_length)
+                if configured_fb_context_length <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid context_length %r for fallback %s/%s; "
+                    "using auto-detection",
+                    configured_fb_context_length,
+                    fb_provider,
+                    fb_model,
+                )
+                configured_fb_context_length = None
+        agent._config_context_length = configured_fb_context_length
         agent.model = fb_model
         agent.provider = fb_provider
         agent.requested_provider = fb_provider

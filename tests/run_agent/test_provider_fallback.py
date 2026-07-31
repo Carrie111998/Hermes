@@ -146,6 +146,100 @@ class TestFallbackChainAdvancement:
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
 
+    def test_honors_explicit_api_mode(self):
+        """Per-entry api_mode must override endpoint/model heuristics."""
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "custom-claude",
+                "base_url": "https://fallback.example/v1",
+                "api_mode": "anthropic_messages",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(
+                    _mock_client(base_url="https://fallback.example/v1"),
+                    "custom-claude",
+                ),
+            ),
+            patch(
+                "hermes_cli.model_normalize.normalize_model_for_provider",
+                side_effect=lambda m, p: m,
+            ),
+            patch(
+                "agent.anthropic_adapter.build_anthropic_client",
+                return_value=MagicMock(),
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.api_mode == "anthropic_messages"
+
+    def test_honors_explicit_context_length_and_restores_primary(self):
+        """Per-entry context_length is active only while fallback is active."""
+        fbs = [
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "context_length": 1_000_000,
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._config_context_length = 200_000
+        agent._primary_runtime["config_context_length"] = 200_000
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=1_000_000,
+            ) as mock_context_length,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._config_context_length == 1_000_000
+        assert agent.context_compressor.context_length == 1_000_000
+        assert (
+            mock_context_length.call_args.kwargs["config_context_length"]
+            == 1_000_000
+        )
+
+        assert agent._restore_primary_runtime() is True
+        assert agent._config_context_length == 200_000
+
+    def test_without_context_length_clears_previous_override(self):
+        """An entry without an override must not inherit the primary value."""
+        fbs = [
+            {
+                "provider": "openai",
+                "model": "gpt-4o",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent._config_context_length = 200_000
+
+        with (
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-4o"),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=128_000,
+            ) as mock_context_length,
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent._config_context_length is None
+        assert mock_context_length.call_args.kwargs["config_context_length"] is None
+
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.
 
