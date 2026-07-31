@@ -125,6 +125,78 @@ def test_config_gateway_timeout_wins_over_stale_env(hermes_home: Path) -> None:
     assert env.get("HERMES_AGENT_TIMEOUT_WARNING") == "900"
 
 
+def test_config_display_busy_input_mode_wins_over_stale_env(hermes_home: Path) -> None:
+    _write_config(hermes_home, display_cfg={"busy_input_mode": "interrupt"})
+    _write_env(hermes_home, {"HERMES_GATEWAY_BUSY_INPUT_MODE": "queue"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_GATEWAY_BUSY_INPUT_MODE") == "interrupt"
+
+
+def test_config_display_busy_text_mode_wins_over_stale_env(hermes_home: Path) -> None:
+    _write_config(hermes_home, display_cfg={"busy_text_mode": "queue"})
+    _write_env(hermes_home, {"HERMES_GATEWAY_BUSY_TEXT_MODE": "interrupt"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_GATEWAY_BUSY_TEXT_MODE") == "queue"
+
+
+def test_config_timezone_wins_over_stale_env(hermes_home: Path) -> None:
+    _write_config(hermes_home, timezone="America/Los_Angeles")
+    _write_env(hermes_home, {"HERMES_TIMEZONE": "UTC"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_TIMEZONE") == "America/Los_Angeles"
+
+
+def test_null_config_max_turns_preserves_env_fallback(hermes_home: Path) -> None:
+    """Regression: agent.max_turns: null must not poison the env with "None".
+
+    The bridge previously wrote str(agent_cfg["max_turns"]) whenever the key
+    was present, so an explicit null exported the literal string "None" into
+    HERMES_MAX_ITERATIONS. Every later int() parse then collapsed to the
+    hardcoded default, and the startup budget log disagreed with per-turn
+    resolution. A null config key must leave the .env fallback intact.
+    """
+    _write_config(hermes_home, agent_cfg={"max_turns": None})
+    _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "120"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_MAX_ITERATIONS") == "120", (
+        f"expected .env fallback 120 to survive agent.max_turns: null; "
+        f"got {env.get('HERMES_MAX_ITERATIONS')!r}"
+    )
+
+
+def test_legacy_root_level_max_turns_wins_over_stale_env(hermes_home: Path) -> None:
+    """Legacy root-level max_turns must bridge at import time like agent.max_turns."""
+    import yaml
+    (hermes_home / "config.yaml").write_text(yaml.safe_dump({"max_turns": 250}))
+    _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "60"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_MAX_ITERATIONS") == "250"
+
+
+def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
+    """If config.yaml doesn't set max_turns, .env value must still pass through.
+
+    The bridge only overwrites when the config key is present — an absent
+    config key should NOT clobber the .env value.
+    """
+    _write_config(hermes_home, agent_cfg={})  # no max_turns
+    _write_env(hermes_home, {"HERMES_MAX_ITERATIONS": "123"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_MAX_ITERATIONS") == "123"
+
+
 def test_config_platform_connect_timeout_supplies_env_when_unset(hermes_home: Path) -> None:
     """config.yaml:gateway.platform_connect_timeout supplies the env var when
     it isn't already set (#19776 — config surface for the Discord connect
