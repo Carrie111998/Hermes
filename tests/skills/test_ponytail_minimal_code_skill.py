@@ -86,8 +86,12 @@ def test_decision_ladder_and_attribution_are_preserved() -> None:
         "Is new code still required?",
     ):
         assert marker in content
-    assert "Dietrich Gebert" in content
-    assert "github.com/DietrichGebert/ponytail" in content
+    assert "**Credits:**" in content
+    assert (
+        "[Ponytail project](https://github.com/DietrichGebert/ponytail)" in content
+    )
+    assert "[Dietrich Gebert](https://github.com/DietrichGebert)" in content
+    assert "MIT-licensed" in content
 
 
 def test_skill_has_no_external_runtime_dependency() -> None:

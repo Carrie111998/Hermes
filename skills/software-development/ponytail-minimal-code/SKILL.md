@@ -16,9 +16,12 @@ metadata:
 Ponytail makes implementation deliberately smaller by questioning whether
 code is needed before choosing how to write it. It applies YAGNI and a
 decision ladder while keeping validation, security, accessibility, and data
-safety intact. This skill adapts
-[Ponytail](https://github.com/DietrichGebert/ponytail) by Dietrich Gebert for
-the Hermes Agent skill system.
+safety intact.
+
+**Credits:** This skill adapts the MIT-licensed
+[Ponytail project](https://github.com/DietrichGebert/ponytail) by
+[Dietrich Gebert](https://github.com/DietrichGebert) for the Hermes Agent skill
+system.
 
 ## When to Use
 
