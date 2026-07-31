@@ -1147,6 +1147,19 @@ class CLICommandsMixin:
             _cprint("")
             _cprint(f"  {'#':>2}  {'Title':<26} {'Model':<12} {'Msgs':>4}  {'Source':<6} {'Preview':<30} {'Last Active':<12} {'ID'}")
             _cprint(f"  {'─'*2}  {'─'*26} {'─'*12} {'─'*4}  {'─'*6} {'─'*30} {'─'*12} {'─'*24}")
+
+            # Batch-fetch previews (first 60 chars of first user message per session)
+            sids = list(seen.keys())
+            placeholders = ",".join("?" for _ in sids)
+            conn = self._session_db._conn
+            cur = conn.execute(
+                f"SELECT session_id, substr(content, 1, 60) FROM messages "
+                f"WHERE session_id IN ({placeholders}) AND role = 'user' "
+                f"GROUP BY session_id ORDER BY MIN(id)",
+                sids,
+            )
+            preview_map = {row[0]: row[1] for row in cur.fetchall()}
+
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = self._session_db.get_session(sid) or {}
                 title = (meta.get("title") or "—")[:24]
@@ -1164,9 +1177,8 @@ class CLICommandsMixin:
                     model = model[:11] + "…"
                 mc = meta.get("message_count")
                 msgs_str = str(mc) if mc is not None else "—"
-                # Use session preview (first user message) like /resume does
-                preview = (meta.get("preview") or "")[:28]
-                if len(meta.get("preview") or "") >= 28:
+                preview = (preview_map.get(sid) or "")[:28]
+                if len(preview) >= 28:
                     preview = preview[:27] + "…"
                 _cprint(f"  {idx:>2}  {title:<26} {model:<12} {msgs_str:>4}  {source:<6} {preview:<30} {when:<12} {sid}")
 
