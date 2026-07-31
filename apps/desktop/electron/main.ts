@@ -90,6 +90,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
+import { classifyExternalUrl } from './external-url-policy'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
@@ -1277,19 +1278,13 @@ function loadWindowUrl(win, url, label) {
 }
 
 function openExternalUrl(rawUrl) {
-  const raw = String(rawUrl || '').trim()
+  const target = classifyExternalUrl(rawUrl)
 
-  if (!raw) {
+  if (!target) {
     return false
   }
 
-  let parsed
-
-  try {
-    parsed = new URL(raw)
-  } catch {
-    return false
-  }
+  const parsed = target.url
 
   // `file://` URLs come from the artifacts panel (the renderer can't open
   // them itself because Chromium blocks file:// navigation from the app
@@ -1323,10 +1318,6 @@ function openExternalUrl(rawUrl) {
       .catch(error => rememberLog(`[file] openPath rejected: ${error.message}`))
 
     return true
-  }
-
-  if (!['http:', 'https:', 'mailto:'].includes(parsed.protocol)) {
-    return false
   }
 
   const url = parsed.toString()
