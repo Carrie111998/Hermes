@@ -3497,6 +3497,14 @@ if [ "$SRC" != "$DST" ]; then
   fi
 fi
 /usr/bin/xattr -dr com.apple.quarantine "$DST" 2>/dev/null || true
+# Ad-hoc + hardenedRuntime (from electron-builder config) is rejected by
+# Gatekeeper.  When APPLE notarization was not configured the build is
+# unsigned, so strip hardened runtime by re-signing ad-hoc without
+# --options runtime.  Already-notarized builds pass codesign --verify and
+# are left untouched.  (#75422)
+if ! /usr/bin/codesign --verify "$DST" 2>/dev/null; then
+  /usr/bin/codesign --force --sign - --deep "$DST" 2>/dev/null || true
+fi
 /usr/bin/open "$DST"
 `
 
