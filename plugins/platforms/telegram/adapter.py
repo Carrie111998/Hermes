@@ -8823,23 +8823,72 @@ class TelegramAdapter(BasePlatformAdapter):
         self.config.extra["participation_policy"] = policy
         return key
 
-    def _persist_participation_policy(self) -> None:
+    def _persist_participation_policy(self) -> str:
         from hermes_cli.config import atomic_config_write, read_user_config_raw
 
         config_path = get_hermes_home() / "config.yaml"
+        requested_policy = self.config.extra.get("participation_policy", {})
+
+        def _policy_from(raw: dict) -> tuple[bool, object]:
+            telegram_cfg = raw.get("telegram")
+            if not isinstance(telegram_cfg, dict):
+                return False, None
+            extra = telegram_cfg.get("extra")
+            if not isinstance(extra, dict) or "participation_policy" not in extra:
+                return False, None
+            return True, extra["participation_policy"]
+
         try:
             data = read_user_config_raw(config_path)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Telegram participation policy was not written because "
+                "the prior config could not be read: %s",
+                self.name,
+                exc,
+            )
+            return "not_changed"
+
+        prior_present, prior_policy = _policy_from(data)
+        try:
             telegram_cfg = data.setdefault("telegram", {})
             extra = telegram_cfg.setdefault("extra", {})
-            extra["participation_policy"] = self.config.extra.get("participation_policy", {})
+            extra["participation_policy"] = requested_policy
             atomic_config_write(
                 config_path,
                 data,
                 sort_keys=False,
-                allow_unicode=True,
             )
+            readback = read_user_config_raw(config_path)
         except Exception as exc:
-            logger.warning("[%s] Failed to persist Telegram participation policy: %s", self.name, exc)
+            logger.warning(
+                "[%s] Telegram participation policy write/readback raised; "
+                "re-reading independently: %s",
+                self.name,
+                exc,
+            )
+            try:
+                readback = read_user_config_raw(config_path)
+            except Exception as readback_exc:
+                logger.warning(
+                    "[%s] Telegram participation policy outcome is unknown "
+                    "because independent readback failed: %s",
+                    self.name,
+                    readback_exc,
+                )
+                return "unknown"
+
+        observed_present, observed_policy = _policy_from(readback)
+        if observed_present and observed_policy == requested_policy:
+            return "persisted"
+        if observed_present == prior_present and observed_policy == prior_policy:
+            return "not_changed"
+        logger.warning(
+            "[%s] Telegram participation policy outcome is unknown because "
+            "readback matched neither requested nor prior state",
+            self.name,
+        )
+        return "unknown"
 
     async def _handle_hank_participation_command(self, message: Message) -> bool:
         action, is_hank_command = self._hank_participation_command(message)
@@ -8852,8 +8901,27 @@ class TelegramAdapter(BasePlatformAdapter):
             mode = self._participation_mode_for_message(message) or "legacy"
             await self._send_participation_notice(message, f"Hank participation here: {mode}")
             return True
+        missing = object()
+        previous_policy = self.config.extra.get("participation_policy", missing)
         key = self._set_participation_mode_in_memory(message, action)
-        self._persist_participation_policy()
+        persistence = self._persist_participation_policy()
+        if persistence != "persisted":
+            if previous_policy is missing:
+                self.config.extra.pop("participation_policy", None)
+            else:
+                self.config.extra["participation_policy"] = previous_policy
+        if persistence == "not_changed":
+            await self._send_participation_notice(
+                message,
+                f"Hank participation for {key} was not changed because the setting could not be saved.",
+            )
+            return True
+        if persistence != "persisted":
+            await self._send_participation_notice(
+                message,
+                f"Hank participation for {key} could not be verified. Treat the saved setting as unknown until it is checked.",
+            )
+            return True
         label = {"active": "active — Hank responds here without being tagged", "passive": "passive — Hank reacts 👀 unless tagged/assigned", "muted": "muted — Hank stays fully silent except admin commands"}[action]
         await self._send_participation_notice(message, f"Set Hank participation for {key}: {label}")
         return True

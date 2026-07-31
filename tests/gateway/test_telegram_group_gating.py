@@ -267,7 +267,11 @@ def test_participation_policy_passive_can_suppress_reactions_without_dispatch():
 def test_hank_participation_command_sets_thread_mode_without_agent_dispatch(monkeypatch):
     async def _run():
         adapter = _make_adapter(participation_policy={})
-        monkeypatch.setattr(adapter, "_persist_participation_policy", lambda: None)
+        monkeypatch.setattr(
+            adapter,
+            "_persist_participation_policy",
+            lambda: "persisted",
+        )
         update = SimpleNamespace(
             update_id=1004,
             message=_group_message("/hank active here", thread_id=55),
@@ -279,6 +283,175 @@ def test_hank_participation_command_sets_thread_mode_without_agent_dispatch(monk
         adapter._message_handler.assert_not_awaited()
         assert adapter.config.extra["participation_policy"]["threads"]["-100:55"] == "active"
         adapter._bot.send_message.assert_awaited_once()
+
+    asyncio.run(_run())
+
+
+def test_hank_participation_command_persists_exact_policy_and_reloads(
+    monkeypatch,
+    tmp_path,
+):
+    async def _run():
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  extra:\n"
+            "    existing_setting: preserved\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        adapter = _make_adapter(participation_policy={})
+        update = SimpleNamespace(
+            update_id=1004,
+            message=_group_message("/hank active here", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_command(update, SimpleNamespace())
+
+        from hermes_cli.config import read_user_config_raw
+
+        raw = read_user_config_raw(config_path)
+        persisted = raw["telegram"]["extra"]["participation_policy"]
+        assert persisted == {
+            "threads": {"-100:55": "active"},
+            "passive_reaction": "\U0001f440",
+        }
+        assert raw["telegram"]["extra"]["existing_setting"] == "preserved"
+
+        reloaded = load_gateway_config()
+        telegram = reloaded.platforms[Platform.TELEGRAM]
+        assert telegram.extra["participation_policy"] == persisted
+        assert adapter.config.extra["participation_policy"] == persisted
+        assert "Set Hank participation" in adapter._bot.send_message.await_args.kwargs["text"]
+        adapter._message_handler.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_hank_participation_command_reports_persistence_failure_and_rolls_back(
+    monkeypatch,
+    tmp_path,
+):
+    async def _run():
+        from hermes_cli import config as hermes_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  extra:\n"
+            "    participation_policy:\n"
+            "      threads:\n"
+            "        \"-100:55\": passive\n"
+            "      passive_reaction: \"\U0001f440\"\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        original = {
+            "threads": {"-100:55": "passive"},
+            "passive_reaction": "\U0001f440",
+        }
+        adapter = _make_adapter(participation_policy=original)
+
+        def _fail_persistence(*_args, **_kwargs):
+            raise RuntimeError("simulated config write failure")
+
+        monkeypatch.setattr(
+            hermes_config,
+            "atomic_config_write",
+            _fail_persistence,
+        )
+        update = SimpleNamespace(
+            update_id=1004,
+            message=_group_message("/hank active here", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_command(update, SimpleNamespace())
+
+        assert adapter.config.extra["participation_policy"] == original
+        assert (
+            hermes_config.read_user_config_raw(config_path)["telegram"]["extra"][
+                "participation_policy"
+            ]
+            == original
+        )
+        notice = adapter._bot.send_message.await_args.kwargs["text"]
+        assert "was not changed" in notice
+        assert "Set Hank participation" not in notice
+        adapter._message_handler.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
+def test_hank_participation_command_reports_unknown_without_blind_rollback(
+    monkeypatch,
+    tmp_path,
+):
+    async def _run():
+        from hermes_cli import config as hermes_config
+
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  extra:\n"
+            "    participation_policy:\n"
+            "      threads:\n"
+            "        \"-100:55\": passive\n"
+            "      passive_reaction: \"\U0001f440\"\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        original = {
+            "threads": {"-100:55": "passive"},
+            "passive_reaction": "\U0001f440",
+        }
+        third_state = {
+            "threads": {"-100:55": "muted"},
+            "passive_reaction": "\U0001f440",
+        }
+        adapter = _make_adapter(participation_policy=original)
+        real_atomic_config_write = hermes_config.atomic_config_write
+
+        def _write_then_replace_with_third_state(path, data, **kwargs):
+            real_atomic_config_write(path, data, **kwargs)
+            replaced = hermes_config.read_user_config_raw(path)
+            replaced["telegram"]["extra"]["participation_policy"] = third_state
+            real_atomic_config_write(path, replaced, sort_keys=False)
+
+        monkeypatch.setattr(
+            hermes_config,
+            "atomic_config_write",
+            _write_then_replace_with_third_state,
+        )
+        update = SimpleNamespace(
+            update_id=1004,
+            message=_group_message("/hank active here", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_command(update, SimpleNamespace())
+
+        assert adapter.config.extra["participation_policy"] == original
+        assert (
+            hermes_config.read_user_config_raw(config_path)["telegram"]["extra"][
+                "participation_policy"
+            ]
+            == third_state
+        )
+        notice = adapter._bot.send_message.await_args.kwargs["text"]
+        assert "could not be verified" in notice
+        assert "saved setting as unknown" in notice
+        assert "was not changed" not in notice
+        assert "Set Hank participation" not in notice
+        adapter._message_handler.assert_not_awaited()
 
     asyncio.run(_run())
 
