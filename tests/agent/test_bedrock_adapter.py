@@ -695,6 +695,53 @@ class TestBedrockContextLength:
         from agent.bedrock_adapter import get_bedrock_context_length, BEDROCK_DEFAULT_CONTEXT_LENGTH
         assert get_bedrock_context_length("unknown.model-v1:0") == BEDROCK_DEFAULT_CONTEXT_LENGTH
 
+    @pytest.mark.parametrize("model_id", [
+        "anthropic.claude-opus-5",
+        "eu.anthropic.claude-opus-5",
+        "us.anthropic.claude-opus-5",
+        "global.anthropic.claude-opus-5",
+        "eu.anthropic.claude-opus-5-v1:0",
+    ])
+    def test_opus_5_inference_profiles_get_1m(self, model_id):
+        """Opus 5 is 1M, including the regional/global inference profiles.
+
+        Regression for #74263: with no `-5` opus entry the lookup fell
+        through to BEDROCK_DEFAULT_CONTEXT_LENGTH (128K), under-reporting
+        the window ~8x and making the compressor compact far too early.
+        """
+        from agent.bedrock_adapter import get_bedrock_context_length
+        with patch("agent.bedrock_adapter.probe_bedrock_context_length") as mock_probe:
+            assert get_bedrock_context_length(model_id) == 1_000_000
+            mock_probe.assert_not_called()
+
+    def test_million_token_entries_match_model_metadata(self):
+        """BEDROCK_CONTEXT_LENGTHS must not drift from DEFAULT_CONTEXT_LENGTHS.
+
+        The Bedrock table's own comment requires the 1M Claude entries to
+        match ``agent.model_metadata.DEFAULT_CONTEXT_LENGTHS``; nothing
+        enforced it, so ``claude-opus-5`` was added to one table and not the
+        other (#74263).  Bedrock model IDs use hyphens, so the dotted
+        aliases in DEFAULT_CONTEXT_LENGTHS have no Bedrock counterpart and
+        are skipped.
+        """
+        from agent.bedrock_adapter import get_bedrock_context_length
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+
+        missing = []
+        with patch("agent.bedrock_adapter.probe_bedrock_context_length"):
+            for name, ctx in DEFAULT_CONTEXT_LENGTHS.items():
+                if ctx != 1_000_000 or not name.startswith("claude") or "." in name:
+                    continue
+                resolved = get_bedrock_context_length(f"anthropic.{name}")
+                if resolved != 1_000_000:
+                    missing.append(f"anthropic.{name} -> {resolved:,}")
+
+        assert not missing, (
+            "BEDROCK_CONTEXT_LENGTHS is missing 1M entries present in "
+            "DEFAULT_CONTEXT_LENGTHS; these models silently fall back to "
+            f"BEDROCK_DEFAULT_CONTEXT_LENGTH: {missing}"
+        )
+
 
 
     def test_no_region_skips_probe_uses_table(self):
