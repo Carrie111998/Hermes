@@ -332,6 +332,57 @@ class TestShellFileOpsHelpers:
             "/home/alice/notes.txt"
         ) == "'/home/alice/notes.txt'"
 
+    def test_search_files_rg_emits_native_windows_path(self, mock_env, monkeypatch):
+        # The sorted rg --files command AND its unsorted fallback must both
+        # carry the native drive path, not the /c/... rewrite (which native
+        # rg cannot resolve when MSYS2_ARG_CONV_EXCL=* disables conversion).
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._search_files_rg("notes.txt", r"C:\Users\alice", 10, 0)
+
+        commands = [c.args[0] for c in mock_env.execute.call_args_list]
+        assert len(commands) >= 2  # sorted attempt + fallback (empty output)
+        assert commands[0] == (
+            "rg --files --sortr=modified -g '*notes.txt' "
+            r"'C:\Users\alice' 2>/dev/null | head -n 10"
+        )
+        assert commands[1] == (
+            "rg --files -g '*notes.txt' "
+            r"'C:\Users\alice' 2>/dev/null | head -n 10"
+        )
+        assert "/c/Users" not in commands[0]
+        assert "/c/Users" not in commands[1]
+
+    def test_search_with_rg_emits_native_windows_path(self, mock_env, monkeypatch):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._search_with_rg("pattern", r"C:\Users\alice", None, 10, 0, "content", 0)
+
+        cmd = mock_env.execute.call_args.args[0]
+        assert cmd == (
+            "set -o pipefail; rg --line-number --no-heading --with-filename "
+            r"'pattern' 'C:\Users\alice' | head -n 10"
+        )
+        assert "/c/Users" not in cmd
+
+    def test_search_with_grep_emits_native_windows_path(self, mock_env, monkeypatch):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._search_with_grep("pattern", r"C:\Users\alice", None, 10, 0, "content", 0)
+
+        cmd = mock_env.execute.call_args.args[0]
+        assert cmd == (
+            "set -o pipefail; grep -rnH --exclude-dir='.*' "
+            r"'pattern' 'C:\Users\alice' | head -n 10"
+        )
+        assert "/c/Users" not in cmd
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 
