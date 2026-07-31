@@ -343,12 +343,19 @@ _FACEBOOK_MARKETPLACE_ITEM_MENTION_RE = re.compile(
     r"Facebook Marketplace item (?P<listing_id>[0-9]+)",
     flags=re.IGNORECASE,
 )
+_FACEBOOK_CROSSPOST_CONTINUATION_GROUPS_RE = re.compile(
+    r"(?:後續外部跨貼必須嚴格綁定(?:[^：:]*?)群組IDs?"
+    r"|Exact Facebook cross-post group IDs)\s*[:：]\s*"
+    r"(?P<ids>[0-9]+(?:\s*[、,，]\s*[0-9]+)*)\s*\Z",
+    flags=re.IGNORECASE,
+)
 
 
 def _grace_compiled_contract(body: str) -> Optional[Mapping[str, Any]]:
     """Return the sole compiled Grace contract, or None when ambiguous."""
     text = str(body or "")
-    if _grace_loop_stage_header(text) not in {"execution", "grace_review"}:
+    # _grace_loop_stage_header normalizes the grace_review wire value to review.
+    if _grace_loop_stage_header(text) not in {"execution", "review"}:
         return None
     fenced_blocks = re.findall(
         r"```json[ \t]*\r?\n(.*?)\r?\n```",
@@ -376,6 +383,8 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
         return frozenset()
     crosspost = contract.get("facebook_crosspost")
     if isinstance(crosspost, Mapping):
+        from proactive.loop_contract import facebook_crosspost_target_ids
+
         listing_id = str(
             crosspost.get("marketplace_listing_id") or ""
         ).strip()
@@ -394,19 +403,11 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
             or len(set(structured_group_ids)) != len(structured_group_ids)
         ):
             return frozenset()
-        display_text = " ".join(str(target or "") for target in targets)
-        mentioned_group_ids = {
-            match.group("group_id")
-            for match in _FACEBOOK_GROUP_MENTION_RE.finditer(display_text)
-        }
+        mentioned_listing_ids, mentioned_group_ids = (
+            facebook_crosspost_target_ids(targets)
+        )
         if mentioned_group_ids != set(structured_group_ids):
             return frozenset()
-        mentioned_listing_ids = {
-            match.group("listing_id")
-            for match in _FACEBOOK_MARKETPLACE_ITEM_MENTION_RE.finditer(
-                display_text
-            )
-        }
         if mentioned_listing_ids != {listing_id}:
             return frozenset()
         return frozenset(structured_group_ids)
@@ -455,6 +456,149 @@ def grace_facebook_crosspost_scope(
     ):
         return None, frozenset()
     return listing_id, group_ids
+
+
+def accepted_grace_callback_facebook_crosspost_scope(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+) -> tuple[Optional[str], frozenset[str]]:
+    """Return the exact cross-post scope proven by an accepted review.
+
+    A discovery-stage review may add the listing ID as verified evidence, but
+    its destination groups remain locked to the explicit continuation record
+    in the original compiled contract. A publishing-stage contract instead
+    carries both values in its structured facebook_crosspost field.
+    """
+    event = conn.execute(
+        "SELECT task_id, run_id, kind FROM task_events WHERE id = ?",
+        (int(event_id),),
+    ).fetchone()
+    task = conn.execute(
+        "SELECT body, created_by FROM tasks WHERE id = ?",
+        (review_task_id.strip(),),
+    ).fetchone()
+    review_run = conn.execute(
+        """
+        SELECT metadata
+          FROM task_runs
+         WHERE id = ? AND task_id = ? AND outcome = 'completed'
+        """,
+        (event["run_id"] if event is not None else None, review_task_id.strip()),
+    ).fetchone()
+    if (
+        event is None
+        or event["task_id"] != review_task_id.strip()
+        or event["kind"] != "completed"
+        or event["run_id"] is None
+        or task is None
+        or task["created_by"] != "grace-loop-compiler"
+        or review_run is None
+    ):
+        return None, frozenset()
+    try:
+        metadata = json.loads(review_run["metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, frozenset()
+    if (
+        not isinstance(metadata, Mapping)
+        or metadata.get("review_outcome") != "accepted"
+    ):
+        return None, frozenset()
+    contract = _grace_compiled_contract(str(task["body"] or ""))
+    if contract is None:
+        return None, frozenset()
+    # Compiler-created review bodies are immutable after creation: the only
+    # body-edit API is limited to triage tasks. The event run_id above binds
+    # the accepted metadata to this exact completion rather than a later run.
+    structured = contract.get("facebook_crosspost")
+    if isinstance(structured, Mapping):
+        listing_id, group_ids = grace_facebook_crosspost_scope(
+            str(task["body"] or "")
+        )
+        return listing_id, group_ids
+
+    memory = contract.get("memory")
+    working = memory.get("working") if isinstance(memory, Mapping) else None
+    if not isinstance(working, list):
+        return None, frozenset()
+    group_sets: list[frozenset[str]] = []
+    for item in working:
+        match = _FACEBOOK_CROSSPOST_CONTINUATION_GROUPS_RE.fullmatch(
+            str(item or "").strip()
+        )
+        if match is None:
+            continue
+        raw_ids = [
+            part.strip()
+            for part in re.split(r"[、,，]", match.group("ids"))
+            if part.strip()
+        ]
+        ids = frozenset(raw_ids)
+        if (
+            ids
+            and len(ids) == len(raw_ids)
+            and all(group_id.isdigit() for group_id in ids)
+        ):
+            group_sets.append(ids)
+    if len(group_sets) != 1:
+        return None, frozenset()
+    verified = metadata.get("verified_evidence")
+    listing_id = str(
+        verified.get("listing_id")
+        if isinstance(verified, Mapping)
+        else ""
+    ).strip()
+    if not listing_id.isdigit():
+        return None, frozenset()
+    verified_url = str(
+        verified.get("url") if isinstance(verified, Mapping) else ""
+    ).strip()
+    if verified_url:
+        from proactive.loop_contract import facebook_crosspost_target_ids
+
+        url_listing_ids, _ = facebook_crosspost_target_ids([verified_url])
+        if url_listing_ids != {listing_id}:
+            return None, frozenset()
+    return listing_id, group_sets[0]
+
+
+def validate_grace_callback_facebook_crosspost_scope(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: str,
+    event_id: int,
+    listing_id: str,
+    group_ids: list[str],
+) -> None:
+    """Fail closed when a callback drifts from its accepted source scope."""
+    expected_listing_id, expected_group_ids = (
+        accepted_grace_callback_facebook_crosspost_scope(
+            conn,
+            review_task_id=review_task_id,
+            event_id=event_id,
+        )
+    )
+    supplied_listing_id = str(listing_id or "").strip()
+    supplied_group_ids = frozenset(
+        str(group_id or "").strip() for group_id in group_ids
+    )
+    if expected_listing_id is None or not expected_group_ids:
+        raise ValueError(
+            "Origin callback does not carry one accepted exact Facebook "
+            "cross-post scope."
+        )
+    if supplied_listing_id != expected_listing_id:
+        raise ValueError(
+            "facebook_crosspost.marketplace_listing_id must match the "
+            "listing id in accepted review evidence."
+        )
+    if supplied_group_ids != expected_group_ids:
+        raise ValueError(
+            "facebook_crosspost.group_ids must match the exact group ids "
+            "locked by the origin Loop Contract."
+        )
 
 
 def _grace_contract_has_legacy_human_approval(

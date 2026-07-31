@@ -1018,6 +1018,37 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_id=session_id,
                         lease_owner=callback_lease_owner,
                     )
+                    (
+                        source_crosspost_listing_id,
+                        source_crosspost_group_ids,
+                    ) = kb.accepted_grace_callback_facebook_crosspost_scope(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                    )
+                    if (
+                        source_crosspost_listing_id is not None
+                        and source_crosspost_group_ids
+                        and facebook_crosspost is None
+                    ):
+                        raise ValueError(
+                            "Origin callback locks an exact Facebook cross-post "
+                            "scope; facebook_crosspost cannot be omitted."
+                        )
+                    if facebook_crosspost is not None:
+                        kb.validate_grace_callback_facebook_crosspost_scope(
+                            conn,
+                            review_task_id=origin_review_id,
+                            event_id=origin_event_id,
+                            listing_id=str(
+                                facebook_crosspost.get(
+                                    "marketplace_listing_id"
+                                ) or ""
+                            ),
+                            group_ids=list(
+                                facebook_crosspost.get("group_ids") or []
+                            ),
+                        )
                 else:
                     kb.validate_accepted_grace_callback_origin(
                         conn,

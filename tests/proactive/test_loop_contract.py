@@ -119,11 +119,6 @@ def test_grace_bodies_require_durable_external_effect_handoff():
 @pytest.mark.parametrize(
     "external_target",
     [
-        (
-            "Facebook Marketplace https://facebook.com/marketplace/item/111 "
-            "→ Facebook group https://facebook.com/groups/222"
-        ),
-        "Facebook Marketplace item 111 → Facebook Group ID 222",
         "Facebook Marketplace item 999 → Facebook Group 222",
         "Facebook Marketplace item 111 → Facebook Group 999",
     ],
@@ -147,6 +142,38 @@ def test_facebook_crosspost_accepts_canonical_matching_display_ids():
     contract["external_targets"] = [
         "Facebook Marketplace item 111 → Facebook Group 222",
     ]
+    contract["facebook_crosspost"] = {
+        "marketplace_listing_id": "111",
+        "group_ids": ["222"],
+    }
+
+    validated = validate_loop_contract(contract)
+
+    assert validated["facebook_crosspost"] == contract["facebook_crosspost"]
+
+
+@pytest.mark.parametrize(
+    "external_targets",
+    [
+        [
+            "https://www.facebook.com/marketplace/item/111/",
+            "https://www.facebook.com/groups/222/",
+        ],
+        [
+            "Facebook Marketplace listing ID: 111",
+            "Facebook group ID: 222",
+        ],
+        [
+            "Facebook 市集項目 111 → 社團 "
+            "https://www.facebook.com/groups/222/",
+        ],
+    ],
+)
+def test_facebook_crosspost_accepts_explicit_url_and_id_labels(
+    external_targets,
+):
+    contract = _contract()
+    contract["external_targets"] = external_targets
     contract["facebook_crosspost"] = {
         "marketplace_listing_id": "111",
         "group_ids": ["222"],

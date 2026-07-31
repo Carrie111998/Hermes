@@ -16,6 +16,72 @@ class LoopContractError(ValueError):
     """Raised when Grace has not supplied an executable contract."""
 
 
+_FACEBOOK_MARKETPLACE_TARGET_PATTERNS = (
+    re.compile(
+        r"Facebook\s+Marketplace\s+item\s+(?P<id>[0-9]+)"
+        r"(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"Facebook\s+Marketplace\s+(?:listing\s+)?ID\s*[:：]?\s*"
+        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"Facebook\s+(?:市集項目|市集刊登)(?:\s*ID)?\s*[:：]?\s*"
+        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"https://(?:(?:www|m)\.)?facebook\.com/marketplace/item/"
+        r"(?P<id>[0-9]+)(?:[/?#]|$)",
+        flags=re.IGNORECASE,
+    ),
+)
+_FACEBOOK_GROUP_TARGET_PATTERNS = (
+    re.compile(
+        r"Facebook\s+Group(?:\s+ID)?\s*[:：]?\s*(?P<id>[0-9]+)"
+        r"(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"Facebook\s+(?:社團|群組)(?:\s*ID)?\s*[:：]?\s*"
+        r"(?P<id>[0-9]+)(?![0-9A-Za-z])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"https://(?:(?:www|m)\.)?facebook\.com/groups/"
+        r"(?P<id>[0-9]+)(?:[/?#]|$)",
+        flags=re.IGNORECASE,
+    ),
+)
+
+
+def facebook_crosspost_target_ids(
+    targets: Any,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Read only explicit Marketplace listing and Facebook group identifiers.
+
+    This intentionally accepts the canonical labels emitted by Grace plus the
+    corresponding Facebook URLs and localized ID labels. Arbitrary numbers are
+    never treated as authority.
+    """
+    if not isinstance(targets, list):
+        return frozenset(), frozenset()
+    target_text = " ".join(str(target or "") for target in targets)
+    listing_ids = {
+        match.group("id")
+        for pattern in _FACEBOOK_MARKETPLACE_TARGET_PATTERNS
+        for match in pattern.finditer(target_text)
+    }
+    group_ids = {
+        match.group("id")
+        for pattern in _FACEBOOK_GROUP_TARGET_PATTERNS
+        for match in pattern.finditer(target_text)
+    }
+    return frozenset(listing_ids), frozenset(group_ids)
+
+
 def contract_fingerprint(contract: Mapping[str, Any]) -> str:
     """Return the immutable scope fingerprint used by approval and callbacks.
 
@@ -117,17 +183,10 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
                     "strings"
                 )
             targets = value.get("external_targets")
-            target_text = (
-                " ".join(str(target) for target in targets)
-                if isinstance(targets, list)
-                else ""
+            mentioned_listing_ids, mentioned_group_ids = (
+                facebook_crosspost_target_ids(targets)
             )
-            folded_targets = target_text.casefold()
-            if not (
-                "facebook" in folded_targets
-                and "marketplace" in folded_targets
-                and ("group" in folded_targets or "社團" in target_text)
-            ):
+            if not mentioned_listing_ids or not mentioned_group_ids:
                 errors.append(
                     "facebook_crosspost requires Facebook Marketplace and "
                     "group destinations in external_targets"
@@ -135,26 +194,16 @@ def validate_loop_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
             if isinstance(group_ids, list) and all(
                 isinstance(group_id, str) for group_id in group_ids
             ):
-                mentioned_group_ids = set(re.findall(
-                    r"Facebook Group ([0-9]+)",
-                    target_text,
-                    flags=re.IGNORECASE,
-                ))
-                if mentioned_group_ids != set(group_ids):
+                if mentioned_group_ids != frozenset(group_ids):
                     errors.append(
                         "facebook_crosspost.group_ids must match group ids "
                         "shown in external_targets"
                     )
-            mentioned_listing_ids = set(re.findall(
-                r"Facebook Marketplace item ([0-9]+)",
-                target_text,
-                flags=re.IGNORECASE,
-            ))
             if (
                 not mentioned_listing_ids
                 or (
                     not isinstance(listing_id, str)
-                    or mentioned_listing_ids != {listing_id}
+                    or mentioned_listing_ids != frozenset({listing_id})
                 )
             ):
                 errors.append(
