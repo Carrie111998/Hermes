@@ -6545,7 +6545,7 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
         if sys.platform == "win32":
             return (
                 "powershell -NoProfile -Command "
-                "\"Remove-Item -LiteralPath \\\"$env:USERPROFILE\\.claude\\credentials.json\\\" "
+                "\"Remove-Item -LiteralPath \\\"$env:USERPROFILE\\.claude\\.credentials.json\\\" "
                 "-Force -ErrorAction SilentlyContinue\""
             )
         return "rm -f ~/.claude/.credentials.json"
