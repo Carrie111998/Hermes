@@ -1318,3 +1318,127 @@ class TestSlackReplyInThreadProgressRouting:
         ) is None
 
 
+
+# ── Progress-callback redaction: the real active path (review of #72432) ───
+#
+# A prior fix redacted gateway/platforms/base.py::format_tool_event(), a
+# renderer GatewayEventDispatcher instantiates -- but production gateway
+# delivery routes through TurnRunner.progress_callback (this file) instead,
+# and agent/codex_runtime.py forwards raw MCP args/preview into that SAME
+# callback. These tests exercise the real, active path end to end: a fake
+# Agent (mimicking agent/codex_runtime.py's calling convention) invokes the
+# real bound progress_callback with a browser_type call carrying a
+# recognizable secret, through the full _run_with_agent harness (real
+# GatewayRunner, real adapter, real config-driven display mode).
+
+
+class CodexLikeAgent:
+    """Mimics agent/codex_runtime.py forwarding a browser_type call's raw
+    MCP args and a raw preview string (both carrying an unredacted secret)
+    to tool_progress_callback, exactly as the real Codex bridge does."""
+
+    SECRET = "sk-ant-api03-FAKEsecretvalue1234567890abcdefgh"
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback(
+            "tool.started", "browser_type",
+            f'typing "{self.SECRET}" into @e3',  # raw preview, as codex_runtime builds it
+            {"ref": "@e3", "text": self.SECRET},  # raw MCP args
+        )
+        time.sleep(0.35)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "session_input_tokens": 0, "session_output_tokens": 0,
+            "session_cache_read_tokens": 0, "session_cache_write_tokens": 0,
+            "session_prompt_tokens": 0, "session_completion_tokens": 0,
+            "session_total_tokens": 0, "api_calls": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_verbose_mode_redacts_secret_from_codex_bridge_args(monkeypatch, tmp_path):
+    """Verbose mode: a secret in the raw args dict forwarded by the Codex
+    bridge must not reach chat history."""
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, CodexLikeAgent,
+        session_id="sess-codex-verbose-redact",
+        config_data={"display": {"tool_progress": "verbose", "tool_preview_length": 0}},
+    )
+    assert result["final_response"] == "done"
+    all_content = " ".join(c["content"] for c in adapter.sent)
+    all_content += " ".join(c["content"] for c in adapter.edits)
+    assert CodexLikeAgent.SECRET not in all_content, (
+        f"Secret leaked into verbose-mode chat history: {all_content!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compact_mode_redacts_secret_from_codex_bridge_preview(monkeypatch, tmp_path):
+    """Default (compact/new) mode: a secret in the raw preview string
+    forwarded by the Codex bridge must not reach chat history."""
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, CodexLikeAgent,
+        session_id="sess-codex-compact-redact",
+        config_data={"display": {"tool_progress": "all"}},
+    )
+    assert result["final_response"] == "done"
+    all_content = " ".join(c["content"] for c in adapter.sent)
+    all_content += " ".join(c["content"] for c in adapter.edits)
+    # Compact mode truncates the preview to a short cap by design (a UX
+    # feature, unrelated to redaction) -- so even with the fix applied,
+    # the FULL secret string is never present regardless. What must never
+    # appear is a recognizable PREFIX of the secret: a truncated-but-still
+    # -unredacted leak (e.g. "sk-ant-api03-FAKEs...") is still a real
+    # credential exposure, just a shorter one.
+    secret_prefix = CodexLikeAgent.SECRET[:20]
+    assert secret_prefix not in all_content, (
+        f"Secret prefix leaked into compact-mode chat history: {all_content!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_log_mode_redacts_secret_from_codex_bridge_preview(monkeypatch, tmp_path):
+    """Log mode (display.tool_progress: log): a secret in the raw preview
+    string forwarded by the Codex bridge must not reach the persisted
+    tool-call log queue -- the sink at gateway/run.py's log-mode branch,
+    reached via ctx.log_queue.put(preview_str), BEFORE the verbose/compact
+    branches further down in progress_callback. Regression requested in
+    review of #75074: the existing verbose/compact tests don't cover this
+    sink, so a regression in the redaction's ordering (moved to run AFTER
+    this branch instead of before it) would go undetected.
+
+    Captures queue.Queue.put() calls SYNCHRONOUSLY (via a wrapped put
+    method) rather than inspecting the queue's contents after the run
+    completes: gateway/run.py spawns a background write_tool_log() task
+    (asyncio.create_task) that concurrently drains the SAME queue via
+    get_nowait() and writes to the log file, so by the time a test
+    function resumes after the turn completes, the queue may already be
+    empty -- checking put() calls directly avoids that race entirely.
+    """
+    import queue as _queue_mod
+
+    captured_puts: list[str] = []
+    _real_put = _queue_mod.Queue.put
+
+    def _capturing_put(self, item, *a, **kw):
+        captured_puts.append(item)
+        return _real_put(self, item, *a, **kw)
+
+    monkeypatch.setattr(_queue_mod.Queue, "put", _capturing_put)
+
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, CodexLikeAgent,
+        session_id="sess-codex-log-redact",
+        config_data={"display": {"tool_progress": "log"}},
+    )
+    assert result["final_response"] == "done"
+
+    joined = " ".join(str(item) for item in captured_puts)
+    assert CodexLikeAgent.SECRET not in joined, (
+        f"Secret leaked into the tool-call log queue: {captured_puts!r}"
+    )

@@ -3366,6 +3366,28 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        # Redact recognizable secrets in args/preview BEFORE any sink below
+        # reads them -- this is the single boundary every source (native
+        # tools, MCP tools, the Codex bridge in agent/codex_runtime.py,
+        # etc.) funnels through on its way to a display or log surface, so
+        # sanitizing here covers the live status phrase just below, the log
+        # mode append, the verbose-mode arg serialization, and the
+        # compact/new-mode preview render all at once -- rather than
+        # requiring a separate fix at each upstream caller and each sink
+        # (issue #72298, #10520; a prior attempt at gateway/platforms/base.py
+        # redacted a renderer GatewayEventDispatcher that production gateway
+        # delivery never instantiates -- this callback is the actual active
+        # path). tool_name-specific dict redaction (browser_type's typed
+        # text) plus a general pattern-based text scan on the preview string
+        # (which may already be a truncated/formatted summary, not
+        # necessarily args-shaped) together cover both representations of
+        # the same underlying call.
+        if args:
+            from agent.display import redact_tool_args_for_display
+            args = redact_tool_args_for_display(tool_name, args) or args
+        if preview:
+            from agent.redact import redact_sensitive_text
+            preview = redact_sensitive_text(preview, force=True)
         # Live status line (Slack's assistant status): stash the current
         # tool phrase on the adapter; the _keep_typing refresh renders it
         # within a couple of seconds. Handled before every other gate
