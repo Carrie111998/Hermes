@@ -13,6 +13,173 @@ def reset_single_query_finalize_state(monkeypatch):
 
 
 
+@pytest.fixture
+def session_db():
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _fake_cli(db, agent_session_id, cli_session_id, calls):
+    agent = SimpleNamespace(
+        session_id=agent_session_id,
+        platform="cli",
+        close=lambda: calls.append("agent-close"),
+    )
+    return SimpleNamespace(
+        _session_db=db,
+        session_id=cli_session_id,
+        agent=agent,
+        _release_active_session=lambda: calls.append("release"),
+    )
+
+
+def test_finalize_single_query_ends_live_session_row(monkeypatch, session_db):
+    db = session_db
+    db.create_session("one-shot-session", "cli")
+    calls = []
+    fake_cli = _fake_cli(db, "one-shot-session", "one-shot-session", calls)
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    row = db.get_session("one-shot-session")
+    assert row["ended_at"] is not None
+    assert row["end_reason"] == "cli_close"
+    assert "agent-close" not in calls
+    assert calls[-1] == "release"
+
+
+def test_finalize_single_query_ends_live_agent_session_not_stale_cli_session(
+    monkeypatch, session_db
+):
+    db = session_db
+    db.create_session("stale-cli-session", "cli")
+    db.create_session("live-agent-session", "cli")
+    calls = []
+    fake_cli = _fake_cli(db, "live-agent-session", "stale-cli-session", calls)
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    live = db.get_session("live-agent-session")
+    assert live["ended_at"] is not None
+    assert live["end_reason"] == "cli_close"
+    stale = db.get_session("stale-cli-session")
+    assert stale["ended_at"] is None
+    assert stale["end_reason"] is None
+
+
+def test_finalize_single_query_cleanup_failure_still_ends_session_and_releases(
+    monkeypatch, session_db
+):
+    db = session_db
+    db.create_session("one-shot-session", "cli")
+    calls = []
+    fake_cli = _fake_cli(db, "one-shot-session", "one-shot-session", calls)
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+
+    def cleanup(**kwargs):
+        calls.append("cleanup")
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(cli, "_run_cleanup", cleanup)
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        cli._finalize_single_query(fake_cli)
+
+    row = db.get_session("one-shot-session")
+    assert row["ended_at"] is not None
+    assert row["end_reason"] == "cli_close"
+    assert calls[-1] == "release"
+
+
+def test_finalize_single_query_close_failure_still_runs_cleanup_and_release(monkeypatch):
+    calls = []
+
+    class ExplodingDB:
+        def end_session(self, session_id, end_reason):
+            calls.append("end_session")
+            raise RuntimeError("db write failed")
+
+    fake_cli = _fake_cli(ExplodingDB(), "one-shot-session", "one-shot-session", calls)
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    assert calls == ["finalize", "end_session", "cleanup", "release"]
+
+
+@pytest.mark.parametrize(
+    "hook_error",
+    [KeyboardInterrupt(), SystemExit(23)],
+    ids=["keyboard-interrupt", "system-exit"],
+)
+def test_finalize_single_query_hook_base_exception_still_closes_and_cleans_up(
+    monkeypatch, session_db, hook_error
+):
+    db = session_db
+    db.create_session("one-shot-session", "cli")
+    calls = []
+    fake_cli = _fake_cli(db, "one-shot-session", "one-shot-session", calls)
+
+    def finalize(_cli):
+        calls.append("finalize")
+        raise hook_error
+
+    monkeypatch.setattr(cli, "_notify_single_query_session_finalize", finalize)
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    with pytest.raises(type(hook_error)) as exc_info:
+        cli._finalize_single_query(fake_cli)
+
+    assert exc_info.value is hook_error
+    row = db.get_session("one-shot-session")
+    assert row["ended_at"] is not None
+    assert row["end_reason"] == "cli_close"
+    assert calls == ["finalize", "cleanup", "release"]
+
+
+def test_finalize_single_query_preserves_existing_end_reason(monkeypatch, session_db):
+    db = session_db
+    db.create_session("one-shot-session", "cli")
+    db.end_session("one-shot-session", "new_session")
+    already_ended = db.get_session("one-shot-session")
+    calls = []
+    fake_cli = _fake_cli(db, "one-shot-session", "one-shot-session", calls)
+
+    monkeypatch.setattr(
+        cli, "_notify_single_query_session_finalize", lambda _cli: calls.append("finalize")
+    )
+    monkeypatch.setattr(cli, "_run_cleanup", lambda **kwargs: calls.append("cleanup"))
+
+    cli._finalize_single_query(fake_cli)
+
+    row = db.get_session("one-shot-session")
+    assert row["end_reason"] == "new_session"
+    assert row["ended_at"] == already_ended["ended_at"]
+    assert calls[-1] == "release"
+
+
 def test_finalize_single_query_releases_session_when_cleanup_fails(monkeypatch):
     calls = []
     fake_cli = SimpleNamespace(_release_active_session=lambda: calls.append("release"))

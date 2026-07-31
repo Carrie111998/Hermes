@@ -1340,8 +1340,24 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
-        _notify_single_query_session_finalize(cli)
-        _run_cleanup(notify_session_finalize=False)
+        try:
+            _notify_single_query_session_finalize(cli)
+        finally:
+            # Durably close the live session row (mirrors the interactive exit
+            # path) before _run_cleanup so hook or cleanup failures can't leave
+            # the one-shot session open. Agent session_id wins over a stale
+            # cli.session_id left behind by a mid-run continuation, and
+            # end_session is first-reason-wins so an already-ended row keeps
+            # its original reason.
+            try:
+                session_db = getattr(cli, "_session_db", None)
+                agent = getattr(cli, "agent", None)
+                session_id = getattr(agent, "session_id", None) or getattr(cli, "session_id", None)
+                if session_db and session_id:
+                    session_db.end_session(session_id, "cli_close")
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Could not close single-query session in DB: %s", e)
+            _run_cleanup(notify_session_finalize=False)
     finally:
         cli._release_active_session()
 
