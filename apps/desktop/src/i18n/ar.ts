@@ -951,6 +951,15 @@ export const ar = defineLocale({
     modeAgent: 'وكيل',
     modeScript: 'سكريبت',
     modeScriptOnly: 'سكريبت فقط',
+    jobViews: {
+      attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
+      driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },
+      inbox: { description: 'Inbox monitor: private metadata triage with action-only reporting.', label: 'Inbox monitor' },
+      revenue: { description: 'Revenue loop: track concrete customer/revenue progress and human-only gates.', label: 'Revenue operator' },
+      sentinel: { description: 'Sentinel/guard: script-only health checks should stay silent unless state changes.', label: 'Sentinel guard' },
+      trading: { description: 'Paper research lane: read-only/paper-only market experiments and summaries.', label: 'Paper trading research' },
+      watchdog: { description: 'Watchdog: self-heal or alert only on concrete health changes.', label: 'Watchdog' }
+    },
     noCronJobsTitle: 'لم يتم اكتشاف مهام Cron',
     noCronJobsDesc: profile => `ستظهر المهام الجديدة التي ينشئها ${profile} هنا تلقائيا بعرض افتراضي.`,
     emptyTitle: 'لا يوجد وكلاء فرعيون مباشرون',

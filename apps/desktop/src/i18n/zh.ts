@@ -1333,6 +1333,15 @@ export const zh: Translations = {
     modeAgent: '代理',
     modeScript: '脚本',
     modeScriptOnly: '仅脚本',
+    jobViews: {
+      attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
+      driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },
+      inbox: { description: 'Inbox monitor: private metadata triage with action-only reporting.', label: 'Inbox monitor' },
+      revenue: { description: 'Revenue loop: track concrete customer/revenue progress and human-only gates.', label: 'Revenue operator' },
+      sentinel: { description: 'Sentinel/guard: script-only health checks should stay silent unless state changes.', label: 'Sentinel guard' },
+      trading: { description: 'Paper research lane: read-only/paper-only market experiments and summaries.', label: 'Paper trading research' },
+      watchdog: { description: 'Watchdog: self-heal or alert only on concrete health changes.', label: 'Watchdog' }
+    },
     noCronJobsTitle: '未检测到 Cron 作业',
     noCronJobsDesc: profile => `${profile} 新建的作业会自动以默认视图显示在这里。`,
     emptyTitle: '暂无活跃子代理',

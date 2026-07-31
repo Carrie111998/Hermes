@@ -1068,6 +1068,15 @@ export const zhHant = defineLocale({
     modeAgent: '代理',
     modeScript: '腳本',
     modeScriptOnly: '僅腳本',
+    jobViews: {
+      attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
+      driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },
+      inbox: { description: 'Inbox monitor: private metadata triage with action-only reporting.', label: 'Inbox monitor' },
+      revenue: { description: 'Revenue loop: track concrete customer/revenue progress and human-only gates.', label: 'Revenue operator' },
+      sentinel: { description: 'Sentinel/guard: script-only health checks should stay silent unless state changes.', label: 'Sentinel guard' },
+      trading: { description: 'Paper research lane: read-only/paper-only market experiments and summaries.', label: 'Paper trading research' },
+      watchdog: { description: 'Watchdog: self-heal or alert only on concrete health changes.', label: 'Watchdog' }
+    },
     noCronJobsTitle: '未偵測到 Cron 作業',
     noCronJobsDesc: profile => `${profile} 新增的作業會自動以預設檢視顯示在這裡。`,
     emptyTitle: '暫無活躍子代理',

@@ -998,6 +998,10 @@ export interface Translations {
     modeAgent: string
     modeScript: string
     modeScriptOnly: string
+    jobViews: Record<
+      'attention' | 'driver' | 'inbox' | 'revenue' | 'sentinel' | 'trading' | 'watchdog',
+      { description: string; label: string }
+    >
     noCronJobsTitle: string
     noCronJobsDesc: (profile: string) => string
     emptyTitle: string

@@ -149,42 +149,14 @@ type CronJobViewKind =
   | 'watchdog'
   | 'default'
 
-const CUSTOM_JOB_VIEW: Record<Exclude<CronJobViewKind, 'default'>, { accent: string; description: string; label: string }> = {
-  attention: {
-    accent: 'border-sky-500/35 bg-sky-500/10 text-sky-700 dark:text-sky-300',
-    description: 'Attention monitor: verify live notifications/review requests before taking action.',
-    label: 'GitHub attention'
-  },
-  driver: {
-    accent: 'border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300',
-    description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.',
-    label: 'Driver loop'
-  },
-  inbox: {
-    accent: 'border-cyan-500/35 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
-    description: 'Inbox monitor: private metadata triage with action-only reporting.',
-    label: 'Inbox monitor'
-  },
-  revenue: {
-    accent: 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
-    description: 'Revenue loop: track concrete customer/revenue progress and human-only gates.',
-    label: 'Revenue operator'
-  },
-  sentinel: {
-    accent: 'border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300',
-    description: 'Sentinel/guard: script-only health checks should stay silent unless state changes.',
-    label: 'Sentinel guard'
-  },
-  trading: {
-    accent: 'border-orange-500/35 bg-orange-500/10 text-orange-700 dark:text-orange-300',
-    description: 'Paper research lane: read-only/paper-only market experiments and summaries.',
-    label: 'Paper trading research'
-  },
-  watchdog: {
-    accent: 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300',
-    description: 'Watchdog: self-heal or alert only on concrete health changes.',
-    label: 'Watchdog'
-  }
+const CUSTOM_JOB_VIEW_ACCENT: Record<Exclude<CronJobViewKind, 'default'>, string> = {
+  attention: 'border-sky-500/35 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  driver: 'border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300',
+  inbox: 'border-cyan-500/35 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  revenue: 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  sentinel: 'border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  trading: 'border-orange-500/35 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+  watchdog: 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300'
 }
 
 function jobViewKind(job: CronJob): CronJobViewKind {
@@ -435,7 +407,9 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
   const prompt = jobPrompt(job)
   const flags = [job.no_agent ? a.modeScriptOnly : '', job.script ? a.modeScript : ''].filter(Boolean)
   const custom = jobViewKind(job)
-  const customView = custom === 'default' ? null : CUSTOM_JOB_VIEW[custom]
+  const customView = custom === 'default' ? null : a.jobViews[custom]
+  const customAccent = custom === 'default' ? '' : CUSTOM_JOB_VIEW_ACCENT[custom]
+
   const meta = [
     repeatText(job),
     asText(job.last_status) ? `last: ${asText(job.last_status)}` : '',
@@ -458,7 +432,7 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
       </div>
 
       {customView ? (
-        <div className={cn('rounded-md border px-3 py-2 text-xs leading-relaxed', customView.accent)}>
+        <div className={cn('rounded-md border px-3 py-2 text-xs leading-relaxed', customAccent)}>
           <p className="font-semibold">{customView.label}</p>
           <p className="mt-0.5 opacity-85">{customView.description}</p>
         </div>
