@@ -1977,3 +1977,44 @@ def test_dynamic_workspace_real_container_round_trips_files_and_git_without_host
         check=True,
     ).stdout.splitlines()
     assert not (volume_names & set(remaining))
+
+
+def test_workspace_only_is_normalized_to_a_strict_bool(tmp_path, monkeypatch):
+    """The constructor owns the type contract.
+
+    ``tools/file_tools.py`` reads ``env._workspace_only`` with a strict
+    ``is True`` check, so a truthy non-bool reaching the attribute would
+    silently route document reads down the host path while the container is
+    still confined. Normalizing here keeps both sides honest.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.email", "t@example.test"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=project, check=True)
+    (project / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
+    _fake_docker(monkeypatch)
+    for value in (True, 1, "yes"):
+        env = docker_env.DockerEnvironment(
+            image="example/image",
+            cwd="/workspace",
+            timeout=120,
+            task_id=f"t_norm_{id(value)}",
+            host_cwd=str(project),
+            auto_mount_cwd=True,
+            workspace_only=value,
+        )
+        assert env._workspace_only is True, value
+    for value in (False, 0, "", None):
+        env = docker_env.DockerEnvironment(
+            image="example/image",
+            cwd="/workspace",
+            timeout=120,
+            task_id=f"t_norm_off_{id(value)}",
+            host_cwd=str(project),
+            auto_mount_cwd=True,
+            workspace_only=value,
+        )
+        assert env._workspace_only is False, value

@@ -1797,7 +1797,10 @@ class DockerEnvironment(BaseEnvironment):
             persist_across_processes = False
             run_as_host_user = True
             network = False
-        self._workspace_only = workspace_only
+        # Strict bool at the boundary: tools/file_tools.py gates the
+        # workspace-only read path on ``is True``, so a truthy non-bool here
+        # would confine the container while routing reads to the host.
+        self._workspace_only = bool(workspace_only)
         self._private_workspace = bool(workspace_only and workspace_identity is not None)
         self._workspace_git_metadata = git_metadata
         self._git_broker_root: Path | None = None

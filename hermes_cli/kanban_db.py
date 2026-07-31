@@ -6984,9 +6984,15 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
-    if process_start_time and not _worker_identity_is_alive(
-        int(pid), process_start_time
-    ):
+    if not process_start_time:
+        # No captured identity means no proof of what this PID currently is.
+        # Signalling anyway would be a blind kill of whatever inherited the
+        # number (legacy pre-migration rows, or a failed ``ps`` capture).
+        # Falls through to the normal release path via termination_attempted.
+        info["identity_unproven"] = True
+        return info
+
+    if not _worker_identity_is_alive(int(pid), process_start_time):
         # Either the worker exited (nothing to signal) or this PID now belongs
         # to a different process (must never be signalled). Both are "gone".
         info["identity_mismatch"] = True
@@ -7012,22 +7018,27 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _pid_alive(pid):
+        if not _worker_identity_is_alive(int(pid), process_start_time):
             info["terminated"] = True
             return info
         time.sleep(0.5)
 
-    if _pid_alive(pid):
-        try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
-            info["sigkill"] = True
-        except (ProcessLookupError, OSError):
-            return info
+    # Re-prove the exact identity immediately before escalating: the worker may
+    # have exited during the grace window and the OS may have already handed
+    # its PID to an unrelated process.
+    if not _worker_identity_is_alive(int(pid), process_start_time):
+        info["terminated"] = True
+        return info
+    try:
+        # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
+        # (which maps to TerminateProcess via the stdlib shim).
+        _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
+        kill(int(pid), _sigkill)
+        info["sigkill"] = True
+    except (ProcessLookupError, OSError):
+        return info
 
-    info["terminated"] = not _pid_alive(pid)
+    info["terminated"] = not _worker_identity_is_alive(int(pid), process_start_time)
     return info
 
 

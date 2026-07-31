@@ -261,3 +261,103 @@ def test_block_still_terminates_when_start_time_identity_matches(kanban_home):
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# R2-M4 — identity must fail closed at EVERY signal, not just the first
+# ---------------------------------------------------------------------------
+
+def test_recycled_pid_during_grace_is_never_sigkilled(kanban_home, monkeypatch):
+    """Identity must be re-proven immediately before SIGKILL too.
+
+    A worker can exit during the SIGTERM grace window and the OS can hand its
+    PID to another process. Signalling again on the strength of the pre-SIGTERM
+    check would kill that innocent process.
+    """
+    import signal as signal_module
+
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    identity = kb._worker_process_start_time(proc.pid)
+    state = {"alive_calls": 0}
+
+    def flaky_identity(pid, start_time):
+        # Alive for the pre-SIGTERM check, recycled by the time the grace
+        # window expires and SIGKILL is considered.
+        state["alive_calls"] += 1
+        return state["alive_calls"] == 1
+
+    monkeypatch.setattr(kb, "_worker_identity_is_alive", flaky_identity)
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+
+    try:
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, f"{kb._claimer_id().split(':', 1)[0]}:x",
+            signal_fn=lambda p, s: sent.append(s),
+            process_start_time=identity,
+        )
+        assert signal_module.SIGTERM in sent, "the live worker must get SIGTERM"
+        assert not any(
+            s == getattr(signal_module, "SIGKILL", signal_module.SIGTERM)
+            for s in sent[1:]
+        ), f"a recycled PID must never be SIGKILLed: {sent}"
+        assert info.get("sigkill") is False
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_missing_start_time_capture_refuses_to_signal(kanban_home, monkeypatch):
+    """If identity cannot be captured, never fall back to PID-only signalling."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    try:
+        conn = kb.connect()
+        try:
+            def refuse_start_time(pid):
+                raise RuntimeError("ps unavailable")
+
+            monkeypatch.setattr(kb, "_worker_process_start_time", refuse_start_time)
+            tid = _running_task(conn, pid=proc.pid)
+            row = conn.execute(
+                "SELECT worker_start_time FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            assert row["worker_start_time"] is None
+
+            termination = kb._terminate_worker_for_block(
+                conn, tid, None, signal_fn=lambda p, s: sent.append((p, s)),
+            )
+            assert sent == [], (
+                "no captured identity means no proof of what this PID is; "
+                "signalling it would be a blind kill"
+            )
+            assert (termination or {}).get("identity_unproven") is True
+            assert proc.poll() is None
+        finally:
+            conn.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_legacy_null_identity_rows_are_conservative_on_reclaim(kanban_home):
+    """Pre-migration rows carry no identity: reclaim must not blind-signal."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    try:
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, f"{kb._claimer_id().split(':', 1)[0]}:x",
+            signal_fn=lambda p, s: sent.append(s),
+            process_start_time=None,
+        )
+        assert sent == [], f"legacy NULL identity must not be signalled: {sent}"
+        assert info["termination_attempted"] is False
+        assert info.get("identity_unproven") is True
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
