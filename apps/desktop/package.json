@@ -178,6 +178,7 @@
       {
         "name": "Douglas Agent Protocol",
         "schemes": [
+          "douglas",
           "hermes"
         ]
       }

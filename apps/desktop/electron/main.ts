@@ -11582,12 +11582,19 @@ ipcMain.handle('hermes:vscode-theme:fetch', async (_event, id) => fetchMarketpla
 ipcMain.handle('hermes:vscode-theme:search', async (_event, query) => searchMarketplaceThemes(String(query || ''), 20))
 
 // ---------------------------------------------------------------------------
-// hermes:// deep links (e.g. hermes://blueprint/morning-brief?time=08:00).
-// A docs/dashboard "Send to App" button opens this URL; we route it into the
-// running app's chat composer. Three delivery paths: macOS 'open-url',
-// Win/Linux running-app 'second-instance' (argv), Win/Linux cold-start argv.
+// douglas:// / hermes:// deep links (e.g. douglas://blueprint/morning-brief?
+// time=08:00). A docs/dashboard "Send to App" button opens this URL; we route
+// it into the running app's chat composer. Three delivery paths: macOS
+// 'open-url', Win/Linux running-app 'second-instance' (argv), Win/Linux
+// cold-start argv.
+//
+// Douglas Agent: accepts links on EITHER scheme (hermes:// kept for
+// backward compatibility with existing docs/dashboard links that predate
+// the rename; douglas:// is the new canonical one) but only ever
+// GENERATES douglas:// links when reconstructing a queued one below.
 // ---------------------------------------------------------------------------
-const HERMES_PROTOCOL = 'hermes'
+const DEEP_LINK_PROTOCOLS = ['douglas', 'hermes']
+const CANONICAL_DEEP_LINK_PROTOCOL = 'douglas'
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
 
@@ -11596,7 +11603,10 @@ function _extractDeepLink(argv) {
     return null
   }
 
-  return argv.find(a => typeof a === 'string' && a.startsWith(`${HERMES_PROTOCOL}://`)) || null
+  return (
+    argv.find(a => typeof a === 'string' && DEEP_LINK_PROTOCOLS.some(protocol => a.startsWith(`${protocol}://`))) ||
+    null
+  )
 }
 
 function handleDeepLink(url) {
@@ -11614,7 +11624,7 @@ function handleDeepLink(url) {
     return
   }
 
-  // hermes://blueprint/<key>?slot=val  -> host="blueprint", path="/<key>"
+  // douglas://blueprint/<key>?slot=val (or hermes://...) -> host="blueprint", path="/<key>"
   const kind = parsed.hostname || ''
   const name = decodeURIComponent((parsed.pathname || '').replace(/^\//, ''))
   const params = {}
@@ -11651,7 +11661,7 @@ ipcMain.handle('hermes:deep-link-ready', () => {
     const queued = _pendingDeepLink
     _pendingDeepLink = null
     handleDeepLink(
-      `${HERMES_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
+      `${CANONICAL_DEEP_LINK_PROTOCOL}://${queued.kind}/${encodeURIComponent(queued.name)}` +
         (Object.keys(queued.params).length ? '?' + new URLSearchParams(queued.params).toString() : '')
     )
   }
@@ -11660,21 +11670,23 @@ ipcMain.handle('hermes:deep-link-ready', () => {
 })
 
 function registerDeepLinkProtocol() {
-  try {
-    if (process.defaultApp && process.argv.length >= 2) {
-      // Dev: register with the electron exec path + entry script so the OS can
-      // relaunch us with the URL.
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [path.resolve(process.argv[1])])
-    } else {
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
+  for (const protocol of DEEP_LINK_PROTOCOLS) {
+    try {
+      if (process.defaultApp && process.argv.length >= 2) {
+        // Dev: register with the electron exec path + entry script so the OS can
+        // relaunch us with the URL.
+        app.setAsDefaultProtocolClient(protocol, process.execPath, [path.resolve(process.argv[1])])
+      } else {
+        app.setAsDefaultProtocolClient(protocol)
+      }
+    } catch (err) {
+      rememberLog(`[deeplink] protocol registration failed for ${protocol}: ${err.message}`)
     }
-  } catch (err) {
-    rememberLog(`[deeplink] protocol registration failed: ${err.message}`)
   }
 }
 
 // Single-instance lock: deep links on a running app (Win/Linux) arrive as a
-// second-instance argv. Without the lock a second `hermes://` launch spawns a
+// second-instance argv. Without the lock a second `douglas://`/`hermes://` launch spawns a
 // whole new app instead of routing into the running one.
 const _gotSingleInstanceLock = app.requestSingleInstanceLock()
 
@@ -11736,7 +11748,7 @@ app.whenReady().then(() => {
   applyQuickEntrySettings(readQuickEntrySettings())
   createWindow()
 
-  // Win/Linux cold start: the launching hermes:// URL is in our own argv.
+  // Win/Linux cold start: the launching douglas:///hermes:// URL is in our own argv.
   const _coldStartLink = _extractDeepLink(process.argv)
 
   if (_coldStartLink) {
