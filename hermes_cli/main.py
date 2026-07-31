@@ -91,6 +91,15 @@ try:
     _early_recovery_mod.recover_if_needed()
 except Exception:
     pass
+# ==== LOGGING SETUP ======================================================
+# Initialise logging as early as possible, before any other imports that
+# might trigger log output (e.g. plugins, agents, etc.).
+from hermes_cli.logging_setup import setup_logging
+
+# Default to plain‑text, pipe‑separated logs. Override with HERMES_LOG_JSON=1.
+setup_logging()
+# =========================================================================
+
 
 
 def _exit_after_oneshot(rc: object) -> None:
