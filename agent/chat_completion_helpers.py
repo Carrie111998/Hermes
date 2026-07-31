@@ -51,11 +51,13 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 def _is_stream_timeout(error: BaseException) -> bool:
     """Use one timeout classifier for stream retries and outer-loop routing."""
     import httpx
-    from openai import APITimeoutError
 
-    return isinstance(
-        error,
-        (APITimeoutError, httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout),
+    return (
+        any(cls.__name__ == "APITimeoutError" for cls in type(error).__mro__)
+        or isinstance(
+            error,
+            (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout),
+        )
     )
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
@@ -3224,6 +3226,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
+                deltas_were_sent["yes"] = True
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
@@ -3644,6 +3647,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             if thinking_text:
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
+                                deltas_were_sent["yes"] = True
             if not agent._interrupt_requested:
                 raw_stream = _stream_context["stream"]
                 if raw_stream is not None:

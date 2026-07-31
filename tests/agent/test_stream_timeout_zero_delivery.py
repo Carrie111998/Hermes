@@ -60,6 +60,25 @@ def test_zero_delivery_timeout_is_marked_at_stream_retry_boundary(
     assert request_client.chat.completions.create.call_count == 1
 
 
+def test_native_anthropic_zero_delivery_timeout_is_marked(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+    agent = _make_agent()
+    agent.api_mode = "anthropic_messages"
+    sdk_timeout_type = type("APITimeoutError", (Exception,), {})
+    timeout = sdk_timeout_type("request timed out")
+    request_client = MagicMock()
+    request_client.messages.stream.side_effect = timeout
+    agent._create_request_anthropic_client = MagicMock(return_value=request_client)
+
+    with pytest.raises(sdk_timeout_type) as caught:
+        agent._interruptible_streaming_api_call({"model": "test/model", "messages": []})
+
+    assert getattr(caught.value, _TIMEOUT_MARKER, False) is True
+    assert request_client.messages.stream.call_count == 1
+
+
 def test_post_delta_timeout_is_not_marked(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -95,6 +114,84 @@ def test_post_delta_timeout_is_not_marked(
         {"model": "test/model", "messages": []}
     )
 
+    assert response.choices[0].finish_reason == "length"
+    assert getattr(timeout, _TIMEOUT_MARKER, False) is False
+
+
+def test_openai_reasoning_delta_counts_as_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    agent = _make_agent()
+    agent._fire_reasoning_delta = MagicMock()
+    timeout = httpx.ReadTimeout(
+        "read timeout",
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+    )
+
+    def stream():
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(
+                    content=None,
+                    tool_calls=None,
+                    reasoning_content="partial reasoning",
+                    reasoning=None,
+                ),
+                finish_reason=None,
+            )],
+            model="test/model",
+            usage=None,
+        )
+        raise timeout
+
+    request_client = MagicMock()
+    request_client.chat.completions.create.return_value = stream()
+    agent._create_request_openai_client = MagicMock(return_value=request_client)
+
+    response = agent._interruptible_streaming_api_call(
+        {"model": "test/model", "messages": []}
+    )
+
+    agent._fire_reasoning_delta.assert_called_once_with("partial reasoning")
+    assert response.choices[0].finish_reason == "length"
+    assert getattr(timeout, _TIMEOUT_MARKER, False) is False
+
+
+def test_anthropic_reasoning_delta_counts_as_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+    agent = _make_agent()
+    agent.api_mode = "anthropic_messages"
+    agent._fire_reasoning_delta = MagicMock()
+    timeout = httpx.ReadTimeout(
+        "read timeout",
+        request=httpx.Request("POST", "https://api.anthropic.com/v1/messages"),
+    )
+
+    def stream():
+        yield SimpleNamespace(
+            type="content_block_delta",
+            delta=SimpleNamespace(
+                type="thinking_delta",
+                thinking="partial reasoning",
+            ),
+        )
+        raise timeout
+
+    stream_manager = MagicMock()
+    stream_manager.__enter__.return_value = stream()
+    request_client = MagicMock()
+    request_client.messages.stream.return_value = stream_manager
+    agent._create_request_anthropic_client = MagicMock(return_value=request_client)
+
+    response = agent._interruptible_streaming_api_call(
+        {"model": "test/model", "messages": []}
+    )
+
+    agent._fire_reasoning_delta.assert_called_once_with("partial reasoning")
     assert response.choices[0].finish_reason == "length"
     assert getattr(timeout, _TIMEOUT_MARKER, False) is False
 
