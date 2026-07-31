@@ -400,3 +400,24 @@ describe('ModelMenuPanel provider collapse', () => {
     expect($collapsedProviders.get()).toContain('deepseek')
   })
 })
+
+describe('ModelMenuPanel model labels', () => {
+  it('preserves provider prefixes only for rows with colliding friendly names', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          models: ['anthropic/claude-sonnet-4.6', 'openrouter/claude-sonnet-4.6', 'openai/gpt-5.5'],
+          name: '9Router',
+          slug: 'custom:9router'
+        }
+      ]
+    })
+
+    const { content } = renderPanel()
+
+    expect(await content.findByText('anthropic/claude-sonnet-4.6')).toBeTruthy()
+    expect(await content.findByText('openrouter/claude-sonnet-4.6')).toBeTruthy()
+    expect(await content.findByText('GPT-5.5')).toBeTruthy()
+    expect(content.queryByText('openai/gpt-5.5')).toBeNull()
+  })
+})

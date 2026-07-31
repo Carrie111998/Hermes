@@ -13,7 +13,7 @@ import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Search } from '@/lib/icons'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import { ambiguousModelDisplayNames, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import {
   $visibleModels,
@@ -103,6 +103,7 @@ export function ModelVisibilityDialog({
           ) : (
             providers.map(provider => {
               const models = collapseModelFamilies(provider.models ?? []).filter(family => matches(provider, family.id))
+              const ambiguousNames = ambiguousModelDisplayNames(models.map(family => family.id))
 
               if (models.length === 0) {
                 return null
@@ -142,7 +143,12 @@ export function ModelVisibilityDialog({
                   </div>
                   {!collapsed &&
                     models.map(family => {
-                      const { name, tag } = modelDisplayParts(family.id)
+                      const friendlyName = modelDisplayParts(family.id).name
+
+                      const { name, tag } = modelDisplayParts(family.id, {
+                        preserveProviderPrefix: ambiguousNames.has(friendlyName)
+                      })
+
                       const key = modelVisibilityKey(provider.slug, family.id)
 
                       return (

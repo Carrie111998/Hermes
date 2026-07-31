@@ -22,7 +22,12 @@ import { Skeleton } from '@/components/ui/skeleton'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
-import { currentPickerSelection, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
+import {
+  ambiguousModelDisplayNames,
+  currentPickerSelection,
+  displayModelName,
+  modelDisplayParts
+} from '@/lib/model-status-label'
 import { DEFAULT_REASONING_EFFORT, reasoningEffortLabel } from '@/lib/reasoning-effort'
 import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
@@ -63,6 +68,7 @@ interface ModelMenuPanelProps {
 }
 
 interface ProviderGroup {
+  ambiguousNames: Set<string>
   families: ModelFamily[]
   provider: ModelOptionProvider
 }
@@ -410,7 +416,12 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
                         : null
 
                     const isCurrent = activeId !== null
-                    const name = modelDisplayParts(family.id).name
+                    const friendlyName = modelDisplayParts(family.id).name
+
+                    const name = modelDisplayParts(family.id, {
+                      preserveProviderPrefix: group.ambiguousNames.has(friendlyName)
+                    }).name
+
                     // Capabilities are looked up against the active/base id; the
                     // -fast variant carries the same param support as its base.
                     const caps = group.provider.capabilities?.[family.id]
@@ -599,7 +610,11 @@ function groupModels(
     const families = allFamilies.filter(family => shown.has(family.id) || family.id === activeId)
 
     if (families.length > 0) {
-      groups.push({ families, provider })
+      groups.push({
+        ambiguousNames: ambiguousModelDisplayNames(families.map(family => family.id)),
+        families,
+        provider
+      })
     }
   }
 
