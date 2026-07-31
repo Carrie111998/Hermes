@@ -4522,7 +4522,11 @@ class GatewaySlashCommandsMixin:
                     search_session_listing,
                     db,
                     search_query,
-                    limit=50,
+                    # Candidate pool is larger than the visible page: the
+                    # origin filter below can cut cross-room matches, and a
+                    # 50-row cap could otherwise starve the caller's own
+                    # results out of the first 50 global hits.
+                    limit=200,
                     exclude_session_id=current_entry.session_id,
                 )
             except Exception as exc:

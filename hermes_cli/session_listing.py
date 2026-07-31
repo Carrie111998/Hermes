@@ -200,6 +200,37 @@ def search_session_listing(
         if sid not in kept:
             seen.pop(sid, None)
 
+    # Project ancestor-only hits to the live tip. When FTS matched an old
+    # generation (e.g. #1) but not the tip (#13), the row must describe #13
+    # — the same generation the # rank and Last column resolve — otherwise
+    # the displayed row, last_active, and rank disagree. The tip's row is
+    # synthesized from its session meta since it was absent from the hit set.
+    tip_rows: dict[str, dict[str, Any]] = {}
+    for sid in list(seen.keys()):
+        tip = session_db.get_compression_tip(sid)
+        if tip == sid:
+            continue
+        if exclude_session_id and tip == exclude_session_id:
+            seen.pop(sid, None)
+            continue
+        meta = session_db.get_session(tip) or {}
+        if not meta:
+            seen.pop(sid, None)
+            continue
+        tip_rows[tip] = {
+            "id": tip,
+            "title": meta.get("title"),
+            "model": meta.get("model"),
+            "source": meta.get("source"),
+            "started_at": meta.get("started_at"),
+            "ended_at": meta.get("ended_at"),
+            "parent_session_id": meta.get("parent_session_id"),
+            "message_count": meta.get("message_count"),
+            "preview": "",
+        }
+        seen.pop(sid, None)
+    seen.update(tip_rows)
+
     # Sort by last_active descending (most recent first) — the same
     # definition as the listing's Last column, so search and list order +
     # display agree. Apply the display limit last: N most recent matches.
@@ -210,35 +241,32 @@ def search_session_listing(
         sids_sorted = sids_sorted[:limit]
     seen = {sid: seen[sid] for sid in sids_sorted}
 
-    # Batch-fetch root ancestor previews and root started_at in one walk
-    # per session (caching every visited generation so sibling matches in
-    # the same chain never re-walk it — the old per-site pipelines walked
-    # the lineage 2-3 times per row).
-    all_meta_cache: dict[str, dict[str, Any]] = {}
+    # Batch-fetch root-ancestor previews and root started_at via the same
+    # edge-aware walker the listing uses (_compression_root stops at
+    # branch/delegate/tool edges — branches are their own conversations and
+    # must not inherit the parent's opener). Cached per root so sibling
+    # matches in the same chain never re-walk it; the returned caches are
+    # keyed per surfaced row id, exactly like the caller expects.
+    root_meta_cache: dict[str, dict[str, Any]] = {}
+    root_preview_of_root: dict[str, str] = {}
+    root_started_of_root: dict[str, Any] = {}
     root_preview_cache: dict[str, str] = {}
     root_started_cache: dict[str, Any] = {}
     for sid in seen:
-        current = sid
-        chain = [current]
-        while current and len(chain) < COMPRESSION_CHAIN_MAX_HOPS:
-            if current not in all_meta_cache:
-                all_meta_cache[current] = session_db.get_session(current) or {}
-            m = all_meta_cache[current]
-            parent = m.get("parent_session_id")
-            if parent:
-                chain.append(parent)
-                current = parent
-            else:
-                break
-        root_id = chain[-1]
-        row = session_db._conn.execute(
-            "SELECT substr(content, 1, 60) FROM messages "
-            "WHERE session_id = ? AND role = 'user' "
-            "ORDER BY id ASC LIMIT 1",
-            (root_id,),
-        ).fetchone()
-        root_preview_cache[sid] = row[0] if row else ""
-        root_started_cache[sid] = (all_meta_cache.get(root_id) or {}).get("started_at")
+        root_id = _compression_root(session_db, sid)
+        if root_id not in root_meta_cache:
+            root_meta = session_db.get_session(root_id) or {}
+            row = session_db._conn.execute(
+                "SELECT substr(content, 1, 60) FROM messages "
+                "WHERE session_id = ? AND role = 'user' "
+                "ORDER BY id ASC LIMIT 1",
+                (root_id,),
+            ).fetchone()
+            root_meta_cache[root_id] = root_meta
+            root_preview_of_root[root_id] = row[0] if row else ""
+            root_started_of_root[root_id] = root_meta.get("started_at")
+        root_preview_cache[sid] = root_preview_of_root[root_id]
+        root_started_cache[sid] = root_started_of_root[root_id]
 
     # Build canonical row dicts (same shape render_sessions_table expects).
     rank_of = session_rank_lookup(session_db)

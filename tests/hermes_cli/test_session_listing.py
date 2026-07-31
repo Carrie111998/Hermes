@@ -154,6 +154,57 @@ class TestSearchSessionListing:
         finally:
             db.close()
 
+    def test_ancestor_only_hit_projects_to_tip(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "search_ancestor.db")
+        conn = db._conn
+        # Chain pa_root → pa_mid → pa_tip; only the ROOT's message matches
+        # FTS. The surfaced row must be the tip (same generation as the #
+        # rank and Last column resolve), with the root's Created + opener.
+        db.create_session("pa_root", "cli")
+        db.append_message("pa_root", "user", "needle only in the root", timestamp=1.0)
+        db.end_session("pa_root", end_reason="compression")
+        db.create_session("pa_mid", "cli", parent_session_id="pa_root")
+        db.append_message("pa_mid", "user", "unrelated mid", timestamp=2.0)
+        db.end_session("pa_mid", end_reason="compression")
+        db.create_session("pa_tip", "cli", parent_session_id="pa_mid")
+        db.append_message("pa_tip", "user", "unrelated tip", timestamp=3.0)
+        for sid, ts in [("pa_root", 100.0), ("pa_mid", 200.0), ("pa_tip", 300.0)]:
+            conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
+        conn.commit()
+        try:
+            rows, previews = search_session_listing(db, "needle")
+            assert [r["id"] for r in rows] == ["pa_tip"]  # projected, not pa_root
+            assert rows[0]["rank"] == 1  # tip's canonical position
+            assert rows[0]["started_at"] == 100.0  # root's Created
+            assert previews["pa_tip"] == "needle only in the root"  # root's opener
+        finally:
+            db.close()
+
+    def test_branch_child_preview_does_not_cross_into_parent(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "search_branch.db")
+        conn = db._conn
+        # Parent conversation + child with a parent_session_id but NO
+        # compression end on the parent (branch-like split). The child's
+        # preview must be its OWN opener — branches are separate
+        # conversations and must not inherit the parent's opener.
+        db.create_session("br_parent", "cli")
+        db.append_message("br_parent", "user", "parent opener words", timestamp=1.0)
+        db.create_session("br_child", "cli", parent_session_id="br_parent")
+        db.append_message("br_child", "user", "needle child opener", timestamp=2.0)
+        for sid, ts in [("br_parent", 100.0), ("br_child", 200.0)]:
+            conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
+        conn.commit()
+        try:
+            rows, previews = search_session_listing(db, "needle")
+            assert [r["id"] for r in rows] == ["br_child"]
+            assert previews["br_child"] == "needle child opener"
+        finally:
+            db.close()
+
     def test_no_matches_returns_empty(self, tmp_path):
         from hermes_state import SessionDB
 
