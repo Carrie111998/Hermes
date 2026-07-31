@@ -102,7 +102,7 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
     return (
       <>
         <button
-          className="mt-2 inline-block bg-transparent font-semibold text-foreground underline underline-offset-4 decoration-current/20 wrap-anywhere"
+          className="mt-2 ref inline-block bg-transparent wrap-anywhere"
           onClick={openFullFile}
           type="button"
         >

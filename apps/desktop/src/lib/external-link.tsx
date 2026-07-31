@@ -197,7 +197,9 @@ export function useLinkTitle(url?: null | string): string {
 
 export function openExternalLink(href: string): void {
   if (href) {
-    void window.hermesDesktop?.openExternal?.(href).catch(() => undefined)
+    const result = window.hermesDesktop?.openExternal?.(href)
+
+    void Promise.resolve(result).catch(() => undefined)
   }
 }
 
@@ -239,7 +241,7 @@ export function ExternalLink({
 
   return (
     <a
-      className={cn('link-chip', className)}
+      className={cn('ref', className)}
       href={target}
       onClick={event => {
         event.stopPropagation()
