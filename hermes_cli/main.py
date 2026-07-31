@@ -16506,9 +16506,14 @@ def main():
     sessions_list.add_argument(
         "--workspace",
         metavar="NEEDLE",
-        help="Only sessions in one workspace: a git repo root or project dir "
-        "(matched by path substring or basename).",
+        help="Filter by workspace (git repo root basename or path substring)",
     )
+
+    sessions_search = sessions_subparsers.add_parser(
+        "search",
+        help="Search session content via FTS5 (message text, not just titles)",
+    )
+    sessions_search.add_argument("query", nargs="+", help="Search terms (pass as multiple words)")
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(
@@ -17969,6 +17974,54 @@ def main():
             if result.get("vacuumed") is False:
                 print("  (VACUUM was skipped or failed — run "
                       "`hermes sessions optimize` later to reclaim freed space.)")
+
+        elif action == "search":
+            import re as _re
+            query = " ".join(args.query)
+            raw = db.search_messages(
+                query=query,
+                role_filter=["user", "assistant"],
+                exclude_sources=["tool", "subagent", "cron"],
+                limit=40,
+            )
+            seen = {}
+            for r in raw:
+                sid = r["session_id"]
+                if sid not in seen:
+                    seen[sid] = r
+                if len(seen) >= 10:
+                    break
+            if not seen:
+                print(f"No sessions matching \"{query}\".")
+                db.close()
+                return
+            print(f"⚙️  sessions search {query}\n")
+            print(f"Sessions matching \"{query}\":\n")
+            for idx, (sid, r) in enumerate(seen.items(), 1):
+                meta = db.get_session(sid) or {}
+                title = meta.get("title") or "(no title)"
+                started = meta.get("started_at")
+                if started:
+                    from datetime import datetime as _dt
+                    when = _dt.fromtimestamp(started).strftime("%b %d")
+                else:
+                    when = "?"
+                source = r.get("source", "?")
+                model_raw = (r.get("model") or "?")
+                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                if len(model) > 18:
+                    model = model[:17] + "…"
+                mc = meta.get("message_count")
+                snip_raw = r.get("snippet", "") or ""
+                snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snip_raw))
+                snip_short = snip_clean.replace("\n", " ").strip()
+                if len(snip_short) > 80:
+                    snip_short = snip_short[:77] + "..."
+                print(f"{idx:<3}  {when}  {source:<6} {model:<18} {title[:40]}")
+                if snip_short:
+                    print(f"      {snip_short}")
+                print()
+            print("Use /resume <id> from an interactive Hermes session to continue.")
 
         elif action == "stats":
             total = db.session_count()
