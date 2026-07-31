@@ -94,6 +94,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -105,10 +106,10 @@ import shutil
 import sys
 import threading
 import time
-from types import SimpleNamespace
-from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Coroutine, Dict, List, Mapping, Optional
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -5406,6 +5407,186 @@ def _mcp_declared_effect(mcp_tool):
     return ToolEffect.UNKNOWN
 
 
+_TRUSTED_READ_ONLY_TOOL_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+_TRUSTED_MCP_SOURCE_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _bounded_source_sha256(source: Path) -> str | None:
+    """Hash one stable, bounded local source file without loading it at once."""
+
+    try:
+        before = source.stat()
+        if before.st_size > _TRUSTED_MCP_SOURCE_MAX_BYTES:
+            return None
+        digest = hashlib.sha256()
+        total = 0
+        with source.open("rb") as stream:
+            while chunk := stream.read(64 * 1024):
+                total += len(chunk)
+                if total > _TRUSTED_MCP_SOURCE_MAX_BYTES:
+                    return None
+                digest.update(chunk)
+        after = source.stat()
+    except OSError:
+        return None
+
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    )
+    if total != before.st_size or identity_before != identity_after:
+        return None
+    return digest.hexdigest()
+
+
+def _trusted_read_only_mcp_effects(
+    server_name: str,
+    config: dict,
+) -> dict[str, Callable[[Mapping[str, Any]], str]]:
+    """Build dispatch-time effects for exact owner-trusted local read tools.
+
+    External MCP annotations remain untrusted. This opt-in is intentionally
+    narrower: the owner must name an absolute local source file, pin its
+    SHA-256, bind that same path into the configured stdio launch command, and
+    list exact raw tool names. The source is re-hashed immediately before each
+    dispatch. A changed source, remote transport, glob, ambiguous path, or
+    malformed policy fails closed to ``UNKNOWN``.
+
+    The pin is owner attestation and change detection, not proof that imported
+    dependencies or backend credentials are read-only. Consequential sources
+    must still use structurally read-only backend credentials.
+    """
+
+    policy = config.get("trusted_read_only")
+    if not isinstance(policy, dict):
+        return {}
+
+    def _reject(reason: str) -> dict[str, Callable[[Mapping[str, Any]], str]]:
+        logger.warning(
+            "MCP server '%s': trusted_read_only rejected: %s",
+            server_name,
+            reason,
+        )
+        return {}
+
+    raw_source = policy.get("source")
+    expected_sha256 = str(policy.get("sha256") or "").strip().lower()
+    raw_tools = policy.get("tools")
+    if (
+        not isinstance(raw_source, str)
+        or not raw_source.strip()
+        or raw_source != raw_source.strip()
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+        or not isinstance(raw_tools, list)
+        or not raw_tools
+    ):
+        return _reject("malformed source, sha256, or empty tools list")
+    if "url" in config:
+        return _reject("hash-pinned trust is stdio-only; url must be absent")
+
+    command = config.get("command")
+    raw_args = config.get("args", [])
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or not isinstance(raw_args, list)
+        or any(not isinstance(value, str) for value in raw_args)
+    ):
+        return _reject("stdio command and string args are required")
+
+    source = Path(raw_source).expanduser()
+    if not source.is_absolute():
+        return _reject("source must be absolute")
+    try:
+        source = source.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return _reject("source is unavailable")
+    if not source.is_file():
+        return _reject("source is not a regular file")
+
+    command_candidate = Path(command).expanduser()
+    if not command_candidate.is_absolute():
+        return _reject("trusted stdio command must be absolute")
+    try:
+        command_path = command_candidate.resolve(strict=True)
+        current_python = Path(sys.executable).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return _reject("stdio command or current Python is unavailable")
+
+    direct_source = (
+        command_path == source
+        and not raw_args
+        and os.access(source, os.X_OK)
+    )
+    python_source = False
+    if command_path == current_python and len(raw_args) == 1:
+        first_arg = Path(raw_args[0]).expanduser()
+        if first_arg.is_absolute():
+            try:
+                python_source = first_arg.resolve(strict=True) == source
+            except (OSError, RuntimeError):
+                python_source = False
+    if not direct_source and not python_source:
+        return _reject(
+            "launch must be the pinned executable itself or current Python "
+            "with the pinned source as its only argument"
+        )
+
+    actual_sha256 = _bounded_source_sha256(source)
+    if actual_sha256 != expected_sha256:
+        return _reject("source is unreadable, oversized, unstable, or changed")
+
+    tools: list[str] = []
+    seen_tools: set[str] = set()
+    seen_registry_names: set[str] = set()
+    for raw_tool in raw_tools:
+        if not isinstance(raw_tool, str):
+            return _reject("tool names must be exact strings")
+        tool_name = raw_tool
+        if not _TRUSTED_READ_ONLY_TOOL_NAME.fullmatch(tool_name):
+            return _reject("tool names must be exact and cannot use globs")
+        if tool_name in seen_tools:
+            return _reject("duplicate tool names are not allowed")
+        registry_name = mcp_prefixed_tool_name(server_name, tool_name)
+        if registry_name in seen_registry_names:
+            return _reject("tool names collide after provider normalization")
+        seen_tools.add(tool_name)
+        seen_registry_names.add(registry_name)
+        tools.append(tool_name)
+
+    runtime_trusted = True
+    runtime_status_lock = threading.Lock()
+
+    def _effect(_args: Mapping[str, Any]) -> str:
+        nonlocal runtime_trusted
+        trusted_now = _bounded_source_sha256(source) == expected_sha256
+        with runtime_status_lock:
+            if trusted_now != runtime_trusted:
+                log = logger.info if trusted_now else logger.warning
+                log(
+                    "MCP server '%s': trusted_read_only source is now %s",
+                    server_name,
+                    "accepted" if trusted_now else "rejected",
+                )
+                runtime_trusted = trusted_now
+        return "read_only" if trusted_now else "unknown"
+
+    logger.info(
+        "MCP server '%s': trusted_read_only accepted for exact tools: %s",
+        server_name,
+        ", ".join(tools),
+    )
+    return {tool_name: _effect for tool_name in tools}
+
+
 def _build_utility_schemas(server_name: str) -> List[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
@@ -5704,6 +5885,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     check_fn = _make_check_fn(name)
     candidates: List[dict] = []
+    trusted_read_only_effects = _trusted_read_only_mcp_effects(name, config)
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
@@ -5725,7 +5907,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, mcp_tool.name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
-                "effect": _mcp_declared_effect(mcp_tool),
+                "effect": trusted_read_only_effects.get(
+                    mcp_tool.name,
+                    _mcp_declared_effect(mcp_tool),
+                ),
             }
         )
 
@@ -5749,7 +5934,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
-                "effect": ToolEffect.READ_ONLY,
+                "effect": ToolEffect.UNKNOWN,
             }
         )
 
