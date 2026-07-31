@@ -1470,20 +1470,25 @@ def _is_response_format_rejection(exc: Exception) -> bool:
 
 
 def _openai_speech_create_with_format_fallback(client, create_kwargs: Dict[str, Any]):
-    """Call ``audio.speech.create``; on a response_format rejection, retry mp3.
+    """Call ``audio.speech.create``; on an *opus* rejection, retry mp3.
 
-    Native opus (or whatever the extension implies) is always requested first,
-    so backends that support it are unaffected. When the backend rejects the
-    format, we retry exactly once as ``mp3`` — a format the OpenAI speech API
-    contract guarantees — and let the downstream ``_repair_ogg_container`` step
-    transcode those mp3 bytes into a real Ogg/Opus container. The retry carries
-    a fresh idempotency key because it is a distinct request.
+    Native opus is always requested first (from a ``.ogg`` target), so backends
+    that support it are unaffected. When the backend rejects opus, we retry
+    exactly once as ``mp3`` — a format the OpenAI speech API contract
+    guarantees — and let the downstream ``_repair_ogg_container`` step transcode
+    those mp3 bytes into a real Ogg/Opus container. The retry carries a fresh
+    idempotency key because it is a distinct request.
+
+    The fallback is deliberately limited to ``opus``: ``_repair_ogg_container``
+    only rewrites ``.ogg`` outputs, so retrying a rejected ``wav``/``flac``/
+    ``pcm`` request as mp3 would leave mp3 bytes mislabeled under the requested
+    extension. Those rejections propagate unchanged (#73470 review).
     """
     try:
         return client.audio.speech.create(**create_kwargs)
     except Exception as exc:
         requested = create_kwargs.get("response_format")
-        if requested in (None, "mp3") or not _is_response_format_rejection(exc):
+        if requested != "opus" or not _is_response_format_rejection(exc):
             raise
         logger.warning(
             "TTS backend rejected response_format=%r — retrying as 'mp3' "

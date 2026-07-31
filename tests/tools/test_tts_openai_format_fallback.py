@@ -169,6 +169,28 @@ class TestSpeechCreateFallback:
             )
         assert len(calls) == 1
 
+    @pytest.mark.parametrize("requested", ["wav", "flac", "pcm"])
+    def test_non_opus_rejection_is_not_retried_as_mp3(self, requested):
+        """Only opus has a post-synthesis container repair. Retrying a rejected
+        wav/flac/pcm request as mp3 would write mp3 bytes under a .wav/.flac/.pcm
+        path, so those rejections must propagate untouched (#73470 review)."""
+        calls: list = []
+
+        class _RejectSpeech:
+            def create(self, **kwargs):
+                calls.append(kwargs)
+                raise _RejectResponseFormat()
+
+        client = _FakeClient(calls)
+        client.audio.speech = _RejectSpeech()
+
+        with pytest.raises(_RejectResponseFormat):
+            tts_tool._openai_speech_create_with_format_fallback(
+                client, {"response_format": requested}
+            )
+        # No mp3 retry — the single failed call is the only one.
+        assert [c["response_format"] for c in calls] == [requested]
+
 
 # --------------------------------------------------------------------------
 # End-to-end through _generate_openai_tts (opus .ogg target recovers to mp3)
