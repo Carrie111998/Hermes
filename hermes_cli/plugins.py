@@ -1999,9 +1999,26 @@ class PluginContext:
                 cli._pending_input.put(msg)
             return True
 
+        # No interactive CLI in this process. The dashboard/desktop chat
+        # hosts its sessions in the in-process tui_gateway server instead
+        # — route the message to its most recently active session. Gate on
+        # sys.modules: a process that never imported the dashboard stack
+        # (e.g. a pure messaging gateway) has no sessions to route to, and
+        # must not pay the import for a guaranteed miss.
+        tui_server = sys.modules.get("tui_gateway.server")
+        if tui_server is not None:
+            try:
+                if tui_server.inject_external_message(msg):
+                    return True
+            except Exception:
+                logger.warning(
+                    "inject_message: tui_gateway routing failed", exc_info=True
+                )
+
         if not session_key:
             logger.warning(
-                "inject_message: gateway mode requires an existing session_key"
+                "inject_message: no CLI reference, no active dashboard "
+                "session, and no session_key for gateway mode"
             )
             return False
         if not self._gateway_injection_allowed():
