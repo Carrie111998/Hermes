@@ -1,0 +1,75 @@
+name: Hermes exact-head test gate
+run-name: marshal-${{ github.event_name == 'workflow_dispatch' && inputs.gate_id || format('{0}-{1}-{2}', github.event_name, github.run_id, github.run_attempt) }}
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact immutable hermes-pcl candidate SHA
+        required: true
+        type: string
+      gate_id:
+        description: Unique caller-generated gate identifier
+        required: true
+        type: string
+      runner_location:
+        description: Runner location requested by the managed PR gate
+        required: true
+        default: mini
+        type: choice
+        options:
+          - mbp
+          - mini
+
+concurrency:
+  group: hermes-exact-head-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event.pull_request.head.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  exact-head-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event.pull_request.head.sha }}
+      EXPECTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event.pull_request.head.ref }}
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          ref: ${{ env.EXPECTED_SHA }}
+          fetch-depth: 1
+
+      - name: Attest checkout identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "invalid candidate SHA: $EXPECTED_SHA" >&2
+            exit 1
+          }
+          actual_sha="$(git rev-parse HEAD)"
+          if [[ "$actual_sha" != "$EXPECTED_SHA" ]]; then
+            echo "checked out $actual_sha, expected exact candidate $EXPECTED_SHA" >&2
+            exit 1
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv venv .venv --python 3.11
+          uv pip install --python .venv/bin/python -e ".[all,dev]"
+
+      - name: Run canonical Hermes test suite
+        shell: bash
+        run: scripts/run_tests.sh
