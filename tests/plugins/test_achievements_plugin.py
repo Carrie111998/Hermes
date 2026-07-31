@@ -395,6 +395,27 @@ def test_achievements_locale_applies_names_descriptions_and_criteria(plugin_api)
     assert "青铜 200" in item["criteria"]
 
 
+def test_zh_cn_locale_translates_every_catalog_metric(plugin_api):
+    """Every metric used to render criteria has a non-empty zh-CN label."""
+    used_metrics = {
+        metric
+        for achievement in plugin_api.ACHIEVEMENTS
+        for metric in (
+            [achievement["threshold_metric"]]
+            if "threshold_metric" in achievement
+            else [requirement["metric"] for requirement in achievement.get("requirements", [])]
+        )
+    }
+    translated_metrics = plugin_api._load_locale("zh-CN")["._metrics"]
+
+    missing_metrics = {
+        metric
+        for metric in used_metrics
+        if not isinstance(translated_metrics.get(metric), str) or not translated_metrics[metric].strip()
+    }
+    assert missing_metrics == set()
+
+
 def test_achievements_locale_keeps_secret_cards_hidden(plugin_api):
     """Localized secret achievements still hide trigger/name until discovered."""
     definition = next(a for a in plugin_api.ACHIEVEMENTS if a.get("secret"))
