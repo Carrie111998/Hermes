@@ -1001,6 +1001,15 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#   voice_barge_in:                   # Strict VC interruption while bot TTS plays (default: off)
+#     enabled: false                  # Opt in; otherwise inbound capture pauses during bot speech
+#     phrases:                        # Use distinctive multi-word phrases, not broad single words
+#       - "세린아 멈춰"
+#       - "세린아 잠깐"
+#     min_trailing_characters: 2      # Shorter tail is treated as noise/filler and not sent to model
+#   # Example: "세린아 멈춰, 다음 질문에 답해줘" stops current TTS and routes
+#   # only "다음 질문에 답해줘" as the next voice input. Audio without one of
+#   # the configured prefix phrases is discarded while TTS is playing.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

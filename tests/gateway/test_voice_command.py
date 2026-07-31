@@ -750,13 +750,15 @@ class TestDiscordVoiceChannelMethods:
         adapter._voice_clients[111] = mock_vc
 
         mock_receiver = MagicMock()
-        mock_receiver.flush_pending.side_effect = lambda: events.append("flush") or [(42, b"pcm")]
+        mock_receiver.flush_pending.side_effect = (
+            lambda **_kwargs: events.append("flush") or [(42, b"pcm", None)]
+        )
         mock_receiver.stop.side_effect = lambda: events.append("stop")
         adapter._voice_receivers[111] = mock_receiver
         adapter._voice_listen_tasks[111] = MagicMock()
         adapter._is_allowed_user = MagicMock(return_value=True)
 
-        async def process(guild_id, user_id, pcm_data):
+        async def process(guild_id, user_id, pcm_data, *, playback_token=None):
             events.append("process")
 
         adapter._process_voice_input = process
