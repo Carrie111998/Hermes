@@ -1124,18 +1124,38 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
     try:
         raw = json.loads(auth_file.read_text(encoding="utf-8"))
-    except Exception as exc:
+    except OSError:
+        logger.warning(
+            "auth: could not read %s — leaving the store on disk untouched "
+            "rather than degrading to an empty one",
+            auth_file,
+            exc_info=True,
+        )
+        raise
+    except json.JSONDecodeError as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
+        copied = False
         try:
             import shutil
             shutil.copy2(auth_file, corrupt_path)
-        except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
-        )
+            copied = True
+        except Exception as copy_exc:
+            logger.warning(
+                "auth: failed to preserve corrupt auth store %s at %s (%s)",
+                auth_file, corrupt_path, copy_exc,
+            )
+        if copied:
+            logger.warning(
+                "auth: failed to parse %s (%s) — starting with empty store. "
+                "Corrupt file preserved at %s",
+                auth_file, exc, corrupt_path,
+            )
+        else:
+            logger.warning(
+                "auth: failed to parse %s (%s) — starting with empty store. "
+                "Could not preserve corrupt file at %s",
+                auth_file, exc, corrupt_path,
+            )
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     if isinstance(raw, dict) and (
