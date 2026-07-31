@@ -18022,21 +18022,19 @@ def main():
             # Deduplicate compression children: if A → A #2 → A #3,
             # keep only the latest descendant in each lineage — even when
             # intermediate generations are absent from the FTS5 hit set.
-            from hermes_cli.session_listing import dedup_compression_chains
+            from hermes_cli.session_listing import dedup_compression_chains, last_active_of
             kept = dedup_compression_chains(db, list(seen.keys()))
             for sid in list(seen.keys()):
                 if sid not in kept:
                     seen.pop(sid, None)
 
-            # Sort by last_active descending (most recent first)
+            # Sort by last_active descending (most recent first). The same
+            # definition as the listing's Last column (latest message
+            # timestamp, falling back to ended_at/started_at), so search and
+            # list order + display agree — not COALESCE(ended_at, ...), which
+            # can put a long-idle session above a live one.
             sids_sorted = list(seen.keys())
-            conn = db._conn
-            ph_sorted = ",".join("?" for _ in sids_sorted)
-            cur = conn.execute(
-                f"SELECT id, COALESCE(ended_at, started_at, 0) FROM sessions WHERE id IN ({ph_sorted})",
-                sids_sorted,
-            )
-            sid_latest = {row[0]: row[1] for row in cur.fetchall()}
+            sid_latest = last_active_of(db, sids_sorted)
             sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
             # Apply the display limit last: N most recent matches.
             if len(sids_sorted) > _limit:
@@ -18055,7 +18053,7 @@ def main():
                     else:
                         break
                 root_id = current
-                cur = conn.execute(
+                cur = db._conn.execute(
                     "SELECT substr(content, 1, 60) FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
                     (root_id,),
                 )

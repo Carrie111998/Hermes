@@ -3,6 +3,7 @@
 import pytest
 
 from hermes_cli.session_listing import (
+    last_active_of,
     parse_session_listing_args,
     query_session_listing,
 )
@@ -97,3 +98,77 @@ class TestQuerySessionListingSearch:
 
     def test_plain_listing_still_hides_unnamed(self, db):
         assert self._ids(db, source="telegram") == ["sess_an94"]
+
+
+class TestLastActiveOf:
+    """`last_active_of` must share the listing's Last-column definition:
+    the latest message timestamp, never a later `ended_at`.
+
+    Regression coverage for the search/list drift where search rendered
+    `COALESCE(ended_at, started_at)` — a session that idled for hours
+    after its final message showed a Last in the future relative to its
+    own listing row, and the search sort inherited the same wrong key.
+    """
+
+    def test_uses_latest_message_timestamp_not_ended_at(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "la.db")
+        db.create_session("sess_old", "cli")
+        db.append_message("sess_old", "user", "first", timestamp=1_000_000.0)
+        db.append_message("sess_old", "assistant", "second", timestamp=1_000_500.0)
+        # Closed 2h after its final message: ended_at > last message ts.
+        db.end_session("sess_old", end_reason="cli_close")
+        try:
+            last = last_active_of(db, ["sess_old"])["sess_old"]
+            assert last == 1_000_500.0
+            # Agrees with the canonical listing column.
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            assert {r["id"]: r["last_active"] for r in rows}["sess_old"] == 1_000_500.0
+        finally:
+            db.close()
+
+    def test_falls_back_to_started_at_when_no_messages(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "empty.db")
+        db.create_session("sess_empty", "cli")
+        try:
+            meta = db.get_session("sess_empty")
+            assert last_active_of(db, ["sess_empty"])["sess_empty"] == meta["started_at"]
+        finally:
+            db.close()
+
+    def test_search_order_matches_listing_order(self, tmp_path):
+        """Sessions ordered by `last_active_of` sort identically to the
+        canonical listing's last-active ordering — the contract search
+        promises when it says it shows the same numbers/order as the list.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "order.db")
+        # A: old messages, closed late (ended_at in the future relative to
+        # its last message). B: newer messages, still open.
+        db.create_session("sess_a", "cli")
+        db.append_message("sess_a", "user", "a1", timestamp=1_000_000.0)
+        db.end_session("sess_a", end_reason="cli_close")
+        db.create_session("sess_b", "cli")
+        db.append_message("sess_b", "user", "b1", timestamp=1_100_000.0)
+        try:
+            sid_latest = last_active_of(db, ["sess_a", "sess_b"])
+            search_order = sorted(
+                ["sess_a", "sess_b"],
+                key=lambda s: sid_latest.get(s, 0),
+                reverse=True,
+            )
+            listing_order = [
+                r["id"]
+                for r in db.list_sessions_rich(
+                    source="cli", include_children=False, order_by_last_active=True
+                )
+            ]
+            # Both surfaces agree on which session is "most recent" even
+            # though sess_a's ended_at is later than sess_b's last message.
+            assert search_order == listing_order == ["sess_b", "sess_a"]
+        finally:
+            db.close()

@@ -92,6 +92,38 @@ def query_session_listing(
     return result
 
 
+def last_active_of(session_db: Any, session_ids: list[str]) -> dict[str, float]:
+    """Map session id -> last activity timestamp.
+
+    Uses the same definition as ``list_sessions_rich``'s ``last_active``
+    column (latest message timestamp), so the search ``Last`` column and
+    sort agree with the canonical listing instead of drifting to
+    ``ended_at`` (which can be hours after the final message). Sessions
+    with no messages fall back to ``ended_at`` then ``started_at``.
+    """
+    if not session_ids:
+        return {}
+    conn = session_db._conn
+    ph = ",".join("?" for _ in session_ids)
+    rows = conn.execute(
+        f"SELECT session_id, MAX(timestamp) FROM messages "
+        f"WHERE session_id IN ({ph}) GROUP BY session_id",
+        session_ids,
+    ).fetchall()
+    latest = {r[0]: r[1] for r in rows}
+    missing = [sid for sid in session_ids if sid not in latest]
+    if missing:
+        ph_missing = ",".join("?" for _ in missing)
+        rows = conn.execute(
+            f"SELECT id, COALESCE(ended_at, started_at, 0) FROM sessions "
+            f"WHERE id IN ({ph_missing})",
+            missing,
+        ).fetchall()
+        for sid, ts in rows:
+            latest[sid] = ts
+    return latest
+
+
 def format_gateway_session_listing(
     rows: list[dict[str, Any]],
     *,
