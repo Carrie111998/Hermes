@@ -706,6 +706,10 @@
     const [laneByProfile, setLaneByProfile] = useState(true);
     const [configApplied, setConfigApplied] = useState(false);
 
+    const [deepLinkTaskId] = useState(function () {
+      return initialUrlSelectionRef.current.task || "";
+    });
+    const [deepLinkNotice, setDeepLinkNotice] = useState(null);
     const [selectedTaskId, setSelectedTaskId] = useState(null);
     const [selectedIds, setSelectedIds] = useState(() => new Set());
     const [lastSelectedId, setLastSelectedId] = useState(null);
@@ -830,6 +834,35 @@
     }, [board]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
+
+    // Resolve /kanban?task=<id> without requiring callers to know the board.
+    // The auth gate preserves the full path+query in its `next` parameter, so
+    // this runs unchanged after an OAuth/password round trip.
+    useEffect(function () {
+      if (!deepLinkTaskId) return;
+      SDK.fetchJSON(`${API}/tasks/locate/${encodeURIComponent(deepLinkTaskId)}`)
+        .then(function (result) {
+          const targetBoard = result && result.board;
+          const targetTask = result && result.task && result.task.id;
+          if (!targetBoard || !targetTask) throw new Error("invalid task lookup response");
+          if (targetBoard !== board) {
+            setBoardData(null);
+            cursorRef.current = 0;
+            setLoading(true);
+            setBoard(targetBoard);
+            writeSelectedBoard(targetBoard);
+            setSearch("");
+            setTenantFilter("");
+            setAssigneeFilter("");
+            setIncludeArchived(false);
+          }
+          openTask(targetTask);
+        })
+        .catch(function () {
+          setDeepLinkNotice(`Card ${deepLinkTaskId} was not found or is archived.`);
+          replaceKanbanUrl(board, null);
+        });
+    }, []);  // deep-link input is immutable for this page load
 
     const scheduleReload = useCallback(function () {
       if (reloadTimerRef.current) return;
@@ -1473,6 +1506,10 @@
          onSelectAllVisible: selectAllVisible,
          onDelete: deleteSelected,
        }) : null,
+        deepLinkNotice ? h("div", {
+          className: "text-xs text-muted-foreground border border-border bg-muted/40 px-3 py-2",
+          role: "status",
+        }, deepLinkNotice) : null,
         error ? h("div", { className: "text-xs text-destructive px-2" }, error) : null,
         h(KanbanDialogs, {
           dialogProps: kanbanDialogs.dialogProps,
