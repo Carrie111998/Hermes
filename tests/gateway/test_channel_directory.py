@@ -317,3 +317,26 @@ class TestChannelAliases:
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
 
+
+    def test_null_alias_hides_retired_channel_through_rebuild(self, tmp_path, monkeypatch):
+        """A null alias removes a retired target without deleting its session history."""
+        from gateway.config import Platform
+
+        cache_file = tmp_path / "channel_directory.json"
+        discovered = [
+            {"id": "-100-old", "name": "Leadership", "type": "group", "thread_id": None},
+            {"id": "-100-live", "name": "Leadership", "type": "group", "thread_id": None},
+        ]
+        monkeypatch.setattr(
+            "gateway.channel_directory._build_from_sessions",
+            lambda plat: list(discovered) if plat == "telegram" else [],
+        )
+
+        aliases = {"telegram": {"-100-old": None, "-100-live": "Leadership"}}
+        with patch("gateway.channel_directory.DIRECTORY_PATH", cache_file), \
+             self._setup_aliases(tmp_path, aliases):
+            asyncio.run(build_channel_directory({Platform.TELEGRAM: object()}))
+            on_disk = json.loads(cache_file.read_text())
+            assert [e["id"] for e in on_disk["platforms"]["telegram"]] == ["-100-live"]
+            assert resolve_channel_name("telegram", "Leadership") == "-100-live"
+            assert resolve_channel_name("telegram", "-100-old") is None
