@@ -26,7 +26,7 @@ class _FakeStore:
     def __init__(self):
         self.facts = []
 
-    def add_fact(self, content, category="general", tags=""):
+    def add_fact(self, content, category="general", tags="", initial_trust=None):
         fid = len(self.facts) + 1
         self.facts.append({"id": fid, "content": content, "category": category, "tags": tags})
         return fid

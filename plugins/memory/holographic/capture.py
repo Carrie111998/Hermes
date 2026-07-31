@@ -33,7 +33,24 @@ Rules:
 - Only extract facts the user would want the agent to remember long-term
 - Skip: greetings, pleasantries, trivial chat
 - Skip: instructions the agent just followed (those are ephemeral)
-- Include: preferences, tools used, decisions made, project details, environment facts
+- Skip: task progress and session state — PR/issue numbers, commit SHAs, branch names, file counts, test counts, "fixed X", "submitted Y", prices/values observed this session, "stored fact id N", "created skill X"
+- Include: user preferences and corrections, decisions made, durable environment facts (paths, credentials locations, tool quirks), project conventions, stable workflows
+- Durability test: would this fact still be true and worth knowing in 30 days? If not, skip it.
+
+Tagging (append one tag in parentheses at line end, no spaces inside):
+- If the fact is borderline session state that must still be captured (e.g. a paused job, a pending decision), append "(entity:cron)"
+- Otherwise no tag
+
+Examples:
+[Conversation]
+User: I just opened PR #42 for the new authentication flow.
+Agent: Great! I also fixed the failing unit tests.
+User: Good. Remember that staging database credentials are in ~/.config/app/secrets.json.
+Agent: Noted. I'll remember that.
+User: Oh, and pause the 'weekly report' cron job until I review the metrics.
+[Facts]
+- Environment: Staging database credentials are stored in ~/.config/app/secrets.json.
+- Cron 'weekly report' is paused awaiting user review of metrics. (entity:cron)
 
 Conversation:
 {conversation}
@@ -116,11 +133,20 @@ class CaptureEngine:
         for fact in facts:
             if len(fact) < 10:
                 continue  # skip too-short fragments
+            # Extract the entity:cron marker emitted by the prompt as a real tag.
+            tags = "auto_capture"
+            if fact.rstrip().endswith("(entity:cron)"):
+                fact = fact.rstrip()[: -len("(entity:cron)")].rstrip()
+                tags = "auto_capture,entity:cron"
             try:
                 self._store.add_fact(
                     fact[:400],
                     category="auto_capture",
-                    tags="auto_capture",
+                    tags=tags,
+                    # Unconfirmed captures start discounted (below the 0.5
+                    # verified baseline, above the 0.3 search floor) so
+                    # fact_feedback-confirmed facts outrank them.
+                    initial_trust=0.35,
                 )
                 stored += 1
             except Exception as e:
