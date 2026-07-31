@@ -3763,6 +3763,36 @@ def test_production_transport_performs_identity_preflight_before_mutation() -> N
     ]
 
 
+def test_production_transport_invoke_uses_supported_remote_bounds() -> None:
+    transport = _production_transport()
+    captured: dict[str, object] = {}
+
+    def run_remote_input(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=b'{"ok":true}\n',
+            stderr=b"",
+        )
+
+    transport._run_remote_input = run_remote_input
+
+    assert transport.invoke(
+        REVISION,
+        "stage-publication",
+        publication={"action": "unit-input-authority"},
+    ) == {"ok": True}
+    assert captured["maximum_input_bytes"] == (
+        canary_transport._STOPPED_RELEASE_REMOTE_INPUT_MAX_BYTES
+    )
+    assert captured["maximum_output_bytes"] == (
+        canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+    )
+    assert len(captured["input_bytes"]) < captured["maximum_input_bytes"]
+
+
 def test_stopped_release_transport_accepts_opt_in_live_sized_iam_response() -> None:
     transport = _production_transport()
     snapshot = ("1" * 64, "2" * 64, "3" * 64)
