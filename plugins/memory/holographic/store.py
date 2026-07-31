@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS facts (
     helpful_count   INTEGER DEFAULT 0,
     created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    hrr_vector      BLOB
+    hrr_vector      BLOB,
+    sbert_vector    BLOB
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -179,6 +180,8 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        if "sbert_vector" not in columns:
+            self._conn.execute("ALTER TABLE facts ADD COLUMN sbert_vector BLOB")
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -190,12 +193,13 @@ class MemoryStore:
         content: str,
         category: str = "general",
         tags: str = "",
-    ) -> int:
-        """Insert a fact and return its fact_id.
+    ) -> dict:
+        """Insert a fact. Returns dict with fact_id and status.
 
         Deduplicates by content (UNIQUE constraint). On duplicate, returns
-        the existing fact_id without modifying the row. Extracts entities from
-        the content and links them to the fact.
+        the existing fact_id with status "duplicate". If sentence-transformers
+        is available, also checks semantic similarity — merges near-duplicates
+        (cosine > 0.85) with status "merged".
         """
         with self._lock:
             content = content.strip()
@@ -213,22 +217,67 @@ class MemoryStore:
                 self._conn.commit()
                 fact_id: int = cur.lastrowid  # type: ignore[assignment]
             except sqlite3.IntegrityError:
-                # Duplicate content — return existing id
-                row = self._conn.execute(
-                    "SELECT fact_id FROM facts WHERE content = ?", (content,)
-                ).fetchone()
-                return int(row["fact_id"])
+                return {
+                    "fact_id": self._conn.execute(
+                        "SELECT fact_id FROM facts WHERE content = ?",
+                        (content,),
+                    ).fetchone()["fact_id"],
+                    "status": "duplicate",
+                }
 
             # Entity extraction and linking
             for name in self._extract_entities(content):
                 entity_id = self._resolve_entity(name)
                 self._link_fact_entity(fact_id, entity_id)
 
-            # Compute HRR vector after entity linking
+            # Compute HRR vector
             self._compute_hrr_vector(fact_id, content)
-            self._rebuild_bank(category)
 
-            return fact_id
+            # Semantic dedup: check cosine similarity against existing facts
+            from .embeddings import get_embedder, pack_vector, unpack_vector, cosine_similarity
+            embed = get_embedder()
+            if embed is not None:
+                try:
+                    new_vec = embed([content])[0]
+                    existing = self._conn.execute(
+                        "SELECT fact_id, sbert_vector FROM facts "
+                        "WHERE sbert_vector IS NOT NULL AND fact_id != ?",
+                        (fact_id,),
+                    ).fetchall()
+                    for other_id, other_blob in existing:
+                        other_vec = unpack_vector(other_blob)
+                        sim = cosine_similarity(new_vec, other_vec)
+                        if sim > 0.92:
+                            # Near-duplicate: delete new, bump trust of existing
+                            self._conn.execute(
+                                "DELETE FROM fact_entities WHERE fact_id = ?",
+                                (fact_id,),
+                            )
+                            self._conn.execute(
+                                "DELETE FROM facts WHERE fact_id = ?", (fact_id,)
+                            )
+                            self._conn.commit()
+                            return {
+                                "fact_id": other_id,
+                                "status": "merged",
+                                "merged_with": other_id,
+                                "similarity": round(sim, 3),
+                            }
+                    # No near-duplicate — store the embedding
+                    blob = pack_vector(new_vec)
+                    self._conn.execute(
+                        "UPDATE facts SET sbert_vector = ? WHERE fact_id = ?",
+                        (blob, fact_id),
+                    )
+                    self._conn.commit()
+                except Exception as exc:
+                    logger.warning(
+                        "Semantic dedup check failed for fact %d: %s",
+                        fact_id, exc,
+                    )
+
+            self._rebuild_bank(category)
+            return {"fact_id": fact_id, "status": "added"}
 
     def search_facts(
         self,

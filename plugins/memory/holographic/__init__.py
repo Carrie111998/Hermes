@@ -275,12 +275,12 @@ class HolographicMemoryProvider(MemoryProvider):
             retriever = self._retriever
 
             if action == "add":
-                fact_id = store.add_fact(
+                result = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
                 )
-                return json.dumps({"fact_id": fact_id, "status": "added"})
+                return json.dumps(result)
 
             elif action == "search":
                 results = retriever.search(
