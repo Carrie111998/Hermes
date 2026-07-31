@@ -3027,7 +3027,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cleanup's ``agent_close`` bug or a mistaken TUI ``ws_orphan_reap``
         (dashboard viewer disconnect before #60609) are treated as recoverable;
         explicit conversation boundaries such as /new, /resume switches, and
-        compression splits are not.
+        compression splits are not.  Rows that have been expiry-finalized
+        (``expiry_finalized = 1``) are excluded: even if ``promote_to_session_reset``
+        silently failed, the expiry watcher already declared the session dead
+        and recovery would resurrect a stale transcript (#67781).
         """
         if not session_key:
             return None
@@ -3038,6 +3041,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 WHERE session_key = ?
                   AND source = ?
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND COALESCE(expiry_finalized, 0) = 0
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
@@ -3063,6 +3067,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
+                  AND COALESCE(expiry_finalized, 0) = 0
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
                   ))
