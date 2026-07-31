@@ -16501,12 +16501,19 @@ def main():
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
 
-    sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions")
+    sessions_list = sessions_subparsers.add_parser("list", help="List recent sessions (paginated)")
     sessions_list.add_argument(
         "--source", help="Filter by source (cli, telegram, discord, etc.)"
     )
     sessions_list.add_argument(
-        "-l", "--limit", type=int, default=20, help="Max sessions to show"
+        "-l", "--limit", type=int, default=10, help="Sessions per page (default 10, max 100)"
+    )
+    sessions_list.add_argument(
+        "page",
+        nargs="?",
+        type=int,
+        default=1,
+        help="Page number; each page holds --limit sessions (e.g. 'sessions list 2' = rows limit+1..2*limit)",
     )
     sessions_list.add_argument(
         "--workspace",
@@ -17077,8 +17084,10 @@ def main():
         if action == "list":
             from hermes_state import workspace_key as _ws_key
 
+            _page = max(1, getattr(args, "page", 1) or 1)
+            _offset = (_page - 1) * args.limit
             sessions = db.list_sessions_rich(
-                source=args.source, exclude_sources=_exclude, limit=args.limit
+                source=args.source, exclude_sources=_exclude, limit=args.limit, offset=_offset
             )
 
             # Workspace filter: match a session by its workspace key (git repo
@@ -17133,7 +17142,12 @@ def main():
                 return
 
             # Canonical table (same format as /sessions and /sessions search).
+            # The # column shows the global position in the canonical list, so
+            # page 2 renders rows limit+1..2*limit (not 1..limit) and the
+            # number on screen is the number /resume <N> accepts.
             from hermes_cli.session_listing import render_sessions_table
+            for _i, _s in enumerate(sessions, 1):
+                _s["rank"] = _offset + _i
             render_sessions_table(sessions, out=print, db=db)
 
         elif action == "export":

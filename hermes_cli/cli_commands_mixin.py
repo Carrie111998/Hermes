@@ -882,7 +882,7 @@ class CLICommandsMixin:
                 i += 1
             return " ".join(clean), parsed_limit
 
-        target, limit = _parse_flags(rest, default_limit=20)
+        target, limit = _parse_flags(rest, default_limit=10)
 
         # Strip common outer brackets/quotes users may type literally from the
         # usage hint (e.g. ``/resume <abc123>`` or ``/resume [abc123]``).  The
@@ -897,15 +897,26 @@ class CLICommandsMixin:
         ):
             target = target[1:-1].strip()
 
+        # /resume list [page] — paginated listing (page size = --limit).
+        # Page 1 shows ranks 1..limit, page 2 shows limit+1..2*limit, etc.
+        page = 1
+        if target == "list" or target.startswith("list "):
+            page_tok = target[5:].strip() if len(target) > 4 else ""
+            if page_tok.isdigit():
+                page = max(1, int(page_tok))
+            target = ""
+
         if not target:
             _cprint("  Usage: /resume <number|session_id_or_title>")
-            if self._show_recent_sessions(reason="resume", limit=limit):
+            offset = (page - 1) * limit
+            if self._show_recent_sessions(reason="resume", limit=limit, offset=offset):
                 # Arm a one-shot pending-resume selection so the user can type
                 # just the number (`3`) on the next line instead of having to
-                # retype `/resume 3`. Store the limit so the bare-number
-                # flow re-fetches the same count.
-                self._pending_resume_sessions = self._list_recent_sessions(limit=limit)
+                # retype `/resume 3`. Store the limit/offset so the bare-number
+                # flow re-fetches the same page.
+                self._pending_resume_sessions = self._list_recent_sessions(limit=limit, offset=offset)
                 self._pending_resume_limit = limit
+                self._pending_resume_offset = offset
                 return
             _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
             return
@@ -923,16 +934,19 @@ class CLICommandsMixin:
         if target.isdigit():
             # The # column everywhere (search results included) is the
             # session's position in the canonical sessions list, so resolve
-            # against that same list. The stored limit from a prior --limit
-            # keeps the bare-number flow consistent with what was displayed.
-            digit_limit = getattr(self, '_pending_resume_limit', 20)
-            sessions = self._list_recent_sessions(limit=digit_limit)
+            # against that same list. The stored limit/offset from a prior
+            # --limit or /resume list <page> keeps the bare-number flow
+            # consistent with what was displayed.
+            digit_limit = getattr(self, '_pending_resume_limit', 10)
+            digit_offset = getattr(self, '_pending_resume_offset', 0)
+            sessions = self._list_recent_sessions(limit=digit_limit, offset=digit_offset)
             index = int(target)
-            if index < 1 or index > len(sessions):
+            local_index = index - digit_offset
+            if index < 1 or local_index < 1 or local_index > len(sessions):
                 _cprint(f"  Resume index {index} is out of range.")
                 _cprint("  Use /resume with no arguments to see available sessions.")
                 return
-            selected = sessions[index - 1]
+            selected = sessions[local_index - 1]
             target_id = selected["id"]
         else:
             from hermes_cli.main import _resolve_session_by_name_or_id
@@ -1088,12 +1102,12 @@ class CLICommandsMixin:
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        # Extract --limit/-l N (bare listing default 20, matching
-        # `hermes sessions list`; search caps at 10 unless -l given, matching
-        # `hermes sessions search`). Capped at 100. The flag is stripped from
-        # anywhere in the args, then the rest goes to the shared arg parser.
+        # Extract --limit/-l N (bare listing default 10; search caps at 10
+        # unless -l given, matching `hermes sessions search`). Capped at 100.
+        # The flag is stripped from anywhere in the args, then the rest goes
+        # to the shared arg parser.
         import shlex as _shlex
-        limit = 20
+        limit = 10
         limit_given = False
         _tokens = _shlex.split(arg)
         _clean = []
@@ -1250,14 +1264,27 @@ class CLICommandsMixin:
             return
 
         sub = arg.lower()
-        # Bare /sessions or /sessions list — show recent sessions inline.
+        # Bare /sessions or /sessions list [page] — show recent sessions inline.
         if not arg or sub in {"list", "ls", "browse"}:
             if not self._session_db:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
-            if not self._show_recent_sessions(reason="sessions", limit=limit):
+            # /sessions list 2 — paginated listing (page size = -l N).
+            page = 1
+            _toks = arg.split()
+            if len(_toks) >= 2 and _toks[1].isdigit():
+                page = max(1, int(_toks[1]))
+            offset = (page - 1) * limit
+            if not self._show_recent_sessions(reason="sessions", limit=limit, offset=offset):
                 _cprint("  (._.) No previous sessions yet.")
+                return
+            # Arm the same one-shot numbered selection as bare /resume, so the
+            # # column shown above resolves immediately (bare number or
+            # /resume <N>), including on paginated pages.
+            self._pending_resume_sessions = self._list_recent_sessions(limit=limit, offset=offset)
+            self._pending_resume_limit = limit
+            self._pending_resume_offset = offset
             return
 
         # /sessions <id_or_title> behaves the same as /resume <id_or_title>.
