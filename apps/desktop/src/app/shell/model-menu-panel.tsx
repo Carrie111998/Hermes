@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
@@ -23,8 +23,8 @@ import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
   modelOptionsQueryKey,
-  readModelOptionsCache,
   requestModelOptions,
+  useModelOptionsQuery,
   writeModelOptionsCache
 } from '@/lib/model-options'
 import { currentPickerSelection, displayModelName, modelDisplayParts } from '@/lib/model-status-label'
@@ -92,24 +92,13 @@ export function ModelMenuPanel({ gateway, onSelectModel, profile = 'default', re
   const visibleModels = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
 
-  const cachedModelOptions = useMemo(
-    () => readModelOptionsCache(profile, activeSessionId),
-    [profile, activeSessionId]
-  )
-
-  const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, activeSessionId),
+  const modelOptions = useModelOptionsQuery({
+    profile,
+    sessionId: activeSessionId,
     // Gateway-first even with no session yet: a connected (possibly remote)
     // gateway owns the model catalog, including virtual providers like `moa`
     // that the local REST fallback can't know about (#53817).
-    queryFn: async (): Promise<ModelOptionsResponse> => {
-      const next = await requestModelOptions({ gateway, sessionId: activeSessionId })
-      writeModelOptionsCache(profile, activeSessionId, next)
-
-      return next
-    },
-    initialData: cachedModelOptions?.data,
-    initialDataUpdatedAt: cachedModelOptions?.updatedAt
+    gateway
   })
 
   const { model: optionsModel, provider: optionsProvider } = currentPickerSelection(

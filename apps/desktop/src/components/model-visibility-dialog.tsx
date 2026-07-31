@@ -1,5 +1,4 @@
 import { useStore } from '@nanostores/react'
-import { useQuery } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
@@ -12,7 +11,7 @@ import { Switch } from '@/components/ui/switch'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { Search } from '@/lib/icons'
-import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import { useModelOptionsQuery } from '@/lib/model-options'
 import { displayModelName, modelDisplayParts } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
 import {
@@ -25,7 +24,7 @@ import {
   toggleModelVisibility
 } from '@/store/model-visibility'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
-import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
+import type { ModelOptionProvider } from '@/types/hermes'
 
 interface ModelVisibilityDialogProps {
   gw?: HermesGateway
@@ -50,9 +49,10 @@ export function ModelVisibilityDialog({
   const stored = useStore($visibleModels)
   const collapsedProviders = useStore($collapsedProviders)
 
-  const modelOptions = useQuery({
-    queryKey: modelOptionsQueryKey(profile, sessionId),
-    queryFn: (): Promise<ModelOptionsResponse> => requestModelOptions({ gateway: gw, sessionId }),
+  const modelOptions = useModelOptionsQuery({
+    profile,
+    sessionId,
+    gateway: gw,
     enabled: open
   })
 

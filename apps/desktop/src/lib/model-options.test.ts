@@ -36,15 +36,25 @@ describe('model options local cache', () => {
     expect(cached?.updatedAt).toEqual(expect.any(Number))
   })
 
-  it('reuses the latest profile catalog immediately for a new session id', () => {
-    writeModelOptionsCache('default', 'old-session', catalog('gpt-5.6-sol'))
+  it('never crosses session boundaries: a concrete session reads only its own catalog', () => {
+    writeModelOptionsCache('default', 'session-1', catalog('gpt-5.6-sol'))
+    writeModelOptionsCache('default', 'session-2', catalog('claude-sonnet-4.6'))
 
-    expect(readModelOptionsCache('default', 'new-session')?.data).toEqual(catalog('gpt-5.6-sol'))
+    expect(readModelOptionsCache('default', 'session-1')?.data).toEqual(catalog('gpt-5.6-sol'))
+    expect(readModelOptionsCache('default', 'session-2')?.data).toEqual(catalog('claude-sonnet-4.6'))
   })
 
-  it('keeps the cache bounded across profiles', () => {
+  it('falls back to the profile-global catalog only for a fresh session (no session id)', () => {
+    writeModelOptionsCache('default', null, catalog('gpt-5.6-sol'))
+
+    expect(readModelOptionsCache('default')?.data).toEqual(catalog('gpt-5.6-sol'))
+    // A concrete session must NOT pick up the profile-global entry.
+    expect(readModelOptionsCache('default', 'session-1')).toBeUndefined()
+  })
+
+  it('keeps the cache bounded across sessions', () => {
     for (let index = 0; index < 20; index += 1) {
-      writeModelOptionsCache(`profile-${index}`, `session-${index}`, catalog(`model-${index}`))
+      writeModelOptionsCache('default', `session-${index}`, catalog(`model-${index}`))
     }
 
     const raw = localStorage.getItem('hermes.desktop.model-options.v1')
