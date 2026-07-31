@@ -5046,6 +5046,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 if safe_text:
                     _enqueue("assistant.delta", {"message_id": message_id, "delta": safe_text})
 
+        async def _flush_delta_media_resolver() -> None:
+            """Emit whatever the MEDIA-tag resolver is still holding back.
+
+            Idempotent -- ``flush()`` clears its own buffer, so a second call
+            on an already-flushed path is a no-op returning "".
+            """
+            try:
+                remainder = _delta_media_resolver.flush()
+            except Exception:
+                return
+            if remainder:
+                await queue.put(_event_payload("assistant.delta", {
+                    "message_id": message_id, "delta": remainder,
+                }))
+
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
@@ -5098,11 +5113,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         else ""
                     ),
                 )
-                _delta_remainder = _delta_media_resolver.flush()
-                if _delta_remainder:
-                    await queue.put(_event_payload("assistant.delta", {
-                        "message_id": message_id, "delta": _delta_remainder,
-                    }))
+                await _flush_delta_media_resolver()
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id,
                     "message_id": message_id,
@@ -5147,9 +5158,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     error=_redact_api_error_text(exc),
                     last_event="run.failed",
                 )
+                # Release any MEDIA-tag holdback before the terminal error.
+                # feed() retains all text from the last "MEDIA:" onward, so
+                # failing without flushing silently swallows text this stream
+                # used to deliver (raw, but delivered).
+                await _flush_delta_media_resolver()
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
                 self._active_run_agents.pop(run_id, None)
+                # Safety net for any terminal path that reaches neither the
+                # success flush nor the except above -- notably cancellation,
+                # which is a BaseException and bypasses `except Exception`.
+                # Must precede the close sentinel. Idempotent, so this is a
+                # no-op on paths that already flushed.
+                await _flush_delta_media_resolver()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
 
