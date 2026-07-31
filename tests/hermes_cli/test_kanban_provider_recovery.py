@@ -450,6 +450,12 @@ def test_exact_wait_cleanup_cannot_remove_successor_registration(recovery_db):
     )
 
     assert kb.reclaim_task(conn, task_id, reason="test successor")
+    old_wait = conn.execute(
+        "SELECT 1 FROM provider_recovery_waits WHERE task_id = ? AND run_id = ?",
+        (task_id, old_run_id),
+    ).fetchone()
+    assert old_wait is None
+
     successor = kb.claim_task(conn, task_id, claimer="test:successor")
     assert successor is not None and successor.current_run_id is not None
     new_run_id = int(successor.current_run_id)
@@ -464,7 +470,7 @@ def test_exact_wait_cleanup_cannot_remove_successor_registration(recovery_db):
         waiting_at=200,
     )
 
-    assert kb.close_provider_recovery_wait(
+    assert not kb.close_provider_recovery_wait(
         conn, task_id=task_id, run_id=old_run_id, session_id="old-session"
     )
     waits = conn.execute(
@@ -474,9 +480,6 @@ def test_exact_wait_cleanup_cannot_remove_successor_registration(recovery_db):
     assert [(row["run_id"], row["session_id"]) for row in waits] == [
         (new_run_id, "new-session")
     ]
-    assert not kb.close_provider_recovery_wait(
-        conn, task_id=task_id, run_id=old_run_id, session_id="old-session"
-    )
 
 
 def test_proof_api_and_storage_have_no_secret_payload_surface(recovery_db):

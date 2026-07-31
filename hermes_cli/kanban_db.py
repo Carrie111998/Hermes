@@ -4134,6 +4134,10 @@ def _end_run(
         ),
     )
     conn.execute(
+        "DELETE FROM provider_recovery_waits WHERE task_id = ? AND run_id = ?",
+        (task_id, run_id),
+    )
+    conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
     )
     return run_id
