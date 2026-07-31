@@ -216,15 +216,15 @@ class TestReopenKeepsTaskWatchdogVisible:
             kb.complete_task(conn, tid, result="premature", summary="s")
             assert kb.get_task(conn, tid).status == "done"
 
-            ok = kb.reopen_task(
+            run_id = kb.reopen_task(
                 conn, tid, reason="judge rejected",
                 claim_lock="host:123", worker_pid=4242, claim_ttl_seconds=900,
             )
-            assert ok
+            assert run_id is not None
 
             row = conn.execute(
-                "SELECT status, worker_pid, claim_lock, claim_expires, completed_at "
-                "FROM tasks WHERE id = ?", (tid,),
+                "SELECT status, worker_pid, claim_lock, claim_expires, completed_at, "
+                "current_run_id FROM tasks WHERE id = ?", (tid,),
             ).fetchone()
 
         assert row["status"] == "running"
@@ -232,6 +232,115 @@ class TestReopenKeepsTaskWatchdogVisible:
         assert row["worker_pid"] == 4242, "reap_crashed_workers would skip a NULL pid"
         assert row["claim_lock"] == "host:123"
         assert row["claim_expires"], "release_stale_claims would skip a NULL claim_expires"
+        assert row["current_run_id"] == run_id, (
+            "a reopened task with no live run cannot terminally complete: "
+            "complete_task matches the worker's pinned run id against current_run_id"
+        )
+
+    def test_full_complete_reopen_complete_lifecycle(self, tmp_path, monkeypatch):
+        """The guarded worker path must still work after a reopen.
+
+        kanban_complete passes the worker's pinned HERMES_KANBAN_RUN_ID and
+        complete_task requires it to equal tasks.current_run_id. If a reopen
+        leaves that pointer stale or NULL, the continuation can never
+        terminally complete or block through the guarded paths - it just
+        fails silently and the card hangs in running.
+        """
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        kb.init_db()
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="goal card", assignee="w", goal_mode=True)
+
+            # Claim it like the dispatcher does, so a real run row exists.
+            claimed = kb.claim_task(conn, tid, claimer="host:123")
+            assert claimed is not None
+            first_run = kb.get_task(conn, tid).current_run_id
+            assert first_run is not None, "claim must open a run"
+
+            # First attempt: worker completes with its own run id pinned.
+            assert kb.complete_task(
+                conn, tid, result="premature", summary="s",
+                expected_run_id=first_run,
+            ) is True
+
+            # Judge rejects it -> reopen onto a NEW run.
+            second_run = kb.reopen_task(
+                conn, tid, reason="judge rejected",
+                claim_lock="host:123", worker_pid=4242,
+            )
+            assert second_run is not None
+            assert second_run != first_run, "reopen must not revive the closed run"
+
+            # The stale run id must NOT be able to complete the task.
+            assert kb.complete_task(
+                conn, tid, result="stale", summary="s",
+                expected_run_id=first_run,
+            ) is False
+            assert kb.get_task(conn, tid).status == "running"
+
+            # The rebound run id must succeed.
+            assert kb.complete_task(
+                conn, tid, result="real work", summary="done properly",
+                expected_run_id=second_run,
+            ) is True
+            assert kb.get_task(conn, tid).status == "done"
+
+            runs = conn.execute(
+                "SELECT id, status, outcome FROM task_runs WHERE task_id = ? ORDER BY id",
+                (tid,),
+            ).fetchall()
+
+        assert len(runs) == 2, "each attempt keeps its own run row"
+        assert all(r["status"] != "running" for r in runs), "both runs closed"
+
+    def test_reopen_allows_block_after_reopen(self, tmp_path, monkeypatch):
+        """A reopened continuation must also be able to block for a human."""
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        kb.init_db()
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="goal card", assignee="w", goal_mode=True)
+            kb.complete_task(conn, tid, result="premature", summary="s")
+            new_run = kb.reopen_task(conn, tid, reason="judge rejected", worker_pid=4242)
+            assert new_run is not None
+
+            kb.block_task(conn, tid, reason="needs a human", kind="needs_input")
+            task = kb.get_task(conn, tid)
+
+        assert task.status == "blocked"
+        assert task.block_kind == "needs_input"
+
+    def test_reopen_heartbeat_uses_the_restored_lock(self, tmp_path, monkeypatch):
+        """heartbeat_claim matches on claim_lock - the drain must pass it."""
+        from pathlib import Path
+        from hermes_cli import kanban_db as kb
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        kb.init_db()
+
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="goal card", assignee="w", goal_mode=True)
+            kb.complete_task(conn, tid, result="x", summary="s")
+            kb.reopen_task(conn, tid, reason="r", claim_lock="host:999", worker_pid=1)
+
+            assert kb.heartbeat_claim(conn, tid, claimer="host:999") is True
+            assert kb.heartbeat_claim(conn, tid, claimer="wrong:lock") is False
 
     def test_reopen_rejects_non_terminal_task(self, tmp_path, monkeypatch):
         from pathlib import Path
@@ -245,4 +354,4 @@ class TestReopenKeepsTaskWatchdogVisible:
 
         with kb.connect() as conn:
             tid = kb.create_task(conn, title="open card", assignee="w")
-            assert kb.reopen_task(conn, tid, reason="x") is False
+            assert kb.reopen_task(conn, tid, reason="x") is None

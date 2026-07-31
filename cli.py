@@ -17418,6 +17418,9 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             print(resp)
         return resp or ""
 
+    def _claim_lock() -> "str | None":
+        return (_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
+
     def _task_status() -> "str | None":
         c = _kb.connect()
         try:
@@ -17441,16 +17444,23 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 pass
 
     def _reopen(reason: str) -> None:
-        # Restore the live worker's claim identity along with the status —
-        # a 'running' row with NULL worker_pid/claim_expires is invisible to
-        # both watchdogs and would hang forever if this process died.
+        # Restore the live worker's claim identity AND open a fresh run.
+        #
+        # Two invariants make this fiddly:
+        #  1. A 'running' row with NULL worker_pid/claim_expires is invisible
+        #     to both watchdogs and would hang forever if this process died.
+        #  2. complete_task/block_task closed the previous run and cleared
+        #     tasks.current_run_id. kanban_complete passes the worker's pinned
+        #     HERMES_KANBAN_RUN_ID and complete_task matches it against
+        #     current_run_id — so without rebinding, the continuation could
+        #     never terminally complete or block.
         c = _kb.connect()
         try:
-            _kb.reopen_task(
+            new_run_id = _kb.reopen_task(
                 c,
                 task_id,
                 reason=reason,
-                claim_lock=(_os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or None),
+                claim_lock=_claim_lock(),
                 worker_pid=_os.getpid(),
                 claim_ttl_seconds=_kb._resolve_claim_ttl_seconds(),
             )
@@ -17459,6 +17469,13 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
                 c.close()
             except Exception:
                 pass
+        if new_run_id is not None:
+            # Rebind so this worker's later kanban_complete/kanban_block
+            # passes the run id the task now points at.
+            _os.environ["HERMES_KANBAN_RUN_ID"] = str(new_run_id)
+            logger.info(
+                "kanban goal loop: task %s reopened on run %s", task_id, new_run_id,
+            )
 
     def _block(reason: str) -> None:
         c = _kb.connect()
@@ -17484,6 +17501,62 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _resolve_drain_deadline(task_id: str) -> Optional[float]:
+    """Seconds left before this worker's supervisor stops tolerating it.
+
+    Preference order:
+
+    1. ``HERMES_KANBAN_DEADLINE_TS`` — an explicit epoch deadline, when the
+       spawning build exports one.
+    2. The ACTIVE RUN's own cap: ``task_runs.max_runtime_seconds`` measured
+       from ``task_runs.started_at``, falling back to
+       ``tasks.max_runtime_seconds``. This is what the dispatcher's
+       timeout reaping uses, so it is the honest bound on how long this
+       process may keep running.
+
+    Returns ``None`` when no cap applies (no kanban task, or an uncapped
+    run) — the caller then waits indefinitely, which is correct for a run
+    nobody is going to reclaim.
+    """
+    deadline_raw = (os.environ.get("HERMES_KANBAN_DEADLINE_TS") or "").strip()
+    if deadline_raw:
+        try:
+            return max(0.0, float(deadline_raw) - time.time())
+        except ValueError:
+            pass
+
+    if not task_id:
+        return None
+
+    try:
+        from hermes_cli import kanban_db as _kb
+        conn = _kb.connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT COALESCE(r.max_runtime_seconds, t.max_runtime_seconds) AS cap,
+                       r.started_at AS run_started,
+                       t.started_at AS task_started
+                  FROM tasks t
+                  LEFT JOIN task_runs r ON r.id = t.current_run_id
+                 WHERE t.id = ?
+                """,
+                (task_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:
+        logger.debug("drain deadline lookup failed", exc_info=True)
+        return None
+
+    if not row or not row["cap"]:
+        return None
+    started = row["run_started"] or row["task_started"]
+    if not started:
+        return None
+    return max(0.0, float(started) + float(row["cap"]) - time.time())
+
+
 def _drain_background_delegations() -> None:
     """Wait for in-flight background subagents before a ``-q`` process exits.
 
@@ -17492,11 +17565,13 @@ def _drain_background_delegations() -> None:
     ``sys.exit`` while a child is working destroys that work with no record
     of what it had done.
 
-    The wait is bounded by the task's OWN deadline: kanban workers are
-    spawned with ``HERMES_KANBAN_DEADLINE_TS`` (epoch seconds), and the
-    dispatcher reclaims the task after it passes, so draining beyond it
-    would just get the worker killed anyway. A non-kanban ``-q`` run has no
-    deadline and waits indefinitely — it has no supervisor to answer to.
+    The wait is bounded by the task's OWN runtime cap, read from the active
+    run (``task_runs.max_runtime_seconds`` + ``started_at``, falling back to
+    the task row). The dispatcher reclaims a task once that cap is exceeded,
+    so draining past it would only get the worker killed anyway.
+    ``HERMES_KANBAN_DEADLINE_TS`` is honoured when present as a more precise
+    override. A run with no cap, and any non-kanban ``-q`` run, waits
+    indefinitely — there is no supervisor to answer to.
 
     On timeout we exit anyway and let the survivors be classified by
     ``recover_abandoned_delegations`` (owner PID gone → state ``unknown``),
@@ -17504,7 +17579,10 @@ def _drain_background_delegations() -> None:
 
     While draining we keep the kanban heartbeat fresh: a drain can outlast
     the claim TTL, and a worker that is deliberately waiting must not look
-    like a hung one to ``release_stale_claims``.
+    like a hung one to ``release_stale_claims``. The heartbeat is passed the
+    worker's pinned ``HERMES_KANBAN_CLAIM_LOCK`` because
+    ``heartbeat_claim`` matches on ``claim_lock``; without it the update
+    silently affects nothing.
     """
     try:
         from tools.async_delegation import active_count, active_ids, drain_active
@@ -17517,15 +17595,9 @@ def _drain_background_delegations() -> None:
     except Exception:
         return
 
-    timeout: Optional[float] = None
-    deadline_raw = (os.environ.get("HERMES_KANBAN_DEADLINE_TS") or "").strip()
-    if deadline_raw:
-        try:
-            timeout = max(0.0, float(deadline_raw) - time.time())
-        except ValueError:
-            timeout = None
-
     task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip() or None
+    timeout = _resolve_drain_deadline(task_id)
 
     def _on_wait(remaining: int, elapsed: float) -> None:
         logger.info(
@@ -17540,7 +17612,8 @@ def _drain_background_delegations() -> None:
             from hermes_cli import kanban_db as _kb
             c = _kb.connect()
             try:
-                _kb.heartbeat_claim(c, task_id)
+                # claimer= is required: heartbeat_claim matches on claim_lock.
+                _kb.heartbeat_claim(c, task_id, claimer=claim_lock)
             finally:
                 c.close()
         except Exception:
