@@ -4357,7 +4357,6 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     ],
                 }
             ],
-            "max_tokens": 2000,
             "temperature": vision_temperature,
             "timeout": vision_timeout,
         }
