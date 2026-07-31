@@ -1,5 +1,6 @@
 """Regression tests for zero-delivery stream timeout retry amplification."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +23,7 @@ def _make_agent() -> AIAgent:
         agent = AIAgent(
             api_key="test-key",
             base_url="https://example.com/v1",
+            provider="test-provider",
             model="test/model",
             quiet_mode=True,
             skip_context_files=True,
@@ -196,6 +198,57 @@ def test_anthropic_reasoning_delta_counts_as_delivery(
     assert getattr(timeout, _TIMEOUT_MARKER, False) is False
 
 
+def test_timeout_after_tool_delta_uses_stream_retry(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A tool-call chunk is response progress, even without visible text."""
+    from tests.run_agent.test_streaming import (
+        _make_stream_chunk,
+        _make_tool_call_delta,
+    )
+
+    monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+    agent = _make_agent()
+    timeout = httpx.ReadTimeout(
+        "read timeout",
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+    )
+    attempts = 0
+
+    def first_stream():
+        yield _make_stream_chunk(tool_calls=[
+            _make_tool_call_delta(index=0, tc_id="call_1", name="terminal"),
+        ])
+        raise timeout
+
+    def second_stream():
+        yield _make_stream_chunk(tool_calls=[
+            _make_tool_call_delta(index=0, tc_id="call_1", name="terminal"),
+        ])
+        yield _make_stream_chunk(tool_calls=[
+            _make_tool_call_delta(index=0, arguments='{"command": "pwd"}'),
+        ])
+        yield _make_stream_chunk(finish_reason="tool_calls")
+
+    def pick_stream(**_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return first_stream() if attempts == 1 else second_stream()
+
+    request_client = MagicMock()
+    request_client.chat.completions.create.side_effect = pick_stream
+    agent._create_request_openai_client = MagicMock(return_value=request_client)
+
+    response = agent._interruptible_streaming_api_call(
+        {"model": "test/model", "messages": []}
+    )
+
+    assert attempts == 2
+    assert response is not None
+    assert response.choices[0].message.tool_calls
+    assert getattr(timeout, _TIMEOUT_MARKER, False) is False
+
+
 def _marked_read_timeout() -> httpx.ReadTimeout:
     timeout = httpx.ReadTimeout(
         "read timeout",
@@ -240,7 +293,10 @@ def test_zero_delivery_timeout_uses_one_primary_recovery_then_fallback():
     agent._try_activate_fallback.assert_called_once()
 
 
-def test_zero_delivery_timeout_attempts_configured_fallback_without_outer_retries():
+def test_zero_delivery_timeout_attempts_configured_fallback_without_outer_retries(
+    caplog: pytest.LogCaptureFixture,
+):
+    caplog.set_level(logging.ERROR, logger="agent.conversation_loop")
     agent = _make_agent()
     agent._api_max_retries = 3
     agent.client = MagicMock()
@@ -250,11 +306,26 @@ def test_zero_delivery_timeout_attempts_configured_fallback_without_outer_retrie
     agent._try_recover_primary_transport = MagicMock(return_value=False)
     agent._has_pending_fallback = MagicMock(return_value=True)
     agent._try_activate_fallback = MagicMock(return_value=False)
+    agent._buffer_status = MagicMock()
+    agent._emit_status = MagicMock()
+    agent._dump_api_request_debug = MagicMock()
 
     result = _run_non_streaming_turn(agent)
 
     assert agent.client.chat.completions.create.call_count == 1
     agent._try_activate_fallback.assert_called_once()
+    agent._buffer_status.assert_called_once_with(
+        "⚠️ Provider timed out before delivering any response — trying fallback..."
+    )
+    agent._emit_status.assert_any_call(
+        "❌ Provider timed out before delivering any response after the "
+        "available recovery options were exhausted."
+    )
+    assert agent._dump_api_request_debug.call_args.kwargs["reason"] == (
+        "zero_delivery_stream_timeout"
+    )
+    assert "zero-delivery stream timeout recovery exhausted" in caplog.text
+    assert "after 3 retries" not in caplog.text
     assert "timed out before delivering any response" in result["final_response"]
     assert "payload may be too large" in result["final_response"]
 

@@ -2875,6 +2875,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     first_delta_fired = {"done": False}
     deltas_were_sent = {"yes": False}  # Track if any deltas were fired (for fallback)
     provider_tool_in_flight = {"yes": False}
+    response_progress_seen = {"yes": False}
     # Wall-clock timestamp of the last real streaming chunk.  The outer
     # poll loop uses this to detect stale connections that keep receiving
     # SSE keep-alive pings but no actual data.
@@ -2916,6 +2917,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             stream_attempt_state["current"] += 1
             attempt_id = int(stream_attempt_state["current"])
         provider_tool_in_flight["yes"] = False
+        response_progress_seen["yes"] = False
         return attempt_id
 
     def _cancel_current_stream_attempt(reason: str) -> None:
@@ -3207,6 +3209,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not _stream_attempt_is_active(stream_attempt_id):
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
+
+            response_progress_seen["yes"] = True
 
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
@@ -3611,6 +3615,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         try:
             for event in stream:
                 saw_stream_event = True
+                response_progress_seen["yes"] = True
                 last_chunk_time["t"] = time.time()
                 agent._touch_activity("receiving stream response")
                 try:
@@ -3748,13 +3753,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _is_stream_parse_err = agent._is_provider_stream_parse_error(e)
                     _is_empty_stream = isinstance(e, EmptyStreamError)
 
-                    # A timeout before the first delivered delta is escalated
+                    # A timeout before the first response event is escalated
                     # immediately to the outer recovery pipeline. Retrying the
                     # identical payload in both this loop and the outer loop
                     # multiplies long provider timeouts. The marker lets the
                     # outer loop preserve one primary transport rebuild and
                     # configured fallbacks without another ordinary retry cycle.
-                    if _is_timeout and not deltas_were_sent["yes"]:
+                    # Any event — including a tool-call or metadata event — means
+                    # the provider made progress, so existing mid-stream retry
+                    # behavior must remain in control.
+                    if _is_timeout and not response_progress_seen["yes"]:
                         setattr(e, ZERO_DELIVERY_STREAM_TIMEOUT_ATTR, True)
                         result["error"] = e
                         return
