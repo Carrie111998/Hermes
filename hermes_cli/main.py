@@ -392,8 +392,8 @@ def _print_fast_version_info() -> None:
     from hermes_cli import __release_date__, __version__
 
     print(f"Hermes Agent v{__version__} ({__release_date__})")
-    _print_runtime_capabilities()
     print(f"Install directory: {PROJECT_ROOT}")
+    _print_auth_home()
 
     print(f"Python: {sys.version.split()[0]}")
 
@@ -401,8 +401,29 @@ def _print_fast_version_info() -> None:
     print(f"OpenAI SDK: {openai_version}" if openai_version else "OpenAI SDK: Not installed")
 
 
-def _print_runtime_capabilities() -> None:
-    print("Runtime capabilities: provider-auth-home-v1")
+def _exit_on_invalid_auth_home() -> None:
+    """Exit with an actionable message when ``HERMES_AUTH_HOME`` is unusable."""
+    from hermes_constants import HermesAuthHomeError, get_hermes_auth_home_strict
+
+    try:
+        get_hermes_auth_home_strict()
+    except HermesAuthHomeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _print_auth_home() -> None:
+    """Print where provider credentials actually resolve to.
+
+    Prints only under ``HERMES_AUTH_HOME``, where the residence diverges from
+    the install/home paths already shown and an operator otherwise has no way
+    to tell which store a box is reading.
+    """
+    from hermes_constants import get_hermes_auth_home_strict
+
+    if "HERMES_AUTH_HOME" not in os.environ:
+        return
+    print(f"Auth home: {get_hermes_auth_home_strict()} (HERMES_AUTH_HOME)")
 
 
 def _try_termux_ultrafast_version() -> bool:
@@ -414,6 +435,7 @@ def _try_termux_ultrafast_version() -> bool:
     if not _is_termux_fast_version_argv(sys.argv[1:]):
         return False
 
+    _exit_on_invalid_auth_home()
     _print_fast_version_info()
     return True
 
@@ -4881,9 +4903,9 @@ def _print_version_info(*, check_updates: bool = True) -> None:
     # Core version line is registry-owned (shared with the gateway /version);
     # the install/python/SDK detail below is CLI-only decoration.
     print(execute_command("version", CommandContext(surface="cli")).text)
-    _print_runtime_capabilities()
     print(f"Install directory: {PROJECT_ROOT}")
     print(f"Install method: {detect_install_method(PROJECT_ROOT)}")
+    _print_auth_home()
 
     # Show Python version
     print(f"Python: {sys.version.split()[0]}")
@@ -11041,6 +11063,14 @@ def main():
         configure_windows_stdio()
     except Exception:
         pass
+
+    # Reject a malformed HERMES_AUTH_HOME here, before anything resolves a
+    # credential path. The resolver itself is deliberately total (it warns and
+    # falls back), so without this check a launcher typo would surface as a
+    # silent fallback to HERMES_HOME rather than an error the operator can act
+    # on. Deliberately ahead of argv parsing: every subcommand touches
+    # credentials eventually.
+    _exit_on_invalid_auth_home()
 
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when

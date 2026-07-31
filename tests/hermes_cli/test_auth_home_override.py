@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -84,13 +85,95 @@ def test_auth_home_defaults_to_runtime_home_and_validates_override(
     assert get_hermes_auth_home_override() == residence.resolve()
     assert get_hermes_auth_home() == residence.resolve()
 
-    monkeypatch.setenv("HERMES_AUTH_HOME", "")
-    with pytest.raises(ValueError, match="must not be empty"):
-        get_hermes_auth_home()
 
-    monkeypatch.setenv("HERMES_AUTH_HOME", "relative/auth")
-    with pytest.raises(ValueError, match="absolute path"):
-        get_hermes_auth_home()
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [("", "set but empty"), ("   ", "set but empty"),
+     ("relative/auth", "absolute path")],
+)
+def test_invalid_override_is_rejected_by_validation_not_by_the_resolver(
+    monkeypatch, tmp_path, value, message
+):
+    """An unusable value must fail loudly at startup, never mid-run.
+
+    The resolver itself has to stay total: it runs from import-time module
+    constants and from the file-safety guards, and a raise there either aborts
+    startup or gets swallowed into a fail-open credential read.
+    """
+    import hermes_constants
+
+    runtime_home = tmp_path / "runtime"
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", value)
+    monkeypatch.setattr(hermes_constants, "_auth_home_invalid_warned", False)
+
+    with pytest.raises(hermes_constants.HermesAuthHomeError, match=message):
+        hermes_constants.validate_hermes_auth_home()
+
+    assert get_hermes_auth_home_override() is None
+    assert get_hermes_auth_home() == runtime_home
+
+
+def test_invalid_override_keeps_the_credential_read_guard_closed(
+    monkeypatch, tmp_path
+):
+    """Regression: an empty HERMES_AUTH_HOME must not disable the read deny.
+
+    get_read_block_error() resolves several Hermes homes; when that raised,
+    raise_if_read_blocked's best-effort ``except Exception: return`` turned
+    every image-gen/vision reference-file guard into a no-op at once.
+    """
+    from agent.file_safety import raise_if_read_blocked
+
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+
+    for name in ("auth.json", ".env", ".anthropic_oauth.json"):
+        target = runtime_home / name
+        target.write_text("secret", encoding="utf-8")
+        for value in ("", "relative/auth"):
+            monkeypatch.setenv("HERMES_AUTH_HOME", value)
+            with pytest.raises(ValueError, match="Access denied"):
+                raise_if_read_blocked(str(target))
+
+
+def test_auth_store_temp_files_are_denied_for_read_and_write(
+    monkeypatch, tmp_path
+):
+    """Atomic-write temps hold the same plaintext tokens as auth.json."""
+    from agent.file_safety import get_read_block_error, is_write_denied
+
+    residence = tmp_path / "auth-residence"
+    residence.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "runtime"))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+
+    for name in ("auth.json.tmp.4242.deadbeef", "auth.json.corrupt"):
+        target = residence / name
+        target.write_text("{}", encoding="utf-8")
+        assert get_read_block_error(str(target)), name
+        assert is_write_denied(str(target)), name
+
+
+def test_legacy_rebootstrap_temp_is_exactly_classified_and_uninstalled(
+    tmp_path,
+):
+    from hermes_cli.auth_artifacts import is_primary_auth_transient
+    from hermes_cli.uninstall import _clean_auth_residence
+
+    legacy = tmp_path / "auth.json.rebootstrap.tmp"
+    unknown = tmp_path / "auth.json.rebootstrap.tmp.extra"
+    legacy.write_text("credential copy", encoding="utf-8")
+    unknown.write_text("operator data", encoding="utf-8")
+
+    assert is_primary_auth_transient(legacy.name)
+    assert not is_primary_auth_transient(unknown.name)
+
+    _clean_auth_residence(tmp_path)
+
+    assert not legacy.exists()
+    assert unknown.read_text(encoding="utf-8") == "operator data"
 
 
 def test_override_routes_current_credential_paths_and_guards(
@@ -126,7 +209,6 @@ def test_override_routes_current_credential_paths_and_guards(
     from hermes_cli.models import _credential_fingerprint
     from hermes_cli.web_server import _save_anthropic_oauth_creds
     from plugins.platforms.photon.auth import (
-        _auth_json_path as photon_auth_json_path,
         load_photon_token,
         store_photon_token,
     )
@@ -137,7 +219,7 @@ def test_override_routes_current_credential_paths_and_guards(
     assert _auth_lock_path() == residence / "auth.lock"
     assert _get_hermes_oauth_file() == residence / ".anthropic_oauth.json"
     assert auxiliary_auth_json_path() == residence / "auth.json"
-    assert photon_auth_json_path() == residence / "auth.json"
+    assert get_hermes_auth_home() / "auth.json" == residence / "auth.json"
     assert managed_auth_json_path() == residence / "auth.json"
     assert _global_auth_file_path() is None
 
@@ -177,10 +259,16 @@ def test_override_routes_current_credential_paths_and_guards(
     assert get_provider_auth_state("global-only") is None
     assert has_xai_credentials()
 
+    # The shared Nous store relocates into the residence rather than being
+    # switched off. Disabling it would strand every profile with its own
+    # refresh-token chain, which is how single-use tokens get replayed
+    # (#48415); relocating keeps the sharing inside the residence boundary.
     _write_shared_nous_state(
         {"access_token": "new-access", "refresh_token": "new-refresh"}
     )
-    assert _read_shared_nous_state() is None
+    residence_shared = residence / "shared" / "nous_auth.json"
+    assert residence_shared.is_file()
+    assert (_read_shared_nous_state() or {}).get("access_token") == "new-access"
     assert shared_path.read_text(encoding="utf-8") == shared_payload
 
     store_photon_token("photon-token")
@@ -368,3 +456,391 @@ def test_two_runtime_processes_share_only_the_auth_residence(tmp_path):
     assert shared_path.read_text(encoding="utf-8") == shared_payload
     if os.name != "nt":
         assert (residence / "auth.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_profiles_keep_separate_stores_inside_the_residence(monkeypatch, tmp_path):
+    """Two multiplexed profiles must not share one auth.json or active_provider.
+
+    The gateway scopes each profile turn with a context-local HERMES_HOME
+    (``_profile_runtime_scope``). A residence resolved purely from the process
+    environment would collapse every profile onto one store.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_cli.auth import (
+        _auth_file_path,
+        _auth_store_lock,
+        _load_auth_store,
+        _save_auth_store,
+        _store_provider_state,
+        get_provider_auth_state,
+    )
+
+    root = tmp_path / "root"
+    residence = tmp_path / "auth-residence"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+
+    def write_profile_state(profile: str, value: str) -> Path:
+        token = set_hermes_home_override(str(root / "profiles" / profile))
+        try:
+            with _auth_store_lock():
+                store = _load_auth_store()
+                _store_provider_state(store, "nous", {"value": value}, set_active=True)
+                _save_auth_store(store)
+            return _auth_file_path()
+        finally:
+            reset_hermes_home_override(token)
+
+    def read_profile_state(profile: str):
+        token = set_hermes_home_override(str(root / "profiles" / profile))
+        try:
+            return get_provider_auth_state("nous")
+        finally:
+            reset_hermes_home_override(token)
+
+    work_path = write_profile_state("work", "work-token")
+    play_path = write_profile_state("play", "play-token")
+
+    assert work_path == residence / "profiles" / "work" / "auth.json"
+    assert play_path == residence / "profiles" / "play" / "auth.json"
+    assert work_path != play_path
+    assert read_profile_state("work") == {"value": "work-token"}
+    assert read_profile_state("play") == {"value": "play-token"}
+
+    # active_provider is per-profile too, not one field they fight over.
+    work_store = json.loads(work_path.read_text(encoding="utf-8"))
+    play_store = json.loads(play_path.read_text(encoding="utf-8"))
+    assert work_store["providers"].keys() == {"nous"}
+    assert work_store["providers"]["nous"] == {"value": "work-token"}
+    assert play_store["providers"]["nous"] == {"value": "play-token"}
+
+
+def test_residence_equal_to_home_is_a_no_op_not_a_fallback_teardown(
+    monkeypatch, tmp_path
+):
+    """Pointing the residence at the directory already in use changes nothing.
+
+    _global_auth_file_path() used to return None whenever the env var was set
+    at all, so this silently disabled the global-root read fallback *and* the
+    write-through that keeps rotated single-use refresh tokens in sync.
+    """
+    from hermes_cli.auth import _global_auth_file_path
+
+    root = tmp_path / "operator" / ".hermes"
+    profile_home = root / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    monkeypatch.delenv("HERMES_AUTH_HOME", raising=False)
+    assert _global_auth_file_path() == root / "auth.json"
+
+    # Same directory, spelled explicitly — must not change the resolution.
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(profile_home))
+    assert _global_auth_file_path() == root / "auth.json"
+
+    # A residence that genuinely relocates the store does move the fallback,
+    # into the residence root, so write-through still has somewhere to go.
+    residence = tmp_path / "auth-residence"
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+    assert _global_auth_file_path() == residence / "auth.json"
+
+
+def test_generated_service_values_use_strict_resolution(monkeypatch, tmp_path):
+    from hermes_cli.gateway import _service_auth_home_directive
+    from hermes_cli.gateway_windows import _auth_home_for_service
+
+    residence = tmp_path / "auth-residence"
+    monkeypatch.delenv("HERMES_AUTH_HOME", raising=False)
+    assert _service_auth_home_directive() == ""
+    assert _auth_home_for_service() == ""
+
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+    assert f'Environment="HERMES_AUTH_HOME={residence}"' in _service_auth_home_directive()
+    assert _auth_home_for_service() == str(residence)
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "",
+        "relative/auth",
+        "~/auth",
+        " /absolute/with-leading-space",
+        "/absolute/with-trailing-space ",
+        "bad\npath",
+    ),
+)
+def test_service_generation_rejects_invalid_auth_home(monkeypatch, value):
+    from hermes_cli.gateway import _service_auth_home_directive
+    from hermes_cli.gateway_windows import _auth_home_for_service
+
+    monkeypatch.setenv("HERMES_AUTH_HOME", value)
+    with pytest.raises(ValueError):
+        _service_auth_home_directive()
+    with pytest.raises(ValueError):
+        _auth_home_for_service()
+
+
+def test_systemd_auth_home_value_is_escaped_and_parseable(monkeypatch, tmp_path):
+    from hermes_cli.gateway import _service_auth_home_directive, generate_systemd_unit
+
+    residence = tmp_path / 'auth\\store"100%ready'
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+
+    expected = (
+        str(residence.resolve())
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+    )
+    assert _service_auth_home_directive() == (
+        f'Environment="HERMES_AUTH_HOME={expected}"\n'
+    )
+
+    systemd_analyze = shutil.which("systemd-analyze")
+    if systemd_analyze is None:
+        pytest.skip("systemd-analyze is unavailable")
+    unit_path = tmp_path / "hermes-auth-home.service"
+    unit_path.write_text(generate_systemd_unit(), encoding="utf-8")
+    result = subprocess.run(
+        [systemd_analyze, "verify", str(unit_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_windows_cmd_wrapper_preserves_literal_percent(monkeypatch, tmp_path):
+    import hermes_cli.gateway_windows as gateway_windows
+
+    residence = tmp_path / "%LOCALAPPDATA%" / "auth"
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+    monkeypatch.setattr(
+        gateway_windows,
+        "_resolve_detached_python",
+        lambda python_path: (python_path, tmp_path / "venv", []),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_preserve_hermes_home_path",
+        lambda path: str(path),
+    )
+
+    script = gateway_windows._build_gateway_cmd_script(
+        sys.executable,
+        str(tmp_path),
+        str(tmp_path / "runtime"),
+        "",
+    )
+
+    escaped = str(residence.resolve()).replace("%", "%%")
+    assert f'set "HERMES_AUTH_HOME={escaped}"' in script.splitlines()
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "",
+        "   ",
+        "relative/auth",
+        "~/auth",
+        " /absolute/with-leading-space",
+        "/absolute/with-trailing-space ",
+        "bad\npath",
+    ),
+)
+@pytest.mark.parametrize("termux_fast", (False, True))
+def test_invalid_auth_home_version_exits_two_without_fallback_write(
+    tmp_path, value, termux_fast
+):
+    runtime_home = tmp_path / ("termux" if termux_fast else "normal")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(runtime_home),
+            "HERMES_AUTH_HOME": value,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        }
+    )
+    if termux_fast:
+        env["TERMUX_VERSION"] = "test"
+        env.pop("HERMES_TERMUX_DISABLE_FAST_CLI", None)
+    else:
+        env["HERMES_TERMUX_DISABLE_FAST_CLI"] = "1"
+        env.pop("TERMUX_VERSION", None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "--version"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "HERMES_AUTH_HOME" in result.stderr
+    assert not (runtime_home / "auth.json").exists()
+
+
+def test_version_reports_valid_effective_auth_home(tmp_path):
+    runtime_home = tmp_path / "runtime"
+    residence = tmp_path / "residence"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(runtime_home),
+            "HERMES_AUTH_HOME": str(residence),
+            "HERMES_TERMUX_DISABLE_FAST_CLI": "1",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        }
+    )
+    env.pop("TERMUX_VERSION", None)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "hermes_cli.main", "--version"],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Auth home: {residence.resolve()} (HERMES_AUTH_HOME)" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        ("-m", "acp_adapter.entry", "--version"),
+        ("-m", "hermes_agent_entry"),
+        (str(Path(__file__).resolve().parents[2] / "run_agent.py"), "--list-tools"),
+    ),
+)
+@pytest.mark.parametrize(
+    "value",
+    (
+        "",
+        "   ",
+        "relative/auth",
+        "~/auth",
+        " /absolute/with-leading-space",
+        "/absolute/with-trailing-space ",
+        "bad\npath",
+        "/",
+    ),
+)
+def test_other_operational_entrypoints_reject_invalid_auth_home(
+    tmp_path, command, value
+):
+    runtime_home = tmp_path / "runtime"
+    env = os.environ.copy()
+    env.update(
+        {
+            "HERMES_HOME": str(runtime_home),
+            "HERMES_AUTH_HOME": value,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, *command],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    error_lines = [line for line in result.stderr.splitlines() if line.strip()]
+    assert len(error_lines) == 1
+    assert "HERMES_AUTH_HOME" in error_lines[0]
+    assert "ignored" not in error_lines[0]
+    assert not runtime_home.exists()
+
+
+def test_installed_agent_command_uses_the_early_validation_wrapper():
+    project = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    text = project.read_text(encoding="utf-8")
+
+    assert 'hermes-agent = "hermes_agent_entry:main"' in text
+    assert '"hermes_agent_entry"' in text
+
+
+def test_xai_login_success_names_the_actual_auth_residence(
+    monkeypatch, tmp_path, capsys
+):
+    """The login summary must point at the store that was actually written."""
+    import base64
+    from types import SimpleNamespace
+
+    from hermes_cli.auth import DEFAULT_XAI_OAUTH_BASE_URL, _login_xai_oauth
+
+    runtime_home = tmp_path / "runtime"
+    runtime_home.mkdir()
+    residence = tmp_path / "auth-residence"
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": int(time.time()) + 7200}).encode("utf-8")
+    ).rstrip(b"=").decode("utf-8")
+    access_token = f"h.{payload}.s"
+    monkeypatch.setattr(
+        "hermes_cli.auth._xai_oauth_device_code_login",
+        lambda **kwargs: {
+            "tokens": {
+                "access_token": access_token,
+                "refresh_token": "rt-new",
+                "id_token": "",
+                "token_type": "Bearer",
+            },
+            "discovery": {"token_endpoint": "https://auth.x.ai/token"},
+            "redirect_uri": "",
+            "base_url": DEFAULT_XAI_OAUTH_BASE_URL,
+            "last_refresh": "2026-07-31T10:00:00Z",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._update_config_for_provider",
+        lambda *args, **kwargs: "config.yaml",
+    )
+
+    _login_xai_oauth(
+        SimpleNamespace(no_browser=True, timeout=3),
+        None,
+        force_new_login=True,
+    )
+
+    output = capsys.readouterr().out
+    assert f"Auth state: {residence.resolve()}/auth.json" in output
+    assert f"{runtime_home}/auth.json" not in output
+    assert (residence / "auth.json").is_file()
+    assert not (runtime_home / "auth.json").exists()
+
+
+def test_quick_snapshot_captures_credentials_from_the_residence(
+    monkeypatch, tmp_path
+):
+    """Backups resolved auth.json under HERMES_HOME, so they captured nothing."""
+    from hermes_cli.backup import _resolve_state_path
+
+    runtime_home = tmp_path / "runtime"
+    residence = tmp_path / "auth-residence"
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+
+    monkeypatch.delenv("HERMES_AUTH_HOME", raising=False)
+    assert _resolve_state_path(runtime_home, "auth.json") == runtime_home / "auth.json"
+    assert _resolve_state_path(runtime_home, "config.yaml") == runtime_home / "config.yaml"
+
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+    assert _resolve_state_path(runtime_home, "auth.json") == residence / "auth.json"
+    # Non-credential state still follows HERMES_HOME.
+    assert _resolve_state_path(runtime_home, "config.yaml") == runtime_home / "config.yaml"

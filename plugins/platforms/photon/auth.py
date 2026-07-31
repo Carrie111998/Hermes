@@ -26,7 +26,7 @@ Credential storage mirrors every other Hermes channel:
 
     * runtime SDK creds  -> ``~/.hermes/.env``  (``PHOTON_PROJECT_ID`` =
       project id, ``PHOTON_PROJECT_SECRET``) via ``save_env_value``
-    * management metadata -> ``~/.hermes/auth.json`` under
+    * management metadata -> the resolved Hermes ``auth.json`` under
       ``credential_pool.photon`` (device token),
       ``credential_pool.photon_project`` (dashboard id, spectrum id, name), and
       ``credential_pool.photon_user`` (operator number + assigned text line)
@@ -43,7 +43,6 @@ import re
 import time
 from base64 import b64encode
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -85,20 +84,18 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # ---------------------------------------------------------------------------
 # auth.json helpers — share the file with the rest of hermes-agent.
 
-def _auth_json_path() -> Path:
-    """Resolve ``~/.hermes/auth.json`` honouring the active Hermes profile."""
-    from hermes_constants import get_hermes_auth_home
-
-    return Path(get_hermes_auth_home()) / "auth.json"
-
-
 def _load_auth() -> Dict[str, Any]:
     try:
         from hermes_cli.auth import _load_auth_store
 
         return _load_auth_store()
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("photon: could not read %s: %s", _auth_json_path(), e)
+    except Exception as e:
+        # _load_auth_store swallows OSError/JSONDecodeError itself and returns
+        # an empty store; what actually escapes is the pytest seat belt's
+        # RuntimeError or a home-resolution failure. Deliberately not calling
+        # _auth_json_path() in the message — under those failures it raises
+        # again, turning a logged warning into a crash.
+        logger.warning("photon: could not read the Hermes auth store: %s", e)
         return {}
 
 

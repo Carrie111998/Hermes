@@ -114,6 +114,14 @@ def _preserve_hermes_home_path(path: str | Path) -> str:
 # Quoting helpers (two DIFFERENT parsers — do not mix)
 # ---------------------------------------------------------------------------
 
+def _auth_home_for_service() -> str:
+    """Return the strictly resolved auth residence for generated launchers."""
+    from hermes_constants import get_hermes_auth_home_override_strict
+
+    override = get_hermes_auth_home_override_strict()
+    return str(override) if override is not None else ""
+
+
 def _quote_cmd_script_arg(value: str) -> str:
     """Quote a single argument for use INSIDE a .cmd file, for cmd.exe parsing.
 
@@ -409,6 +417,11 @@ def _build_gateway_cmd_script(
     lines = ["@echo off", f"rem {_TASK_DESCRIPTION}"]
     lines.append(f"cd /d {_quote_cmd_script_arg(working_dir)}")
     lines.append(f'set "HERMES_HOME={hermes_home}"')
+    _service_auth_home = _auth_home_for_service()
+    if _service_auth_home:
+        lines.append(
+            f'set "HERMES_AUTH_HOME={_service_auth_home.replace("%", "%%")}"'
+        )
     lines.append('set "PYTHONIOENCODING=utf-8"')
     lines.append('set "HERMES_GATEWAY_DETACHED=1"')
     python_exe_path, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)

@@ -2632,6 +2632,35 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     return changed, active_sources
 
 
+def _auth_store_outlives_env_home() -> bool:
+    """True when the credential store is shared by sessions with distinct .env.
+
+    ``HERMES_AUTH_HOME`` relocates the pool (it lives in ``auth.json``) but
+    deliberately does NOT relocate ``.env``, which stays per-``HERMES_HOME``.
+    In that layout the two files no longer belong to the same session.
+    """
+    try:
+        from hermes_constants import is_hermes_auth_home_relocated
+
+        return is_hermes_auth_home_relocated()
+    except Exception:
+        return False
+
+
+def _is_session_private_entry(entry: PooledCredential) -> bool:
+    """True for pool rows that must stay out of a shared credential store.
+
+    ``env:*`` rows are references to a variable in this session's ``.env``.
+    Persisting them into a store shared with other sessions publishes a row
+    whose token those sessions can never rehydrate — they inherit an empty
+    credential plus this session's secret fingerprint, and two sessions
+    holding different values for the same variable overwrite each other
+    (``_upsert_entry`` keys on ``source``). Keeping them in memory preserves
+    the #9331 non-destructive-read behavior for the session that owns them.
+    """
+    return entry.source.startswith("env:") and _auth_store_outlives_env_home()
+
+
 def _prune_stale_seeded_entries(
     entries: List[PooledCredential],
     active_sources: Set[str],
@@ -2743,6 +2772,18 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
+    removed_session_private = False
+    if _auth_store_outlives_env_home():
+        filtered_entries = [
+            payload
+            for payload in raw_entries
+            if not (
+                isinstance(payload, dict)
+                and str(payload.get("source") or "").startswith("env:")
+            )
+        ]
+        removed_session_private = len(filtered_entries) != len(raw_entries)
+        raw_entries = filtered_entries
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2774,13 +2815,19 @@ def load_pool(provider: str) -> CredentialPool:
     if provider.startswith(CUSTOM_POOL_PREFIX):
         # Custom endpoint pool — seed from custom_providers config and model config
         custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = raw_needs_sanitization or raw_needs_auth_normalization or custom_changed
+        changed = (
+            removed_session_private
+            or raw_needs_sanitization
+            or raw_needs_auth_normalization
+            or custom_changed
+        )
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
         singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
-            raw_needs_sanitization
+            removed_session_private
+            or raw_needs_sanitization
             or raw_needs_auth_normalization
             or singleton_changed
             or env_changed
@@ -2797,10 +2844,15 @@ def load_pool(provider: str) -> CredentialPool:
         changed |= _normalize_pool_priorities(provider, entries)
 
     if changed:
-        new_ids = {entry.id for entry in entries}
+        persistable = [
+            entry
+            for entry in sorted(entries, key=lambda item: item.priority)
+            if not _is_session_private_entry(entry)
+        ]
+        new_ids = {entry.id for entry in persistable}
         write_credential_pool(
             provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            [entry.to_dict() for entry in persistable],
             removed_ids=disk_ids - new_ids,
         )
     return CredentialPool(provider, entries)

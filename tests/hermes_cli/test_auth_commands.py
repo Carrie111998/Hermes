@@ -689,7 +689,11 @@ def test_credential_sources_registry_has_expected_steps():
     from agent.credential_sources import _REGISTRY
 
     descriptions = [step.description for step in _REGISTRY]
-    # No empty descriptions, no duplicates.
+    identities = [(step.provider, step.source_id) for step in _REGISTRY]
+    # Every step has a distinct machine identity and useful display prose.
+    assert len(identities) == len(set(identities)), (
+        f"Registry has duplicate provider/source identities: {identities}"
+    )
     assert all(d for d in descriptions), "Every removal step must have a description"
     assert len(descriptions) == len(set(descriptions)), (
         f"Registry has duplicate step descriptions: {descriptions}"
@@ -697,17 +701,17 @@ def test_credential_sources_registry_has_expected_steps():
     # Core steps must be present — these are the ones the rest of the code
     # assumes exist. When deliberately dropping one, update this list.
     required = {
-        "gh auth token / COPILOT_GITHUB_TOKEN / GH_TOKEN",
-        "Any env-seeded credential (XAI_API_KEY, DEEPSEEK_API_KEY, etc.)",
-        "~/.claude/.credentials.json",
-        "~/.hermes/.anthropic_oauth.json",
-        "auth.json providers.nous",
-        "auth.json providers.openai-codex + ~/.codex/auth.json",
-        "auth.json providers.minimax-oauth",
-        "~/.qwen/oauth_creds.json",
-        "Custom provider config.yaml api_key field",
+        ("copilot", "gh_cli"),
+        ("*", "env:"),
+        ("anthropic", "claude_code"),
+        ("anthropic", "hermes_pkce"),
+        ("nous", "device_code"),
+        ("openai-codex", "device_code"),
+        ("minimax-oauth", "oauth"),
+        ("qwen-oauth", "qwen-cli"),
+        ("*", "config:"),
     }
-    missing = required - set(descriptions)
+    missing = required - set(identities)
     assert not missing, f"Registry missing required steps: {missing}"
 
 
@@ -767,5 +771,4 @@ def test_auth_remove_copilot_suppresses_all_variants(tmp_path, monkeypatch):
     assert is_source_suppressed("copilot", "env:COPILOT_GITHUB_TOKEN")
     assert is_source_suppressed("copilot", "env:GH_TOKEN")
     assert is_source_suppressed("copilot", "env:GITHUB_TOKEN")
-
 
