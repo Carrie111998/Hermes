@@ -33,6 +33,7 @@ from session_bridge.sidebar import (
     sidebar_idempotency_key,
     sidebar_title,
 )
+from session_bridge.sidebar_placement import filesystem_path_identity
 
 
 NOW = 1_800_000_000.0
@@ -692,14 +693,17 @@ def test_readable_registration_prompt_puts_preview_before_bridge_metadata() -> N
 
 
 def test_minimum_readable_preview_builds_a_registration_valid_prompt() -> None:
-    source_cwd = "C:\\repo\\" + ("source-directory-" * 6)
-    git_root = "C:\\repo\\" + ("repository-root-" * 6)
+    source_cwd = "C:\\" + ("s" * 257)
+    git_root = "C:\\" + ("r" * 257)
+    snapshot_title = "T" * 120
+    assert len(source_cwd) == 260
+    assert filesystem_path_identity(source_cwd, platform="windows") is not None
     candidate = _candidate(cwd=source_cwd, git_root=git_root)
     preview = build_session_preview(
         source_session_id=candidate.source_session_id,
         source_cursor="cursor-1",
         source_hash="hash-1",
-        title="Snapshot title " + ("detail-" * 14),
+        title=snapshot_title,
         provider=candidate.provider.value,
         cwd=candidate.cwd,
         captured_at=NOW,
@@ -713,11 +717,13 @@ def test_minimum_readable_preview_builds_a_registration_valid_prompt() -> None:
 
     prompt = build_registration_prompt(candidate, _marker_for(candidate), preview=preview)
 
+    assert len(preview.rendered) <= MIN_READABLE_PREVIEW_BUDGET_CHARS
     assert is_registration_prompt(prompt)
     assert "## Continuation Brief" in prompt
     assert "## Last 5 Messages" in prompt
     assert "## Source and Filesystem Safety" in prompt
     assert f"Source working directory: {source_cwd}" in prompt
+    assert f"Title: {snapshot_title}" in prompt
 
 
 def test_hydration_message_is_a_maintenance_only_turn() -> None:

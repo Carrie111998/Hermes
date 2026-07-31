@@ -38,10 +38,11 @@ _ENV_NAMES = frozenset({
 _LIVE_CHARACTERIZATION_ENV_NAMES = frozenset({
     f"{_ENV_PREFIX}LIVE_TESTS",
 })
-# A minimum structural envelope for a readable preview with no retained context.
-# It keeps the title/source headers, continuation sections, message heading, and
-# filesystem-safety instructions intact rather than allowing a partial fragment.
-MIN_READABLE_PREVIEW_BUDGET_CHARS = 1024
+# A 1,091-character canonical Windows structural envelope: 260-character cwd,
+# 120-character title, required headings, and filesystem-safety instructions.
+# 1,280 is the next 256-character allocation boundary, preserving a fixed
+# 189-character margin without allowing a partial preview fragment.
+MIN_READABLE_PREVIEW_BUDGET_CHARS = 1280
 _Result = TypeVar("_Result")
 
 

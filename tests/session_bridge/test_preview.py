@@ -260,10 +260,10 @@ def test_preview_truncates_oversized_messages_inside_total_budget() -> None:
                 "timestamp": 1.0,
             }
         ],
-        budget_chars=1_200,
+        budget_chars=1_400,
     )
 
-    assert len(preview.rendered) <= 1_200
+    assert len(preview.rendered) <= 1_400
     assert preview.truncated is True
     assert preview.recent_messages[0].truncated is True
     assert "[truncated]" in preview.recent_messages[0].content
