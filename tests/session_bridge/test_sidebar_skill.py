@@ -153,6 +153,9 @@ def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
         "- Scenario C kept the task but omitted hydration send reservation and "
         "marker reconciliation.\n"
         "- An empty wake skipped both pending calls.\n\n"
+        "Behavioral GREEN pressure exposed two remaining instruction loopholes: a "
+        "string environment selector and a status-count shortcut that skipped the "
+        "persisted heartbeat calls.\n\n"
         "It correctly used at most one lease and did not move, fork, archive, or "
         "rename legacy tasks.\n"
     )
@@ -220,8 +223,8 @@ def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> No
 
     assert "session_sidebar_hydration_pending(limit=1)" in skill
     assert "hydration-pending --limit 1" in skill
-    assert "Call hydration pending once" in skill
-    assert "If it returns no job, call registration pending once" in skill
+    assert "always call hydration pending once" in skill
+    assert "if it is empty, always call registration pending once regardless of status counts" in skill
 
     hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
         "\n## Registration Procedure\n", 1
@@ -262,6 +265,12 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
     assert queue.index("list_projects({})") < queue.index("session_sidebar_hydration_pending(limit=1)")
     assert "Preflight failure ends before leasing" in queue
     assert "no job attempt is consumed" in skill
+    assert (
+        "After successful preflight, always call hydration pending once; if it is "
+        "empty, always call registration pending once regardless of status counts."
+    ) in queue
+    assert "Status counts never authorize skipping either persisted-heartbeat call." in queue
+    assert "If both registration counts are zero, end immediately" not in skill
 
 
 def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missing() -> (
@@ -425,12 +434,18 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     create = (
         '`create_thread({"prompt":"<registration_prompt verbatim>",'
         '"target":{"type":"project","projectId":"local-e59c279a6cdda9313cf111e46a80b027",'
-        '"environment":"local"}})`'
+        '"environment":{"type":"local"}}})`'
     )
     assert create in skill
     assert "cwd" not in create
     assert "runtimeWorkspaceRoots" not in create
     assert "idempotencyKey" not in create
+    create_examples = [
+        line for line in skill.splitlines() if "create_thread({" in line
+    ]
+    assert create_examples
+    assert all('"environment":{"type":"local"}' in line for line in create_examples)
+    assert all('"environment":"local"' not in line for line in create_examples)
     assert "Only the returned `threadId` is a successful create result" in skill
     assert (
         "`session_sidebar_bind(lease_token=<exact token>, "

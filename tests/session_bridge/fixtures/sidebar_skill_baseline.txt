@@ -5,4 +5,6 @@ Baseline pressure run without the skill:
 - Scenario C kept the task but omitted hydration send reservation and marker reconciliation.
 - An empty wake skipped both pending calls.
 
+Behavioral GREEN pressure exposed two remaining instruction loopholes: a string environment selector and a status-count shortcut that skipped the persisted heartbeat calls.
+
 It correctly used at most one lease and did not move, fork, archive, or rename legacy tasks.
