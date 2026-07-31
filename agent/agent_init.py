@@ -1221,6 +1221,10 @@ def init_agent(
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:
+                        from agent.fallback_cooldown import cooldown_remaining
+
+                        if cooldown_remaining(_fb) > 0:
+                            continue
                         _fb_explicit_key = (_fb.get("api_key") or "").strip() or None
                         if not _fb_explicit_key:
                             _fb_key_env = (_fb.get("key_env") or _fb.get("api_key_env") or "").strip()
@@ -1235,6 +1239,7 @@ def init_agent(
                             agent.provider = _fb["provider"]
                             agent.model = _fb_model or _fb["model"]
                             agent._fallback_activated = True
+                            agent._active_fallback_entry = dict(_fb)
                             client_kwargs = {
                                 "api_key": _fb_client.api_key,
                                 "base_url": str(_fb_client.base_url),

@@ -1703,7 +1703,24 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    cooldown_reasons = {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.upstream_rate_limit,
+    }
+    if reason in cooldown_reasons:
+        active_fallback = getattr(agent, "_active_fallback_entry", None)
+        if active_fallback:
+            from agent.fallback_cooldown import record_cooldown
+
+            expires_at = record_cooldown(active_fallback)
+            if expires_at:
+                logger.warning(
+                    "Fallback cooldown: suppressing %s/%s until %s",
+                    active_fallback.get("provider"),
+                    active_fallback.get("model"),
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires_at)),
+                )
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -1743,6 +1760,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
+
+    from agent.fallback_cooldown import cooldown_remaining
+
+    remaining = cooldown_remaining(fb)
+    if remaining > 0:
+        logger.warning(
+            "Fallback skip: %s/%s remains in persistent cooldown for %.0fs",
+            fb_provider,
+            fb_model,
+            remaining,
+        )
+        return agent._try_activate_fallback(reason)
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -1882,6 +1911,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        agent._active_fallback_entry = dict(fb)
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream

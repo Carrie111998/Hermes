@@ -4807,6 +4807,16 @@ def _try_main_fallback_chain(
             _log_skip_unhealthy(fb_norm, task)
             tried.append(f"{label} (unhealthy)")
             continue
+        from agent.fallback_cooldown import cooldown_remaining
+
+        remaining = cooldown_remaining(entry)
+        if remaining > 0:
+            logger.info(
+                "Auxiliary %s: skipping %s (persistent cooldown %.0fs remaining)",
+                task or "call", label, remaining,
+            )
+            tried.append(f"{label} (cooldown)")
+            continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
