@@ -274,8 +274,7 @@ class TestGetAllToolsetsAliasBranches:
     """Cover the alias-display-name loop and duplicate-skip guard in get_all_toolsets."""
 
     def test_plugin_toolset_shown_under_alias_name(self, monkeypatch):
-        # Lines 739-743: canonical name is mcp-srv2; alias is "srv2";
-        # get_all_toolsets should expose it as "srv2", not "mcp-srv2".
+        # A registry-only canonical toolset is exposed under its non-static alias.
         reg = ToolRegistry()
         reg.register(
             name="srv2_op",
@@ -291,7 +290,7 @@ class TestGetAllToolsetsAliasBranches:
         assert "mcp-srv2" not in all_ts  # canonical hidden behind alias
 
     def test_duplicate_display_name_skipped(self, monkeypatch):
-        # Lines 741-742: alias display name matches an already-added plugin toolset.
+        # Two registry-only canonical names resolve to the same display key.
         reg = ToolRegistry()
         reg.register(
             name="alpha_op",
@@ -308,16 +307,37 @@ class TestGetAllToolsetsAliasBranches:
         reg.register_toolset_alias("alpha", "mcp-srv2")
         monkeypatch.setattr("tools.registry.registry", reg)
 
-        all_ts = get_all_toolsets()
+        import toolsets as ts_mod
+
+        assert set(ts_mod._get_plugin_toolset_names()) == {"alpha", "mcp-srv2"}
+        assert ts_mod._get_registry_toolset_aliases() == {"alpha": "mcp-srv2"}
+
+        real_get_tool_names = reg.get_tool_names_for_toolset
+        materializations = []
+
+        def record_materialization(toolset):
+            names = real_get_tool_names(toolset)
+            if toolset == "alpha":
+                marker = f"materialization_{len(materializations)}"
+                materializations.append((tuple(names), marker))
+                return [*names, marker]
+            return names
+
+        monkeypatch.setattr(reg, "get_tool_names_for_toolset", record_materialization)
+        all_ts = ts_mod.get_all_toolsets()
+
         assert "alpha" in all_ts
-        assert set(all_ts["alpha"]["tools"]) == {"alpha_op"}
         assert "mcp-srv2" not in all_ts
+        assert len(materializations) == 1
+        names, marker = materializations[0]
+        assert all_ts["alpha"]["tools"] == sorted([*names, marker])
+        assert "alpha_op" in all_ts["alpha"]["tools"]
 
 class TestGetToolsetRegistryFailure:
     """Cover get_toolset branches that require registry import or alias wiring."""
 
     def test_registry_import_error_returns_static_toolset(self, monkeypatch):
-        # Lines 570-571: except Exception on registry import returns static entry.
+        # A missing registry preserves the static toolset definition.
         import builtins
         real_import = builtins.__import__
 
@@ -332,7 +352,7 @@ class TestGetToolsetRegistryFailure:
         assert "web_search" in ts["tools"]
 
     def test_registry_import_error_returns_none_for_unknown(self, monkeypatch):
-        # Lines 570-571: except Exception path when toolset not in TOOLSETS.
+        # A missing registry leaves unknown names unresolved.
         import builtins
         real_import = builtins.__import__
 
@@ -345,19 +365,17 @@ class TestGetToolsetRegistryFailure:
         assert get_toolset("nonexistent_xyz") is None
 
     def test_alias_with_no_target_returns_none(self, monkeypatch):
-        # Line 587: name not in plugin toolsets and alias_target is falsy.
+        # An alias without a canonical target is unresolved.
         reg = ToolRegistry()
         reg.register_toolset_alias("dangling-alias", "nonexistent-canonical")
         monkeypatch.setattr("tools.registry.registry", reg)
-        # Patch get_toolset_alias_target on the live registry object to return None,
-        # so registry_toolset is falsy and the early return fires.
+        # The live registry reports that the alias has no target.
         monkeypatch.setattr(reg, "get_toolset_alias_target", lambda name: None)
         result = get_toolset("dangling-alias")
         assert result is None
 
     def test_canonical_with_reverse_alias_uses_alias_in_description(self, monkeypatch):
-        # Line 597: canonical toolset found in plugin names; reverse alias found,
-        # so description becomes "MCP server '<alias>' tools".
+        # A canonical registry toolset uses its reverse alias in the description.
         reg = ToolRegistry()
         reg.register(
             name="srv_ping",
@@ -376,8 +394,7 @@ class TestResolveToolsetHermesPlatform:
     """Cover the hermes-<platform> dynamic resolution branch in resolve_toolset."""
 
     def test_registered_platform_returns_core_tools(self, monkeypatch):
-        # Lines 647-663: platform_registry.is_registered is True; result includes
-        # _HERMES_CORE_TOOLS plus any tools the plugin registered under the platform name.
+        # A registered platform resolves core tools plus its registry tools.
         from unittest.mock import MagicMock
 
         mock_registry = MagicMock()
@@ -400,7 +417,7 @@ class TestResolveToolsetHermesPlatform:
         assert "my_platform_tool" in tools  # registered under the platform toolset
 
     def test_unregistered_platform_returns_empty(self, monkeypatch):
-        # Lines 641-666: hermes-<platform> but is_registered is False; falls through to [].
+        # An unregistered platform has no generated toolset.
         from unittest.mock import MagicMock
 
         mock_registry = MagicMock()
@@ -414,7 +431,7 @@ class TestResolveToolsetHermesPlatform:
         assert result == []
 
     def test_platform_registry_import_error_returns_empty(self, monkeypatch):
-        # Lines 647-665: outer except Exception; platform_registry import fails.
+        # An unavailable platform registry leaves the generated toolset empty.
         import builtins
         real_import = builtins.__import__
 
@@ -428,8 +445,7 @@ class TestResolveToolsetHermesPlatform:
         assert result == []
 
     def test_platform_tool_registry_import_error_falls_back_to_core(self, monkeypatch):
-        # Lines 656-660: inner except Exception; tools.registry import fails but
-        # platform_registry import succeeds, so result is just _HERMES_CORE_TOOLS.
+        # A registered platform keeps core tools when its tool registry is unavailable.
         from unittest.mock import MagicMock
         mock_pr = MagicMock()
         mock_pr.is_registered.return_value = True
@@ -456,7 +472,7 @@ class TestPrivateHelperExceptionPaths:
     """Cover the except-fallback paths in _get_plugin_toolset_names and _get_registry_toolset_aliases."""
 
     def test_get_plugin_toolset_names_import_error_returns_empty(self, monkeypatch):
-        # Lines 712-713: registry import raises -> returns set().
+        # An unavailable registry produces no plugin toolset names.
         import builtins
         import toolsets as ts_mod
         real_import = builtins.__import__
@@ -471,7 +487,7 @@ class TestPrivateHelperExceptionPaths:
         assert result == set()
 
     def test_get_registry_toolset_aliases_import_error_returns_empty(self, monkeypatch):
-        # Lines 721-722: registry import raises -> returns {}.
+        # An unavailable registry produces no registry aliases.
         import builtins
         import toolsets as ts_mod
         real_import = builtins.__import__
@@ -490,8 +506,7 @@ class TestGetToolsetNamesForElse:
     """Cover the for/else else-branch in get_toolset_names."""
 
     def test_unaliased_plugin_toolset_appears_under_canonical_name(self, monkeypatch):
-        # Lines 763-765: plugin toolset "mcp-rawplugin" has no alias; else branch
-        # adds "mcp-rawplugin" directly to names.
+        # An unaliased registry toolset appears under its canonical name.
         reg = ToolRegistry()
         reg.register(
             name="rawplugin_op",
@@ -510,7 +525,7 @@ class TestValidateToolsetPluginAndAlias:
     """Cover the plugin-name and registry-alias paths in validate_toolset."""
 
     def test_plugin_toolset_name_is_valid(self, monkeypatch):
-        # Line 787: name is in _get_plugin_toolset_names() -> True.
+        # A registry-only canonical name is valid.
         reg = ToolRegistry()
         reg.register(
             name="val_plugin_tool",
@@ -522,7 +537,7 @@ class TestValidateToolsetPluginAndAlias:
         assert validate_toolset("mcp-valplugin") is True
 
     def test_registry_alias_name_is_valid(self, monkeypatch):
-        # Line 789: name is in _get_registry_toolset_aliases() -> True.
+        # A registered alias is valid.
         reg = ToolRegistry()
         reg.register(
             name="val_alias_tool",
