@@ -422,6 +422,110 @@ def convert_table_to_bullets(text: str) -> str:
     return '\n'.join(out)
 
 
+# ─── HTML <details> → Plain Text Expansion ───────────────────────────────────
+
+_DETAILS_OPEN_RE = re.compile(r"<details\b[^>]*>", re.IGNORECASE)
+_DETAILS_CLOSE_RE = re.compile(r"</details\s*>", re.IGNORECASE)
+_SUMMARY_RE = re.compile(
+    r"\s*<summary\b[^>]*>(.*?)</summary\s*>", re.IGNORECASE | re.DOTALL,
+)
+
+
+def expand_details_blocks(text: str) -> str:
+    """Expand HTML ``<details>`` blocks for platforms without HTML support.
+
+    The summary is emitted as a visible ``📎`` heading.  Fenced code blocks
+    are copied without modification so example HTML remains literal.
+    """
+    if not text or "<details" not in text.lower():
+        return text
+
+    lines = text.split("\n")
+    output: list[str] = []
+    in_fence = False
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            output.append(line)
+            index += 1
+            continue
+
+        if in_fence or not _DETAILS_OPEN_RE.search(line):
+            output.append(line)
+            index += 1
+            continue
+
+        block_lines = [line]
+        depth = len(_DETAILS_OPEN_RE.findall(line)) - len(_DETAILS_CLOSE_RE.findall(line))
+        while depth > 0:
+            index += 1
+            if index >= len(lines):
+                # Preserve malformed, unterminated markup rather than deleting
+                # user content that does not form a complete details block.
+                output.extend(block_lines)
+                break
+            block_lines.append(lines[index])
+            depth += len(_DETAILS_OPEN_RE.findall(lines[index]))
+            depth -= len(_DETAILS_CLOSE_RE.findall(lines[index]))
+        else:
+            output.extend(_expand_details_block("\n".join(block_lines)).split("\n"))
+
+        index += 1
+
+    return "\n".join(output)
+
+
+def _expand_details_block(block: str) -> str:
+    """Render one balanced details block, recursively expanding nested blocks."""
+    open_match = _DETAILS_OPEN_RE.search(block)
+    if not open_match:
+        return block
+
+    content_start = open_match.end()
+    depth = 1
+    cursor = content_start
+    closing_match = None
+    while depth:
+        next_open = _DETAILS_OPEN_RE.search(block, cursor)
+        next_close = _DETAILS_CLOSE_RE.search(block, cursor)
+        if next_close is None:
+            return block
+        if next_open is not None and next_open.start() < next_close.start():
+            depth += 1
+            cursor = next_open.end()
+            continue
+        depth -= 1
+        if depth == 0:
+            closing_match = next_close
+            break
+        cursor = next_close.end()
+
+    if closing_match is None:
+        return block
+
+    prefix = block[:open_match.start()]
+    content = block[content_start:closing_match.start()]
+    suffix = expand_details_blocks(block[closing_match.end():])
+    summary_match = _SUMMARY_RE.match(content)
+    summary = summary_match.group(1).strip() if summary_match else ""
+    body = content[summary_match.end():] if summary_match else content
+    body = expand_details_blocks(body).strip()
+
+    rendered: list[str] = []
+    if prefix:
+        rendered.append(prefix)
+    if summary:
+        rendered.append(f"📎 {summary}")
+    if body:
+        rendered.append(body)
+    if suffix:
+        rendered.append(suffix)
+    return "\n".join(rendered)
+
+
 # ─── Mention-pattern compilation ─────────────────────────────────────────────
 
 
