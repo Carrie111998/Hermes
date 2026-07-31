@@ -179,6 +179,37 @@ def test_scan_never_mutates_the_skill_library(tmp_path):
     assert snapshot() == before
 
 
+def test_default_scan_classifies_external_dirs_as_external(tmp_path, monkeypatch):
+    """`skills.external_dirs` entries are read-only and externally owned, but
+    `skill_usage.provenance()` classifies purely by name against the hub and
+    bundled manifests — it has no notion of "external" at all. A skill that
+    exists only in an external directory must not inherit whatever provenance
+    an unrelated same-named manifest entry would produce; the discovered path
+    has to settle it. Exercises the *default* scan (no explicit skills_dirs),
+    since that's the path skill_usage.get_all_skills_dirs() feeds in
+    production."""
+    import agent.skill_utils as skill_utils
+
+    local_root = tmp_path / "local"
+    external_root = tmp_path / "external"
+    local_root.mkdir()
+    external_root.mkdir()
+
+    _write_skill(local_root, "ai-voice-cloning", "Clone a voice", VOICE_BODY)
+    _write_skill(external_root, "cosyvoice2-voice-cloning", "Clone a voice", VOICE_BODY)
+
+    monkeypatch.setattr(skill_utils, "get_all_skills_dirs", lambda: [local_root, external_root])
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [external_root])
+
+    candidates = scan_duplicates()  # default scan — no explicit skills_dirs
+
+    assert len(candidates) == 1
+    ownership = {candidates[0].name_a: candidates[0].ownership_a,
+                 candidates[0].name_b: candidates[0].ownership_b}
+    assert ownership["cosyvoice2-voice-cloning"] == "external, read-only"
+    assert ownership["ai-voice-cloning"] != "external, read-only"
+
+
 def test_registry_boilerplate_headings_are_discounted(tmp_path):
     """Skill families invent their own templates. Once a heading is everywhere in
     the registry it stops identifying anything, whatever template produced it."""

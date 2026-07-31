@@ -140,8 +140,25 @@ def _ratio(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _ownership(skill_name: str) -> str:
-    """Human-facing origin label, with a note when the skill can't be curated."""
+def _ownership(skill_name: str, skill_path: Path) -> str:
+    """Human-facing origin label, with a note when the skill can't be curated.
+
+    Path is checked before name: ``skills.external_dirs`` entries are
+    externally owned and read-only, but ``skill_usage.provenance()`` has no
+    concept of "external" — it classifies purely by name against the hub and
+    bundled manifests. A skill discovered only in an external directory can
+    share its name with an unrelated hub or bundled entry, in which case
+    naming-only classification reports the wrong origin for the file this
+    scan actually read. Checking the discovered path first avoids that.
+    """
+    try:
+        from agent.skill_utils import is_external_skill_path
+
+        if is_external_skill_path(skill_path):
+            return "external, read-only"
+    except Exception:
+        pass
+
     try:
         from tools import skill_usage
 
@@ -194,6 +211,7 @@ def _load_skills(skills_dirs: Optional[Sequence[Path]] = None) -> List[Dict[str,
             skills.append(
                 {
                     "name": name,
+                    "path": index_file.parent,
                     "tokens": _name_tokens(name),
                     "headings": _headings(body),
                     "digest": _body_digest(body),
@@ -282,8 +300,8 @@ def scan_duplicates(
                     name_b=name_b,
                     confidence=confidence,
                     signals=signals,
-                    ownership_a=_ownership(name_a),
-                    ownership_b=_ownership(name_b),
+                    ownership_a=_ownership(name_a, Path(str(left["path"]))),
+                    ownership_b=_ownership(name_b, Path(str(right["path"]))),
                 )
             )
 
