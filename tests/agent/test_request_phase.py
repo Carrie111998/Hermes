@@ -870,6 +870,43 @@ def test_investigation_cannot_write_an_unbounded_non_repo_report(clean_repo):
     assert not report_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("function_name", "args"),
+    [
+        ("tool_search", {"query": "client lookup"}),
+        (
+            "tool_describe",
+            {"name": "mcp__terrain_quote__find_clients"},
+        ),
+    ],
+)
+def test_investigation_may_inspect_the_session_tool_catalog(
+    clean_repo,
+    function_name,
+    args,
+):
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    assert guard_tool_call(function_name, args) is None
+
+
+def test_investigation_catalog_bridge_cannot_bypass_effect_classification(
+    clean_repo,
+):
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    block = guard_tool_call(
+        "tool_call",
+        {
+            "name": "mcp__terrain_quote__save_quote",
+            "arguments": {},
+        },
+    )
+
+    assert block is not None
+    assert "only registered read-only tools" in block
+
+
 def test_investigation_move_patch_cannot_bypass_from_a_non_repo_cwd(
     clean_repo,
     tmp_path,

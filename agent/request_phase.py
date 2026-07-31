@@ -1368,6 +1368,14 @@ def _investigation_effect_block(
 
     if policy.phase is not RequestPhase.INVESTIGATION:
         return None
+    if function_name in {"tool_search", "tool_describe"}:
+        # These bridge tools only inspect the in-memory, session-scoped tool
+        # catalog. They cannot dispatch the described tool: deferred execution
+        # goes through ``tool_call``, which the executor unwraps to the real
+        # tool name before this guard runs. Blocking catalog inspection here
+        # makes registered read-only deferred tools impossible to use and
+        # pushes the model toward broader fallback paths.
+        return None
     try:
         from tools.registry import ToolEffect, registry
 
