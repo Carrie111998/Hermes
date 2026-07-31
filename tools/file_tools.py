@@ -7,6 +7,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -952,7 +953,13 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    initial_config = _get_env_config()
+    from tools.workspace_bootstrap import uses_dynamic_workspace_bootstrap
+    task_id = (
+        raw_task_id
+        if uses_dynamic_workspace_bootstrap(initial_config)
+        else _resolve_container_task_id(raw_task_id)
+    )
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -998,7 +1005,9 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         if terminal_env is None:
             from tools.terminal_tool import resolve_task_overrides
 
-            config = _get_env_config()
+            config = initial_config
+            from tools.workspace_bootstrap import prepare_workspace_only_config
+            config = prepare_workspace_only_config(config, task_id=raw_task_id)
             env_type = config["env_type"]
             overrides = resolve_task_overrides(raw_task_id)
 
@@ -1052,8 +1061,14 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "docker_volumes": config.get("docker_volumes", []),
                     "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
                     "docker_forward_env": config.get("docker_forward_env", []),
+                    "docker_env": config.get("docker_env", {}),
                     "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                     "docker_network": config.get("docker_network", True),
+                    "docker_extra_args": config.get("docker_extra_args", []),
+                    "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                    "docker_workspace_only": config.get("docker_workspace_only", False),
+                    "workspace_identity": config.get("workspace_identity"),
+                    "workspace_transport": config.get("workspace_transport"),
                 }
 
             ssh_config = None
@@ -1072,6 +1087,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "persistent": config.get("local_persistent", False),
                 }
 
+            from tools.workspace_bootstrap import revalidate_workspace_identity
+            revalidate_workspace_identity(config)
             terminal_env = _create_environment(
                 env_type=env_type,
                 image=image,
@@ -1122,7 +1139,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 "block or produce infinite output."
             )
 
-        _resolved = _resolve_path_for_task(path, task_id)
+        file_ops = _get_file_ops(task_id)
+        workspace_only = bool(getattr(file_ops.env, "_workspace_only", False))
+        _resolved = Path(path) if workspace_only else _resolve_path_for_task(path, task_id)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -1130,12 +1149,30 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
 
         if is_extractable_document(str(_resolved)):
+            extracted_path = str(_resolved)
+            extracted_size = None
+            temporary_path = None
             try:
-                extracted_text = extract_document_text(str(_resolved))
+                if workspace_only:
+                    document_bytes = file_ops.read_bytes(path, 50 * 1024 * 1024)
+                    extracted_size = len(document_bytes)
+                    with tempfile.NamedTemporaryFile(
+                        suffix=_resolved.suffix,
+                        delete=False,
+                    ) as temporary:
+                        temporary.write(document_bytes)
+                        temporary_path = temporary.name
+                    extracted_path = temporary_path
+                extracted_text = extract_document_text(extracted_path)
+            except OSError:
+                if workspace_only:
+                    return json.dumps(
+                        {"error": f"Cannot read '{path}' through the selected environment."}
+                    )
+                raise
             except ExtractionError:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
@@ -1143,7 +1180,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 result_dict = {
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
+                    "file_size": (
+                        extracted_size
+                        if extracted_size is not None
+                        else os.path.getsize(_resolved)
+                    ),
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }
@@ -1182,6 +1223,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 if result_dict["content"]:
                     result_dict["content"] = redact_sensitive_text(result_dict["content"], file_read=True)
                 return json.dumps(result_dict, ensure_ascii=False)
+            finally:
+                if temporary_path:
+                    Path(temporary_path).unlink(missing_ok=True)
 
         # ── Binary file guard ─────────────────────────────────────────
         # Block binary files by extension (no I/O).
@@ -1262,7 +1306,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
-        file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 

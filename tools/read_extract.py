@@ -17,6 +17,9 @@ __all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text",
 
 EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
 MAX_XLSX_BYTES = 50 * 1024 * 1024
+_MAX_ZIP_XML_MEMBER_BYTES = 16 * 1024 * 1024
+_MAX_ZIP_XML_TOTAL_BYTES = 32 * 1024 * 1024
+_MAX_ZIP_COMPRESSION_RATIO = 100
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -95,11 +98,35 @@ def _extract_notebook(path: str) -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
+class _BoundedZipReader:
+    """Read only bounded OOXML members after validating archive metadata."""
+
+    def __init__(self, zf: zipfile.ZipFile):
+        self._zf = zf
+        self._total = 0
+
+    def read(self, name: str) -> bytes:
+        try:
+            info = self._zf.getinfo(name)
+        except KeyError as exc:
+            raise ExtractionError(f"Missing {name}") from exc
+        if info.file_size > _MAX_ZIP_XML_MEMBER_BYTES:
+            raise ExtractionError(f"OOXML member exceeds decompression limit: {name}")
+        compressed = max(info.compress_size, 1)
+        if info.file_size / compressed > _MAX_ZIP_COMPRESSION_RATIO:
+            raise ExtractionError(f"OOXML member exceeds compression ratio limit: {name}")
+        if self._total + info.file_size > _MAX_ZIP_XML_TOTAL_BYTES:
+            raise ExtractionError("OOXML archive exceeds cumulative decompression limit")
+        content = self._zf.read(info)
+        if len(content) != info.file_size:
+            raise ExtractionError(f"OOXML member size changed while reading: {name}")
+        self._total += len(content)
+        return content
+
+
+def _zip_xml(reader: _BoundedZipReader, name: str) -> ET.Element:
     try:
-        return ET.fromstring(zf.read(name))
-    except KeyError as exc:
-        raise ExtractionError(f"Missing {name}") from exc
+        return ET.fromstring(reader.read(name))
     except ET.ParseError as exc:
         raise ExtractionError(f"Malformed XML in {name}: {exc}") from exc
 
@@ -107,7 +134,7 @@ def _zip_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
 def _extract_docx(path: str) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
-            root = _zip_xml(zf, "word/document.xml")
+            root = _zip_xml(_BoundedZipReader(zf), "word/document.xml")
     except zipfile.BadZipFile as exc:
         raise ExtractionError(f"Not a valid DOCX: {exc}") from exc
     except OSError as exc:
@@ -133,10 +160,11 @@ def _extract_docx(path: str) -> str:
 def _extract_xlsx(path: str) -> str:
     try:
         with zipfile.ZipFile(path) as zf:
+            reader = _BoundedZipReader(zf)
             names = set(zf.namelist())
-            shared = _shared_strings(zf, names)
-            sheets = _workbook_sheets(zf)
-            rels = _workbook_rels(zf, names)
+            shared = _shared_strings(reader, names)
+            sheets = _workbook_sheets(reader)
+            rels = _workbook_rels(reader, names)
             out: list[str] = []
             for name, state, rid in sheets:
                 if state in {"hidden", "veryHidden"}:
@@ -145,7 +173,7 @@ def _extract_xlsx(path: str) -> str:
                 if part not in names:
                     continue
                 try:
-                    rows = _sheet_rows(zf.read(part), shared)
+                    rows = _sheet_rows(reader.read(part), shared)
                 except ET.ParseError:
                     continue
                 out.append(f"# ── Sheet: {name} ──")
@@ -163,19 +191,19 @@ def _extract_xlsx(path: str) -> str:
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def _shared_strings(zf: zipfile.ZipFile, names: set[str]) -> list[str]:
+def _shared_strings(reader: _BoundedZipReader, names: set[str]) -> list[str]:
     if "xl/sharedStrings.xml" not in names:
         return []
     try:
-        root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+        root = ET.fromstring(reader.read("xl/sharedStrings.xml"))
     except ET.ParseError:
         return []
     s = f"{{{_NS_S}}}"
     return ["".join(t.text or "" for t in item.iter(f"{s}t")) for item in root.iter(f"{s}si")]
 
 
-def _workbook_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str, str]]:
-    root = _zip_xml(zf, "xl/workbook.xml")
+def _workbook_sheets(reader: _BoundedZipReader) -> list[tuple[str, str, str]]:
+    root = _zip_xml(reader, "xl/workbook.xml")
     s, r = f"{{{_NS_S}}}", f"{{{_NS_REL}}}"
     return [
         (sheet.get("name", "Sheet"), sheet.get("state", "visible"), sheet.get(f"{r}id", ""))
@@ -183,12 +211,12 @@ def _workbook_sheets(zf: zipfile.ZipFile) -> list[tuple[str, str, str]]:
     ]
 
 
-def _workbook_rels(zf: zipfile.ZipFile, names: set[str]) -> dict[str, str]:
+def _workbook_rels(reader: _BoundedZipReader, names: set[str]) -> dict[str, str]:
     rels_path = "xl/_rels/workbook.xml.rels"
     if rels_path not in names:
         return {}
     try:
-        root = ET.fromstring(zf.read(rels_path))
+        root = ET.fromstring(reader.read(rels_path))
     except ET.ParseError:
         return {}
     rel_tag = f"{{{_NS_PKG_REL}}}Relationship"

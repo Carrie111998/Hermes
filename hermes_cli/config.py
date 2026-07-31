@@ -3223,6 +3223,8 @@ TERMINAL_CONFIG_ENV_MAP = {
     "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
     "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
     "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
+    "docker_workspace_only": "TERMINAL_DOCKER_WORKSPACE_ONLY",
+    "workspace_bootstrap": "TERMINAL_WORKSPACE_BOOTSTRAP",
     "sandbox_dir": "TERMINAL_SANDBOX_DIR",
     "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
 }
@@ -3274,6 +3276,9 @@ def apply_terminal_config_to_env(
         if cfg_key not in terminal_cfg:
             continue
         value = terminal_cfg[cfg_key]
+        if cfg_key == "workspace_bootstrap":
+            from tools.workspace_bootstrap import validate_workspace_bootstrap_spec
+            value = validate_workspace_bootstrap_spec(value, allow_empty=True)
         if cfg_key == "cwd":
             raw_cwd = str(value or "").strip()
             if raw_cwd in {".", "auto", "cwd"}:
@@ -4869,7 +4874,17 @@ def set_config_value(key: str, value: str, force: bool = False):
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    if key == "terminal.workspace_bootstrap":
+        try:
+            coerced_value = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            from tools.workspace_bootstrap import WorkspaceBootstrapError
+            raise WorkspaceBootstrapError(
+                "workspace_bootstrap must be valid JSON"
+            ) from exc
+        from tools.workspace_bootstrap import validate_workspace_bootstrap_spec
+        coerced_value = validate_workspace_bootstrap_spec(coerced_value, allow_empty=True)
+    elif not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:

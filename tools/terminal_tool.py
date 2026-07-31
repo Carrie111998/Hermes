@@ -338,6 +338,9 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
     """Return True when a Docker sandbox exposes host paths through bind mounts."""
     if config.get("env_type") != "docker":
         return False
+    from tools.workspace_bootstrap import uses_dynamic_workspace_bootstrap
+    if uses_dynamic_workspace_bootstrap(config):
+        return True
     if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
         return True
     return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
@@ -1531,6 +1534,10 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_persist_across_processes": os.getenv(
             "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES", "true"
         ).lower() in {"true", "1", "yes"},
+        "docker_workspace_only": os.getenv(
+            "TERMINAL_DOCKER_WORKSPACE_ONLY", "false"
+        ).lower() in {"true", "1", "yes"},
+        "workspace_bootstrap": _parse_env_var("TERMINAL_WORKSPACE_BOOTSTRAP", "{}", json.loads, "valid JSON"),
         # Startup orphan reaper for hermes-tagged containers left behind by
         # crashed / SIGKILL'd previous processes that bypassed atexit.
         # Conservative: only sweeps Exited containers older than 2× the
@@ -1607,6 +1614,9 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             network=docker_network,
             extra_args=docker_extra_args,
             persist_across_processes=cc.get("docker_persist_across_processes", True),
+            workspace_only=cc.get("docker_workspace_only", False),
+            workspace_identity=cc.get("workspace_identity"),
+            workspace_transport=cc.get("workspace_transport"),
         )
     
     elif env_type == "singularity":
@@ -2245,8 +2255,14 @@ def terminal_tool(
         # task_ids collapse back to "default" so the top-level agent and
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
-
+        # A dynamic workspace-only bind is the exception: one container can
+        # safely mount only the worktree claimed for its originating session.
+        from tools.workspace_bootstrap import uses_dynamic_workspace_bootstrap
+        effective_task_id = (
+            task_id or "default"
+            if uses_dynamic_workspace_bootstrap(config)
+            else _resolve_container_task_id(task_id)
+        )
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
         # reads the raw task id first then the collapsed container id, so a
@@ -2356,6 +2372,20 @@ def terminal_tool(
                         needs_creation = False
 
                 if needs_creation:
+                    from tools.workspace_bootstrap import (
+                        prepare_workspace_only_config,
+                        revalidate_workspace_identity,
+                    )
+
+                    config = prepare_workspace_only_config(config, task_id=task_id)
+                    env_type = config["env_type"]
+                    if env_type == "docker":
+                        image = overrides.get("docker_image") or config["docker_image"]
+                    cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+                    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+                        cwd = config["cwd"]
+                    default_timeout = config["timeout"]
+                    effective_timeout = timeout or default_timeout
                     if env_type == "singularity":
                         _check_disk_usage_warning()
                     logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
@@ -2388,6 +2418,9 @@ def terminal_tool(
                                 "docker_network": config.get("docker_network", True),
                                 "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
                                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                                "docker_workspace_only": config.get("docker_workspace_only", False),
+                                "workspace_identity": config.get("workspace_identity"),
+                                "workspace_transport": config.get("workspace_transport"),
                             }
 
                         local_config = None
@@ -2396,6 +2429,7 @@ def terminal_tool(
                                 "persistent": config.get("local_persistent", False),
                             }
 
+                        revalidate_workspace_identity(config)
                         new_env = _create_environment(
                             env_type=env_type,
                             image=image,
@@ -2420,6 +2454,9 @@ def terminal_tool(
                         _last_activity[effective_task_id] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+
+        if uses_dynamic_workspace_bootstrap(config):
+            cwd = getattr(env, "cwd", cwd) or cwd
 
         if env is None:
             # Unreachable in practice (either the cached branch or the creation

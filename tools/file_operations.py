@@ -25,6 +25,7 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import base64
 import os
 import re
 import difflib
@@ -1084,6 +1085,38 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     # READ Implementation
     # =========================================================================
+
+    def read_bytes(self, path: str, max_bytes: int) -> bytes:
+        """Read bounded binary content through the selected environment.
+
+        The final path must not be a symlink. This is primarily used by
+        structured-document extraction so container boundaries are enforced
+        before host-side parsers see any bytes.
+        """
+        path = self._expand_path(path)
+        quoted = self._escape_shell_arg(path)
+        command = (
+            "set -e; "
+            f"test ! -L {quoted}; "
+            f"size=$(wc -c < {quoted}); "
+            f"test \"$size\" -le {int(max_bytes)}; "
+            "printf '%s\\n' \"$size\"; "
+            f"base64 {quoted} | tr -d '\\n'"
+        )
+        result = self._exec(command)
+        if result.exit_code != 0:
+            raise OSError("file is unavailable through the selected environment")
+        size_line, separator, encoded = result.stdout.partition("\n")
+        if not separator:
+            raise OSError("selected environment returned invalid binary data")
+        try:
+            expected_size = int(size_line.strip())
+            content = base64.b64decode(encoded.strip(), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise OSError("selected environment returned invalid binary data") from exc
+        if expected_size != len(content) or expected_size > max_bytes:
+            raise OSError("selected environment returned invalid binary data")
+        return content
     
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         """

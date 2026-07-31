@@ -15,6 +15,9 @@ import os
 import tempfile
 import unittest
 import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools.read_extract import (
     ExtractionError,
@@ -141,6 +144,29 @@ class TestDocxExtraction(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             extract_document_text(p)
 
+    def test_rejects_high_ratio_document_xml_before_decompression(self):
+        p = os.path.join(self.tmp, "bomb.docx")
+        bomb = self._doc(
+            '<w:p><w:r><w:t>' + ("A" * (2 * 1024 * 1024)) + "</w:t></w:r></w:p>"
+        )
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", bomb)
+
+        with self.assertRaisesRegex(ExtractionError, "compression ratio"):
+            extract_document_text(p)
+
+
+    def test_rejects_oversized_document_xml_before_decompression(self):
+        p = os.path.join(self.tmp, "oversized.docx")
+        bomb = self._doc(
+            '<w:p><w:r><w:t>' + ("A" * (17 * 1024 * 1024)) + "</w:t></w:r></w:p>"
+        )
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_STORED) as z:
+            z.writestr("word/document.xml", bomb)
+
+        with self.assertRaisesRegex(ExtractionError, "decompression limit"):
+            extract_document_text(p)
+
 
 # ---------------------------------------------------------------------------
 # Excel workbooks (.xlsx) — #10740
@@ -197,6 +223,75 @@ class TestXlsxExtraction(unittest.TestCase):
         with self.assertRaises(ExtractionError):
             extract_document_text(p)
 
+    def test_rejects_high_ratio_sheet_xml_before_decompression(self):
+        p = os.path.join(self.tmp, "bomb.xlsx")
+        office_relationships = (
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        )
+        package_relationships = (
+            "http://schemas.openxmlformats.org/package/2006/relationships"
+        )
+        workbook = (
+            f'<workbook xmlns="{_NS_S}" xmlns:r="{office_relationships}"><sheets>'
+            '<sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        )
+        rels = (
+            f'<Relationships xmlns="{package_relationships}">'
+            '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/>'
+            '</Relationships>'
+        )
+        sheet = (
+            f'<worksheet xmlns="{_NS_S}"><sheetData><row><c t="str"><v>'
+            + ("A" * (2 * 1024 * 1024))
+            + "</v></c></row></sheetData></worksheet>"
+        )
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("xl/workbook.xml", workbook)
+            z.writestr("xl/_rels/workbook.xml.rels", rels)
+            z.writestr("xl/worksheets/sheet1.xml", sheet)
+
+        with self.assertRaisesRegex(ExtractionError, "compression ratio"):
+            extract_document_text(p)
+
+
+    def test_rejects_cumulative_sheet_xml_before_third_member_read(self):
+        p = os.path.join(self.tmp, "cumulative.xlsx")
+        office_relationships = (
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        )
+        package_relationships = (
+            "http://schemas.openxmlformats.org/package/2006/relationships"
+        )
+        workbook = (
+            f'<workbook xmlns="{_NS_S}" xmlns:r="{office_relationships}"><sheets>'
+            + "".join(
+                f'<sheet name="Data{index}" sheetId="{index}" r:id="rId{index}"/>'
+                for index in range(1, 4)
+            )
+            + "</sheets></workbook>"
+        )
+        rels = (
+            f'<Relationships xmlns="{package_relationships}">'
+            + "".join(
+                f'<Relationship Id="rId{index}" Target="worksheets/sheet{index}.xml" Type="x"/>'
+                for index in range(1, 4)
+            )
+            + "</Relationships>"
+        )
+        sheet = (
+            f'<worksheet xmlns="{_NS_S}"><sheetData><row><c t="str"><v>'
+            + ("A" * (11 * 1024 * 1024))
+            + "</v></c></row></sheetData></worksheet>"
+        )
+        with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_STORED) as z:
+            z.writestr("xl/workbook.xml", workbook)
+            z.writestr("xl/_rels/workbook.xml.rels", rels)
+            for index in range(1, 4):
+                z.writestr(f"xl/worksheets/sheet{index}.xml", sheet)
+
+        with self.assertRaisesRegex(ExtractionError, "cumulative decompression limit"):
+            extract_document_text(p)
+
 
 # ---------------------------------------------------------------------------
 # read_file_tool integration
@@ -239,6 +334,133 @@ class TestReadFileToolIntegration(unittest.TestCase):
         res = json.loads(read_file_tool(p))
         self.assertTrue(res.get("extracted_document"))
         self.assertIn("Report body", res["content"])
+
+
+class _WorkspaceOnlyFileOps:
+    def __init__(self, allowed):
+        self.env = SimpleNamespace(_workspace_only=True)
+        self.allowed = allowed
+
+    def read_bytes(self, path, max_bytes):
+        if path not in self.allowed:
+            raise OSError("outside workspace")
+        content = self.allowed[path]
+        if len(content) > max_bytes:
+            raise OSError("document too large")
+        return content
+
+    @staticmethod
+    def _add_line_numbers(content, start_line=1):
+        return "\n".join(
+            f"{line_number}|{line}"
+            for line_number, line in enumerate(content.split("\n"), start=start_line)
+        )
+
+
+class TestWorkspaceOnlyStructuredReadBoundary(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="rex_boundary_")
+        self.paths = {}
+        notebook = os.path.join(self.tmp, "foreign.ipynb")
+        _write_notebook(notebook, [{"cell_type": "markdown", "source": "FOREIGN-NOTEBOOK"}])
+        self.paths[".ipynb"] = notebook
+
+        docx = os.path.join(self.tmp, "foreign.docx")
+        _write_docx(
+            docx,
+            f'<w:document xmlns:w="{_NS_W}"><w:body><w:p><w:r>'
+            '<w:t>FOREIGN-DOCX</w:t></w:r></w:p></w:body></w:document>',
+        )
+        self.paths[".docx"] = docx
+
+        xlsx = os.path.join(self.tmp, "foreign.xlsx")
+        relationships = "http://schemas.openxmlformats.org/package/2006/relationships"
+        office_relationships = (
+            "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        )
+        _write_xlsx(
+            xlsx,
+            workbook=(
+                f'<workbook xmlns="{_NS_S}" xmlns:r="{office_relationships}"><sheets>'
+                '<sheet name="Data" sheetId="1" r:id="rId1"/>'
+                '</sheets></workbook>'
+            ),
+            rels=(
+                f'<Relationships xmlns="{relationships}">'
+                '<Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/>'
+                '</Relationships>'
+            ),
+            shared=None,
+            sheets={
+                "xl/worksheets/sheet1.xml": (
+                    f'<worksheet xmlns="{_NS_S}"><sheetData><row r="1">'
+                    '<c r="A1" t="str"><v>FOREIGN-XLSX</v></c>'
+                    '</row></sheetData></worksheet>'
+                )
+            },
+        )
+        self.paths[".xlsx"] = xlsx
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_internal_structured_documents_are_read_through_selected_environment(self):
+        for extension, host_path in self.paths.items():
+            with self.subTest(extension=extension):
+                container_path = f"/workspace/internal{extension}"
+                file_ops = _WorkspaceOnlyFileOps(
+                    {container_path: Path(host_path).read_bytes()}
+                )
+                with patch("tools.file_tools._get_file_ops", return_value=file_ops):
+                    result = json.loads(
+                        read_file_tool(container_path, task_id=f"internal-{extension}")
+                    )
+                self.assertTrue(result.get("extracted_document"), result)
+                self.assertIn("FOREIGN-", result["content"])
+
+    def test_foreign_absolute_and_symlinked_structured_documents_are_refused(self):
+        file_ops = _WorkspaceOnlyFileOps({})
+        for extension, foreign_path in self.paths.items():
+            symlink_path = os.path.join(self.tmp, f"link{extension}")
+            os.symlink(foreign_path, symlink_path)
+            for candidate in (foreign_path, symlink_path):
+                with self.subTest(extension=extension, candidate=candidate):
+                    with patch("tools.file_tools._get_file_ops", return_value=file_ops):
+                        result = json.loads(
+                            read_file_tool(candidate, task_id=f"foreign-{extension}")
+                        )
+                    self.assertIn("error", result)
+                    self.assertNotIn("FOREIGN-", result.get("content", ""))
+
+    def test_zip_bomb_rejection_removes_workspace_bridge_temp_file(self):
+        container_path = "/workspace/bomb.docx"
+        host_bomb = os.path.join(self.tmp, "bomb.docx")
+        document = (
+            f'<w:document xmlns:w="{_NS_W}"><w:body><w:p><w:r><w:t>'
+            + ("A" * (2 * 1024 * 1024))
+            + "</w:t></w:r></w:p></w:body></w:document>"
+        )
+        with zipfile.ZipFile(host_bomb, "w", compression=zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", document)
+        file_ops = _WorkspaceOnlyFileOps(
+            {container_path: Path(host_bomb).read_bytes()}
+        )
+        real_named_temporary_file = tempfile.NamedTemporaryFile
+
+        def local_temporary_file(*args, **kwargs):
+            return real_named_temporary_file(*args, dir=self.tmp, **kwargs)
+
+        before = set(os.listdir(self.tmp))
+        with patch("tools.file_tools._get_file_ops", return_value=file_ops), patch(
+            "tools.file_tools.tempfile.NamedTemporaryFile",
+            side_effect=local_temporary_file,
+        ):
+            result = json.loads(read_file_tool(container_path, task_id="bomb-cleanup"))
+
+        self.assertIn("error", result)
+        self.assertEqual(set(os.listdir(self.tmp)), before)
 
 
 if __name__ == "__main__":
