@@ -386,10 +386,11 @@ async fn run_update(app: AppHandle) -> Result<()> {
 
     emit_stage(&app, "update", StageState::Running, None, None);
     let started = Instant::now();
+    let update_full_args = hermes.full_args(&update_args);
     let mut update = run_streamed(
         &app,
-        &hermes,
-        &update_args,
+        &hermes.program,
+        &update_full_args,
         &install_root,
         &child_env,
         Some("update"),
@@ -419,8 +420,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         update = run_streamed(
             &app,
-            &hermes,
-            &update_args,
+            &hermes.program,
+            &update_full_args,
             &install_root,
             &child_env,
             Some("update"),
@@ -486,10 +487,11 @@ async fn run_update(app: AppHandle) -> Result<()> {
     emit_stage(&app, "rebuild", StageState::Running, None, None);
     let started = Instant::now();
     let rebuild_args: Vec<String> = vec!["desktop".into(), "--build-only".into()];
+    let rebuild_full_args = hermes.full_args(&rebuild_args);
     let mut rebuild = run_streamed(
         &app,
-        &hermes,
-        &rebuild_args,
+        &hermes.program,
+        &rebuild_full_args,
         &install_root,
         &child_env,
         Some("rebuild"),
@@ -514,8 +516,8 @@ async fn run_update(app: AppHandle) -> Result<()> {
         );
         rebuild = run_streamed(
             &app,
-            &hermes,
-            &rebuild_args,
+            &hermes.program,
+            &rebuild_full_args,
             &install_root,
             &child_env,
             Some("rebuild"),
@@ -874,12 +876,80 @@ fn venv_hermes(install_root: &Path) -> PathBuf {
     }
 }
 
+/// Path to the venv's python interpreter under an install root, regardless of
+/// existence.
+fn venv_python(install_root: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        install_root.join("venv").join("Scripts").join("python.exe")
+    } else {
+        install_root.join("venv").join("bin").join("python")
+    }
+}
+
+/// How to invoke the resolved hermes CLI: either the console-script shim
+/// directly, or an interpreter plus the args needed to run it as a module.
+struct HermesInvocation {
+    program: PathBuf,
+    /// Prepended to the caller's own argv, e.g. `["-m", "hermes_cli.main"]`.
+    prefix_args: Vec<String>,
+}
+
+impl HermesInvocation {
+    fn direct(program: PathBuf) -> Self {
+        Self { program, prefix_args: Vec::new() }
+    }
+
+    fn full_args(&self, trailing: &[String]) -> Vec<String> {
+        self.prefix_args.iter().cloned().chain(trailing.iter().cloned()).collect()
+    }
+}
+
+/// Same probe as the Electron desktop's `canImportHermesCli()`
+/// (apps/desktop/electron/backend-probes.ts): a venv can have `python.exe` on
+/// disk but be dead (missing deps from an update that died mid-`pip
+/// install`), so importing `hermes_cli.config` (not just the top-level
+/// package) is required before trusting it as a fallback interpreter.
+/// `install_root` is added to `PYTHONPATH` so a source-tree checkout resolves
+/// `hermes_cli` even if the editable install's `.pth`/egg-link is stale.
+fn venv_python_can_import_hermes_cli(python: &Path, install_root: &Path) -> bool {
+    if !python.exists() {
+        return false;
+    }
+    let mut python_path = install_root.as_os_str().to_os_string();
+    if let Some(existing) = env::var_os("PYTHONPATH") {
+        python_path.push(if cfg!(target_os = "windows") { ";" } else { ":" });
+        python_path.push(existing);
+    }
+    std::process::Command::new(python)
+        .args(["-c", "import yaml; import dotenv; import hermes_cli.config"])
+        .env("PYTHONPATH", python_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 /// Resolve the hermes CLI to drive. Prefer the venv shim in the install we
-/// just updated; fall back to `hermes` on PATH.
-fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
+/// just updated; fall back to `hermes` on PATH; finally fall back to the
+/// venv's own python run as `python -m hermes_cli.main` when the shim is
+/// missing but the venv is otherwise intact.
+///
+/// The shim-missing-but-venv-intact case is exactly issue #75584: an
+/// interrupted `hermes update` can leave `venv/Scripts/hermes.exe` deleted
+/// (uv/distlib skips the launcher write when the live shim was locked) while
+/// `hermes-agent.exe`/`hermes-acp.exe` and the rest of the venv remain. Without
+/// this fallback the updater dead-ends here with "Could not find the hermes
+/// CLI" and the user must manually run `pip install -e .` to recover — even
+/// though `hermes update` itself already self-heals this exact shim via
+/// `_verify_console_scripts_installed` (hermes_cli/main.py) once it manages to
+/// run at all. Mirrors `resolveVenvHermesCommand()` in
+/// apps/desktop/electron/windows-hermes-path.ts, which the Electron desktop
+/// backend launcher already uses for the same recovery.
+fn resolve_hermes(install_root: &Path) -> Option<HermesInvocation> {
     let shim = venv_hermes(install_root);
     if shim.exists() {
-        return Some(shim);
+        return Some(HermesInvocation::direct(shim));
     }
     // PATH fallback. which-style probe via env, kept dependency-free.
     let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
@@ -888,9 +958,16 @@ fn resolve_hermes(install_root: &Path) -> Option<PathBuf> {
         for dir in path.split(sep) {
             let cand = Path::new(dir).join(exe);
             if cand.exists() {
-                return Some(cand);
+                return Some(HermesInvocation::direct(cand));
             }
         }
+    }
+    let python = venv_python(install_root);
+    if venv_python_can_import_hermes_cli(&python, install_root) {
+        return Some(HermesInvocation {
+            program: python,
+            prefix_args: vec!["-m".to_string(), "hermes_cli.main".to_string()],
+        });
     }
     None
 }
@@ -1225,6 +1302,63 @@ mod tests {
         let shim = venv_hermes(root);
         assert!(shim.starts_with(root));
         assert!(shim.to_string_lossy().contains("venv"));
+    }
+
+    #[test]
+    fn venv_python_is_under_install_root() {
+        let root = Path::new("/x/hermes-agent");
+        let python = venv_python(root);
+        assert!(python.starts_with(root));
+        assert!(python.to_string_lossy().contains("venv"));
+    }
+
+    #[test]
+    fn hermes_invocation_direct_has_no_prefix_args() {
+        let invocation = HermesInvocation::direct(PathBuf::from("/x/hermes.exe"));
+        let trailing = vec!["update".to_string(), "--yes".to_string()];
+        assert_eq!(invocation.full_args(&trailing), trailing);
+    }
+
+    #[test]
+    fn hermes_invocation_module_fallback_prepends_prefix_args() {
+        // #75584: when the shim is missing, we drive the CLI as
+        // `python -m hermes_cli.main <trailing args>` — the module flag must
+        // come BEFORE the caller's own argv (e.g. `update --yes --gateway`),
+        // not after.
+        let invocation = HermesInvocation {
+            program: PathBuf::from("/x/venv/Scripts/python.exe"),
+            prefix_args: vec!["-m".to_string(), "hermes_cli.main".to_string()],
+        };
+        let trailing = vec!["update".to_string(), "--yes".to_string()];
+        assert_eq!(
+            invocation.full_args(&trailing),
+            vec!["-m", "hermes_cli.main", "update", "--yes"]
+        );
+    }
+
+    #[test]
+    fn venv_python_can_import_hermes_cli_false_when_interpreter_missing() {
+        let ghost = Path::new("/nonexistent/does/not/exist/python.exe");
+        assert!(!venv_python_can_import_hermes_cli(ghost, Path::new("/nonexistent")));
+    }
+
+    #[test]
+    fn resolve_hermes_prefers_existing_shim_over_python_fallback() {
+        // When the console-script shim is present, resolve_hermes must return
+        // it directly (no `-m hermes_cli.main` prefix) regardless of whether a
+        // venv python or a hermes on PATH would also resolve.
+        let dir = unique_tmp_dir("resolve-hermes-shim");
+        let shim = venv_hermes(&dir);
+        if let Some(parent) = shim.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&shim, "").unwrap();
+
+        let resolved = resolve_hermes(&dir).expect("shim on disk must resolve");
+        assert_eq!(resolved.program, shim);
+        assert!(resolved.prefix_args.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
