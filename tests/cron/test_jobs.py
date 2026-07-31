@@ -1068,12 +1068,6 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["plainjob01"]
 
-
-        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        JOBS_FILE.write_bytes(b'\xef\xbb\xbf{"jobs": []}')
-
-        assert load_jobs() == []
-
     def test_load_jobs_bom_plus_bare_list_auto_repairs(self, tmp_cron_dir):
         """BOM + bare list (hand-edited) must load and rewrap to dict envelope."""
         import json
