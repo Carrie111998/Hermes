@@ -5661,7 +5661,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            self._choice_picker_state[str(chat_id)] = {
+            self._choice_picker_state[f"{chat_id}:{msg.message_id}"] = {
                 "msg_id": msg.message_id,
                 "choices": choices,
                 "session_key": session_key,
@@ -5675,8 +5675,16 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_choice_picker_callback(
         self, query, data: str, chat_id: str
     ) -> None:
-        """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
+        """Handle choice picker button taps (cp:<index>).
+        
+        State is keyed by ``chat_id:message_id`` so two open pickers in the
+        same chat cannot cross-talk: a tap on the first message resolves from
+        the first picker's state, and the second message resolves independently.
+        """
+        query_message = getattr(query, "message", None)
+        query_msg_id = getattr(query_message, "message_id", None)
+        state_key = f"{chat_id}:{query_msg_id}" if query_msg_id is not None else chat_id
+        state = self._choice_picker_state.get(state_key)
         if not state:
             await query.answer(text="Picker expired — run the command again.")
             return
@@ -5728,7 +5736,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+        self._choice_picker_state.pop(state_key, None)
 
     _MODEL_PAGE_SIZE = 8
 

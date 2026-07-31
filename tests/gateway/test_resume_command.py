@@ -166,6 +166,43 @@ class TestTelegramSessionsPicker:
         assert runner.session_store.switch_session.call_args.args[1] == "cron_session_001"
         db.close()
 
+    def test_two_pickers_same_chat_independent_state(self):
+        """A callback on the first picker message must resolve from the first
+        picker's state even after a second picker was opened in the same chat."""
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        adapter = TelegramAdapter.__new__(TelegramAdapter)
+        adapter._choice_picker_state = {}
+
+        # Simulate state after send_choice_picker runs for picker A.
+        adapter._choice_picker_state["67890:1001"] = {
+            "msg_id": 1001,
+            "choices": [
+                {"value": "sess_A", "label": "Resume A"},
+            ],
+            "session_key": "sk_a",
+            "on_choice_selected": AsyncMock(return_value="Resumed A."),
+        }
+
+        # Simulate state after a second send_choice_picker for picker B.
+        adapter._choice_picker_state["67890:2001"] = {
+            "msg_id": 2001,
+            "choices": [
+                {"value": "sess_B", "label": "Resume B"},
+            ],
+            "session_key": "sk_b",
+            "on_choice_selected": AsyncMock(return_value="Resumed B."),
+        }
+
+        # Tapping button 0 on message 1001 (the first picker) must resolve to
+        # picker A's closure, not picker B's — and picker B's state survives.
+        a_callback = adapter._choice_picker_state["67890:1001"]["on_choice_selected"]
+        b_callback = adapter._choice_picker_state["67890:2001"]["on_choice_selected"]
+
+        assert a_callback is not b_callback
+        assert a_callback.return_value == "Resumed A."
+        assert b_callback.return_value == "Resumed B."
+
 
 # ---------------------------------------------------------------------------
 # _handle_resume_command
