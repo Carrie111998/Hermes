@@ -1871,3 +1871,77 @@ def register(ctx) -> None:
         emoji="🐳",
         allow_update_command=True,
     )
+
+
+
+# ========== URL 分析同步模組 - 中央處理器入口 ==========
+# 導入中央 URL 處理器
+_URL_PROCESSOR_PATH = os.path.expanduser("~/.hermes/scripts/url_processor.py")
+
+def process_url_via_central(url, source='default'):
+    '''
+    中央 URL 處理器調用入口
+    所有平台都應該使用這個函數來觸發 URL 分析
+    
+    Args:
+        url (str): URL 字串
+        source (str): 來源平台名稱
+    
+    Returns:
+        dict: 處理結果，包含 status, filename, message 等
+    '''
+    if not url or not isinstance(url, str):
+        return None
+    
+    try:
+        import subprocess
+        import json
+        
+        result = subprocess.run(
+            ['python3', _URL_PROCESSOR_PATH, url, source],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        if result.returncode == 0 and result.stdout:
+            response = json.loads(result.stdout)
+            print(f"✅ [{source}] URL 處理完成: {url[:60]}... -> {response.get('filename', 'unknown')}")
+            return response
+        else:
+            stderr_text = (result.stderr or '')[:200]
+            print(f"❌ [{source}] URL 處理失敗: {stderr_text}")
+            return None
+            
+    except Exception as e:
+        print(f"❌ [{source}] URL 處理異常: {e}")
+        return None
+
+def extract_urls_from_text(text):
+    '''從文字中提取所有 URL'''
+    if not text or not isinstance(text, str):
+        return []
+    
+    url_pattern = r'https?://[^\s<>"\|]+'
+    urls = re.findall(url_pattern, text)
+    
+    # 清理 URL 中的標點符號
+    cleaned_urls = []
+    for url in urls:
+        url = url.rstrip('.,;:!?)')
+        if url.startswith(('http://', 'https://')):
+            cleaned_urls.append(url)
+    
+    return cleaned_urls
+
+def process_urls_batch(urls, source='default'):
+    '''批量處理 URL 列表'''
+    results = []
+    for url in urls:
+        result = process_url_via_central(url, source=source)
+        if result:
+            results.append(result)
+    return results
+# ==========================================================
+
+# URL Processor Integration: Added on 2026-07-22

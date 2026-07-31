@@ -1,3 +1,41 @@
+
+# URL 分析同步模組 — 使用中央 URL 處理器
+import subprocess
+import json
+import os
+import sys
+from pathlib import Path
+
+# URL 分析同步配置
+TELEGRAM_URL_SYNC_ENABLED = True
+URL_PROCESSOR_SCRIPT = os.path.expanduser("~/.hermes/scripts/url_processor.py")
+
+def process_url_via_central(url, source='telegram'):
+    """
+    中央 URL 處理器調用入口
+    所有平台都應該使用這個函數來觸發 URL 分析
+    """
+    if not url:
+        return
+    
+    try:
+        result = subprocess.run(
+            ['python3', URL_PROCESSOR_SCRIPT, url, source],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        
+        if result.returncode == 0:
+            print(f"✅ URL 處理完成 ({source}): {url[:60]}...")
+            return json.loads(result.stdout) if result.stdout else None
+        else:
+            print(f"❌ URL 處理失敗 ({source}): {result.stderr[:200]}")
+            return None
+    except Exception as e:
+        print(f"❌ URL 處理異常 ({source}): {e}")
+        return None
+
 """
 Telegram platform adapter.
 
@@ -9560,6 +9598,37 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_type = "group"
         elif telegram_chat_type == "channel":
             chat_type = "channel"
+        
+        # Extract URL entities from Telegram message to ensure full URLs are preserved
+        # Telegram stores URLs in entities with type 'url' or 'text_link'
+        # We need to reconstruct the full URL from these entities
+        text = message.text or ""
+        if hasattr(message, 'entities') and message.entities:
+            # Get all URL entities and reconstruct the text with full URLs
+            url_entities = []
+            for entity in message.entities:
+                entity_type = getattr(entity, 'type', '').lower()
+                if entity_type in ('url', 'text_link', 'mention', 'bank_link'):
+                    offset = getattr(entity, 'offset', 0)
+                    length = getattr(entity, 'length', 0)
+                    if offset is not None and length is not None and length > 0:
+                        # For text_link, get the actual URL from the entity
+                        if entity_type == 'text_link':
+                            url = getattr(entity, 'url', None)
+                            if url:
+                                url_entities.append((offset, length, url))
+                        else:
+                            # For 'url' type, the text itself is the URL
+                            entity_text = text[offset:offset+length]
+                            url_entities.append((offset, length, entity_text))
+            
+            # Sort by offset in reverse order to replace from end to start
+            url_entities.sort(key=lambda x: x[0], reverse=True)
+            
+            # Replace URL entities with full URLs
+            for offset, length, url in url_entities:
+                if offset + length <= len(text):
+                    text = text[:offset] + url + text[offset+length:]
 
         # Resolve routable thread id for DM topics and forum group topics via
         # the shared normalizer, so gating and session routing agree on one
@@ -9690,7 +9759,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
         return MessageEvent(
-            text=message.text or "",
+            text=text or "",
             message_type=msg_type,
             source=source,
             raw_message=message,
@@ -10017,3 +10086,30 @@ def register(ctx) -> None:
         emoji="✈️",
         allow_update_command=True,
     )
+
+
+
+def telegram_url_processor(message_text, message_id=None):
+    '''處理 Telegram 訊息中的 URL 並觸發同步（使用中央處理器）'''
+    if not TELEGRAM_URL_SYNC_ENABLED:
+        return False
+    
+    # 提取 URL
+    url_pattern = r'https?://[^\s<>"\|]+'
+    urls = re.findall(url_pattern, message_text)
+    
+    if not urls:
+        return False
+    
+    print(f"🔗 偵測到 {len(urls)} 個 URL，開始處理...")
+    
+    # 使用中央 URL 處理器處理每個 URL
+    results = []
+    for url in urls:
+        result = process_url_via_central(url, source='telegram')
+        results.append(result)
+    
+    if results:
+        print(f"✅ 已處理 {len(results)} 個 URL")
+        return True
+    return False
