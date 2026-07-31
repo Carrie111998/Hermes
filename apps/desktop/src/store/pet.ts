@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import { persistBoolean, storedBoolean } from '@/lib/storage'
+import { persistBoolean, persistString, storedBoolean, storedString } from '@/lib/storage'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { $busy } from '@/store/session'
 
@@ -37,6 +37,11 @@ export interface PetInfo {
   loopMs?: number
   scale?: number
   stateRows?: string[]
+}
+
+interface CachedPetInfo {
+  profile: string
+  info: PetInfo
 }
 
 export interface PetActivity {
@@ -89,7 +94,41 @@ export function derivePetState(activity: PetActivity): PetState {
   return 'idle'
 }
 
-export const $petInfo = atom<PetInfo>({ enabled: false })
+// The full spritesheet normally arrives only after the gateway is ready. Keep
+// one profile-scoped snapshot so the mascot can paint during backend startup,
+// then let the first live `pet.info` response reconcile it.
+const PET_INFO_CACHE_KEY = 'hermes.desktop.pet-info-cache.v1'
+
+export function petInfoFromCache(raw: null | string, profile: string): PetInfo {
+  if (!raw) {
+    return { enabled: false }
+  }
+
+  try {
+    const cached = JSON.parse(raw) as Partial<CachedPetInfo>
+    const info = cached.info
+
+    if (
+      cached.profile !== profile ||
+      !info ||
+      typeof info !== 'object' ||
+      typeof info.enabled !== 'boolean' ||
+      (info.enabled && (typeof info.spritesheetBase64 !== 'string' || !info.spritesheetBase64))
+    ) {
+      return { enabled: false }
+    }
+
+    return info
+  } catch {
+    return { enabled: false }
+  }
+}
+
+function loadCachedPetInfo(): PetInfo {
+  return petInfoFromCache(storedString(PET_INFO_CACHE_KEY), petProfile())
+}
+
+export const $petInfo = atom<PetInfo>(loadCachedPetInfo())
 export const $petActivity = atom<PetActivity>({})
 
 /** Pet installed + enabled with a loaded spritesheet (ready to show/react). */
@@ -136,6 +175,12 @@ export const flashPetActivity = (next: Partial<PetActivity>, ms = 1600) => {
 }
 
 export const setPetInfo = (info: PetInfo) => $petInfo.set(info)
+
+/** Apply a gateway-authoritative pet snapshot and retain it for the next boot. */
+export const cachePetInfo = (info: PetInfo) => {
+  setPetInfo(info)
+  persistString(PET_INFO_CACHE_KEY, JSON.stringify({ info, profile: petProfile() } satisfies CachedPetInfo))
+}
 
 /**
  * Resolve the live activity state from the dedicated activity atom, falling back

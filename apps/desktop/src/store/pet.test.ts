@@ -7,8 +7,33 @@ import {
   $petState,
   derivePetState,
   flashPetActivity,
+  petInfoFromCache,
   setPetActivity
 } from './pet'
+
+describe('pet info startup cache', () => {
+  const info = {
+    enabled: true,
+    slug: 'cached-pet',
+    spritesheetBase64: 'd2VicA==',
+    spritesheetRevision: '1:8'
+  }
+
+  it('restores a complete snapshot for the active profile', () => {
+    expect(petInfoFromCache(JSON.stringify({ info, profile: 'default' }), 'default')).toEqual(info)
+  })
+
+  it('ignores another profile or an incomplete enabled snapshot', () => {
+    expect(petInfoFromCache(JSON.stringify({ info, profile: 'work' }), 'default')).toEqual({ enabled: false })
+    expect(petInfoFromCache(JSON.stringify({ info: { enabled: true }, profile: 'default' }), 'default')).toEqual({
+      enabled: false
+    })
+  })
+
+  it('ignores malformed storage', () => {
+    expect(petInfoFromCache('{broken', 'default')).toEqual({ enabled: false })
+  })
+})
 
 describe('derivePetState', () => {
   it('rests at idle by default and uses waiting when awaiting input', () => {
