@@ -244,6 +244,9 @@ class TestCopilotNormalization:
         assert copilot_model_api_mode("gpt-5.2-codex") == "codex_responses"
         assert copilot_model_api_mode("gpt-5.2") == "codex_responses"
 
+    def test_copilot_normalizes_gemini_short_alias(self):
+        assert normalize_copilot_model_id("gemini-3.5") == "gemini-3.5-flash"
+
     def test_validate_copilot_accepts_bare_id_when_catalog_is_vendor_prefixed(self):
         with patch(
             "hermes_cli.models.provider_model_ids",
@@ -549,4 +552,3 @@ class TestProbeApiModelsUserAgent:
         assert ua and ua.startswith("hermes-cli/")
         # No Authorization was set, but UA must still be present.
         assert req.get_header("Authorization") is None
-

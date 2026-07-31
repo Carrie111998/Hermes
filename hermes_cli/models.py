@@ -3854,6 +3854,8 @@ _COPILOT_MODEL_ALIASES = {
     # Google Gemini models (Copilot catalog uses google/ prefix)
     "google/gemini-3.5-flash": "gemini-3.5-flash",
     "google/gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
+    "gemini-3.5": "gemini-3.5-flash",
+    "google/gemini-3.5": "gemini-3.5-flash",
     "gemini-3.5-flash": "gemini-3.5-flash",
     "gemini-3.1-pro-preview": "gemini-3.1-pro-preview",
     # Kimi and MAI models
