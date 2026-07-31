@@ -17,7 +17,10 @@ disk.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -223,4 +226,69 @@ class TestHandoffFromOrchestratingUpdater:
         lock = UpdateLock(path=marker)
         assert lock.acquire() is True
         assert lock.acquired is True
+        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+
+    def test_handoff_via_parent_pid_when_env_unset(self, marker, monkeypatch):
+        """Older updater binaries never set HERMES_UPDATE_HANDOFF_PID, but they
+        spawn ``hermes update`` as a direct child whose parent owns the marker.
+
+        The child must recognize that parent through its real parent pid and run
+        under the existing claim — otherwise a GUI update deadlocks forever
+        (#75278): the in-app updater keeps relaunching the same old binary, and
+        every attempt refuses its own parent's lock with the concurrent-update
+        exit code.
+        """
+        # The orchestrating updater (our parent) owns the marker; no handoff env.
+        monkeypatch.setattr(os, "getppid", lambda: os.getpid())
+        monkeypatch.delenv(HANDOFF_PID_ENV, raising=False)
+        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+
+        lock = UpdateLock(path=marker)
+        assert lock.acquire() is True
+        assert lock.acquired is False, "the parent's claim is not ours to own"
+
+        lock.release()
+        assert marker.exists(), "the parent still needs its marker after our stage ends"
+        assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()
+
+    def test_handoff_via_real_parent_pid_end_to_end(self, tmp_path, monkeypatch):
+        """End-to-end reproduction of #75278 against an older updater binary.
+
+        A real child process is launched with NO HERMES_UPDATE_HANDOFF_PID in
+        its environment, while its actual parent holds the marker. The child's
+        real ``os.getppid()`` equals the live marker owner, so it must acquire
+        the lock via the parent-pid fallback. Without that fallback the child
+        exits 2 ("Hermes is still running") and the macOS in-app update is
+        permanently broken.
+        """
+        marker = tmp_path / ".hermes-update-in-progress"
+        # Parent (this process) holds the marker, exactly like hermes-setup --update.
+        marker.write_text(f"{os.getpid()}\n{int(time.time())}\n", encoding="utf-8")
+
+        child_script = (
+            "import os\n"
+            "from pathlib import Path\n"
+            "from hermes_cli.update_lock import UpdateLock, describe_holder\n"
+            "lock = UpdateLock(path=Path(os.environ['MARKER']))\n"
+            "ok = lock.acquire()\n"
+            "print('ACQUIRED' if ok else 'REFUSED')\n"
+            "if not ok:\n"
+            "    print(describe_holder(lock.holder))\n"
+        )
+        env = dict(os.environ)
+        env.pop(HANDOFF_PID_ENV, None)
+        env["MARKER"] = str(marker)
+        repo_root = Path(__file__).resolve().parents[2]
+        env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+
+        result = subprocess.run(
+            [sys.executable, "-c", child_script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "ACQUIRED" in result.stdout, result.stdout + result.stderr
+        # The child must NOT have taken ownership: the parent's marker is intact.
         assert int(marker.read_text(encoding="utf-8").splitlines()[0]) == os.getpid()

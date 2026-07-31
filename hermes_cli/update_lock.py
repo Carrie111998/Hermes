@@ -36,6 +36,14 @@ The updater therefore exports :data:`HANDOFF_PID_ENV` naming its own pid, and
 ``acquire`` treats a live holder matching that pid as the lock we are already
 running under. The env var alone grants nothing: the pid must also be the
 live marker owner, so a stale or forged value cannot bypass the lock.
+
+For resilience against updater binaries built *before* that env existed (which
+still write the marker and spawn ``hermes update`` as a direct child but never
+set the env), ``acquire`` ALSO treats a live holder whose pid is our direct
+parent (``os.getppid()``) as our orchestrator. This breaks the otherwise
+unwinnable chicken-and-egg on macOS drag-installs, where the in-app update
+keeps relaunching the same old binary and deadlocks against its own parent's
+lock on every attempt — see issue #75278.
 """
 
 from __future__ import annotations
@@ -202,14 +210,38 @@ class UpdateLock:
     def acquire(self) -> bool:
         """Claim the lock. Returns False (and sets ``holder``) if it's taken.
 
-        A live holder whose pid matches :data:`HANDOFF_PID_ENV` is our own
-        orchestrating parent (the Tauri updater spawning `hermes update` as a
-        stage): we run under ITS claim rather than refusing or re-writing the
-        marker, and ``release`` leaves the parent's marker untouched.
+        A live holder is our own orchestrating parent in two cases, and we run
+        under ITS claim rather than refusing or re-writing the marker (and
+        ``release`` leaves the parent's marker untouched):
+
+        * its pid is named in :data:`HANDOFF_PID_ENV` — set by the current Tauri
+          updater (``update_child_env`` in
+          ``apps/bootstrap-installer/src-tauri/src/update.rs``); or
+        * it is our direct parent process (``os.getppid()``).
+
+        The second case is the chicken-and-egg breaker for #75278. A
+        ``hermes-setup --update`` binary BUILT BEFORE the handoff env existed
+        still writes the in-progress marker and spawns ``hermes update`` as a
+        direct child, but never sets ``HERMES_UPDATE_HANDOFF_PID``. The new
+        Python ``hermes update`` would then refuse its own parent's lock with
+        the concurrent-update exit code, the GUI maps that to "Hermes is still
+        running", and — because the updater is relaunched from that same (old)
+        binary on every retry — no number of retries can ever succeed. macOS
+        drag-installs in particular ship that older binary, so every in-app
+        update there is permanently broken until the binary itself is rebuilt,
+        which the deadlocked update can never do. Recognizing the parent as the
+        orchestrator via ``os.getppid()`` makes the handoff work with BOTH old
+        and new updater binaries, on every platform, with no binary bump
+        required.
+
+        In both cases the pid/pid alone grants nothing: the holder must also be
+        the *live* marker owner, so a stale value, a reused pid, or a forged env
+        cannot bypass the lock, and a dashboard-spawned ``hermes update`` (no
+        handoff env, no updater parent) is still refused exactly as before.
         """
         existing = read_live_update(path=self.path)
         if existing is not None:
-            if existing.pid == _handoff_pid():
+            if existing.pid == _handoff_pid() or existing.pid == os.getppid():
                 return True
             self.holder = existing
             return False
