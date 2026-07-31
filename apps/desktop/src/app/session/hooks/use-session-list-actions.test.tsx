@@ -4,10 +4,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
 import {
   $cronSessions,
+  $hiddenPinnedSessionCount,
   $messagingSessions,
   $sessions,
   $sessionsLoading,
   setCronSessions,
+  setHiddenPinnedSessionCount,
   setMessagingSessions,
   setSessions,
   setSessionsLoading
@@ -43,11 +45,19 @@ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
 // separate listAllProfileSessions calls (each of which reopened every profile
 // DB) — #66377-adjacent perf work from the desktop audit canvas.
 const sidebar = (
-  recents: { sessions: SessionInfo[]; profiles_truncated?: Record<string, boolean> },
+  recents: {
+    sessions: SessionInfo[]
+    hidden_pinned_count?: number
+    profiles_truncated?: Record<string, boolean>
+  },
   cron: SessionInfo[] = [],
   messaging: SessionInfo[] = []
 ): SidebarSessionsResponse => ({
-  recents: { sessions: recents.sessions, profiles_truncated: recents.profiles_truncated },
+  recents: {
+    hidden_pinned_count: recents.hidden_pinned_count,
+    profiles_truncated: recents.profiles_truncated,
+    sessions: recents.sessions
+  },
   cron: { sessions: cron },
   messaging: { sessions: messaging }
 })
@@ -76,6 +86,7 @@ beforeEach(() => {
   removed.ids = new Set()
   setSessions([])
   setCronSessions([])
+  setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
   setSessionsLoading(false)
 })
@@ -83,6 +94,7 @@ beforeEach(() => {
 afterEach(() => {
   setSessions([])
   setCronSessions([])
+  setHiddenPinnedSessionCount(0)
   setMessagingSessions([])
   setSessionsLoading(false)
 })
@@ -209,6 +221,18 @@ describe('refreshSessions batches slices into one request', () => {
     expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])
     expect($cronSessions.get().map(s => s.id)).toEqual(['c1'])
     expect($messagingSessions.get().map(s => s.id)).toEqual(['m1'])
+  })
+
+  it('stores the number of durable pins hidden by the concrete profile scope', async () => {
+    listSidebarSessions.mockResolvedValue(sidebar({ hidden_pinned_count: 2, sessions: [row('a')] }))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($hiddenPinnedSessionCount.get()).toBe(2)
   })
 
   it('forwards the active profile scope + section limits to the batched call', async () => {

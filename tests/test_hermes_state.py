@@ -2399,6 +2399,20 @@ class TestSessionPinAndStaleArchive:
         assert with_pins[:3] == page
         assert len(with_pins) == len(page) + 1
 
+    def test_session_count_can_select_only_listable_pins(self, db):
+        self._make_idle(db, "keep", days_idle=3)
+        self._make_idle(db, "ordinary", days_idle=2)
+        self._make_idle(db, "archived", days_idle=1)
+        db.set_session_pinned("keep", True)
+        db.set_session_pinned("archived", True)
+        db.set_session_archived("archived", True)
+
+        assert db.session_count(
+            min_message_count=1,
+            exclude_children=True,
+            pinned_only=True,
+        ) == 1
+
 
 
 

@@ -20,6 +20,7 @@ import {
   mergeSessionPage,
   MESSAGING_SECTION_LIMIT,
   setCronSessions,
+  setHiddenPinnedSessionCount,
   setMessagingPlatformTotals,
   setMessagingSessions,
   setMessagingTruncated,
@@ -215,6 +216,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
             ? prev
             : next
         })
+        setHiddenPinnedSessionCount(recents.hidden_pinned_count ?? 0)
 
         // Cron section: latest N cron sessions (kept so a pinned cron run still
         // resolves via sessionByAnyId), signature-gated like above.

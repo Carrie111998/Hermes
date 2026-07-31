@@ -50,3 +50,21 @@ export function SidebarPinnedEmptyState() {
     </div>
   )
 }
+
+export function SidebarCrossProfilePinsNotice({ count, onShowAll }: { count: number; onShowAll: () => void }) {
+  const { t } = useI18n()
+
+  return (
+    <Button
+      aria-label={t.profiles.showAllProfiles}
+      className="h-7 w-full justify-start gap-1.5 px-2 text-[0.75rem] font-normal text-(--ui-text-tertiary)"
+      onClick={onShowAll}
+      size="sm"
+      variant="ghost"
+    >
+      <Codicon className="text-(--ui-text-quaternary)" name="accounts-view-bar-icon" size="0.75rem" />
+      <span className="min-w-0 flex-1 truncate text-left">{t.profiles.showAllProfiles}</span>
+      <span className="text-(--ui-text-quaternary)">+{count}</span>
+    </Button>
+  )
+}

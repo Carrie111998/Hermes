@@ -63,7 +63,14 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey,
+  setShowAllProfiles
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -87,6 +94,7 @@ import {
   $cronSessions,
   $currentCwd,
   $gatewayState,
+  $hiddenPinnedSessionCount,
   $messagingPlatformTotals,
   $messagingSessions,
   $messagingTruncated,
@@ -130,7 +138,12 @@ import {
   StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
-import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
+import {
+  SidebarBlankState,
+  SidebarCrossProfilePinsNotice,
+  SidebarPinnedEmptyState,
+  SidebarSessionSkeletons
+} from './section-states'
 import { buildSessionByAnyId } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
@@ -302,6 +315,7 @@ export function ChatSidebar({
   const messagingTruncated = useStore($messagingTruncated)
   const sessionsLoading = useStore($sessionsLoading)
   const sessionProfilesTruncated = useStore($sessionProfilesTruncated)
+  const hiddenPinnedSessionCount = useStore($hiddenPinnedSessionCount)
   const workingSessionIds = useStore($workingSessionIds)
   const profiles = useStore($profiles)
   const profileScope = useStore($profileScope)
@@ -312,6 +326,7 @@ export function ChatSidebar({
   // profile while scope is still ALL (persisted), the rail is hidden and they'd
   // otherwise be stuck in the grouped view with no way out.
   const showAllProfiles = multiProfile && profileScope === ALL_PROFILES
+  const crossProfilePinCount = showAllProfiles ? 0 : hiddenPinnedSessionCount
   const agentOrderIds = useStore($sidebarSessionOrderIds)
   const agentOrderManual = useStore($sidebarSessionOrderManual)
   const workspaceOrderIds = useStore($sidebarWorkspaceOrderIds)
@@ -1270,7 +1285,16 @@ export function ChatSidebar({
                 contentClassName={cn('flex max-h-[50vh] flex-col gap-px rounded-lg pb-2 pt-1', GROUP_BODY)}
                 dndSensors={dndSensors}
                 emptyState={<SidebarPinnedEmptyState />}
+                footer={
+                  crossProfilePinCount > 0 ? (
+                    <SidebarCrossProfilePinsNotice
+                      count={crossProfilePinCount}
+                      onShowAll={() => setShowAllProfiles(true)}
+                    />
+                  ) : undefined
+                }
                 label={s.pinned}
+                labelMeta={crossProfilePinCount > 0 ? `+${crossProfilePinCount}` : undefined}
                 onArchiveSession={onArchiveSession}
                 onBranchSession={onBranchSession}
                 onDeleteSession={onDeleteSession}

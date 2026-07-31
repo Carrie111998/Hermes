@@ -221,7 +221,11 @@ def get_profiles_sessions_sidebar(
     from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
-    # cron + messaging are cross-profile; recents is scoped to recents_profile.
+    # cron + messaging are cross-profile; ordinary recents are scoped to
+    # recents_profile. Count durable pins in other profiles separately so the
+    # renderer can explain hidden pins without mixing profile rows. Profile
+    # clones may legitimately share session ids, so appending sibling rows to
+    # the scoped list would make the unqualified Desktop pin index ambiguous.
     # Scan every profile once regardless (each DB opened a single time).
     try:
         infos = profiles_mod.list_profiles()
@@ -241,6 +245,7 @@ def get_profiles_sessions_sidebar(
     messaging_cap = min(max(messaging_limit, 1), 500)
 
     recents_rows: List[Dict[str, Any]] = []
+    hidden_pinned_count = 0
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
     recents_truncated: Dict[str, bool] = {}
@@ -297,6 +302,14 @@ def get_profiles_sessions_sidebar(
                 unpinned_count = sum(1 for s in profile_rows if not s.get("pinned"))
                 recents_truncated[name] = unpinned_count >= recents_cap
                 recents_rows.extend(_tag(profile_rows, name))
+            else:
+                hidden_pinned_count += db.session_count(
+                    exclude_sources=recents_exclude_list or None,
+                    min_message_count=1,
+                    include_archived=False,
+                    exclude_children=True,
+                    pinned_only=True,
+                )
             cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
             messaging_rows.extend(
                 _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
@@ -321,6 +334,7 @@ def get_profiles_sessions_sidebar(
     return {
         "recents": {
             "sessions": _window(recents_rows, recents_cap),
+            "hidden_pinned_count": hidden_pinned_count,
             "profiles_truncated": recents_truncated,
         },
         "cron": {"sessions": _window(cron_rows, cron_cap)},

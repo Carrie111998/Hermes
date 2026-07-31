@@ -4,12 +4,14 @@ import { $sessionsLimit, resetSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '
 import {
   $cronSessions,
   $freshDraftReady,
+  $hiddenPinnedSessionCount,
   $messagingSessions,
   $sessionProfilesTruncated,
   $sessions,
   $sessionsLoading,
   setCronSessions,
   setFreshDraftReady,
+  setHiddenPinnedSessionCount,
   setMessagingSessions,
   setSessionProfilesTruncated,
   setSessions,
@@ -28,6 +30,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
     $gatewaySwitching.set(false)
     setSessions([{ id: 's1', title: 'old', profile: 'default' } as never])
     setSessionProfilesTruncated({ default: true })
+    setHiddenPinnedSessionCount(2)
     setCronSessions([{ id: 'c1', title: 'cron', profile: 'default' } as never])
     setMessagingSessions([{ id: 'm1', title: 'tg', profile: 'default' } as never])
     $stalledSessionIds.set(['s1'])
@@ -39,6 +42,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
   afterEach(() => {
     resetSessionsLimit()
     setSessions([])
+    setHiddenPinnedSessionCount(0)
     setCronSessions([])
     setMessagingSessions([])
     $stalledSessionIds.set([])
@@ -51,6 +55,7 @@ describe('wipeSessionListsForGatewaySwitch', () => {
 
     expect($sessions.get()).toEqual([])
     expect($sessionProfilesTruncated.get()).toEqual({})
+    expect($hiddenPinnedSessionCount.get()).toBe(0)
     expect($cronSessions.get()).toEqual([])
     expect($messagingSessions.get()).toEqual([])
     expect($stalledSessionIds.get()).toEqual([])

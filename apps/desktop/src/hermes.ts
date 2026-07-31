@@ -431,6 +431,8 @@ export async function listAllProfileSessions(
 // splices remote profiles per slice (see interceptSessionRequestForRemote).
 export interface SidebarSessionSlice {
   sessions: SessionInfo[]
+  /** Durable recents pins owned by profiles hidden by a concrete scope. */
+  hidden_pinned_count?: number
   /** Per-profile "the window came back full, more rows exist on disk" flags —
    *  what pagination needs, without a COUNT(*) per profile DB per refresh. */
   profiles_truncated?: Record<string, boolean>
@@ -522,6 +524,7 @@ async function listSidebarSessionsLegacy(req: SidebarSessionsRequest): Promise<S
 
   return {
     recents: {
+      hidden_pinned_count: 0,
       profiles_truncated: profilesTruncatedFrom(recents.sessions, req.recentsLimit),
       sessions: recents.sessions
     },
