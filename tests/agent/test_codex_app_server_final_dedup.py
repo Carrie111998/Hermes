@@ -58,3 +58,98 @@ class TestFinalTextWasStreamed:
                 raise RuntimeError("boom")
 
         assert _final_text_was_streamed(_Boom(), "The answer is 42.") is False
+
+
+# ---------- turn-level: the returned result contract ----------
+
+
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from agent.codex_runtime import run_codex_app_server_turn
+
+
+def _make_turn(**overrides):
+    turn = SimpleNamespace(
+        interrupted=False,
+        error=None,
+        thread_id="thread-1",
+        turn_id="turn-1",
+        projected_messages=[{"role": "assistant", "content": "The answer is 42."}],
+        tool_iterations=0,
+        final_text="The answer is 42.",
+        should_retire=False,
+    )
+    for key, value in overrides.items():
+        setattr(turn, key, value)
+    return turn
+
+
+def _make_agent(turn, streamed=""):
+    agent = MagicMock()
+    # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
+    agent._codex_session = MagicMock()
+    agent._codex_session.run_turn.return_value = turn
+    agent.tool_progress_callback = None
+    agent._iters_since_skill = 0
+    agent._skill_nudge_interval = 0
+    agent.valid_tool_names = set()
+    agent._session_db = None
+    agent._session_db_created = True
+    agent.session_id = "sess-codex"
+    agent._interrupt_requested = False
+    # A MagicMock probe returns a truthy MagicMock — pin the real semantics.
+    agent._interim_content_was_streamed = (
+        lambda content: bool(streamed) and (content or "").startswith(streamed)
+    )
+    return agent
+
+
+def _run(agent):
+    return run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-1",
+    )
+
+
+class TestTurnResultContract:
+    def test_streamed_final_is_previewed_on_the_turn_result(self):
+        """The #74248 shape, observed at the run_codex_app_server_turn
+        contract the gateway consumes — not just the helper."""
+        turn = _make_turn()
+        result = _run(_make_agent(turn, streamed="The answer is 42."))
+
+        assert result["completed"] is True
+        assert result["response_previewed"] is True
+        assert result["final_response"] == "The answer is 42."
+
+    def test_unrelated_commentary_is_not_previewed(self):
+        turn = _make_turn()
+        result = _run(_make_agent(turn, streamed="Working on it..."))
+
+        assert result["completed"] is True
+        assert result["response_previewed"] is False
+
+    def test_aborted_turn_is_never_previewed(self):
+        """Codex substitutes sentinel text (<turn_aborted>) on an
+        interrupted/errored turn. Even when the streamed probe would match,
+        the partial result must not be marked previewed — the gateway would
+        suppress delivering it at all."""
+        turn = _make_turn(
+            interrupted=True,
+            error="turn aborted",
+            final_text="<turn_aborted>",
+            projected_messages=[],
+        )
+        # Probe that would match anything — the completed gate must win.
+        agent = _make_agent(turn)
+        agent._interim_content_was_streamed = lambda content: True
+
+        result = _run(agent)
+
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["response_previewed"] is False

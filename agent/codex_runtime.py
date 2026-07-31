@@ -880,6 +880,7 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    _turn_completed = not turn.interrupted and turn.error is None
     return {
         "final_response": turn.final_text,
         # The live app-server event bridge routes every completed agentMessage
@@ -889,10 +890,17 @@ def run_codex_app_server_turn(
         # the gateway defaulted it to False and delivered the same text twice —
         # one unreferenced copy from the bridge, one reply-referenced copy from
         # the normal final path (#74248).
-        "response_previewed": _final_text_was_streamed(agent, turn.final_text),
+        #
+        # Successful turns only: an interrupted/errored turn substitutes
+        # sentinel text like <turn_aborted> for final_text, and marking that
+        # partial result previewed would let the gateway suppress its delivery
+        # entirely — the failure mode this key must never cause.
+        "response_previewed": (
+            _turn_completed and _final_text_was_streamed(agent, turn.final_text)
+        ),
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
+        "completed": _turn_completed,
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
         **(
