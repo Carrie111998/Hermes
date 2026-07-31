@@ -3728,6 +3728,32 @@ def test_sidebar_status_uses_broker_thresholds_and_preserves_identity(
         "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
         "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
     }
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    ("C:\\unsafe\x00path", "C:\\unsafe\x85path", "C:\\unsafe\u2028path", "C:\\unsafe\u2029path"),
+)
+def test_sidebar_status_omits_placement_with_unsafe_inbox_path(
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe: str,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "counts": {},
+        "placement": {
+            "inbox_cwd": unsafe,
+            "generation": 1,
+            "verified_visible": 1,
+            "mismatch_count": 0,
+            "canary": {"status": "passed", "verified_at": 1234.0},
+        },
+    })
+
+    status = backend.sidebar_status()
+
+    assert "placement" not in status
+    assert unsafe not in json.dumps(status)
     assert "messages" not in repr(status)
 
 

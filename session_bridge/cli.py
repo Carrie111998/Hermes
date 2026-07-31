@@ -4729,7 +4729,7 @@ def _public_sidebar_status(
     return result
 
 
-def _public_sidebar_placement_status(value: object) -> dict[str, Any]:
+def _public_sidebar_placement_status(value: object) -> dict[str, Any] | None:
     if not isinstance(value, Mapping) or set(value) != {
         "inbox_cwd",
         "generation",
@@ -4739,14 +4739,8 @@ def _public_sidebar_placement_status(value: object) -> dict[str, Any]:
     }:
         raise ConfigurationFailure("invalid_sidebar_status")
     inbox_cwd = value.get("inbox_cwd")
-    if (
-        type(inbox_cwd) is not str
-        or not inbox_cwd
-        or inbox_cwd != inbox_cwd.strip()
-        or "\n" in inbox_cwd
-        or "\r" in inbox_cwd
-    ):
-        raise ConfigurationFailure("invalid_sidebar_status")
+    if not is_canonical_sidebar_string(inbox_cwd):
+        return None
     generation = _status_count(value.get("generation"))
     if generation < 1:
         raise ConfigurationFailure("invalid_sidebar_status")
