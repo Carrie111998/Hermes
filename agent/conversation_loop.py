@@ -25,6 +25,7 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.chat_completion_helpers import ensure_current_date_line
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -848,6 +849,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         effective = sp
         if agent.ephemeral_system_prompt:
             effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective = ensure_current_date_line(effective)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1552,6 +1554,10 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        # Volatile date tail: per-call only, never persisted. Date-only so the
+        # tail is byte-stable within the day; the static-prefix cache block is
+        # untouched and the full-system block re-computes at most once per day.
+        effective_system = ensure_current_date_line(effective_system)
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

@@ -1662,6 +1662,42 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
+def ensure_current_date_line(prompt: str) -> str:
+    """Append/refresh a date-only ``Today's date:`` line on the volatile tail.
+
+    The system prompt is built once per session and replayed verbatim for
+    prefix-cache warmth, so in a gateway session spanning days the
+    ``Conversation started:`` date (a session-start value by design) goes
+    stale and models copy it into long-term memory.  This helper injects the
+    current date as a per-call volatile tail: only the outgoing wire system
+    message is touched, never ``_cached_system_prompt`` and never the session
+    DB, so the stored-prompt and cache-marker contracts are preserved.
+
+    Only the LAST ``Today's date:`` line is replaced (earlier occurrences may
+    be user content / memory echoes).  When the last line already equals
+    today's line the original object is returned unchanged (idempotent);
+    when there is no such line the date is appended.  Empty/non-string input
+    is returned unchanged.
+
+    Date-only (``%A, %B %d, %Y``) so the tail is byte-stable for the full
+    day: the static-prefix cache block always hits, and the full-system
+    block re-computes at most once per day.
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return prompt
+    from hermes_time import now as _hermes_now
+    expected_line = f"Today's date: {_hermes_now().strftime('%A, %B %d, %Y')}"
+    matches = list(re.finditer(r"(?m)^Today's date: .*$", prompt))
+    if matches:
+        last = matches[-1]
+        if last.group() == expected_line:
+            return prompt
+        return prompt[:last.start()] + expected_line + prompt[last.end():]
+    if prompt.endswith("\n"):
+        return prompt + expected_line
+    return prompt + "\n\n" + expected_line
+
+
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     return (
         str(fb.get("provider") or "").strip().lower(),
