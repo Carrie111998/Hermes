@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from dataclasses import dataclass
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -481,7 +482,10 @@ _SUDO_STDIN_RE = re.compile(
     re.IGNORECASE)
 
 
-def _check_sudo_stdin_guard(command: str) -> tuple:
+def _check_sudo_stdin_guard(
+    command: str,
+    classification: "_CommandDetectionClassification | None" = None,
+) -> tuple:
     """Detect ``sudo -S`` (stdin password) without configured SUDO_PASSWORD.
 
     When SUDO_PASSWORD is set, ``_transform_sudo_command`` injects ``-S``
@@ -494,7 +498,12 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     """
     if "SUDO_PASSWORD" in os.environ:
         return (False, None)
-    normalized = _normalize_command_for_detection(command).lower()
+    classification = classification or _classify_command_for_detection(command)
+    if classification.length_finding is not None:
+        return (True, classification.length_finding[1])
+    if classification.limit == "parser":
+        return (True, _PARSER_LIMIT_DESCRIPTION)
+    normalized = classification.normalized_command.lower()
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "sudo password guessing via stdin (sudo -S)")
     return (False, None)
@@ -508,13 +517,21 @@ def detect_hardline_command(command: str) -> tuple:
     Returns:
         (is_hardline, description) or (False, None)
     """
-    if _command_parser_limit_exceeded(command):
+    return _detect_hardline_classified(_classify_command_for_detection(command))
+
+
+def _detect_hardline_classified(
+    classification: "_CommandDetectionClassification",
+) -> tuple:
+    if classification.length_finding is not None:
+        return (True, classification.length_finding[1])
+    if classification.limit == "parser":
         return (True, _PARSER_LIMIT_DESCRIPTION)
-    normalized = _normalize_command_for_detection(command)
+    normalized = classification.normalized_command
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
-    for command_variant in _command_detection_variants(command):
+    for command_variant in _command_detection_variants_normalized(normalized):
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
@@ -522,7 +539,10 @@ def detect_hardline_command(command: str) -> tuple:
     return (False, None)
 
 
-def _match_user_deny_rule(command: str) -> str | None:
+def _match_user_deny_rule(
+    command: str,
+    classification: "_CommandDetectionClassification | None" = None,
+) -> str | None:
     """Return the matching ``approvals.deny`` glob, or None.
 
     ``approvals.deny`` in config.yaml is a user-defined list of fnmatch
@@ -546,7 +566,12 @@ def _match_user_deny_rule(command: str) -> str | None:
              if isinstance(p, str) and p.strip()]
     if not globs:
         return None
-    for command_variant in _command_detection_variants(command):
+    classification = classification or _classify_command_for_detection(command)
+    if classification.limit is not None:
+        return None
+    for command_variant in _command_detection_variants_normalized(
+        classification.normalized_command
+    ):
         candidate = command_variant.lower().strip()
         for pattern in globs:
             if fnmatch.fnmatchcase(candidate, pattern.lower()):
@@ -581,6 +606,23 @@ def _hardline_block_result(description: str) -> dict:
             "approvals.mode=off, or cron approve mode. If you genuinely "
             "need to run it, run it yourself in a terminal outside the "
             "agent."
+        ),
+    }
+
+
+def _command_length_limit_block_result() -> dict:
+    """Build the standard fail-closed block for over-limit commands."""
+    pattern_key, description = _COMMAND_LENGTH_LIMIT_FINDING
+    return {
+        "approved": False,
+        "hardline": True,
+        "pattern_key": pattern_key,
+        "description": description,
+        "message": (
+            f"BLOCKED (fail-closed): {description}. "
+            "This command is too long to classify safely and cannot be "
+            "executed via the agent, including with --yolo, /yolo, "
+            "approvals.mode=off, or cron approve mode."
         ),
     }
 
@@ -1170,6 +1212,22 @@ _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+_MAX_APPROVAL_DETECTION_COMMAND_LENGTH = 10_000
+_MAX_APPROVAL_DETECTION_RAW_COMMAND_LENGTH = 20_000
+_COMMAND_LENGTH_LIMIT_FINDING = (
+    "command length limit",
+    "command exceeds approval detection length limit",
+)
+
+
+@dataclass(frozen=True)
+class _CommandDetectionClassification:
+    """The one parser and normalization result shared by approval detection."""
+
+    command: str
+    normalized_command: str | None
+    limit: str | None = None
+    length_finding: tuple[str, str] | None = None
 
 
 
@@ -1197,6 +1255,28 @@ def _command_parser_limit_exceeded(command: str) -> bool:
             if separators >= _MAX_DETECTION_SEGMENTS:
                 return True
     return False
+
+
+def _classify_command_for_detection(command: str) -> _CommandDetectionClassification:
+    """Bound and normalize a terminal command before approval detection."""
+    if len(command) > _MAX_APPROVAL_DETECTION_RAW_COMMAND_LENGTH:
+        return _CommandDetectionClassification(
+            command,
+            None,
+            limit="raw",
+            length_finding=_COMMAND_LENGTH_LIMIT_FINDING,
+        )
+    if _command_parser_limit_exceeded(command):
+        return _CommandDetectionClassification(command, None, limit="parser")
+    normalized_command = _normalize_command_for_detection(command)
+    if len(normalized_command) > _MAX_APPROVAL_DETECTION_COMMAND_LENGTH:
+        return _CommandDetectionClassification(
+            command,
+            normalized_command,
+            limit="normalized",
+            length_finding=_COMMAND_LENGTH_LIMIT_FINDING,
+        )
+    return _CommandDetectionClassification(command, normalized_command)
 
 
 def _shell_tokens_with_spans(segment: str, start: int):
@@ -1961,7 +2041,12 @@ def _iter_shell_command_word_spans(command: str):
 
 
 def _command_detection_variants(command: str):
-    normalized = _normalize_command_for_detection(command)
+    yield from _command_detection_variants_normalized(
+        _normalize_command_for_detection(command)
+    )
+
+
+def _command_detection_variants_normalized(normalized: str):
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -2041,21 +2126,55 @@ def detect_dangerous_command(command: str) -> tuple:
     Returns:
         (is_dangerous, pattern_key, description) or (False, None, None)
     """
-    if _command_parser_limit_exceeded(command):
+    return _detect_dangerous_classified(_classify_command_for_detection(command))
+
+
+def _detect_dangerous_classified(
+    classification: _CommandDetectionClassification,
+) -> tuple:
+    if classification.length_finding is not None:
+        return (True, *classification.length_finding)
+    if classification.limit == "parser":
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
-    if _is_verification_artifact_cleanup(command):
+    if _is_verification_artifact_cleanup(classification.command):
         return (False, None, None)
 
-    for command_variant in _command_detection_variants(command):
+    normalized_command = classification.normalized_command
+    for command_variant in _command_detection_variants_normalized(normalized_command):
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):
                 pattern_key = description
                 return (True, pattern_key, description)
-    normalized = _normalize_command_for_detection(command)
-    for description, _ in _execution_flag_findings(normalized):
+    for description, _ in _execution_flag_findings(normalized_command):
         return (True, description, description)
     return (False, None, None)
+
+
+_DETECT_HARDLINE_COMMAND_IMPL = detect_hardline_command
+_DETECT_DANGEROUS_COMMAND_IMPL = detect_dangerous_command
+
+
+def _call_detect_hardline_command(
+    command: str,
+    classification: _CommandDetectionClassification,
+) -> tuple:
+    """Use classified detection without breaking one-argument patches."""
+    detector = detect_hardline_command
+    if detector is _DETECT_HARDLINE_COMMAND_IMPL:
+        return _detect_hardline_classified(classification)
+    return detector(command)
+
+
+def _call_detect_dangerous_command(
+    command: str,
+    classification: _CommandDetectionClassification,
+) -> tuple:
+    """Use classified detection without breaking one-argument patches."""
+    detector = detect_dangerous_command
+    if detector is _DETECT_DANGEROUS_COMMAND_IMPL:
+        return _detect_dangerous_classified(classification)
+    return detector(command)
 
 
 # =========================================================================
@@ -3077,6 +3196,12 @@ def check_dangerous_command(command: str, env_type: str,
     Returns:
         {"approved": True/False, "message": str or None, ...}
     """
+    classification = _classify_command_for_detection(command)
+    if classification.length_finding is not None:
+        logger.warning("Command length limit block: %s", command[:200])
+        return _command_length_limit_block_result()
+    if classification.limit == "parser":
+        return _hardline_block_result(_PARSER_LIMIT_DESCRIPTION)
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
@@ -3085,7 +3210,10 @@ def check_dangerous_command(command: str, env_type: str,
     # unconditionally, BEFORE the yolo bypass.  Opting into yolo is
     # trusting the agent with your files and services, not trusting it
     # to wipe the disk or power the box off.
-    is_hardline, hardline_desc = detect_hardline_command(command)
+    is_hardline, hardline_desc = _call_detect_hardline_command(
+        command,
+        classification,
+    )
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
@@ -3093,7 +3221,7 @@ def check_dangerous_command(command: str, env_type: str,
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo bypass — a deny rule is the
     # user saying "never, even under yolo".
-    deny_pattern = _match_user_deny_rule(command)
+    deny_pattern = _match_user_deny_rule(command, classification)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
@@ -3107,7 +3235,10 @@ def check_dangerous_command(command: str, env_type: str,
     if _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    is_dangerous, pattern_key, description = _call_detect_dangerous_command(
+        command,
+        classification,
+    )
     if not is_dangerous:
         return {"approved": True, "message": None}
 
@@ -3376,6 +3507,12 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
+    classification = _classify_command_for_detection(command)
+    if classification.length_finding is not None:
+        logger.warning("Command length limit block: %s", command[:200])
+        return _command_length_limit_block_result()
+    if classification.limit == "parser":
+        return _hardline_block_result(_PARSER_LIMIT_DESCRIPTION)
     # Skip isolated container backends for both checks. Docker stops skipping
     # once host paths are bind-mounted into the sandbox.
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
@@ -3385,7 +3522,10 @@ def check_all_command_guards(command: str, env_type: str,
     # (rm -rf /, mkfs, dd to raw device, shutdown/reboot, fork bomb,
     # kill -1). Applies BEFORE yolo / mode=off / cron approve-mode so
     # no session-level setting can bypass it.
-    is_hardline, hardline_desc = detect_hardline_command(command)
+    is_hardline, hardline_desc = _call_detect_hardline_command(
+        command,
+        classification,
+    )
     if is_hardline:
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
@@ -3395,7 +3535,7 @@ def check_all_command_guards(command: str, env_type: str,
     # legitimate reason for the agent to pipe passwords to sudo -S when no
     # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
     # check so even yolo/smart approval/mode=off cannot bypass it.
-    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
+    is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command, classification)
     if is_sudo_guess:
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
@@ -3404,7 +3544,7 @@ def check_all_command_guards(command: str, env_type: str,
     # User-defined deny rules (approvals.deny in config.yaml): like the
     # hardline floor, these fire BEFORE the yolo / mode=off bypass — a deny
     # rule is the user saying "never, even under yolo".
-    deny_pattern = _match_user_deny_rule(command)
+    deny_pattern = _match_user_deny_rule(command, classification)
     if deny_pattern is not None:
         logger.warning("User deny rule %r blocked command: %s",
                        deny_pattern, command[:200])
@@ -3430,7 +3570,10 @@ def check_all_command_guards(command: str, env_type: str,
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
                 # Run detection to get a description for the block message
-                is_dangerous, _pk, description = detect_dangerous_command(command)
+                is_dangerous, _pk, description = _call_detect_dangerous_command(
+                    command,
+                    classification,
+                )
                 if is_dangerous:
                     return {
                         "approved": False,
@@ -3536,7 +3679,10 @@ def check_all_command_guards(command: str, env_type: str,
         # else: tirith_fail_open is True — allow as before (tirith_result stays "allow")
 
     # Dangerous command check (detection only, no approval)
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
+    is_dangerous, pattern_key, description = _call_detect_dangerous_command(
+        command,
+        classification,
+    )
 
     # --- Phase 2: Decide ---
 

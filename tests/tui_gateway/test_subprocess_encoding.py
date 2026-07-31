@@ -108,6 +108,43 @@ def test_shell_exec_uses_utf8_replace():
         )
 
 
+def test_shell_exec_shares_one_classification_before_execution(monkeypatch):
+    """The direct TUI path must not normalize once per detector."""
+    import tools.approval as approval
+
+    handler = server._methods["shell.exec"]
+    original_classify = approval._classify_command_for_detection
+    original_normalize = approval._normalize_command_for_detection
+    calls = {"classify": 0, "normalize": 0}
+
+    def count_classify(command):
+        calls["classify"] += 1
+        return original_classify(command)
+
+    def count_normalize(command):
+        calls["normalize"] += 1
+        return original_normalize(command)
+
+    monkeypatch.setattr(approval, "_classify_command_for_detection", count_classify)
+    monkeypatch.setattr(approval, "_normalize_command_for_detection", count_normalize)
+    with patch("subprocess.run", return_value=_make_completed_process()) as mock_run:
+        handler(1, {"command": "echo hello"})
+
+    assert mock_run.called
+    assert calls == {"classify": 1, "normalize": 1}
+
+
+def test_shell_exec_over_limit_does_not_start_subprocess():
+    handler = server._methods["shell.exec"]
+    command = "x;" * 10_000 + "x"
+
+    with patch("subprocess.run") as mock_run:
+        response = handler(1, {"command": command})
+
+    assert mock_run.called is False
+    assert "command exceeds approval detection length limit" in str(response)
+
+
 # ── quick-command exec path (via command.dispatch) ───────────────────────
 
 def test_quick_command_exec_uses_utf8_replace():

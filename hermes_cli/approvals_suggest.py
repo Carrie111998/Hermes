@@ -217,7 +217,11 @@ def scan_approval_history(
     the session DB — dangerous-classified terminal commands that actually
     executed (i.e. carried an implied user approval).
     """
-    from tools.approval import detect_dangerous_command, detect_hardline_command
+    from tools.approval import (
+        _call_detect_dangerous_command,
+        _call_detect_hardline_command,
+        _classify_command_for_detection,
+    )
 
     path = Path(db_path) if db_path else default_db_path()
     if not path.exists():
@@ -232,12 +236,19 @@ def scan_approval_history(
         for tool_call_id, command in _iter_terminal_calls(con, since_ts):
             if tool_call_id in blocked:
                 continue
-            is_hardline, _desc = detect_hardline_command(command)
+            classification = _classify_command_for_detection(command)
+            is_hardline, _desc = _call_detect_hardline_command(
+                command,
+                classification,
+            )
             if is_hardline:
                 # Hardline commands are unconditionally blocked at runtime;
                 # never mine them (defense in depth against stale DB rows).
                 continue
-            is_dangerous, _key, description = detect_dangerous_command(command)
+            is_dangerous, _key, description = _call_detect_dangerous_command(
+                command,
+                classification,
+            )
             if not is_dangerous:
                 continue
             records.append((command, description))
