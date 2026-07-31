@@ -90,6 +90,7 @@ export function normalizePullRequestSummary(raw) {
   ) {
     return null
   }
+  
   const state = ['OPEN', 'CLOSED', 'MERGED'].includes(String(raw.state).toUpperCase())
     ? String(raw.state).toUpperCase()
     : 'UNKNOWN'
@@ -140,6 +141,7 @@ export function normalizePullRequestDetail(raw, repository) {
   if (!summary) {
     return null
   }
+  
   const mergedAt = typeof raw.mergedAt === 'string' ? raw.mergedAt : null
 
   return {
@@ -174,6 +176,7 @@ export async function listGithubPullRequests(filter, ghBin, runner = runGh) {
   if (authState !== 'ready') {
     return { authState, items: [], fetchedAt: Date.now() }
   }
+  
   const result = await runner(buildPullRequestSearchArgs(filter), { ghBin })
 
   if (!result.ok) {
@@ -200,6 +203,7 @@ export async function listGithubPullRequests(filter, ghBin, runner = runGh) {
 
 export async function getGithubPullRequestDetail(ref, ghBin, runner = runGh) {
   const safe = validatePullRequestRef(ref)
+
   const result = await runner(['pr', 'view', String(safe.number), '--repo', safe.repository, '--json', DETAIL_FIELDS], {
     ghBin
   })
@@ -207,6 +211,7 @@ export async function getGithubPullRequestDetail(ref, ghBin, runner = runGh) {
   if (!result.ok) {
     throw new Error(result.kind === 'timeout' ? 'GitHub CLI request timed out' : 'Failed to load pull request details')
   }
+
   let raw
 
   try {

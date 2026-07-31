@@ -42,7 +42,7 @@ def _run(args: list[str], timeout: int = 30) -> dict[str, Any]:
     if not gh:
         return {"ok": False, "kind": "missing", "stdout": ""}
     try:
-        result = subprocess.run([gh, *args], capture_output=True, text=True, timeout=timeout, shell=False, check=False)
+        result = subprocess.run([gh, *args], capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, shell=False, check=False)
     except subprocess.TimeoutExpired:
         return {"ok": False, "kind": "timeout", "stdout": ""}
     stdout = result.stdout[:MAX_OUTPUT]
