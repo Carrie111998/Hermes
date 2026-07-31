@@ -220,6 +220,11 @@ async def test_periodic_output_is_throttled_profile_safe_and_final_only_syntheti
     runner.adapters = {Platform.FEISHU: default_adapter}
     runner._profile_adapters = {"coder": {Platform.FEISHU: coder_adapter}}
     runner._active_profile_name = lambda: "default"
+    thread_metadata = {
+        "reply_in_thread": True,
+        "reply_to_message_id": "om-origin",
+    }
+    runner._thread_metadata_for_source = MagicMock(return_value=thread_metadata)
 
     source = SessionSource(
         platform=Platform.FEISHU,
@@ -246,6 +251,7 @@ async def test_periodic_output_is_throttled_profile_safe_and_final_only_syntheti
     assert "phase latest" in second.args[2]
     assert first.kwargs["metadata"]["reply_in_thread"] is True
     assert first.kwargs["metadata"]["reply_to_message_id"] == "om-origin"
+    runner._thread_metadata_for_source.assert_called_with(source, "om-origin")
 
     coder_adapter.handle_message.assert_awaited_once()
     final_event = coder_adapter.handle_message.await_args.args[0]

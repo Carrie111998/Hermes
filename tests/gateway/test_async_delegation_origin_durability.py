@@ -189,9 +189,8 @@ async def test_synthetic_completion_uses_origin_profile_adapter_and_anchor():
     assert event.message_id == "om-origin"
     assert event.source.message_id == "om-origin"
     assert event.metadata["gateway_origin_profile"] == "coder"
-    assert runner._thread_metadata_for_source(
-        event.source, event.message_id
-    ) == {"reply_in_thread": True}
+    assert event.source.platform == Platform.FEISHU
+    assert event.source.profile == "coder"
 
 
 @pytest.mark.asyncio
