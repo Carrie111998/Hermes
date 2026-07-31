@@ -201,6 +201,52 @@ def test_ws_plugin_command_dispatch_is_sessionless(monkeypatch):
     assert server._sessions == {}
 
 
+def test_ws_plugin_command_dispatch_rejects_unknown_plugin_without_fallback(monkeypatch):
+    """Unknown plugin commands stay on the bounded sessionless RPC path."""
+    import hermes_cli.plugins as plugins
+
+    monkeypatch.setattr(plugins, "get_plugin_command_handler", lambda _name: None)
+    server._sessions.clear()
+    sent = []
+
+    class FakeWS:
+        reads = 0
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            sent.append(json.loads(line))
+
+        async def receive_text(self):
+            self.reads += 1
+            if self.reads == 1:
+                return json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": "unknown-plugin-command",
+                        "method": "plugin.command.dispatch",
+                        "params": {"name": "missing-plugin-command", "arg": "fixed input"},
+                    }
+                )
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    asyncio.run(ws_mod.handle_ws(FakeWS()))
+
+    assert {
+        "jsonrpc": "2.0",
+        "id": "unknown-plugin-command",
+        "error": {
+            "code": 4011,
+            "message": "unknown plugin command: missing-plugin-command",
+        },
+    } in sent
+    assert server._sessions == {}
+
+
 def test_ws_transport_serializes_concurrent_sends():
     active_sends = 0
     max_active_sends = 0
@@ -274,4 +320,3 @@ def test_ws_transport_preserves_cross_batch_order():
         assert entered == ["A1", "A2", "B1", "B2"]
 
     asyncio.run(scenario())
-

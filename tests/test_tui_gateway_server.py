@@ -171,6 +171,33 @@ def test_plugin_command_dispatch_rejects_any_non_contract_parameter(params):
     assert response["error"]["code"] == -32602
 
 
+def test_plugin_command_dispatch_rejects_unknown_plugin_without_fallback(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    looked_up = []
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_command_handler",
+        lambda name: looked_up.append(name) or None,
+    )
+
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "unknown-plugin-command",
+            "method": "plugin.command.dispatch",
+            "params": {"name": "missing-plugin-command", "arg": "fixed input"},
+        }
+    )
+
+    assert response["error"] == {
+        "code": 4011,
+        "message": "unknown plugin command: missing-plugin-command",
+    }
+    assert looked_up == ["missing-plugin-command"]
+    assert server._sessions == {}
+
+
 def test_plugin_command_dispatch_redacts_handler_failure(monkeypatch):
     import hermes_cli.plugins as plugins
 

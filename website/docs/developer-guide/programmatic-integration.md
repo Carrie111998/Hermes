@@ -49,12 +49,23 @@ session.title           session.usage           session.status
 clarify.respond         sudo.respond            secret.respond
 approval.respond        config.set / config.get commands.catalog
 command.resolve         command.dispatch        cli.exec
+plugin.command.dispatch
 reload.mcp              reload.env              process.stop
 delegation.status       subagent.interrupt      spawn_tree.save / list / load
 terminal.resize         clipboard.paste         image.attach
 ```
 
 `session.active_list`, `session.activate`, and `session.close` are the process-local live-session controls used by the TUI session switcher. Use `session.list` / `/resume` for saved transcript discovery; use the active-session methods only for sessions that are currently open in the TUI gateway process.
+
+### Sessionless plugin command dispatch
+
+`plugin.command.dispatch` is a deliberately narrow RPC for a host that needs
+to invoke one already-registered plugin command without creating an Agent
+session. Its params must be exactly `{ "name": "lowercase-command", "arg":
+"string input" }`. It looks up only the named plugin command; it does not
+resolve quick commands, bundles, skills, shell commands, prompts, or any other
+gateway command surface. Unknown commands return the fixed `4011` error and
+registry or handler failures return a fixed redacted `5000` error.
 
 ### Events streamed back
 
