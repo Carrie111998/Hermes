@@ -15,6 +15,12 @@ from .models import (
     encode_bridge_marker,
     stable_message_key,
 )
+from .sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationProofInput,
+    SidebarReconciliationState,
+    sidebar_reconciliation_proof_digest,
+)
 
 __all__ = [
     "BridgeMarkerPayload",
@@ -27,9 +33,13 @@ __all__ = [
     "Relation",
     "SessionLink",
     "SessionProjection",
+    "SidebarReconciliationEvidence",
+    "SidebarReconciliationProofInput",
+    "SidebarReconciliationState",
     "UpsertResult",
     "canonical_session_id",
     "decode_bridge_marker",
     "encode_bridge_marker",
+    "sidebar_reconciliation_proof_digest",
     "stable_message_key",
 ]

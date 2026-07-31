@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import FrozenInstanceError
 import asyncio
 import threading
@@ -17,12 +18,97 @@ from session_bridge.sidebar import (
     VerifiedSidebarThread,
     sidebar_bridge_id,
 )
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationProofInput,
+    SidebarReconciliationState,
+    sidebar_reconciliation_proof_digest,
+)
 from session_bridge.store import SessionBridgeStore
 
 
 SOURCE = "claude:source-1"
 BRIDGE = "sidebar:bridge-1"
 THREAD = "22222222-2222-4222-8222-222222222222"
+
+
+def test_sidebar_reconciliation_proof_digest_binds_every_authority_field() -> None:
+    base = SidebarReconciliationProofInput(
+        job_id="sidebar-job:1",
+        source_session_id=SOURCE,
+        bridge_id=BRIDGE,
+        marker_digest="1" * 64,
+        placement_generation=1,
+        delivery_generation=1,
+        reconciliation_generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        state=SidebarReconciliationState.ABSENCE_PROVEN,
+        match_count=0,
+        recovered_thread_id=None,
+        fixed_reason=None,
+    )
+
+    digest = sidebar_reconciliation_proof_digest(base)
+
+    assert len(digest) == 64
+    assert digest != sidebar_reconciliation_proof_digest(
+        dataclasses.replace(base, reconciliation_generation="scan:2")
+    )
+    assert digest != sidebar_reconciliation_proof_digest(
+        dataclasses.replace(base, placement_generation=2)
+    )
+    assert digest != sidebar_reconciliation_proof_digest(
+        dataclasses.replace(base, source_session_id="claude:other")
+    )
+
+
+@pytest.mark.parametrize(
+    ("state", "match_count", "thread_id", "reason"),
+    [
+        (SidebarReconciliationState.RECOVERED, 1, THREAD, None),
+        (SidebarReconciliationState.ABSENCE_PROVEN, 0, None, None),
+        (SidebarReconciliationState.BLOCKED, 2, None, "marker_conflict"),
+    ],
+)
+def test_sidebar_reconciliation_evidence_enforces_state_shape(
+    state: SidebarReconciliationState,
+    match_count: int,
+    thread_id: str | None,
+    reason: str | None,
+) -> None:
+    evidence = SidebarReconciliationEvidence.create(
+        state=state,
+        generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=match_count,
+        recovered_thread_id=thread_id,
+        fixed_reason=reason,
+    )
+
+    assert evidence.state is state
+
+
+def test_sidebar_reconciliation_evidence_rejects_cross_state_shape() -> None:
+    with pytest.raises(
+        ValueError,
+        match="sidebar reconciliation state shape is malformed",
+    ):
+        SidebarReconciliationEvidence.create(
+            state=SidebarReconciliationState.ABSENCE_PROVEN,
+            generation="scan:1",
+            completed_at=100.0,
+            expires_at=130.0,
+            inventory_digest="2" * 64,
+            marker_digest="1" * 64,
+            match_count=1,
+            recovered_thread_id=THREAD,
+            fixed_reason=None,
+        )
 
 
 def _leased_job(*, expires_at: float = 400.0) -> dict[str, Any]:
