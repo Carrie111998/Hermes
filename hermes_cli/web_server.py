@@ -832,7 +832,12 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     },
     "memory.provider": {
         "type": "select",
-        "description": "Memory provider plugin",
+        "description": "Memory provider plugin (legacy single-select; prefer the ordered list)",
+        "options": _memory_provider_options(),
+    },
+    "memory.providers": {
+        "type": "list",
+        "description": "Active memory providers, in priority order (list order == injection order)",
         "options": _memory_provider_options(),
     },
     "model": {
@@ -1222,18 +1227,30 @@ def _memory_provider_schema_options(cfg: Dict[str, Any]) -> List[str]:
     """Discovered memory providers for a per-request schema merge.
 
     Reuses the cheap directory scan of :func:`_memory_provider_options` and
-    additionally preserves the currently-configured provider, so a value
+    additionally preserves every currently-configured provider, so a value
     selected in config but not (yet) discoverable — e.g. a plugin removed from
     disk — never silently vanishes from the dropdown.
+
+    Reads through the canonical FR-1 resolver (``get_active_memory_providers``)
+    so the full ordered ``memory.providers`` set is preserved, not just the
+    legacy singular ``memory.provider`` value. Preserved entries are appended
+    in configured order after the discovered options.
     """
     options = _memory_provider_options()
 
-    memory = cfg.get("memory")
-    configured = memory.get("provider") if isinstance(memory, dict) else None
-    current = _normalize_memory_provider_name(configured)
+    try:
+        from hermes_cli.config import get_active_memory_providers
 
-    if current and current not in options:
-        options = [*options, current]
+        configured = get_active_memory_providers(cfg)
+    except Exception:  # pragma: no cover - resolver must not break schema
+        memory = cfg.get("memory")
+        legacy = memory.get("provider") if isinstance(memory, dict) else None
+        configured = [legacy] if legacy else []
+
+    for raw in configured:
+        current = _normalize_memory_provider_name(raw)
+        if current and current not in options:
+            options = [*options, current]
 
     return options
 
@@ -1275,6 +1292,7 @@ def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
             merge(f"{kind}.provider", _custom_provider_options(kind, list(existing), cfg))
 
     merge("memory.provider", _memory_provider_schema_options(cfg))
+    merge("memory.providers", _memory_provider_schema_options(cfg))
 
     if not overlay:
         return CONFIG_SCHEMA
@@ -12475,9 +12493,17 @@ async def remove_credential_pool_entry(provider: str, index: int):
 async def get_memory_status():
     cfg = load_config()
     active = ""
+    providers: List[str] = []
     mem = cfg.get("memory")
     if isinstance(mem, dict):
-        active = _normalize_memory_provider_name(mem.get("provider"))
+        try:
+            from hermes_cli.config import get_active_memory_providers
+
+            providers = get_active_memory_providers(cfg)
+        except Exception:  # pragma: no cover - resolver must not break status
+            legacy = _normalize_memory_provider_name(mem.get("provider"))
+            providers = [legacy] if legacy else []
+        active = providers[0] if providers else ""
 
     # Built-in memory file sizes (so the UI can show what a reset would erase).
     mem_dir = get_hermes_home() / "memories"
@@ -12488,6 +12514,7 @@ async def get_memory_status():
 
     return {
         "active": active,
+        "active_providers": providers,
         "providers": _discover_memory_provider_statuses(),
         "builtin_files": files,
     }
@@ -12495,16 +12522,34 @@ async def get_memory_status():
 
 @app.put("/api/memory/provider")
 async def set_memory_provider(body: MemoryProviderSelect):
-    provider = _normalize_memory_provider_name(body.provider)
+    # FR-7: accept the ordered ``providers`` list (canonical) and fall back to
+    # the legacy singular ``provider`` only when the list is absent, so an
+    # older dashboard still works. The full ordered set is persisted via the
+    # canonical setter — this is the save path that previously clobbered
+    # ``memory.providers`` back to a single value.
+    if body.providers is not None:
+        raw_names = body.providers
+    elif body.provider is not None:
+        raw_names = [body.provider]
+    else:
+        raw_names = []
 
-    _require_memory_provider_ready(provider)
+    # Normalize + order-preserving de-dup; drop blanks / "built-in" sentinels.
+    providers: List[str] = []
+    for raw in raw_names:
+        name = _normalize_memory_provider_name(raw)
+        if name and name not in providers:
+            providers.append(name)
+
+    for name in providers:
+        _require_memory_provider_ready(name)
 
     cfg = load_config()
     if not isinstance(cfg.get("memory"), dict):
         cfg["memory"] = {}
-    set_active_memory_providers(cfg, [provider] if provider else [])
+    set_active_memory_providers(cfg, providers)
     save_config(cfg)
-    return {"ok": True, "active": provider}
+    return {"ok": True, "active": providers[0] if providers else "", "providers": providers}
 
 
 @app.post("/api/memory/reset")

@@ -89,8 +89,10 @@ class TestMemoryPluginCliDiscovery:
         sys.modules.pop(mod_key, None)
 
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
-        # Set testplugin as the active provider
-        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "testplugin")
+        # Set testplugin as the active provider. discover_plugin_cli_commands
+        # now reads the plural seam (multi-provider, #5688); patch it so the
+        # legacy first-of-N shim isn't the thing under test here.
+        monkeypatch.setattr(pm, "_get_active_memory_providers", lambda: ["testplugin"])
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:
@@ -116,7 +118,7 @@ class TestMemoryPluginCliDiscovery:
         import plugins.memory as pm
         original_dir = pm._MEMORY_PLUGINS_DIR
         monkeypatch.setattr(pm, "_MEMORY_PLUGINS_DIR", tmp_path)
-        monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: None)
+        monkeypatch.setattr(pm, "_get_active_memory_providers", lambda: [])
         try:
             cmds = pm.discover_plugin_cli_commands()
         finally:

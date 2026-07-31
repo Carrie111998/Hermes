@@ -18,6 +18,8 @@ hermes memory off        # disable external providers
 
 You can also select the active memory providers via `hermes plugins` → Provider Plugins → Memory Provider (a multi-select checklist; the order you have them is the injection/priority order).
 
+In the desktop app, go to **Settings → Memory & Context → Memory providers**: an ordered list of numbered rows, one provider per row. Row 1 is highest priority; add rows with **+ Add provider** and remove with the **✕** button. The row order is the injection/priority order, and saving preserves the full list.
+
 Or set manually in `~/.hermes/config.yaml` — use the ordered `providers` list:
 
 ```yaml

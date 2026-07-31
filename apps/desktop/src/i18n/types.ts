@@ -446,6 +446,10 @@ export interface Translations {
       none: string
       noneParen: string
       builtinOnly: string
+      memoryProvidersEmpty: string
+      memoryProvidersPlaceholder: string
+      memoryProvidersAdd: string
+      memoryProviderNotInstalled: string
       notSet: string
       commaSeparated: string
       searchPlaceholder: string
