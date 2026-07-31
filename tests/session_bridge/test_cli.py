@@ -62,6 +62,7 @@ from session_bridge.models import (
     Relation,
     SessionLink,
     SessionProjection,
+    SidebarHydrationState,
     SidebarJobState,
     canonical_session_id,
     encode_bridge_marker,
@@ -1367,6 +1368,12 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
         **dry_run,
         "mode": "apply",
         "seeded": 1,
+        "candidates": [
+            {
+                **dry_run["candidates"][0],
+                "hydration_state": SidebarHydrationState.PENDING.value,
+            }
+        ],
     }
     assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 1
     readable_job = store.get_sidebar_job_for_source(

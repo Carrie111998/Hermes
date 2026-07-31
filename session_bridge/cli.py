@@ -1317,6 +1317,15 @@ class ProductionBackend:
                 code = "hydration_target_unreadable"
             blocked_codes[code] = blocked_codes.get(code, 0) + 1
 
+        candidate_payloads = [
+            {
+                "source_session_id": str(row["source_session_id"]),
+                "codex_thread_id": str(row["codex_thread_id"]),
+                "visible_at": float(row["visible_at"]),
+                "hydration_state": "not_seeded",
+            }
+            for row in eligible
+        ]
         result = {
             "mode": "apply" if apply else "dry_run",
             "scope": "all_history" if days is None else "days",
@@ -1328,28 +1337,42 @@ class ProductionBackend:
             "seeded": 0,
             "blocked": sum(blocked_codes.values()),
             "blocked_codes": dict(sorted(blocked_codes.items())),
-            "candidates": [
-                {
-                    "source_session_id": str(row["source_session_id"]),
-                    "codex_thread_id": str(row["codex_thread_id"]),
-                    "visible_at": float(row["visible_at"]),
-                    "hydration_state": "not_seeded",
-                }
-                for row in eligible
-            ],
+            "candidates": candidate_payloads,
         }
         if not apply or blocked_codes:
             return result
 
         seeded = 0
-        for row in eligible:
-            self.sidebar_hydration_seed(
+        seeded_candidates: list[dict[str, Any]] = []
+        for row, candidate in zip(eligible, candidate_payloads, strict=True):
+            seeded_result = self.sidebar_hydration_seed(
                 source_session_id=str(row["source_session_id"]),
                 codex_thread_id=str(row["codex_thread_id"]),
                 confirmation="HYDRATE_EXACT_EXISTING_TASK",
             )
+            if (
+                seeded_result.get("source_session_id")
+                != candidate["source_session_id"]
+                or seeded_result.get("codex_thread_id")
+                != candidate["codex_thread_id"]
+            ):
+                raise ConfigurationFailure(
+                    "sidebar_hydration_backfill_seed_identity_mismatch"
+                )
+            hydration_state = seeded_result.get("state")
+            if not isinstance(hydration_state, str) or not hydration_state:
+                raise ConfigurationFailure(
+                    "sidebar_hydration_backfill_seed_state_invalid"
+                )
+            seeded_candidates.append(
+                {**candidate, "hydration_state": hydration_state}
+            )
             seeded += 1
-        return {**result, "seeded": seeded}
+        return {
+            **result,
+            "seeded": seeded,
+            "candidates": seeded_candidates,
+        }
 
     def sidebar_hydration_status(self) -> Mapping[str, Any]:
         return _public_sidebar_hydration_status(

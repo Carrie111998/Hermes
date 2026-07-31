@@ -3378,25 +3378,56 @@ def test_sidebar_backlog_recovery_preserves_exact_tasks_and_drains_both_ledgers(
 
         dry_run = backend.sidebar_hydration_seed_backfill(
             days=30,
+            limit=10,
             apply=False,
             confirmation=None,
         )
+        hydration_inventory = harness.store.list_sidebar_hydration_candidates(
+            now=harness.now,
+            backfill_days=30,
+            limit=10,
+        )
+        expected_candidates = [
+            {
+                "source_session_id": str(row["source_session_id"]),
+                "codex_thread_id": str(row["codex_thread_id"]),
+                "visible_at": float(row["visible_at"]),
+                "hydration_state": "not_seeded",
+            }
+            for row in hydration_inventory
+            if row["source_session_id"] in legacy_sources
+        ]
         assert dry_run == {
             "mode": "dry_run",
+            "scope": "days",
             "days": 30,
+            "limit": 10,
             "examined": 3,
             "eligible": 2,
             "already_readable": 1,
             "seeded": 0,
             "blocked": 0,
             "blocked_codes": {},
+            "candidates": expected_candidates,
         }
         applied = backend.sidebar_hydration_seed_backfill(
             days=30,
+            limit=10,
             apply=True,
             confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
         )
-        assert applied == {**dry_run, "mode": "apply", "seeded": 2}
+        assert applied == {
+            **dry_run,
+            "mode": "apply",
+            "seeded": 2,
+            "candidates": [
+                {
+                    **candidate,
+                    "hydration_state": SidebarHydrationState.PENDING.value,
+                }
+                for candidate in expected_candidates
+            ],
+        }
 
         hydration_executor = SidebarHydrationExecutor(
             claim_once=lambda: asyncio.run(
