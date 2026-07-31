@@ -7609,9 +7609,20 @@ def _recover_from_interrupted_install() -> None:
     if not core_marker and not lazy_marker:
         return
 
-    # Skip in managed/Docker installs and on PyPI installs with no git checkout:
-    # those don't run the source-tree update path, so a stray marker is not ours
-    # to act on. Just clear it.
+    # Skip in Docker installs: the venv is baked into an immutable image,
+    # lazy-backend refresh is disabled, and the marker (if present) can't
+    # be deleted by the runtime hermes user. A stray marker is not ours
+    # to act on — just try to clear it and return.
+    # Also skip on PyPI installs with no git checkout (same rationale).
+    try:
+        from hermes_cli.config import detect_install_method
+
+        if detect_install_method(PROJECT_ROOT) in ("docker",):
+            _clear_update_incomplete_marker()
+            _clear_lazy_refresh_incomplete_marker()
+            return
+    except Exception:
+        pass
     if not (PROJECT_ROOT / "pyproject.toml").is_file():
         _clear_update_incomplete_marker()
         _clear_lazy_refresh_incomplete_marker()
@@ -7745,7 +7756,7 @@ def _recover_core_update_marker_locked() -> None:
 
         uv_bin = ensure_uv()
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+            uv_env = {**os.environ, "VIRTUAL_ENV": str(_detect_venv_path())}
             if _is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
@@ -7819,6 +7830,20 @@ def _windows_running_hermes_launcher_locked() -> bool:
     return False
 
 
+def _detect_venv_path() -> Path:
+    """Detect the actual project venv directory, preferring .venv over venv.
+
+    ``uv sync`` creates ``.venv/`` by default, while older install scripts
+    and managed-uv helpers historically used ``venv/``.  Probe both so the
+    update-recovery import probes work regardless of which layout is in use.
+    """
+    for candidate in (".venv", "venv"):
+        p = PROJECT_ROOT / candidate
+        if p.is_dir():
+            return p
+    return PROJECT_ROOT / ".venv"
+
+
 def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     """Return ``(install_cmd_prefix, env)`` for the project venv when possible."""
     try:
@@ -7828,7 +7853,7 @@ def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     except Exception:
         uv_bin = None
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        env = {**os.environ, "VIRTUAL_ENV": str(_detect_venv_path())}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
@@ -7881,11 +7906,13 @@ def _is_windows() -> bool:
 
 def _venv_scripts_dir() -> Path | None:
     """Return the venv Scripts directory if we're running inside the project venv."""
-    venv_dir = PROJECT_ROOT / "venv"
-    if not venv_dir.is_dir():
-        return None
-    scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
-    return scripts if scripts.is_dir() else None
+    for venv_candidate in (".venv", "venv"):
+        venv_dir = PROJECT_ROOT / venv_candidate
+        if venv_dir.is_dir():
+            scripts = venv_dir / ("Scripts" if _is_windows() else "bin")
+            if scripts.is_dir():
+                return scripts
+    return None
 
 
 def _hermes_exe_shims(scripts_dir: Path) -> list[Path]:
