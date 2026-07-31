@@ -365,6 +365,120 @@ def test_resolve_runtime_provider_openrouter_ignores_codex_config_base_url(monke
     assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
 
 
+def _write_openrouter_pool(hermes_home):
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "credential_pool": {
+                    "openrouter": [
+                        {
+                            "id": "daily-key",
+                            "label": "daily-key",
+                            "auth_type": "api_key",
+                            "priority": 0,
+                            "source": "manual",
+                            "access_token": "pool-key",
+                            "base_url": rp.OPENROUTER_BASE_URL,
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("requested", "config_text", "openai_base_url"),
+    [
+        pytest.param(
+            "openrouter",
+            "model:\n"
+            "  provider: custom\n"
+            "  base_url: https://litellm.example/v1\n"
+            "  api_key: custom-key\n",
+            None,
+            id="model-config",
+        ),
+        pytest.param(
+            "openrouter",
+            "{}\n",
+            "https://custom.example/v1",
+            id="environment",
+        ),
+        pytest.param(
+            "or",
+            "model:\n"
+            "  provider: custom\n"
+            "  base_url: https://litellm.example/v1\n"
+            "  api_key: custom-key\n",
+            None,
+            id="provider-alias",
+        ),
+    ],
+)
+def test_explicit_openrouter_uses_pool_despite_unrelated_custom_endpoint(
+    tmp_path,
+    monkeypatch,
+    requested,
+    config_text,
+    openai_base_url,
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if openai_base_url is None:
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("OPENAI_BASE_URL", openai_base_url)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_key"] == "pool-key"
+    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
+    assert resolved["credential_pool"].provider == "openrouter"
+
+
+@pytest.mark.parametrize("requested", ["openrouter", "or"])
+def test_openrouter_base_url_override_skips_populated_pool(tmp_path, monkeypatch, requested):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+    monkeypatch.setenv("OPENROUTER_BASE_URL", "https://openrouter-proxy.example/v1")
+
+    resolved = rp.resolve_runtime_provider(requested=requested)
+
+    assert resolved["api_key"] == "fallback-key"
+    assert resolved["base_url"] == "https://openrouter-proxy.example/v1"
+    assert resolved.get("credential_pool") is None
+
+
+def test_explicit_openrouter_alias_honors_disabled_provider(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "providers:\n"
+        "  openrouter:\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+
+    with pytest.raises(ValueError, match=r"providers\.openrouter\.enabled: false"):
+        rp.resolve_runtime_provider(requested="or")
+
+
 def test_resolve_runtime_provider_auto_uses_custom_config_base_url(monkeypatch):
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
     monkeypatch.setattr(

@@ -1150,17 +1150,16 @@ def _resolve_openrouter_runtime(
             break
     requested_norm = (requested_provider or "").strip().lower()
     cfg_provider = cfg_provider.strip().lower()
-    # GitHub #27132: provider aliases that resolve to "custom" (ollama,
-    # vllm, llamacpp, …) follow the same base_url trust + routing rules
-    # as a bare `provider: custom`. Normalising here keeps every check
-    # below — `requested_norm == "custom"`, the trust check, the pool
-    # gate up the stack — alias-aware without duplicating the alias map.
+    # GitHub #27132: provider aliases follow the same base_url trust + routing
+    # rules as their canonical custom/OpenRouter provider. Normalising here
+    # keeps every check below alias-aware without duplicating the alias map.
     if requested_norm and requested_norm != "custom":
         try:
             from hermes_cli.auth import resolve_provider as _resolve_provider
 
-            if _resolve_provider(requested_norm) == "custom":
-                requested_norm = "custom"
+            resolved_requested = _resolve_provider(requested_norm)
+            if resolved_requested in {"custom", "openrouter"}:
+                requested_norm = resolved_requested
         except Exception:
             pass
 
@@ -1639,11 +1638,22 @@ def resolve_runtime_provider(
     _full_cfg = load_config()
     _provs_cfg = _full_cfg.get("providers") if isinstance(_full_cfg, dict) else None
     if isinstance(_provs_cfg, dict):
-        _block = _provs_cfg.get(requested_provider)
+        _provider_config_key = requested_provider
+        _block = _provs_cfg.get(_provider_config_key)
+        if (
+            not isinstance(_block, dict)
+            and requested_provider != "auto"
+            and _get_named_custom_provider(requested_provider) is None
+        ):
+            try:
+                _provider_config_key = auth_mod.resolve_provider(requested_provider)
+            except AuthError:
+                _provider_config_key = requested_provider
+            _block = _provs_cfg.get(_provider_config_key)
         if isinstance(_block, dict) and not is_provider_enabled(_block):
             raise ValueError(
                 f"provider {requested_provider!r} is disabled in config "
-                f"(providers.{requested_provider}.enabled: false)"
+                f"(providers.{_provider_config_key}.enabled: false)"
             )
 
     if requested_provider == "moa":
@@ -1789,20 +1799,28 @@ def resolve_runtime_provider(
 
     should_use_pool = provider != "openrouter"
     if provider == "openrouter":
+        explicit_openrouter_request = (
+            requested_provider != "auto"
+            and auth_mod.resolve_provider(requested_provider) == "openrouter"
+        )
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
         env_openai_base_url = _getenv("OPENAI_BASE_URL", "").strip()
         env_openrouter_base_url = _getenv("OPENROUTER_BASE_URL", "").strip()
         has_custom_endpoint = bool(
             explicit_base_url
-            or env_openai_base_url
             or env_openrouter_base_url
+            or (not explicit_openrouter_request and env_openai_base_url)
         )
-        if cfg_base_url and cfg_provider in {"auto", "custom"}:
+        if (
+            not explicit_openrouter_request
+            and cfg_base_url
+            and cfg_provider in {"auto", "custom"}
+        ):
             has_custom_endpoint = True
         has_runtime_override = bool(explicit_api_key or explicit_base_url)
         should_use_pool = (
-            requested_provider in {"openrouter", "auto"}
+            (explicit_openrouter_request or requested_provider == "auto")
             and not has_custom_endpoint
             and not has_runtime_override
         )
