@@ -4,6 +4,7 @@
 **Owner:** Codex Desktop task-creation boundary
 **Consumer:** Hermes Session Bridge sidebar broker
 **Status:** Upstream API request; not implemented by the installed Desktop build
+**Upstream tracker:** [openai/codex#36250](https://github.com/openai/codex/issues/36250)
 
 ## Summary
 
