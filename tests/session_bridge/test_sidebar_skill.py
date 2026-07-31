@@ -325,7 +325,15 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
     assert "Status counts never authorize skipping either persisted-heartbeat call." in queue
     assert "If both registration counts are zero, end immediately" not in skill
     assert "broker_project_id" in queue
-    assert "equals configured `broker_project_id`" in queue
+    assert (
+        "canonical path equals `C:\\Users\\diego\\Developer\\session-sidebar-broker`, "
+        "whose returned ID equals configured `broker_project_id`"
+    ) in queue
+    assert (
+        "canonical path equals `C:\\Users\\diego\\.hermes`; retain its returned ID "
+        "separately as `inbox_project_id`"
+    ) in queue
+    assert "`.hermes` project ID equals configured `broker_project_id`" not in queue
     assert "ID differs, preflight stops before lease" in queue
 
 
@@ -548,6 +556,8 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert all('"environment":{"type":"local"}' in line for line in create_examples)
     assert all('"environment":"local"' not in line for line in create_examples)
     assert "illustrates the validated returned production ID" in skill
+    assert "substitute only the exact preflight-validated returned `inbox_project_id`" in skill
+    assert "substitute only the exact preflight-validated returned `broker_project_id`" not in skill
     assert "Only the returned `threadId` is a successful create result" in skill
     assert (
         "`session_sidebar_bind(lease_token=<exact token>, "
