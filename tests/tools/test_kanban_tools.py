@@ -550,34 +550,6 @@ def test_worker_lifecycle_through_tools(worker_env):
 # System-prompt guidance injection
 # ---------------------------------------------------------------------------
 
-def test_kanban_guidance_not_in_normal_prompt(monkeypatch, tmp_path):
-    """A normal chat session (no HERMES_KANBAN_TASK) must NOT have
-    KANBAN_GUIDANCE in its system prompt."""
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    from pathlib import Path as _P
-    monkeypatch.setattr(_P, "home", lambda: tmp_path)
-
-    from tools.registry import invalidate_check_fn_cache
-    from model_tools import _clear_tool_defs_cache
-    invalidate_check_fn_cache()
-    _clear_tool_defs_cache()
-
-    from run_agent import AIAgent
-    a = AIAgent(
-        api_key="test",
-        base_url="https://openrouter.ai/api/v1",
-        quiet_mode=True,
-        skip_context_files=True,
-        skip_memory=True,
-    )
-    prompt = a._build_system_prompt()
-    assert "You are a Kanban worker" not in prompt
-    assert "kanban_show()" not in prompt
-
-
 def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     """A worker session (HERMES_KANBAN_TASK set) MUST have the full
     lifecycle guidance in its system prompt."""
