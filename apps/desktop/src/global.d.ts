@@ -379,6 +379,10 @@ export interface DesktopUpdateStatus {
   message?: string
   error?: string
   behind?: number
+  /** True when source code changed (merge, local edit) but the running .app
+   *  hasn't been rebuilt yet. The update flow should offer a rebuild even
+   *  though there are no new git commits to pull. */
+  rebuildNeeded?: boolean
   currentSha?: string
   /** Backend only: the version string the backend reports for itself. */
   currentVersion?: string

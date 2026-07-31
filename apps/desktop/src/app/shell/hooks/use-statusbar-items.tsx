@@ -220,6 +220,9 @@ export function useStatusbarItems({
 
   const clientVersionItem = useMemo<StatusbarItem>(() => {
     const applying = updateApply.applying || updateApply.stage === 'restart'
+    // A stale bundle needs a rebuild even when the checkout is up to date, so
+    // the hint rides alongside the shared version status rather than inside it.
+    const rebuildNeeded = !applying && updateStatus?.rebuildNeeded === true
 
     const status = resolveVersionStatus({
       applying,
@@ -234,18 +237,23 @@ export function useStatusbarItems({
       version: desktopVersion?.appVersion
     })
 
+    const label = rebuildNeeded ? `${status.label} (+rebuild)` : status.label
+    const tooltip = rebuildNeeded
+      ? [status.tooltip, copy.rebuildNeeded].filter(Boolean).join(' · ')
+      : status.tooltip
+
     return {
-      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
+      className: status.hasUpdate || rebuildNeeded ? 'text-primary hover:text-primary' : undefined,
       detail: status.detail,
       hidden: status.unknown,
       icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
       id: 'version-client',
-      label: status.label,
+      label,
       // Update state is not a preference: hiding it is how a user misses that
       // their client is behind. Listed in the menu, but locked on.
       lockedVisible: true,
       onSelect: () => openUpdateOverlayFor('client'),
-      title: status.tooltip,
+      title: tooltip,
       toggleLabel: copy.toggleVersion,
       variant: 'action'
     }
@@ -258,7 +266,8 @@ export function useStatusbarItems({
     updateApply.stage,
     updateStatus?.behind,
     updateStatus?.branch,
-    updateStatus?.currentSha
+    updateStatus?.currentSha,
+    updateStatus?.rebuildNeeded
   ])
 
   const backendVersionItem = useMemo<StatusbarItem | null>(() => {
