@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -691,6 +693,33 @@ def test_kwilo_cli_help_exposes_governance_readback_commands(capsys):
             _parse_kanban_cli(argv)
         assert exc.value.code == 0
         assert expected in capsys.readouterr().out
+
+
+def test_top_level_cli_propagates_kanban_command_exit_codes(kwilo_home):
+    env = os.environ.copy()
+    env["HERMES_KANBAN_BOARD"] = "kwilo"
+
+    def run_kanban(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "hermes_cli.main", "kanban", *args],
+            cwd=Path(__file__).parents[2],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+    success = run_kanban("list", "--json")
+    missing_task = run_kanban("admit", "t_missing", "0" * 64)
+    handler_usage_error = run_kanban("daemon")
+
+    assert success.returncode == 0
+    assert json.loads(success.stdout) == []
+    assert missing_task.returncode == 1
+    assert "task t_missing not found" in missing_task.stderr
+    assert handler_usage_error.returncode == 2
+    assert "DEPRECATED" in handler_usage_error.stderr
 
 
 def test_file_backed_kwilo_connection_outranks_mismatched_ambient_board(kwilo_home, monkeypatch):
