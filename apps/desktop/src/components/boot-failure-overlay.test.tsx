@@ -98,4 +98,42 @@ describe('BootFailureOverlay', () => {
       restore()
     }
   })
+
+  it('offers sign-out and sign-in for an OAuth failure on the stored active profile', async () => {
+    const original = window.hermesDesktop
+    const activeProfileOauth = {
+      ...remoteToken,
+      mode: 'remote',
+      profile: 'hermes-nexus',
+      remoteAuthMode: 'oauth',
+      remoteUrl: 'https://hermes-dashboard.example.test'
+    }
+
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        getRecentLogs: async () => ({ lines: [] }),
+        getConnectionConfig: async (profile?: string) => (profile === 'hermes-nexus' ? activeProfileOauth : { mode: 'local' }),
+        profile: { get: async () => ({ profile: 'hermes-nexus' }) },
+        probeConnectionConfig: async () => ({ providers: [] })
+      }
+    })
+    $desktopBoot.set({
+      error: 'Remote Hermes gateway uses OAuth, but you are not signed in.',
+      fakeMode: false,
+      message: 'boot failed',
+      phase: 'renderer.error',
+      progress: 40,
+      running: false,
+      timestamp: Date.now(),
+      visible: true
+    })
+
+    try {
+      render(<BootFailureOverlay />)
+      expect(await screen.findByRole('button', { name: /sign out.*sign in/i })).toBeTruthy()
+    } finally {
+      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: original })
+    }
+  })
 })

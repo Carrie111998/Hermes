@@ -101,7 +101,12 @@ export function BootFailureOverlay() {
       let config: DesktopConnectionConfig
 
       try {
-        config = await desktop.getConnectionConfig()
+        // Boot can fail before the renderer learns its active gateway profile. The
+        // persisted Desktop profile is therefore authoritative here; reading the
+        // global connection would misclassify a per-profile OAuth backend as local
+        // and hide the only viable recovery action.
+        const active = await desktop.profile?.get?.()
+        config = await desktop.getConnectionConfig(active?.profile || undefined)
       } catch {
         return
       }
