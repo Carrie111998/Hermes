@@ -2,6 +2,8 @@
 
 import os
 import re
+import shutil
+import sys
 import pytest
 import subprocess
 from pathlib import Path
@@ -255,9 +257,11 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     env.cwd = cwd
 
     def execute(command, **kwargs):
+        # Explicit bash -c: on Windows, subprocess.run(shell=True) invokes
+        # cmd.exe (or mangles args as "<exe> /c ..."), which cannot run the
+        # POSIX find/sort/tail pipelines these tests drive.
         completed = subprocess.run(
-            command,
-            shell=True,
+            [shutil.which("bash") or "/bin/bash", "-c", command],
             text=True,
             capture_output=True,
             input=kwargs.get("stdin_data"),
@@ -666,6 +670,10 @@ class _DeletedTestGitBaselineCheck:
 class TestAtomicWriteNewFilePermissions:
     """_atomic_write should apply umask-default perms to new files (not 0600)."""
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX umask permission semantics don't apply on Windows",
+    )
     @pytest.mark.parametrize("test_umask", [0o022, 0o002, 0o077])
     def test_new_file_gets_umask_default_permissions(self, tmp_path, test_umask):
         """Newly created file should get umask-computed perms, not mktemp's 0600.
@@ -691,6 +699,10 @@ class TestAtomicWriteNewFilePermissions:
             f"got {actual_mode:04o}"
         )
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="POSIX chmod mode bits don't apply on Windows",
+    )
     def test_overwrite_still_preserves_existing_mode(self, tmp_path):
         """The new-file branch must not disturb the overwrite path's
         mode preservation (e.g. an executable script stays 0755)."""
