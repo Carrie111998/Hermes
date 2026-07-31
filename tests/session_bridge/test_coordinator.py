@@ -3848,24 +3848,47 @@ async def test_hydration_claim_rebuilds_and_verifies_preview_before_send() -> No
 
 
 class _HeartbeatClaimStore:
-    def __init__(self, *, fail_claim: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_claim: bool = False,
+        fail_heartbeat: bool = False,
+        block_heartbeat: bool = False,
+    ) -> None:
         self.fail_claim = fail_claim
+        self.fail_heartbeat = fail_heartbeat
+        self.block_heartbeat = block_heartbeat
         self.heartbeats: list[float] = []
+        self.events: list[str] = []
+        self.registration_claims = 0
+        self.hydration_claims = 0
+        self.heartbeat_started = Event()
+        self.heartbeat_release = Event()
 
     def claim_sidebar_jobs(
         self, *, now: float, limit: int, lease_seconds: int
     ) -> list[dict[str, Any]]:
+        self.events.append("registration_claim")
+        self.registration_claims += 1
         if self.fail_claim:
             raise RuntimeError("claim failed")
         return []
 
     def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
+        self.events.append("heartbeat")
         self.heartbeats.append(now)
+        self.heartbeat_started.set()
+        if self.fail_heartbeat:
+            raise RuntimeError("heartbeat failed")
+        if self.block_heartbeat:
+            assert self.heartbeat_release.wait(timeout=5)
 
     def claim_sidebar_hydration_jobs(
         self, *, now: float, limit: int
     ) -> list[dict[str, Any]]:
         assert limit == 1
+        self.events.append("hydration_claim")
+        self.hydration_claims += 1
         return []
 
 
@@ -3882,7 +3905,7 @@ class _EmptySidebarVerifier:
 
 
 @pytest.mark.asyncio
-async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_claim() -> (
+async def test_sidebar_delivery_records_heartbeat_before_registration_claim() -> (
     None
 ):
     successful = _HeartbeatClaimStore()
@@ -3897,6 +3920,7 @@ async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_cl
 
     assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
     assert successful.heartbeats == [100.0]
+    assert successful.events == ["heartbeat", "registration_claim"]
 
     failing = _HeartbeatClaimStore(fail_claim=True)
     coordinator = SessionBridgeCoordinator(
@@ -3909,7 +3933,8 @@ async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_cl
     )
     with pytest.raises(RuntimeError, match="claim failed"):
         await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
-    assert failing.heartbeats == []
+    assert failing.heartbeats == [100.0]
+    assert failing.events == ["heartbeat", "registration_claim"]
 
 
 @pytest.mark.asyncio
@@ -3931,6 +3956,56 @@ async def test_sidebar_hydration_empty_claim_records_broker_heartbeat() -> None:
 
     assert await coordinator.claim_sidebar_hydration_for_delivery(limit=1) == ()
     assert store.heartbeats == [500.0]
+    assert store.events == ["heartbeat", "hydration_claim"]
+
+
+@pytest.mark.asyncio
+async def test_sidebar_heartbeat_failure_prevents_both_claim_acquisitions() -> None:
+    store = _HeartbeatClaimStore(fail_heartbeat=True)
+    enabled_config = replace(
+        _sidebar_config(),
+        sidebar=replace(_sidebar_config().sidebar, legacy_hydration_enabled=True),
+    )
+    coordinator = SessionBridgeCoordinator(
+        config=enabled_config,
+        store=store,
+        adapters={},
+        target_adapters={},
+        sidebar_verifier=_EmptySidebarVerifier(),
+        clock=lambda: 502.0,
+    )
+
+    with pytest.raises(RuntimeError, match="heartbeat failed"):
+        await coordinator.claim_sidebar_jobs_for_delivery(now=502.0, limit=1)
+    with pytest.raises(RuntimeError, match="heartbeat failed"):
+        await coordinator.claim_sidebar_hydration_for_delivery(limit=1)
+
+    assert store.registration_claims == 0
+    assert store.hydration_claims == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_heartbeat_cannot_acquire_a_hydration_lease() -> None:
+    store = _HeartbeatClaimStore(block_heartbeat=True)
+    coordinator = SessionBridgeCoordinator(
+        config=replace(
+            _sidebar_config(),
+            sidebar=replace(_sidebar_config().sidebar, legacy_hydration_enabled=True),
+        ),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 503.0,
+    )
+
+    task = asyncio.create_task(coordinator.claim_sidebar_hydration_for_delivery())
+    assert await asyncio.to_thread(store.heartbeat_started.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    store.heartbeat_release.set()
+
+    assert store.hydration_claims == 0
 
 
 @pytest.mark.asyncio

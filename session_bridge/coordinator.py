@@ -1251,12 +1251,11 @@ class SessionBridgeCoordinator:
         if type(limit) is not int or limit != 1:
             raise ValueError("sidebar delivery limit must be exactly one")
         claim_time = _finite_number(self._clock() if now is None else now, "now")
+        await self._record_sidebar_broker_heartbeat(claim_time)
         if not self._config.sidebar.enabled:
-            await self._record_sidebar_broker_heartbeat(claim_time)
             return ()
         verifier = self._sidebar_verifier
         if verifier is None:
-            await self._record_sidebar_broker_heartbeat(claim_time)
             return ()
         claim_task = asyncio.create_task(
             asyncio.to_thread(
@@ -1415,7 +1414,6 @@ class SessionBridgeCoordinator:
                         create_reserved=create_reserved,
                     )
                 )
-            await self._record_sidebar_broker_heartbeat(claim_time)
             return tuple(delivery)
         except asyncio.CancelledError as cancelled:
             try:
@@ -1441,8 +1439,8 @@ class SessionBridgeCoordinator:
         if type(limit) is not int or limit != 1:
             raise ValueError("sidebar hydration delivery limit must be exactly one")
         claim_time = _finite_number(self._clock(), "now")
+        await self._record_sidebar_broker_heartbeat(claim_time)
         if not self._config.sidebar.legacy_hydration_enabled:
-            await self._record_sidebar_broker_heartbeat(claim_time)
             return ()
         raw_claims = await asyncio.to_thread(
             _call,
@@ -1597,7 +1595,6 @@ class SessionBridgeCoordinator:
                     send_reserved=send_reserved,
                 )
             )
-        await self._record_sidebar_broker_heartbeat(claim_time)
         return tuple(delivery)
 
     async def _record_sidebar_broker_heartbeat(self, now: float) -> None:

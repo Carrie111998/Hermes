@@ -4311,6 +4311,7 @@ def _public_sidebar_status(
             state_counts[SidebarJobState.FAILED.value],
         )
     )
+    state_counts["needs_attention"] = blocking_failed_count
     terminally_resolved_failed_count = _status_count(
         raw.get("terminally_resolved_failed_count", 0)
     )

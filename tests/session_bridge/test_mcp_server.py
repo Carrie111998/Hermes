@@ -2349,6 +2349,14 @@ def test_sidebar_status_preserves_all_fixed_terminal_resolution_codes() -> None:
     assert status["execution_blockers"] == []
 
 
+def test_sidebar_status_canonicalizes_needs_attention_from_failed_count() -> None:
+    status = _sidebar_status({
+        "counts": {"sidebar_failed": 3, "needs_attention": 1},
+    })
+
+    assert status["counts"]["needs_attention"] == 3
+
+
 @pytest.mark.parametrize(
     ("by_resolution_code", "effective"),
     (

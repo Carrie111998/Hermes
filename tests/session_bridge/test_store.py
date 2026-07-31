@@ -7455,6 +7455,30 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
     assert status["active_lease"] is False
 
 
+def test_sidebar_hydration_status_counts_expired_null_error_lease_as_retry(db) -> None:
+    store, candidate = _visible_sidebar_for_hydration(
+        db,
+        native_id="hydration-expired-null-retry",
+    )
+    _seed_hydration(store, candidate)
+    lease = store.claim_sidebar_hydration_jobs(now=125.0, limit=1)[0]
+
+    with pytest.raises(ValueError, match="hydration lease has expired"):
+        store.reserve_sidebar_hydration_send(
+            lease_token=lease["lease_token"],
+            now=1_000.0,
+        )
+
+    assert store.sidebar_hydration_status(now=1_000.0)["health_counts"] == {
+        "pending": 0,
+        "leased": 0,
+        "retry": 1,
+        "committed": 0,
+        "ambiguous": 0,
+        "failed": 0,
+    }
+
+
 def test_sidebar_hydration_operator_recovers_exact_proven_absent_send(db) -> None:
     _visible_store, candidate = _visible_sidebar_for_hydration(
         db,

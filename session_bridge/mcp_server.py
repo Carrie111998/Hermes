@@ -1483,6 +1483,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     blocking_failed_count = _nonnegative_status_int(
         source.get("blocking_failed_count"), failed_count
     )
+    state_counts["needs_attention"] = blocking_failed_count
     terminally_resolved_failed_count = _nonnegative_status_int(
         source.get("terminally_resolved_failed_count"), 0
     )

@@ -3343,7 +3343,7 @@ def test_sidebar_status_exposes_fixed_health_counts_without_private_payloads(
         "sidebar_failed": 5,
         "sidebar_excluded": 0,
         "ambiguous": 2,
-        "needs_attention": 1,
+        "needs_attention": 5,
         "projectless_legacy_count": 3,
     }
     rendered = json.dumps(status)

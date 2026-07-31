@@ -9205,7 +9205,8 @@ class SessionBridgeStore:
                        SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS pending,
                        SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS leased,
                        SUM(CASE
-                               WHEN state = ? AND error_code != ?
+                               WHEN state = ?
+                                AND (error_code IS NULL OR error_code != ?)
                                THEN 1 ELSE 0
                            END) AS retry,
                        SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS committed,
