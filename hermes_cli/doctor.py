@@ -2618,7 +2618,7 @@ def run_doctor(args):
         pass
 
     _normalized_memory_provider = str(_active_memory_provider or "").strip().lower()
-    if not _active_memory_provider or _normalized_memory_provider in {"default", "builtin", "built-in", "none"}:
+    if not _normalized_memory_provider or _normalized_memory_provider in {"default", "builtin", "built-in", "none"}:
         check_ok("Built-in memory active", "(no external provider configured — this is fine)")
     elif _active_memory_provider == "honcho":
         try:

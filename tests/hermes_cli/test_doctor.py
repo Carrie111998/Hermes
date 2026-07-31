@@ -272,7 +272,7 @@ class TestDoctorMemoryProviderSection:
         assert "Mem0" not in out
 
     def test_builtin_provider_aliases_show_builtin_ok(self, monkeypatch, tmp_path):
-        for provider in ("default", "builtin", "built-in", "none", " BuiltIn "):
+        for provider in ("default", "builtin", "built-in", "none", " BuiltIn ", "   "):
             out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider=provider)
 
             assert "Built-in memory active" in out
