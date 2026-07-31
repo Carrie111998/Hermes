@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 
+import { $terminalTakeover } from '../store'
+
 import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('./terminals', () => ({
@@ -166,6 +168,7 @@ describe('PersistentTerminal rect tracking', () => {
 
   afterEach(() => {
     cleanup()
+    $terminalTakeover.set(false)
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
     setVisibility(false)
@@ -314,23 +317,37 @@ describe('PersistentTerminal rect tracking', () => {
     expect(raf.pending()).toBe(1)
   })
 
-  it('hides the overlay when the terminal pane is an inactive kept-alive tab', () => {
+  it('hides the inactive overlay without remounting its terminal workspace', () => {
     installRaf()
     vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
+    $terminalTakeover.set(true)
 
     render(<Harness />)
 
     const overlay = container!.lastElementChild as HTMLElement
+    const workspace = container!.querySelector('[data-testid="terminal-workspace"]')
+
     expect(overlay.style.visibility).toBe('visible')
+    expect(overlay.style.opacity).toBe('1')
+    expect(overlay.style.pointerEvents).toBe('auto')
+    expect(workspace).not.toBeNull()
 
     act(() => {
       root!.render(<Harness paneVisible={false} />)
     })
 
-    // Inactive tree tabs deliberately retain the same non-zero layout rect.
-    // Pane visibility, rather than geometry, must remove the fixed overlay.
     expect(overlay.style.visibility).toBe('hidden')
+    expect(overlay.style.opacity).toBe('0')
     expect(overlay.style.pointerEvents).toBe('none')
-    expect(overlay.getAttribute('aria-hidden')).toBe('true')
+    expect(container!.querySelector('[data-testid="terminal-workspace"]')).toBe(workspace)
+
+    act(() => {
+      root!.render(<Harness />)
+    })
+
+    expect(overlay.style.visibility).toBe('visible')
+    expect(overlay.style.opacity).toBe('1')
+    expect(overlay.style.pointerEvents).toBe('auto')
+    expect(container!.querySelector('[data-testid="terminal-workspace"]')).toBe(workspace)
   })
 })
