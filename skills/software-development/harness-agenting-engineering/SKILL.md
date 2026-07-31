@@ -2,7 +2,7 @@
 name: harness-agenting-engineering
 description: Spec-first AI engineering with evidence gates.
 version: 0.1.0
-author: Hermes Agent
+author: Kevin Lin (@wumujushi) + Hermes Agent
 license: MIT
 platforms:
   - linux
@@ -296,13 +296,18 @@ If the active profile's `bin` directory is on `PATH`, use `hermes-harness ...` d
 
 ## Hermes plugin entrypoints
 
-This profile also has a user-local plugin for Level 3 soft integration:
+This skill can be paired with the `harness_engineering` standalone plugin for
+Level 3 soft integration. Install or enable it in the active profile before
+expecting `/intake`, `hermes harness ...`, or gateway preflight hooks to load:
 
-```text
-~/.hermes/plugins/harness_engineering/
+```bash
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins"
+cp -R plugins/harness_engineering "${HERMES_HOME:-$HOME/.hermes}/plugins/harness_engineering"
+hermes plugins enable harness_engineering
 ```
 
-It is enabled in the active `default` profile and registers:
+Bundled `standalone` plugins are opt-in via `plugins.enabled`; this plugin does
+not auto-load until enabled. Once enabled, it registers:
 
 ```bash
 # Hermes-native CLI wrapper around the same helper

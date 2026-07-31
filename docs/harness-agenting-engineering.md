@@ -91,9 +91,12 @@ Retention is what makes the next session better instead of forcing the same expl
 
 This section is the operator-facing usage guide for the current Hermes Harness / Agenting Engineering setup.
 
-### 1. Normal WebUI / chat usage
+### 1. Normal chat usage
 
-For non-trivial engineering work, just ask normally in WebUI, CLI, or connected gateway platforms:
+For non-trivial engineering work, just ask normally in Hermes. Current in-repo
+soft preflight integration is gateway-scoped; CLI and WebUI users can invoke the
+explicit `hermes harness classify`, `hermes harness new`, and `/intake` surfaces
+until those entrypoints grow their own model-facing bridge.
 
 ```text
 请修复这个 bug
@@ -101,7 +104,11 @@ For non-trivial engineering work, just ask normally in WebUI, CLI, or connected 
 请重构这段逻辑并保证不破坏现有行为
 ```
 
-When `HERMES_HARNESS_PREFLIGHT` is unset or set to `advisory`, Hermes will keep the visible user message unchanged, but will prepend a model-facing Harness reminder for engineering-like tasks. The reminder asks the assistant to define scope, acceptance criteria, risk surface, rollback, context routing, and verification evidence before implementation.
+When `harness_engineering.preflight_mode` is unset or set to `advisory`, gateway
+messages keep the visible/persisted user message unchanged, but the hook returns
+a model-facing Harness reminder for engineering-like tasks. The reminder asks
+the assistant to define scope, acceptance criteria, risk surface, rollback,
+context routing, and verification evidence before implementation.
 
 Plain questions should not trigger the harness:
 
@@ -129,12 +136,24 @@ hermes harness prompt /tmp/harness-intake.md --output /tmp/harness-prompt.txt --
 If `hermes harness ...` is unavailable in a particular shell, use the profile-local helper directly:
 
 ```bash
-~/.hermes/bin/hermes-harness new --title "My task" --workspace /path/to/repo --mode "Implement changes"
-~/.hermes/bin/hermes-harness check /path/to/intake.md
-~/.hermes/bin/hermes-harness prompt /path/to/intake.md
+${HERMES_HOME:-$HOME/.hermes}/bin/hermes-harness new --title "My task" --workspace /path/to/repo --mode "Implement changes"
+${HERMES_HOME:-$HOME/.hermes}/bin/hermes-harness check /path/to/intake.md
+${HERMES_HOME:-$HOME/.hermes}/bin/hermes-harness prompt /path/to/intake.md
 ```
 
 Blank generated forms are expected to fail `check` until the required fields are filled.
+
+For plugin-backed `/intake`, `hermes harness ...`, and gateway preflight hooks,
+enable the standalone plugin in the active profile:
+
+```bash
+mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins"
+cp -R plugins/harness_engineering "${HERMES_HOME:-$HOME/.hermes}/plugins/harness_engineering"
+hermes plugins enable harness_engineering
+```
+
+`kind: standalone` plugins are opt-in via `plugins.enabled`; the harness plugin
+does not auto-load until enabled.
 
 ### 3. In-session helper
 
@@ -148,27 +167,24 @@ It prints the Harness / Agenting Engineering intake instructions. It is advisory
 
 ### 4. Preflight modes
 
-The soft preflight is controlled by `HERMES_HARNESS_PREFLIGHT`:
+The gateway soft preflight is controlled by `harness_engineering.preflight_mode`
+in `config.yaml`:
 
 | Mode | Behavior | Use when |
 |---|---|---|
-| unset / `advisory` | Soft rewrite for engineering-like requests | Default daily development |
+| unset / `advisory` | Soft gateway rewrite for engineering-like requests | Default daily development |
 | `strict` | Prepends an intake-required instruction | Risky work: auth, secrets, shell, filesystem, deploys, data deletion, cross-platform behavior |
 | `off` | No rewrite | Debugging false positives or temporarily disabling the harness |
 
 Examples:
 
 ```bash
-export HERMES_HARNESS_PREFLIGHT=advisory
-export HERMES_HARNESS_PREFLIGHT=strict
-export HERMES_HARNESS_PREFLIGHT=off
+hermes config set harness_engineering.preflight_mode advisory
+hermes config set harness_engineering.preflight_mode strict
+hermes config set harness_engineering.preflight_mode off
 ```
 
-Restart the relevant process after changing the variable:
-
-- WebUI/API server: restart the WebUI/API process.
-- Gateway/WeChat/Telegram/etc.: restart the gateway.
-- CLI: start a new `hermes` session.
+Restart the gateway after changing the setting.
 
 ### 5. Verification commands
 
@@ -188,8 +204,7 @@ scripts/run_tests.sh \
 venv/bin/python -m py_compile \
   hermes_cli/plugins.py \
   gateway/run.py \
-  hermes-webui/api/streaming.py \
-  ~/.hermes/plugins/harness_engineering/__init__.py
+  plugins/harness_engineering/__init__.py
 ```
 
 If pytest fails before collection with `unrecognized arguments: --timeout=30 --timeout-method=signal`, install `pytest-timeout` into the active venv or run a focused check with `-o addopts=''`.
@@ -200,9 +215,9 @@ Use these behavioral checks after changes:
 
 - Engineering request such as `请修复这个 bug` triggers `[Harness / Agenting Engineering preflight]`.
 - Plain explanation such as `解释一下什么是 MCP` is allowed unchanged.
-- `HERMES_HARNESS_PREFLIGHT=strict` emits the `intake required` variant.
-- `HERMES_HARNESS_PREFLIGHT=off` disables rewrites.
-- WebUI must not mutate the visible/persisted user message; only the model-facing current turn is rewritten.
+- `harness_engineering.preflight_mode: strict` emits the `intake required` variant.
+- `harness_engineering.preflight_mode: off` disables gateway rewrites.
+- WebUI/CLI coverage claims stay limited to explicit `hermes harness ...` commands until their entrypoints wire an equivalent model-facing bridge.
 - The current Harness plugin should use `allow` / `rewrite`, not `skip`, so it remains a soft guard rather than a hard blocker.
 
 ### 7. Notes and pitfalls

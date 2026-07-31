@@ -12,9 +12,13 @@ Hermes profile home continue to work as a fallback.
 ```bash
 mkdir -p "${HERMES_HOME:-$HOME/.hermes}/plugins"
 cp -R plugins/harness_engineering "${HERMES_HOME:-$HOME/.hermes}/plugins/harness_engineering"
+hermes plugins enable harness_engineering
 ```
 
 Restart Hermes WebUI/gateway/CLI after installation.
+
+Bundled `standalone` plugins are opt-in via `plugins.enabled`; this plugin does
+not auto-load until enabled.
 
 ## Modes
 

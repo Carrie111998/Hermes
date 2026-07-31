@@ -8,4 +8,4 @@ provides_commands:
   - intake
 provides_hooks:
   - pre_gateway_dispatch
-author: Hermes Agent
+author: Kevin Lin (@wumujushi) + Hermes Agent
