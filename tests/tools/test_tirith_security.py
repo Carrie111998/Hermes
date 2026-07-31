@@ -179,6 +179,56 @@ class TestDisabled:
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker respects tirith_fail_open (issue #74922)
+# ---------------------------------------------------------------------------
+
+class TestCircuitBreakerFailOpen:
+    """When the circuit breaker is open, the verdict must still respect
+    tirith_fail_open — every other failure path in check_command_security()
+    honors it, and an operator who sets tirith_fail_open=false expects
+    scanner unavailability to block commands, not silently allow them."""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_circuit_open_fail_open_allows(self, mock_cfg):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._circuit_open = True
+        try:
+            result = check_command_security("rm -rf /")
+        finally:
+            _tirith_mod._circuit_open = False
+        assert result["action"] == "allow"
+        assert "circuit breaker" in result["summary"]
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_circuit_open_fail_closed_blocks(self, mock_cfg):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        _tirith_mod._circuit_open = True
+        try:
+            result = check_command_security("rm -rf /")
+        finally:
+            _tirith_mod._circuit_open = False
+        assert result["action"] == "block"
+        assert "fail-closed" in result["summary"]
+
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_circuit_open_never_spawns(self, mock_cfg, mock_run):
+        # Anti-hang behavior from #41400 must be preserved: when the breaker
+        # is open, no tirith subprocess is spawned regardless of fail_open.
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._circuit_open = True
+        try:
+            result = check_command_security("rm -rf /")
+        finally:
+            _tirith_mod._circuit_open = False
+        assert result["action"] == "allow"
+        mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Findings cap + summary cap
 # ---------------------------------------------------------------------------
 
