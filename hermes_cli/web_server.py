@@ -14296,8 +14296,13 @@ def _ws_client_reason(ws: "WebSocket") -> Optional[str]:
     """
     if getattr(app.state, "auth_required", False):
         return None
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-    if bound_host and bound_host not in _LOOPBACK_HOSTS:
+    bound_hosts: frozenset[str] | None = getattr(app.state, "bound_hosts", None)
+    bound_host: str = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    if bound_hosts is not None:
+        all_loopback = all(bh.lower() in _LOOPBACK_HOSTS for bh in bound_hosts)
+    else:
+        all_loopback = bound_host in _LOOPBACK_HOSTS
+    if not all_loopback:
         return None
     client_host = ws.client.host if ws.client else ""
     if not client_host:
@@ -14343,8 +14348,13 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
     # access via --insecure.  The loopback-only peer gate only applies to
     # an actual loopback bind; otherwise the WS handshake is rejected even
     # though same-bind HTTP requests pass _is_accepted_host.
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-    if bound_host and bound_host not in _LOOPBACK_HOSTS:
+    bound_hosts_set: frozenset[str] | None = getattr(app.state, "bound_hosts", None)
+    bound_host: str = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    if bound_hosts_set is not None:
+        all_loopback = all(bh.lower() in _LOOPBACK_HOSTS for bh in bound_hosts_set)
+    else:
+        all_loopback = bound_host in _LOOPBACK_HOSTS
+    if not all_loopback:
         return True
     client_host = ws.client.host if ws.client else ""
     if not client_host:
@@ -14415,8 +14425,13 @@ def _ws_auth_mode() -> str:
     """Short label for the active WS auth mode — logged on every connection."""
     if getattr(app.state, "auth_required", False):
         return "gated"
-    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
-    if bound_host and bound_host not in _LOOPBACK_HOSTS:
+    bound_hosts_set: frozenset[str] | None = getattr(app.state, "bound_hosts", None)
+    bound_host: str = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    if bound_hosts_set is not None:
+        all_loopback = all(bh.lower() in _LOOPBACK_HOSTS for bh in bound_hosts_set)
+    else:
+        all_loopback = bound_host in _LOOPBACK_HOSTS
+    if not all_loopback:
         return "insecure"
     return "loopback"
 
