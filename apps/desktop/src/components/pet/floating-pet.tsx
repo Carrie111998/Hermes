@@ -12,6 +12,7 @@ import {
   $petInfo,
   $petRoam,
   $petRoamDir,
+  cachePetInfo,
   clearPetUnread,
   type PetInfo,
   petProfile,
@@ -163,7 +164,7 @@ export function FloatingPet() {
     // revision (scale-only move still changes the sig) short-circuits below
     // via samePetRevision.
     if (changeEventsAvailable && petChange.tick > 0 && petChange.meta?.enabled === false) {
-      setPetInfo({ enabled: false })
+      cachePetInfo({ enabled: false })
 
       return
     }
@@ -179,7 +180,7 @@ export function FloatingPet() {
             }
 
             if (!meta.enabled) {
-              setPetInfo({ enabled: false })
+              cachePetInfo({ enabled: false })
 
               return
             }
@@ -209,7 +210,7 @@ export function FloatingPet() {
             return
           }
 
-          setPetInfo(next)
+          cachePetInfo(next)
         }
       } catch {
         // cosmetic feature — never surface gateway errors
