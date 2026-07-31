@@ -7033,10 +7033,18 @@ def _terminate_reclaimed_worker(
         # let the dispatcher spawn duplicates beside them — but the diagnostic
         # is recorded either way. Rows written since the identity migration
         # always carry a fingerprint, so this is a shrinking legacy surface.
+        # No fingerprint. An *absent* PID is still positive evidence the
+        # worker is gone — there is nothing to kill and nothing to protect, so
+        # the claim can be released normally. A *live* PID we cannot identify
+        # is the dangerous case (R4-B8b): it may be an unrelated process that
+        # inherited the number, so it is never signalled, and ``worker_pid``
+        # stays put because it is the only handle left on a worker that may
+        # still be running. The survival guard then holds the claim.
         info["identity_unproven"] = True
-        if require_identity:
+        if not _pid_alive(int(pid)):
+            info["terminated"] = True
             return info
-        return _terminate_worker_without_identity(int(pid), info, kill=signal_fn)
+        return info
 
     state = _worker_identity_state(int(pid), process_start_time)
     if state == IDENTITY_UNKNOWN:
@@ -7118,7 +7126,11 @@ def _worker_survived_termination(termination: dict) -> bool:
     claim lock or a no-op attempt (no ``os.kill`` available) must fall through
     to the normal release path, since we cannot manage that worker anyway.
     """
-    if termination.get("identity_unknown") and termination.get("host_local"):
+    if (
+        (termination.get("identity_unknown") or termination.get("identity_unproven"))
+        and termination.get("host_local")
+        and not termination.get("terminated")
+    ):
         # We could not prove the worker is gone. Holding the claim is the safe
         # reading: releasing it would spawn a duplicate beside a possibly-live
         # worker, which is the failure this guard exists to prevent.
@@ -9533,7 +9545,8 @@ def _wait_for_pid_exit_and_run_release(
 ) -> bool:
     ack_error: Optional[OSError] = None
     while True:
-        worker_alive = _worker_identity_is_alive(pid, process_start_time)
+        state = _worker_identity_state(pid, process_start_time)
+        worker_alive = state == IDENTITY_ALIVE
         if ready_fd is not None:
             if worker_alive:
                 try:
@@ -9547,7 +9560,16 @@ def _wait_for_pid_exit_and_run_release(
                 if exc.errno != errno.EBADF and ack_error is None:
                     ack_error = exc
             ready_fd = None
-        if not worker_alive:
+        if state == IDENTITY_UNKNOWN:
+            # We cannot observe the worker. Releasing its owner here would let
+            # the dispatcher spawn a duplicate beside a process that may well
+            # be running. Quarantine: keep the claim, release nothing.
+            _log.warning(
+                "worker identity unknown (pid=%s); keeping the owner claim "
+                "instead of releasing it", pid,
+            )
+            return False
+        if state == IDENTITY_DEAD:
             break
         time.sleep(poll_interval)
     result = subprocess.run(
@@ -10004,6 +10026,18 @@ def _default_spawn(
                     task, workspace, profile_home, proc.pid,
                     process_start_time, str(worker_session_id),
                 )
+        # The wrapper parks before ``exec()`` waiting for the gate. Everything
+        # above (owner claim, reaper, session, attestation, re-proof) takes
+        # real time, so prove the wrapper is still the exact process we
+        # spawned before creating a gate for it — otherwise the gate is an
+        # orphan file and the pid we return belongs to nobody (R4-B6).
+        if proc.poll() is not None or _worker_identity_state(
+            proc.pid, process_start_time
+        ) != IDENTITY_ALIVE:
+            raise RuntimeError(
+                "gated worker wrapper is no longer alive after admission "
+                f"(task {task.id}); refusing to create its owner gate"
+            )
         gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(gate_fd)
     except Exception as spawn_error:

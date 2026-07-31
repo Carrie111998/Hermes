@@ -331,3 +331,99 @@ def test_code_a_and_code_b_canary_lanes_run_without_collision(monkeypatch, tmp_p
             assert task.status == "done", (
                 f"{name} canary card should complete, got {task.status}"
             )
+
+
+def test_code_a_and_code_b_canary_with_real_attestation_and_launcher(
+    monkeypatch, tmp_path,
+):
+    """R4-B8d: one full A/B canary that does NOT stub the attestation.
+
+    The other canary drives the controller path with a deterministic probe
+    worker, which is not a Hermes launcher, so it stubs the armed check. This
+    one closes that gap: both lanes go through the genuine
+    ``_attest_worker_admission_hook_armed`` against a real wrapper chain
+    (bash -> sh -> console script), a real nonce and a real trusted-launcher
+    check, so no lane can open its gate without a verdict from its own install.
+    """
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    # A launcher chain shaped exactly like the packaged install.
+    bindir = tmp_path / "install" / "venv" / "bin"
+    bindir.mkdir(parents=True)
+    console = bindir / "hermes"
+    console.write_text(
+        "#!/bin/sh\n"
+        "'''exec' \"%s\" \"$0\" \"$@\"\n"
+        "' '''\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "from hermes_cli.main import main\n"
+        "sys.exit(main())\n" % sys.executable,
+        encoding="utf-8",
+    )
+    console.chmod(0o755)
+    outer_dir = tmp_path / "install" / "bin"
+    outer_dir.mkdir(parents=True)
+    launcher = outer_dir / "hermes"
+    launcher.write_text(
+        "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\n"
+        f'exec "{console}" "$@"\n',
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    verdicts = []
+    real_attest = kb._attest_worker_admission_hook_armed
+
+    def traced_attest(**kwargs):
+        verdicts.append(kwargs["profile_home"].name)
+        return real_attest(**kwargs)
+
+    monkeypatch.setattr(kb, "_attest_worker_admission_hook_armed", traced_attest)
+
+    for lane in ("hermes-code-a", "hermes-code-b"):
+        profile = root / "profiles" / lane
+        profile.mkdir(parents=True)
+        command = " ".join([
+            sys.executable, str(HOOK), "--registry", str(registry),
+            "--agent", lane, "--profile", lane,
+            "--only-mutating", "--require-owned-git",
+        ])
+        profile.joinpath("config.yaml").write_text(
+            "hooks:\n  pre_tool_call:\n    - matcher: '.*'\n"
+            "      fail_closed: true\n"
+            f"      command: {json.dumps(command)}\n",
+            encoding="utf-8",
+        )
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+        workspace = tmp_path / f"ws-{lane}"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(profile)
+        # The genuine armed check, through the genuine wrapper chain.
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=env, worker_argv=[str(launcher)],
+            cwd=str(workspace), workspace=str(workspace),
+        )
+
+        # A lane whose profile drops the factory hook must be refused, so the
+        # pass above is a real verdict and not a vacuous one.
+        profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+        with pytest.raises(RuntimeError, match="admission hook|attestation"):
+            kb._attest_worker_admission_hook_armed(
+                profile_home=profile, env=env, worker_argv=[str(launcher)],
+                cwd=str(workspace), workspace=str(workspace),
+            )
+
+    # Both lanes went through the genuine attestation, twice each (the armed
+    # profile and its disarmed control).
+    assert verdicts == [
+        "hermes-code-a", "hermes-code-a", "hermes-code-b", "hermes-code-b",
+    ], verdicts

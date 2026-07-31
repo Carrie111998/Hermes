@@ -131,6 +131,9 @@ def test_default_spawn_claims_exact_owner_and_pins_deterministic_session(
     class FakeProc:
         pid = os.getpid()
 
+        def poll(self):
+            return None
+
         def terminate(self):
             captured["terminated"] = True
 
@@ -485,6 +488,9 @@ def test_default_spawn_kills_child_and_preserves_foreign_owner_on_collision(
     class FakeProc:
         pid = os.getpid()
 
+        def poll(self):
+            return None
+
         def terminate(self):
             state["terminated"] = True
 
@@ -521,6 +527,9 @@ def test_default_spawn_releases_its_claim_when_reaper_start_fails(
 
     class FakeProc:
         pid = os.getpid()
+
+        def poll(self):
+            return None
 
         def terminate(self):
             state["terminated"] = True
@@ -799,14 +808,14 @@ def test_owner_reaper_ack_disconnect_still_waits_and_releases(
     os.close(ready_r)
     if ack_failure == "bad-fd":
         os.close(ready_w)
-    alive = iter([True, False])
+    alive = iter([kb.IDENTITY_ALIVE, kb.IDENTITY_DEAD])
     identity_checks = []
 
     def fake_identity(pid, process_start_time):
         identity_checks.append((pid, process_start_time))
         return next(alive)
 
-    monkeypatch.setattr(kb, "_worker_identity_is_alive", fake_identity)
+    monkeypatch.setattr(kb, "_worker_identity_state", fake_identity)
     monkeypatch.setattr(kb.time, "sleep", lambda _interval: None)
 
     assert kb._wait_for_pid_exit_and_run_release(
@@ -825,7 +834,7 @@ def test_owner_reaper_ack_disconnect_still_waits_and_releases(
 def test_owner_reaper_without_ack_fd_still_waits_and_releases(monkeypatch):
     from hermes_cli import kanban_db as kb
 
-    alive = iter([True, False])
+    alive = iter([kb.IDENTITY_ALIVE, kb.IDENTITY_DEAD])
     identity_checks = []
     releases = []
 
@@ -837,7 +846,7 @@ def test_owner_reaper_without_ack_fd_still_waits_and_releases(monkeypatch):
         releases.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(kb, "_worker_identity_is_alive", fake_identity)
+    monkeypatch.setattr(kb, "_worker_identity_state", fake_identity)
     monkeypatch.setattr(kb.subprocess, "run", fake_run)
     monkeypatch.setattr(kb.time, "sleep", lambda _interval: None)
 
@@ -856,7 +865,7 @@ def test_owner_reaper_unexpected_ack_error_is_raised_after_release(monkeypatch):
     from hermes_cli import kanban_db as kb
 
     ready_r, ready_w = os.pipe()
-    alive = iter([True, False])
+    alive = iter([kb.IDENTITY_ALIVE, kb.IDENTITY_DEAD])
     identity_checks = []
     releases = []
 
@@ -868,7 +877,7 @@ def test_owner_reaper_unexpected_ack_error_is_raised_after_release(monkeypatch):
         releases.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    monkeypatch.setattr(kb, "_worker_identity_is_alive", fake_identity)
+    monkeypatch.setattr(kb, "_worker_identity_state", fake_identity)
     monkeypatch.setattr(kb.os, "write", lambda _fd, _marker: (_ for _ in ()).throw(
         PermissionError("unexpected ack failure")
     ))
@@ -1082,6 +1091,9 @@ def _spawn_with_fakes(monkeypatch, kb, captured, *, attest=None):
 
     class FakeProc:
         pid = os.getpid()
+
+        def poll(self):
+            return None
 
         def terminate(self):
             captured["terminated"] = True
@@ -1629,6 +1641,9 @@ def test_default_spawn_attests_through_the_unmonkeypatched_launcher(
     class FakeProc:
         pid = os.getpid()
 
+        def poll(self):
+            return None
+
         def terminate(self):
             captured["terminated"] = True
 
@@ -1932,3 +1947,86 @@ def test_hostile_python_env_is_scrubbed_in_code_for_worker_and_attestation(
         assert var not in seen["env"], f"{var} reached the attestation"
     # And both must see the *same* environment.
     assert seen["env"] == captured["env"]
+
+
+# ---------------------------------------------------------------------------
+# R4-B6 — the gate must never be created for a wrapper that already gave up
+# ---------------------------------------------------------------------------
+
+def test_gate_is_not_created_when_the_wrapper_died_during_attestation(
+    monkeypatch, tmp_path,
+):
+    """R4-B6: a wrapper that dies *during* attestation must not get a gate.
+
+    The claim already won and the reaper is up; the window this closes is the
+    one after that, where the parent would otherwise create a gate file for a
+    process that has since exited and return its dead pid as if it were live.
+    """
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    # A real child, alive for the claim and killed while we "attest".
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    captured: dict = {}
+
+    class LiveThenDeadProc:
+        pid = child.pid
+
+        def poll(self):
+            return child.poll()
+
+        def terminate(self):
+            captured["terminated"] = True
+
+        def wait(self, timeout=None):
+            return child.poll()
+
+    def fake_start(cmd, *, workspace, log_f, env):
+        return LiveThenDeadProc()
+
+    class FakeReaper:
+        def poll(self):
+            return None
+
+    def fake_reaper(**kwargs):
+        ready_r, ready_w = os.pipe()
+        os.write(ready_w, b"R")
+        os.close(ready_w)
+        return FakeReaper(), ready_r
+
+    def kill_the_wrapper_while_attesting(**kwargs):
+        child.kill()
+        child.wait(timeout=10)
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_start_kanban_worker_process", fake_start)
+    monkeypatch.setattr(kb, "_start_worker_owner_reaper", fake_reaper)
+    monkeypatch.setattr(
+        kb, "_attest_worker_admission_hook_armed", kill_the_wrapper_while_attesting,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="no longer alive"):
+            kb._default_spawn(_task(kb), str(workspace))
+        gates = list(kb.worker_logs_dir().glob("*.owner-ready-*"))
+        assert gates == [], f"no gate may exist for a dead wrapper: {gates}"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5)
+
+
+def test_wrapper_deadline_outlives_the_attestation_budget():
+    """Single shared timing contract, asserted as a relationship."""
+    from hermes_cli import kanban_db as kb
+
+    assert (
+        kb._OWNER_GATE_WRAPPER_DEADLINE_SECONDS
+        > kb._ATTESTATION_TIMEOUT_SECONDS * 2
+    ), "the wrapper must outlive attestation + re-proof with margin"

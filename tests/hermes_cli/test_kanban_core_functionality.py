@@ -1259,9 +1259,15 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        # R4-B8b: this row has no recorded start-time fingerprint while its
+        # pid is still alive — the pid may belong to an unrelated process that
+        # inherited the number, so it is never signalled. A *manual* reclaim
+        # still resets the card (the operator asked for it explicitly) but the
+        # event records that termination was neither attempted nor proven.
+        assert reclaim_evs[0].get("termination_attempted") is False
+        assert reclaim_evs[0].get("terminated") is False
+        assert reclaim_evs[0].get("identity_unproven") is True
+        assert killed == []
     finally:
         conn.close()
 

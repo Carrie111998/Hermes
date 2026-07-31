@@ -367,14 +367,16 @@ def test_legacy_null_identity_is_refused_on_the_controller_block_path(kanban_hom
         assert info["identity_unproven"] is True
         assert proc.poll() is None
 
+        # R4-B8b superseded the historical PID-only reclaim contract: both
+        # paths now quarantine rather than blind-kill an unidentifiable PID.
         legacy: list = []
         info = kb._terminate_reclaimed_worker(
             proc.pid, host_lock,
             signal_fn=lambda p, s: legacy.append(s),
             process_start_time=None,
         )
-        assert legacy, "reclaim keeps its historical PID-only contract"
-        assert info["termination_attempted"] is True
+        assert legacy == [], "reclaim must not blind-kill either"
+        assert info["termination_attempted"] is False
         assert info["identity_unproven"] is True
     finally:
         if proc.poll() is None:
@@ -462,6 +464,105 @@ def test_transient_ps_failure_before_sigkill_does_not_claim_termination(
         assert info["terminated"] is False
         assert info.get("identity_unknown") is True
         assert kb._worker_survived_termination(info) is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# R4-B5 — the reaper must consume tri-state liveness directly
+# ---------------------------------------------------------------------------
+
+def _release_probe(tmp_path):
+    """A release command that records whether it was ever invoked."""
+    marker = tmp_path / "released"
+    script = tmp_path / "release.py"
+    script.write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).write_text('x')\n",
+        encoding="utf-8",
+    )
+    return [sys.executable, str(script)], marker
+
+
+def test_reaper_never_releases_on_unknown_at_entry(tmp_path, monkeypatch):
+    """UNKNOWN at the first probe must not be read as 'worker exited'."""
+    from hermes_cli import kanban_db as kb
+
+    release_argv, marker = _release_probe(tmp_path)
+    monkeypatch.setattr(
+        kb, "_worker_identity_state", lambda pid, start: kb.IDENTITY_UNKNOWN,
+    )
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+
+    released = kb._wait_for_pid_exit_and_run_release(
+        pid=os.getpid(), process_start_time="x", release_argv=release_argv,
+        poll_interval=0,
+    )
+    assert released is False, "UNKNOWN must not authorize an owner release"
+    assert not marker.exists(), "the release command must never have run"
+
+
+def test_reaper_never_releases_on_unknown_during_the_loop(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    release_argv, marker = _release_probe(tmp_path)
+    states = [kb.IDENTITY_ALIVE, kb.IDENTITY_ALIVE, kb.IDENTITY_UNKNOWN]
+    monkeypatch.setattr(
+        kb, "_worker_identity_state",
+        lambda pid, start: states.pop(0) if states else kb.IDENTITY_UNKNOWN,
+    )
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+
+    released = kb._wait_for_pid_exit_and_run_release(
+        pid=os.getpid(), process_start_time="x", release_argv=release_argv,
+        poll_interval=0,
+    )
+    assert released is False
+    assert not marker.exists()
+
+
+def test_reaper_releases_only_on_positively_proven_dead(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    release_argv, marker = _release_probe(tmp_path)
+    states = [kb.IDENTITY_ALIVE, kb.IDENTITY_DEAD]
+    monkeypatch.setattr(
+        kb, "_worker_identity_state",
+        lambda pid, start: states.pop(0) if states else kb.IDENTITY_DEAD,
+    )
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+
+    released = kb._wait_for_pid_exit_and_run_release(
+        pid=os.getpid(), process_start_time="x", release_argv=release_argv,
+        poll_interval=0,
+    )
+    assert released is True
+    assert marker.exists(), "a proven-dead worker must release its owner"
+
+
+def test_legacy_null_identity_quarantines_instead_of_blind_kill(kanban_home):
+    """R4-B8b: never blind-kill, and never erase the only recoverable PID.
+
+    Behaviour change vs R2: the historical PID-only reclaim contract is
+    replaced by quarantine. Killing a PID we cannot identify can hit an
+    unrelated process, and clearing ``worker_pid`` would destroy the only
+    handle left on a worker that may still be running.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    host_lock = f"{kb._claimer_id().split(':', 1)[0]}:x"
+    try:
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, host_lock, signal_fn=lambda p, s: sent.append(s),
+            process_start_time=None,
+        )
+        assert sent == [], f"legacy NULL identity must not be signalled: {sent}"
+        assert info["termination_attempted"] is False
+        assert info["identity_unproven"] is True
+        # Quarantine: the claim is held, so no duplicate is spawned beside it.
+        assert kb._worker_survived_termination(info) is True
+        assert proc.poll() is None
     finally:
         if proc.poll() is None:
             proc.kill()
