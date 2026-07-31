@@ -116,7 +116,13 @@ def test_pronunciation_non_word_boundaries_support_technical_terms():
 
 @pytest.mark.parametrize(
     "substitutions",
-    ["Tahlia: Tarlia", ["Tahlia", "Tarlia"], {"Tahlia": 123}, {123: "Tarlia"}],
+    [
+        "Tahlia: Tarlia",
+        ["Tahlia", "Tarlia"],
+        {"Tahlia": 123},
+        {123: "Tarlia"},
+        {"": "INVALID", "Tahlia": "Tarlia"},
+    ],
 )
 def test_pronunciation_invalid_config_is_a_noop(substitutions):
     """Malformed user config must not break or partially alter spoken text."""
@@ -160,6 +166,54 @@ def test_pronunciation_cannot_mutate_protected_nonspoken_markers():
     )
     assert spoken == "Hello"
     assert "secret" not in spoken
+
+
+def test_pronunciation_cannot_replace_an_entire_protected_block():
+    """A source equal to protected content cannot rewrite it into spoken text."""
+    protected = "```secret code```"
+    spoken = prepare_spoken_text(
+        f"{protected} Hello",
+        pronunciation_substitutions={protected: "LEAK"},
+    )
+    assert spoken == "Hello"
+    assert "LEAK" not in spoken
+
+
+def test_unterminated_fenced_code_tail_is_never_spoken():
+    raw = "Visible answer. ```python\nSECRET = 'do not speak'"
+    spoken = prepare_spoken_text(
+        raw,
+        pronunciation_substitutions={"SECRET": "LEAK"},
+    )
+    assert spoken == "Visible answer."
+    assert "SECRET" not in spoken
+    assert "LEAK" not in spoken
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        "<think>literal documentation</think>",
+        "<think>literal unclosed documentation",
+    ],
+)
+def test_think_literal_inside_fenced_code_does_not_consume_visible_tail(literal):
+    raw = f"```text\n{literal}\n```Visible answer survives."
+    assert prepare_spoken_text(raw) == "Visible answer survives."
+
+
+def test_truncation_inside_fenced_code_does_not_expose_its_contents():
+    raw = "Visible answer. ```text\n" + ("SECRET " * 800) + "``` Later answer."
+    truncated = raw[:4000]
+    assert truncated.count("```") == 1
+
+    spoken = prepare_spoken_text(
+        truncated,
+        pronunciation_substitutions={"SECRET": "LEAK"},
+    )
+    assert spoken == "Visible answer."
+    assert "SECRET" not in spoken
+    assert "LEAK" not in spoken
 
 
 def test_prepare_spoken_text_without_pronunciation():

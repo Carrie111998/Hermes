@@ -94,13 +94,15 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
     adapter._keep_typing = _hold_typing()
     adapter._should_auto_tts_for_chat = lambda _chat_id: True
     adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
-    long_reply = "x" * 2000  # avoid the telegram caption-collapse path
+    long_reply = "Our **R&D** team shipped." + ("x" * 5000)
     adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=long_reply))
     event = _make_voice_event(platform)
     requested = []
 
-    def fake_tts(*, text, output_path=None):
-        requested.append(output_path)
+    def fake_tts(*, text, output_path=None, _max_chars=None):
+        requested.append(
+            {"text": text, "output_path": output_path, "max_chars": _max_chars}
+        )
         from pathlib import Path
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(output_path).write_bytes(b"fake audio")
@@ -116,6 +118,21 @@ async def _run_auto_tts(adapter: _DummyAdapter, platform: Platform):
 
 
 @pytest.mark.asyncio
+async def test_base_auto_tts_preserves_raw_symbols_and_4000_character_cap():
+    requested, adapter = await _run_auto_tts(
+        _DummyAdapter(Platform.TELEGRAM),
+        Platform.TELEGRAM,
+    )
+
+    assert len(requested) == 1
+    expected = "Our **R&D** team shipped." + ("x" * 5000)
+    assert requested[0]["text"] == expected
+    assert requested[0]["max_chars"] == 4000
+    assert requested[0]["output_path"].endswith(".ogg")
+    adapter.play_tts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     """A success=False tool result must not deliver a stale/partial file."""
     adapter = _DummyAdapter(Platform.TELEGRAM)
@@ -125,7 +142,7 @@ async def test_base_auto_tts_skips_playback_when_tool_reports_failure():
     adapter.set_message_handler(lambda _event: asyncio.sleep(0, result="reply text"))
     event = _make_voice_event(Platform.TELEGRAM)
 
-    def fake_tts(*, text, output_path=None):
+    def fake_tts(*, text, output_path=None, _max_chars=None):
         from pathlib import Path
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         Path(output_path).write_bytes(b"partial")

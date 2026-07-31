@@ -165,6 +165,8 @@ tts:
       Notre: No-tra
 ```
 
+Pronunciation substitutions are currently a YAML-only advanced setting because the generic desktop settings form does not yet provide a safe key/value map editor.
+
 Protected non-spoken blocks are removed before substitutions, so a configured term cannot alter private reasoning or verifier markers. Substitutions then run before Markdown stripping and provider dispatch, so they still work on formatted text across synchronous and streaming TTS paths.
 
 ### Input length limits

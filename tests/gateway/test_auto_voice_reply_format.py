@@ -33,9 +33,13 @@ class TestAutoVoiceReplyFormat:
         runner.adapters[platform] = adapter
         event = _make_event(platform)
         requested_paths = []
+        requested_texts = []
+        requested_caps = []
 
-        def fake_tts(*, text, output_path):
+        def fake_tts(*, text, output_path, _max_chars=None):
+            requested_texts.append(text)
             requested_paths.append(output_path)
+            requested_caps.append(_max_chars)
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
             Path(output_path).write_bytes(b"fake ogg opus")
             return json.dumps({
@@ -45,9 +49,12 @@ class TestAutoVoiceReplyFormat:
                 "voice_compatible": True,
             })
 
+        raw_reply = "Our **R&D** team shipped." + ("x" * 5000)
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
-            await runner._send_voice_reply(event, "hello from auto tts")
+            await runner._send_voice_reply(event, raw_reply)
 
+        assert requested_texts == [raw_reply]
+        assert requested_caps == [4000]
         assert requested_paths and requested_paths[0].endswith(".ogg")
         adapter.send_voice.assert_awaited_once()
         assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")

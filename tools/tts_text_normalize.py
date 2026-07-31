@@ -18,7 +18,7 @@ import re
 # rather than leaving a bare "Weather." label that reads abruptly aloud.
 _HEAD = "\x00"
 
-_MD_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_MD_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?(?:```|$)")
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((?:[^()]|\([^)]*\))*\)")
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\((?:[^()]|\([^)]*\))*\)")
 _MD_INLINE_CODE_RE = re.compile(r"`([^`]+)`")
@@ -230,11 +230,15 @@ _VERIFIER_FOOTER_RE = re.compile(
 def strip_nonspoken_blocks(text: str) -> str:
     """Remove blocks that must never reach a speech provider.
 
-    Currently: ``<think>`` reasoning blocks and the end-of-turn
-    file-mutation verifier footer.
+    Currently: ``<think>`` reasoning blocks, fenced code blocks, and the
+    end-of-turn file-mutation verifier footer.
     """
     if not text:
         return ""
+    # Remove fenced examples first so literal ``<think>`` or verifier syntax
+    # inside documentation cannot be mistaken for an outer protected block and
+    # consume visible prose that follows the closing fence.
+    text = _MD_CODE_BLOCK_RE.sub(" ", text)
     text = _THINK_BLOCK_RE.sub(" ", text)
     text = _THINK_BLOCK_OPEN_RE.sub(" ", text)
     text = _VERIFIER_FOOTER_RE.sub(" ", text)
@@ -263,7 +267,8 @@ def get_pronunciation_substitutions(tts_config: object) -> dict[str, str]:
 
     A malformed map is rejected as a whole rather than partially applied, so a
     typo in user configuration cannot produce surprising partial substitutions.
-    Empty source strings are ignored because they cannot identify a term.
+    Empty source strings invalidate the whole map because they cannot identify
+    a term and partial application would hide a configuration error.
     """
     if not isinstance(tts_config, dict):
         return {}
@@ -280,11 +285,9 @@ def _validate_pronunciation_substitutions(substitutions: object) -> dict[str, st
     if not all(isinstance(source, str) and isinstance(replacement, str)
                for source, replacement in substitutions.items()):
         return {}
-    return {
-        source: replacement
-        for source, replacement in substitutions.items()
-        if isinstance(source, str) and isinstance(replacement, str) and source
-    }
+    if any(not source for source in substitutions):
+        return {}
+    return dict(substitutions)
 
 
 def apply_pronunciation_substitutions(text: str, substitutions: object) -> str:

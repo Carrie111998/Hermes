@@ -25,7 +25,7 @@ import logging
 import re
 import time
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from tools.tool_backend_helpers import resolve_openai_audio_api_key
 from tools.tts_tool import _get_provider, _load_tts_config, get_env_value
@@ -83,33 +83,259 @@ def take_speech_interrupted() -> bool:
 
 # Sentence boundary: after .!? followed by whitespace, or a blank line.
 SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
-_THINK_BLOCK_RE = re.compile(r"<think[\s>].*?</think>", flags=re.DOTALL)
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:\s[^>]*)?>.*?</think\s*>",
+    flags=re.DOTALL | re.IGNORECASE,
+)
+_THINK_OPEN_RE = re.compile(r"<think(?:\s[^>]*)?>", flags=re.IGNORECASE)
+_FENCED_CODE_BLOCK_RE = re.compile(r"```[\s\S]*?```")
+_VERIFIER_START_RE = re.compile(
+    r"(?:⚠️?\s*)?File-mutation verifier:",
+    flags=re.IGNORECASE,
+)
+_REGEX_ASCII_FOLD_TRANSLATION = str.maketrans(
+    {"İ": "i", "ı": "i", "ſ": "s", "K": "k"}
+)
+
+
+def _regex_ascii_casefold(text: str) -> str:
+    """Fold text like ``re.IGNORECASE`` does for ASCII literals."""
+    return text.translate(_REGEX_ASCII_FOLD_TRANSLATION).casefold()
+
+
+def _literal_ignorecase_matches(text: str, literal: str) -> bool:
+    """Return whether equal-length *text* matches *literal* under ``re.I``."""
+    return len(text) == len(literal) and re.fullmatch(
+        re.escape(literal), text, flags=re.IGNORECASE
+    ) is not None
+
+
+def _fenced_code_ranges(text: str) -> List[Tuple[int, int]]:
+    """Return complete and open triple-backtick ranges in *text*."""
+    ranges: List[Tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = text.find("```", cursor)
+        if start < 0:
+            break
+        end = text.find("```", start + 3)
+        if end < 0:
+            ranges.append((start, len(text)))
+            break
+        ranges.append((start, end + 3))
+        cursor = end + 3
+    return ranges
+
+
+def _position_in_ranges(position: int, ranges: List[Tuple[int, int]]) -> bool:
+    return any(start <= position < end for start, end in ranges)
+
+
+def _first_think_open_outside_fences(text: str) -> Optional[re.Match]:
+    fenced_ranges = _fenced_code_ranges(text)
+    return next(
+        (
+            match
+            for match in _THINK_OPEN_RE.finditer(text)
+            if not _position_in_ranges(match.start(), fenced_ranges)
+        ),
+        None,
+    )
 
 
 class SentenceChunker:
     """Incremental sentence cutter for LLM token deltas.
 
-    Shared by the speaker pipeline (`stream_tts_to_speaker`) and the
-    speak-stream WebSocket so every surface cuts speech identically. Strips
-    ``<think>`` blocks (even split across deltas) and merges fragments shorter
-    than *min_len* into the following sentence, so "Ha!" rides along with the
-    sentence after it instead of stalling as a tiny clip.
+    Shared by every streaming speech surface. Protected non-spoken blocks are
+    removed before sentence cutting, even when their delimiters span deltas.
+    Optional pronunciation substitutions inform boundary selection without
+    altering returned display text. A boundary inside a configured phrase is
+    held until the phrase can be matched, so terms such as ``Dr. Smith`` reach
+    the speech-only rewrite intact.
     """
 
-    def __init__(self, min_len: int = 20):
+    def __init__(self, min_len: int = 20, pronunciation_substitutions: object = None):
         self.min_len = min_len
         self.buf = ""
+        self._discard_rest = False
+        from tools.tts_text_normalize import get_pronunciation_substitutions
+
+        self._pronunciation_substitutions = get_pronunciation_substitutions({
+            "pronunciation": {"substitutions": pronunciation_substitutions},
+        })
+        self._pronunciation_sources = tuple(self._pronunciation_substitutions)
+
+    @property
+    def holding_protected_text(self) -> bool:
+        """Whether an open protected block is waiting for its closing marker."""
+        return (
+            self._has_open_protected_block()
+            or self._partial_protected_tail_start(self.buf) is not None
+        )
+
+    @property
+    def holding_pronunciation_lookahead(self) -> bool:
+        """Whether the buffer ends inside a configured source phrase."""
+        return self._substitution_may_cross_boundary(len(self.buf))
+
+    def _remove_complete_protected_blocks(self, text: str) -> str:
+        fenced_ranges = _fenced_code_ranges(text)
+        removable_think_blocks = [
+            match
+            for match in _THINK_BLOCK_RE.finditer(text)
+            if not _position_in_ranges(match.start(), fenced_ranges)
+        ]
+        if removable_think_blocks:
+            parts: List[str] = []
+            cursor = 0
+            for match in removable_think_blocks:
+                parts.append(text[cursor:match.start()])
+                cursor = match.end()
+            parts.append(text[cursor:])
+            text = "".join(parts)
+
+        fenced_ranges = _fenced_code_ranges(text)
+        open_think = _first_think_open_outside_fences(text)
+        for verifier in _VERIFIER_START_RE.finditer(text):
+            # Literal verifier examples inside fenced documentation or an open
+            # think block are protected content, not the start of the actual
+            # hidden verifier footer. Complete think blocks were removed above.
+            if _position_in_ranges(verifier.start(), fenced_ranges) or (
+                open_think is not None and open_think.start() < verifier.start()
+            ):
+                continue
+            text = text[:verifier.start()]
+            self._discard_rest = True
+            break
+        return text
+
+    def _has_open_protected_block(self) -> bool:
+        return bool(
+            _first_think_open_outside_fences(self.buf) is not None
+            or self.buf.count("```") % 2
+        )
+
+    @staticmethod
+    def _partial_protected_tail_start(text: str) -> Optional[int]:
+        """Return the start of an incomplete protected opening delimiter."""
+        starts: List[int] = []
+
+        last_angle = text.rfind("<")
+        if last_angle >= 0:
+            fragment = text[last_angle:]
+            keyword = "<think"
+            if (
+                len(fragment) <= len(keyword)
+                and _literal_ignorecase_matches(fragment, keyword[:len(fragment)])
+            ) or (
+                len(fragment) > len(keyword)
+                and _literal_ignorecase_matches(fragment[:len(keyword)], keyword)
+                and fragment[len(keyword)].isspace()
+                and ">" not in fragment[len(keyword):]
+            ):
+                starts.append(last_angle)
+
+        trailing_ticks = len(text) - len(text.rstrip("`"))
+        if trailing_ticks in (1, 2):
+            starts.append(len(text) - trailing_ticks)
+
+        folded = _regex_ascii_casefold(text)
+        verifier_openers = (
+            "file-mutation verifier:",
+            "⚠ file-mutation verifier:",
+            "⚠️ file-mutation verifier:",
+        )
+        for opener in verifier_openers:
+            max_prefix = min(len(folded), len(opener) - 1)
+            for prefix_len in range(max_prefix, 0, -1):
+                if folded.endswith(opener[:prefix_len]):
+                    starts.append(len(text) - prefix_len)
+                    break
+
+        return min(starts) if starts else None
+
+    def _strip_open_protected_tail(self, text: str) -> str:
+        starts = []
+        think = _first_think_open_outside_fences(text)
+        if think is not None:
+            starts.append(think.start())
+        if text.count("```") % 2:
+            fence = text.rfind("```")
+            if fence >= 0:
+                starts.append(fence)
+        partial = self._partial_protected_tail_start(text)
+        if partial is not None:
+            starts.append(partial)
+        return text[:min(starts)] if starts else text
+
+    def _boundary_is_inside_fenced_code(self, boundary_end: int) -> bool:
+        return any(
+            match.start() < boundary_end <= match.end()
+            for match in _FENCED_CODE_BLOCK_RE.finditer(self.buf)
+        )
+
+    @staticmethod
+    def _is_word_char(char: str) -> bool:
+        return bool(char and re.match(r"\w", char))
+
+    def _substitution_may_cross_boundary(self, split: int) -> bool:
+        """Return True when a configured source may span *split*.
+
+        This includes an incomplete source prefix at the end of the current
+        buffer, which delays only the candidate boundary until the next delta
+        confirms or rejects the match.
+        """
+        if not self._pronunciation_sources:
+            return False
+        for source in self._pronunciation_sources:
+            source_len = len(source)
+
+            # At an idle boundary, a source that ends exactly at the current
+            # buffer tail still has an unresolved ``(?!\w)`` right boundary.
+            # Hold it until another delta supplies that character, or until the
+            # explicit end-of-text flush confirms there is no character.
+            exact_start = split - source_len
+            if split == len(self.buf) and exact_start >= 0:
+                candidate = self.buf[exact_start:split]
+                if (
+                    _literal_ignorecase_matches(candidate, source)
+                    and (exact_start == 0 or not self._is_word_char(self.buf[exact_start - 1]))
+                ):
+                    return True
+
+            first_start = max(0, split - source_len + 1)
+            for start in range(first_start, split):
+                end = start + source_len
+                if not (start < split < end):
+                    continue
+                available_end = min(len(self.buf), end)
+                candidate = self.buf[start:available_end]
+                source_prefix = source[:available_end - start]
+                if not _literal_ignorecase_matches(candidate, source_prefix):
+                    continue
+                if start > 0 and self._is_word_char(self.buf[start - 1]):
+                    continue
+                if len(self.buf) >= end:
+                    if end < len(self.buf) and self._is_word_char(self.buf[end]):
+                        continue
+                return True
+        return False
 
     def feed(self, delta: str) -> List[str]:
         """Absorb *delta*; return every complete sentence now ready to speak."""
-        self.buf = _THINK_BLOCK_RE.sub("", self.buf + delta)
-        if "<think" in self.buf and "</think>" not in self.buf:
-            return []  # open think tag — the closing tag may arrive next delta
+        if self._discard_rest:
+            return []
+        self.buf = self._remove_complete_protected_blocks(self.buf + delta)
+        if self.holding_protected_text:
+            return []
         out: List[str] = []
         start = 0  # skip boundaries that would leave the head too short
         while m := SENTENCE_BOUNDARY_RE.search(self.buf, start):
-            head = self.buf[: m.end()]
-            if len(head.strip()) < self.min_len:
+            if self._boundary_is_inside_fenced_code(m.end()):
+                start = m.end()
+                continue
+            head = self.buf[:m.end()]
+            if len(head.strip()) < self.min_len or self._substitution_may_cross_boundary(m.end()):
                 start = m.end()
                 continue
             out.append(head)
@@ -117,10 +343,61 @@ class SentenceChunker:
             start = 0
         return out
 
+    def flush_for_idle(self) -> List[str]:
+        """Drain an idle-safe prefix while retaining pronunciation context.
+
+        Pronunciation substitutions use ``(?<!\\w)``.  If an idle flush clears
+        a trailing word, the next delta can incorrectly make a source appear to
+        start at a word boundary.  Retain that trailing word until the next
+        delta (or the explicit end-of-text flush) resolves the boundary.
+        """
+        if not self._pronunciation_sources:
+            return self.flush()
+
+        tail = self._remove_complete_protected_blocks(self.buf)
+        self.buf = tail
+        if self.holding_protected_text:
+            return []
+        match = re.search(r"\w+$", tail)
+        if match is None:
+            self.buf = ""
+            return [tail] if tail.strip() else []
+
+        retain_start = match.start()
+        # A punctuation-ending source may sit immediately before the trailing
+        # word (for example ``C++s``).  Emitting it would invent a false
+        # ``(?!\\w)`` boundary.  Pull every such valid source into the retained
+        # suffix; iterate for adjacent/overlapping configured sources.
+        while True:
+            earlier_start: Optional[int] = None
+            for source in self._pronunciation_sources:
+                source_start = retain_start - len(source)
+                if source_start < 0:
+                    continue
+                if not _literal_ignorecase_matches(
+                    tail[source_start:retain_start], source
+                ):
+                    continue
+                if source_start > 0 and self._is_word_char(
+                    tail[source_start - 1]
+                ):
+                    continue
+                if earlier_start is None or source_start < earlier_start:
+                    earlier_start = source_start
+            if earlier_start is None:
+                break
+            retain_start = earlier_start
+
+        ready = tail[:retain_start]
+        self.buf = tail[retain_start:]
+        return [ready] if ready.strip() else []
+
     def flush(self) -> List[str]:
         """Drain the tail (end-of-text or long-idle flush)."""
-        tail = _THINK_BLOCK_RE.sub("", self.buf).strip()
+        tail = self._remove_complete_protected_blocks(self.buf)
+        tail = self._strip_open_protected_tail(tail).strip()
         self.buf = ""
+        self._discard_rest = False
         return [tail] if tail else []
 
 
@@ -131,6 +408,8 @@ class SentenceChunker:
 class StreamingTTSProvider(ABC):
     """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate``."""
 
+    provider_name: str = ""
+    model_id: Optional[str] = None
     sample_rate: int = 24000
     channels: int = 1
     sample_width: int = 2  # bytes/sample (int16)
@@ -154,6 +433,7 @@ _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
 
 def register(name: str) -> Callable[[type[StreamingTTSProvider]], type[StreamingTTSProvider]]:
     def _wrap(cls: type[StreamingTTSProvider]) -> type[StreamingTTSProvider]:
+        cls.provider_name = name
         _REGISTRY[name] = cls
         return cls
 
@@ -223,13 +503,22 @@ class ElevenLabsStreamer(StreamingTTSProvider):
 
     sample_rate = 24000
 
+    def __init__(self, tts_config: Dict, section: Dict):
+        super().__init__(tts_config, section)
+        from tools.tts_tool import DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
+
+        self.model_id = str(
+            section.get("streaming_model_id")
+            or section.get("model_id")
+            or DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
+        )
+
     @staticmethod
     def available() -> bool:
         return bool(_resolve_key("ELEVENLABS_API_KEY", "elevenlabs"))
 
     def stream(self, text: str) -> Iterator[bytes]:
         from tools.tts_tool import (
-            DEFAULT_ELEVENLABS_STREAMING_MODEL_ID,
             DEFAULT_ELEVENLABS_VOICE_ID,
             _elevenlabs_environment_kwargs,
             _import_elevenlabs,
@@ -240,14 +529,10 @@ class ElevenLabsStreamer(StreamingTTSProvider):
             **_elevenlabs_environment_kwargs(self.section),
         )
         voice_id = self.section.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
-        model_id = self.section.get(
-            "streaming_model_id",
-            self.section.get("model_id", DEFAULT_ELEVENLABS_STREAMING_MODEL_ID),
-        )
         yield from client.text_to_speech.convert(
             text=text,
             voice_id=voice_id,
-            model_id=model_id,
+            model_id=self.model_id,
             output_format="pcm_24000",
         )
 

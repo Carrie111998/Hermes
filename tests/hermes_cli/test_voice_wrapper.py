@@ -186,6 +186,29 @@ class TestSpeakTextGuards:
         assert voice.speak_text("Hello world") is None
         assert played == [returned_path]
 
+    def test_sync_path_passes_raw_text_to_central_tts_pipeline(self, monkeypatch):
+        import hermes_cli.voice as voice
+        from tools import tts_tool
+
+        requested = []
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda _cfg: None,
+        )
+        monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {})
+        monkeypatch.setattr(
+            tts_tool,
+            "text_to_speech_tool",
+            lambda **kwargs: requested.append(kwargs) or "{}",
+        )
+        monkeypatch.setattr(voice.os, "makedirs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(voice.os.path, "isfile", lambda _path: False)
+
+        raw = "Our **R&D** team shipped." + ("x" * 5000)
+        assert voice.speak_text(raw) is None
+        assert requested[0]["text"] == raw
+        assert requested[0]["_max_chars"] == 4000
+
     def test_speak_text_prefers_requested_mp3_over_returned_ogg(self, monkeypatch):
         import hermes_cli.voice as voice
         from tools import tts_tool

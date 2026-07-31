@@ -3,7 +3,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -170,7 +170,7 @@ class TestTelegramAutoTtsCaptionDelivery:
         # below it. Caption eligibility must follow the ORIGINAL reply, so the
         # full formatted text is still delivered as its own message instead of
         # being swallowed into a lossy caption.
-        long_reply = "\n".join(
+        long_reply = "Our **R&D** team shipped.\n" + "\n".join(
             f"- **item {i}** [details](https://example.com/some/very/long/path/{i:04d})"
             for i in range(20)
         )
@@ -182,12 +182,16 @@ class TestTelegramAutoTtsCaptionDelivery:
         tts_path.write_text("audio", encoding="utf-8")
         event = self._make_voice_event()
 
+        tts_mock = MagicMock(
+            return_value=json.dumps({"file_path": str(tts_path)})
+        )
         with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
             "tools.tts_tool.text_to_speech_tool",
-            return_value=json.dumps({"file_path": str(tts_path)}),
+            tts_mock,
         ):
             await adapter._process_message_background(event, build_session_key(event.source))
 
+        assert tts_mock.call_args.kwargs["text"] == long_reply
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] is None
         assert adapter.sent == [
