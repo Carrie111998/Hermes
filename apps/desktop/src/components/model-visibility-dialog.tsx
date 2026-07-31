@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useMemo, useState } from 'react'
 
+import { HERMES_CONFIG_KEY } from '@/app/hooks/use-config-record'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -36,9 +37,11 @@ import { notifyError } from '@/store/notifications'
 import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-collapse'
 import type { HermesConfigRecord, ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
-/** Config record backing the provider switches. Its own key (not the settings
- *  page's) so toggling here refetches exactly this dialog. */
-const CONFIG_QUERY_KEY = ['hermes-config', 'excluded-providers'] as const
+/** Config record backing the provider switches, keyed by profile like the model
+ *  catalog above it: `GET /api/config` answers for whichever profile the app is
+ *  routed to, and this dialog is mounted across profile switches — one shared
+ *  key would paint the previous profile's blocklist. */
+const configQueryKey = (profile: string) => ['hermes-config', 'excluded-providers', profile] as const
 
 interface ModelVisibilityDialogProps {
   gw?: HermesGateway
@@ -71,7 +74,7 @@ export function ModelVisibilityDialog({
   })
 
   const config = useQuery({
-    queryKey: CONFIG_QUERY_KEY,
+    queryKey: configQueryKey(profile),
     queryFn: getHermesConfigRecord,
     enabled: open
   })
@@ -119,25 +122,46 @@ export function ModelVisibilityDialog({
   // local preference: the backend builds every picker's catalog from it, so an
   // off provider is gone from the composer menu, the ⌘-picker, the TUI and
   // `hermes model` alike — including one that authenticated itself from ambient
-  // credentials (a logged-in `gh`, Claude Code's OAuth file). Optimistic, with
-  // rollback on a failed write; the catalog is re-fetched because it's derived
-  // server-side from the config we just changed.
+  // credentials (a logged-in `gh`, Claude Code's OAuth file).
+  //
+  // The switch flips optimistically (with rollback), but the record that gets
+  // PERSISTED is re-read first: `PUT /api/config` takes a whole record, and the
+  // cached one can be up to a staleTime old — edited meanwhile by a settings
+  // page, the CLI, or another profile's backend. Writing the cached copy would
+  // resurrect its stale values as an edit. The catalog is re-fetched afterwards
+  // because the backend derives it from the config we just changed.
   const setProviderEnabled = async (provider: ModelOptionProvider, enabled: boolean) => {
-    const current = config.data
+    const cached = config.data
+    const key = configQueryKey(profile)
 
-    if (!current) {
+    if (!cached) {
       return
     }
 
-    const next = withExcludedProviders(current, withProviderExcluded(excluded, provider.slug, !enabled))
-
-    queryClient.setQueryData<HermesConfigRecord>(CONFIG_QUERY_KEY, next)
+    queryClient.setQueryData<HermesConfigRecord>(
+      key,
+      withExcludedProviders(cached, withProviderExcluded(excluded, provider.slug, !enabled))
+    )
 
     try {
+      const fresh = await getHermesConfigRecord()
+
+      const next = withExcludedProviders(
+        fresh,
+        withProviderExcluded(readExcludedProviders(fresh), provider.slug, !enabled)
+      )
+
       await saveHermesConfig(next)
-      await queryClient.invalidateQueries({ queryKey: ['model-options'] })
+      queryClient.setQueryData<HermesConfigRecord>(key, next)
+      // The settings pages cache the same record under their own key and save it
+      // back whole — leave theirs stale and their next save would PUT a
+      // `model_catalog` block from before this switch.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: HERMES_CONFIG_KEY }),
+        queryClient.invalidateQueries({ queryKey: ['model-options'] })
+      ])
     } catch (err) {
-      queryClient.setQueryData<HermesConfigRecord>(CONFIG_QUERY_KEY, current)
+      queryClient.setQueryData<HermesConfigRecord>(key, cached)
       notifyError(err, copy.providerToggleFailed)
     }
   }
