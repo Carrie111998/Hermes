@@ -154,6 +154,74 @@ def test_resolve_runtime_provider_lmstudio_uses_token_when_present(monkeypatch):
     assert resolved["base_url"] == "http://127.0.0.1:1234/v1"
 
 
+def test_resolve_runtime_provider_lmstudio_honors_configured_key_env(monkeypatch):
+    """Built-in providers can point at a custom secret env var."""
+    monkeypatch.delenv("LM_API_KEY", raising=False)
+    monkeypatch.setenv("LAN_LMSTUDIO_KEY", "lm-configured-token")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "lmstudio",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "default": "publisher/model-a",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+    )
+
+    def _config():
+        return {
+            "model": {"provider": "lmstudio"},
+            "providers": {"lmstudio": {"key_env": "LAN_LMSTUDIO_KEY"}},
+        }
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _config)
+
+    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert resolved["provider"] == "lmstudio"
+    assert resolved["api_key"] == "lm-configured-token"
+    assert resolved["source"] == "LAN_LMSTUDIO_KEY"
+
+
+def test_configured_key_env_takes_priority_over_default_provider_env(monkeypatch):
+    monkeypatch.setenv("LM_API_KEY", "lm-default-token")
+    monkeypatch.setenv("LAN_LMSTUDIO_KEY", "lm-configured-token")
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "lmstudio")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "lmstudio",
+            "base_url": "http://127.0.0.1:1234/v1",
+            "default": "publisher/model-a",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda provider: type("Pool", (), {"has_credentials": lambda self: False})(),
+    )
+
+    def _config():
+        return {
+            "model": {"provider": "lmstudio"},
+            "providers": {"lmstudio": {"key_env": "LAN_LMSTUDIO_KEY"}},
+        }
+
+    monkeypatch.setattr("hermes_cli.config.load_config", _config)
+
+    resolved = rp.resolve_runtime_provider(requested="lmstudio")
+
+    assert resolved["api_key"] == "lm-configured-token"
+    assert resolved["source"] == "LAN_LMSTUDIO_KEY"
+
+
 def test_resolve_runtime_provider_lmstudio_honors_saved_base_url(monkeypatch):
     """Pre-existing configs with `provider: lmstudio` + custom base_url must keep working.
 
