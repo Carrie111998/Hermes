@@ -1145,121 +1145,35 @@ class CLICommandsMixin:
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
             search_limit = limit if limit_given else 10
+            from hermes_cli.session_listing import (
+                render_sessions_table,
+                search_session_listing,
+            )
+
             try:
-                # Use FTS5 content search — searches message text, not just
-                # session titles/IDs. Returns ranked results with match
-                # snippets, grouped by session.
-                raw = self._session_db.search_messages(
-                    query=search_query,
-                    role_filter=["user", "assistant"],
-                    exclude_sources=["tool", "subagent", "cron"],
-                    limit=min(max(search_limit * 4, 40), 200),
+                # One shared search pipeline (hermes sessions search uses the
+                # same function): FTS5 content search, compression-chain
+                # dedup, recency sort (listing's Last-column definition),
+                # limit-last, canonical rows (rank, root Created, chain-total
+                # Tok, root previews).
+                table_rows, root_preview_cache = search_session_listing(
+                    self._session_db,
+                    search_query,
+                    limit=search_limit,
+                    exclude_session_id=self.session_id,
                 )
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
                 return
 
-            # Group by session_id (no cap here — dedup + recency sort come
-            # after; the limit is applied last so --limit N always means
-            # "N most recent matches", independent of FTS5 rank order).
-            seen = {}
-            for r in raw:
-                sid = r["session_id"]
-                if sid == self.session_id:
-                    continue
-                if sid not in seen:
-                    seen[sid] = r
-
-            if not seen:
+            if not table_rows:
                 _cprint(f"  No sessions matching \"{search_query}\".")
                 return
-
-            # Deduplicate compression children: if A → A #2 → A #3,
-            # keep only the latest descendant in each lineage — even when
-            # intermediate generations are absent from the FTS5 hit set.
-            from hermes_cli.session_listing import dedup_compression_chains, last_active_of
-            kept = dedup_compression_chains(self._session_db, list(seen.keys()))
-            for sid in list(seen.keys()):
-                if sid not in kept:
-                    seen.pop(sid, None)
 
             _cprint("")
             _cprint(f"  ⚙️  /sessions search {search_query}")
             _cprint(f"  Sessions matching \"{search_query}\":")
             _cprint("")
-
-            # Sort by last_active descending (most recent first). Same
-            # definition as the listing's Last column (latest message
-            # timestamp, falling back to ended_at/started_at) so search and
-            # list order + display agree — not COALESCE(ended_at, ...).
-            sids_sorted = list(seen.keys())
-            sid_latest = last_active_of(self._session_db, sids_sorted)
-            sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
-            # Apply the display limit last: N most recent matches.
-            if len(sids_sorted) > search_limit:
-                sids_sorted = sids_sorted[:search_limit]
-
-            # Resequence the seen dict
-            seen = {sid: seen[sid] for sid in sids_sorted}
-
-            # Batch-fetch root ancestor previews: for each session, walk up
-            # to root ancestor and get that root's first user message.
-            all_meta_cache = {}
-            root_preview_cache = {}
-            for sid in seen:
-                current = sid
-                chain = [current]
-                while current:
-                    if current not in all_meta_cache:
-                        all_meta_cache[current] = self._session_db.get_session(current) or {}
-                    m = all_meta_cache[current]
-                    parent = m.get("parent_session_id")
-                    if parent:
-                        chain.append(parent)
-                        current = parent
-                    else:
-                        break
-                root_id = chain[-1]
-                # Preview from root's first user message
-                cur = self._session_db._conn.execute(
-                    "SELECT substr(content, 1, 60) FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
-                    (root_id,),
-                )
-                row = cur.fetchone()
-                root_preview_cache[sid] = row[0] if row else ""
-
-            # Build canonical row dicts and render with the shared table
-            # renderer (same format as /sessions and hermes sessions list).
-            from hermes_cli.session_listing import (
-                render_sessions_table,
-                root_started_at,
-                session_rank,
-                session_rank_lookup,
-            )
-            rank_of = session_rank_lookup(self._session_db)
-            table_rows = []
-            for sid in sids_sorted:
-                meta = self._session_db.get_session(sid) or {}
-                row = dict(seen[sid])
-                row.update(meta)
-                row["id"] = sid
-                row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
-                # The # column shows the session's position in the canonical
-                # `hermes sessions list` (chain-aware: roots and mid-chain
-                # sessions resolve through their live tip), so the number on
-                # screen is the number /resume <N> accepts.
-                row["rank"] = session_rank(self._session_db, sid, rank_of)
-                # Created shows when the conversation first began (its
-                # compression root), not when the matched generation spawned.
-                row["started_at"] = root_started_at(self._session_db, sid) or meta.get("started_at")
-                table_rows.append(row)
-            # Tok(ΣIn/ΣOut) shows the chain total, matching the listing
-            # header — not the matched generation's single-generation count.
-            chain_tok = self._session_db.chain_token_totals(sids_sorted)
-            for row in table_rows:
-                tot = chain_tok.get(row["id"])
-                if tot and (tot[0] is not None or tot[1] is not None):
-                    row["input_tokens"], row["output_tokens"] = tot
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
             _cprint("")

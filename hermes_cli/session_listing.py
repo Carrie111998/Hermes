@@ -126,6 +126,131 @@ def last_active_of(session_db: Any, session_ids: list[str]) -> dict[str, float]:
     return latest
 
 
+def search_session_listing(
+    session_db: Any,
+    query: str,
+    *,
+    limit: int = 10,
+    exclude_session_id: str | None = None,
+    exclude_sources: tuple[str, ...] = ("tool", "subagent", "cron"),
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Full-text search over session messages with the canonical row shape.
+
+    This is the ONE search pipeline behind ``hermes sessions search`` and
+    the interactive ``/sessions search`` (and, via those, the gateway
+    slash surface) — the two call sites previously each implemented it,
+    and they had drifted (Last-column definition, token display, current
+    session exclusion, root previews). Steps, in order:
+
+    1. FTS5 over user+assistant messages (subagent/cron/tool sources
+       excluded) — grouped by session, first hit wins the match row.
+    2. Compression chains are deduplicated: only the latest descendant of
+       each lineage is kept (branch/delegate/tool children are their own
+       conversations, so they survive — see ``dedup_compression_chains``).
+    3. Sorted by last activity — the listing's Last-column definition
+       (``last_active_of``), never ``ended_at``.
+    4. The display limit applies LAST: ``limit`` means "N most recent
+       matches", independent of FTS5 rank order.
+    5. Rows are built in the canonical shape: id, chain-aware rank, root
+       ``started_at`` (Created), chain-total tokens, last_active — plus a
+       ``root_preview_cache`` of the root ancestor's first user message.
+
+    Returns ``(table_rows, root_preview_cache)`` ready for
+    ``render_sessions_table``. ``table_rows`` is empty when nothing
+    matched.
+    """
+    raw = session_db.search_messages(
+        query=query,
+        role_filter=["user", "assistant"],
+        exclude_sources=list(exclude_sources),
+        limit=min(max(limit * 4, 40), 200),
+    )
+    seen: dict[str, dict[str, Any]] = {}
+    for r in raw:
+        sid = r["session_id"]
+        if exclude_session_id and sid == exclude_session_id:
+            continue
+        if sid not in seen:
+            seen[sid] = r
+    if not seen:
+        return [], {}
+
+    # Deduplicate compression children: if A → A #2 → A #3, keep only the
+    # latest descendant in each lineage — even when intermediate generations
+    # are absent from the FTS5 hit set.
+    kept = dedup_compression_chains(session_db, list(seen.keys()))
+    for sid in list(seen.keys()):
+        if sid not in kept:
+            seen.pop(sid, None)
+
+    # Sort by last_active descending (most recent first) — the same
+    # definition as the listing's Last column, so search and list order +
+    # display agree. Apply the display limit last: N most recent matches.
+    sids_sorted = list(seen.keys())
+    sid_latest = last_active_of(session_db, sids_sorted)
+    sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
+    if len(sids_sorted) > limit:
+        sids_sorted = sids_sorted[:limit]
+    seen = {sid: seen[sid] for sid in sids_sorted}
+
+    # Batch-fetch root ancestor previews and root started_at in one walk
+    # per session (caching every visited generation so sibling matches in
+    # the same chain never re-walk it — the old per-site pipelines walked
+    # the lineage 2-3 times per row).
+    all_meta_cache: dict[str, dict[str, Any]] = {}
+    root_preview_cache: dict[str, str] = {}
+    root_started_cache: dict[str, Any] = {}
+    for sid in seen:
+        current = sid
+        chain = [current]
+        while current and len(chain) < COMPRESSION_CHAIN_MAX_HOPS:
+            if current not in all_meta_cache:
+                all_meta_cache[current] = session_db.get_session(current) or {}
+            m = all_meta_cache[current]
+            parent = m.get("parent_session_id")
+            if parent:
+                chain.append(parent)
+                current = parent
+            else:
+                break
+        root_id = chain[-1]
+        row = session_db._conn.execute(
+            "SELECT substr(content, 1, 60) FROM messages "
+            "WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id ASC LIMIT 1",
+            (root_id,),
+        ).fetchone()
+        root_preview_cache[sid] = row[0] if row else ""
+        root_started_cache[sid] = (all_meta_cache.get(root_id) or {}).get("started_at")
+
+    # Build canonical row dicts (same shape render_sessions_table expects).
+    rank_of = session_rank_lookup(session_db)
+    table_rows: list[dict[str, Any]] = []
+    for sid in sids_sorted:
+        meta = session_db.get_session(sid) or {}
+        row = dict(seen[sid])
+        row.update(meta)
+        row["id"] = sid
+        row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
+        # The # column shows the session's position in the canonical
+        # `hermes sessions list` (chain-aware: roots and mid-chain sessions
+        # resolve through their live tip), so the number on screen is the
+        # number /resume <N> accepts.
+        row["rank"] = session_rank(session_db, sid, rank_of)
+        # Created shows when the conversation first began (its compression
+        # root), not when the matched generation spawned.
+        row["started_at"] = root_started_cache.get(sid) or meta.get("started_at")
+        table_rows.append(row)
+    # Tok(ΣIn/ΣOut) shows the chain total, matching the listing header —
+    # not the matched generation's single-generation count.
+    chain_tok = session_db.chain_token_totals(sids_sorted)
+    for row in table_rows:
+        tot = chain_tok.get(row["id"])
+        if tot and (tot[0] is not None or tot[1] is not None):
+            row["input_tokens"], row["output_tokens"] = tot
+    return table_rows, root_preview_cache
+
+
 def format_gateway_session_listing(
     rows: list[dict[str, Any]],
     *,

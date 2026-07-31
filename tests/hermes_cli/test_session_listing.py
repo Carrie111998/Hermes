@@ -10,6 +10,7 @@ from hermes_cli.session_listing import (
     last_active_of,
     parse_session_listing_args,
     query_session_listing,
+    search_session_listing,
     session_rank,
     session_rank_lookup,
 )
@@ -113,6 +114,97 @@ def test_hop_caps_unified():
     assert COMPRESSION_CHAIN_MAX_HOPS == 100
     sig = inspect.signature(_compression_root)
     assert sig.parameters["max_hops"].default == COMPRESSION_CHAIN_MAX_HOPS
+
+
+class TestSearchSessionListing:
+    """The shared search pipeline (F9): both `hermes sessions search` and
+    `/sessions search` must produce identical canonical rows — chain-aware
+    rank, root Created, chain-total Tok, root-ancestor previews.
+    """
+
+    def test_chain_aware_rows(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "search.db")
+        conn = db._conn
+        db.create_session("sr_root", "cli")
+        db.append_message("sr_root", "user", "needle alpha", timestamp=1.0)
+        db.end_session("sr_root", end_reason="compression")
+        db.create_session("sr_mid", "cli", parent_session_id="sr_root")
+        db.append_message("sr_mid", "user", "needle beta", timestamp=2.0)
+        db.end_session("sr_mid", end_reason="compression")
+        db.create_session("sr_tip", "cli", parent_session_id="sr_mid")
+        db.append_message("sr_tip", "user", "needle gamma", timestamp=3.0)
+        db.create_session("sr_stand", "cli")
+        db.append_message("sr_stand", "user", "needle standalone", timestamp=4.0)
+        for sid, ts in [
+            ("sr_root", 100.0),
+            ("sr_mid", 200.0),
+            ("sr_tip", 300.0),
+            ("sr_stand", 400.0),
+        ]:
+            conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (ts, sid))
+        conn.execute(
+            "UPDATE sessions SET input_tokens=100, output_tokens=10 WHERE id='sr_root'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=200, output_tokens=20 WHERE id='sr_mid'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=300, output_tokens=30 WHERE id='sr_tip'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=50, output_tokens=5 WHERE id='sr_stand'"
+        )
+        conn.commit()
+        try:
+            rows, previews = search_session_listing(db, "needle")
+            # Recency order (last_active), chain deduped to its tip.
+            assert [r["id"] for r in rows] == ["sr_stand", "sr_tip"]
+            assert set(previews) == {"sr_stand", "sr_tip"}
+            tip = next(r for r in rows if r["id"] == "sr_tip")
+            assert tip["rank"] == 2  # canonical position of the chain
+            assert tip["started_at"] == 100.0  # root's Created, not tip's
+            assert (tip["input_tokens"], tip["output_tokens"]) == (600, 60)  # chain total
+            assert previews["sr_tip"] == "needle alpha"  # root's first user msg
+            stand = next(r for r in rows if r["id"] == "sr_stand")
+            assert stand["rank"] == 1
+            assert stand["started_at"] == 400.0
+        finally:
+            db.close()
+
+    def test_exclude_session_id_and_limit(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "search2.db")
+        for i, sid in enumerate(["sx_a", "sx_b", "sx_c"]):
+            db.create_session(sid, "cli")
+            db.append_message(sid, "user", f"needle {sid}", timestamp=float(i + 1))
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?", (float(i + 1), sid)
+            )
+        db._conn.commit()
+        try:
+            # Limit applies LAST, after recency sort.
+            rows, _ = search_session_listing(db, "needle", limit=2)
+            assert [r["id"] for r in rows] == ["sx_c", "sx_b"]
+            rows, _ = search_session_listing(db, "needle", exclude_session_id="sx_c")
+            assert {r["id"] for r in rows} == {"sx_b", "sx_a"}
+        finally:
+            db.close()
+
+    def test_no_matches_returns_empty(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "search3.db")
+        db.create_session("sx_none", "cli")
+        db.append_message("sx_none", "user", "unrelated words", timestamp=1.0)
+        db._conn.commit()
+        try:
+            rows, previews = search_session_listing(db, "needle")
+            assert rows == [] and previews == {}
+        finally:
+            db.close()
 
 
 class TestLastActiveOf:
