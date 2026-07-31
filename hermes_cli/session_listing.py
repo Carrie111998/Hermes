@@ -122,7 +122,7 @@ def format_gateway_session_listing(
 
 
 def session_rank_lookup(
-    session_db: Any, *, limit: int = 500
+    session_db: Any, *, limit: int = 2000
 ) -> dict[str, int]:
     """Map session id -> position in the canonical `hermes sessions list`.
 
@@ -130,11 +130,42 @@ def session_rank_lookup(
     ``tool``, unnamed included, ordered by original start time with
     compression chains projected to their live tip) so the ``#`` column in
     search results shows the same numbers the user sees in the listing.
+    The window defaults to 2000 rows so every tip in the store is covered.
     """
     rows = session_db.list_sessions_rich(
         source=None, exclude_sources=["tool"], limit=limit
     )
     return {r["id"]: i + 1 for i, r in enumerate(rows)}
+
+
+def session_rank(
+    session_db: Any, sid: str, rank_of: dict[str, int] | None = None
+) -> int | None:
+    """Position of ``sid`` in the canonical sessions list, chain-aware.
+
+    ``session_rank_lookup`` keys the map by *projected tip* ids, but search
+    results are frequently roots or mid-chain sessions (FTS5 matches old
+    messages). So walk forward along continuation children (latest started_at
+    first) until an id present in the map is found — every chain's tip is in
+    the map — and return its rank. Returns None only if no mapped tip is
+    reachable within 20 hops.
+    """
+    if rank_of is None:
+        rank_of = session_rank_lookup(session_db)
+    current = sid
+    for _ in range(20):
+        rank = rank_of.get(current)
+        if rank is not None:
+            return rank
+        row = session_db._conn.execute(
+            "SELECT id FROM sessions WHERE parent_session_id = ? "
+            "ORDER BY started_at DESC LIMIT 1",
+            (current,),
+        ).fetchone()
+        if not row:
+            return None
+        current = row[0]
+    return None
 
 
 def render_sessions_table(

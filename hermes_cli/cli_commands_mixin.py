@@ -1223,6 +1223,7 @@ class CLICommandsMixin:
             # renderer (same format as /sessions and hermes sessions list).
             from hermes_cli.session_listing import (
                 render_sessions_table,
+                session_rank,
                 session_rank_lookup,
             )
             rank_of = session_rank_lookup(self._session_db)
@@ -1234,9 +1235,10 @@ class CLICommandsMixin:
                 row["id"] = sid
                 row["last_active"] = sid_latest.get(sid) or meta.get("started_at")
                 # The # column shows the session's position in the canonical
-                # `hermes sessions list`, so the number on screen is the
-                # number /resume <N> accepts.
-                row["rank"] = rank_of.get(sid)
+                # `hermes sessions list` (chain-aware: roots and mid-chain
+                # sessions resolve through their live tip), so the number on
+                # screen is the number /resume <N> accepts.
+                row["rank"] = session_rank(self._session_db, sid, rank_of)
                 table_rows.append(row)
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
