@@ -1141,6 +1141,20 @@ class CLICommandsMixin:
                 _cprint(f"  No sessions matching \"{search_query}\".")
                 return
 
+            # Deduplicate compression children: if A → A #2 → A #3,
+            # keep only the latest descendant in each lineage.
+            result_ids = set(seen.keys())
+            ancestors = set()
+            for sid in result_ids:
+                meta = self._session_db.get_session(sid) or {}
+                parent_id = meta.get("parent_session_id")
+                while parent_id and parent_id in result_ids:
+                    ancestors.add(parent_id)
+                    parent_meta = self._session_db.get_session(parent_id) or {}
+                    parent_id = parent_meta.get("parent_session_id")
+            for sid in ancestors:
+                seen.pop(sid, None)
+
             _cprint("")
             _cprint(f"  ⚙️  /sessions search {search_query}")
             _cprint(f"  Sessions matching \"{search_query}\":")
