@@ -1,19 +1,23 @@
 import { cn } from '@/lib/utils'
 
-const assetPath = (path: string) => `${import.meta.env.BASE_URL}${path.replace(/^\/+/, '')}`
-
-// Brand badge: nous-girl mark on a white tile, identical in light/dark.
-// Fills the tile (softly rounded); size via className (default size-14).
+// Brand badge: typographic placeholder ("DA" on emerald) until real Douglas
+// Agent iconography exists. Deliberately no external image -- the previous
+// mark was Nous Research's own illustrated mascot (nous-girl.jpg), which MIT
+// covers as code but not as artwork; it can't represent a different product.
+// Identical in light/dark; size via className (default size-14).
 export function BrandMark({ className, ...props }: React.ComponentProps<'span'>) {
   return (
     <span
       className={cn(
-        'inline-flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-md bg-white',
+        'font-display inline-flex size-14 shrink-0 items-center justify-center overflow-hidden rounded-md bg-emerald-600 font-bold text-white select-none',
         className
       )}
       {...props}
     >
-      <img alt="" className="size-full object-contain" src={assetPath('nous-girl.jpg')} />
+      <span aria-hidden className="text-[0.4em] tracking-tight">
+        DA
+      </span>
+      <span className="sr-only">Douglas Agent</span>
     </span>
   )
 }
