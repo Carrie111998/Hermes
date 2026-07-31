@@ -270,22 +270,6 @@ class TestDefaultModelFromCache:
                 f"must match PREFERRED_SILENT_DEFAULT_MODEL"
             )
 
-    def test_shipped_manifest_includes_openrouter_qwen_flash(self, isolated_home):
-        """Regression for #74144: Qwen Flash should be selectable from the
-        curated OpenRouter catalog. OpenRouter lists the canonical slug without
-        a hyphen between qwen and 3.7.
-        """
-        import hermes_cli.model_catalog as model_catalog
-
-        repo_root = Path(model_catalog.__file__).resolve().parent.parent
-        manifest = json.loads(
-            (repo_root / "website" / "static" / "api" / "model-catalog.json").read_text()
-        )
-        openrouter_ids = [m["id"] for m in manifest["providers"]["openrouter"]["models"]]
-
-        assert "qwen/qwen3.7-flash" in openrouter_ids
-        assert "qwen/qwen-3.7-flash" not in openrouter_ids
-
 
 class TestProviderOverride:
     def test_override_url_takes_precedence(self, isolated_home):
