@@ -40,7 +40,16 @@ class TestChatCompletionsBasic:
         result = transport.convert_messages(msgs)
         assert result is msgs  # no copy needed
 
+    def test_convert_messages_drops_empty_tool_calls(self, transport):
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "done", "tool_calls": []},
+        ]
 
+        result = transport.convert_messages(msgs)
+
+        assert "tool_calls" not in result[1]
+        assert msgs[1]["tool_calls"] == []
 
     def _msg_with_extra_content(self):
         return [

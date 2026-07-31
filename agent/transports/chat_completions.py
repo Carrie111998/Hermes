@@ -173,6 +173,8 @@ class ChatCompletionsTransport(ProviderTransport):
           gateways (e.g. opencode-go, codex.nekos.me) reject with
           ``Extra inputs are not permitted, field: 'messages[N]._empty_recovery_synthetic'``,
           which then poisons every subsequent request in the session.
+        - Empty ``tool_calls`` arrays — absence carries the same meaning and
+          strict OpenAI-compatible providers reject the explicit empty field.
         """
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
@@ -188,6 +190,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
                 or "api_content" in msg  # persist-what-you-send sidecar
+                or msg.get("tool_calls") == []
             ):
                 needs_sanitize = True
                 break
@@ -249,6 +252,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 for key in internal_keys:
                     out_msg.pop(key, None)
+
+            if msg.get("tool_calls") == []:
+                mutable_msg().pop("tool_calls", None)
 
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
