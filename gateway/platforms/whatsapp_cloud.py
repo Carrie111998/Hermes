@@ -1666,12 +1666,11 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         Returns True if the tap was claimed (caller should drop the
         webhook entry without dispatching a fresh conversation turn).
-        Returns False when the id has no recognized prefix, no live
-        state entry, or the resolver itself reports no waiter — in
-        those cases the caller falls back to standard text-event
-        dispatch, which treats the button title as a normal user
-        message. That graceful fallback covers stale-tap and
-        cross-process-restart scenarios.
+        Returns False when the id has no recognized prefix or a
+        non-approval resolver cannot claim it. Approval controls are
+        always consumed once their prefix is recognized: degrading a
+        stale or malformed approval tap to its button title would turn
+        a consequential control into a fresh conversation message.
 
         Dispatch table:
           ``cl:<clarify_id>:<idx|other>``  → resolve_gateway_clarify
@@ -1794,27 +1793,27 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         if button_id.startswith("appr:"):
             parts = button_id.split(":", 2)
             if len(parts) != 3:
-                return False
+                return True
             _, approval_id, choice = parts
             approval_state = self._exec_approval_state.pop(approval_id, None)
             if not approval_state:
                 logger.info(
                     "[whatsapp_cloud] approval tap with no matching state "
-                    "(approval_id=%s) — likely stale; falling back to text",
+                    "(approval_id=%s) — likely stale; ignoring",
                     approval_id,
                 )
-                return False
+                return True
             session_key, backend_approval_id = approval_state
             if choice not in ("approve", "deny"):
                 self._exec_approval_state[approval_id] = approval_state
-                return False
+                return True
             try:
                 from tools.approval import resolve_gateway_approval
             except ImportError:
                 logger.warning(
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
-                return False
+                return True
             resolver_choice = "once" if choice == "approve" else choice
             count = resolve_gateway_approval(
                 session_key,

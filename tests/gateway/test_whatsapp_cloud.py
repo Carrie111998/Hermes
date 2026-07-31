@@ -1100,6 +1100,52 @@ class TestDispatchInteractiveReplyApproval:
     """Inbound side: approval-tap → resolve_gateway_approval."""
 
     @pytest.mark.asyncio
+    async def test_stale_approval_tap_is_consumed_without_starting_a_turn(
+        self, monkeypatch
+    ):
+        adapter = _make_adapter()
+        adapter.handle_message = AsyncMock()
+        resolve_calls = []
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda *args, **kwargs: resolve_calls.append((args, kwargs)) or 1,
+        )
+
+        await adapter._dispatch_payload(
+            {
+                "object": "whatsapp_business_account",
+                "entry": [
+                    {
+                        "changes": [
+                            {
+                                "field": "messages",
+                                "value": {
+                                    "messages": [
+                                        {
+                                            "from": "15551234567",
+                                            "id": "wamid.stale-approval",
+                                            "type": "interactive",
+                                            "interactive": {
+                                                "type": "button_reply",
+                                                "button_reply": {
+                                                    "id": "appr:expired:approve",
+                                                    "title": "Approve",
+                                                },
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                ],
+            }
+        )
+
+        adapter.handle_message.assert_not_awaited()
+        assert resolve_calls == []
+
+    @pytest.mark.asyncio
     async def test_tap_resolves_the_approval_shown_on_that_button(self, monkeypatch):
         adapter = _make_adapter()
         adapter._http_client = MagicMock()
