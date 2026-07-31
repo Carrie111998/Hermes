@@ -16496,7 +16496,7 @@ def main():
             "View and manage the SQLite session store.\n\n"
             "Common: `hermes sessions` or `hermes sessions list` shows recent "
             "sessions; `hermes sessions search <query>` full-text searches "
-            "session messages; `hermes sessions <id>` resumes a session."
+            "session messages; `hermes --resume <id>` resumes a session."
         ),
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
@@ -18048,7 +18048,8 @@ def main():
             print(f"⚙️  sessions search {query}\n")
             render_sessions_table(table_rows, out=print, preview_lookup=root_preview_cache)
             print()
-            print("  Use /resume <id> from an interactive Hermes session to continue.")
+            print("  Resume interactively: /resume <number> (the # column above) or /resume <session id>")
+            print("  From this CLI:        hermes --resume <session id>")
 
         elif action == "stats":
             total = db.session_count()

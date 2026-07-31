@@ -882,7 +882,7 @@ class CLICommandsMixin:
                 i += 1
             return " ".join(clean), parsed_limit
 
-        target, limit = _parse_flags(rest, default_limit=10)
+        target, limit = _parse_flags(rest, default_limit=20)
 
         # Strip common outer brackets/quotes users may type literally from the
         # usage hint (e.g. ``/resume <abc123>`` or ``/resume [abc123]``).  The
@@ -911,7 +911,10 @@ class CLICommandsMixin:
             return
 
         # Any explicit /resume <target> supersedes a previously-armed bare
-        # numbered prompt.
+        # numbered prompt, but the armed list stays the preferred resolution
+        # source for numbers — it matches what was just displayed (recent
+        # list, or search results), avoiding drift if sessions changed since.
+        armed = self._pending_resume_sessions
         self._pending_resume_sessions = None
 
         if not self._session_db:
@@ -921,18 +924,20 @@ class CLICommandsMixin:
 
         # Resolve numbered selection, title, or ID
         if target.isdigit():
-            # Use the stored limit from a prior --limit so the bare-number
-            # flow (via _consume_pending_resume_selection) re-fetches the
-            # same number of sessions that was displayed.
-            digit_limit = getattr(self, '_pending_resume_limit', 10)
-            sessions = self._list_recent_sessions(limit=digit_limit)
             index = int(target)
-            if index < 1 or index > len(sessions):
-                _cprint(f"  Resume index {index} is out of range.")
-                _cprint("  Use /resume with no arguments to see available sessions.")
-                return
-            selected = sessions[index - 1]
-            target_id = selected["id"]
+            # Prefer the just-displayed list (search results or /resume list).
+            if armed and 1 <= index <= len(armed):
+                selected = armed[index - 1]
+                target_id = selected["id"]
+            else:
+                digit_limit = getattr(self, '_pending_resume_limit', 20)
+                sessions = self._list_recent_sessions(limit=digit_limit)
+                if index < 1 or index > len(sessions):
+                    _cprint(f"  Resume index {index} is out of range.")
+                    _cprint("  Use /resume with no arguments to see available sessions.")
+                    return
+                selected = sessions[index - 1]
+                target_id = selected["id"]
         else:
             from hermes_cli.main import _resolve_session_by_name_or_id
             resolved = _resolve_session_by_name_or_id(target)
@@ -1087,10 +1092,13 @@ class CLICommandsMixin:
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
-        # Extract --limit/-l N (default 10, capped 100) from anywhere in the
-        # args, then hand the rest to the shared arg parser.
+        # Extract --limit/-l N (bare listing default 20, matching
+        # `hermes sessions list`; search caps at 10 unless -l given, matching
+        # `hermes sessions search`). Capped at 100. The flag is stripped from
+        # anywhere in the args, then the rest goes to the shared arg parser.
         import shlex as _shlex
-        limit = 10
+        limit = 20
+        limit_given = False
         _tokens = _shlex.split(arg)
         _clean = []
         _i = 0
@@ -1098,6 +1106,7 @@ class CLICommandsMixin:
             if _tokens[_i] in ("--limit", "-l") and _i + 1 < len(_tokens):
                 try:
                     limit = min(int(_tokens[_i + 1]), 100)
+                    limit_given = True
                 except ValueError:
                     pass
                 _i += 2
@@ -1122,6 +1131,7 @@ class CLICommandsMixin:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
+            search_limit = limit if limit_given else 10
             try:
                 # Use FTS5 content search — searches message text, not just
                 # session titles/IDs. Returns ranked results with match
@@ -1130,7 +1140,7 @@ class CLICommandsMixin:
                     query=search_query,
                     role_filter=["user", "assistant"],
                     exclude_sources=["tool", "subagent", "cron"],
-                    limit=min(max(limit * 4, 40), 200),
+                    limit=min(max(search_limit * 4, 40), 200),
                 )
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
@@ -1181,8 +1191,8 @@ class CLICommandsMixin:
             sid_latest = {row[0]: row[1] for row in cur.fetchall()}
             sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
             # Apply the display limit last: N most recent matches.
-            if len(sids_sorted) > limit:
-                sids_sorted = sids_sorted[:limit]
+            if len(sids_sorted) > search_limit:
+                sids_sorted = sids_sorted[:search_limit]
 
             # Resequence the seen dict
             seen = {sid: seen[sid] for sid in sids_sorted}
@@ -1226,8 +1236,14 @@ class CLICommandsMixin:
                 table_rows.append(row)
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
+            # Arm a one-shot numbered-resume selection against THESE results,
+            # so `/resume 2` (or just typing `2`) right after a search resumes
+            # search match #2 — the numbers on screen are the numbers that work.
+            self._pending_resume_sessions = table_rows
+            self._pending_resume_limit = search_limit
+
             _cprint("")
-            _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
+            _cprint("  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.")
             _cprint("  Example: /resume 2")
             _cprint("")
             _cprint("  More: /sessions search <query>, /sessions -l <N>")

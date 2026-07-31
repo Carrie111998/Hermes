@@ -7584,7 +7584,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Config File: {config_path} {config_status}")
         print()
     
-    def _list_recent_sessions(self, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+    def _list_recent_sessions(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         """Return recent CLI sessions for in-chat browsing/resume affordances.
 
         Pass ``offset`` to skip past already-shown rows for pagination.
@@ -7611,7 +7611,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self,
         *,
         reason: str = "history",
-        limit: int = 10,
+        limit: int = 20,
         offset: int = 0,
         sessions: list[dict] | None = None,
     ) -> bool:
@@ -7639,7 +7639,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cli_visible_print()
         render_sessions_table(sessions, out=_cli_visible_print, db=self._session_db)
         _cli_visible_print()
-        _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
+        _cli_visible_print("  Use /resume <number> (the # column above), /resume <session id>, or /resume <session title> to continue.")
         _cli_visible_print("  Example: /resume 2")
         _cli_visible_print()
         _cli_visible_print("  More: /sessions search <query>, /sessions -l <N>")
