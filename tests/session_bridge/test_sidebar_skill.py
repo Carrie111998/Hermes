@@ -293,8 +293,8 @@ def test_sidebar_skill_allows_only_prebind_candidate_authentication_reads() -> N
     assert "Bounded pre-bind reads are allowed solely to authenticate a candidate" in registration
     assert "do not poll, rename, or commit during candidate authentication" in registration
     assert "Never bind an unauthenticated candidate" in registration
-    assert "bind that exact candidate ID" in registration
-    assert "only the bound ID may be polled, renamed, or committed" in registration
+    assert "exactly one authenticated candidate, call `session_sidebar_bind" in registration
+    assert "Only the bound ID may then be polled, renamed, or committed" in registration
     assert "Bounded pre-bind candidate-authentication reads are permitted" in hard_stops
     assert "Never poll, rename, or commit a selected task before binding" in hard_stops
 
@@ -397,26 +397,39 @@ def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     assert 'prompt="Review launch"' not in skill
 
 
-def test_sidebar_skill_renames_only_after_applicable_read_checks_pass() -> None:
+def test_sidebar_skill_binds_each_registration_branch_exactly_once() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
-    rename_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+    create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
+    verification_step = skill.split("\n7. ", 1)[1].split("\n8. ", 1)[0]
 
-    assert rename_step.startswith(
-        "Before any rename, durably bind every reconciled task and every newly "
-        "created task to its exact native thread ID"
-    )
+    bind_call = "session_sidebar_bind(lease_token=<exact token>, codex_thread_id=<threadId>)"
+    assert reconcile_step.count(bind_call) == 1
+    assert create_step.count(bind_call) == 1
+    assert bind_call not in verification_step
+    assert (
+        "Reconciled and newly created tasks are already bound exactly once in their "
+        "respective branches."
+    ) in verification_step
+    assert "Do not call `session_sidebar_bind` again" in verification_step
     assert (
         "Rename a bound task only after every applicable exact-ID read, identity, "
         "marker, and authenticated-quiescence check has passed"
-    ) in rename_step
-    assert "Rename every bound task" not in rename_step
-    assert "whenever" not in rename_step
-    assert "flag" not in rename_step.casefold()
+    ) in verification_step
     assert (
         "On rename failure, call `session_sidebar_fail` with `rename_failed` and "
         "`codex_thread_id=<threadId>`; do not commit and do not create a "
         "replacement task."
-    ) in rename_step
+    ) in verification_step
+
+
+def test_sidebar_skill_reconciled_bind_is_after_candidate_authentication() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    reconcile_step = skill.split("\n5. ", 1)[1].split("\n6. ", 1)[0]
+
+    assert reconcile_step.index("Never bind an unauthenticated candidate") < (
+        reconcile_step.index("session_sidebar_bind")
+    )
 
 
 def test_sidebar_skill_waits_for_new_task_indexing_before_rename() -> None:
