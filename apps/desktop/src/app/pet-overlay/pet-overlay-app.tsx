@@ -46,8 +46,8 @@ const ALPHA_HIT_THRESHOLD = 16
 
 // Below this much pointer travel, a press counts as a click, not a drag.
 const CLICK_SLOP_PX = 3
-// A second click within this window is a double-click (raise app) and cancels
-// the deferred single-click (open composer), so a double never flashes it open.
+// A second click within this window is a double-click (open composer) and
+// cancels the deferred single-click (raise app), so Hermes never flashes first.
 const DOUBLE_CLICK_MS = 250
 
 interface DragState {
@@ -268,19 +268,19 @@ export function PetOverlayApp() {
       return
     }
 
-    // Double-click toggles the app window (minimize ↔ restore); defer the
-    // single-click composer toggle so a double never flashes the composer open.
+    // Single-click brings Hermes forward. Defer it briefly so a double-click
+    // can open the quick composer without flashing/focusing the main app first.
     if (clickTimerRef.current) {
       clearTimeout(clickTimerRef.current)
       clickTimerRef.current = undefined
-      window.hermesDesktop?.petOverlay?.control({ type: 'toggle-app' })
+      setComposerOpen(open => !open)
 
       return
     }
 
     clickTimerRef.current = setTimeout(() => {
       clickTimerRef.current = undefined
-      setComposerOpen(open => !open)
+      window.hermesDesktop?.petOverlay?.control({ type: 'show-app' })
     }, DOUBLE_CLICK_MS)
   }
 

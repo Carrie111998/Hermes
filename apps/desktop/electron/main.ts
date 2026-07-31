@@ -9639,16 +9639,15 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
     return
   }
 
-  // Double-click toggles the app window: hide it away if it's up front, bring it
-  // back if it's minimized/buried. Pure window control — nothing for the
-  // renderer to do, so don't forward it.
-  if (payload && payload.type === 'toggle-app') {
-    if (mainWindow.isMinimized() || !mainWindow.isVisible()) {
-      mainWindow.show()
-      mainWindow.focus()
-    } else {
-      mainWindow.minimize()
+  // Ordinary pet click is one-way: surface Hermes without minimizing an
+  // already-visible window. Pure window control, so don't forward it.
+  if (payload && payload.type === 'show-app') {
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore()
     }
+
+    mainWindow.show()
+    mainWindow.focus()
 
     return
   }

@@ -56,7 +56,7 @@ export type PetOverlayControl =
   | { type: 'submit'; text: string }
   | { type: 'bounds'; bounds: PetOverlayBounds }
   | { type: 'open-app' }
-  | { type: 'toggle-app' }
+  | { type: 'show-app' }
   | { type: 'scale'; scale: number }
 
 // Persisted across restarts: was the pet popped out, and where on the desktop
