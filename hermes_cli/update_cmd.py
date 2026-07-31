@@ -3157,11 +3157,9 @@ def _restart_launchd_gateway_after_update() -> list[str]:
     from tests, mirroring ``_for_each_systemd_gateway_unit`` on the systemd
     side (#68523).
     """
-    label = None
     try:
         from hermes_cli.gateway import (
             launchd_restart,
-            launchd_start,
             get_launchd_label,
             get_launchd_plist_path,
         )
@@ -3173,26 +3171,16 @@ def _restart_launchd_gateway_after_update() -> list[str]:
             # managed, so there is nothing to restart and nothing to warn about.
             return []
 
-        check = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=5,
-        )
         try:
-            if check.returncode == 0:
-                launchd_restart()
-            else:
-                # Booted out of launchd while the plist is still installed:
-                # `launchctl list` exits non-zero, and KeepAlive cannot revive
-                # a definition that is no longer registered. This branch used
-                # to be skipped with no else and no message, so the update
-                # exited 0 with the gateway dead — the one state that actually
-                # needs recovery was the state being screened out.
-                # launchd_start() bootstraps the plist rather than assuming a
-                # live process to drain.
-                print("  ↻ Gateway was unloaded from launchd; reloading it")
-                launchd_start()
+            # No loaded/unloaded pre-classification: `launchctl list <label>`
+            # is session-scoped and can exit non-zero while the job is alive
+            # in its gui/user domain, and that state must still be restarted
+            # onto the new code — a plain start would leave the old process
+            # running (kickstart without -k does not terminate it).
+            # launchd_restart() covers every plist-present state: it drains a
+            # live PID, kickstarts with -k, and falls back to
+            # bootout/bootstrap/kickstart when the job is genuinely unloaded.
+            launchd_restart()
             return [label]
         except subprocess.CalledProcessError as e:
             stderr = (getattr(e, "stderr", "") or "").strip()
@@ -3200,9 +3188,9 @@ def _restart_launchd_gateway_after_update() -> list[str]:
             _warn_launchd_gateway_left_down()
             return []
     except (FileNotFoundError, subprocess.TimeoutExpired, ImportError) as e:
-        # A missing launchctl, a 5s timeout, or a failed import used to
-        # `pass`, producing a silent no-op restart beneath a success-looking
-        # update.
+        # A missing launchctl, a launchctl timeout, or a failed import used
+        # to `pass`, producing a silent no-op restart beneath a
+        # success-looking update.
         print(f"  ⚠ Could not restart the gateway: {e}")
         _warn_launchd_gateway_left_down()
         return []
