@@ -158,6 +158,15 @@ class TestDetectProviderForModel:
         assert detect_provider_for_model("gpt-5.4", "custom:foo") is None
 
 
+    def test_nous_served_gemini_lite_models_stay_on_nous(self):
+        """Nous-served IDs must not be reassigned to Vertex by static routing."""
+        for model_id in (
+            "google/gemini-3.1-flash-lite",
+            "google/gemini-3.5-flash-lite",
+        ):
+            assert detect_provider_for_model(model_id, "nous") is None
+
+
 
 
 class TestIsNousFreeTier:
@@ -446,5 +455,4 @@ class TestClaudeSonnet5InCuratedLists:
     def test_anthropic_native_list_includes_sonnet_5(self):
         from hermes_cli.models import _PROVIDER_MODELS
         assert "claude-sonnet-5" in _PROVIDER_MODELS["anthropic"]
-
 
