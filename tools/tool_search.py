@@ -96,6 +96,15 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 20000
+    # Providers for which the deferred-tool bridge is force-disabled, no
+    # matter what ``enabled`` says. Small local models (e.g. Ollama-served
+    # qwen3) often can't drive the tool_search/tool_describe/tool_call
+    # indirection — they wrap every call through a malformed ``tool_call``
+    # envelope and loop until interrupt. Listing a provider here makes the
+    # gate behave as ``off`` for that provider only, so those models see and
+    # call real tools directly. Case-insensitive match against the active
+    # provider name. Example: ``disabled_providers: [custom]``.
+    disabled_providers: Tuple[str, ...] = ()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -145,6 +154,8 @@ class ToolSearchConfig:
             listing = "auto"
         listing_max_tokens = max(200, min(60000, _safe_int(raw.get("listing_max_tokens"), 20000)))
 
+        disabled_providers = _parse_provider_list(raw.get("disabled_providers"))
+
         return cls(
             enabled=enabled,
             threshold_pct=threshold_pct,
@@ -152,6 +163,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            disabled_providers=disabled_providers,
         )
 
 
@@ -167,6 +179,64 @@ def _safe_float(value: Any, fallback: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _parse_provider_list(value: Any) -> Tuple[str, ...]:
+    """Normalize a ``disabled_providers`` config value to a lowercase tuple.
+
+    Accepts a YAML list (``[custom, lmstudio]``), a single string
+    (``custom``), or a comma-separated string (``custom,lmstudio``). Blank /
+    non-string entries are dropped. Anything unparseable yields ``()`` rather
+    than raising, so a config typo never breaks tool loading.
+    """
+    if not value:
+        return ()
+    items: List[Any]
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return ()
+    out: List[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        name = item.strip().lower()
+        if name and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
+def resolve_active_provider() -> str:
+    """Resolve the provider name for the *current* run, lowercased.
+
+    Prefers the task-local ``HERMES_ACTIVE_PROVIDER`` ContextVar (set by the
+    cron scheduler from the job's pinned provider and by the gateway from a
+    per-session model override), then falls back to ``model.provider`` in
+    config. Task-local resolution is required because the parallel cron pass
+    and the gateway both run jobs/sessions concurrently — a process-global
+    would race. Returns ``""`` when it can't be resolved — callers treat that
+    as "no provider-specific override applies".
+    """
+    try:
+        from gateway.session_context import get_session_env
+        ctx_provider = (get_session_env("HERMES_ACTIVE_PROVIDER", "") or "").strip()
+        if ctx_provider:
+            return ctx_provider.lower()
+    except Exception:
+        # session_context import/read must never break tool loading; fall
+        # through to the config default.
+        pass
+    try:
+        from hermes_cli.config import load_config as _load
+        cfg = _load() or {}
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        return str(model_cfg.get("provider") or "").strip().lower()
+    except Exception:
+        return ""
 
 
 def load_config() -> ToolSearchConfig:

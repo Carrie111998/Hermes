@@ -516,3 +516,170 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+# ---------------------------------------------------------------------------
+# Per-provider force-off (tools.tool_search.disabled_providers)
+# ---------------------------------------------------------------------------
+
+
+class TestDisabledProviders:
+    """Small local models (e.g. Ollama-served qwen3 on the ``custom``
+    provider) can't drive the tool_search/describe/call bridge — they wrap
+    every call through a malformed ``tool_call`` envelope and loop until
+    interrupt. ``disabled_providers`` lets the bridge stay on for capable
+    providers while being force-disabled per provider."""
+
+    def test_disabled_providers_parsed_from_list(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw(
+            {"enabled": "auto", "disabled_providers": ["Custom", "LMStudio"]}
+        )
+        assert cfg.disabled_providers == ("custom", "lmstudio")
+
+    def test_disabled_providers_parsed_from_csv_string(self):
+        from tools.tool_search import ToolSearchConfig
+        cfg = ToolSearchConfig.from_raw(
+            {"disabled_providers": "custom, openrouter"}
+        )
+        assert cfg.disabled_providers == ("custom", "openrouter")
+
+    def test_disabled_providers_defaults_empty(self):
+        from tools.tool_search import ToolSearchConfig
+        assert ToolSearchConfig.from_raw({"enabled": "auto"}).disabled_providers == ()
+        assert ToolSearchConfig.from_raw(True).disabled_providers == ()
+        assert ToolSearchConfig.from_raw(None).disabled_providers == ()
+
+    def test_parse_provider_list_dedupes_and_drops_garbage(self):
+        from tools.tool_search import _parse_provider_list
+        assert _parse_provider_list(["a", "a", "b"]) == ("a", "b")
+        assert _parse_provider_list([1, None, "  ", "x"]) == ("x",)
+        assert _parse_provider_list(123) == ()
+        assert _parse_provider_list(None) == ()
+
+    def test_resolve_active_provider_prefers_contextvar(self):
+        from tools.tool_search import resolve_active_provider
+        from gateway.session_context import (
+            set_active_provider, reset_active_provider,
+        )
+        tok = set_active_provider("Custom")
+        try:
+            assert resolve_active_provider() == "custom"
+        finally:
+            reset_active_provider(tok)
+
+    def test_gate_defers_for_capable_provider_but_not_disabled_one(self, monkeypatch):
+        """The whole contract: identical toolsets + config, one provider keeps
+        the bridge (deferrable tool hidden), the disabled provider sees the
+        real tool directly with no bridge."""
+        import model_tools
+        from tools.registry import registry
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+        from gateway.session_context import (
+            set_active_provider, reset_active_provider,
+        )
+
+        registry.register(
+            name="mcp__gatecheck__op",
+            toolset="mcp-gatecheck",
+            schema={
+                "name": "mcp__gatecheck__op",
+                "description": "x" * 400,
+                "parameters": {"type": "object",
+                               "properties": {"a": {"type": "string"}}},
+            },
+            handler=lambda args, **kw: "{}",
+        )
+
+        def _bridge_and_tool(provider: str):
+            tok = set_active_provider(provider)
+            try:
+                model_tools._tool_defs_cache.clear()
+                defs = model_tools.get_tool_definitions(
+                    enabled_toolsets=["mcp-gatecheck"], quiet_mode=True
+                )
+            finally:
+                reset_active_provider(tok)
+            names = {d["function"]["name"] for d in defs}
+            return bool(names & BRIDGE_TOOL_NAMES), "mcp__gatecheck__op" in names
+
+        # Force a config where 'custom' is disabled and the bridge would
+        # otherwise activate (auto + a deferrable tool present).
+        from tools import tool_search as _ts
+        monkeypatch.setattr(
+            _ts, "load_config",
+            lambda: _ts.ToolSearchConfig.from_raw(
+                {"enabled": "auto", "disabled_providers": ["custom"]}
+            ),
+        )
+        monkeypatch.setattr(model_tools, "_resolve_active_context_length",
+                            lambda: 200000, raising=False)
+
+        or_bridge, or_tool = _bridge_and_tool("openrouter")
+        cu_bridge, cu_tool = _bridge_and_tool("custom")
+
+        assert or_bridge is True, "capable provider should keep the bridge"
+        assert or_tool is False, "deferrable tool should be hidden behind bridge"
+        assert cu_bridge is False, "disabled provider must NOT get the bridge"
+        assert cu_tool is True, "disabled provider must see the real tool directly"
+
+    def test_concurrent_jobs_do_not_clobber_each_other(self, monkeypatch):
+        """Two threads assembling schemas with different providers must not
+        race: the ContextVar is task-local, so a 'custom' (bridge-off) run and
+        an 'openrouter' (bridge-on) run in parallel each get their own answer.
+        This is the regression guard for the os.environ concurrency bug."""
+        import threading
+        import model_tools
+        from tools.registry import registry
+        from tools.tool_search import BRIDGE_TOOL_NAMES
+        from gateway.session_context import (
+            set_active_provider, reset_active_provider,
+        )
+
+        registry.register(
+            name="mcp__concur__op",
+            toolset="mcp-concur",
+            schema={
+                "name": "mcp__concur__op",
+                "description": "y" * 400,
+                "parameters": {"type": "object",
+                               "properties": {"a": {"type": "string"}}},
+            },
+            handler=lambda args, **kw: "{}",
+        )
+        from tools import tool_search as _ts
+        monkeypatch.setattr(
+            _ts, "load_config",
+            lambda: _ts.ToolSearchConfig.from_raw(
+                {"enabled": "auto", "disabled_providers": ["custom"]}
+            ),
+        )
+        monkeypatch.setattr(model_tools, "_resolve_active_context_length",
+                            lambda: 200000, raising=False)
+
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def _run(provider: str):
+            tok = set_active_provider(provider)
+            try:
+                # Sync both threads so their assembly windows overlap.
+                barrier.wait(timeout=5)
+                defs = model_tools.get_tool_definitions(
+                    enabled_toolsets=["mcp-concur"], quiet_mode=True
+                )
+                names = {d["function"]["name"] for d in defs}
+                results[provider] = bool(names & BRIDGE_TOOL_NAMES)
+            finally:
+                reset_active_provider(tok)
+
+        # Each thread starts with a fresh copied context (like a real per-job /
+        # per-message task) so the ContextVar is isolated.
+        import contextvars
+        t1 = threading.Thread(target=contextvars.copy_context().run, args=(_run, "openrouter"))
+        t2 = threading.Thread(target=contextvars.copy_context().run, args=(_run, "custom"))
+        t1.start(); t2.start()
+        t1.join(10); t2.join(10)
+
+        assert results.get("openrouter") is True, "openrouter must keep the bridge under concurrency"
+        assert results.get("custom") is False, "custom must stay bridge-off under concurrency"
