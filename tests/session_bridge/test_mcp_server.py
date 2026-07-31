@@ -2379,6 +2379,44 @@ def test_sidebar_status_shapes_placement_without_secret_identity_fields() -> Non
         assert secret not in encoded
 
 
+def test_sidebar_status_preserves_only_broker_thresholds_and_identity() -> None:
+    status = _sidebar_status({
+        "counts": {"pending": 1},
+        "oldest_eligible_age_seconds": 301.0,
+        "oldest_pending_age_seconds": 12.0,
+        "heartbeat_stale": True,
+        "oldest_job_overdue": True,
+        "degraded_reasons": [
+            "broker_heartbeat_stale",
+            "oldest_pending_stale",
+            "private exception",
+        ],
+        "broker": {
+            "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+            "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+            "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+            "messages": ["private source payload"],
+            "lease_token": "private token",
+        },
+        "messages": ["private source payload"],
+    })
+
+    assert status["heartbeat_stale"] is True
+    assert status["oldest_job_overdue"] is True
+    assert status["degraded_reasons"] == [
+        "broker_heartbeat_stale",
+        "oldest_pending_stale",
+    ]
+    assert status["broker"] == {
+        "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+    }
+    rendered = repr(status)
+    assert "messages" not in rendered
+    assert "private" not in rendered
+
+
 def test_sidebar_status_sanitizes_negative_canary_verified_at() -> None:
     status = _sidebar_status({
         "counts": {},

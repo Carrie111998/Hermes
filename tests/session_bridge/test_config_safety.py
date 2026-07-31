@@ -34,7 +34,12 @@ from session_bridge.config import (
 
 
 def _installed_default_bridge_config() -> BridgeConfig:
-    return BridgeConfig(sidebar=SidebarConfig(inbox_cwd=str(_DEFAULT_CONFIG_HOME)))
+    return BridgeConfig(
+        sidebar=SidebarConfig(
+            inbox_cwd=str(_DEFAULT_CONFIG_HOME),
+            readable_preview_enabled=False,
+        )
+    )
 
 
 def _load(
@@ -239,7 +244,16 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
             "inbox_cwd": str(_DEFAULT_CONFIG_HOME),
         }
     }
-    assert asdict(SidebarConfig()) == _SIDEBAR_DEFAULTS
+    assert asdict(SidebarConfig()) == {
+        **_SIDEBAR_DEFAULTS,
+        "delivery_mode": "desktop_broker",
+        "broker_thread_id": None,
+        "broker_project_id": None,
+        "broker_cwd": None,
+        "heartbeat_interval_seconds": 60,
+        "oldest_job_alert_seconds": 300,
+        "readable_preview_enabled": True,
+    }
     assert not any("SIDEBAR" in name for name in _ENV_NAMES)
 
     config = _load_with_sidebar(monkeypatch, {})
@@ -450,12 +464,18 @@ def test_sidebar_config_loads_only_from_config_yaml(
         "placement_generation": 1,
         "enabled": True,
         "continuous": True,
+        "delivery_mode": "desktop_broker",
+        "broker_thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "broker_project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "broker_cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
         "backfill_days": 14,
         "continuous_batch_limit": 3,
         "manual_batch_limit": 7,
         "lease_seconds": 300,
         "max_attempts": 5,
-        "heartbeat_grace_seconds": 45,
+        "heartbeat_interval_seconds": 60,
+        "heartbeat_grace_seconds": 120,
+        "oldest_job_alert_seconds": 300,
         "readable_preview_enabled": True,
         "legacy_hydration_enabled": True,
         "preview_budget_chars": 12_000,
@@ -464,6 +484,59 @@ def test_sidebar_config_loads_only_from_config_yaml(
     config = _load_with_sidebar(monkeypatch, configured)
 
     assert asdict(config.sidebar) == configured
+    assert config.sidebar.heartbeat_stale_seconds == 180
+
+
+def test_desktop_broker_continuous_delivery_requires_exact_identity_and_thresholds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configured = {
+        "enabled": True,
+        "continuous": True,
+        "delivery_mode": "desktop_broker",
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+        "broker_thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "broker_project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "broker_cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+        "heartbeat_interval_seconds": 60,
+        "heartbeat_grace_seconds": 120,
+        "oldest_job_alert_seconds": 300,
+        "readable_preview_enabled": True,
+    }
+
+    config = _load_with_sidebar(monkeypatch, configured)
+
+    assert config.sidebar.delivery_mode == "desktop_broker"
+    assert config.sidebar.heartbeat_interval_seconds == 60
+    assert config.sidebar.heartbeat_stale_seconds == 180
+    assert config.sidebar.oldest_job_alert_seconds == 300
+    assert config.service.catalog_scan_seconds <= 60
+
+
+@pytest.mark.parametrize(
+    "field",
+    ("inbox_cwd", "broker_thread_id", "broker_project_id", "broker_cwd"),
+)
+def test_desktop_broker_continuous_delivery_fails_closed_without_identity(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    configured = {
+        "enabled": True,
+        "continuous": True,
+        "delivery_mode": "desktop_broker",
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+        "broker_thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "broker_project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "broker_cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+        "heartbeat_interval_seconds": 60,
+        "heartbeat_grace_seconds": 120,
+        "oldest_job_alert_seconds": 300,
+        "readable_preview_enabled": True,
+    }
+    configured.pop(field)
+
+    with pytest.raises(ValueError, match="desktop broker identity"):
+        _load_with_sidebar(monkeypatch, configured)
 
 
 @pytest.mark.parametrize(
@@ -471,7 +544,6 @@ def test_sidebar_config_loads_only_from_config_yaml(
     (
         ("inbox_cwd", "", "inbox_cwd must be a non-empty string"),
         ("inbox_cwd", 1, "inbox_cwd must be a non-empty string"),
-        ("inbox_cwd", None, "inbox_cwd must be a non-empty string"),
         ("placement_generation", True, "placement_generation must be an integer"),
         (
             "placement_generation",

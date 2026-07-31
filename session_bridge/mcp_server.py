@@ -391,6 +391,47 @@ def create_app(
             inbox_cwd=config.sidebar.inbox_cwd,
             placement_generation=config.sidebar.placement_generation,
         )
+        status_time = time.time()
+        heartbeat_at = _finite_status_number(sidebar_status.get("last_heartbeat_at"))
+        heartbeat_age = (
+            max(0.0, status_time - heartbeat_at) if heartbeat_at is not None else None
+        )
+        counts = _status_mapping(sidebar_status.get("counts"))
+        pending = sum(
+            _nonnegative_status_int(counts.get(state.value), 0)
+            for state in (
+                SidebarJobState.PENDING,
+                SidebarJobState.LEASED,
+                SidebarJobState.RETRY,
+            )
+        )
+        oldest_eligible_age = _finite_status_number(
+            sidebar_status.get("oldest_eligible_age_seconds")
+        )
+        sidebar_status.update({
+            "heartbeat_stale": (
+                heartbeat_age is not None
+                and heartbeat_age > config.sidebar.heartbeat_stale_seconds
+            ),
+            "oldest_job_overdue": (
+                pending > 0
+                and oldest_eligible_age is not None
+                and oldest_eligible_age > config.sidebar.oldest_job_alert_seconds
+            ),
+            "broker": {
+                "thread_id": config.sidebar.broker_thread_id,
+                "project_id": config.sidebar.broker_project_id,
+                "cwd": config.sidebar.broker_cwd,
+            },
+        })
+        sidebar_status["degraded_reasons"] = [
+            code
+            for code, active in (
+                ("broker_heartbeat_stale", sidebar_status["heartbeat_stale"]),
+                ("oldest_pending_stale", sidebar_status["oldest_job_overdue"]),
+            )
+            if active
+        ]
         hydration_status = await asyncio.to_thread(
             store.sidebar_hydration_status,
             time.time(),
@@ -1531,6 +1572,30 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         recovery_status = None
         recovery_at = None
     placement = _sidebar_placement_status(source.get("placement"))
+    broker_source = _status_mapping(source.get("broker"))
+    broker = {
+        key: value
+        for key, value in (
+            ("thread_id", broker_source.get("thread_id")),
+            ("project_id", broker_source.get("project_id")),
+            ("cwd", broker_source.get("cwd")),
+        )
+        if type(value) is str
+        and value
+        and value == value.strip()
+        and "\n" not in value
+        and "\r" not in value
+    }
+    raw_degraded_reasons = source.get("degraded_reasons")
+    degraded_reasons = (
+        [
+            code
+            for code in raw_degraded_reasons
+            if code in {"broker_heartbeat_stale", "oldest_pending_stale"}
+        ]
+        if isinstance(raw_degraded_reasons, (list, tuple))
+        else []
+    )
     result = {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
@@ -1560,10 +1625,17 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             "by_resolution_code": shaped_resolution_codes,
         },
         "execution_blockers": execution_blockers,
+        "oldest_eligible_age_seconds": _finite_status_number(
+            source.get("oldest_eligible_age_seconds")
+        ),
         "oldest_pending_age_seconds": _finite_status_number(
             source.get("oldest_pending_age_seconds")
         ),
         "last_heartbeat_at": _finite_status_number(source.get("last_heartbeat_at")),
+        "heartbeat_stale": source.get("heartbeat_stale") is True,
+        "oldest_job_overdue": source.get("oldest_job_overdue") is True,
+        "degraded_reasons": degraded_reasons,
+        "broker": broker,
         "last_visible_task_id": task_id,
         "recent_error_codes": (
             _fixed_status_codes(recent) if isinstance(recent, (list, tuple)) else []

@@ -72,15 +72,25 @@ class SidebarConfig:
     placement_generation: int = 1
     enabled: bool = False
     continuous: bool = False
+    delivery_mode: str = "desktop_broker"
+    broker_thread_id: str | None = None
+    broker_project_id: str | None = None
+    broker_cwd: str | None = None
     backfill_days: int = 30
     continuous_batch_limit: int = 5
     manual_batch_limit: int = 10
     lease_seconds: int = 300
     max_attempts: int = 5
+    heartbeat_interval_seconds: int = 60
     heartbeat_grace_seconds: int = 120
-    readable_preview_enabled: bool = False
+    oldest_job_alert_seconds: int = 300
+    readable_preview_enabled: bool = True
     legacy_hydration_enabled: bool = False
     preview_budget_chars: int = 24_000
+
+    @property
+    def heartbeat_stale_seconds(self) -> int:
+        return self.heartbeat_interval_seconds + self.heartbeat_grace_seconds
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,12 @@ class BridgeConfig:
                 "preview_budget_chars",
                 "inbox_cwd",
                 "placement_generation",
+                "delivery_mode",
+                "broker_thread_id",
+                "broker_project_id",
+                "broker_cwd",
+                "heartbeat_interval_seconds",
+                "oldest_job_alert_seconds",
             }),
             scope="session_bridge.sidebar",
         )
@@ -359,14 +375,11 @@ class BridgeConfig:
             ),
         )
         sidebar_defaults = cls().sidebar
-        if "inbox_cwd" in sidebar:
-            inbox_cwd = sidebar["inbox_cwd"]
-            if not isinstance(inbox_cwd, str) or not inbox_cwd:
-                raise ValueError(
-                    "session_bridge.sidebar.inbox_cwd must be a non-empty string"
-                )
-        else:
-            inbox_cwd = sidebar_defaults.inbox_cwd
+        inbox_cwd = _canonical_sidebar_string(
+            sidebar.get("inbox_cwd", sidebar_defaults.inbox_cwd),
+            "session_bridge.sidebar.inbox_cwd",
+            allow_none=True,
+        )
         placement_generation = _toml_int(
             sidebar.get(
                 "placement_generation", sidebar_defaults.placement_generation
@@ -389,6 +402,51 @@ class BridgeConfig:
         )
         if max_attempts != 5:
             raise ValueError("session_bridge.sidebar.max_attempts must be exactly 5")
+        delivery_mode = _canonical_sidebar_string(
+            sidebar.get("delivery_mode", sidebar_defaults.delivery_mode),
+            "session_bridge.sidebar.delivery_mode",
+        )
+        if delivery_mode != "desktop_broker":
+            raise ValueError(
+                "session_bridge.sidebar.delivery_mode must be exactly desktop_broker"
+            )
+        broker_thread_id = _canonical_sidebar_string(
+            sidebar.get("broker_thread_id", sidebar_defaults.broker_thread_id),
+            "session_bridge.sidebar.broker_thread_id",
+            allow_none=True,
+        )
+        broker_project_id = _canonical_sidebar_string(
+            sidebar.get("broker_project_id", sidebar_defaults.broker_project_id),
+            "session_bridge.sidebar.broker_project_id",
+            allow_none=True,
+        )
+        broker_cwd = _canonical_sidebar_string(
+            sidebar.get("broker_cwd", sidebar_defaults.broker_cwd),
+            "session_bridge.sidebar.broker_cwd",
+            allow_none=True,
+        )
+        heartbeat_interval_seconds = _toml_int(
+            sidebar.get(
+                "heartbeat_interval_seconds",
+                sidebar_defaults.heartbeat_interval_seconds,
+            ),
+            "session_bridge.sidebar.heartbeat_interval_seconds",
+        )
+        if heartbeat_interval_seconds != 60:
+            raise ValueError(
+                "session_bridge.sidebar.heartbeat_interval_seconds must be exactly 60"
+            )
+        oldest_job_alert_seconds = _toml_int(
+            sidebar.get(
+                "oldest_job_alert_seconds",
+                sidebar_defaults.oldest_job_alert_seconds,
+            ),
+            "session_bridge.sidebar.oldest_job_alert_seconds",
+        )
+        if oldest_job_alert_seconds != 300:
+            raise ValueError(
+                "session_bridge.sidebar.oldest_job_alert_seconds must be exactly 300"
+            )
         sidebar_config = SidebarConfig(
             inbox_cwd=inbox_cwd,
             placement_generation=placement_generation,
@@ -400,6 +458,10 @@ class BridgeConfig:
                 sidebar.get("continuous", sidebar_defaults.continuous),
                 "session_bridge.sidebar.continuous",
             ),
+            delivery_mode=delivery_mode,
+            broker_thread_id=broker_thread_id,
+            broker_project_id=broker_project_id,
+            broker_cwd=broker_cwd,
             backfill_days=_toml_int(
                 sidebar.get("backfill_days", sidebar_defaults.backfill_days),
                 "session_bridge.sidebar.backfill_days",
@@ -425,6 +487,7 @@ class BridgeConfig:
             ),
             lease_seconds=lease_seconds,
             max_attempts=max_attempts,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
             heartbeat_grace_seconds=_toml_int(
                 sidebar.get(
                     "heartbeat_grace_seconds",
@@ -433,6 +496,7 @@ class BridgeConfig:
                 "session_bridge.sidebar.heartbeat_grace_seconds",
                 minimum=0,
             ),
+            oldest_job_alert_seconds=oldest_job_alert_seconds,
             readable_preview_enabled=_toml_bool(
                 sidebar.get(
                     "readable_preview_enabled",
@@ -457,6 +521,24 @@ class BridgeConfig:
                 maximum=100_000,
             ),
         )
+        if sidebar_config.enabled and sidebar_config.continuous:
+            if not all(
+                (
+                    sidebar_config.inbox_cwd,
+                    sidebar_config.broker_thread_id,
+                    sidebar_config.broker_project_id,
+                    sidebar_config.broker_cwd,
+                )
+            ):
+                raise ValueError("desktop broker identity is required for continuous delivery")
+            if not sidebar_config.readable_preview_enabled:
+                raise ValueError(
+                    "desktop broker readable preview is required for continuous delivery"
+                )
+            if service_config.catalog_scan_seconds > 60:
+                raise ValueError(
+                    "desktop broker continuous delivery requires catalog_scan_seconds at most 60"
+                )
         claude_visibility_defaults = cls().claude_visibility
         claude_visibility_config = ClaudeVisibilityConfig(
             enabled=_toml_bool(
@@ -615,6 +697,27 @@ def _host(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} must be a non-empty string")
     return value.strip().lower()
+
+
+def _canonical_sidebar_string(
+    value: object,
+    name: str,
+    *,
+    allow_none: bool = False,
+) -> str | None:
+    if value is None and allow_none:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+    ):
+        if name == "session_bridge.sidebar.inbox_cwd":
+            raise ValueError(f"{name} must be a non-empty string")
+        raise ValueError(f"{name} must be a canonical non-empty single-line string")
+    return value
 
 
 def _is_loopback_host(host: str) -> bool:

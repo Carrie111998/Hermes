@@ -592,6 +592,14 @@ class _Backend(Protocol):
     ) -> Mapping[str, Any]: ...
     def status(self) -> Mapping[str, Any]: ...
     def sidebar_status(self) -> Mapping[str, Any]: ...
+    def configure_sidebar_broker(
+        self,
+        *,
+        thread_id: str,
+        project_id: str,
+        cwd: str,
+        inbox_cwd: str,
+    ) -> Mapping[str, Any]: ...
     def sidebar_backfill(
         self, *, days: int, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
@@ -941,8 +949,76 @@ class ProductionBackend:
         return _public_sidebar_status(
             raw,
             now=status_time,
-            grace_seconds=self.config.sidebar.heartbeat_grace_seconds,
+            heartbeat_interval_seconds=self.config.sidebar.heartbeat_interval_seconds,
+            heartbeat_grace_seconds=self.config.sidebar.heartbeat_grace_seconds,
+            oldest_job_alert_seconds=self.config.sidebar.oldest_job_alert_seconds,
+            broker_thread_id=self.config.sidebar.broker_thread_id,
+            broker_project_id=self.config.sidebar.broker_project_id,
+            broker_cwd=self.config.sidebar.broker_cwd,
         )
+
+    def configure_sidebar_broker(
+        self,
+        *,
+        thread_id: str,
+        project_id: str,
+        cwd: str,
+        inbox_cwd: str,
+    ) -> Mapping[str, Any]:
+        values = {
+            "broker_thread_id": _canonical_sidebar_broker_value(thread_id),
+            "broker_project_id": _canonical_sidebar_broker_value(project_id),
+            "broker_cwd": _canonical_sidebar_broker_value(cwd),
+            "inbox_cwd": _canonical_sidebar_broker_value(inbox_cwd),
+        }
+        persisted_values = {
+            "delivery_mode": "desktop_broker",
+            **values,
+            "heartbeat_interval_seconds": 60,
+            "heartbeat_grace_seconds": 120,
+            "oldest_job_alert_seconds": 300,
+            "readable_preview_enabled": True,
+        }
+        from hermes_cli.config import ConfigPersistenceRejected, mutate_config
+
+        def _mutate(document: dict[str, Any]) -> None:
+            session_bridge = document.setdefault("session_bridge", {})
+            if not isinstance(session_bridge, dict):
+                raise ConfigurationFailure("invalid_session_bridge_config")
+            sidebar = session_bridge.setdefault("sidebar", {})
+            if not isinstance(sidebar, dict):
+                raise ConfigurationFailure("invalid_sidebar_config")
+            sidebar.update(persisted_values)
+
+        try:
+            persisted = mutate_config(
+                _mutate,
+                preserve_keys={
+                    ("session_bridge", "sidebar", key)
+                    for key in persisted_values
+                },
+            )
+        except ConfigPersistenceRejected as exc:
+            raise ConfigurationFailure("config_persistence_rejected") from exc
+        sidebar = _persisted_sidebar_values(persisted)
+        if {key: sidebar.get(key) for key in persisted_values} != persisted_values:
+            raise ConfigurationFailure("sidebar_broker_not_persisted")
+        reloaded = BridgeConfig.load()
+        configured = reloaded.sidebar
+        if {
+            "delivery_mode": configured.delivery_mode,
+            "broker_thread_id": configured.broker_thread_id,
+            "broker_project_id": configured.broker_project_id,
+            "broker_cwd": configured.broker_cwd,
+            "inbox_cwd": configured.inbox_cwd,
+            "heartbeat_interval_seconds": configured.heartbeat_interval_seconds,
+            "heartbeat_grace_seconds": configured.heartbeat_grace_seconds,
+            "oldest_job_alert_seconds": configured.oldest_job_alert_seconds,
+            "readable_preview_enabled": configured.readable_preview_enabled,
+        } != persisted_values:
+            raise ConfigurationFailure("sidebar_broker_reload_mismatch")
+        self.config = reloaded
+        return persisted_values
 
     def sidebar_backfill(
         self, *, days: int, limit: int, apply: bool
@@ -3347,6 +3423,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sidebar_status.add_argument("--json", action="store_true")
 
+    sidebar_broker_configure = commands.add_parser(
+        "sidebar-broker-configure",
+        help="persist the exact Desktop sidebar broker identity",
+    )
+    sidebar_broker_configure.add_argument("--thread-id", required=True)
+    sidebar_broker_configure.add_argument("--project-id", required=True)
+    sidebar_broker_configure.add_argument("--cwd", required=True)
+    sidebar_broker_configure.add_argument("--inbox-cwd", required=True)
+
     sidebar_backfill = commands.add_parser(
         "sidebar-backfill",
         help="preview or enqueue a bounded recent native sidebar batch",
@@ -3680,6 +3765,17 @@ def main(
             payload = dict(backend.sidebar_status())
             _emit(payload)
             return EXIT_OK if payload.get("healthy") is True else EXIT_DEGRADED
+        if args.command == "sidebar-broker-configure":
+            payload = dict(
+                backend.configure_sidebar_broker(
+                    thread_id=args.thread_id,
+                    project_id=args.project_id,
+                    cwd=args.cwd,
+                    inbox_cwd=args.inbox_cwd,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
         if args.command == "sidebar-backfill":
             payload = dict(
                 backend.sidebar_backfill(
@@ -4310,10 +4406,22 @@ def _public_sidebar_status(
     raw: Mapping[str, Any],
     *,
     now: float,
-    grace_seconds: int,
+    heartbeat_interval_seconds: int,
+    heartbeat_grace_seconds: int,
+    oldest_job_alert_seconds: int,
+    broker_thread_id: str | None,
+    broker_project_id: str | None,
+    broker_cwd: str | None,
 ) -> dict[str, Any]:
     status_time = _finite_status_number(now)
-    if type(grace_seconds) is not int or grace_seconds < 0:
+    if (
+        type(heartbeat_interval_seconds) is not int
+        or heartbeat_interval_seconds < 0
+        or type(heartbeat_grace_seconds) is not int
+        or heartbeat_grace_seconds < 0
+        or type(oldest_job_alert_seconds) is not int
+        or oldest_job_alert_seconds < 0
+    ):
         raise ConfigurationFailure("invalid_sidebar_heartbeat_grace")
     raw_counts = raw.get("counts")
     counts = raw_counts if isinstance(raw_counts, Mapping) else {}
@@ -4445,12 +4553,15 @@ def _public_sidebar_status(
         Provider.CLAUDE.value: _status_count(providers.get(Provider.CLAUDE.value, 0)),
         Provider.HERMES.value: _status_count(providers.get(Provider.HERMES.value, 0)),
     }
+    oldest_eligible_age = _optional_status_number(
+        raw.get("oldest_eligible_age_seconds")
+    )
     oldest_age = _optional_status_number(raw.get("oldest_pending_age_seconds"))
     heartbeat_at = _optional_status_number(raw.get("last_heartbeat_at"))
     heartbeat_age = (
         max(0.0, status_time - heartbeat_at) if heartbeat_at is not None else None
     )
-    threshold = 60 + grace_seconds
+    heartbeat_threshold = heartbeat_interval_seconds + heartbeat_grace_seconds
     work_pending = (
         sum(
             state_counts[state.value]
@@ -4466,12 +4577,14 @@ def _public_sidebar_status(
     if blocking_failed_count > 0:
         degraded_reasons.append("sidebar_failed")
     heartbeat_stale = (
-        heartbeat_age > threshold
-        if heartbeat_age is not None
-        else oldest_age is not None and oldest_age > threshold
+        heartbeat_age is not None and heartbeat_age > heartbeat_threshold
     )
-    overdue_work = work_pending and oldest_age is not None and oldest_age > threshold
-    if overdue_work and heartbeat_stale:
+    overdue_work = (
+        work_pending
+        and oldest_eligible_age is not None
+        and oldest_eligible_age > oldest_job_alert_seconds
+    )
+    if heartbeat_stale:
         degraded_reasons.append("broker_heartbeat_stale")
     if overdue_work:
         degraded_reasons.append("oldest_pending_stale")
@@ -4581,10 +4694,19 @@ def _public_sidebar_status(
             },
         },
         "execution_blockers": execution_blockers,
+        "oldest_eligible_age_seconds": oldest_eligible_age,
         "oldest_pending_age_seconds": oldest_age,
         "last_heartbeat_at": heartbeat_at,
         "last_successful_heartbeat_at": heartbeat_at,
         "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_stale_seconds": heartbeat_threshold,
+        "heartbeat_stale": heartbeat_stale,
+        "oldest_job_overdue": overdue_work,
+        "broker": {
+            "thread_id": broker_thread_id,
+            "project_id": broker_project_id,
+            "cwd": broker_cwd,
+        },
         "last_visible_task_id": redact_codex_thread_id(task_id),
         "recent_error_codes": recent_codes,
         "delivery_latency_seconds": {
@@ -4759,6 +4881,30 @@ def _status_count(value: object) -> int:
     if type(value) is not int or value < 0:
         raise ConfigurationFailure("invalid_sidebar_status")
     return value
+
+
+def _canonical_sidebar_broker_value(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ConfigurationFailure("invalid_sidebar_broker_identity")
+    return value
+
+
+def _persisted_sidebar_values(document: object) -> Mapping[str, Any]:
+    if not isinstance(document, Mapping):
+        raise ConfigurationFailure("invalid_persisted_sidebar_config")
+    bridge = document.get("session_bridge")
+    if not isinstance(bridge, Mapping):
+        raise ConfigurationFailure("invalid_persisted_sidebar_config")
+    sidebar = bridge.get("sidebar")
+    if not isinstance(sidebar, Mapping):
+        raise ConfigurationFailure("invalid_persisted_sidebar_config")
+    return sidebar
 
 
 def _is_finite_number(value: object) -> bool:

@@ -244,6 +244,27 @@ class FakeBackend:
         self.calls.append(("sidebar_status",))
         return dict(self.sidebar_status_payload)
 
+    def configure_sidebar_broker(
+        self,
+        *,
+        thread_id: str,
+        project_id: str,
+        cwd: str,
+        inbox_cwd: str,
+    ) -> dict[str, Any]:
+        self.calls.append(("configure_sidebar_broker", thread_id, project_id, cwd, inbox_cwd))
+        return {
+            "delivery_mode": "desktop_broker",
+            "broker_thread_id": thread_id,
+            "broker_project_id": project_id,
+            "broker_cwd": cwd,
+            "inbox_cwd": inbox_cwd,
+            "heartbeat_interval_seconds": 60,
+            "heartbeat_grace_seconds": 120,
+            "oldest_job_alert_seconds": 300,
+            "readable_preview_enabled": True,
+        }
+
     def sidebar_backfill(self, *, days: int, limit: int, apply: bool) -> dict[str, Any]:
         self.calls.append(("sidebar_backfill", days, limit, apply))
         return {
@@ -614,6 +635,33 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     assert not any(
         call[0] in {"apply_backfill", "apply_mirror"} for call in backend.calls
     )
+
+
+def test_sidebar_broker_configure_persists_only_canonical_identity(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+    thread_id = "019f9b71-7109-7ed0-943a-d7291190245c"
+    project_id = "local-453ac85f86839c6d001817cb8480b8ca"
+    cwd = "C:\\Users\\diego\\Developer\\session-sidebar-broker"
+    inbox_cwd = "C:\\Users\\diego\\.hermes"
+
+    assert _run(
+        [
+            "sidebar-broker-configure",
+            "--thread-id", thread_id,
+            "--project-id", project_id,
+            "--cwd", cwd,
+            "--inbox-cwd", inbox_cwd,
+        ],
+        backend,
+    ) == 0
+
+    assert _json_output(capsys)["delivery_mode"] == "desktop_broker"
+    assert backend.calls == [
+        ("configure_sidebar_broker", thread_id, project_id, cwd, inbox_cwd),
+        ("close",),
+    ]
 
 
 def test_sidebar_readable_hydration_commands_are_explicit_and_never_schedule(
@@ -3095,7 +3143,7 @@ class _SidebarStatusStore:
         placement_generation: int,
     ) -> dict[str, Any]:
         assert now == 1_000.0
-        assert inbox_cwd is None
+        assert inbox_cwd in {None, "C:\\Users\\diego\\.hermes"}
         assert placement_generation == 1
         return dict(self.payload)
 
@@ -3469,6 +3517,7 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     backend = _production_sidebar_backend({
         "eligible_by_provider": {"claude": 2, "hermes": 1},
         "counts": {"pending": 1, "leased": 0, "retry": 0, "visible": 2, "failed": 0},
+        "oldest_eligible_age_seconds": 301.0,
         "oldest_pending_age_seconds": 181.0,
         "last_heartbeat_at": 819.0,
         "last_visible_task_id": "019f-secret-thread-identifier",
@@ -3507,6 +3556,51 @@ def test_sidebar_status_degrades_stale_pending_work_and_redacts_task_identity(
     assert "019f-secret-thread-identifier" not in rendered
     assert "lease_token" not in rendered
     assert "marker" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_at", "heartbeat_stale", "reasons"),
+    (
+        (821.0, False, ["oldest_pending_stale"]),
+        (819.0, True, ["broker_heartbeat_stale", "oldest_pending_stale"]),
+    ),
+)
+def test_sidebar_status_uses_broker_thresholds_and_preserves_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    heartbeat_at: float,
+    heartbeat_stale: bool,
+    reasons: list[str],
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    sidebar = replace(
+        SidebarConfig(),
+        enabled=True,
+        continuous=True,
+        inbox_cwd="C:\\Users\\diego\\.hermes",
+        broker_thread_id="019f9b71-7109-7ed0-943a-d7291190245c",
+        broker_project_id="local-453ac85f86839c6d001817cb8480b8ca",
+        broker_cwd="C:\\Users\\diego\\Developer\\session-sidebar-broker",
+    )
+    backend = ProductionBackend(replace(BridgeConfig(), sidebar=sidebar))
+    backend._store = _SidebarStatusStore({  # type: ignore[assignment]
+        "counts": {"pending": 1},
+        "oldest_eligible_age_seconds": 301.0,
+        "oldest_pending_age_seconds": 12.0,
+        "last_heartbeat_at": heartbeat_at,
+    })
+    backend._catalog = object()  # type: ignore[assignment]
+
+    status = backend.sidebar_status()
+
+    assert status["heartbeat_stale"] is heartbeat_stale
+    assert status["oldest_job_overdue"] is True
+    assert status["degraded_reasons"] == reasons
+    assert status["broker"] == {
+        "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+    }
+    assert "messages" not in repr(status)
 
 
 @pytest.mark.parametrize(
@@ -3580,21 +3674,21 @@ def test_sidebar_status_never_redacts_hostile_task_ids_by_fragment(
 @pytest.mark.parametrize(
     ("oldest_age", "heartbeat_at", "healthy", "reasons"),
     (
-        (179.0, 1.0, True, []),
-        (180.0, None, True, []),
+        (299.0, 999.0, True, []),
+        (300.0, None, True, []),
         (
-            181.0,
+            301.0,
             None,
             False,
-            ["broker_heartbeat_stale", "oldest_pending_stale"],
+            ["oldest_pending_stale"],
         ),
         (
-            181.0,
+            301.0,
             819.0,
             False,
             ["broker_heartbeat_stale", "oldest_pending_stale"],
         ),
-        (181.0, 999.0, False, ["oldest_pending_stale"]),
+        (301.0, 999.0, False, ["oldest_pending_stale"]),
     ),
 )
 def test_sidebar_status_alerts_only_for_work_older_than_threshold(
@@ -3607,8 +3701,9 @@ def test_sidebar_status_alerts_only_for_work_older_than_threshold(
     monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
     backend = _production_sidebar_backend({
         "eligible_by_provider": {"claude": 1, "hermes": 0},
-        "counts": {"pending": 1},
-        "oldest_pending_age_seconds": oldest_age,
+            "counts": {"pending": 1},
+            "oldest_eligible_age_seconds": oldest_age,
+            "oldest_pending_age_seconds": oldest_age,
         "last_heartbeat_at": heartbeat_at,
         "last_visible_task_id": None,
         "recent_error_codes": [],
@@ -3623,7 +3718,7 @@ def test_sidebar_status_alerts_only_for_work_older_than_threshold(
 
 @pytest.mark.parametrize(
     ("age", "healthy"),
-    ((0.0, True), (181.0, False)),
+    ((0.0, True), (301.0, False)),
 )
 def test_sidebar_status_includes_leased_only_actionable_work(
     monkeypatch: pytest.MonkeyPatch,
@@ -3633,9 +3728,10 @@ def test_sidebar_status_includes_leased_only_actionable_work(
     monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
     backend = _production_sidebar_backend({
         "eligible_by_provider": {"claude": 1, "hermes": 0},
-        "counts": {"leased": 1},
-        "oldest_pending_age_seconds": age,
-        "last_heartbeat_at": 1.0,
+            "counts": {"leased": 1},
+            "oldest_eligible_age_seconds": age,
+            "oldest_pending_age_seconds": age,
+            "last_heartbeat_at": 999.0,
         "last_visible_task_id": None,
         "recent_error_codes": [],
         "delivery_latency_seconds": {},
