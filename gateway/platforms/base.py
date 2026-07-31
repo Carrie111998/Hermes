@@ -4923,6 +4923,27 @@ class BasePlatformAdapter(ABC):
         done = getattr(task, "done", None)
         return bool(done and done())
 
+    def _make_session_lock_heal_callback(self, session_key: str, owner_task: "asyncio.Task[None]"):
+        """Build a done-callback that proactively heals a stale session lock.
+
+        This is the proactive counterpart to the reactive ``_heal_stale_session_lock``:
+        when the owner task exits (for any reason — success, error, or cancellation),
+        the callback heals the session lock so the adapter never ends up in a permanent
+        deadlock state where ``_active_sessions[session_key]`` is held but nothing is
+        actually processing.
+
+        The identity check (``self._session_tasks.get(key) is completed_task``) prevents
+        cross-contamination: if a newer task has taken over the session, the callback
+        for the old task is a no-op.
+        """
+
+        def _heal_lock_on_done(completed_task: "asyncio.Task[None]") -> None:
+            if self._session_tasks.get(session_key) is not owner_task:
+                return  # replaced by a newer task; not our job to clean up
+            self._heal_stale_session_lock(session_key)
+
+        return _heal_lock_on_done
+
     def _heal_stale_session_lock(self, session_key: str) -> bool:
         """Clear a stale session lock if the owner task is already gone.
 
@@ -4980,6 +5001,7 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
+            task.add_done_callback(self._make_session_lock_heal_callback(session_key, task))
         return True
 
     async def cancel_session_processing(
