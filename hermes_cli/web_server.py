@@ -461,13 +461,13 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     return host not in _LOOPBACK_HOST_VALUES
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
-    """True if the Host header targets the interface we bound to.
+def _is_accepted_host(host_header: str, bound_hosts: frozenset[str]) -> bool:
+    """True if the Host header targets one of the interfaces we bound to.
 
     Accepts:
-    - Exact bound host (with or without port suffix)
-    - Loopback aliases when bound to loopback
-    - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
+    - Exact bound host (with or without port suffix) matching ANY bound host
+    - Loopback aliases when at least one bound host is loopback
+    - Any host when bound to 0.0.0.0 or :: (explicit opt-in to all-interfaces,
       no protection possible at this layer)
     """
     if not host_header:
@@ -480,29 +480,44 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     #   127.0.0.1:9119
     h = host_header.strip()
     if h.startswith("["):
-        # IPv6 bracketed — port (if any) follows "]:"
+        # IPv6 bracketed — port (if any) follows "]:""
         close = h.find("]")
         if close != -1:
             host_only = h[1:close]  # strip brackets
         else:
             host_only = h.strip("[]")
     else:
-        host_only = h.rsplit(":", 1)[0] if ":" in h else h
+        # Bare IPv6 (no brackets) or v4. Port suffix is the part after the
+        # LAST colon — if it's all digits it's a port, otherwise it's part of
+        # the IPv6 address (e.g. "::1" is pure IPv6, "::1:9119" has a port).
+        colon_idx = h.rfind(":")
+        if colon_idx != -1:
+            maybe_port = h[colon_idx + 1:]
+            if maybe_port.isdigit() and not h[colon_idx - 1] == ":":
+                # "127.0.0.1:9119" or "::1:9119" — port suffix
+                host_only = h[:colon_idx]
+            else:
+                # "::1" or "fe80::1" — bare IPv6, no port
+                host_only = h
+        else:
+            host_only = h
     host_only = host_only.lower()
 
-    # 0.0.0.0 bind means operator explicitly opted into all-interfaces
-    # (requires --insecure per web_server.start_server). No Host-layer
-    # defence can protect that mode; rely on operator network controls.
-    if bound_host in {"0.0.0.0", "::"}:
-        return True
+    # Any wildcard bind means operator explicitly opted into all-interfaces.
+    # No Host-layer defence can protect that mode; rely on operator controls.
+    for bh in bound_hosts:
+        if bh in {"0.0.0.0", "::"}:
+            return True
 
-    # Loopback bind: accept the loopback names
-    bound_lc = bound_host.lower()
-    if bound_lc in _LOOPBACK_HOST_VALUES:
-        return host_only in _LOOPBACK_HOST_VALUES
+    for bh in bound_hosts:
+        bh_lc = bh.lower()
+        if bh_lc in _LOOPBACK_HOST_VALUES:
+            if host_only in _LOOPBACK_HOST_VALUES:
+                return True
+        elif host_only == bh_lc:
+            return True
 
-    # Explicit non-loopback bind: require exact host match
-    return host_only == bound_lc
+    return False
 
 
 @app.middleware("http")
@@ -520,9 +535,10 @@ async def host_header_middleware(request: Request, call_next):
     # Store the bound host on app.state so this middleware can read it —
     # set by start_server() at listen time.
     bound_host = getattr(app.state, "bound_host", None)
-    if bound_host:
+    bound_hosts = getattr(app.state, "bound_hosts", None)
+    if bound_hosts:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        if not _is_accepted_host(host_header, bound_hosts):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -14346,13 +14362,13 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     machine-parseable token (``host_mismatch …`` / ``origin_mismatch …``)
     on rejection so the close path can log *why* the upgrade was refused.
     """
-    bound_host = getattr(app.state, "bound_host", None)
-    if not bound_host:
+    bound_hosts = getattr(app.state, "bound_hosts", None)
+    if not bound_hosts:
         return None
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
-        return f"host_mismatch host={host_header or '?'} bound={bound_host}"
+    if not _is_accepted_host(host_header, bound_hosts):
+        return f"host_mismatch host={host_header or '?'} bound={','.join(bound_hosts)}"
 
     origin = ws.headers.get("origin", "")
     if not origin:
@@ -14366,10 +14382,10 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
 
     if not parsed.netloc:
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+        return f"origin_mismatch origin={origin}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
-        return f"origin_mismatch origin={origin} bound={bound_host}"
+    if not _is_accepted_host(parsed.netloc, bound_hosts):
+        return f"origin_mismatch origin={origin} bound={','.join(bound_hosts)}"
     return None
 
 
@@ -17195,6 +17211,7 @@ def start_server(
 
     # Record the bound host so host_header_middleware can validate incoming
     # Host headers against it. Defends against DNS rebinding (GHSA-ppp5-vxwm-4cf7).
+    app.state.bound_hosts = frozenset(hosts)
     app.state.bound_host = _primary
 
     # ── Pre-bind sockets for all requested hosts ────────────────────
