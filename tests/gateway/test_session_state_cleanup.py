@@ -290,3 +290,82 @@ class TestSessionResetZombieRace:
         assert exploding.interrupt_calls == 1
         assert key not in runner._pending_messages
 
+    def test_stale_moa_restore_does_not_clobber_newer_turn_override(self):
+        """After /stop, Turn A's MoA finally restore must not overwrite Turn B's
+        model_override or evict Turn B's agent cache.
+        """
+        import threading
+        from types import SimpleNamespace
+
+        from gateway.run import GatewayRunner
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._agent_cache = {}
+        runner._agent_cache_lock = threading.Lock()
+        for name in (
+            "_sessions_map",
+            "_session_state",
+            "_peek_session_state",
+            "_begin_session_run_generation",
+            "_invalidate_session_run_generation",
+            "_release_running_agent_state",
+            "_is_session_run_current",
+            "_evict_cached_agent",
+            "_restore_moa_one_shot",
+            "_restore_pending_one_turn_model_override",
+            "_restore_session_model_override",
+            "_snapshot_session_model_override",
+        ):
+            setattr(
+                runner,
+                name,
+                getattr(GatewayRunner, name).__get__(runner, GatewayRunner),
+            )
+
+        key = "agent:main:telegram:private:5"
+        gen_a = runner._begin_session_run_generation(key)
+        prior = {"provider": "openai", "model": "gpt-old"}
+        state = runner._session_state(key)
+        state.conversation.model_override = {
+            "provider": "moa",
+            "model": "default",
+            "base_url": "moa://local",
+            "api_key": "moa-virtual-provider",
+            "api_mode": "chat_completions",
+        }
+        state.conversation.one_turn_restore = {
+            "had_override": True,
+            "override": dict(prior),
+        }
+        event_a = SimpleNamespace(
+            _moa_disable_after_turn=True,
+            _moa_restore_override=prior,
+        )
+        state.turn.agent = object()
+        runner._agent_cache[key] = (object(), "sig-a")
+
+        # /stop: bump, clear slot, restore one-shot, evict
+        runner._invalidate_session_run_generation(key, reason="stop")
+        assert runner._release_running_agent_state(key) is True
+        runner._restore_pending_one_turn_model_override(key)
+        runner._evict_cached_agent(key)
+        assert state.conversation.model_override == prior
+
+        # Turn B claims slot + sets a new override
+        gen_b = runner._begin_session_run_generation(key)
+        assert gen_b != gen_a
+        turn_b_override = {"provider": "anthropic", "model": "claude-new"}
+        state.conversation.model_override = turn_b_override
+        cached_b = object()
+        runner._agent_cache[key] = (cached_b, "sig-b")
+        state.turn.agent = object()
+
+        # Stale Turn A finally: generation-guarded restores are no-ops
+        assert runner._is_session_run_current(key, gen_a) is False
+        if runner._is_session_run_current(key, gen_a):
+            runner._restore_moa_one_shot(event_a, key)
+            runner._restore_pending_one_turn_model_override(key)
+
+        assert state.conversation.model_override == turn_b_override
+        assert runner._agent_cache[key][0] is cached_b
+

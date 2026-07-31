@@ -14604,6 +14604,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.text = moa_payload
                 _moa_state = self._session_state(_quick_key)
                 event._moa_restore_override = _moa_state.conversation.model_override
+                # Seed session-level restore so /stop can revert MoA without
+                # the per-turn event. Outer finally is generation-scoped and
+                # will skip after invalidate; without this, MoA would leak.
+                if _moa_state.conversation.one_turn_restore is None:
+                    _moa_state.conversation.one_turn_restore = (
+                        self._snapshot_session_model_override(_quick_key)
+                    )
                 _moa_state.conversation.model_override = {
                     "provider": "moa",
                     "model": preset,
@@ -14948,10 +14955,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # out of scope — so if _handle_message_with_agent raises, a restore
             # in the try block would be skipped and the MoA override would leak
             # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            # Putting restores in finally guarantees the revert on success,
+            # exception, and interrupt alike — but only while THIS generation
+            # still owns the session. After /stop clears the slot, a follow-up
+            # turn may already have a new model_override / agent cache entry;
+            # applying our one-shot restore then would clobber it. Interrupt
+            # itself restores pending one-shot state after the generation bump.
+            if self._is_session_run_current(_quick_key, _run_generation):
+                self._restore_moa_one_shot(event, _quick_key)
+                self._restore_pending_one_turn_model_override(_quick_key)
             # Generation-scoped release on every exit path. A /stop or /new that
             # bumped the generation while this turn was in flight has already
             # cleared the slot at interrupt/reset time (#28686); a follow-up turn
@@ -21985,6 +21997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cannot leave the slot locked forever.
         if release_running_state:
             self._release_running_agent_state(session_key)
+            # Revert /model --once and /moa one-shot overrides now. Outer
+            # finally is generation-scoped and will not restore for this turn
+            # after the bump; skipping here would leak MoA/--once forever
+            # when /stop has no immediate follow-up.
+            self._restore_pending_one_turn_model_override(session_key)
             # Evict the cached agent: ``_interrupt_requested`` is only
             # cleared by the turn finalizer, so on a hung or still-draining
             # run the flag survives the lock release and kills the session's
