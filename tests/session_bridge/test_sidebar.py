@@ -96,6 +96,20 @@ def test_native_claude_and_hermes_requests_are_eligible(
     assert is_sidebar_session_eligible(_projection(provider, content), now=NOW)
 
 
+def test_sidebar_eligibility_accepts_all_history() -> None:
+    projection = _projection(
+        Provider.CLAUDE,
+        "recover this old session",
+        last_active=1.0,
+    )
+
+    assert is_sidebar_session_eligible(
+        projection,
+        now=2_000_000_000.0,
+        backfill_days=None,
+    )
+
+
 @pytest.mark.parametrize("provider", [Provider.CLAUDE, Provider.HERMES])
 @pytest.mark.parametrize(
     "content",

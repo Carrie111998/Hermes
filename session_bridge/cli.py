@@ -601,7 +601,7 @@ class _Backend(Protocol):
         inbox_cwd: str,
     ) -> Mapping[str, Any]: ...
     def sidebar_backfill(
-        self, *, days: int, limit: int, apply: bool
+        self, *, days: int | None, limit: int, apply: bool
     ) -> Mapping[str, Any]: ...
     def set_sidebar_continuous(self, *, enabled: bool) -> Mapping[str, Any]: ...
     def set_sidebar_readable_preview(self, *, enabled: bool) -> Mapping[str, Any]: ...
@@ -616,7 +616,8 @@ class _Backend(Protocol):
     def sidebar_hydration_seed_backfill(
         self,
         *,
-        days: int,
+        days: int | None,
+        limit: int,
         apply: bool,
         confirmation: str | None,
     ) -> Mapping[str, Any]: ...
@@ -999,7 +1000,7 @@ class ProductionBackend:
         return persisted_values
 
     def sidebar_backfill(
-        self, *, days: int, limit: int, apply: bool
+        self, *, days: int | None, limit: int, apply: bool
     ) -> Mapping[str, Any]:
         coordinator = SessionBridgeCoordinator(
             config=self.config,
@@ -1018,6 +1019,7 @@ class ProductionBackend:
         payload = asdict(summary)
         result = {
             "mode": "apply" if apply else "dry_run",
+            "scope": "all_history" if days is None else "days",
             "days": days,
             "limit": limit,
             **payload,
@@ -1242,7 +1244,8 @@ class ProductionBackend:
     def sidebar_hydration_seed_backfill(
         self,
         *,
-        days: int,
+        days: int | None,
+        limit: int,
         apply: bool,
         confirmation: str | None,
     ) -> Mapping[str, Any]:
@@ -1250,6 +1253,8 @@ class ProductionBackend:
             raise RolloutGateBlocked("sidebar_hydration_disabled")
         if type(apply) is not bool:
             raise ConfigurationFailure("invalid_sidebar_hydration_backfill_mode")
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ConfigurationFailure("invalid_sidebar_hydration_backfill_limit")
         if apply and confirmation != "HYDRATE_ALL_EXACT_EXISTING_TASKS":
             raise RolloutGateBlocked(
                 "sidebar_hydration_backfill_confirmation_required"
@@ -1260,23 +1265,11 @@ class ProductionBackend:
             )
 
         store = self._require_store()
-        inventory: list[dict[str, Any]] = []
-        after_visible_at: float | None = None
-        after_job_id: str | None = None
-        while True:
-            page = store.list_sidebar_hydration_candidates(
-                now=time.time(),
-                backfill_days=days,
-                limit=100,
-                after_visible_at=after_visible_at,
-                after_job_id=after_job_id,
-            )
-            inventory.extend(page)
-            if len(page) < 100:
-                break
-            last = page[-1]
-            after_visible_at = float(last["visible_at"])
-            after_job_id = str(last["job_id"])
+        inventory = store.list_sidebar_hydration_candidates(
+            now=time.time(),
+            backfill_days=days,
+            limit=limit,
+        )
 
         marker_secret = resolve_marker_key()
         native = self._require_sidebar_terminal_delivery()
@@ -1326,13 +1319,24 @@ class ProductionBackend:
 
         result = {
             "mode": "apply" if apply else "dry_run",
+            "scope": "all_history" if days is None else "days",
             "days": days,
+            "limit": limit,
             "examined": len(inventory),
             "eligible": len(eligible),
             "already_readable": already_readable,
             "seeded": 0,
             "blocked": sum(blocked_codes.values()),
             "blocked_codes": dict(sorted(blocked_codes.items())),
+            "candidates": [
+                {
+                    "source_session_id": str(row["source_session_id"]),
+                    "codex_thread_id": str(row["codex_thread_id"]),
+                    "visible_at": float(row["visible_at"]),
+                    "hydration_state": "not_seeded",
+                }
+                for row in eligible
+            ],
         }
         if not apply or blocked_codes:
             return result
@@ -3308,9 +3312,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     sidebar_backfill = commands.add_parser(
         "sidebar-backfill",
-        help="preview or enqueue a bounded recent native sidebar batch",
+        help="preview or enqueue a bounded native sidebar batch",
     )
-    sidebar_backfill.add_argument("--days", type=_bounded_sidebar_days, default=30)
+    sidebar_backfill_window = sidebar_backfill.add_mutually_exclusive_group(
+        required=True
+    )
+    sidebar_backfill_window.add_argument("--days", type=_bounded_sidebar_days)
+    sidebar_backfill_window.add_argument("--all-history", action="store_true")
     sidebar_backfill.add_argument("--limit", type=_bounded_sidebar_limit, default=10)
     sidebar_backfill_mode = sidebar_backfill.add_mutually_exclusive_group(required=True)
     sidebar_backfill_mode.add_argument("--dry-run", action="store_true")
@@ -3362,12 +3370,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sidebar_hydration_seed_backfill = commands.add_parser(
         "sidebar-hydration-seed-backfill",
-        help="inventory or seed recent exact legacy tasks for in-place hydration",
+        help="inventory or seed exact legacy tasks for in-place hydration",
     )
-    sidebar_hydration_seed_backfill.add_argument(
+    sidebar_hydration_seed_backfill_window = (
+        sidebar_hydration_seed_backfill.add_mutually_exclusive_group(required=True)
+    )
+    sidebar_hydration_seed_backfill_window.add_argument(
         "--days",
         type=_bounded_sidebar_days,
-        default=30,
+    )
+    sidebar_hydration_seed_backfill_window.add_argument(
+        "--all-history",
+        action="store_true",
+    )
+    sidebar_hydration_seed_backfill.add_argument(
+        "--limit",
+        type=_bounded_sidebar_hydration_limit,
+        default=10,
     )
     sidebar_hydration_seed_backfill_mode = (
         sidebar_hydration_seed_backfill.add_mutually_exclusive_group()
@@ -3656,7 +3675,7 @@ def main(
         if args.command == "sidebar-backfill":
             payload = dict(
                 backend.sidebar_backfill(
-                    days=args.days,
+                    days=None if args.all_history else args.days,
                     limit=args.limit,
                     apply=bool(args.apply),
                 )
@@ -3690,7 +3709,8 @@ def main(
         if args.command == "sidebar-hydration-seed-backfill":
             payload = dict(
                 backend.sidebar_hydration_seed_backfill(
-                    days=args.days,
+                    days=None if args.all_history else args.days,
+                    limit=args.limit,
                     apply=bool(args.apply),
                     confirmation=args.confirm,
                 )
@@ -4890,6 +4910,13 @@ def _bounded_sidebar_limit(value: str) -> int:
     parsed = _positive_int(value)
     if parsed > 10:
         raise argparse.ArgumentTypeError("value must be at most 10")
+    return parsed
+
+
+def _bounded_sidebar_hydration_limit(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > 500:
+        raise argparse.ArgumentTypeError("value must be at most 500")
     return parsed
 
 

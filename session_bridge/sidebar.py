@@ -142,12 +142,12 @@ def is_sidebar_session_eligible(
     projection: SessionProjection,
     *,
     now: float,
-    backfill_days: int = 30,
+    backfill_days: int | None = 30,
     automation_only: bool = False,
     subagent_only: bool = False,
 ) -> bool:
     _validate_finite_timestamp(now, "now")
-    if (
+    if backfill_days is not None and (
         not isinstance(backfill_days, int)
         or isinstance(backfill_days, bool)
         or backfill_days < 0
@@ -161,7 +161,10 @@ def is_sidebar_session_eligible(
         or subagent_only
     ):
         return False
-    if projection.last_active < now - backfill_days * 86_400:
+    if (
+        backfill_days is not None
+        and projection.last_active < now - backfill_days * 86_400
+    ):
         return False
     if (
         projection.provider is Provider.CLAUDE

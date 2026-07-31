@@ -118,6 +118,7 @@ class FakeBackend:
     sidebar_backfill_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "mode": "dry_run",
+            "scope": "days",
             "days": 30,
             "limit": 10,
             "examined": 0,
@@ -183,13 +184,16 @@ class FakeBackend:
     sidebar_hydration_backfill_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "mode": "dry_run",
+            "scope": "days",
             "days": 30,
+            "limit": 10,
             "examined": 4,
             "eligible": 3,
             "already_readable": 1,
             "seeded": 0,
             "blocked": 0,
             "blocked_codes": {},
+            "candidates": [],
         }
     )
     claude_visibility_payload: dict[str, Any] = field(
@@ -266,11 +270,16 @@ class FakeBackend:
             "readable_preview_enabled": True,
         }
 
-    def sidebar_backfill(self, *, days: int, limit: int, apply: bool) -> dict[str, Any]:
+    def sidebar_backfill(
+        self, *, days: int | None, limit: int, apply: bool
+    ) -> dict[str, Any]:
         self.calls.append(("sidebar_backfill", days, limit, apply))
         return {
             **self.sidebar_backfill_payload,
             "mode": "apply" if apply else "dry_run",
+            "scope": "all_history" if days is None else "days",
+            "days": days,
+            "limit": limit,
         }
 
     def set_sidebar_continuous(self, *, enabled: bool) -> dict[str, Any]:
@@ -314,20 +323,24 @@ class FakeBackend:
     def sidebar_hydration_seed_backfill(
         self,
         *,
-        days: int,
+        days: int | None,
+        limit: int,
         apply: bool,
         confirmation: str | None,
     ) -> dict[str, Any]:
         self.calls.append((
             "sidebar_hydration_seed_backfill",
             days,
+            limit,
             apply,
             confirmation,
         ))
         return {
             **self.sidebar_hydration_backfill_payload,
             "mode": "apply" if apply else "dry_run",
+            "scope": "all_history" if days is None else "days",
             "days": days,
+            "limit": limit,
             "seeded": (
                 int(self.sidebar_hydration_backfill_payload["eligible"])
                 if apply
@@ -638,6 +651,54 @@ def test_sidebar_rollout_commands_are_bounded_and_route_without_mirroring(
     )
 
 
+def test_sidebar_backfill_all_history_is_dry_run_by_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+
+    assert (
+        _run(
+            [
+                "sidebar-backfill",
+                "--all-history",
+                "--limit",
+                "10",
+                "--dry-run",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    payload = _json_output(capsys)
+    assert payload["scope"] == "all_history"
+    assert payload["queued"] == 0
+    assert backend.calls == [
+        ("sidebar_backfill", None, 10, False),
+        ("close",),
+    ]
+
+
+def test_sidebar_backfill_rejects_days_with_all_history() -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "sidebar-backfill",
+                "--days",
+                "30",
+                "--all-history",
+                "--limit",
+                "10",
+                "--dry-run",
+            ],
+            backend,
+        )
+
+    assert backend.calls == []
+
+
 def test_sidebar_broker_configure_persists_only_canonical_identity(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -908,16 +969,62 @@ def test_sidebar_hydration_seed_backfill_defaults_to_dry_run_and_requires_apply_
     assert applied["mode"] == "apply"
     assert applied["seeded"] == 3
     assert backend.calls == [
-        ("sidebar_hydration_seed_backfill", 30, False, None),
+        ("sidebar_hydration_seed_backfill", 30, 10, False, None),
         ("close",),
         (
             "sidebar_hydration_seed_backfill",
             30,
+            10,
             True,
             "HYDRATE_ALL_EXACT_EXISTING_TASKS",
         ),
         ("close",),
     ]
+
+
+def test_sidebar_hydration_seed_backfill_all_history_is_bounded_and_dry_run(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    backend = FakeBackend()
+
+    assert (
+        _run(
+            [
+                "sidebar-hydration-seed-backfill",
+                "--all-history",
+                "--limit",
+                "2",
+            ],
+            backend,
+        )
+        == 0
+    )
+
+    payload = _json_output(capsys)
+    assert payload["scope"] == "all_history"
+    assert payload["limit"] == 2
+    assert payload["seeded"] == 0
+    assert backend.calls == [
+        ("sidebar_hydration_seed_backfill", None, 2, False, None),
+        ("close",),
+    ]
+
+
+def test_sidebar_hydration_seed_backfill_rejects_days_with_all_history() -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(SystemExit):
+        _run(
+            [
+                "sidebar-hydration-seed-backfill",
+                "--days",
+                "30",
+                "--all-history",
+            ],
+            backend,
+        )
+
+    assert backend.calls == []
 
 
 def test_production_sidebar_hydration_seed_requires_one_exact_visible_link(
@@ -1208,33 +1315,50 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
         "_require_sidebar_terminal_delivery",
         lambda: reader,
     )
+    legacy_job = store.get_sidebar_job_for_source(
+        candidates["legacy"].source_session_id
+    )
+    assert legacy_job is not None
 
     dry_run = backend.sidebar_hydration_seed_backfill(
         days=30,
+        limit=10,
         apply=False,
         confirmation=None,
     )
 
     assert dry_run == {
         "mode": "dry_run",
+        "scope": "days",
         "days": 30,
+        "limit": 10,
         "examined": 2,
         "eligible": 1,
         "already_readable": 1,
         "seeded": 0,
         "blocked": 0,
         "blocked_codes": {},
+        "candidates": [
+            {
+                "source_session_id": candidates["legacy"].source_session_id,
+                "codex_thread_id": str(legacy_job["codex_thread_id"]),
+                "visible_at": 1_001.0,
+                "hydration_state": "not_seeded",
+            }
+        ],
     }
     assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 0
     with pytest.raises(RolloutGateBlocked, match="confirmation"):
         backend.sidebar_hydration_seed_backfill(
             days=30,
+            limit=10,
             apply=True,
             confirmation=None,
         )
 
     applied = backend.sidebar_hydration_seed_backfill(
         days=30,
+        limit=10,
         apply=True,
         confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
     )
@@ -1245,9 +1369,6 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
         "seeded": 1,
     }
     assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 1
-    legacy_job = store.get_sidebar_job_for_source(
-        candidates["legacy"].source_session_id
-    )
     readable_job = store.get_sidebar_job_for_source(
         candidates["readable"].source_session_id
     )
@@ -1257,19 +1378,23 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
 
     blocked = backend.sidebar_hydration_seed_backfill(
         days=30,
+        limit=10,
         apply=True,
         confirmation="HYDRATE_ALL_EXACT_EXISTING_TASKS",
     )
 
     assert blocked == {
         "mode": "apply",
+        "scope": "days",
         "days": 30,
+        "limit": 10,
         "examined": 1,
         "eligible": 0,
         "already_readable": 0,
         "seeded": 0,
         "blocked": 1,
         "blocked_codes": {"hydration_target_identity_mismatch": 1},
+        "candidates": [],
     }
     assert store.sidebar_hydration_status(now)["counts"]["hydration_pending"] == 1
     backend.close()

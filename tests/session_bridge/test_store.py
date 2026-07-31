@@ -7956,6 +7956,106 @@ def test_sidebar_candidates_exclude_persisted_rows_before_limit(db) -> None:
     assert page.has_more is False
 
 
+def test_sidebar_all_history_candidates_are_newest_first(db) -> None:
+    store = SessionBridgeStore(db)
+    store.upsert_projection(
+        _projection(
+            _message("old", content="recover old"),
+            native_id="old",
+            last_active=1.0,
+        )
+    )
+    store.upsert_projection(
+        _projection(
+            _message("new", content="recover new"),
+            native_id="new",
+            last_active=2.0,
+        )
+    )
+
+    page = store.list_sidebar_candidates(after=None, limit=10)
+
+    assert [row.source_session_id for row in page] == ["claude:new", "claude:old"]
+
+
+def test_sidebar_hydration_all_history_includes_visible_task_older_than_3650_days(
+    db,
+) -> None:
+    oldest_visible_at = 10.0
+    newest_visible_at = 20.0
+    now = newest_visible_at + 3_651 * 86_400.0
+    store = SessionBridgeStore(
+        db,
+        clock=lambda: oldest_visible_at,
+        sidebar_token_factory=_token_factory(
+            "all-history-hydration-old-token",
+            "all-history-hydration-new-token",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidates = {
+        native_id: _sidebar_candidate(
+            db,
+            native_id=f"all-history-hydration-{native_id}",
+            eligible_at=visible_at,
+        )
+        for native_id, visible_at in (
+            ("old", oldest_visible_at),
+            ("new", newest_visible_at),
+        )
+    }
+    for candidate in candidates.values():
+        store.enqueue_sidebar_job(candidate)
+    for claim in store.claim_sidebar_jobs(now=newest_visible_at, limit=2):
+        candidate = next(
+            item
+            for item in candidates.values()
+            if item.source_session_id == claim["source_session_id"]
+        )
+        visible_at = (
+            newest_visible_at
+            if candidate is candidates["new"]
+            else oldest_visible_at
+        )
+        thread_id = f"{candidate.source_session_id}-thread"
+        store.commit_sidebar_job(
+            lease_token=str(claim["lease_token"]),
+            codex_thread_id=thread_id,
+            now=visible_at,
+        )
+        target_id = _seed_sidebar_codex_target(store, candidate, thread_id)
+        store.create_link(
+            SessionLink(
+                id=f"{candidate.source_session_id}-link",
+                from_session_id=candidate.source_session_id,
+                to_session_id=target_id,
+                relation=Relation.MIRRORS,
+                bridge_id=candidate.bridge_id,
+                source_cursor=None,
+                source_hash=None,
+                created_at=visible_at,
+            )
+        )
+
+    first_page = store.list_sidebar_hydration_candidates(
+        now=now,
+        backfill_days=None,
+        limit=1,
+    )
+    second_page = store.list_sidebar_hydration_candidates(
+        now=now,
+        backfill_days=None,
+        limit=1,
+        after_visible_at=float(first_page[-1]["visible_at"]),
+        after_job_id=str(first_page[-1]["job_id"]),
+    )
+
+    assert [row["source_session_id"] for row in (*first_page, *second_page)] == [
+        candidates["new"].source_session_id,
+        candidates["old"].source_session_id,
+    ]
+
+
 def test_sidebar_enqueue_is_source_idempotent_and_preserves_one_bridge(db) -> None:
     store = SessionBridgeStore(db, clock=lambda: 125.0)
     candidate = _sidebar_candidate(db)

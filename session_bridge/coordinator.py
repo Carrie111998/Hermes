@@ -914,6 +914,7 @@ _SIDEBAR_REGISTRATION_PAGE_SIZE = 10
 _SIDEBAR_NEWEST_PROBE_SIZE = 30
 _SIDEBAR_BACKFILL_QUERY_BUDGET = 100
 _SIDEBAR_BACKFILL_EXAMINED_BUDGET = 1000
+_USE_CONFIGURED_BACKFILL = object()
 # Foreground cancellation recovery is intentionally short. Unfinished ownership
 # transfers to tracked background recovery, with the durable 300-second lease as
 # the final fallback if a synchronous worker never returns.
@@ -1208,12 +1209,12 @@ class SessionBridgeCoordinator:
     async def backfill_sidebar_jobs_once(
         self,
         *,
-        days: int = 30,
+        days: int | None = 30,
         limit: int = 10,
         apply: bool = False,
         now: float | None = None,
     ) -> SidebarRegistrationSummary:
-        if type(days) is not int or not 1 <= days <= 30:
+        if days is not None and (type(days) is not int or not 1 <= days <= 30):
             raise ValueError("sidebar backfill days must be between 1 and 30")
         if type(limit) is not int or not 1 <= limit <= 10:
             raise ValueError("sidebar backfill limit must be between 1 and 10")
@@ -1923,17 +1924,27 @@ class SessionBridgeCoordinator:
         *,
         registration_time: float,
         limit: int,
-        backfill_days: int | None = None,
+        backfill_days: int | None | object = _USE_CONFIGURED_BACKFILL,
         apply: bool = True,
         persist_cursor: bool = True,
         record_summary: bool = True,
     ) -> SidebarRegistrationSummary:
         effective_backfill_days = (
             self._config.sidebar.backfill_days
-            if backfill_days is None
+            if backfill_days is _USE_CONFIGURED_BACKFILL
             else backfill_days
         )
-        after = registration_time - effective_backfill_days * 86_400
+        if (
+            effective_backfill_days is not None
+            and type(effective_backfill_days) is not int
+        ):
+            raise ValueError("sidebar backfill days must be an integer or None")
+        effective_backfill_days = cast(int | None, effective_backfill_days)
+        after = (
+            None
+            if effective_backfill_days is None
+            else registration_time - effective_backfill_days * 86_400
+        )
         by_provider = {Provider.CLAUDE.value: 0, Provider.HERMES.value: 0}
         queued = 0
         failed = 0

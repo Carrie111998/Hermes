@@ -4329,12 +4329,16 @@ class SessionBridgeStore:
 
     def list_sidebar_candidates(
         self,
-        after: float,
+        after: float | None,
         limit: int,
         *,
         cursor: SidebarCandidateCursor | None = None,
     ) -> SidebarSourcePage:
-        cutoff = _finite_number(after, "sidebar candidate cutoff")
+        cutoff = (
+            None
+            if after is None
+            else _finite_number(after, "sidebar candidate cutoff")
+        )
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
@@ -4343,14 +4347,17 @@ class SessionBridgeStore:
             raise ValueError("sidebar candidate limit must be between 1 and 1000")
         normalized_cursor = _validated_sidebar_candidate_cursor(cursor)
         cursor_clause = ""
+        cutoff_clause = ""
         params: dict[str, Any] = {
-            "after": cutoff,
             "claude": Provider.CLAUDE.value,
             "native": OriginKind.NATIVE.value,
             "activity_prefix": "session-bridge:external-activity:",
             "profile_shadow_source": _PROFILE_SHADOW_SOURCE,
             "query_limit": limit + 1,
         }
+        if cutoff is not None:
+            cutoff_clause = "AND last_active >= :after"
+            params["after"] = cutoff
         if normalized_cursor is not None:
             cursor_clause = """AND (
                 candidate.last_active < :cursor_activity
@@ -4437,7 +4444,7 @@ class SessionBridgeStore:
                    ), candidate AS (
                        SELECT * FROM source_metadata
                         WHERE last_active IS NOT NULL
-                          AND last_active >= :after
+                          {cutoff_clause}
                    )
                    SELECT * FROM candidate
                     WHERE 1 = 1
@@ -4588,14 +4595,18 @@ class SessionBridgeStore:
         profile_db: SessionDB,
         *,
         profile: str,
-        after: float,
+        after: float | None,
         limit: int,
         cursor: SidebarCandidateCursor | None,
     ) -> tuple[list[SidebarSource], bool]:
         if not self._profile_catalog_compatible(profile_db):
             return [], False
         cursor_clause = ""
-        params: dict[str, Any] = {"after": after, "query_limit": limit + 1}
+        cutoff_clause = ""
+        params: dict[str, Any] = {"query_limit": limit + 1}
+        if after is not None:
+            cutoff_clause = "AND last_active >= :after"
+            params["after"] = after
         if cursor is not None:
             cursor_clause = """AND (
                 candidate.last_active < :cursor_activity
@@ -4649,7 +4660,8 @@ class SessionBridgeStore:
                           )
                    )
                    SELECT * FROM candidate
-                    WHERE last_active IS NOT NULL AND last_active >= :after
+                    WHERE last_active IS NOT NULL
+                      {cutoff_clause}
                       {cursor_clause}
                     ORDER BY last_active DESC, session_id
                     LIMIT :query_limit""",
@@ -8673,15 +8685,14 @@ class SessionBridgeStore:
         self,
         *,
         now: float,
-        backfill_days: int,
+        backfill_days: int | None,
         limit: int,
         after_visible_at: float | None = None,
         after_job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         checked_at = _finite_number(now, "hydration inventory time")
-        if (
-            type(backfill_days) is not int
-            or not 0 <= backfill_days <= 3_650
+        if backfill_days is not None and (
+            type(backfill_days) is not int or not 0 <= backfill_days <= 3_650
         ):
             raise ValueError(
                 "hydration inventory backfill days must be between 0 and 3650"
@@ -8718,7 +8729,12 @@ class SessionBridgeStore:
             )
             signed_registration_sql = " AND job.visible_at >= ?"
 
-        cutoff = checked_at - backfill_days * 86_400.0
+        cutoff = (
+            None
+            if backfill_days is None
+            else checked_at - backfill_days * 86_400.0
+        )
+        cutoff_sql = ""
         pagination_sql = ""
         parameters: list[object] = [
             Provider.CLAUDE.value,
@@ -8727,13 +8743,15 @@ class SessionBridgeStore:
             OriginKind.BRIDGE_PLACEHOLDER.value,
             Relation.MIRRORS.value,
             SidebarJobState.VISIBLE.value,
-            cutoff,
         ]
+        if cutoff is not None:
+            cutoff_sql = " AND job.eligible_at >= ?"
+            parameters.append(cutoff)
         if signed_registration_at is not None:
             parameters.append(signed_registration_at)
         if cursor_time is not None and cursor_job is not None:
             pagination_sql = (
-                " AND (job.visible_at > ?"
+                " AND (job.visible_at < ?"
                 " OR (job.visible_at = ? AND job.id > ?))"
             )
             parameters.extend((cursor_time, cursor_time, cursor_job))
@@ -8767,11 +8785,11 @@ class SessionBridgeStore:
                  LEFT JOIN session_sidebar_hydration_jobs AS hydration
                         ON hydration.source_session_id = job.source_session_id
                      WHERE job.state = ?
-                       AND job.eligible_at >= ?
+                       {cutoff_sql}
                        AND hydration.id IS NULL
                        {signed_registration_sql}
                        {pagination_sql}
-                  ORDER BY job.visible_at, job.id
+                  ORDER BY job.visible_at DESC, job.id
                      LIMIT ?""",
                 parameters,
             ).fetchall()

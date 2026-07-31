@@ -3334,6 +3334,31 @@ async def test_sidebar_backfill_preview_is_side_effect_free_and_apply_is_bounded
 
 
 @pytest.mark.asyncio
+async def test_sidebar_all_history_backfill_includes_oldest_candidate(
+    sidebar_db: SessionDB,
+) -> None:
+    now = 3_000_000.0
+    store = _seed_sidebar_sources(sidebar_db, now=now)
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=False),
+        store=store,
+        adapters={},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    preview = await coordinator.backfill_sidebar_jobs_once(
+        now=now,
+        days=None,
+        limit=10,
+        apply=False,
+    )
+
+    assert preview.queued == 4
+    assert store.get_sidebar_job_for_source("old-hermes") is None
+
+
+@pytest.mark.asyncio
 async def test_sidebar_backfill_preview_matches_apply_exclusions(
     sidebar_db: SessionDB,
     tmp_path: Path,
