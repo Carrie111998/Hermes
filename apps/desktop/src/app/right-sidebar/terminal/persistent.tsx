@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
+import { PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
 import { createRendererLoopPauseController } from '@/lib/renderer-loop-pause'
 
 import { $terminalTakeover } from '../store'
@@ -14,6 +15,12 @@ import { TerminalWorkspace } from './workspace'
  * whichever `<TerminalSlot />` is active. Moving the host DOM detaches xterm's
  * WebGL renderer (it observes its own attachment) and resets the screen, so
  * the host stays put and we chase the slot's bounding rect with position:fixed.
+ *
+ * Keep-alive tabs hide with `visibility: hidden` + {@link PANE_HIDDEN_ATTR}
+ * while preserving their layout box (see pane-visibility.ts). The inactive
+ * terminal slot therefore keeps a non-zero rect identical to the front tab —
+ * we must treat a hidden ancestor as "no slot", or the overlay paints over
+ * Session/Review after the user leaves the Terminal tab.
  */
 
 const $slot = atom<HTMLElement | null>(null)
@@ -63,10 +70,12 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
   const [ready, setReady] = useState(false)
 
   // VS Code parity: once the pane has ever been opened, keep the terminals
-  // mounted — and their shells alive — even while hidden. Hiding the pane just
-  // collapses the slot, so the overlay below goes invisible; nothing is torn
-  // down. Only an explicit per-tab close kills a PTY. Re-opening re-ensures one
-  // terminal exists (covers having closed the last tab).
+  // mounted — and their shells alive — even while hidden. Collapsing the
+  // terminal zone zeroes the slot rect; parking it on an inactive keep-alive
+  // tab keeps a full-size (but data-pane-hidden) box — measure() treats that
+  // as invisible so the overlay does not cover the front tab. Nothing is torn
+  // down either way. Only an explicit per-tab close kills a PTY. Re-opening
+  // re-ensures one terminal exists (covers having closed the last tab).
   const [mounted, setMounted] = useState(false)
 
   useEffect(() => {
@@ -99,6 +108,21 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
     const measure = (): boolean => {
       if (rendererPaused()) {
+        return false
+      }
+
+      // Inactive keep-alive tabs preserve layout size, so a non-zero rect alone
+      // cannot mean "Terminal is the front tab". Skip those slots entirely.
+      if (slot.closest(`[${PANE_HIDDEN_ATTR}]`)) {
+        const next: Rect = { top: 0, left: 0, width: 0, height: 0 }
+
+        if (!sameRect(prev, next)) {
+          prev = next
+          setRect(next)
+
+          return true
+        }
+
         return false
       }
 
@@ -171,7 +195,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
     for (let node: HTMLElement | null = slot; node; node = node.parentElement) {
       positionObserver?.observe(node, {
-        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state'],
+        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'data-state', PANE_HIDDEN_ATTR],
         attributes: true,
         childList: true,
         subtree: true
