@@ -90,7 +90,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
-from toolsets import get_toolset_names
+from toolsets import get_toolset_names, validate_toolset
 
 _log = logging.getLogger(__name__)
 
@@ -134,6 +134,8 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
+TASK_AUTHORITY_CONTRACT = "task_toolsets.v1"
+_TASK_RESERVED_TOOLSETS = frozenset({"all", "*", "kanban", "kanban_worker"})
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
@@ -907,6 +909,10 @@ class Task:
     # --skills). Stored as a JSON array of skill names. None = use only
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
+    # Fixed per-task runtime capability allowlist. None preserves the legacy
+    # profile-derived worker surface; [] means no profile tools. The dispatcher
+    # always adds only the task-scoped Kanban lifecycle bundle.
+    toolsets: Optional[list] = None
     model_override: Optional[str] = None
     # Provider that ``model_override`` belongs to. When set, the dispatcher
     # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
@@ -962,6 +968,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        toolsets_value: Optional[list] = None
+        if "toolsets" in keys and row["toolsets"] is not None:
+            try:
+                parsed = json.loads(row["toolsets"])
+                if isinstance(parsed, list):
+                    toolsets_value = [str(s) for s in parsed if s]
+            except Exception:
+                toolsets_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1012,6 +1026,7 @@ class Task:
                 row["current_step_key"] if "current_step_key" in keys else None
             ),
             skills=skills_value,
+            toolsets=toolsets_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
             provider_override=(
                 row["provider_override"]
@@ -1177,6 +1192,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Force-loaded skills for the worker on this task, stored as JSON.
     -- Passed to the worker via `--skills`. NULL or empty array = no extras.
     skills               TEXT,
+    -- Fixed worker capability allowlist, stored as JSON. NULL preserves the
+    -- assignee profile's legacy CLI toolsets; [] grants no profile tools.
+    -- The dispatcher adds a narrow task-scoped Kanban lifecycle bundle.
+    toolsets             TEXT,
     -- Per-task model override. When set, the dispatcher passes -m <model>
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
@@ -2356,6 +2375,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         # worker via --skills. NULL is fine for existing rows.
         _add_column_if_missing(conn, "tasks", "skills", "skills TEXT")
 
+    if "toolsets" not in cols:
+        # NULL keeps legacy boards/profile-derived worker behavior. An explicit
+        # empty JSON array is materially different and must round-trip as [].
+        _add_column_if_missing(conn, "tasks", "toolsets", "toolsets TEXT")
+
     if "max_retries" not in cols:
         # Per-task override for the consecutive-failure circuit breaker.
         # NULL = fall through to the dispatcher-level ``kanban.failure_limit``
@@ -2834,6 +2858,7 @@ def create_task(
     idempotency_key: Optional[str] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
+    toolsets: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
     model_override: Optional[str] = None,
     provider_override: Optional[str] = None,
@@ -2868,6 +2893,10 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
+    ``toolsets`` is an optional fixed runtime capability allowlist. ``None``
+    preserves legacy profile-derived behavior; an explicit empty iterable
+    grants no profile tools. Dispatcher-owned Kanban lifecycle tools are added
+    separately and cannot be requested through this field.
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
     config — passed to the worker as ``-m <model> [--provider <name>]``.
@@ -3036,6 +3065,36 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Normalize the fixed task authority allowlist independently from skills.
+    # Preserve the semantic distinction between None (legacy profile surface)
+    # and [] (no profile tools). Unknown, wildcard, and Kanban routing bundles
+    # fail closed so a typo or broad alias cannot silently widen authority.
+    toolsets_list: Optional[list[str]] = None
+    if toolsets is not None:
+        cleaned_toolsets: list[str] = []
+        seen_toolsets: set[str] = set()
+        for raw_toolset in toolsets:
+            name = str(raw_toolset).strip()
+            if not name:
+                raise ValueError("task toolset names cannot be empty")
+            if "," in name:
+                raise ValueError(
+                    f"task toolset name cannot contain comma: {name!r} "
+                    "(pass a list of separate names)"
+                )
+            if name in _TASK_RESERVED_TOOLSETS:
+                raise ValueError(
+                    f"task toolset {name!r} is reserved; Kanban lifecycle "
+                    "authority is added by the dispatcher"
+                )
+            if not validate_toolset(name):
+                raise ValueError(f"unknown task toolset: {name!r}")
+            if name in seen_toolsets:
+                continue
+            seen_toolsets.add(name)
+            cleaned_toolsets.append(name)
+        toolsets_list = cleaned_toolsets
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -3135,9 +3194,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, model_override, provider_override,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, toolsets, max_retries, goal_mode, goal_max_turns,
+                        session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3156,6 +3215,7 @@ def create_task(
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
+                        json.dumps(toolsets_list) if toolsets_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
                         model_override,
                         provider_override,
@@ -3183,6 +3243,9 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
+                        "toolsets": (
+                            list(toolsets_list) if toolsets_list is not None else None
+                        ),
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
@@ -8932,6 +8995,19 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+    if task.toolsets is not None:
+        # Explicit task authority is immutable for this whole worker process.
+        # The hidden worker bundle permits only own-task lifecycle/evidence
+        # operations; profile defaults, memory, context rules, and delegation
+        # are not inherited. ``--ignore-rules`` maps to skip_context_files and
+        # skip_memory on AIAgent while still allowing explicitly pinned skills.
+        worker_toolsets = [*task.toolsets, "kanban_worker"]
+        env["HERMES_KANBAN_TASK_AUTHORITY"] = TASK_AUTHORITY_CONTRACT
+        cmd.extend(["--toolsets", ",".join(worker_toolsets), "--ignore-rules"])
+    else:
+        worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+        if worker_toolsets:
+            cmd.extend(["--toolsets", ",".join(worker_toolsets)])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
         # profile's configured provider (mixing model X with provider Y is
@@ -8944,14 +9020,15 @@ def _default_spawn(
     cmd.extend([
         "chat",
         "-q", prompt,
+        # Every dispatcher worker is an automation caller, not an interactive
+        # chat.  The fully-quiet query path preserves the result's failure
+        # classification in the process exit code, including EX_TEMPFAIL for
+        # provider quota walls.  Without it, an ordinary worker can exhaust
+        # all provider retries, print the failure, and still exit rc=0; the
+        # reaper then misclassifies the untouched running card as a lifecycle
+        # protocol violation.
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

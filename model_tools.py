@@ -378,6 +378,8 @@ def _compute_tool_definitions(
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
             os.environ.get("HERMES_KANBAN_TASK")
+            and "kanban" not in effective_enabled_toolsets
+            and "kanban_worker" not in effective_enabled_toolsets
             and not _is_delegated_child_context()
             and "kanban" not in effective_enabled_toolsets
         ):
@@ -385,7 +387,10 @@ def _compute_tool_definitions(
             # must always receive the lifecycle handoff tools. Assignee
             # profiles may intentionally restrict their normal chat toolsets
             # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
+            # worker's completion/block/heartbeat surface. Explicitly
+            # authority-scoped tasks already carry the narrower
+            # ``kanban_worker`` bundle and must not be widened back to the
+            # full orchestrator-capable ``kanban`` toolset here.
             effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
