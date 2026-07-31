@@ -2775,6 +2775,96 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _load_skills_into_context(
+    skill_names: List[str],
+    caller_label: str = "delegate_task",
+) -> str:
+    """Load one or more skills by name and return their content concatenated.
+
+    Mirrors the skill-loading path in cron/scheduler.py ``_build_job_prompt``
+    exactly: resolves bundle commands first, then falls back to skill_view.
+    Missing skills emit a warning and are skipped (not a hard error), matching
+    the cron behavior so a typo doesn't kill the whole delegation.
+
+    Returns a single string with skill content blocks ready to prepend to the
+    subagent's context, or an empty string when no skills could be loaded.
+    """
+    from tools.skills_tool import skill_view
+    from tools.skill_usage import bump_use
+    from agent.skill_bundles import build_bundle_invocation_message, resolve_bundle_command_key
+    from agent.skill_utils import normalize_skill_lookup_name
+    import json as _json
+
+    parts: list[str] = []
+    skipped: list[str] = []
+
+    for skill_name in skill_names:
+        skill_name = str(skill_name).strip()
+        if not skill_name:
+            continue
+
+        # Bundle support: let bundles shadow skills with the same slug, matching
+        # the slash-command and cron paths.
+        bundle_key = resolve_bundle_command_key(skill_name.lstrip("/"))
+        if bundle_key:
+            bundle_payload = build_bundle_invocation_message(
+                bundle_key,
+                user_instruction="",
+                task_id=None,
+            )
+            if bundle_payload:
+                bundle_message, _loaded, _missing = bundle_payload
+                if parts:
+                    parts.append("")
+                parts.append(bundle_message)
+                continue
+            logger.warning(
+                "%s: bundle '%s' could not load any skills, skipping",
+                caller_label, skill_name,
+            )
+            skipped.append(skill_name)
+            continue
+
+        try:
+            loaded = _json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "%s: skill '%s' returned invalid JSON, skipping",
+                caller_label, skill_name,
+            )
+            skipped.append(skill_name)
+            continue
+
+        if not loaded.get("success"):
+            error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
+            logger.warning("%s: skill not found, skipping — %s", caller_label, error)
+            skipped.append(skill_name)
+            continue
+
+        try:
+            bump_use(skill_name)
+        except Exception:
+            logger.debug("%s: failed to bump skill usage for '%s'", caller_label, skill_name, exc_info=True)
+
+        content = str(loaded.get("content") or "").strip()
+        if parts:
+            parts.append("")
+        parts.extend([
+            f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want you to follow its instructions. The full skill content is loaded below.]',
+            "",
+            content,
+        ])
+
+    if skipped:
+        notice = (
+            f"[IMPORTANT: The following skill(s) were listed for this delegation but could not be found "
+            f"and were skipped: {', '.join(skipped)}.]"
+        )
+        parts.insert(0, notice)
+
+    return "\n".join(parts)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2782,6 +2872,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    skills: Optional[List[str]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2795,6 +2886,13 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The optional 'skills' parameter accepts a list of skill names to load into
+    the subagent's context before execution. This mirrors the ``skills`` field
+    supported by cron jobs (cron/scheduler.py) and prevents the blank-context
+    failure mode where a subagent wastes many tool calls rediscovering guidance
+    that already exists as a skill.  Skills are loaded from the user's skills
+    directory; missing names are warned and skipped (not a hard error).
 
     Returns JSON with results array, one entry per task.
     """
@@ -2860,6 +2958,31 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Load skills into context when provided.  Skills are prepended to the
+    # context string so the subagent sees them before the caller's own context.
+    # This mirrors how cron/scheduler.py ``_build_job_prompt`` injects skills
+    # into the job prompt before any user instruction.
+    skill_names: List[str] = []
+    if skills:
+        if isinstance(skills, str):
+            skill_names = [skills]
+        elif isinstance(skills, list):
+            skill_names = [str(s).strip() for s in skills if str(s).strip()]
+
+    if skill_names:
+        try:
+            skills_content = _load_skills_into_context(skill_names)
+        except Exception as exc:
+            logger.warning("delegate_task: skill loading failed, proceeding without skills: %s", exc)
+            skills_content = ""
+        if skills_content:
+            # Prepend skill content to the context string so subagents see it
+            # as part of their initial context alongside the caller's context.
+            if context and context.strip():
+                context = skills_content + "\n\n" + context
+            else:
+                context = skills_content
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3906,6 +4029,21 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "skills": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of skill names to load into the subagent's "
+                    "context before execution. Skills are read from the user's "
+                    "skills directory by name (e.g. ['delegate-task-guide', "
+                    "'read-write-safety']). Each named skill's full content is "
+                    "prepended to the subagent's context so the subagent starts "
+                    "with the guidance it needs rather than spending many tool "
+                    "calls rediscovering it. Mirrors the 'skills' field "
+                    "supported by cron jobs. Missing skill names are warned and "
+                    "skipped (not a hard error)."
+                ),
+            },
         },
         "required": [],
     },
@@ -3966,6 +4104,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        skills=args.get("skills"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
