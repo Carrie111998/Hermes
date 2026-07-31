@@ -40,7 +40,10 @@ lifecycle**. ``_live_lock`` is therefore held across three critical sections,
 each of which spans the syscall *and* the registry mutation:
 
 * open + register (:func:`connect_tracked`)
-* unregister + close (:meth:`TrackedConnection.close`)
+* close + unregister (:meth:`TrackedConnection.close`) -- in that order, so a
+  failed ``close()`` (e.g. cross-thread use with ``check_same_thread=True``)
+  leaves the entry registered rather than untracking a descriptor that is
+  still open
 * check + ``open``/``read``/``close`` (:func:`read_header_bytes_preopen`)
 
 Without that, a thread could pass the "no live connection" check, a second
@@ -154,10 +157,10 @@ class _TrackingMixin:
     def close(self) -> None:  # type: ignore[misc]
         with _live_lock:
             path = getattr(self, "_hermes_tracked_path", None)
+            super().close()  # type: ignore[misc]
             if path is not None:
                 self._hermes_tracked_path = None
                 untrack_connection(path)
-            super().close()  # type: ignore[misc]
 
 
 class TrackedConnection(_TrackingMixin, sqlite3.Connection):

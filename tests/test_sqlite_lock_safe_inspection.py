@@ -253,6 +253,60 @@ def test_session_db_read_only_is_tracked(tmp_path, clean_registry, monkeypatch):
 
 
 
+def test_close_failure_keeps_connection_tracked(tmp_path, clean_registry):
+    """A failed close() must not untrack a descriptor that is still open.
+
+    ``sqlite3`` raises ``ProgrammingError`` when ``close()`` is called from a
+    thread other than the one that created the connection (the default
+    ``check_same_thread=True``). If the registry entry were removed before
+    the real ``close()`` runs, ``has_live_connection`` would go false while
+    the fd -- and its POSIX locks -- are still live, reopening the exact
+    byte-probe race this module exists to prevent.
+    """
+    import threading
+
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    db = tmp_path / "state.db"
+    _make_db(db, "DELETE")
+
+    holder: dict = {}
+    ready = threading.Event()
+    may_close = threading.Event()
+    closed_ok = threading.Event()
+
+    def worker():
+        holder["conn"] = connect_tracked(db)
+        ready.set()
+        # Stay on this thread so a later close() from here succeeds --
+        # check_same_thread=True binds the connection to the thread that
+        # created it, not just to "some thread that isn't main".
+        may_close.wait(10)
+        holder["conn"].close()
+        closed_ok.set()
+
+    t = threading.Thread(target=worker)
+    t.start()
+    ready.wait(10)
+
+    conn = holder["conn"]
+    assert has_live_connection(db)
+
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.close()
+
+    # Failed close: registry must still reflect the live descriptor.
+    assert has_live_connection(db)
+    assert read_header_bytes_preopen(db, length=16) is None
+
+    may_close.set()
+    t.join(10)
+
+    assert closed_ok.is_set()
+    assert not has_live_connection(db)
+    assert read_header_bytes_preopen(db, length=16) is not None
+
+
 def test_page_count_bytes_matches_on_disk_size(tmp_path):
     """The PRAGMA route reports the same size the header field encodes."""
     db = tmp_path / "state.db"
