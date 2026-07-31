@@ -36,7 +36,9 @@ test('spawnUpdaterProcess hides the updater console and detaches the child on Wi
     {
       args: ['--update', '--branch', 'main'],
       command: 'hermes-setup.exe',
-      options: { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore', windowsHide: true }
+      // shell:true on Windows so .cmd / .bat wrappers (in-house update-wrapper)
+      // route through cmd.exe — CreateProcessW can't execute them directly.
+      options: { cwd: 'C:\\Hermes', detached: true, stdio: 'ignore', windowsHide: true, shell: true }
     }
   ])
 })
@@ -59,4 +61,30 @@ test('spawnUpdaterProcess preserves updater options off Windows', () => {
   )
 
   assert.deepEqual(capturedOptions, { detached: true, stdio: 'ignore' })
+})
+
+test('spawnUpdaterProcess respects explicit shell:false on Windows', () => {
+  const calls: Array<{ args: string[]; command: string; options: SpawnOptions }> = []
+
+  spawnUpdaterProcess(
+    'hermes-setup.exe',
+    ['--update'],
+    { detached: true, stdio: 'ignore', shell: false },
+    {
+      isWindows: true,
+      spawnProcess: (command, args, options) => {
+        calls.push({ args, command, options })
+
+        return { unref: () => {} }
+      }
+    }
+  )
+
+  assert.deepEqual(calls, [
+    {
+      args: ['--update'],
+      command: 'hermes-setup.exe',
+      options: { detached: true, stdio: 'ignore', windowsHide: true, shell: false }
+    }
+  ])
 })

@@ -2609,7 +2609,23 @@ let quitConfirmedWithActiveWork = false
 // the desktop never touches its own bits while running. Returns null when the
 // updater isn't staged (e.g. a dev/source run that never went through the
 // installer); callers degrade gracefully.
+//
+// On Windows, if a `hermes-update-wrapper.cmd` is staged in HERMES_HOME
+// alongside the renamed `hermes-setup-real.exe`, prefer the wrapper. The
+// wrapper waits for the desktop to fully exit before running the real
+// installer, which breaks the Tauri-shell PID race that produces the
+// "Another Hermes update is already running" loop. See
+// apps/desktop/scripts/hermes-update-wrapper.{cmd,ps1} for details. When the
+// wrapper is not staged, behavior is identical to upstream (uses
+// hermes-setup.exe directly).
 function resolveUpdaterBinary() {
+  if (IS_WINDOWS) {
+    const wrapper = path.join(HERMES_HOME, 'hermes-update-wrapper.cmd')
+    if (fileExists(wrapper)) {
+      return wrapper
+    }
+  }
+
   const name = IS_WINDOWS ? 'hermes-setup.exe' : 'hermes-setup'
   const candidate = path.join(HERMES_HOME, name)
 
