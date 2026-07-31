@@ -140,6 +140,9 @@ The implementation plan must begin with a requirement traceability audit of:
 Each relevant requirement must be marked implemented, missing, superseded,
 deferred to upstream, or verified by a named test or canary.
 
+Implementation evidence is maintained in
+`../audits/2026-07-30-session-sidebar-requirement-traceability.md`.
+
 ## Architecture
 
 ### Session Bridge authority
