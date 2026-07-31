@@ -3,7 +3,7 @@
 Covers:
 
 1. ``typescript-language-server`` install recipe pulls in ``typescript``
-   alongside the server, so the npm install command targets both.
+   alongside the server, so the configured Node package manager targets both.
 2. ``hermes lsp status`` surfaces a ``Backend warnings`` section when
    bash-language-server is installed but ``shellcheck`` is missing.
 3. ``_check_lint`` returns ``skipped`` (not ``error``) when the linter
@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import io
+import os
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
@@ -28,37 +29,206 @@ from agent.lsp.install import INSTALL_RECIPES
 # ---------------------------------------------------------------------------
 
 
+def _write_fake_node_installer(bin_dir, name):
+    script = bin_dir / name
+    script.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "printf '%s\n' \"$PWD\" > \"$FAKE_NODE_LOG_DIR/cwd\"\n"
+        "printf '%s\n' \"$@\" > \"$FAKE_NODE_LOG_DIR/args\"\n"
+        "mkdir -p node_modules/.bin\n"
+        "printf '#!/bin/sh\\n' > \"node_modules/.bin/$FAKE_NODE_BIN_NAME\"\n"
+        "chmod +x \"node_modules/.bin/$FAKE_NODE_BIN_NAME\"\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
 
 
+def _fake_node_env(tmp_path, monkeypatch, manager, bin_name, *, corepack=False):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    if corepack:
+        _write_fake_node_installer(fake_bin, "corepack")
+    else:
+        _write_fake_node_installer(fake_bin, manager)
+    log_dir = tmp_path / "node-log"
+    log_dir.mkdir()
+    # Keep the fake toolchain first and exclude developer Node shims so a real
+    # Corepack installation cannot mask the direct-binary fallback path.
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}/bin{os.pathsep}/usr/bin")
+    monkeypatch.setenv("FAKE_NODE_LOG_DIR", str(log_dir))
+    monkeypatch.setenv("FAKE_NODE_BIN_NAME", bin_name)
+    return log_dir
 
 
-def test_install_npm_works_without_extras(tmp_path, monkeypatch):
+def _set_lsp_package_manager(monkeypatch, manager):
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"lsp": {"package_manager": manager}},
+    )
+
+
+def _read_fake_invocation(log_dir):
+    return (
+        (log_dir / "cwd").read_text(encoding="utf-8").strip(),
+        (log_dir / "args").read_text(encoding="utf-8").splitlines(),
+    )
+
+
+def test_install_uses_corepack_pnpm_and_passes_extras(tmp_path, monkeypatch):
+    """Configured pnpm runs through Corepack in the managed staging tree."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    _set_lsp_package_manager(monkeypatch, "pnpm")
+    log_dir = _fake_node_env(
+        tmp_path, monkeypatch, "pnpm", "typescript-language-server", corepack=True
+    )
+
+    resolved = install_mod._install_node_package(
+        "typescript-language-server",
+        "typescript-language-server",
+        extra_pkgs=["typescript"],
+    )
+
+    staging = tmp_path / "lsp"
+    cwd, args = _read_fake_invocation(log_dir)
+    assert cwd == str(staging)
+    assert args == [
+        "pnpm",
+        "add",
+        "--silent",
+        "typescript-language-server",
+        "typescript",
+    ]
+    assert resolved is not None
+    assert (install_mod.hermes_lsp_bin_dir() / "typescript-language-server").exists()
+
+
+def test_install_falls_back_to_direct_pnpm_when_corepack_missing(tmp_path, monkeypatch):
     """Backwards compat: pyright-style recipes (no extras) still install."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    _set_lsp_package_manager(monkeypatch, "pnpm")
+    log_dir = _fake_node_env(tmp_path, monkeypatch, "pnpm", "pyright-langserver")
+
+    resolved = install_mod._install_node_package("pyright", "pyright-langserver")
+
+    staging = tmp_path / "lsp"
+    cwd, args = _read_fake_invocation(log_dir)
+    assert cwd == str(staging)
+    assert args == ["add", "--silent", "pyright"]
+    assert resolved is not None
+
+
+def test_install_uses_yarn_add_in_staging(tmp_path, monkeypatch):
+    """Yarn adds requested packages; ``yarn install <pkg>`` is not valid."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    _set_lsp_package_manager(monkeypatch, "yarn")
+    log_dir = _fake_node_env(
+        tmp_path, monkeypatch, "yarn", "typescript-language-server"
+    )
+
+    resolved = install_mod._install_node_package(
+        "typescript-language-server",
+        "typescript-language-server",
+        extra_pkgs=["typescript"],
+    )
+
+    staging = tmp_path / "lsp"
+    cwd, args = _read_fake_invocation(log_dir)
+    assert cwd == str(staging)
+    assert args == ["add", "--silent", "typescript-language-server", "typescript"]
+    assert resolved is not None
+
+
+def test_install_defaults_to_npm_when_package_manager_unset(tmp_path, monkeypatch):
+    """Hermes' upstream default stays npm unless lsp.package_manager is set."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"lsp": {}})
+    log_dir = _fake_node_env(tmp_path, monkeypatch, "npm", "pyright-langserver", corepack=True)
+
+    resolved = install_mod._install_node_package("pyright", "pyright-langserver")
+
+    staging = tmp_path / "lsp"
+    cwd, args = _read_fake_invocation(log_dir)
+    assert cwd == str(staging)
+    assert args == [
+        "npm",
+        "install",
+        "--prefix",
+        str(staging),
+        "--silent",
+        "--no-fund",
+        "--no-audit",
+        "pyright",
+    ]
+    assert resolved is not None
+
+
+def test_node_installer_retains_windows_safe_subprocess_kwargs(tmp_path, monkeypatch):
+    """Node installs preserve UTF-8 decoding and Windows hide flags from main."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+    import hermes_cli.config as config_mod
 
     captured = {}
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        bin_dir = kwargs["cwd"] / "node_modules" / ".bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        launcher = bin_dir / "pyright-langserver"
+        launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+        launcher.chmod(0o755)
         return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"lsp": {}})
+    monkeypatch.setattr(install_mod.shutil, "which", lambda c: "/usr/bin/npm" if c == "npm" else None)
+    monkeypatch.setattr(install_mod, "windows_hide_flags", lambda: 12345)
+    monkeypatch.setattr(install_mod.subprocess, "run", fake_run)
+
+    resolved = install_mod._install_node_package("pyright", "pyright-langserver")
+
+    assert resolved is not None
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["encoding"] == "utf-8"
+    assert captured["kwargs"]["errors"] == "replace"
+    assert captured["kwargs"]["creationflags"] == 12345
+    assert captured["kwargs"]["stdin"] is install_mod.subprocess.DEVNULL
+
+
+def test_existing_binary_finds_windows_wrapper_in_staging(tmp_path, monkeypatch):
+    """Installed Windows shims should satisfy later status/probe calls."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from agent.lsp import install as install_mod
 
-    monkeypatch.setattr(install_mod.subprocess, "run", fake_run)
-    monkeypatch.setattr(install_mod.shutil, "which", lambda c: "/usr/bin/npm" if c == "npm" else None)
+    wrapper = install_mod.hermes_lsp_bin_dir() / "pyright-langserver.cmd"
+    wrapper.write_text("@echo off\n")
+    wrapper.chmod(0o755)
 
-    install_mod._install_npm("pyright", "pyright-langserver")
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _name: None)
 
-    cmd = captured["cmd"]
-    assert "pyright" in cmd
-    # Should not blow up when extra_pkgs is omitted/None
-    install_targets = [c for c in cmd if not c.startswith("-") and c not in {
-        "install", "--prefix", str(install_mod.hermes_lsp_bin_dir().parent),
-        "/usr/bin/npm",
-    }]
-    assert install_targets == ["pyright"]
-
-
+    assert install_mod._existing_binary("pyright-langserver") == str(wrapper)
+    assert install_mod.detect_status("pyright") == "installed"
 
 
 def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):

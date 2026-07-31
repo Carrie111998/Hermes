@@ -2710,6 +2710,12 @@ DEFAULT_CONFIG = {
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
 
+        # Node package manager used for Node-based LSP installs. Hermes
+        # prefers Corepack when available, but the configured value is
+        # still the package manager name itself. Supported values:
+        # ``npm`` (default), ``pnpm``, and ``yarn``.
+        "package_manager": "npm",
+
         # Idle language servers are shut down automatically after this
         # many seconds with no file activity, then respawned on demand.
         # Prevents long-running gateway/CLI processes from accumulating
