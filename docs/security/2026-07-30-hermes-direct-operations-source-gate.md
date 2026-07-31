@@ -2,7 +2,8 @@
 
 ## Result
 
-**SOURCE GATE: PASS. HELD INSTALL: PASS. ACTIVATION: PROHIBITED.**
+**SOURCE GATE: PASS. HELD INSTALL: PASS. TRUSTED READ PROOF: PASS.
+ACTIVATION: PROHIBITED.**
 
 This is the minimal global repair requested after the July 30 incidents. It
 preserves Hermes' native agency and existing specialist skills while enforcing
@@ -34,11 +35,11 @@ small set of relevant specialist skills.
 - upstream default branch commit:
   `dbe14424ed192b83993e5655629b0dd5714f3355`
 - integrated source commit:
-  `d4a9df32a4c475d4f5a116d7d2941a7cd90fb152`
+  `a9fa619d1a808d339eff5bc702ae99d291bf7fd2`
 - integrated source tree:
-  `2531d64a2d1caf3d071a6ddaf9f741d92a2ac4fa`
+  `250d887c91fb82a4da476e2ebe3e485d0080cf45`
 - direct parent:
-  `a4ad8cad5bbe85c9b74ee9d148839d9e55d75ca7`
+  `9c31627c5c9b29bda1bd8b69d4f66bce23f6882c`
 - clean integration worktree:
   `/home/ed/.hermes/worktrees/direct-ops-live-integration-20260730`
 - branch:
@@ -50,7 +51,10 @@ integrated commit. The merge that joined the safety branch and live behavior
 resolved exactly three expected conflicts: model-status recognition, Telegram
 command/authorization ordering, and Telegram regression fixtures. A later
 merge of current upstream was conflict-free and changed only frontend/TUI
-sources on the upstream side.
+sources on the upstream side. Subsequent commits added the pinned trusted-read
+MCP classification, allowed only the pure deferred-tool catalog bridges during
+investigation, and added executor-level proof that deferred calls are checked
+against the exact underlying tool effect before dispatch.
 
 Before integration, the live repository's two dirty Telegram files and commit
 were preserved in Git refs, an immutable stash object, a verified Git bundle,
@@ -206,6 +210,60 @@ the final integrated commit:
 
 Together these gates account for every failure in the frozen full inventory.
 
+### Trusted deferred-read closure
+
+At current installed source commit
+`a9fa619d1a808d339eff5bc702ae99d291bf7fd2`, the exact request-phase,
+deferred-tool, and MCP effect boundary reran:
+
+```text
+4 files
+180 tests passed
+0 failed
+runner wall: 14.27 seconds
+retries: 0
+```
+
+Transcript:
+
+`C:\Users\Ed\AppData\Local\Temp\hermes-direct-ops-focused-a9fa.log`
+
+SHA-256:
+`53CF8A254ECC301A4734752A90CE9533BB6B57B0C6CBD430C3B14E130F8F7676`
+
+This includes both sequential and concurrent executor proofs:
+
+- a deferred `tool_call` targeting a registered `READ_ONLY` tool is unwrapped
+  to the exact underlying name and arguments, then reaches its handler;
+- the same path targeting an `UNKNOWN` tool is blocked before its handler;
+- `tool_search` and `tool_describe` may inspect only the session-scoped catalog
+  and cannot dispatch a target themselves; and
+- the trusted MCP source hash is re-read immediately before each dispatch.
+
+The immediately preceding production-identical head also ran the expanded
+changed-area gate:
+
+```text
+39 files
+710 tests passed
+0 failed
+runner wall: 102.4 seconds
+workers: 8
+retries: 0
+stderr: empty
+```
+
+Transcript:
+
+`C:\Users\Ed\AppData\Local\Temp\hermes-direct-ops-changed-9c3162.out.log`
+
+SHA-256:
+`D38095E608CF38C66756A94598ECCD005325F2992936BFEF39A9A2BD89BF0134`
+
+The only later source change was a test-harness refactor that removed a new
+advisory type diagnostic; it did not change production code. The exact-head
+180-test gate above reran after that refactor.
+
 ## Independent security review
 
 The final independent review found and blocked one deterministic false-success
@@ -223,15 +281,22 @@ success. The corrected final commit:
 - has real success/reload, pre-write failure, and third-state/no-rollback
   regressions.
 
-The independent review's final immutable-source verdict was **GO for held
+The first independent review's immutable-source verdict was **GO for held
 cutover only** at
 `d4a9df32a4c475d4f5a116d7d2941a7cd90fb152`. It found no remaining
 source/security blocker and explicitly prohibited start, restart, unmask, or
 hold release before the external activation proof.
 
+A second independent review inspected the trusted-read registration and the
+deferred-tool repair. Its final verdict was **GO**: only the two exact Terrain
+read tools are `READ_ONLY`; sibling quote mutations and generated MCP
+resource/prompt utilities remain `UNKNOWN`; catalog inspection cannot execute
+a target; and both executor paths reclassify the exact underlying tool before
+dispatch.
+
 ## Static, dependency, type, and build truth
 
-At final source:
+At current installed source:
 
 - repository-wide `ruff check .`: PASS;
 - Windows-footgun scan: PASS, 896 files;
@@ -242,8 +307,11 @@ At final source:
 - worktree clean: PASS.
 
 The repository pins `ty 0.0.21` as advisory and its CI runs type reporting with
-`--exit-zero`. A changed-source invocation completed with advisory diagnostics;
-no false full-repository type-pass is claimed. The repository's own
+`--exit-zero`. A repository-wide invocation produced the existing advisory
+backlog and reported that not every project file could be analyzed; no false
+full-repository type-pass is claimed. The exact three changed files completed
+with 31 pre-existing advisory diagnostics and zero diagnostics on newly added
+lines. The repository's own
 `setup.py` explicitly rejects wheel/sdist packaging because Hermes runs from an
 editable source checkout. Therefore the production build proof for this
 installation is editable-source identity, import-path readback, dependency
@@ -299,9 +367,9 @@ releasing any unit:
 - live editable checkout:
   `/home/ed/.hermes/hermes-agent`
 - installed runtime source commit:
-  `d4a9df32a4c475d4f5a116d7d2941a7cd90fb152`
+  `a9fa619d1a808d339eff5bc702ae99d291bf7fd2`
 - installed runtime tree:
-  `2531d64a2d1caf3d071a6ddaf9f741d92a2ac4fa`
+  `250d887c91fb82a4da476e2ebe3e485d0080cf45`
 - worktree readback: clean
 - preserved live-dirty stash:
   `8c5a02acc7849dcdf0e748862c4133589374982d`
@@ -345,7 +413,7 @@ Hygiene migration receipt:
 Editable import readback resolved every inspected module to the live checkout:
 
 - `agent.request_phase`:
-  `983fe96ed0625ece33a14344e5da879a5882c5af9c3709a9753cc7102b84149c`;
+  `f2e0a5a26f7ccf1ffa3f98bcee5118f98e978624268e5bf8953a6b0ac0281bac`;
 - `gateway.delivery_ledger`:
   `a5e62028803533ca2bbb18e4509a62ee86f0448be5db4ebb93ae7c16a798cf2f`;
 - `hermes_cli.gateway_hygiene`:
@@ -361,13 +429,66 @@ Final held-state readback:
 - hygiene timer: inactive/dead, `RefuseManualStart=yes`, no next run; and
 - no `hermes_cli.main gateway run` process exists.
 
+### Pinned trusted-read configuration
+
+The live MCP configuration was updated atomically while all holds remained
+active:
+
+- config SHA-256:
+  `427f8e55b3ca020e0265a2064a9c476ae937f0185f4dbde5c5cc7632bec1cbad`;
+- preserved prior config:
+  `/home/ed/.hermes/quarantine/direct-ops-trusted-read-config/config.yaml.before-trusted-read-20260731`;
+- prior config SHA-256:
+  `07dbd10870832572925bd37b72758c2e458d80806de252fb272b3dc26aee68c9`;
+- pinned local source:
+  `/home/ed/.hermes/scripts/terrain_quote_mcp.py`;
+- pinned source SHA-256:
+  `2e8c8827663500129da2ed21c695380589dc3122b28156729c985db8e2638b74`;
+- launch command:
+  `/home/ed/.hermes/hermes-agent/venv/bin/python`;
+- sole launch argument:
+  `/home/ed/.hermes/scripts/terrain_quote_mcp.py`; and
+- exact trusted tools:
+  `find_clients` and `list_client_properties`.
+
+The executable and source must remain absolute, local, identity-stable, under
+16 MiB, and hash-identical immediately before dispatch. Any URL, extra argument,
+tool-name ambiguity, source drift, or sibling MCP operation fails closed to
+`UNKNOWN`. This source hash is owner attestation and change detection, not a
+claim that imported dependencies or backend credentials are structurally
+read-only.
+
+### Held natural-language read proof
+
+Session `20260731_024805_e36fa0` received ordinary owner wording to return one
+current client record and its property list, read-only, with source readback
+and one terminal result.
+
+- started: `2026-07-31T02:48:06.574-04:00`;
+- ended: `2026-07-31T02:48:38.471-04:00`;
+- elapsed: `31.897 seconds`;
+- terminal result: `done`;
+- final output: generated with source readback;
+- final delivery: CLI generated only, not represented as Telegram-delivered;
+- effective business tools:
+  `mcp__terrain_quote__find_clients` and
+  `mcp__terrain_quote__list_client_properties`;
+- terminal fallback: none;
+- arbitrary code execution: none;
+- write/mutation tool: none; and
+- business-data mutation: none.
+
+The session ended durably with `ended_at` and `end_reason=agent_close`. Its
+redacted session record shows only `skill_view`, `tool_describe`, and
+scope-checked deferred `tool_call` bridges, which resolved to the two trusted
+reads above.
+
 Activation remains a separate coordinated release decision. No business canary
 may be manufactured. The only valid later canary is a genuine low-risk
 owner-requested operation with its normal specialist skill and source readback.
-Before activation, run one real existing-skill business lookup using ordinary
-investigation wording such as "tell me" or "analyze." This verifies that the
-small trusted read path remains frictionless without reopening arbitrary script
-or untrusted MCP reads.
+The required preactivation existing-skill lookup is now complete. Activation
+still requires explicit coordination because the gateway owner hold remains in
+force and Telegram delivery has intentionally not been exercised.
 
 ## Residual boundary
 
@@ -383,15 +504,29 @@ but eliminating the last window requires OS/container isolation or universal
 cooperative locking. This release does not represent that residual race as
 solved.
 
+Two cleanup items were discovered and deliberately deferred rather than
+expanding this release:
+
+- `terrain-operations` renders 41,214 characters, above the 32,000-character
+  per-result skill budget. The guard rejected it without loading partial
+  instructions, and the trusted lookup still completed. Its root should be
+  reduced to a compact router with bounded supporting references.
+- Runtime logs warn that linked SQLite `3.50.4` lacks later WAL-reset
+  corruption fixes. Upgrade to the supported fixed SQLite/Python build in a
+  separate dependency-maintenance change with session-store regressions.
+
 ## Release state vocabulary
 
 - **source-ready**: reviewed code and local evidence pass;
 - **installed-and-held**: live editable source and hygiene files match the
-  reviewed release while Hermes remains inactive;
+  reviewed release while the Telegram gateway remains inactive;
+- **trusted-read-verified**: an ordinary owner lookup completed through the
+  pinned read path with source readback while all runtime holds stayed active;
 - **activated**: gateway explicitly started after separate coordination; and
 - **business-verified**: a genuine later owner request completed with source
   readback.
 
-The first two states are claimed. Hermes is installed and protected but not
-activated or business-verified. Health checks or source installation alone must
+The first three states are claimed. Hermes is installed, protected, and
+read-verified, but not activated, Telegram-delivery-verified, or
+business-mutation-verified. Health checks or source installation alone must
 never be described as live business proof.
