@@ -2182,7 +2182,11 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        # LC_ALL=C forces a locale-independent '%T@' mtime format: on
+        # non-C locales (e.g. hu_HU) Cygwin find emits NBSP thousands
+        # separators (byte 0xa0) and a comma decimal separator, which both
+        # break UTF-8 decoding and the 'mtime path' parse below.
+        cmd = f"LC_ALL=C find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2190,7 +2194,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"LC_ALL=C find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2204,6 +2208,12 @@ class ShellFileOperations(FileOperations):
                 files.append(parts[1])
             else:
                 files.append(line)
+
+        # find emits MSYS-form paths (/c/Users/x) on Windows; normalize to
+        # the native drive form so results match the rg path and resolve
+        # correctly in the hidden-root filtering below.
+        from tools.environments.local import _msys_to_windows_path
+        files = [_msys_to_windows_path(f) for f in files]
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
