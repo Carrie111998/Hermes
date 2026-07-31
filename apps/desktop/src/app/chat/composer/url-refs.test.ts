@@ -92,6 +92,12 @@ describe('linkifyUrls', () => {
     expect(linkifyUrls(unfinishedInline)).toBe(unfinishedInline)
   })
 
+  it('rewrites prose links after an escaped unmatched backtick', () => {
+    expect(linkifyUrls('show \\` literally, then visit https://example.dev/api')).toBe(
+      'show \\` literally, then visit @url:`https://example.dev/api`'
+    )
+  })
+
   it('leaves text without a scheme alone', () => {
     expect(linkifyUrls('example.dev/a and src/foo.ts')).toBe('example.dev/a and src/foo.ts')
   })
@@ -170,6 +176,16 @@ describe('chipTypedUrlOnSpace', () => {
     expect(composerPlainText(editor)).toBe(
       ['```', 'https://code.dev/api', '```', 'see @url:`https://example.dev/api` '].join('\n')
     )
+
+    editor.remove()
+  })
+
+  it('chips a prose link typed after an escaped unmatched backtick', () => {
+    const text = 'show \\` literally, then visit https://example.dev/api'
+    const { editor, event } = spaceOn(text, text.length)
+
+    expect(chipTypedUrlOnSpace(event)).toBe(true)
+    expect(composerPlainText(editor)).toBe('show \\` literally, then visit @url:`https://example.dev/api` ')
 
     editor.remove()
   })

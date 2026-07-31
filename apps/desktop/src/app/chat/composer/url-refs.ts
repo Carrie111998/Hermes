@@ -23,6 +23,16 @@ interface TextRange {
 const containsIndex = (ranges: TextRange[], index: number) =>
   ranges.some(range => index >= range.start && index < range.end)
 
+function isEscaped(text: string, index: number) {
+  let backslashes = 0
+
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === '\\'; cursor -= 1) {
+    backslashes += 1
+  }
+
+  return backslashes % 2 === 1
+}
+
 /** Markdown fenced code blocks, including an unfinished block while composing. */
 function fencedCodeRanges(text: string) {
   const ranges: TextRange[] = []
@@ -62,7 +72,13 @@ function fencedCodeRanges(text: string) {
 /** Markdown inline code spans outside fences, including an unfinished span. */
 function inlineCodeRanges(text: string, fenced: TextRange[]) {
   const ranges: TextRange[] = []
-  const markers = Array.from(text.matchAll(/`+/g)).filter(marker => !containsIndex(fenced, marker.index ?? 0))
+
+  const markers = Array.from(text.matchAll(/`+/g)).filter(marker => {
+    const index = marker.index ?? 0
+
+    return !containsIndex(fenced, index) && !isEscaped(text, index)
+  })
+
   let markerIndex = 0
 
   while (markerIndex < markers.length) {
