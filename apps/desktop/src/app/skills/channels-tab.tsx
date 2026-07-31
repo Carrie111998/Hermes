@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { Dispatch, SetStateAction } from 'react'
 import { useEffect, useMemo, useState } from 'react'
@@ -13,8 +14,10 @@ import { AlertTriangle, Lock } from '@/lib/icons'
 import { queryClient } from '@/lib/query-client'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { ChannelMcpMode } from '@/types/hermes'
 
+import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 import { DetailColumn, ListColumn, MasterDetail, ToolChip } from '../master-detail'
 
 const CHANNEL_CAPABILITIES_QUERY_KEY = ['channel-capabilities'] as const
@@ -26,9 +29,11 @@ interface ChannelsTabProps {
 
 export function ChannelsTab({ query }: ChannelsTabProps) {
   const { t } = useI18n()
+  const activeProfile = useStore($activeGatewayProfile)
+  const profileKey = normalizeProfileKey(activeProfile)
 
   const { data: channels, isError, isLoading } = useQuery({
-    queryKey: CHANNEL_CAPABILITIES_QUERY_KEY,
+    queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, profileKey],
     queryFn: getChannelCapabilities,
     staleTime: 0
   })
@@ -38,6 +43,16 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
   const [mcpMode, setMcpMode] = useState<ChannelMcpMode>('all')
   const [mcpServers, setMcpServers] = useState<Set<string>>(new Set())
   const [saving, setSaving] = useState(false)
+
+  // A profile swap changes the backend authority. Drop every local draft
+  // before another click can route profile A's selections to profile B.
+  useOnProfileSwitch(() => {
+    setSelected(null)
+    setEnabledToolsets(new Set())
+    setMcpMode('all')
+    setMcpServers(new Set())
+    setSaving(false)
+  })
 
   const visibleChannels = useMemo(() => {
     const needle = query.trim().toLowerCase()
@@ -60,12 +75,14 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
     )
   }, [channels, query])
 
+  // Filtering only changes the list. It must not switch the detail pane and
+  // overwrite an unsaved draft for the currently selected channel.
   const active = useMemo(
     () =>
-      visibleChannels.find(channel => channel.platform === selected) ??
-      visibleChannels[0] ??
+      channels?.find(channel => channel.platform === selected) ??
+      channels?.[0] ??
       null,
-    [selected, visibleChannels]
+    [channels, selected]
   )
 
   useEffect(() => {
@@ -108,7 +125,9 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
         mcp_mode: mcpMode,
         mcp_servers: mcpMode === 'allowlist' ? [...mcpServers].sort() : []
       })
-      await queryClient.invalidateQueries({ queryKey: CHANNEL_CAPABILITIES_QUERY_KEY })
+      await queryClient.invalidateQueries({
+        queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, profileKey]
+      })
       notify({
         kind: 'success',
         title: t.skills.channels.savedTitle,
@@ -144,6 +163,7 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
                 ? 'bg-(--ui-control-active-background) text-foreground'
                 : 'text-muted-foreground hover:bg-(--chrome-action-hover) hover:text-foreground'
             )}
+            disabled={saving}
             key={channel.platform}
             onClick={() => setSelected(channel.platform)}
           >
@@ -191,6 +211,7 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
                     <Switch
                       aria-label={t.skills.channels.toggleToolset(toolset.label)}
                       checked={enabledToolsets.has(toolset.name)}
+                      disabled={saving || (enabledToolsets.size === 1 && enabledToolsets.has(toolset.name))}
                       onCheckedChange={checked => updateSet(setEnabledToolsets, toolset.name, checked)}
                       size="xs"
                     />
@@ -235,6 +256,7 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
                 <h4 className="text-xs font-semibold">{t.skills.channels.mcpAccess}</h4>
               </div>
               <SegmentedControl
+                disabled={saving}
                 onChange={setMcpMode}
                 options={[
                   { id: 'all', label: t.skills.channels.mcpAll },
@@ -252,6 +274,7 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
                       <label className="flex items-center gap-2 text-xs" key={server}>
                         <Switch
                           checked={mcpServers.has(server)}
+                          disabled={saving}
                           onCheckedChange={checked => updateSet(setMcpServers, server, checked)}
                           size="xs"
                         />
