@@ -12024,7 +12024,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if self._voice_recorder is None:
                 return
 
-            wav_path = self._voice_recorder.stop()
+            recorder = self._voice_recorder
+            release_for_wake = (
+                getattr(self, "_wake_suspended", False)
+                and not self._voice_continuous
+            )
+            try:
+                wav_path = recorder.stop()
+            finally:
+                # A wake-triggered turn hands the capture device back to the
+                # wake listener after one utterance. AudioRecorder.stop()
+                # deliberately keeps its stream alive for regular/continuous
+                # voice mode, but the wake listener cannot reopen an exclusive
+                # device while that persistent stream still owns it. Release it
+                # before transcription, including when stop() itself fails.
+                if release_for_wake:
+                    try:
+                        recorder.shutdown()
+                    except Exception:
+                        pass
+                    if self._voice_recorder is recorder:
+                        self._voice_recorder = None
 
             # Audio cue: double beep after stream stopped (no CoreAudio conflict)
             if self._voice_beeps_enabled():

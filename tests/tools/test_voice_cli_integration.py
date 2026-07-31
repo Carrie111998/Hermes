@@ -322,6 +322,66 @@ class TestVoiceStopAndTranscribeReal:
         assert cli._pending_input.empty()
 
     @patch("cli._cprint")
+    @patch("tools.voice_mode.play_beep")
+    def test_wake_turn_without_speech_releases_capture_device(self, _beep, _cp):
+        recorder = MagicMock()
+        recorder.stop.return_value = None
+        cli = _make_voice_cli(
+            _voice_recording=True,
+            _voice_recorder=recorder,
+            _wake_suspended=True,
+        )
+
+        cli._voice_stop_and_transcribe()
+
+        recorder.shutdown.assert_called_once_with()
+        assert cli._voice_recorder is None
+        assert cli._pending_input.empty()
+
+    def test_wake_turn_releases_capture_device_before_transcription(self):
+        events = []
+        recorder = MagicMock()
+        recorder.stop.return_value = "/tmp/test.wav"
+        recorder.shutdown.side_effect = lambda: events.append("shutdown")
+        cli = _make_voice_cli(
+            _voice_recording=True,
+            _voice_recorder=recorder,
+            _wake_suspended=True,
+        )
+
+        def transcribe(*_args, **_kwargs):
+            events.append("transcribe")
+            return {"success": True, "transcript": "hello world"}
+
+        with patch("cli._cprint"), \
+             patch("cli.os.path.isfile", return_value=False), \
+             patch("hermes_cli.config.load_config", return_value={"stt": {}}), \
+             patch("tools.voice_mode.play_beep"), \
+             patch("tools.voice_mode.transcribe_recording",
+                   side_effect=transcribe) as mock_transcribe:
+            cli._voice_stop_and_transcribe()
+
+        assert events == ["shutdown", "transcribe"]
+        assert cli._voice_recorder is None
+        mock_transcribe.assert_called_once_with("/tmp/test.wav", model=None)
+
+    @patch("cli._cprint")
+    def test_wake_turn_releases_capture_device_when_stop_fails(self, _cp):
+        recorder = MagicMock()
+        recorder.stop.side_effect = RuntimeError("wav write failed")
+        cli = _make_voice_cli(
+            _voice_recording=True,
+            _voice_recorder=recorder,
+            _wake_suspended=True,
+        )
+
+        cli._voice_stop_and_transcribe()
+
+        recorder.shutdown.assert_called_once_with()
+        assert cli._voice_recorder is None
+        assert cli._voice_processing is False
+
+    @patch("cli._cprint")
     @patch("cli.os.unlink")
     @patch("cli.os.path.isfile", return_value=True)
     @patch("hermes_cli.config.load_config", return_value={"stt": {}})
@@ -341,6 +401,8 @@ class TestVoiceStopAndTranscribeReal:
         from cli import _VoiceInputMessage
         assert isinstance(queued, _VoiceInputMessage)
         assert str(queued) == "hello world"
+        recorder.shutdown.assert_not_called()
+        assert cli._voice_recorder is recorder
 
 
     def test_non_local_stt_keeps_generic_transcribing_status(self):
