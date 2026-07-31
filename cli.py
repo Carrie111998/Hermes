@@ -17937,6 +17937,12 @@ def main(
                                     _exit_code = _RL_CODE
                                 except Exception:
                                     _exit_code = 1
+                        try:
+                            from hermes_cli.worker_lifecycle import emit_terminal_event
+
+                            emit_terminal_event(result, session_id=cli.session_id)
+                        except Exception as _lifecycle_exc:
+                            logger.debug("worker lifecycle event emission failed: %s", _lifecycle_exc)
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails

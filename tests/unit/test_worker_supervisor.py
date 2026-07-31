@@ -60,6 +60,37 @@ def _listener_closed(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) != 0
 
 
+def _wait_for(predicate, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+class _FakeProc:
+    def __init__(self, pid: int, *, returncode: int | None = None) -> None:
+        self.pid = pid
+        self.returncode = returncode
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
 def _build_board(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     board_db = tmp_path / "board" / "kanban.db"
     board_db.parent.mkdir()
@@ -507,9 +538,9 @@ def test_raw_rate_limit_exit_does_not_enter_transient_provider_retry(tmp_path):
 
     raw_path = tmp_path / "raw.jsonl"
     typed_path = tmp_path / "typed.jsonl"
-    typed_path.write_text(
-        json.dumps({"kind": "failure", "classification": "transient_provider"}) + "\n",
-        encoding="utf-8",
+    _write_bound_event(
+        typed_path, identity, 1, 45102,
+        classification="transient_provider",
     )
     raw_exit = ws._attempt_exit(identity, 1, RateLimitedProc(45101), raw_path)
     typed_exit = ws._attempt_exit(identity, 1, RateLimitedProc(45102), typed_path)
@@ -533,3 +564,140 @@ def test_raw_rate_limit_exit_does_not_enter_transient_provider_retry(tmp_path):
     assert launches == [1]
     assert [(item.exit_code, item.classification) for item in exits] == [(75, "process_exit")]
     assert supervisor.active_count == 0
+
+def _exact_identity(tmp_path, *, run_id=7):
+    return WorkerIdentity(
+        task_id="task_exact",
+        run_id=run_id,
+        session_id="worker_session",
+        worktree=tmp_path / "worktree",
+    )
+
+
+def _write_bound_event(path, identity, attempt, pid, *, classification):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "kind": "terminal",
+        "task_id": identity.task_id,
+        "run_id": identity.run_id,
+        "attempt": attempt,
+        "session_id": identity.session_id,
+        "worktree": str(identity.worktree.resolve()),
+        "owner_pid": pid,
+        "exit_code": 75 if classification == "transient_provider" else 0,
+        "classification": classification,
+    }
+    path.write_text(json.dumps(payload) + chr(10), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("task_id", "other_task"),
+        ("run_id", 8),
+        ("attempt", 2),
+        ("session_id", "other_session"),
+        ("worktree", "other/worktree"),
+    ],
+)
+def test_transient_terminal_evidence_rejects_identity_mismatch(
+    tmp_path, field, replacement,
+):
+    identity = _exact_identity(tmp_path)
+    launches = []
+    notices = []
+
+    def launch(_identity, attempt, event_path):
+        launches.append(attempt)
+        proc = _FakeProc(7000 + attempt, returncode=75)
+        _write_bound_event(
+            event_path, identity, attempt, proc.pid,
+            classification="transient_provider",
+        )
+        rows = [json.loads(line) for line in event_path.read_text().splitlines()]
+        rows[-1][field] = replacement
+        event_path.write_text(json.dumps(rows[-1]) + chr(10), encoding="utf-8")
+        return proc
+
+    supervisor = DispatcherWorkerSupervisor(event_root=tmp_path / "events")
+    handle = supervisor.start(identity, launch=launch, notifier=notices.append)
+    assert handle.wait(2)
+    assert launches == [1]
+    assert len(notices) == 1
+    assert supervisor.active_count == 0
+
+
+def test_exact_fresh_recovery_signal_releases_one_resume_and_no_third(tmp_path):
+    identity = _exact_identity(tmp_path)
+    launches = []
+    exits = []
+    gates = []
+
+    def launch(_identity, attempt, event_path):
+        launches.append(attempt)
+        classification = "transient_provider" if attempt == 1 else "success"
+        proc = _FakeProc(7100 + attempt, returncode=75 if attempt == 1 else 0)
+        _write_bound_event(
+            event_path, identity, attempt, proc.pid,
+            classification=classification,
+        )
+        return proc
+
+    supervisor = DispatcherWorkerSupervisor(
+        event_root=tmp_path / "events", recovery_timeout=1,
+    )
+    handle = supervisor.start(
+        identity,
+        launch=launch,
+        on_exit=exits.append,
+        gate_advance=lambda _identity: gates.append("advance"),
+    )
+    assert supervisor.signal_recovery(identity, "too-early", signaled_at=0) is False
+    assert _wait_for(lambda: supervisor.is_waiting_for_recovery(identity), timeout=2)
+    stale = WorkerIdentity(
+        task_id=identity.task_id,
+        run_id=identity.run_id + 1,
+        session_id=identity.session_id,
+        worktree=identity.worktree,
+    )
+    assert supervisor.signal_recovery(stale, "wrong-run") is False
+    assert supervisor.signal_recovery(identity, "fresh") is True
+    assert handle.wait(2)
+    assert launches == [1, 2]
+    assert [item.attempt for item in exits] == [1, 2]
+    assert gates == ["advance"]
+    assert supervisor.signal_recovery(identity, "third") is False
+
+
+def test_pid_projection_failure_cleans_and_notifies_once(tmp_path, monkeypatch):
+    identity = _exact_identity(tmp_path)
+    killed = []
+    notices = []
+
+    class RunningProc(_FakeProc):
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.returncode = -15
+            return self.returncode
+
+    proc = RunningProc(7201)
+    monkeypatch.setattr(ws, "_terminate_process_tree", lambda item: killed.append(item) or True)
+
+    def bad_projection(_identity, _attempt, _pid):
+        raise RuntimeError("projection failed")
+
+    supervisor = DispatcherWorkerSupervisor(event_root=tmp_path / "events")
+    with pytest.raises(RuntimeError, match="projection failed"):
+        supervisor.start(
+            identity,
+            launch=lambda *_args: proc,
+            on_pid=bad_projection,
+            notifier=notices.append,
+        )
+    assert killed == [proc]
+    assert len(notices) == 1
+    assert supervisor.active_count == 0
+    assert supervisor.active_pid(identity.task_id, identity.run_id) is None

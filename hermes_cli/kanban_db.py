@@ -8924,10 +8924,28 @@ def signal_worker_recovery(
     *,
     board: Optional[str] = None,
 ) -> bool:
-    """Deliver one explicit recovery signal to a supervised board worker."""
+    """Deliver recovery only to the board's exact current supervised run."""
+    from hermes_cli.worker_supervisor import WorkerIdentity
+
     key = str(kanban_db_path(board=board).resolve())
     supervisor = _dispatcher_worker_supervisors.get(key)
-    return bool(supervisor and supervisor.signal_recovery(task_id, reason))
+    if supervisor is None:
+        return False
+    conn = connect(Path(key))
+    try:
+        task = get_task(conn, task_id)
+    finally:
+        conn.close()
+    if task is None or task.current_run_id is None or not task.workspace_path:
+        return False
+    session_id = task.session_id or f"kanban:{task.id}:{task.current_run_id}"
+    identity = WorkerIdentity(
+        task.id,
+        session_id,
+        Path(task.workspace_path),
+        run_id=task.current_run_id,
+    )
+    return bool(supervisor.signal_recovery(identity, reason))
 
 
 def _record_supervised_worker_exit(attempt_exit) -> None:
@@ -8947,30 +8965,19 @@ def _start_supervised_worker(
     from hermes_cli.worker_supervisor import WorkerIdentity
 
     session_id = task.session_id or f"kanban:{task.id}:{task.current_run_id or 0}"
-    identity = WorkerIdentity(task.id, session_id, Path(workspace))
+    identity = WorkerIdentity(
+        task.id,
+        session_id,
+        Path(workspace),
+        run_id=task.current_run_id,
+    )
     db_path = kanban_db_path(board=board).resolve()
     stable_run_id = task.current_run_id
 
     def launch(_identity, attempt: int, event_path: Path):
-        proc = _default_spawn(
-            task,
-            workspace,
-            board=board,
-            lifecycle_event_path=event_path,
-            lifecycle_attempt=attempt,
+        return _spawn_supervised_attempt(
+            task, workspace, identity, attempt, event_path, board=board
         )
-        if attempt > 1:
-            retry_conn = connect(db_path)
-            try:
-                with write_txn(retry_conn):
-                    retry_conn.execute(
-                        "UPDATE tasks SET worker_pid = ? "
-                        "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
-                        (int(proc.pid), task.id, stable_run_id),
-                    )
-            finally:
-                retry_conn.close()
-        return proc
 
     def on_exit(attempt_exit) -> None:
         _record_supervised_worker_exit(attempt_exit)
@@ -8984,23 +8991,76 @@ def _start_supervised_worker(
         finally:
             event_conn.close()
 
+    def on_pid(_identity, attempt: int, pid: int) -> None:
+        if attempt == 1:
+            return
+        retry_conn = connect(db_path)
+        try:
+            with write_txn(retry_conn):
+                cur = retry_conn.execute(
+                    "UPDATE tasks SET worker_pid = ? "
+                    "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                    (int(pid), task.id, stable_run_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("retry PID projection lost exact run ownership")
+        finally:
+            retry_conn.close()
+
+    def notify(failure) -> None:
+        event_conn = connect(db_path)
+        try:
+            with write_txn(event_conn):
+                _append_event(
+                    event_conn,
+                    task.id,
+                    "worker_supervision_failed",
+                    failure.as_dict(),
+                    run_id=stable_run_id,
+                )
+        finally:
+            event_conn.close()
+
     supervisor = _dispatcher_worker_supervisor(board=board)
     initial_event_path = supervisor.allocate_event_path(identity, 1)
-    initial_proc = _default_spawn(
-        task,
-        workspace,
-        board=board,
-        lifecycle_event_path=initial_event_path,
-        lifecycle_attempt=1,
+    initial_proc = _spawn_supervised_attempt(
+        task, workspace, identity, 1, initial_event_path, board=board
     )
     handle = supervisor.start(
         identity,
         launch,
         on_exit=on_exit,
+        on_pid=on_pid,
+        notifier=notify,
         initial_proc=initial_proc,
         initial_event_path=initial_event_path,
     )
     return handle.pid
+
+
+def _spawn_supervised_attempt(
+    task: Task,
+    workspace: str,
+    identity,
+    attempt: int,
+    event_path: Path,
+    *,
+    board: Optional[str],
+):
+    """Invoke production spawn while preserving older injected test seams."""
+    import inspect
+
+    kwargs: dict[str, Any] = {
+        "board": board,
+        "lifecycle_event_path": event_path,
+        "lifecycle_attempt": attempt,
+    }
+    parameters = inspect.signature(_default_spawn).parameters
+    if "worker_session_id" in parameters:
+        kwargs["worker_session_id"] = identity.session_id
+    if attempt > 1 and "resume_session_id" in parameters:
+        kwargs["resume_session_id"] = identity.session_id
+    return _default_spawn(task, workspace, **kwargs)
 
 
 def _default_spawn(
@@ -9010,6 +9070,8 @@ def _default_spawn(
     board: Optional[str] = None,
     lifecycle_event_path: Optional[Path] = None,
     lifecycle_attempt: int = 1,
+    worker_session_id: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
 ):
     """Spawn ``hermes -p <profile> chat -q ...`` and return its live handle.
 
@@ -9071,6 +9133,8 @@ def _default_spawn(
     if lifecycle_event_path is not None:
         env["HERMES_WORKER_LIFECYCLE_EVENT_PATH"] = str(lifecycle_event_path)
         env["HERMES_WORKER_LIFECYCLE_ATTEMPT"] = str(int(lifecycle_attempt))
+    if worker_session_id:
+        env["HERMES_WORKER_SESSION_ID"] = str(worker_session_id)
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -9168,17 +9232,13 @@ def _default_spawn(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    if resume_session_id:
+        cmd.extend(["--resume", str(resume_session_id)])
     cmd.extend([
         "chat",
         "-q", prompt,
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and

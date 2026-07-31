@@ -19,6 +19,27 @@ def emit(path: Path, **payload: object) -> None:
         stream.flush()
 
 
+def emit_terminal(
+    args: argparse.Namespace,
+    *,
+    exit_code: int,
+    classification: str,
+) -> None:
+    emit(
+        args.event_path,
+        schema_version=1,
+        kind="terminal",
+        task_id=args.task_id,
+        run_id=args.run_id,
+        attempt=args.attempt,
+        session_id=args.session_id,
+        worktree=str(args.worktree.resolve()),
+        owner_pid=os.getpid(),
+        exit_code=exit_code,
+        classification=classification,
+    )
+
+
 def run_listener(event_path: Path) -> int:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -59,6 +80,7 @@ def run_attempt(args: argparse.Namespace) -> int:
             time.sleep(0.02)
         else:
             emit(args.event_path, kind="failure", classification="fixture_timeout")
+            emit_terminal(args, exit_code=70, classification="fixture_timeout")
             return 70
         emit(
             args.event_path,
@@ -66,6 +88,7 @@ def run_attempt(args: argparse.Namespace) -> int:
             classification="transient_provider",
             provider="fixture",
         )
+        emit_terminal(args, exit_code=75, classification="transient_provider")
         return 75
 
     if args.outcome == "fail":
@@ -75,6 +98,7 @@ def run_attempt(args: argparse.Namespace) -> int:
             classification="transient_provider",
             provider="fixture",
         )
+        emit_terminal(args, exit_code=76, classification="transient_provider")
         return 76
 
     bounded_file = args.worktree / "recovered.txt"
@@ -113,8 +137,10 @@ def run_attempt(args: argparse.Namespace) -> int:
         conn.close()
     if not completed:
         emit(args.event_path, kind="failure", classification="completion_rejected")
+        emit_terminal(args, exit_code=71, classification="completion_rejected")
         return 71
     emit(args.event_path, kind="task_done", task_id=args.task_id)
+    emit_terminal(args, exit_code=0, classification="success")
     return 0
 
 
