@@ -381,11 +381,20 @@ function useSessionActions({
 }
 
 interface SessionActionsMenuProps
-  extends SessionActions, Pick<React.ComponentProps<typeof ActionsMenu>, 'align' | 'sideOffset'> {
+  extends
+    SessionActions,
+    Pick<React.ComponentProps<typeof ActionsMenu>, 'align' | 'onOpenChange' | 'open' | 'sideOffset'> {
   children: React.ReactNode
 }
 
-export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ...actions }: SessionActionsMenuProps) {
+export function SessionActionsMenu({
+  children,
+  align = 'end',
+  onOpenChange,
+  open,
+  sideOffset = 6,
+  ...actions
+}: SessionActionsMenuProps) {
   const { t } = useI18n()
   const { renameDialog, renderItems } = useSessionActions(actions)
 
@@ -396,6 +405,8 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
         ariaLabel={t.sidebar.row.sessionActions}
         contentClassName="w-40"
         items={renderItems}
+        onOpenChange={onOpenChange}
+        open={open}
         sideOffset={sideOffset}
       >
         {children}

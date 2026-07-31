@@ -1,5 +1,5 @@
 import type * as React from 'react'
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
@@ -93,6 +93,7 @@ export function ProjectOverviewRow({
   const s = t.sidebar
   const isActive = project.id === activeProjectId
   const [open, toggleOpen] = useWorkspaceNodeOpen(project.id)
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false)
   // The appearance popover anchors here (the full row) so it opens flush with
   // the sidebar's content edge regardless of which side the sidebar is on.
   const rowRef = useRef<HTMLDivElement>(null)
@@ -115,16 +116,31 @@ export function ProjectOverviewRow({
   const shell = (
     <SidebarRowShell
       actions={
-        <>
-          {/* Home has no folder to start a chat in — the sidebar's own "New
-              session" is that button — and no record to rename or delete. */}
-          {onNewSession && !project.isNoProject && (
-            <WorkspaceAddButton label={s.newSessionIn(project.label)} onClick={() => onNewSession(project.path)} />
-          )}
-          {!project.isNoProject && <ProjectMenu anchorRef={rowRef} isActive={isActive} project={project} />}
-        </>
+        <div
+          className="pointer-events-none grid w-0 overflow-hidden opacity-0 transition-[width,opacity] duration-100 ease-out group-hover/workspace:w-[2.25rem] group-hover/workspace:opacity-100 group-focus-within/workspace:w-[2.25rem] group-focus-within/workspace:opacity-100 group-data-[state=open]/workspace:w-[2.25rem] group-data-[state=open]/workspace:opacity-100"
+          data-project-actions
+        >
+          <div className="pointer-events-auto flex gap-1">
+            {/* Home has no folder to start a chat in — the sidebar's own
+                "New session" is that button — and no record to rename or
+                delete. */}
+            {onNewSession && !project.isNoProject && (
+              <WorkspaceAddButton label={s.newSessionIn(project.label)} onClick={() => onNewSession(project.path)} />
+            )}
+            {!project.isNoProject && (
+              <ProjectMenu
+                anchorRef={rowRef}
+                isActive={isActive}
+                onOpenChange={setProjectMenuOpen}
+                open={projectMenuOpen}
+                project={project}
+              />
+            )}
+          </div>
+        </div>
       }
       className={cn('group/workspace', dragging && 'cursor-grabbing bg-(--ui-sidebar-surface-background)')}
+      data-state={projectMenuOpen ? 'open' : undefined}
       ref={rowRef}
     >
       <SidebarRowCluster className="min-w-0 flex-1">

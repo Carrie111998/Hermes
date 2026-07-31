@@ -145,7 +145,9 @@ export function ProjectMenu({
   isActive,
   scoped = false,
   onExitScope,
-  anchorRef
+  anchorRef,
+  onOpenChange,
+  open
 }: {
   project: SidebarProjectTree
   isActive: boolean
@@ -158,6 +160,8 @@ export function ProjectMenu({
   // right-side sidebar drags the picker across the entire panel (the kebab
   // lives at the row's outer edge). Falls back to the kebab when absent.
   anchorRef?: React.RefObject<HTMLElement | null>
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
 }) {
   const { t } = useI18n()
   const p = t.sidebar.projects
@@ -219,7 +223,7 @@ export function ProjectMenu({
       {/* Position the appearance popover against the row (when a ref is wired);
           the kebab is only the dropdown trigger then. */}
       {anchorRef ? <PopoverAnchor virtualRef={anchorRef as React.RefObject<HTMLElement>} /> : null}
-      <DropdownMenu>
+      <DropdownMenu onOpenChange={onOpenChange} open={open}>
         {trigger}
         {/* Closing the menu refocuses the trigger (also the popover anchor),
             which the appearance popover would read as focus-outside and die on.

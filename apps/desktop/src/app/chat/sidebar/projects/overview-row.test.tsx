@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -36,7 +36,9 @@ vi.mock('./model', () => ({
 // right-click wrapper) is stubbed as a pass-through so the row still renders.
 vi.mock('./project-menu', () => ({
   ProjectContextMenu: ({ children }: { children: ReactNode }) => children,
-  ProjectMenu: () => null
+  ProjectMenu: ({ onOpenChange }: { onOpenChange?: (open: boolean) => void }) => (
+    <button aria-label="Project actions" onClick={() => onOpenChange?.(true)} type="button" />
+  )
 }))
 
 const project = { id: 'p1', label: 'Test D' } as unknown as SidebarProjectTree
@@ -44,6 +46,27 @@ const project = { id: 'p1', label: 'Test D' } as unknown as SidebarProjectTree
 const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"]')
 
 describe('ProjectOverviewRow', () => {
+  it('collapses project actions when idle and reveals the track on workspace hover', () => {
+    const { container } = render(<ProjectOverviewRow onNewSession={vi.fn()} project={project} />)
+
+    const track = container.querySelector('[data-project-actions]') as HTMLElement | null
+    expect(track).toBeTruthy()
+    expect(track?.className).toMatch(/\bw-0\b/)
+    expect(track?.className).toMatch(/\bopacity-0\b/)
+    expect(track?.className).toMatch(/group-hover\/workspace:w-\[2\.25rem\]/)
+    expect(track?.className).toMatch(/group-hover\/workspace:opacity-100/)
+  })
+
+  it('keeps the project actions track expanded while the menu is open', () => {
+    const { container } = render(<ProjectOverviewRow project={project} />)
+
+    const track = container.querySelector('[data-project-actions]') as HTMLElement
+    fireEvent.click(screen.getByRole('button', { name: 'Project actions' }))
+
+    expect(track.closest('[data-state="open"]')).toBeTruthy()
+    expect(track.className).toMatch(/group-data-\[state=open\]\/workspace:w-\[2\.25rem\]/)
+  })
+
   it('wraps the "new session" add button in a Tip with the project-scoped label', () => {
     render(<ProjectOverviewRow onNewSession={vi.fn()} project={project} />)
 

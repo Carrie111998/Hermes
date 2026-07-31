@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { memo } from 'react'
+import { memo, useState } from 'react'
 import type * as React from 'react'
 
 import { ProfileTag } from '@/app/chat/profile-tag'
@@ -87,6 +87,12 @@ function SidebarSessionRowImpl({
   // Telegram thread continued here still reads as Telegram.
   const handoffSource = handoffOriginSource(session.handoff_state, session.handoff_platform)
   const handoffLabel = handoffSource ? (sessionSourceLabel(handoffSource) ?? handoffSource) : null
+  // Track the kebab dropdown's open state on the row so the actions slot
+  // stays expanded (and the age label stays in flow) while the menu is open.
+  // ``group-data-[state=open]`` only resolves when the row's ``.group``
+  // ancestor carries ``data-state``; Radix's open signal lives on the inner
+  // trigger, so we lift it onto the row here (#75331).
+  const [menuOpen, setMenuOpen] = useState(false)
   // True when a clarify prompt in this session is waiting on the user.
   const needsInput = useStore($attentionSessionIds).includes(session.id)
 
@@ -106,16 +112,26 @@ function SidebarSessionRowImpl({
           // Hover-revealed actions cluster. Anchored to the right edge so the
           // track only takes layout space while the kebab or the relative-age
           // label is actually visible — no standing 22px gutter on idle rows
-          // (#75331). `group-data` ties the slot to row hover/focus so the
-          // track has zero width when the row is idle, growing only when
-          // interaction has telegraphs it. The kebab itself owns the hit
-          // target; the slot is purely a layout spacer.
+          // (#75331). ``group-hover``/``group-focus-within`` grow the track on
+          // row interaction; ``group-data-[state=open]`` keeps it expanded
+          // while the kebab menu stays open.
+          //
+          // ``data-state`` is lifted onto the row itself (below) so the
+          // ``group-data-[state=open]`` selector above fires while the
+          // kebab dropdown is open: Radix's open state lives on the inner
+          // trigger descendant, not on the row, so we lift the signal up
+          // via the SessionActionsMenu's onOpenChange callback.
           <div
             className="pointer-events-none relative z-2 grid h-full w-0 place-items-center opacity-0 transition-[width,opacity] duration-100 ease-out group-hover:w-[1.375rem] group-hover:opacity-100 group-focus-within:w-[1.375rem] group-focus-within:opacity-100 group-data-[state=open]:w-[1.375rem] group-data-[state=open]:opacity-100"
             data-row-actions
           >
             {!isWorking && (
-              <span className="pointer-events-none absolute right-full top-1/2 mr-1 -translate-y-1/2 whitespace-nowrap text-right text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity group-hover:opacity-100">
+              // The age label sits *inside* the actions track, not absolutely
+              // over the title. Putting it in the normal flow reserves real
+              // layout space only when the row is hovered (track width > 0),
+              // so long titles cannot paint beneath it — they get the
+              // ordinary truncation/elision the row already enforces.
+              <span className="truncate text-[0.625rem] leading-none text-(--ui-text-tertiary) opacity-0 transition-opacity duration-100 group-hover:opacity-100">
                 {age}
               </span>
             )}
@@ -123,7 +139,9 @@ function SidebarSessionRowImpl({
               onArchive={onArchive}
               onBranch={onBranch}
               onDelete={onDelete}
+              onOpenChange={setMenuOpen}
               onPin={onPin}
+              open={menuOpen}
               pinned={isPinned}
               profile={session.profile}
               sessionId={session.id}
@@ -149,6 +167,12 @@ function SidebarSessionRowImpl({
           dragging && 'z-10 cursor-grabbing bg-(--ui-sidebar-surface-background)',
           className
         )}
+        // ``data-state`` on the row lets the actions cluster's
+        // ``group-data-[state=open]`` selector fire once the kebab dropdown
+        // is open. Radix puts ``data-state`` on the inner trigger, not the
+        // row, so we lift the open signal onto the row here via the
+        // SessionActionsMenu's onOpenChange callback (#75331).
+        data-state={menuOpen ? 'open' : undefined}
         data-working={isWorking ? 'true' : undefined}
         onPointerDown={event => {
           // Reorder drags belong to dnd-kit (the grab handle); the ⋯ actions

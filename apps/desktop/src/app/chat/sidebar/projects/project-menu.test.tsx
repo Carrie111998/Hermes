@@ -95,6 +95,16 @@ describe('ProjectMenu', () => {
     expect(tipTrigger(button)).toBeNull()
   })
 
+  it('forwards the dropdown open state to the caller', () => {
+    const onOpenChange = vi.fn()
+
+    render(<ProjectMenu isActive={false} onOpenChange={onOpenChange} project={project} />)
+
+    openTriggerMenu(screen.getByRole('button', { name: 'Actions' }))
+
+    expect(onOpenChange).toHaveBeenCalledWith(true)
+  })
+
   // When anchorRef is absent, PopoverAnchor wraps the dropdown trigger so the
   // appearance popover positions against the kebab. asChild must still reach
   // the real button (no non-forwarding wrappers inside the chain — #67500).
