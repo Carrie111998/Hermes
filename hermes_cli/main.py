@@ -17976,8 +17976,6 @@ def main():
                       "`hermes sessions optimize` later to reclaim freed space.)")
 
         elif action == "search":
-            import re as _re
-
             query = " ".join(args.query)
             raw = db.search_messages(
                 query=query,
@@ -17997,11 +17995,6 @@ def main():
                 db.close()
                 return
 
-            if not seen:
-                print(f"No sessions matching \"{query}\".")
-                db.close()
-                return
-
             # Deduplicate compression children: if A → A #2 → A #3,
             # keep only the latest descendant in each lineage.
             result_ids = set(seen.keys())
@@ -18016,7 +18009,6 @@ def main():
             for sid in ancestors:
                 seen.pop(sid, None)
 
-            import os as _os
             import time as _time
             from datetime import datetime as _dt
 

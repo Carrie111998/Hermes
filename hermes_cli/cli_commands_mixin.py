@@ -1082,7 +1082,7 @@ class CLICommandsMixin:
         registered in the central COMMAND_REGISTRY.
         """
         from cli import _cprint
-        from hermes_cli.session_listing import parse_session_listing_args, query_session_listing
+        from hermes_cli.session_listing import parse_session_listing_args
 
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -1102,8 +1102,6 @@ class CLICommandsMixin:
                 # Use FTS5 content search — searches message text, not just
                 # session titles/IDs. Returns ranked results with match
                 # snippets, grouped by session.
-                import re as _re
-                import os as _os
                 import time as _time
                 from datetime import datetime as _dt
 
@@ -1132,17 +1130,6 @@ class CLICommandsMixin:
                 _cprint(f"  No sessions matching \"{search_query}\".")
                 return
 
-            _cprint("")
-            _cprint(f"  ⚙️  /sessions search {search_query}")
-            _cprint("")
-            _cprint(f"  Sessions matching \"{search_query}\":")
-            _cprint("")
-
-            if not seen:
-                _cprint("")
-                _cprint(f"  No sessions matching \"{search_query}\".")
-                return
-
             # Deduplicate compression children: if A → A #2 → A #3,
             # keep only the latest descendant in each lineage.
             result_ids = set(seen.keys())
@@ -1164,7 +1151,6 @@ class CLICommandsMixin:
 
             # Sort by last_active descending (most recent first)
             sids_sorted = list(seen.keys())
-            sid_order = {}
             conn = self._session_db._conn
             ph = ",".join("?" for _ in sids_sorted)
             cur = conn.execute(
@@ -1203,17 +1189,6 @@ class CLICommandsMixin:
                 row = cur.fetchone()
                 root_preview_cache[sid] = row[0] if row else ""
 
-            # Batch-fetch user/assistant message counts
-            cur = conn.execute(
-                f"SELECT session_id, role, COUNT(*) FROM messages WHERE session_id IN ({ph}) GROUP BY session_id, role",
-                sids_sorted,
-            )
-            role_counts = {}
-            for sid, role, cnt in cur.fetchall():
-                if sid not in role_counts:
-                    role_counts[sid] = {}
-                role_counts[sid][role] = cnt
-
             # Title column width = longest title in results (capped at 50)
             max_title = 0
             for sid in seen:
@@ -1235,8 +1210,6 @@ class CLICommandsMixin:
                     return f"{n//1000}k"
                 return str(n)
 
-            _cprint(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<20} {'ID'}")
-            _cprint(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*20} {'─'*12}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = self._session_db.get_session(sid) or {}
                 title = (meta.get("title") or "—")[:title_w]
