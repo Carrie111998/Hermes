@@ -37,14 +37,24 @@ This plan intentionally does **not** replace SQLite first. It introduces a durab
 
 ## Proposed manifest shape
 
-Start with line-delimited JSON so exports can stream and imports can be deduplicated record-by-record.
+Start with line-delimited JSON so imports can be deduplicated record-by-record. Export records are first serialized in deterministic order to a temporary file while the evidence-level `archive_id` is computed; only then is `manifest + records + receipt` written atomically to the final path. This buffering is required because the manifest is line 1 but its `archive_id` depends on all session and message records.
 
 ```json
-{"type":"manifest","schema_version":1,"exported_at":"2026-05-30T00:00:00Z","producer":"hermes-agent","source":{"profile":"default","machine_id":"..."},"record_count":2}
-{"type":"session","session_id":"20260530_abc","source":"discord","started_at":1770000000.0,"title":"...","parent_session_id":null,"metadata_hash":"sha256:..."}
-{"type":"message","session_id":"20260530_abc","local_message_id":12,"message_index":0,"role":"user","timestamp":1770000001.0,"content_sha256":"...","payload_sha256":"...","payload":{"content":"hi","tool_call_id":null,"tool_calls":null,"tool_name":null,"finish_reason":null,"reasoning":null,"platform_message_id":"...","observed":0}}
+{"type":"manifest","schema_version":1,"archive_id":"sha256:...","generation":null,"evidence_scope":"complete-repair","exported_at":"2026-05-30T00:00:00Z","producer":"hermes-agent","source":{"profile":"default","machine_id":"..."},"record_count":2,"message_payload_fields":["role","content","tool_call_id","tool_calls","tool_name","effect_disposition","timestamp","token_count","finish_reason","reasoning","reasoning_content","reasoning_details","codex_reasoning_items","codex_message_items","platform_message_id","observed","active","compacted","api_content","display_kind","display_metadata"]}
+{"type":"session","schema_version":1,"session_id":"20260530_abc","source":"discord","started_at":1770000000.0,"title":"...","parent_session_id":null,"metadata_hash":"sha256:..."}
+{"type":"message","schema_version":1,"session_id":"20260530_abc","local_message_id":12,"message_index":0,"content_sha256":"sha256:...","payload_sha256":"sha256:...","payload":{"role":"user","content":"hi","tool_call_id":null,"tool_calls":null,"tool_name":null,"effect_disposition":null,"timestamp":1770000001.0,"token_count":null,"finish_reason":null,"reasoning":null,"reasoning_content":null,"reasoning_details":null,"codex_reasoning_items":null,"codex_message_items":null,"platform_message_id":"...","observed":0,"active":1,"compacted":0,"api_content":null,"display_kind":null,"display_metadata":null}}
 {"type":"receipt","schema_version":1,"record_count":2,"content_sha256":"sha256-of-prior-lines","finished_at":"2026-05-30T00:00:01Z"}
 ```
+
+### Archive identity and repeated exports
+
+Define `archive_id = "sha256:" + sha256(canonical_body)`. The `canonical_body` is the concatenation of every `session` and `message` record serialized with `stable_json` (`sort_keys=True`, `separators=(",", ":")`), with each record newline-terminated. Sessions are ordered by `session_id`, followed by messages ordered by `(session_id, message_index)`.
+
+The canonical body excludes the `manifest` and `receipt` records and strips `local_message_id` from each message before canonical serialization. The emitted message record still carries `local_message_id` as informational provenance, but the canonical message record does not: `messages.id` is local provenance only, and hashing it would assign different archive identities to the same conversation on different machines. Likewise, `exported_at`, `producer`, `source.machine_id`, and receipt timestamps describe an export run rather than its evidence.
+
+Two exports of identical evidence therefore have the same `archive_id` even when their timestamps and literal file bytes differ. JSON key order, whitespace, and manifest/receipt-only metadata do not affect evidence identity; a changed record set or hashed field does. `receipt.content_sha256` remains a separate file-level integrity check over the literal preceding lines, so it detects truncation or byte-level tampering. `verify_archive` recomputes both values and reports archive-identity failure separately from receipt-integrity failure; neither check substitutes for the other.
+
+For an intentional new generation of otherwise identical evidence, the CLI accepts `--archive-generation LABEL`. The manifest's `generation` defaults to `null`; when non-null, canonicalization prepends a stable `{"type":"generation","value":...}` line. A schema-version bump or widened record field set also changes canonical records and therefore `archive_id`. Comparing `generation` and `schema_version` distinguishes an intentional new generation from changed evidence.
 
 Design constraints:
 
@@ -54,6 +64,8 @@ Design constraints:
 - `content_sha256` supports transcript integrity checks without always reading full payload text.
 - Import should be idempotent: importing the same archive twice must not duplicate messages.
 - The manifest must be usable as repair input even when FTS tables or parts of `state.db` are broken.
+- The archive boundary is **complete repair evidence**, not live-only replay. A repair artifact must retain rows a damaged database may have lost, including rewind history (`active=0, compacted=0`) and compaction history (`active=0, compacted=1`); otherwise it cannot satisfy the repair goal above.
+- Mechanically, `payload` carries every persisted `messages` column except `id` and `session_id`, represented in the record envelope as `local_message_id` and `session_id`. The source schema is `hermes_state_common.py:192-216`; deriving the field set from that rule avoids a hand-maintained partial boundary.
 
 ---
 
@@ -65,7 +77,7 @@ Design constraints:
 - Create: `docs/session-state-architecture.md`
 
 **Steps:**
-1. Read `hermes_state.py` schema (`sessions`, `messages`, `state_meta`, FTS/trigram tables).
+1. Read the persisted schema in `hermes_state_common.py` (`sessions`, `messages`, `state_meta`, FTS/trigram tables).
 2. Search direct `SessionDB()` construction sites in `cli.py`, `gateway/session.py`, `gateway/run.py`, `mcp_serve.py`, `cron/scheduler.py`, `tui_gateway/server.py`, `acp_adapter/session.py`, and dashboard plugins.
 3. Write the note with a table:
    - state layer,
@@ -79,7 +91,7 @@ Design constraints:
 **Verification:**
 
 ```bash
-python -m pytest tests/test_hermes_state.py -q -o 'addopts='
+scripts/run_tests.sh tests/test_hermes_state.py -q
 ```
 
 Expected: existing SessionDB tests still pass; docs-only task should not affect behavior.
@@ -100,10 +112,14 @@ Expected: existing SessionDB tests still pass; docs-only task should not affect 
 SCHEMA_VERSION = 1
 
 MESSAGE_PAYLOAD_FIELDS = (
+    "role",
     "content",
     "tool_call_id",
     "tool_calls",
     "tool_name",
+    "effect_disposition",
+    "timestamp",
+    "token_count",
     "finish_reason",
     "reasoning",
     "reasoning_content",
@@ -112,6 +128,11 @@ MESSAGE_PAYLOAD_FIELDS = (
     "codex_message_items",
     "platform_message_id",
     "observed",
+    "active",
+    "compacted",
+    "api_content",
+    "display_kind",
+    "display_metadata",
 )
 
 def stable_json(data: dict[str, object]) -> str:
@@ -128,25 +149,26 @@ def message_record(session_id: str, row: Mapping[str, object], message_index: in
         "session_id": session_id,
         "local_message_id": row.get("id"),
         "message_index": message_index,
-        "role": row.get("role"),
-        "timestamp": row.get("timestamp"),
         "content_sha256": sha256_text(str(row.get("content") or "")),
         "payload_sha256": sha256_text(stable_json(payload)),
         "payload": payload,
     }
 ```
 
+`MESSAGE_PAYLOAD_FIELDS` is not an independently chosen allowlist: it implements the mechanical boundary above, every persisted `messages` column except `id` and `session_id`. A schema test should compare it to the persisted column set so future schema additions cannot silently fall outside the repair archive.
+
 **Tests:**
 - stable JSON ordering is deterministic,
 - content hash changes when content changes,
 - payload hash includes tool/reasoning/platform fields,
+- payload contains role, timestamp, lifecycle state, API/display metadata, and every other persisted message field except the two envelope identifiers,
 - generated records contain `schema_version == 1`,
 - helper handles `None` optional fields.
 
 **Verification:**
 
 ```bash
-python -m pytest tests/hermes_cli/test_session_archive.py -q -o 'addopts='
+scripts/run_tests.sh tests/hermes_cli/test_session_archive.py -q
 ```
 
 ---
@@ -165,19 +187,22 @@ python -m pytest tests/hermes_cli/test_session_archive.py -q -o 'addopts='
 Add a pure function first:
 
 ```python
-def export_session_jsonl(db: SessionDB, session_id: str, out_path: Path, *, profile: str | None = None) -> ArchiveReceipt:
+def export_session_jsonl(db: SessionDB, session_id: str, out_path: Path, *, profile: str | None = None, generation: str | None = None) -> ArchiveReceipt:
     session = db.get_session(session_id)
-    messages = db.get_messages(session_id)
-    # write manifest + session + message records + receipt
+    messages = db.get_messages(session_id, include_inactive=True)
+    # Serialize deterministic records to a temp file and compute archive_id.
+    # Then atomically write manifest + records + receipt to out_path.
 ```
+
+The explicit `include_inactive=True` is required for the complete-repair boundary: `SessionDB.get_messages()` otherwise adds `active = 1` (`hermes_state.py:6111-6161`, especially `active_clause` at line 6134) and irreversibly omits rewind and compaction history from the export.
 
 Then expose a CLI command such as:
 
 ```bash
-hermes sessions export-archive SESSION_ID --output /tmp/session.jsonl
+hermes sessions export-archive SESSION_ID --output /tmp/session.jsonl [--archive-generation LABEL]
 ```
 
-If command naming conflicts with the existing `hermes sessions export OUT`, prefer a conservative hidden/experimental flag first:
+The existing session-shaped JSONL path is `hermes_state_portability.py:221-259`, its import entry point is `hermes_state_portability.py:331`, and the current `hermes sessions export OUT` CLI is implemented at `hermes_cli/console_engine.py:1401-1437`. If command naming conflicts with that CLI, prefer a conservative hidden/experimental flag first:
 
 ```bash
 hermes sessions export OUT --format archive-jsonl --session SESSION_ID
@@ -188,19 +213,22 @@ hermes sessions export OUT --format archive-jsonl --session SESSION_ID
 - export to JSONL,
 - assert first line is `manifest`, last line is `receipt`,
 - assert receipt count/hash matches prior lines,
+- assert repeated exports of identical evidence share an `archive_id` despite export-run metadata changes,
+- assert `--archive-generation` changes `archive_id`,
+- assert inactive rewind and compacted rows are exported with their lifecycle flags,
 - assert file is UTF-8 and line-delimited JSON.
 
 **Verification:**
 
 ```bash
-python -m pytest tests/hermes_cli/test_session_archive.py tests/test_hermes_state.py -q -o 'addopts='
+scripts/run_tests.sh tests/hermes_cli/test_session_archive.py tests/test_hermes_state.py -q
 ```
 
 ---
 
 ### Task 4: Verify archive integrity
 
-**Objective:** Add a verifier that checks schema version, record ordering, required fields, receipt hash, and duplicate message identities before import exists.
+**Objective:** Add a verifier that checks schema version, record ordering, required fields, evidence-level archive identity, file-level receipt integrity, and duplicate message identities before import exists.
 
 **Files:**
 - Modify: `hermes_cli/session_archive.py`
@@ -212,14 +240,18 @@ python -m pytest tests/hermes_cli/test_session_archive.py tests/test_hermes_stat
 def verify_archive(path: Path) -> ArchiveVerification:
     # stream lines
     # validate first manifest, last receipt
-    # recompute receipt hash over prior lines
+    # recompute archive_id from canonical evidence records
+    # recompute receipt hash over literal prior lines
     # ensure session records appear before their message records
     # ensure no duplicate (session_id, message_index, payload_sha256)
 ```
 
+Verification may establish well-formedness and both hash contracts, but it may claim **complete repair evidence** only for the complete-repair export path above: the exporter must have queried `get_messages(..., include_inactive=True)`, emitted the full mechanical payload field set, and marked `evidence_scope` accordingly. Hash integrity alone cannot prove that the source query did not omit inactive rows.
+
 **Tests:**
 - valid export verifies,
 - tampered content fails,
+- canonical archive-identity mismatch and literal receipt-integrity mismatch are distinct failures,
 - missing receipt fails,
 - duplicate message identity fails,
 - unsupported `schema_version` fails with a clear error.
@@ -227,7 +259,7 @@ def verify_archive(path: Path) -> ArchiveVerification:
 **Verification:**
 
 ```bash
-python -m pytest tests/hermes_cli/test_session_archive.py -q -o 'addopts='
+scripts/run_tests.sh tests/hermes_cli/test_session_archive.py -q
 ```
 
 ---
@@ -244,6 +276,7 @@ python -m pytest tests/hermes_cli/test_session_archive.py -q -o 'addopts='
 - Use `session_id` from the archive unless an explicit `--prefix-session-id` / `--remap-session-id` is requested later.
 - Create missing sessions with existing SessionDB APIs.
 - For each message, deduplicate on `(session_id, message_index, payload_sha256)` using a small archive import ledger.
+- Insert each restored message through `append_message`, then apply one explicit `UPDATE messages SET active=?, compacted=? WHERE id=?` using the returned row ID. `append_message()` currently has no `active` or `compacted` parameter (`hermes_state.py:5450-5473`), so preserving soft-deleted/compacted state requires this small but real write-path addition; the existing API must not be described as already supporting it.
 - If adding a table is too much for the first code PR, start with a sidecar import receipt file under a Hermes-controlled cache directory and leave DB ledger as the next PR.
 
 Preferred DB table for stable idempotency:
@@ -264,12 +297,12 @@ CREATE TABLE IF NOT EXISTS session_archive_imports (
 - import archive into empty DB creates session/messages,
 - importing same archive twice does not duplicate messages,
 - import preserves roles/content/tool metadata,
-- FTS search sees imported messages after insert triggers run.
+- FTS assertions distinguish lifecycle state: restored `compacted=1` rows are included by `search_messages()` by default, while rewind rows (`active=0, compacted=0`) remain hidden (`hermes_state.py:6039-6045`). Do not promise blanket FTS visibility for every restored inactive row.
 
 **Verification:**
 
 ```bash
-python -m pytest tests/hermes_cli/test_session_archive.py tests/test_hermes_state.py -q -o 'addopts='
+scripts/run_tests.sh tests/hermes_cli/test_session_archive.py tests/test_hermes_state.py -q
 ```
 
 ---
@@ -300,7 +333,7 @@ Dry-run output should include:
 **Verification:**
 
 ```bash
-python -m pytest tests/hermes_cli/test_session_archive.py -q -o 'addopts='
+scripts/run_tests.sh tests/hermes_cli/test_session_archive.py -q
 ```
 
 ---
@@ -357,7 +390,7 @@ A good first implementation PR should satisfy all of these:
 
 ## Risk notes
 
-- Hashing full content helps integrity but not privacy; archive files may contain raw transcripts and must be treated as sensitive.
+- Hashing full content helps integrity but not privacy. Complete-repair archives contain rewind history and compacted-away text that users may believe was discarded, so they are strictly more sensitive than live-only exports and must be treated accordingly.
 - Import must be conservative by default: verify first, dry-run supported, fail closed on conflicts.
 - Existing `messages.id` row IDs are local provenance only; do not treat them as cross-machine identity.
 - FTS tables should be rebuilt/updated through normal inserts, not copied from archive.
