@@ -440,6 +440,11 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
+        from hermes_cli.oneshot_guard import load_guard_config, run_guarded
+
+        gcfg = load_guard_config(cfg)
+        if gcfg.active:
+            return run_guarded(agent, prompt, gcfg)
         result = agent.run_conversation(prompt)
         return (result.get("final_response") or "", result)
     finally:
