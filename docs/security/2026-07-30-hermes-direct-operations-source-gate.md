@@ -12,10 +12,12 @@ incidents:
   for source or installed-skill changes;
 - preserve ordinary business-operation execution and native agent tool use;
 - isolate every Codex implementation turn in a clean dedicated worktree;
+- treat external MCP effect annotations as untrusted and disable direct
+  app/plugin/external-MCP surfaces outside operation turns;
 - keep the existing one-shot destructive confirmation primitive intact;
 - send real progress through the platform after at most about 90 seconds;
-- terminate every run as done, blocked, or failed and distinguish a generated
-  final from a delivered, unknown, or failed final;
+- terminate every run as done, blocked, failed, or cancelled and distinguish a
+  generated final from a delivered, unknown, or failed final;
 - make an owner stop durable and permanently remove hygiene dependency edges
   that can implicitly start the gateway.
 
@@ -28,8 +30,10 @@ confirmation.
 
 - repository: `NousResearch/hermes-agent`
 - branch: `codex/hermes-direct-ops-safety`
-- clean origin/main baseline, local HEAD, and merge base before edits:
-  `8defb9fd60bebe2802eaab7c57fa2ee6a4ff6281`
+- current origin/main and merge base after the final rebase:
+  `cc4cab2f592e60a197e796506de9168f74baf3ea`
+- rebased safety implementation commit before this evidence-only refresh:
+  `46c1eac12fbc9d314c8e1127b1e86eeb6c98a221`
 - implementation worktree:
   `C:\Users\Ed\.codex\worktrees\hermes-direct-ops-0730`
 - no service, systemd, runtime, deploy, unmask, start, restart, provider, or
@@ -37,29 +41,23 @@ confirmation.
 
 ## Final no-retry behavioral gate
 
-The canonical runner was used with all 23 changed-area test files in one
-invocation, `--file-timeout 900`, and `--file-retries 0`.
+The canonical runner was used after the final rebase with all 24
+branch-touched behavior files plus the three existing one-confirmation files
+in one invocation, `--file-timeout 900`, and `--file-retries 0`.
 
 Result:
 
 ```text
-23 files, 566 tests passed, 0 failed
-runner wall: 186.8 seconds
+27 files, 602 tests passed, 0 failed
+runner wall: 186.5 seconds
 process exit: 0
 ```
 
-The immutable Base64 evidence files below decode byte-for-byte to the captured
-stdout, stderr, and exit-code files:
-
-| Evidence | Decoded bytes | Decoded SHA-256 | Base64 artifact SHA-256 |
-|---|---:|---|---|
-| `docs/security/evidence/2026-07-30-hermes-direct-ops-focused.stdout.log.b64` | 4471 | `6eb4f010b60cd3b854062c7cd50548d28c364b51ea724a2e20d4c4ed1391c426` | `0236456e1b666e953b27a9a5246d46c02d88c8d841fe851201f7c0e463510464` |
-| `docs/security/evidence/2026-07-30-hermes-direct-ops-focused.stderr.log.b64` | 561 | `3c89fe112ead23f54f7fe916bf7c72ca81450b69a92a875dc781daf8d787a852` | `5da270a65920a1c239dea57d807a40176f419692081885c014f7b3f1d38f5d72` |
-| `docs/security/evidence/2026-07-30-hermes-direct-ops-focused.exit.txt.b64` | 3 | `13bf7b3039c63bf5a50491fa3cfd8eb4e699d1ba1436315aef9cbe5711530354` | `3cb85ee278ce6ab31f25c4bbb991a6218334a4b06c26ca45f983641f10ce1452` |
-
-The stderr artifact contains only the known WSL worktree gitdir-pointer
-diagnostic plus PowerShell progress serialization. The runner summary and
-captured process exit are green.
+The runner emitted the known post-summary WSL/Windows worktree gitdir-pointer
+diagnostic after reporting the green result; the process still exited zero.
+The existing Base64 files under `docs/security/evidence/` preserve the earlier
+pre-rebase run and are intentionally not represented as evidence for this
+current result.
 
 Supporting preservation gate for the existing one-shot destructive
 confirmation primitive:
@@ -68,23 +66,30 @@ confirmation primitive:
 tests/gateway/test_destructive_slash_confirm.py
 tests/hermes_cli/test_destructive_slash_confirm_gate.py
 tests/tools/test_slash_confirm.py
-3 files, 14 tests passed, 0 failed, retries disabled
+14 tests passed inside the 602-test gate, retries disabled
 ```
 
-High-signal regressions in the 566-test gate include:
+High-signal regressions in the 602-test gate include:
 
 - `test_phase_classifier_preserves_business_operations`
 - `test_business_api_operation_remains_allowed_even_when_repo_is_dirty`
 - `test_exact_quote_investigation_declines_codex_exec_and_patch`
 - `test_dirty_implementation_is_automatically_isolated`
 - `test_clean_implementation_codex_thread_keeps_native_permissions`
+- `test_operation_codex_thread_keeps_native_external_tools`
 - `test_actual_mcp_subprocess_cannot_escape_phase_with_terminal`
 - `test_required_child_fails_closed_for_non_skill_effect_without_channel`
-- `test_july_quote_failure_cannot_load_103k_and_119k_skill_packets`
+- `test_external_tool_cannot_self_declare_read_only_during_investigation`
+- `test_july_quote_failure_cannot_load_oversized_skill_packets`
+- `test_failed_partial_native_file_effect_blocks_every_later_mutation`
 - `test_ninety_second_progress_receipt_reaches_real_send_seam`
 - `test_unknown_stream_outcome_suppresses_resend_without_claiming_delivery`
 - `test_stream_ledger_failure_has_explicit_terminal_delivery_state`
+- `test_cancelled_exception_closes_run_as_cancelled_receipt`
 - `test_unit_migration_removes_only_implicit_gateway_start_edges`
+- `test_systemd_stop_reaches_gateway_when_every_hygiene_stop_raises`
+- `test_failed_systemd_start_restores_prior_owner_hold`
+- `test_failed_systemd_restart_restores_prior_owner_hold`
 - `test_hardened_watchdog_exits_and_cannot_schedule_when_owner_hold_exists`
 - `test_implicit_gateway_run_is_refused_while_owner_hold_exists`
 
@@ -92,21 +97,37 @@ High-signal regressions in the 566-test gate include:
 
 - Python bytecode compilation: PASS
 - `git diff --check`: PASS
-- repository-wide blocking `ruff check .`: PASS
-- `python scripts/check-windows-footguns.py --all`: PASS, 895 files scanned
-- exact changed-file type inspection: completed; four new advisory diagnostics
-  were removed before the final behavioral run
+- repository-wide blocking `ruff check .`: PASS (one pre-existing invalid
+  `noqa` warning, zero blocking diagnostics)
+- `python scripts/check-windows-footguns.py --all`: PASS, 896 files scanned
 
 The repository pins an advisory `ty` release and CI invokes it with
 `--exit-zero`. A directory-wide local invocation of `ty 0.0.21` panics on the
 unchanged `tools/checkpoint_manager.py` cycle and also reports the repository's
-large existing diagnostic baseline. This is not represented as a type-check
-pass. The normal CI base-versus-head advisory report remains required during
-integration.
+large existing diagnostic baseline. No fresh full-repository type-pass is
+claimed here. The normal CI base-versus-head advisory report remains required
+during integration.
 
 The full repository test matrix and production packaging were not run in this
-lane. They remain integration/release gates; the 566-test result is the complete
+lane. They remain integration/release gates; the 602-test result is the complete
 changed-area behavioral gate, not a claim about the full suite.
+
+## Exact residual repository race
+
+Hermes captures repository state at turn intake, re-probes immediately before
+each native mutating tool, verifies typed file effects after execution, advances
+its expected state only for a successful verified effect, and freezes later
+mutations after an exception or partial/unknown effect. This closes the
+observed dirty-checkout and partial-tool races as far as Hermes can enforce
+inside its own process.
+
+One narrow cross-process race remains: another program can modify a repository
+after Hermes' final pre-write probe or source readback because Git and ordinary
+filesystem writes do not provide a mandatory lock shared by every editor and
+process. Hermes will detect that drift before its next mutation, but a final
+response could theoretically race a later outside edit. Eliminating that last
+window requires OS/container isolation or universal cooperative locking; it is
+not silently represented as solved.
 
 ## Dependency and owner-stop proof
 
@@ -123,8 +144,9 @@ installed hygiene unit and confirm it contains no pull dependency on
 
 ## Controlled install and activation order
 
-1. Review the three commits and run the full GitHub test, blocking lint,
-   Windows-footgun, advisory type-diff, and packaging gates.
+1. Review the four safety commits plus this evidence refresh, then run the full
+   GitHub test, blocking lint, Windows-footgun, advisory type-diff, and
+   packaging gates.
 2. Install the reviewed source while the existing gateway/hygiene owner holds
    remain in place. Do not start Hermes as part of installation.
 3. Run the hygiene migration explicitly and read back the installed service and
