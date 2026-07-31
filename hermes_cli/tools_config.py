@@ -765,6 +765,29 @@ def _cua_driver_env() -> dict:
         return dict(os.environ)
 
 
+def _pinned_specs(feature: str, fallback: tuple) -> List[str]:
+    """Resolve a ``tools.lazy_deps`` feature to its pinned pip specs.
+
+    ``tools/lazy_deps.LAZY_DEPS`` is the single source of truth for optional-
+    package versions (it mirrors the pyproject extras). Setup-time installs
+    read that same table so an interactive ``hermes setup`` can never resolve
+    a *different* — or, worse, unpinned and therefore attacker-choosable —
+    version than the lazy runtime path would install for the same feature.
+
+    ``fallback`` is used only when ``tools.lazy_deps`` can't be imported or
+    doesn't know the feature (stripped / partial installs). Keep it in sync
+    with the LAZY_DEPS entry; ``tests/hermes_cli/test_setup_install_pins.py``
+    asserts they match.
+    """
+    try:
+        from tools.lazy_deps import feature_specs
+
+        specs = feature_specs(feature)
+    except Exception:
+        specs = ()
+    return list(specs or fallback)
+
+
 def _pip_install(
     args: List[str],
     *,
