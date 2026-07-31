@@ -1083,7 +1083,6 @@ class TestWebServerEndpoints:
             category_auto_reply=adapter._category_auto_reply,
             custom_skip_patterns=adapter._custom_skip_patterns,
         )
-
     def test_generic_messaging_update_rejects_email_policy_fields(self):
         rejected = self.client.put(
             "/api/messaging/platforms/email",
