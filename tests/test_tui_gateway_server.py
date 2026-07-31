@@ -3417,6 +3417,40 @@ def test_startup_runtime_detects_provider_for_model_env(monkeypatch):
     )
 
 
+def test_startup_temperature_reads_tui_env(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "0.7")
+    assert server._resolve_startup_temperature() == 0.7
+
+
+def test_startup_temperature_none_when_unset(monkeypatch):
+    monkeypatch.delenv("HERMES_TUI_TEMPERATURE", raising=False)
+    assert server._resolve_startup_temperature() is None
+
+
+def test_startup_temperature_none_when_empty(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "  ")
+    assert server._resolve_startup_temperature() is None
+
+
+def test_startup_temperature_rejects_out_of_range(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "2.5")
+    assert server._resolve_startup_temperature() is None
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "-0.1")
+    assert server._resolve_startup_temperature() is None
+
+
+def test_startup_temperature_rejects_non_numeric(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "hot")
+    assert server._resolve_startup_temperature() is None
+
+
+def test_startup_temperature_accepts_boundary_values(monkeypatch):
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "0.0")
+    assert server._resolve_startup_temperature() == 0.0
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "2.0")
+    assert server._resolve_startup_temperature() == 2.0
+
+
 def test_load_fallback_model_merges_chain_providers_first(monkeypatch):
     # Parity with HermesCLI / gateway: fallback_providers stays first and keeps
     # its order, with any distinct legacy fallback_model entry merged in after
@@ -13451,6 +13485,29 @@ def test_make_agent_reads_nested_max_turns(monkeypatch):
         server._make_agent("sid1", "key1")
 
     assert mock_agent.call_args.kwargs["max_iterations"] == 200
+
+
+def test_make_agent_forwards_startup_temperature(monkeypatch):
+    """`hermes --tui --temperature <t>` must reach AIAgent(temperature=...)."""
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setenv("HERMES_TUI_TEMPERATURE", "0.7")
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent("sid1", "key1")
+
+    assert mock_agent.call_args.kwargs["temperature"] == 0.7
+
+
+def test_make_agent_omits_temperature_when_env_unset(monkeypatch):
+    """No HERMES_TUI_TEMPERATURE → temperature stays None (config/provider
+    defaults inside agent_init decide)."""
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.delenv("HERMES_TUI_TEMPERATURE", raising=False)
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent("sid1", "key1")
+
+    assert mock_agent.call_args.kwargs["temperature"] is None
 
 
 def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):

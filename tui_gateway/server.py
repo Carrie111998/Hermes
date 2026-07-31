@@ -3581,6 +3581,34 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
     return model, None
 
 
+def _resolve_startup_temperature() -> float | None:
+    """Sampling temperature seeded by ``hermes --tui --temperature <t>``.
+
+    ``hermes_cli.main`` exports the flag as ``HERMES_TUI_TEMPERATURE`` — a
+    launch-scoped seed exactly like ``HERMES_MODEL`` / ``HERMES_TUI_PROVIDER``.
+    The value must be a float in [0.0, 2.0]; anything else (out of range,
+    non-numeric, empty) is ignored with a warning so a bad seed can never
+    crash the gateway — the agent then falls back to config.yaml
+    ``model.temperature`` / the provider default.
+    """
+    raw = os.environ.get("HERMES_TUI_TEMPERATURE", "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = float(raw)
+        if not (0.0 <= parsed <= 2.0):
+            raise ValueError
+        return parsed
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid HERMES_TUI_TEMPERATURE: %r — must be a float between "
+            "0.0 and 2.0 (e.g. 0.7). Ignoring; falling back to "
+            "config/provider defaults.",
+            raw,
+        )
+        return None
+
+
 # Bare billing buckets are not routable provider identities (kept in parity with the
 # provider gate in agent_init). Restoring one as a session provider override breaks resume.
 _BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
@@ -6320,6 +6348,11 @@ def _make_agent(
     cfg = _load_cfg()
     agent_cfg = cfg.get("agent") or {}
     system_prompt = _prompt_text(agent_cfg.get("system_prompt", ""))
+    # Launch-scoped sampling temperature seed (hermes --tui --temperature).
+    # Read once per agent build so the flag is honored on fresh sessions and
+    # rebuilds alike; None defers to config.yaml model.temperature / provider
+    # defaults inside agent_init.
+    startup_temperature = _resolve_startup_temperature()
     startup_skills = _parse_tui_skills_env()
     if startup_skills:
         from agent.skill_commands import build_preloaded_skills_prompt
@@ -6417,6 +6450,7 @@ def _make_agent(
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
+        temperature=startup_temperature,
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),

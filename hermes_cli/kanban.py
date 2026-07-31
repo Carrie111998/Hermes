@@ -210,6 +210,26 @@ def _check_dispatcher_presence(
     )
 
 
+def _model_temperature_arg(value: str) -> float:
+    """argparse type for ``--model-temperature``: a float in [0.0, 2.0].
+
+    Mirrors the 0.0–2.0 guard in ``tools/kanban_tools._handle_create`` so the
+    CLI rejects the same invalid values the tool handler does (out-of-range
+    values would otherwise be persisted and forwarded to the worker as
+    ``--temperature <value>``).
+    """
+    try:
+        parsed = float(value)
+        if not (0.0 <= parsed <= 2.0):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            "model_temperature must be a number between 0.0 and 2.0, "
+            f"got {value!r}"
+        )
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
@@ -333,7 +353,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--model-temperature", dest="model_temperature",
-                          type=float, default=None, metavar="TEMP",
+                          type=_model_temperature_arg, default=None, metavar="TEMP",
                           help="Sampling temperature override (0.0-2.0) for the worker "
                                "(dispatcher passes --temperature <value>)")
     p_create.add_argument("--parent", action="append", default=[],

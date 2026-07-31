@@ -262,3 +262,32 @@ class TestKanbanCli:
                 seen[opt] = action
         assert "--model" in seen
         assert "--model-temperature" in seen
+
+    def test_create_rejects_out_of_range_temperature(self):
+        import argparse
+        from hermes_cli.kanban import build_parser
+
+        wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+        top_sub = wrap.add_subparsers(dest="_top")
+        parser = build_parser(top_sub)
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        create = sub.choices["create"]
+
+        for bad in ("2.5", "-0.1", "hot"):
+            with pytest.raises(SystemExit):
+                create.parse_args(["t", "--model-temperature", bad])
+
+    def test_create_accepts_in_range_temperature(self):
+        import argparse
+        from hermes_cli.kanban import build_parser
+
+        wrap = argparse.ArgumentParser(prog="wrap", add_help=False)
+        top_sub = wrap.add_subparsers(dest="_top")
+        parser = build_parser(top_sub)
+        sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        create = sub.choices["create"]
+
+        args = create.parse_args(["t", "--model-temperature", "0.7"])
+        assert args.model_temperature == 0.7
+        args = create.parse_args(["t", "--model-temperature", "2.0"])
+        assert args.model_temperature == 2.0
