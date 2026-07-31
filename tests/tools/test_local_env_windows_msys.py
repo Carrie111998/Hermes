@@ -19,6 +19,8 @@ on the real OS.
 """
 
 import os
+import shutil
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -415,6 +417,40 @@ class TestGitBashCoreutilsOnPath:
         assert "mingw64" not in run_env["PATH"]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression")
+def test_login_snapshot_preserves_host_and_default_profile_path(tmp_path, monkeypatch):
+    """A Windows login profile may replace PATH; the host entry must survive."""
+    host_bin = tmp_path / "host-bin"
+    host_bin.mkdir()
+    shutil.copy2(os.environ["COMSPEC"], host_bin / "host-proof.exe")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    profile_bin = tmp_path / "profile-bin"
+    profile_bin.mkdir()
+    shutil.copy2(os.environ["COMSPEC"], profile_bin / "profile-proof.exe")
+    profile_path = _windows_to_msys_path(str(profile_bin))
+    (home / ".bash_profile").write_text(
+        f'export PATH="/usr/bin:/bin:{profile_path}"\n',
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", str(host_bin) + os.pathsep + os.environ["PATH"])
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=20)
+    try:
+        assert env._snapshot_ready is True
+        result = env.execute(
+            "command -v host-proof >/dev/null && command -v profile-proof >/dev/null",
+            timeout=20,
+        )
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 0, result.get("output")
+
+
 # ---------------------------------------------------------------------------
 # Command wrapping — native Windows cwd must be Git Bash-friendly for cd
 # ---------------------------------------------------------------------------
@@ -512,57 +548,3 @@ class TestWrapCommandWindowsNativeCwd:
         script = captured["script"]
         assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
         assert r"C:\Users\Alexander\AppData" not in script
-
-
-class TestWindowsLoginSnapshotPreservesInheritedPath:
-    @pytest.mark.parametrize(
-        ("is_windows", "bash", "cwd", "init_files", "expected"),
-        [
-            (
-                True,
-                r"C:\Program Files\Git\bin\bash.exe",
-                r"C:\Users\Alice\.buzz",
-                ["/c/Users/Alice/.bashrc"],
-                [
-                    r"C:\Program Files\Git\bin\bash.exe",
-                    "-c",
-                    "set +e\n"
-                    "[ -r '/c/Users/Alice/.bashrc' ] && . "
-                    "'/c/Users/Alice/.bashrc' 2>/dev/null || true\n"
-                    "command -v buzz",
-                ],
-            ),
-            (
-                False,
-                "/bin/bash",
-                "/tmp",
-                [],
-                ["/bin/bash", "-l", "-c", "command -v buzz"],
-            ),
-        ],
-    )
-    def test_snapshot_shell_mode(
-        self, monkeypatch, is_windows, bash, cwd, init_files, expected
-    ):
-        """Windows preserves host PATH; POSIX retains login-shell behavior."""
-        monkeypatch.setattr(local_mod, "_IS_WINDOWS", is_windows)
-        monkeypatch.setattr(local_mod, "_find_bash", lambda: bash)
-        monkeypatch.setattr(local_mod, "_resolve_shell_init_files", lambda: init_files)
-
-        captured = {}
-
-        class FakeProc:
-            pid = 123
-
-        def fake_popen(args, **kwargs):
-            captured["args"] = args
-            return FakeProc()
-
-        monkeypatch.setattr(local_mod.subprocess, "Popen", fake_popen)
-        monkeypatch.setattr(local_mod.os, "getpgid", lambda _pid: 1, raising=False)
-        with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
-            env = LocalEnvironment(cwd=cwd, timeout=10)
-
-        env._run_bash("command -v buzz", login=True)
-
-        assert captured["args"] == expected
