@@ -1020,6 +1020,99 @@ def _replace_venv_interpreters_with_held_python(
     return names
 
 
+def _remove_exact_uv_venv_transients(
+    candidate: Path,
+    *,
+    physical_uid: int,
+    physical_gid: int,
+    xattr_reader: Callable[[int], Sequence[str | bytes]],
+) -> None:
+    """Remove only uv's exact non-runtime venv artifacts before sealing."""
+
+    venv = candidate / ".venv"
+    directory: int | None = None
+    lock_descriptor: int | None = None
+    try:
+        directory, _identity = builder._open_directory_path(
+            venv,
+            expected_uid=physical_uid,
+            expected_gid=physical_gid,
+            allowed_modes=frozenset({0o700, 0o750, 0o755}),
+        )
+
+        try:
+            lib64_before = builder.FileIdentity.from_stat(
+                os.stat("lib64", dir_fd=directory, follow_symlinks=False)
+            )
+        except FileNotFoundError:
+            lib64_before = None
+        if lib64_before is not None:
+            if (
+                not stat.S_ISLNK(lib64_before.mode)
+                or lib64_before.uid != physical_uid
+                or lib64_before.gid != physical_gid
+                or lib64_before.links != 1
+                or lib64_before.size != len("lib")
+                or os.readlink("lib64", dir_fd=directory) != "lib"
+                or builder.FileIdentity.from_stat(
+                    os.stat("lib64", dir_fd=directory, follow_symlinks=False)
+                )
+                != lib64_before
+            ):
+                _fail("release_builder_phase_venv_transient_invalid")
+            os.unlink("lib64", dir_fd=directory)
+
+        try:
+            lock_before = builder.FileIdentity.from_stat(
+                os.stat(".lock", dir_fd=directory, follow_symlinks=False)
+            )
+        except FileNotFoundError:
+            lock_before = None
+        if lock_before is not None:
+            lock_descriptor = os.open(
+                ".lock",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory,
+            )
+            lock_opened = builder.FileIdentity.from_stat(os.fstat(lock_descriptor))
+            lock_reachable = builder.FileIdentity.from_stat(
+                os.stat(".lock", dir_fd=directory, follow_symlinks=False)
+            )
+            if (
+                lock_before != lock_opened
+                or lock_opened != lock_reachable
+                or not stat.S_ISREG(lock_opened.mode)
+                or stat.S_ISLNK(lock_opened.mode)
+                or lock_opened.uid != physical_uid
+                or lock_opened.gid != physical_gid
+                or lock_opened.links != 1
+                or lock_opened.size != 0
+                or stat.S_IMODE(lock_opened.mode) not in {0o600, 0o644, 0o666}
+            ):
+                _fail("release_builder_phase_venv_transient_invalid")
+            _list_no_xattrs(lock_descriptor, xattr_reader=xattr_reader)
+            os.unlink(".lock", dir_fd=directory)
+            os.close(lock_descriptor)
+            lock_descriptor = None
+
+        os.fsync(directory)
+        for name in ("lib64", ".lock"):
+            try:
+                os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            _fail("release_builder_phase_venv_transient_invalid")
+    except ProductionReleaseBuilderPhaseError:
+        raise
+    except (builder.ProductionReleaseBuilderError, OSError) as exc:
+        _fail("release_builder_phase_venv_transient_invalid", exc)
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if directory is not None:
+            os.close(directory)
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     view = memoryview(payload)
     try:
@@ -1666,6 +1759,12 @@ def _run_builder_phase_for_test(
             cwd=output_root,
             env=environment,
             pass_fds=(uv_file.descriptor,),
+        )
+        _remove_exact_uv_venv_transients(
+            candidate,
+            physical_uid=physical_builder_uid,
+            physical_gid=physical_builder_gid,
+            xattr_reader=xattr_reader,
         )
         if checkpoint is not None:
             checkpoint("runtime_installed")

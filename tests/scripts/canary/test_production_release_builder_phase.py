@@ -83,11 +83,15 @@ class FakeRunner:
         self,
         *,
         wheel_to_swap: Path | None = None,
+        lib64_target: str = "lib",
+        lock_payload: bytes = b"",
     ) -> None:
         self.calls: list[
             tuple[tuple[str, ...], Path, dict[str, str], tuple[int, ...]]
         ] = []
         self.wheel_to_swap = wheel_to_swap
+        self.lib64_target = lib64_target
+        self.lock_payload = lock_payload
 
     def __call__(
         self,
@@ -112,6 +116,7 @@ class FakeRunner:
                 "include-system-site-packages = false\n",
                 encoding="utf-8",
             )
+            (candidate / ".venv" / "lib64").symlink_to(self.lib64_target)
             if self.wheel_to_swap is not None:
                 self.wheel_to_swap.unlink()
                 self.wheel_to_swap.write_bytes(b"swapped wheel")
@@ -127,6 +132,9 @@ class FakeRunner:
             )
             package.parent.mkdir(parents=True)
             package.write_text("VALUE = 1\n", encoding="utf-8")
+            lock = candidate / ".venv" / ".lock"
+            lock.write_bytes(self.lock_payload)
+            lock.chmod(0o666)
         else:  # pragma: no cover - a contract regression makes this reachable
             raise AssertionError(argv)
 
@@ -373,6 +381,8 @@ def test_offline_build_is_exact_receipt_last_and_secret_free(
     assert (
         candidate / phase.INTERPRETER_RELATIVE_PATH
     ).read_bytes() == fixture.python_path.read_bytes()
+    assert not (candidate / ".venv" / "lib64").exists()
+    assert not (candidate / ".venv" / ".lock").exists()
     payload = json.loads(
         (candidate / phase.PAYLOAD_MANIFEST_NAME).read_text(encoding="ascii")
     )
@@ -417,6 +427,33 @@ def test_offline_build_is_exact_receipt_last_and_secret_free(
     } & set(venv[2])
     assert venv[3] == install[3]
     assert len(venv[3]) == 1
+
+
+@pytest.mark.parametrize(
+    ("lib64_target", "lock_payload"),
+    [
+        ("../escape", b""),
+        ("lib", b"not an empty uv lock"),
+    ],
+)
+def test_uv_venv_transient_cleanup_rejects_unexpected_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    lib64_target: str,
+    lock_payload: bytes,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture.runner.lib64_target = lib64_target
+    fixture.runner.lock_payload = lock_payload
+
+    with pytest.raises(
+        phase.ProductionReleaseBuilderPhaseError,
+        match="release_builder_phase_venv_transient_invalid",
+    ):
+        _run(fixture)
+
+    candidate = fixture.output_root / phase.CANDIDATE_NAME
+    assert not (candidate / phase.TERMINAL_RECEIPT_NAME).exists()
 
 
 def test_unit_input_rotation_stager_is_exactly_purpose_and_entrypoint_bound(
