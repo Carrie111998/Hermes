@@ -1201,8 +1201,9 @@ class GatewaySlashCommandsMixin:
         privacy boundary as ``/resume`` / ``/sessions``). An explicit admin
         ``--all`` override reveals every in-flight session and process.
         Process-global async job counts have no session attribution, so they
-        are only shown under that admin override. Matrix replies redact
-        session keys the same way ``/status`` does.
+        are only shown under that admin override. Async delegations carry
+        ``session_key`` and are filtered the same way as agents/processes.
+        Matrix replies redact session keys the same way ``/status`` does.
         """
         from gateway.run import _AGENT_PENDING_SENTINEL
         from tools.process_registry import format_uptime_short, process_registry
@@ -1324,12 +1325,15 @@ class GatewaySlashCommandsMixin:
         # Background (async) delegations — delegate_task(background=true).
         # Live per-child activity comes from the registry's progress sampler
         # (#51690): api calls, current tool, seconds since last activity.
+        # Records include session_key (tools/async_delegation.py); default
+        # listing stays on the caller's session unless admin --all.
         delegations: list[dict] = []
         try:
             from tools.async_delegation import list_async_delegations
             delegations = [
                 d for d in list_async_delegations()
                 if d.get("status") in ("running", "stalling", "finalizing")
+                and (show_all or d.get("session_key") == current_session_key)
             ]
         except Exception:
             delegations = []
