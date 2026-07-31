@@ -89,6 +89,7 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
     runner._interrupt_and_clear_session = _fake_interrupt
     runner._is_user_authorized = lambda source: False
+    runner._invalidate_session_run_generation = lambda *args, **kwargs: 1
 
     event = MessageEvent(
         text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
@@ -100,8 +101,34 @@ async def test_stop_does_not_interrupt_sibling_when_unauthorized(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# /stop with no active agent still clears a stuck platform status (#32295)
+# /stop with no active agent still fences late callbacks and clears a stuck
+# platform status (#32295)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stop_no_active_agent_invalidates_late_callbacks():
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {}
+    key = _per_user_key("userA")
+    runner.session_store = _FakeStore(key)
+    runner._is_user_authorized = lambda source: True
+    runner.adapters = {}
+    invalidations = []
+
+    def _record_invalidation(session_key, *, reason=""):
+        invalidations.append((session_key, reason))
+        return 1
+
+    runner._invalidate_session_run_generation = _record_invalidation
+
+    event = MessageEvent(
+        text="/stop", message_type=MessageType.TEXT, source=_thread_source("userA")
+    )
+    result = await runner._handle_stop_command(event)
+
+    assert invalidations == [(key, "stop_command_no_active")]
+    assert "no active" in str(getattr(result, "text", result)).lower()
 
 
 class _FakeStatusAdapter:
@@ -126,6 +153,7 @@ async def test_stop_no_active_agent_survives_status_clear_failure():
             raise RuntimeError("boom")
 
     runner.adapters = {Platform.DISCORD: _BoomAdapter()}
+    runner._invalidate_session_run_generation = lambda *args, **kwargs: 1
     runner._thread_metadata_for_source = (
         lambda source, reply_to_message_id=None: None
     )

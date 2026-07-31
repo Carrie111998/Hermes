@@ -1410,7 +1410,12 @@ class GatewaySlashCommandsMixin:
         # indicator can still be stuck — e.g. Slack's persistent
         # assistant.threads.setStatus survives a gateway restart or a turn
         # that died without a final send (#32295). Best-effort clear so
-        # /stop always dismisses a phantom "is thinking...".
+        # /stop always dismisses a phantom "is thinking...". Also fence any
+        # auxiliary callback (such as semantic title generation) scheduled by
+        # the just-finished turn but not yet fired.
+        self._invalidate_session_run_generation(
+            session_key, reason="stop_command_no_active"
+        )
         adapter = getattr(self, "adapters", {}).get(source.platform)
         if adapter and hasattr(adapter, "_stop_typing_with_metadata"):
             try:

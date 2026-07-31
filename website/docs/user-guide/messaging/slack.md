@@ -428,7 +428,8 @@ platforms:
       # {title: "Start here", prompts: [{title: "Plan", message: "..."}]}
       suggested_prompts: []
 
-      # Title Agent/Assistant DM threads from the first user message.
+      # Best-effort title newly handled Agent/Assistant DM threads from the
+      # generated Hermes session title after an early completed exchange.
       # Default: true. Set false to leave Slack's default thread titles.
       assistant_thread_titles: true
 
@@ -455,7 +456,7 @@ platforms:
 | `platforms.slack.extra.rich_blocks` | `false` | When `true`, agent messages are rendered as [Block Kit](https://docs.slack.dev/block-kit/) blocks (headers, dividers, true nested lists, and native tables). A plain-text fallback is always sent. Tables over Slack's limits fall back to aligned monospace. No app reinstall required — it's a send-side change only. |
 | `platforms.slack.extra.feedback_buttons` | `false` | When `true` with `rich_blocks`, appends Slack-native feedback controls to final replies. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
-| `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
+| `platforms.slack.extra.assistant_thread_titles` | `true` | For newly handled Agent/Assistant DM threads, Hermes best-effort sets an automatic Slack thread title from the generated session title after an early completed exchange. Title generation, gateway restarts, stale sessions, cache eviction, or Slack API failures may leave Slack's default title in place. Set to `false` to disable automatic titles. |
 | `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts a bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all of them. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
