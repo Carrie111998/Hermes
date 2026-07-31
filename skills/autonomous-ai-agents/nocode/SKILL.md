@@ -2,7 +2,7 @@
 name: nocode
 description: "Use when /nocode is typed: answer only, no code or installs."
 version: 1.0.0
-author: Hermes Agent
+author: Bruno Barboza (@BrunoBza), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -11,19 +11,12 @@ metadata:
     related_skills: [plan]
 ---
 
-# Answer-Only Mode (/nocode)
+# Nocode Skill
 
-## Overview
-
-`/nocode` is an answer-only mode for the agent: when the user types it (CLI
-or messaging platform) followed by a question, the agent answers directly —
-no code, no file writes, no installs, no state changes. Read-only research
-is allowed and encouraged; mutations are not.
-
-It is the inverse of plan mode: `/plan` produces a plan document, `/nocode`
-produces an answer. Users reach for it when they want a question answered
-without the agent "helpfully" scaffolding projects, installing packages, or
-editing files along the way.
+Answer-only mode for the agent. When the user types `/nocode` followed by a
+question, the agent answers directly with read-only research — it does NOT
+write files, install packages, or mutate state. It is the mirror image of
+plan mode: `/plan` produces a plan document, `/nocode` produces an answer.
 
 ## When to Use
 
@@ -39,10 +32,22 @@ Don't use for:
   those are normal turns.
 - Planning work — use the `plan` skill instead.
 
-## How This Differs from /plan
+## Prerequisites
 
-`/plan` and `/nocode` are sibling mode skills that both restrain the agent
-from running off and doing things, but they produce different deliverables:
+- None. The mode uses only tools already available to the agent
+  (`web_search`, `web_extract`, `read_file`, `session_search`,
+  `skills_list`, read-only terminal inspection).
+
+## How to Run
+
+Type `/nocode <question>` in the CLI or any messaging platform. Installed
+skills are exposed as dynamic slash commands on both surfaces, so the skill
+loads as `/nocode`; the text after the command is the question.
+
+## Quick Reference
+
+`/plan` vs `/nocode` — both are mode skills that restrain the agent from
+running off and doing things, but they produce different deliverables:
 
 | | `/plan` | `/nocode` |
 |---|---|---|
@@ -58,43 +63,40 @@ anything done. `/nocode` is the stricter mode: it permits only read-only
 research, while `/plan` may inspect the repo and writes the plan file as its
 deliverable.
 
-## Core Behavior
+## Procedure
 
 1. **Answer directly in the same turn.** No preamble, no plan, no
    "I'll set that up for you".
-2. **Research is allowed and encouraged** when it improves the answer —
-   anything read-only: `web_search`, `web_extract`, `read_file`,
-   `session_search`, `skills_list`, and read-only terminal inspection.
-3. **Forbidden unless the user explicitly asks in the same message:**
-   - `write_file`, `patch`, or any file creation/editing.
-   - Mutating terminal commands: installs (`pip`, `apt`), `git commit/push`,
-     `rm`, `mv`, config changes, service restarts.
-   - `execute_code` with side effects (pure read-only computation is fine).
-   - `cronjob` create/update/remove, memory writes, skill management.
-   - Any "let me just test it / install it / set it up" behavior.
+2. **Research when it improves the answer** — anything read-only:
+   `web_search`, `web_extract`, `read_file`, `session_search`,
+   `skills_list`, read-only terminal inspection.
+3. **Do not mutate anything** unless the user explicitly asks in the same
+   message: no `write_file`/`patch`, no installs (`pip`, `apt`), no
+   `git commit`/`push`, no `rm`/`mv`, no config changes or service
+   restarts, no side-effecting `execute_code`, no cron/memory/skill
+   mutations.
+4. **If answering genuinely requires an action** (e.g. inspecting a live
+   service): explain briefly what you would do and why, ask permission,
+   and wait.
 
-## When Action Is Genuinely Required
-
-If answering accurately requires an action (e.g., inspecting a live server or
-checking a running service):
-
-1. Explain briefly what you would do and why.
-2. Ask permission and wait.
-
-## Common Pitfalls
+## Pitfalls
 
 1. **Treating "answer only" as "no research".** Read-only research is the
    point of the mode — don't answer from memory when a quick `web_search`
    would verify the facts.
 2. **Slipping in a "helpful" action.** The deliverable is the answer;
-   artifacts, installs, and "I went ahead and..." are failures of this mode.
+   artifacts, installs, and "I went ahead and..." are failures of this
+   mode.
 3. **Asking permission unnecessarily.** If you can answer, just answer —
    only gate when an action is truly required.
 
-## Verification Checklist
+## Verification
 
-- [ ] The user has a complete, direct answer.
-- [ ] No files were created or edited.
-- [ ] No packages were installed.
-- [ ] No config, cron, memory, or service state changed.
-- [ ] If an action was required, permission was requested before doing anything.
+The mode succeeded when:
+
+- The user has a complete, direct answer.
+- No files were created or edited.
+- No packages were installed.
+- No config, cron, memory, or service state changed.
+- If an action was required, permission was requested before doing
+  anything.
