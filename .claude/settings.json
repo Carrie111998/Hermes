@@ -1,11 +1,4 @@
 {
-  "mcpServers": {
-    "codebase-memory": {
-      "type": "stdio",
-      "command": "/Users/danizhaky/.local/bin/codebase-memory-mcp",
-      "args": []
-    }
-  },
   "hooks": {
     "PreToolUse": [
       {
