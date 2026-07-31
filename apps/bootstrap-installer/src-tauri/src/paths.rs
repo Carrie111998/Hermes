@@ -15,14 +15,31 @@
 //! IMPORTANT: this must match exactly. Drift here means install.ps1
 //! writes to one place and the installer reads from another, breaking
 //! the bootstrap-complete check.
+//!
+//! Douglas Agent: DOUGLAS_HOME / an existing douglas-named directory take
+//! priority over all of the above, falling through to the exact Hermes
+//! logic unchanged so existing Hermes installs keep working. Mirrors
+//! `hermes_bootstrap.py::_douglas_home_candidates()` (Python) and
+//! `resolveHermesHome()` in `apps/desktop/electron/main.ts` (Electron) —
+//! see `douglas/README.md`, section "Cadena canonica de resolucion
+//! Douglas/Hermes", for the single source of truth all three implement.
 
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 use tracing_appender::non_blocking::WorkerGuard;
 
-/// Returns the canonical Hermes home directory, respecting $HERMES_HOME if set.
+/// Returns the canonical Hermes home directory, respecting $DOUGLAS_HOME /
+/// $HERMES_HOME if set, else preferring an existing douglas-named install
+/// over an existing hermes-named one, else defaulting to a new
+/// douglas-named install. See the module-level doc comment above.
 pub fn hermes_home() -> PathBuf {
+    if let Ok(override_path) = std::env::var("DOUGLAS_HOME") {
+        if !override_path.trim().is_empty() {
+            return PathBuf::from(override_path);
+        }
+    }
+
     if let Ok(override_path) = std::env::var("HERMES_HOME") {
         if !override_path.trim().is_empty() {
             return PathBuf::from(override_path);
@@ -31,21 +48,48 @@ pub fn hermes_home() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        // %LOCALAPPDATA%\hermes — matches scripts/install.ps1's $HermesHome.
+        // %LOCALAPPDATA%\douglas, falling back to the exact pre-existing
+        // Hermes logic (%LOCALAPPDATA%\hermes, then legacy ~/.hermes)
+        // unchanged — matches scripts/install.ps1's $HermesHome plus the
+        // Douglas tier layered on top.
         if let Some(local_app_data) = dirs::data_local_dir() {
-            return local_app_data.join("hermes");
+            let douglas_appdata = local_app_data.join("douglas");
+            let hermes_appdata = local_app_data.join("hermes");
+            if douglas_appdata.is_dir() {
+                return douglas_appdata;
+            }
+            if hermes_appdata.is_dir() {
+                return hermes_appdata;
+            }
+            if let Some(home) = dirs::home_dir() {
+                let legacy = home.join(".hermes");
+                if legacy.is_dir() {
+                    return legacy;
+                }
+            }
+            return douglas_appdata;
         }
     }
 
-    // macOS + Linux + fallback: ~/.hermes (matches Python get_hermes_home(),
-    // install.sh, and the Electron desktop's resolveHermesHome()).
+    // macOS + Linux + fallback: prefer an existing ~/.douglas, then an
+    // existing ~/.hermes (matches Python get_hermes_home(), install.sh,
+    // and the Electron desktop's resolveHermesHome()), else default to
+    // ~/.douglas for a new install.
     if let Some(home) = dirs::home_dir() {
-        return home.join(".hermes");
+        let douglas_home = home.join(".douglas");
+        let hermes_home = home.join(".hermes");
+        if douglas_home.is_dir() {
+            return douglas_home;
+        }
+        if hermes_home.is_dir() {
+            return hermes_home;
+        }
+        return douglas_home;
     }
 
     // Last resort — current dir, almost certainly wrong but at least
     // doesn't panic.
-    PathBuf::from(".hermes")
+    PathBuf::from(".douglas")
 }
 
 pub fn log_dir() -> PathBuf {

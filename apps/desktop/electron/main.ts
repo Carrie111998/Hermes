@@ -523,7 +523,19 @@ if (INSTALL_STAMP) {
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+//
+// Douglas Agent: DOUGLAS_HOME / an existing douglas-named directory take
+// priority over all of the above, falling through to the exact Hermes logic
+// unchanged so existing Hermes installs keep working. Mirrors
+// hermes_bootstrap.py::_douglas_home_candidates() and
+// apps/bootstrap-installer/src-tauri/src/paths.rs::hermes_home() — see
+// douglas/README.md, section "Cadena canonica de resolucion
+// Douglas/Hermes", for the single source of truth all three implement.
 function resolveHermesHome() {
+  if (process.env.DOUGLAS_HOME) {
+    return normalizeHermesHomeRoot(process.env.DOUGLAS_HOME)
+  }
+
   if (process.env.HERMES_HOME) {
     return normalizeHermesHomeRoot(process.env.HERMES_HOME)
   }
@@ -534,11 +546,18 @@ function resolveHermesHome() {
 
   if (IS_WINDOWS) {
     // A GUI app launched from Explorer inherits the environment block captured
-    // at login, so a HERMES_HOME set via `setx` AFTER login is invisible in
-    // process.env even though the CLI (a fresh shell) sees it. Without this the
-    // backend silently falls back to %LOCALAPPDATA%\hermes and reports "No
-    // inference provider configured" despite a valid configured home (#45471).
-    // Consult the live User-scoped registry value before the default below.
+    // at login, so a DOUGLAS_HOME/HERMES_HOME set via `setx` AFTER login is
+    // invisible in process.env even though the CLI (a fresh shell) sees it.
+    // Without this the backend silently falls back to the platform default
+    // and reports "No inference provider configured" despite a valid
+    // configured home (#45471). Consult the live User-scoped registry value
+    // before the directory-existence checks below.
+    const fromRegistryDouglas = readWindowsUserEnvVar('DOUGLAS_HOME')
+
+    if (fromRegistryDouglas) {
+      return normalizeHermesHomeRoot(fromRegistryDouglas)
+    }
+
     const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
 
     if (fromRegistry) {
@@ -547,19 +566,39 @@ function resolveHermesHome() {
   }
 
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
+    const douglasAppdata = path.join(process.env.LOCALAPPDATA, 'douglas')
     const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
     const legacy = path.join(app.getPath('home'), '.hermes')
 
-    // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
-    // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
-    if (!directoryExists(localappdata) && directoryExists(legacy)) {
+    // Prefer an existing douglas-named install. Otherwise fall through to
+    // the exact pre-existing Hermes logic unchanged: migrate transparently
+    // to LOCALAPPDATA, but honour an existing legacy ~/.hermes setup (no
+    // LOCALAPPDATA install yet) so users don't lose state. New installs
+    // (none of the three exist) go to %LOCALAPPDATA%\douglas.
+    if (directoryExists(douglasAppdata)) {
+      return douglasAppdata
+    }
+    if (directoryExists(localappdata)) {
+      return localappdata
+    }
+    if (directoryExists(legacy)) {
       return legacy
     }
 
-    return localappdata
+    return douglasAppdata
   }
 
-  return path.join(app.getPath('home'), '.hermes')
+  const douglasHome = path.join(app.getPath('home'), '.douglas')
+  const hermesHome = path.join(app.getPath('home'), '.hermes')
+
+  if (directoryExists(douglasHome)) {
+    return douglasHome
+  }
+  if (directoryExists(hermesHome)) {
+    return hermesHome
+  }
+
+  return douglasHome
 }
 
 const HERMES_HOME = resolveHermesHome()

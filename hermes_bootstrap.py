@@ -51,9 +51,81 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 _IS_WINDOWS = sys.platform == "win32"
 _bootstrap_applied = False
+
+
+def _douglas_home_candidates() -> list[Path]:
+    """Directories to check for an existing install, most-preferred first.
+
+    The first entry doubles as the default target for a brand-new install
+    (used unconditionally when none of the candidates exist on disk).
+
+    Mirrors apps/desktop/electron/main.ts::resolveHermesHome() and
+    apps/bootstrap-installer/src-tauri/src/paths.rs::hermes_home() — see
+    douglas/README.md, section "Cadena canonica de resolucion
+    Douglas/Hermes", for the single source of truth this chain implements
+    in three separate runtimes (Python here, Node in Electron's main
+    process, Rust in the native bootstrap installer that runs before
+    Python exists).
+    """
+    if _IS_WINDOWS:
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            base = Path(local_appdata)
+            return [base / "douglas", base / "hermes", Path.home() / ".hermes"]
+        return [Path.home() / ".douglas", Path.home() / ".hermes"]
+    return [Path.home() / ".douglas", Path.home() / ".hermes"]
+
+
+def _resolve_default_douglas_home() -> Path:
+    candidates = _douglas_home_candidates()
+    for candidate in candidates:
+        try:
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            continue
+    return candidates[0]
+
+
+def normalize_douglas_env() -> None:
+    """Normalize DOUGLAS_* environment variables into the HERMES_* names
+    the rest of Hermes already reads, and resolve HERMES_HOME per the
+    Douglas/Hermes compatibility chain when neither is set.
+
+    Must run before any other Hermes module is imported (see the call at
+    the bottom of this file, which runs first among this module's
+    import-time side effects) — get_hermes_home() and ~200 other call
+    sites across the codebase read HERMES_HOME (and other HERMES_* vars)
+    directly from os.environ, so normalizing it here, once, at the very
+    start of the process, makes every one of those call sites work
+    correctly without modifying any of them.
+
+    Does not interact with the profile ContextVar override
+    (hermes_constants.get_hermes_home_override(), used by
+    hermes_cli/profiles.py): that override is checked first and
+    unconditionally wins inside get_hermes_home(), and is only ever set
+    later, contextually, per profile-scoped task — never at process
+    bootstrap. See douglas/README.md for the full resolution chain and
+    the reasoning behind each tier.
+    """
+    # 1. Generic DOUGLAS_<X> -> HERMES_<X> aliasing. DOUGLAS_<X> always
+    #    wins when both are present, matching the documented priority
+    #    (DOUGLAS_HOME > HERMES_HOME, and likewise for every other var).
+    for key, value in list(os.environ.items()):
+        if key.startswith("DOUGLAS_") and value.strip():
+            os.environ["HERMES_" + key[len("DOUGLAS_"):]] = value
+
+    # 2. If HERMES_HOME is still unset after aliasing (neither DOUGLAS_HOME
+    #    nor HERMES_HOME was in the environment), resolve the default
+    #    directory: prefer an existing ~/.douglas install, then an
+    #    existing ~/.hermes install (don't orphan prior Hermes users),
+    #    else create ~/.douglas for a brand-new install.
+    if not os.environ.get("HERMES_HOME", "").strip():
+        os.environ["HERMES_HOME"] = str(_resolve_default_douglas_home())
 
 
 def apply_windows_utf8_bootstrap() -> bool:
@@ -230,6 +302,13 @@ def activate_durable_lazy_target() -> None:
 # (or ``from hermes_bootstrap import apply_windows_utf8_bootstrap``) at
 # the very top of their module, before importing anything else.  The
 # import side effect does the right thing.
+#
+# normalize_douglas_env() runs FIRST, before anything else in this block:
+# HERMES_HOME (and every other HERMES_* var) must be normalized before any
+# other Hermes module — including the UTF-8/console helpers below, which
+# don't depend on it today but might in the future — gets a chance to read
+# os.environ.
+normalize_douglas_env()
 apply_windows_utf8_bootstrap()
 suppress_platform_ver_console()
 
