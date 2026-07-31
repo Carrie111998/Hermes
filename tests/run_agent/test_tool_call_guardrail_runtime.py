@@ -5,8 +5,6 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from run_agent import AIAgent
 
 
@@ -343,25 +341,8 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
 
 
-@pytest.mark.parametrize(
-    "executor_name",
-    [
-        "_execute_tool_calls_sequential",
-        "_execute_tool_calls_concurrent",
-    ],
-)
-@pytest.mark.parametrize(
-    ("effect_name", "should_dispatch"),
-    [
-        ("read_only", True),
-        ("unknown", False),
-    ],
-)
 def test_investigation_deferred_tool_is_guarded_by_its_underlying_effect(
     tmp_path,
-    executor_name,
-    effect_name,
-    should_dispatch,
 ):
     from agent.request_phase import (
         activate_turn_policy,
@@ -369,63 +350,71 @@ def test_investigation_deferred_tool_is_guarded_by_its_underlying_effect(
     )
     from tools.registry import ToolEffect, registry
 
-    underlying_name = (
-        f"mcp__request_phase_test__{effect_name}_{executor_name.rsplit('_', 1)[-1]}"
-    )
-    effect = ToolEffect(effect_name)
-    registry.register(
-        name=underlying_name,
-        toolset="mcp-request_phase_test",
-        schema=_make_tool_defs(underlying_name)[0],
-        handler=lambda _args, **_kwargs: json.dumps({"ok": True}),
-        effect=effect,
-    )
-    agent = _make_agent("tool_search", "tool_describe", "tool_call")
-    tool_call = _mock_tool_call(
-        "tool_call",
-        json.dumps(
-            {
-                "name": underlying_name,
-                "arguments": {"target": "example"},
-            }
-        ),
-        f"call-{effect_name}-{executor_name}",
-    )
-    message = SimpleNamespace(content="", tool_calls=[tool_call])
-    messages = []
-
-    activate_turn_policy(
-        "Analyze the current client record.",
-        cwd=tmp_path,
-    )
-    try:
-        with (
-            patch(
-                "model_tools.get_tool_definitions",
-                return_value=_make_tool_defs(underlying_name),
-            ),
-            patch(
-                "run_agent.handle_function_call",
-                return_value=json.dumps({"ok": True}),
-            ) as dispatch,
+    for executor_name in (
+        "_execute_tool_calls_sequential",
+        "_execute_tool_calls_concurrent",
+    ):
+        for effect_name, should_dispatch in (
+            ("read_only", True),
+            ("unknown", False),
         ):
-            getattr(agent, executor_name)(
-                message,
-                messages,
-                "request-phase-test",
+            underlying_name = (
+                f"mcp__request_phase_test__{effect_name}_"
+                f"{executor_name.rsplit('_', 1)[-1]}"
             )
-    finally:
-        clear_turn_policy()
-        registry.deregister(underlying_name)
+            registry.register(
+                name=underlying_name,
+                toolset="mcp-request_phase_test",
+                schema=_make_tool_defs(underlying_name)[0],
+                handler=lambda _args, **_kwargs: json.dumps({"ok": True}),
+                effect=ToolEffect(effect_name),
+            )
+            agent = _make_agent("tool_search", "tool_describe", "tool_call")
+            tool_call = _mock_tool_call(
+                "tool_call",
+                json.dumps(
+                    {
+                        "name": underlying_name,
+                        "arguments": {"target": "example"},
+                    }
+                ),
+                f"call-{effect_name}-{executor_name}",
+            )
+            message = SimpleNamespace(content="", tool_calls=[tool_call])
+            messages = []
 
-    if should_dispatch:
-        dispatch.assert_called_once()
-        assert dispatch.call_args.args[0] == underlying_name
-        assert dispatch.call_args.args[1] == {"target": "example"}
-        assert json.loads(messages[0]["content"]) == {"ok": True}
-    else:
-        dispatch.assert_not_called()
-        assert "only registered read-only tools" in messages[0]["content"]
+            activate_turn_policy(
+                "Analyze the current client record.",
+                cwd=tmp_path,
+            )
+            try:
+                with (
+                    patch(
+                        "model_tools.get_tool_definitions",
+                        return_value=_make_tool_defs(underlying_name),
+                    ),
+                    patch(
+                        "run_agent.handle_function_call",
+                        return_value=json.dumps({"ok": True}),
+                    ) as dispatch,
+                ):
+                    getattr(agent, executor_name)(
+                        message,
+                        messages,
+                        "request-phase-test",
+                    )
+            finally:
+                clear_turn_policy()
+                registry.deregister(underlying_name)
+
+            if should_dispatch:
+                dispatch.assert_called_once()
+                assert dispatch.call_args.args[0] == underlying_name
+                assert dispatch.call_args.args[1] == {"target": "example"}
+                assert json.loads(messages[0]["content"]) == {"ok": True}
+            else:
+                dispatch.assert_not_called()
+                assert "only registered read-only tools" in messages[0]["content"]
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():
