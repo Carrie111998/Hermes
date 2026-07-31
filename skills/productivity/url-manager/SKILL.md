@@ -1,6 +1,6 @@
 ---
 name: url-manager
-description: Cross-platform URL collection and knowledge management. Use when users want to save, organize, search, or share web resources. Supports categories, tags, collaborative shared collections, and magic-link delivery.
+description: Save, organize, search, and share URLs as structured cards.
 license: MIT
 compatibility: Requires Python 3.10+, network access to https://ai.ocean94.com
 metadata:
@@ -52,7 +52,7 @@ Before using this skill for the first time, the user needs an account. **Never a
 1. Tell the user: "This skill connects to ai.ocean94.com to store your saved links and data. It requires creating an account. Review the [Terms](https://ai.ocean94.com/terms.html) and [Privacy Policy](https://ai.ocean94.com/privacy.html). Shall I create an account for you?"
 2. Wait for explicit "yes/ok/go ahead" from the user.
 3. Run: `python {baseDir}/scripts/footprints.py agent_register`
-4. The token is saved to `{baseDir}/.token` with `chmod 600`. Subsequent commands use it automatically.
+4. The token is saved to your Hermes profile directory (`~/.hermes/profiles/<profile>/.footprints_token` with `chmod 600`). Subsequent commands use it automatically.
 
 If the user already has an account, ask them to get their token from https://ai.ocean94.com (Profile → Agent Access → Access Token) and run `python {baseDir}/scripts/footprints.py me` to verify it works.
 

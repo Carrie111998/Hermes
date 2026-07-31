@@ -25,11 +25,10 @@ AI 足迹 Agent API 工具脚本 — 零配置，装完即用
   python footprints.py agent_register [--json]
   python footprints.py agent_magic_link [--json]
 
-Token 自动管理：
+Token 管理：
   - 优先读环境变量 FOOTPRINTS_TOKEN
-  - 其次读本目录下的 .token 文件
-  - 都没有则自动注册，Token 存入 .token，同时设环境变量
-  - 全程无需人工干预
+  - 其次读 profile-scoped 的 .token 文件
+  - 都没有则需要运行 agent_register 获取新 token（需用户明确同意）
 """
 import os
 import sys
@@ -39,8 +38,15 @@ import urllib.error
 
 # ── 零配置自动引导 ──
 
-BASEDIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOKEN_FILE = os.path.join(BASEDIR, ".token")
+# Hermes profile-scoped token path: $HERMES_HOME/profiles/<profile>/.footprints_token
+# Falls back to ~/.hermes/profiles/default/.footprints_token
+def _get_hermes_token_dir():
+    home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+    profile = os.environ.get("HERMES_PROFILE", "default")
+    return os.path.join(home, "profiles", profile)
+
+_HERMES_DIR = _get_hermes_token_dir()
+TOKEN_FILE = os.path.join(_HERMES_DIR, ".footprints_token")
 ENDPOINT = os.environ.get("FOOTPRINTS_ENDPOINT", "https://ai.ocean94.com")
 # 安全：仅允许白名单内的端点，防止环境变量注入劫持网络请求
 _ALLOWED_ENDPOINTS = {
@@ -57,12 +63,12 @@ JSON_MODE = False
 
 
 def _get_token():
-    """读取 TOKEN：env → .token 文件 → 自动注册并持久化"""
+    """读取 TOKEN：env → .token 文件。无 token 返回空字符串，不触发自动注册。"""
     token = os.environ.get("FOOTPRINTS_TOKEN", "")
     if token:
         return token
 
-    # 尝试从 .token 文件读取
+    # 尝试从 profile-scoped .token 文件读取
     try:
         with open(TOKEN_FILE) as f:
             token = f.read().strip()
@@ -72,22 +78,7 @@ def _get_token():
     except FileNotFoundError:
         pass
 
-    # 自动注册
-    result = _raw_api("/register", method="POST", no_auth=True)
-    if "token" in result:
-        token = result["token"]
-        os.environ["FOOTPRINTS_TOKEN"] = token
-        try:
-            with open(TOKEN_FILE, "w") as f:
-                f.write(token)
-            if sys.platform != "win32":
-                os.chmod(TOKEN_FILE, 0o600)
-        except Exception:
-            pass
-        if not JSON_MODE:
-            print(f"🔗 自动注册成功，Token 已保存至 {TOKEN_FILE}", file=sys.stderr)
-        return token
-
+    # 无 token — 调用者需先执行 agent_register（需用户明确同意）
     return ""
 
 
@@ -135,7 +126,7 @@ def api(path, method="GET", data=None, no_auth=False):
     """API 调用 + token 自动管理"""
     token = _get_token()
     if not token and not no_auth:
-        err = {"error": "无法获取 Token — 自动注册失败，请检查网络连接"}
+        err = {"error": "未登录 — 请先运行 agent_register 创建账号（需要用户明确同意）"}
         _output(err)
         return err
     return _raw_api(path, method=method, data=data, no_auth=no_auth)
@@ -478,12 +469,24 @@ def create_invite_link(sc_id, duration_hours=24):
 
 
 def agent_register():
-    """Agent 自主注册：创建新账号并返回访问令牌"""
-    result = api("/register", method="POST", no_auth=True)
+    """Agent 自主注册：创建新账号并返回访问令牌。需用户明确同意后才调用。"""
+    # 直接用 _raw_api，不经过 api()→_get_token()，避免双重注册
+    result = _raw_api("/register", method="POST", no_auth=True)
     if "error" in result:
         _echo(f"❌ 注册失败: {result['error']}")
         return result
-    _echo(f"Token: {result['token']}")
+    token = result["token"]
+    # 持久化 token
+    os.environ["FOOTPRINTS_TOKEN"] = token
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(token)
+        if sys.platform != "win32":
+            os.chmod(TOKEN_FILE, 0o600)
+    except Exception:
+        pass
+    _echo(f"Token: {token}")
     _echo(f"\n{result.get('message', '')}")
     return result
 
