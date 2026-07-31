@@ -1087,12 +1087,38 @@ class CLICommandsMixin:
         parts = cmd_original.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
 
+        # Extract --limit N (default 10, capped 100) from anywhere in the
+        # args, then hand the rest to the shared arg parser.
+        import shlex as _shlex
+        limit = 10
+        _tokens = _shlex.split(arg)
+        _clean = []
+        _i = 0
+        while _i < len(_tokens):
+            if _tokens[_i] == "--limit" and _i + 1 < len(_tokens):
+                try:
+                    limit = min(int(_tokens[_i + 1]), 100)
+                except ValueError:
+                    pass
+                _i += 2
+                continue
+            _clean.append(_tokens[_i])
+            _i += 1
+        arg = " ".join(_clean)
+
         # Check for search/find subcommand via the shared arg parser
         _, _, _, search_query = parse_session_listing_args(arg)
         if search_query is not None:
             if search_query == "":
-                _cprint("  Usage: /sessions search <query>")
-                _cprint("  Example: /sessions search deploy")
+                _cprint("  Usage: /sessions search <query> [--limit <N>]")
+                _cprint("  Example: /sessions search deploy --limit 5")
+                _cprint("")
+                _cprint("  /sessions            list recent sessions")
+                _cprint("  /sessions all        include all sources")
+                _cprint("  /sessions full       include unnamed sessions")
+                _cprint("  /sessions --limit N  show N sessions (max 100)")
+                _cprint("  /sessions search Q   full-text search session messages")
+                _cprint("  /sessions <id>       resume a session")
                 return
             if not self._session_db:
                 from hermes_state import format_session_db_unavailable
@@ -1106,13 +1132,15 @@ class CLICommandsMixin:
                     query=search_query,
                     role_filter=["user", "assistant"],
                     exclude_sources=["tool", "subagent", "cron"],
-                    limit=40,
+                    limit=min(max(limit * 4, 40), 200),
                 )
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
                 return
 
-            # Group by session_id, keep first (highest-ranked) per session
+            # Group by session_id (no cap here — dedup + recency sort come
+            # after; the limit is applied last so --limit N always means
+            # "N most recent matches", independent of FTS5 rank order).
             seen = {}
             for r in raw:
                 sid = r["session_id"]
@@ -1120,8 +1148,6 @@ class CLICommandsMixin:
                     continue
                 if sid not in seen:
                     seen[sid] = r
-                if len(seen) >= 10:
-                    break
 
             if not seen:
                 _cprint(f"  No sessions matching \"{search_query}\".")
@@ -1156,6 +1182,9 @@ class CLICommandsMixin:
             )
             sid_latest = {row[0]: row[1] for row in cur.fetchall()}
             sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
+            # Apply the display limit last: N most recent matches.
+            if len(sids_sorted) > limit:
+                sids_sorted = sids_sorted[:limit]
 
             # Resequence the seen dict
             seen = {sid: seen[sid] for sid in sids_sorted}
@@ -1202,6 +1231,8 @@ class CLICommandsMixin:
             _cprint("")
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
             _cprint("  Example: /resume 2")
+            _cprint("")
+            _cprint("  More: /sessions search <query>, /sessions all, /sessions full, /sessions --limit <N>")
             _cprint("")
             return
 

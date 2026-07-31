@@ -16491,8 +16491,13 @@ def main():
     # =========================================================================
     sessions_parser = subparsers.add_parser(
         "sessions",
-        help="Manage session history (list, rename, export, prune, delete)",
-        description="View and manage the SQLite session store",
+        help="Manage session history (list, search, rename, export, prune, delete)",
+        description=(
+            "View and manage the SQLite session store.\n\n"
+            "Common: `hermes sessions` or `hermes sessions list` shows recent "
+            "sessions; `hermes sessions search <query>` full-text searches "
+            "session messages; `hermes sessions <id>` resumes a session."
+        ),
     )
     sessions_subparsers = sessions_parser.add_subparsers(dest="sessions_action")
 
@@ -16512,8 +16517,17 @@ def main():
     sessions_search = sessions_subparsers.add_parser(
         "search",
         help="Search session content via FTS5 (message text, not just titles)",
+        description=(
+            "Full-text search over session messages (SQLite FTS5). Results are "
+            "deduplicated across compression children (latest descendant wins) "
+            "and sorted by most recent activity. Previews show the root "
+            "ancestor's first user message."
+        ),
     )
     sessions_search.add_argument("query", nargs="+", help="Search terms (pass as multiple words)")
+    sessions_search.add_argument(
+        "--limit", type=int, default=10, help="Max sessions to show (default 10, max 100)"
+    )
 
     def _add_session_filter_args(p, default_older_help):
         p.add_argument(
@@ -17953,19 +17967,18 @@ def main():
 
         elif action == "search":
             query = " ".join(args.query)
+            _limit = min(getattr(args, "limit", 10) or 10, 100)
             raw = db.search_messages(
                 query=query,
                 role_filter=["user", "assistant"],
                 exclude_sources=["tool", "subagent", "cron"],
-                limit=40,
+                limit=min(max(_limit * 4, 40), 200),
             )
             seen = {}
             for r in raw:
                 sid = r["session_id"]
                 if sid not in seen:
                     seen[sid] = r
-                if len(seen) >= 10:
-                    break
             if not seen:
                 print(f"No sessions matching \"{query}\".")
                 db.close()
@@ -17995,6 +18008,9 @@ def main():
             )
             sid_latest = {row[0]: row[1] for row in cur.fetchall()}
             sids_sorted.sort(key=lambda s: sid_latest.get(s, 0), reverse=True)
+            # Apply the display limit last: N most recent matches.
+            if len(sids_sorted) > _limit:
+                sids_sorted = sids_sorted[:_limit]
             seen = {sid: seen[sid] for sid in sids_sorted}
 
             # Batch-fetch root ancestor previews

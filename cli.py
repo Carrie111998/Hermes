@@ -7642,6 +7642,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cli_visible_print("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
         _cli_visible_print("  Example: /resume 2")
         _cli_visible_print()
+        _cli_visible_print("  More: /sessions search <query>, /sessions all, /sessions full, /sessions --limit <N>")
+        _cli_visible_print()
         return True
 
     def show_history(self):

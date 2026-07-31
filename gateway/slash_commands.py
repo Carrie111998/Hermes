@@ -4503,7 +4503,7 @@ class GatewaySlashCommandsMixin:
             return t("gateway.resume.parse_error", error=exc)
 
         if search_query == "":
-            return "Usage: `/sessions search <query>`"
+            return "Usage: `/sessions search <query>` — e.g. `/sessions search deploy`"
 
         if target:
             resume_event = dataclasses.replace(event, text=f"/resume {target}")
