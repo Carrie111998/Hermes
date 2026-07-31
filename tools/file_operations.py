@@ -975,6 +975,22 @@ class ShellFileOperations(FileOperations):
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
+    def _uses_native_windows_search_paths(self) -> bool:
+        """True when search/lint commands run against the LOCAL Git Bash
+        backend on Windows.
+
+        Native Windows binaries (rg, node, go, rustfmt) need drive-qualified
+        paths because ``MSYS2_ARG_CONV_EXCL=*`` disables MSYS argument
+        conversion in this environment. Remote/container backends must keep
+        their own POSIX path semantics even when the Hermes host itself is
+        Windows — ``/c/Users/x`` may be a real path there.
+        """
+        try:
+            from tools.environments.local import LocalEnvironment, _IS_WINDOWS
+            return _IS_WINDOWS and isinstance(self.env, LocalEnvironment)
+        except Exception:
+            return False
+
     def _escape_shell_arg_native(self, arg: str) -> str:
         """Quote *arg* for shell use WITHOUT the Git Bash ``/c/`` rewrite.
 
@@ -986,10 +1002,12 @@ class ShellFileOperations(FileOperations):
         "os error 3: The system cannot find the path specified". Single
         quotes preserve backslashes verbatim, so the native ``C:\\...``
         form survives bash untouched and works with both native and
-        MSYS binaries.
+        MSYS binaries. Only applies on the local Windows backend; remote
+        backends keep POSIX path semantics.
         """
-        from tools.environments.local import _msys_to_windows_path
-        arg = _msys_to_windows_path(arg)  # /c/Users/x -> C:\Users\x; no-op otherwise
+        if self._uses_native_windows_search_paths():
+            from tools.environments.local import _msys_to_windows_path
+            arg = _msys_to_windows_path(arg)  # /c/Users/x -> C:\Users\x; no-op otherwise
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
@@ -1797,8 +1815,11 @@ class ShellFileOperations(FileOperations):
         if not self._has_command(base_cmd):
             return LintResult(skipped=True, message=f"{base_cmd} not available")
 
-        # Run linter
-        cmd = linter_cmd.replace("{file}", self._escape_shell_arg(path))
+        # Run linter. Use the native-Windows path form (C:/...) for the
+        # file argument: linters like node/go/rustfmt are NATIVE Windows
+        # binaries that reject the MSYS /c/... spelling (_bash_safe_path
+        # would produce), while python/npx (MSYS) also accept C:/...
+        cmd = linter_cmd.replace("{file}", self._escape_shell_arg_native(path))
         result = self._exec(cmd, timeout=30)
 
         if result.exit_code != 0 and _looks_like_linter_unusable(base_cmd, result.stdout):

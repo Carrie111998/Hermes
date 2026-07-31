@@ -304,6 +304,9 @@ class TestShellFileOpsHelpers:
         import tools.environments.local as local_mod
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            file_ops, "_uses_native_windows_search_paths", lambda: True
+        )
         assert file_ops._escape_shell_arg_native(
             r"C:\Users\alice\notes.txt"
         ) == r"'C:\Users\alice\notes.txt'"
@@ -314,6 +317,9 @@ class TestShellFileOpsHelpers:
         import tools.environments.local as local_mod
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            file_ops, "_uses_native_windows_search_paths", lambda: True
+        )
         assert file_ops._escape_shell_arg_native(
             "/c/Users/alice/notes.txt"
         ) == r"'C:\Users\alice\notes.txt'"
@@ -322,6 +328,9 @@ class TestShellFileOpsHelpers:
         import tools.environments.local as local_mod
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            file_ops, "_uses_native_windows_search_paths", lambda: True
+        )
         assert file_ops._escape_shell_arg_native("notes.txt") == "'notes.txt'"
 
     def test_escape_shell_arg_native_noop_off_windows(self, monkeypatch, file_ops):
@@ -344,6 +353,7 @@ class TestShellFileOpsHelpers:
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "_uses_native_windows_search_paths", lambda: True)
         ops._search_files_rg("notes.txt", r"C:\Users\alice", 10, 0)
 
         commands = [c.args[0] for c in mock_env.execute.call_args_list]
@@ -364,6 +374,7 @@ class TestShellFileOpsHelpers:
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "_uses_native_windows_search_paths", lambda: True)
         ops._search_with_rg("pattern", r"C:\Users\alice", None, 10, 0, "content", 0)
 
         cmd = mock_env.execute.call_args.args[0]
@@ -378,6 +389,7 @@ class TestShellFileOpsHelpers:
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "_uses_native_windows_search_paths", lambda: True)
         ops._search_with_grep("pattern", r"C:\Users\alice", None, 10, 0, "content", 0)
 
         cmd = mock_env.execute.call_args.args[0]
@@ -385,6 +397,27 @@ class TestShellFileOpsHelpers:
             "set -o pipefail; grep -rnH --exclude-dir='.*' "
             r"'pattern' 'C:\Users\alice' | head -n 10"
         )
+        assert "/c/Users" not in cmd
+
+    def test_lint_uses_native_windows_path(self, mock_env, monkeypatch):
+        # Linters (node/go/rustfmt) are native Windows binaries too; the
+        # {file} placeholder must carry the drive-qualified path.
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "_uses_native_windows_search_paths", lambda: True)
+
+        def side_effect(command, **kwargs):
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops._check_lint(r"C:\Users\alice\file.js")
+
+        cmd = mock_env.execute.call_args_list[-1].args[0]
+        assert "node --check 'C:\\Users\\alice\\file.js'" in cmd
         assert "/c/Users" not in cmd
 
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
