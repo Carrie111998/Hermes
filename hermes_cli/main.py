@@ -18086,6 +18086,13 @@ def main():
                 # compression root), not when the matched generation spawned.
                 row["started_at"] = root_started_at(db, sid) or meta.get("started_at")
                 table_rows.append(row)
+            # Tok(ΣIn/ΣOut) shows the chain total, matching the listing
+            # header — not the matched generation's single-generation count.
+            chain_tok = db.chain_token_totals(sids_sorted)
+            for row in table_rows:
+                tot = chain_tok.get(row["id"])
+                if tot and (tot[0] is not None or tot[1] is not None):
+                    row["input_tokens"], row["output_tokens"] = tot
 
             print(f"⚙️  sessions search {query}\n")
             render_sessions_table(table_rows, out=print, preview_lookup=root_preview_cache)

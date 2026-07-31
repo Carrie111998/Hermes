@@ -281,7 +281,8 @@ def render_sessions_table(
     """Render the canonical sessions table shared by /sessions, /sessions
     search, `hermes sessions list` and `hermes sessions search`.
 
-    Columns: #, Title, Model, Tok (in/out), Created, Last, Preview, ID.
+    Columns: #, Title, Model, Tok (Σ in/out across the compression chain),
+    Created, Last, Preview, ID.
     Title width sizes to the longest title in the result set (min 16, max 50).
 
     Preview resolution order:
@@ -362,7 +363,7 @@ def render_sessions_table(
             except Exception:
                 previews[sid] = s.get("preview") or ""
 
-    out(f"  {'#':>{num_w}}  {'Title':<{title_w}} {'Model':<10} {'Tok(In/Out)':>12}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+    out(f"  {'#':>{num_w}}  {'Title':<{title_w}} {'Model':<10} {'Tok(ΣIn/ΣOut)':>12}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
     out(f"  {'─'*num_w}  {'─'*title_w} {'─'*10} {'─'*12}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
     for idx, s in enumerate(sessions, 1):
         sid = s.get("id") or "—"

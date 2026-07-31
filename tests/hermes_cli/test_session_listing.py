@@ -172,3 +172,116 @@ class TestLastActiveOf:
             assert search_order == listing_order == ["sess_b", "sess_a"]
         finally:
             db.close()
+
+
+class TestChainTokenTotals:
+    """Tok(ΣIn/ΣOut) shows the compression-chain total, not the root's or
+    the tip's single-generation counts.
+
+    Regression coverage for the projection surfacing the root's historical
+    token counts on a projected tip row — for a long conversation the root
+    figure can differ from the live tip by an order of magnitude.
+    """
+
+    def test_listing_shows_chain_total_not_root_or_tip(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "tok.db")
+        db.create_session("tok_root", "cli")
+        db.end_session("tok_root", end_reason="compression")
+        db.create_session("tok_mid", "cli", parent_session_id="tok_root")
+        db.end_session("tok_mid", end_reason="compression")
+        db.create_session("tok_tip", "cli", parent_session_id="tok_mid")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET input_tokens=100, output_tokens=10 WHERE id='tok_root'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=200, output_tokens=20 WHERE id='tok_mid'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=300, output_tokens=30 WHERE id='tok_tip'"
+        )
+        conn.commit()
+        try:
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            assert [r["id"] for r in rows] == ["tok_tip"]
+            row = rows[0]
+            assert row["input_tokens"] == 600, row["input_tokens"]
+            assert row["output_tokens"] == 60, row["output_tokens"]
+            # chain_token_totals resolves any generation of the chain.
+            assert db.chain_token_totals(["tok_root", "tok_mid", "tok_tip"]) == {
+                "tok_root": (600, 60),
+                "tok_mid": (600, 60),
+                "tok_tip": (600, 60),
+            }
+        finally:
+            db.close()
+
+    def test_branch_delegate_tool_children_not_counted(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "tok_excl.db")
+        db.create_session("tok_root", "cli")
+        db.end_session("tok_root", end_reason="compression")
+        db.create_session("tok_tip", "cli", parent_session_id="tok_root")
+        db.create_session("tok_branch", "cli", parent_session_id="tok_root")
+        db.create_session("tok_delegate", "cli", parent_session_id="tok_root")
+        db.create_session("tok_tool", "tool", parent_session_id="tok_root")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET input_tokens=100, output_tokens=10 WHERE id='tok_root'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=300, output_tokens=30 WHERE id='tok_tip'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=999, output_tokens=99 WHERE id='tok_branch'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=888, output_tokens=88 WHERE id='tok_delegate'"
+        )
+        conn.execute(
+            "UPDATE sessions SET input_tokens=777, output_tokens=77 WHERE id='tok_tool'"
+        )
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_branched_from\": \"tok_root\"}' "
+            "WHERE id='tok_branch'"
+        )
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_delegate_from\": \"tok_root\"}' "
+            "WHERE id='tok_delegate'"
+        )
+        conn.commit()
+        try:
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            # Branch children stay visible as their own rows; the projected
+            # chain entry is the tip, summed over root + tip only.
+            ids = [r["id"] for r in rows]
+            assert "tok_tip" in ids and "tok_branch" in ids
+            tip_row = next(r for r in rows if r["id"] == "tok_tip")
+            assert (tip_row["input_tokens"], tip_row["output_tokens"]) == (400, 40)
+            assert db.chain_token_totals(["tok_tip"]) == {"tok_tip": (400, 40)}
+        finally:
+            db.close()
+
+    def test_standalone_session_keeps_own_tokens(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "tok_standalone.db")
+        db.create_session("tok_standalone", "cli")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET input_tokens=50, output_tokens=5 WHERE id='tok_standalone'"
+        )
+        conn.commit()
+        try:
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            assert [r["id"] for r in rows] == ["tok_standalone"]
+            assert rows[0]["input_tokens"] == 50
+            assert rows[0]["output_tokens"] == 5
+            assert db.chain_token_totals(["tok_standalone"]) == {
+                "tok_standalone": (50, 5)
+            }
+        finally:
+            db.close()

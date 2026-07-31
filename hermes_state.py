@@ -233,6 +233,41 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
+def _chain_token_totals(conn, root_ids) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+    """Sum input/output tokens across each compression chain rooted at *root_ids*.
+
+    Walks compression-continuation edges only (a child counts when its
+    parent ended with ``end_reason == 'compression'``), excluding branch,
+    delegate, and tool children — the same edge definition
+    ``get_compression_tip`` uses. Returns ``{root_id: (in, out)}``.
+    """
+    if not root_ids:
+        return {}
+    ph = ",".join("?" for _ in root_ids)
+    rows = conn.execute(
+        f"""
+        WITH RECURSIVE chain(root_id, sid, depth) AS (
+            SELECT id, id, 0 FROM sessions WHERE id IN ({ph})
+            UNION ALL
+            SELECT c.root_id, child.id, c.depth + 1
+            FROM chain c
+            JOIN sessions parent ON parent.id = c.sid AND parent.end_reason = 'compression'
+            JOIN sessions child ON child.parent_session_id = parent.id
+            WHERE c.depth < 100
+              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+              AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+              AND COALESCE(child.source, '') != 'tool'
+        )
+        SELECT root_id, SUM(s.input_tokens), SUM(s.output_tokens)
+        FROM chain
+        JOIN sessions s ON s.id = chain.sid
+        GROUP BY root_id
+        """,
+        root_ids,
+    ).fetchall()
+    return {r[0]: (r[1], r[2]) for r in rows}
+
+
 def _collect_delegate_child_ids(conn, parent_ids: List[str]) -> List[str]:
     """Delegate-subagent ids to cascade-delete with *parent_ids*.
 
@@ -6753,6 +6788,22 @@ class SessionDB:
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
                 projected.append(merged)
+            # Tok(ΣIn/ΣOut) shows the chain total — the sum across every
+            # generation of the conversation, not the root's (or tip's)
+            # single-generation counts, which for a long-lived chain can
+            # differ by an order of magnitude from what the live session
+            # has actually used.
+            if projected:
+                chain_roots = [
+                    s["_lineage_root_id"] for s in projected if s.get("_lineage_root_id")
+                ]
+                if chain_roots:
+                    with self._lock:
+                        totals = _chain_token_totals(self._conn, chain_roots)
+                    for s in projected:
+                        root_id = s.get("_lineage_root_id")
+                        if root_id in totals:
+                            s["input_tokens"], s["output_tokens"] = totals[root_id]
             sessions = projected
 
         return sessions
@@ -9474,6 +9525,63 @@ class SessionDB:
         except (TypeError, json.JSONDecodeError):
             return False
         return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
+
+    def _is_delegate_child_row(self, session: Dict[str, Any]) -> bool:
+        raw = session.get("model_config")
+        if not raw:
+            return False
+        try:
+            cfg = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, json.JSONDecodeError):
+            return False
+        return isinstance(cfg, dict) and cfg.get("_delegate_from") is not None
+
+    def _is_compression_edge_child_row(self, session: Dict[str, Any]) -> bool:
+        """True when a child row continues a compression chain.
+
+        Mirrors the SQL edge exclusions in ``get_compression_tip``: branch,
+        delegate, and tool children are their own conversations and never
+        count as chain generations.
+        """
+        if self._is_branch_child_row(session):
+            return False
+        if self._is_delegate_child_row(session):
+            return False
+        if (session.get("source") or "") == "tool":
+            return False
+        return True
+
+    def chain_token_totals(
+        self, session_ids: List[str]
+    ) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
+        """Sum input/output tokens across each id's compression chain.
+
+        Returns ``{input_id: (total_in, total_out)}``. For a standalone
+        session this is its own counts; for any generation of a compressed
+        conversation it is the sum across every generation in the chain —
+        the number the ``Tok(ΣIn/ΣOut)`` column displays.
+        """
+        if not session_ids:
+            return {}
+        # Resolve each id to its deepest compression ancestor, then batch-sum.
+        roots: Dict[str, str] = {}
+        for sid in session_ids:
+            current = sid
+            for _ in range(100):
+                meta = self.get_session(current) or {}
+                if not self._is_compression_edge_child_row(meta):
+                    break
+                parent_id = meta.get("parent_session_id")
+                if not parent_id:
+                    break
+                parent = self.get_session(parent_id)
+                if not parent or parent.get("end_reason") != "compression":
+                    break
+                current = parent_id
+            roots[sid] = current
+        root_set = sorted(set(roots.values()))
+        totals = _chain_token_totals(self._conn, root_set)
+        return {sid: totals.get(roots[sid], (None, None)) for sid in session_ids}
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")

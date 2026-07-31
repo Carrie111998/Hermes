@@ -1250,6 +1250,13 @@ class CLICommandsMixin:
                 # compression root), not when the matched generation spawned.
                 row["started_at"] = root_started_at(self._session_db, sid) or meta.get("started_at")
                 table_rows.append(row)
+            # Tok(ΣIn/ΣOut) shows the chain total, matching the listing
+            # header — not the matched generation's single-generation count.
+            chain_tok = self._session_db.chain_token_totals(sids_sorted)
+            for row in table_rows:
+                tot = chain_tok.get(row["id"])
+                if tot and (tot[0] is not None or tot[1] is not None):
+                    row["input_tokens"], row["output_tokens"] = tot
             render_sessions_table(table_rows, out=_cprint, preview_lookup=root_preview_cache)
 
             _cprint("")
