@@ -135,3 +135,47 @@ async def test_verbose_dispatches_mid_run(monkeypatch):
     assert "can't run mid-turn" not in (result or "")
 
 
+class TestBusySlashCommandRejectionPrefixed:
+    """Regression tests (review of #75436): the shared busy-command
+    rejection path (_dispatch_busy_slash_command, "Guard 2" -- routes
+    active-session recognized commands, distinct from
+    _handle_active_session_busy_message()'s own message-selection logic
+    and the separate cold-path external-drain gate both already covered)
+    still returned bare, unprefixed text for its catch-all and its named
+    _BUSY_REJECT_TEXT entries. Drives the real _handle_message() end to
+    end via the same active-session runner fixture used above.
+    """
+
+    @pytest.mark.asyncio
+    async def test_catch_all_reject_is_prefixed(self):
+        """A recognized command with no special mid-run handler and no
+        dispatch policy (e.g. /reasoning) hits the catch-all reject."""
+        runner = _make_runner()
+
+        result = await runner._handle_message(_make_event("/reasoning"))
+
+        assert result is not None
+        assert "can't run mid-turn" in result
+        assert result.startswith("[System] "), (
+            f"Catch-all busy-command reject must carry the [System] "
+            f"prefix like every other busy-ack message: {result!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_named_reject_text_is_prefixed(self):
+        """/model mid-run hits the named _BUSY_REJECT_TEXT entry, a
+        separate dict from the catch-all string above -- both needed
+        the prefix independently."""
+        runner = _make_runner()
+
+        result = await runner._handle_message(_make_event("/model gpt-5"))
+
+        assert result is not None
+        assert "switch models" in result
+        assert result.startswith("[System] "), (
+            f"Named busy-command reject text must carry the [System] "
+            f"prefix like every other busy-ack message: {result!r}"
+        )
+
+
+
