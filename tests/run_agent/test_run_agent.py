@@ -2714,6 +2714,82 @@ class TestRunConversation:
         assert durable["run_ended_at"] == result["run_ended_at"]
         assert durable["final_generated"] is True
 
+    def test_deferred_terminal_receipt_stays_running_until_gateway_owner_closes(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from gateway import delivery_ledger as dl
+
+        receipt_id = "gateway-owned-background-receipt"
+        dl.begin_run_receipt(
+            run_receipt_id=receipt_id,
+            session_id="background-session",
+            task_id="background-task",
+            session_key="gateway:background:task",
+            platform="telegram",
+            run_generation=0,
+            message_ref="incoming-1",
+        )
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = object()
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value={
+                    "final_response": "Generated, awaiting gateway effects.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+            ),
+        ):
+            result = agent.run_conversation(
+                "hello",
+                task_id="background-task",
+                run_receipt_id=receipt_id,
+                persist_terminal_receipt=False,
+            )
+
+        assert result["run_receipt_id"] == receipt_id
+        assert result["run_terminal_state"] == "done"
+        assert result["final_generated"] is True
+        durable = dl.get_run_terminal_receipt(receipt_id)
+        assert durable is not None
+        assert durable["run_terminal_state"] == "running"
+        assert durable["run_end_reason"] is None
+        assert durable["run_ended_at"] is None
+        assert durable["final_generated"] is False
+
+        monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+        closed = dl.sweep_dead_run_receipts(now=9000.0)
+        assert closed == [receipt_id]
+        swept = dl.get_run_terminal_receipt(receipt_id)
+        assert swept is not None
+        assert swept["run_terminal_state"] == "failed"
+        assert swept["run_end_reason"] == "process_terminated_unknown_outcome"
+        assert swept["run_ended_at"] == 9000.0
+        assert swept["final_generated"] is False
+
     def test_exception_path_closes_run_as_explicit_failure(self, agent):
         relay_lease = SimpleNamespace(
             parent_session_id="",

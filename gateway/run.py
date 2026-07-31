@@ -19303,6 +19303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         user_message=enriched_prompt,
                         task_id=task_id,
                         run_receipt_id=_run_receipt_id,
+                        persist_terminal_receipt=False,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)

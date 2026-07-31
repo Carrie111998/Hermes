@@ -7109,8 +7109,14 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         run_receipt_id: Optional[str] = None,
+        persist_terminal_receipt: bool = True,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        ``persist_terminal_receipt=False`` transfers durable receipt ownership
+        to the caller. The agent still returns or attaches exact terminal
+        fields, but it does not begin or close the supplied receipt.
+        """
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -7166,14 +7172,15 @@ class AIAgent:
         task_finished = False
         relay_outcome = "failed"
         try:
-            from gateway.delivery_ledger import begin_run_receipt
+            if persist_terminal_receipt:
+                from gateway.delivery_ledger import begin_run_receipt
 
-            begin_run_receipt(
-                run_receipt_id=local_run_receipt_id,
-                session_id=session_id,
-                task_id=effective_task_id,
-                platform=task_context["platform"],
-            )
+                begin_run_receipt(
+                    run_receipt_id=local_run_receipt_id,
+                    session_id=session_id,
+                    task_id=effective_task_id,
+                    platform=task_context["platform"],
+                )
             phase_token = push_turn_policy(
                 persist_user_message
                 if persist_user_message is not None
@@ -7253,24 +7260,7 @@ class AIAgent:
                 outcome=relay_outcome,
             )
             task_finished = True
-            from gateway.delivery_ledger import record_run_terminal_receipt
-
-            record_run_terminal_receipt(
-                run_receipt_id=local_run_receipt_id,
-                session_id=session_id,
-                task_id=effective_task_id,
-                platform=task_context["platform"],
-                run_terminal_state=result["run_terminal_state"],
-                run_end_reason=result["run_end_reason"],
-                run_ended_at=result["run_ended_at"],
-                final_generated=result["final_generated"],
-            )
-            finish_task_run(**task_context, result=result)
-            return result
-        except BaseException as exc:
-            terminal_receipt = _exception_run_terminal_receipt(exc)
-            terminal_receipt["run_receipt_id"] = local_run_receipt_id
-            try:
+            if persist_terminal_receipt:
                 from gateway.delivery_ledger import record_run_terminal_receipt
 
                 record_run_terminal_receipt(
@@ -7278,21 +7268,42 @@ class AIAgent:
                     session_id=session_id,
                     task_id=effective_task_id,
                     platform=task_context["platform"],
-                    run_terminal_state=terminal_receipt[
-                        "run_terminal_state"
-                    ],
-                    run_end_reason=terminal_receipt["run_end_reason"],
-                    run_ended_at=terminal_receipt["run_ended_at"],
-                    final_generated=terminal_receipt["final_generated"],
+                    run_terminal_state=result["run_terminal_state"],
+                    run_end_reason=result["run_end_reason"],
+                    run_ended_at=result["run_ended_at"],
+                    final_generated=result["final_generated"],
                 )
-            except Exception:
-                # begin_run_receipt already left durable "running" truth. A
-                # terminal update failure must not hide the original run
-                # exception or replace it with observability machinery.
-                logger.exception(
-                    "Failed to finalize local run terminal receipt %s",
-                    local_run_receipt_id,
-                )
+            finish_task_run(**task_context, result=result)
+            return result
+        except BaseException as exc:
+            terminal_receipt = _exception_run_terminal_receipt(exc)
+            terminal_receipt["run_receipt_id"] = local_run_receipt_id
+            if persist_terminal_receipt:
+                try:
+                    from gateway.delivery_ledger import (
+                        record_run_terminal_receipt,
+                    )
+
+                    record_run_terminal_receipt(
+                        run_receipt_id=local_run_receipt_id,
+                        session_id=session_id,
+                        task_id=effective_task_id,
+                        platform=task_context["platform"],
+                        run_terminal_state=terminal_receipt[
+                            "run_terminal_state"
+                        ],
+                        run_end_reason=terminal_receipt["run_end_reason"],
+                        run_ended_at=terminal_receipt["run_ended_at"],
+                        final_generated=terminal_receipt["final_generated"],
+                    )
+                except Exception:
+                    # The locally owned receipt already exposes "running".
+                    # A terminal update failure must not hide the run exception
+                    # or replace it with observability machinery.
+                    logger.exception(
+                        "Failed to finalize local run terminal receipt %s",
+                        local_run_receipt_id,
+                    )
             try:
                 setattr(
                     exc,

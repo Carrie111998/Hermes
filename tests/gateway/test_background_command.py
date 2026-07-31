@@ -222,6 +222,7 @@ class TestRunBackgroundTask:
         runner = _make_runner()
         mock_adapter = AsyncMock()
         delivery_order = []
+        states_during_attachment = []
 
         async def send_terminal(**_kwargs):
             delivery_order.append("terminal")
@@ -229,6 +230,9 @@ class TestRunBackgroundTask:
 
         async def send_document(**_kwargs):
             delivery_order.append("attachment")
+            states_during_attachment.append(
+                _only_run_receipt()["run_terminal_state"]
+            )
             return SendResult(success=True, message_id="document-1")
 
         mock_adapter.send = AsyncMock(side_effect=send_terminal)
@@ -272,11 +276,15 @@ class TestRunBackgroundTask:
         )
         mock_adapter.send_document.assert_awaited_once()
         assert delivery_order == ["attachment", "terminal"]
+        assert states_during_attachment == ["running"]
         receipt = _only_run_receipt()
         assert receipt["run_terminal_state"] == "done"
         assert receipt["final_generated"] is True
         assert receipt["delivery_obligation_id"]
         assert receipt["final_delivery_status"] == "delivered"
+        assert mock_agent.run_conversation.call_args.kwargs[
+            "persist_terminal_receipt"
+        ] is False
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
