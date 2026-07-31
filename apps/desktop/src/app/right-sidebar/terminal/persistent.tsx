@@ -214,6 +214,7 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
     display: 'flex',
     flexDirection: 'column',
     visibility: visible ? 'visible' : 'hidden',
+    opacity: visible ? 1 : 0,
     pointerEvents: visible ? 'auto' : 'none',
     zIndex: 4,
     // Match the live skin surface so the header strip (transparent) and body
