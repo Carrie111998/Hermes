@@ -216,9 +216,9 @@ _CALL_BACKSTOP_SECONDS = 240.0
 _POLL_BUDGET_SECONDS = 180.0
 # The gap between looks, and so the notice delay on a finished job. The
 # gateway's poll limiter allows 120 a minute per principal, and it only ever
-# has one generation of ours to answer for, so this cadence spends about a
-# tenth of what it permits.
-_POLL_GAP_SECONDS = 5.0
+# has one generation of ours to answer for, so this cadence spends about an
+# eighth of what it permits.
+_POLL_GAP_SECONDS = 4.0
 # The budget is counted as it is spent — the waits and the time each look
 # actually takes — rather than read off a wall clock. A slow gateway therefore
 # costs looks instead of overrunning the call, and the loop stays testable
