@@ -16950,6 +16950,10 @@ def _create_server_sockets(hosts: list[str], port: int) -> list:
     port.  Intended for uvicorn's ``server.startup(sockets=…)`` API which
     accepts multiple pre-created sockets natively.
 
+    When *port* is 0, the first socket is bound to an OS-assigned ephemeral
+    port; subsequent sockets reuse that same port so all listeners share a
+    single port number.
+
     Raises ``OSError`` if any host fails to bind.
     """
     import socket as _sk
@@ -16962,6 +16966,11 @@ def _create_server_sockets(hosts: list[str], port: int) -> list:
         if family == _sk.AF_INET6:
             sock.setsockopt(_sk.IPPROTO_IPV6, _sk.IPV6_V6ONLY, 1)
         sock.bind((h, port))
+        if port == 0 and not socks:
+            # First bind with port 0 — read the OS-assigned port so we
+            # reuse it for remaining listeners instead of getting N different
+            # ephemeral ports.
+            port = sock.getsockname()[1]
         sock.set_inheritable(True)
         socks.append(sock)
     return socks
