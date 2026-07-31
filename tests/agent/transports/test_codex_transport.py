@@ -590,8 +590,8 @@ class TestCodexBuildKwargs:
         )
 
     def test_non_xai_path_does_not_inject_native_web_search(self, transport):
-        """Native web_search injection is scoped to xAI — Codex/GitHub paths
-        keep the client-side web_search function untouched."""
+        """Native web_search injection is scoped to xAI and openai-codex —
+        other paths (plain OpenAI, …) keep the client-side function."""
         messages = [{"role": "user", "content": "Search."}]
         kw = transport.build_kwargs(
             model="gpt-5.4", messages=messages,
@@ -600,6 +600,7 @@ class TestCodexBuildKwargs:
                 "parameters": {"type": "object",
                                "properties": {"query": {"type": "string"}}}}}],
             is_xai_responses=False,
+            is_codex_backend=False,
         )
         tools = kw.get("tools", [])
         assert not any(t.get("type") == "web_search" for t in tools)
@@ -607,6 +608,38 @@ class TestCodexBuildKwargs:
             t.get("type") == "function" and t.get("name") == "web_search"
             for t in tools
         )
+
+    def test_codex_backend_injects_native_web_search(self, transport):
+        """openai-codex swaps a client-side ``web_search`` function for the
+        native ``{"type": "web_search"}`` built-in so server-side search
+        runs to completion.  Non-conflicting client tools are preserved."""
+        messages = [{"role": "user", "content": "Search the web."}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+            ],
+            is_xai_responses=False,
+            is_codex_backend=True,
+        )
+        tools = kw.get("tools", [])
+        # Native web_search built-in is present.
+        assert any(t.get("type") == "web_search" for t in tools), tools
+        # Client-side function form of web_search is dropped.
+        assert not any(
+            t.get("type") == "function" and t.get("name") == "web_search"
+            for t in tools
+        )
+        # Non-conflicting client-side tools are preserved.
+        names = [t.get("name") for t in tools if t.get("type") == "function"]
+        assert "read_file" in names
 
     def test_xai_reasoning_disabled_no_reasoning_key(self, transport):
         messages = [{"role": "user", "content": "Hi"}]
