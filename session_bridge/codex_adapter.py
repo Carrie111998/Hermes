@@ -36,6 +36,10 @@ from .sidebar_placement import (
     filesystem_path_identity,
     placement_paths_equivalent,
 )
+from .sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 
 
 _PARSER_VERSION = 1
@@ -150,8 +154,7 @@ class SidebarThreadVerifier:
     """Authenticate native Codex sidebar threads through read-only inventory."""
 
     _ZERO_INTERVAL_READ_BUDGET_SECONDS = 30.0
-    _MAX_SNAPSHOT_TTL_SECONDS = 30.0
-    _ZERO_INTERVAL_SNAPSHOT_TTL_SECONDS = 1.0
+    _COMPATIBILITY_EVIDENCE_TTL_SECONDS = 30.0
 
     def __init__(
         self,
@@ -201,13 +204,6 @@ class SidebarThreadVerifier:
         self._inventory_thread_cap = inventory_thread_cap
         self._monotonic = monotonic
         self._sleep = sleep
-        self._inventory_snapshot: (
-            tuple[
-                float,
-                tuple[SessionProjection, ...],
-            ]
-            | None
-        ) = None
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
@@ -270,7 +266,7 @@ class SidebarThreadVerifier:
     def find_by_marker(
         self, expected: BridgeMarkerPayload
     ) -> VerifiedSidebarThread | None:
-        return self._find_by_marker(expected, include_archived=False)
+        return self._find_by_marker_compatibility(expected)
 
     def find_by_marker_including_archived(
         self,
@@ -278,56 +274,119 @@ class SidebarThreadVerifier:
     ) -> VerifiedSidebarThread | None:
         """Find signed marker evidence across active and archived inventory."""
 
-        return self._find_by_marker(expected, include_archived=True)
+        return self._find_by_marker_compatibility(expected)
 
-    def _find_by_marker(
+    def _find_by_marker_compatibility(
+        self,
+        expected: BridgeMarkerPayload,
+    ) -> VerifiedSidebarThread | None:
+        evidence = self.reconcile_marker(
+            expected,
+            now=time.time(),
+            ttl_seconds=self._COMPATIBILITY_EVIDENCE_TTL_SECONDS,
+        )
+        if evidence.state is SidebarReconciliationState.BLOCKED:
+            assert evidence.fixed_reason is not None
+            raise SidebarVerificationError(evidence.fixed_reason)
+        if evidence.state is SidebarReconciliationState.ABSENCE_PROVEN:
+            return None
+        assert evidence.recovered_thread_id is not None
+        return VerifiedSidebarThread(
+            thread_id=evidence.recovered_thread_id,
+            source_session_id=expected.source_session_id,
+            bridge_id=expected.bridge_id,
+        )
+
+    def reconcile_marker(
         self,
         expected: BridgeMarkerPayload,
         *,
-        include_archived: bool,
-    ) -> VerifiedSidebarThread | None:
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        """Produce fresh, complete, authenticated native-inventory evidence."""
+
         expected = _validated_sidebar_marker_payload(expected)
+        if (
+            isinstance(now, bool)
+            or not isinstance(now, (int, float))
+            or not math.isfinite(float(now))
+        ):
+            raise ValueError("sidebar reconciliation time must be finite")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or not math.isfinite(float(ttl_seconds))
+            or float(ttl_seconds) <= 0
+        ):
+            raise ValueError("sidebar reconciliation TTL must be positive and finite")
+        completed_at = float(now)
+        expires_at = completed_at + float(ttl_seconds)
+        if not math.isfinite(expires_at):
+            raise ValueError("sidebar reconciliation expiry must be finite")
         try:
-            supports_search = getattr(
-                self._source_adapter,
-                "supports_sidebar_search",
-                None,
-            )
-            search_inventory = getattr(
-                self._source_adapter,
-                "search_sidebar_inventory",
-                None,
-            )
-            if (
-                callable(supports_search)
-                and supports_search()
-                and callable(search_inventory)
-            ):
-                projections = self._searched_inventory_projections(
-                    expected,
-                    search_inventory=search_inventory,
-                )
-            else:
-                projections = self._cached_inventory_projections()
+            projections = self._fresh_marker_inventory_projections(expected)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
             raise SidebarVerificationError("bridge_temporarily_unavailable") from None
+
+        marker = encode_bridge_marker(expected, self._marker_secret)
+        marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+        inventory_digest = _sidebar_inventory_digest(projections)
+        generation = f"codex:{int(completed_at * 1_000_000)}:{inventory_digest}"
         matches: dict[str, VerifiedSidebarThread] = {}
+        fixed_reason: str | None = None
         for projection in projections:
-            if not include_archived and projection.native_status == "archived":
+            try:
+                verified = _verified_sidebar_projection(
+                    projection,
+                    expected=expected,
+                    marker_secret=self._marker_secret,
+                    strict=False,
+                )
+            except SidebarVerificationError as exc:
+                fixed_reason = (
+                    exc.code
+                    if fixed_reason in {None, exc.code}
+                    else "marker_conflict"
+                )
                 continue
-            verified = _verified_sidebar_projection(
-                projection,
-                expected=expected,
-                marker_secret=self._marker_secret,
-                strict=False,
-            )
             if verified is not None:
                 matches[verified.thread_id] = verified
+
         if len(matches) > 1:
-            raise SidebarVerificationError("marker_conflict")
-        return next(iter(matches.values()), None)
+            fixed_reason = "marker_conflict"
+        if fixed_reason is not None:
+            return SidebarReconciliationEvidence.create(
+                state=SidebarReconciliationState.BLOCKED,
+                generation=generation,
+                completed_at=completed_at,
+                expires_at=expires_at,
+                inventory_digest=inventory_digest,
+                marker_digest=marker_digest,
+                match_count=len(matches),
+                recovered_thread_id=None,
+                fixed_reason=fixed_reason,
+            )
+        recovered = next(iter(matches.values()), None)
+        return SidebarReconciliationEvidence.create(
+            state=(
+                SidebarReconciliationState.RECOVERED
+                if recovered is not None
+                else SidebarReconciliationState.ABSENCE_PROVEN
+            ),
+            generation=generation,
+            completed_at=completed_at,
+            expires_at=expires_at,
+            inventory_digest=inventory_digest,
+            marker_digest=marker_digest,
+            match_count=int(recovered is not None),
+            recovered_thread_id=(
+                recovered.thread_id if recovered is not None else None
+            ),
+            fixed_reason=None,
+        )
 
     def find_by_recovery_key(
         self,
@@ -363,54 +422,48 @@ class SidebarThreadVerifier:
             raise SidebarVerificationError("codex_thread_conflict")
         return next(iter(native_ids), None)
 
-    def _searched_inventory_projections(
+    def _fresh_marker_inventory_projections(
         self,
         expected: BridgeMarkerPayload,
-        *,
-        search_inventory: Any,
     ) -> tuple[SessionProjection, ...]:
-        now = self._monotonic()
-        deadline = now + (
-            self._reconciliation_interval
-            if self._reconciliation_interval > 0
-            else self._ZERO_INTERVAL_READ_BUDGET_SECONDS
-        )
-        marker = encode_bridge_marker(expected, self._marker_secret).rsplit(".", 1)[0]
-        summaries = search_inventory(
-            marker,
-            deadline=deadline,
-            page_cap=self._inventory_page_cap,
-        )
-        return self._read_inventory_projections(summaries, deadline=deadline)
+        """Read a complete current inventory without consulting snapshot state."""
 
-    def _cached_inventory_projections(self) -> tuple[SessionProjection, ...]:
-        now = self._monotonic()
-        cached = self._inventory_snapshot
-        if cached is not None and now <= cached[0]:
-            return cached[1]
-        deadline = now + (
+        started = self._monotonic()
+        deadline = started + (
             self._reconciliation_interval
             if self._reconciliation_interval > 0
             else self._ZERO_INTERVAL_READ_BUDGET_SECONDS
         )
-        summaries = self._source_adapter.list_sidebar_inventory(
-            deadline=deadline,
-            page_cap=self._inventory_page_cap,
+        supports_search = getattr(
+            self._source_adapter,
+            "supports_sidebar_search",
+            None,
         )
-        result = self._read_inventory_projections(summaries, deadline=deadline)
-        snapshot_ttl = (
-            min(
-                self._reconciliation_interval,
-                self._MAX_SNAPSHOT_TTL_SECONDS,
+        search_inventory = getattr(
+            self._source_adapter,
+            "search_sidebar_inventory",
+            None,
+        )
+        if (
+            callable(supports_search)
+            and supports_search()
+            and callable(search_inventory)
+        ):
+            marker_prefix = encode_bridge_marker(
+                expected,
+                self._marker_secret,
+            ).rsplit(".", 1)[0]
+            summaries = search_inventory(
+                marker_prefix,
+                deadline=deadline,
+                page_cap=self._inventory_page_cap,
             )
-            if self._reconciliation_interval > 0
-            else self._ZERO_INTERVAL_SNAPSHOT_TTL_SECONDS
-        )
-        self._inventory_snapshot = (
-            now + snapshot_ttl,
-            result,
-        )
-        return result
+        else:
+            summaries = self._source_adapter.list_sidebar_inventory(
+                deadline=deadline,
+                page_cap=self._inventory_page_cap,
+            )
+        return self._read_inventory_projections(summaries, deadline=deadline)
 
     def _read_inventory_projections(
         self,
@@ -578,7 +631,12 @@ class CodexSourceAdapter:
             deadline=deadline,
             page_cap=page_cap - used,
         )
-        combined = {summary.native_id: summary for summary in (*active, *archived)}
+        combined: dict[str, CodexThreadSummary] = {}
+        for summary in (*active, *archived):
+            prior = combined.get(summary.native_id)
+            if prior is not None and prior != summary:
+                raise CodexInventoryProtocolError("metadata_conflict")
+            combined[summary.native_id] = summary
         return [combined[native_id] for native_id in sorted(combined)]
 
     def find_sidebar_thread(
@@ -720,8 +778,6 @@ class CodexSourceAdapter:
         cursor: Any = None
         seen_cursors: set[str] = set()
         normalized: dict[str, CodexThreadSummary] = {}
-        conflicts: set[str] = set()
-        raw_entry_count = 0
         pages = 0
         while True:
             if pages >= page_cap:
@@ -743,23 +799,29 @@ class CodexSourceAdapter:
             entries = _first(response, "data", "threads")
             if not isinstance(entries, list):
                 raise ValueError("Codex thread/search response has no entries list")
-            raw_entry_count += len(entries)
             for result in entries:
                 if not isinstance(result, dict):
-                    continue
+                    raise ValueError(
+                        "Codex thread/search result must be an object"
+                    )
                 entry = result.get("thread")
                 if not isinstance(entry, dict):
-                    continue
+                    raise ValueError(
+                        "Codex thread/search result has no thread object"
+                    )
                 try:
                     summary = _normalize_summary(entry, archived=archived)
+                except CodexInventoryProtocolError:
+                    raise
                 except (TypeError, ValueError):
-                    continue
+                    raise ValueError(
+                        "Codex thread/search inventory entry is invalid"
+                    ) from None
                 prior = normalized.get(summary.native_id)
-                if prior is None and summary.native_id not in conflicts:
+                if prior is None:
                     normalized[summary.native_id] = summary
                 elif prior != summary:
-                    normalized.pop(summary.native_id, None)
-                    conflicts.add(summary.native_id)
+                    raise CodexInventoryProtocolError("metadata_conflict")
             next_cursor = _first(response, "nextCursor", "next_cursor")
             if next_cursor in (None, ""):
                 break
@@ -768,8 +830,6 @@ class CodexSourceAdapter:
                 raise ValueError("Codex thread/search returned a repeated cursor")
             seen_cursors.add(cursor_key)
             cursor = next_cursor
-        if raw_entry_count and not normalized:
-            raise ValueError("Codex thread/search contained no valid inventory entries")
         return [normalized[key] for key in sorted(normalized)], pages
 
     def _bounded_sidebar_request(
@@ -2117,6 +2177,37 @@ def _verified_sidebar_projection(
     if decoded:
         raise SidebarVerificationError("source_identity_mismatch")
     raise SidebarVerificationError("source_identity_mismatch")
+
+
+def _sidebar_inventory_digest(
+    projections: tuple[SessionProjection, ...],
+) -> str:
+    """Hash only native identity/revision/status and full marker-bearing content."""
+
+    inventory: list[tuple[str, str, str, tuple[str, ...]]] = []
+    for projection in projections:
+        marker_content = tuple(
+            message.content
+            for message in projection.messages
+            if message.role == "user"
+            and isinstance(message.content, str)
+            and _MARKER_CANDIDATE_RE.search(message.content) is not None
+        )
+        inventory.append(
+            (
+                projection.native_id,
+                projection.native_cursor or "",
+                projection.native_status,
+                marker_content,
+            )
+        )
+    encoded = json.dumps(
+        sorted(inventory, key=lambda value: value[0]),
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _started_thread_id(response: Any) -> str:

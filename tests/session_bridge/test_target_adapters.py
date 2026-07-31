@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -58,6 +59,7 @@ from session_bridge.sidebar import (
     build_registration_prompt,
     sidebar_bridge_id,
 )
+from session_bridge.sidebar_reconciliation import SidebarReconciliationState
 
 
 SECRET = b"target-adapter-test-secret"
@@ -883,13 +885,24 @@ def test_sidebar_marker_lookup_deadline_after_read_is_retryable_not_a_match() ->
     ]
 
 
-def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> None:
+def test_two_sidebar_claim_markers_each_use_fresh_complete_inventory() -> None:
     other_id = "33333333-3333-4333-8333-333333333333"
     first = _codex_inventory()["data"][0]
     second = _codex_inventory(native_id=other_id)["data"][0]
     client = FakeRequestClient({
-        "thread/list": [{"data": [first, second]}, {"data": []}],
+        "thread/list": [
+            {"data": [first, second]},
+            {"data": []},
+            {"data": [first, second]},
+            {"data": []},
+        ],
         "thread/read": [
+            _codex_signed_read(),
+            _codex_signed_read(
+                native_id=other_id,
+                bridge_id="bridge-2",
+                source_session_id="hermes-source-2",
+            ),
             _codex_signed_read(),
             _codex_signed_read(
                 native_id=other_id,
@@ -917,10 +930,14 @@ def test_two_sidebar_claim_markers_reuse_one_bounded_inventory_snapshot() -> Non
         "thread/list",
         "thread/read",
         "thread/read",
+        "thread/list",
+        "thread/list",
+        "thread/read",
+        "thread/read",
     ]
 
 
-def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
+def test_sidebar_compatibility_lookup_bypasses_inventory_snapshot() -> None:
     now = [0.0]
     inventory = MutableSidebarInventory()
     verifier = SidebarThreadVerifier(
@@ -935,8 +952,12 @@ def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
 
     inventory.visible = True
     now[0] = 29.0
-    assert verifier.find_by_marker(_sidebar_expected()) is None
-    assert inventory.list_deadlines == [600.0]
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
+    assert inventory.list_deadlines == [600.0, 629.0]
 
     now[0] = 31.0
     assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
@@ -944,8 +965,8 @@ def test_sidebar_snapshot_ttl_is_capped_below_lease_retry_window() -> None:
         "claude:source-1",
         "bridge-1",
     )
-    assert inventory.list_deadlines == [600.0, 631.0]
-    assert inventory.read_deadlines == [631.0]
+    assert inventory.list_deadlines == [600.0, 629.0, 631.0]
+    assert inventory.read_deadlines == [629.0, 631.0]
 
 
 @pytest.mark.parametrize(
@@ -1081,12 +1102,15 @@ def test_sidebar_marker_lookup_recovers_one_exact_thread_read_only() -> None:
     ]
 
 
-def test_sidebar_terminal_marker_lookup_includes_archived_without_changing_delivery_lookup() -> (
-    None
-):
+def test_sidebar_marker_compatibility_lookups_both_include_archived() -> None:
     client = FakeRequestClient({
-        "thread/list": [{"data": []}, _codex_inventory()],
-        "thread/read": [_codex_signed_read()],
+        "thread/list": [
+            {"data": []},
+            _codex_inventory(),
+            {"data": []},
+            _codex_inventory(),
+        ],
+        "thread/read": [_codex_signed_read(), _codex_signed_read()],
     })
     verifier = SidebarThreadVerifier(
         CodexSourceAdapter(client, marker_secret=SECRET),
@@ -1094,7 +1118,11 @@ def test_sidebar_terminal_marker_lookup_includes_archived_without_changing_deliv
         reconciliation_interval=0,
     )
 
-    assert verifier.find_by_marker(_sidebar_expected()) is None
+    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
+        CODEX_ID,
+        "claude:source-1",
+        "bridge-1",
+    )
     assert verifier.find_by_marker_including_archived(
         _sidebar_expected()
     ) == VerifiedSidebarThread(
@@ -1103,6 +1131,9 @@ def test_sidebar_terminal_marker_lookup_includes_archived_without_changing_deliv
         "bridge-1",
     )
     assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+        "thread/read",
         "thread/list",
         "thread/list",
         "thread/read",
@@ -1417,6 +1448,303 @@ def test_sidebar_marker_lookup_searches_exact_marker_before_thread_reads() -> No
     assert client.initialize_calls == [{"capabilities": {"experimentalApi": True}}]
 
 
+def test_sidebar_reconcile_marker_returns_complete_absence_evidence() -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    client = ExperimentalSearchClient({
+        "thread/search": [{"data": []}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.ABSENCE_PROVEN
+    assert evidence.match_count == 0
+    assert evidence.completed_at == 100.0
+    assert evidence.expires_at == 130.0
+    assert evidence.recovered_thread_id is None
+    assert evidence.fixed_reason is None
+    assert evidence.marker_digest == hashlib.sha256(marker.encode()).hexdigest()
+    assert [
+        (method, params)
+        for method, params, _timeout in client.calls
+    ] == [
+        (
+            "thread/search",
+            {"archived": False, "searchTerm": marker.rsplit(".", 1)[0]},
+        ),
+        (
+            "thread/search",
+            {"archived": True, "searchTerm": marker.rsplit(".", 1)[0]},
+        ),
+    ]
+
+
+def test_sidebar_reconcile_marker_paginates_active_and_archived_before_recovery() -> (
+    None
+):
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    row = _codex_inventory()["data"][0]
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {"data": [], "nextCursor": "active-next"},
+            {"data": [{"thread": row, "snippet": marker}]},
+            {"data": [], "nextCursor": "archive-next"},
+            {"data": []},
+        ],
+        "thread/read": [_codex_signed_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.RECOVERED
+    assert evidence.match_count == 1
+    assert evidence.recovered_thread_id == CODEX_ID
+    assert [method for method, _, _ in client.calls] == [
+        "thread/search",
+        "thread/search",
+        "thread/search",
+        "thread/search",
+        "thread/read",
+    ]
+    search_params = [
+        params for method, params, _ in client.calls if method == "thread/search"
+    ]
+    assert search_params[1]["cursor"] == "active-next"
+    assert search_params[3]["cursor"] == "archive-next"
+
+
+def test_sidebar_reconcile_marker_blocks_multiple_authenticated_matches() -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    archived_id = "33333333-3333-4333-8333-333333333333"
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {
+                "data": [
+                    {"thread": _codex_inventory()["data"][0], "snippet": marker}
+                ]
+            },
+            {
+                "data": [
+                    {
+                        "thread": _codex_inventory(native_id=archived_id)["data"][0],
+                        "snippet": marker,
+                    }
+                ]
+            },
+        ],
+        "thread/read": [
+            _codex_signed_read(),
+            _codex_signed_read(native_id=archived_id),
+        ],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.BLOCKED
+    assert evidence.match_count == 2
+    assert evidence.recovered_thread_id is None
+    assert evidence.fixed_reason == "marker_conflict"
+
+
+def test_sidebar_reconcile_marker_authenticates_full_task_not_summary() -> None:
+    expected = _sidebar_expected()
+    valid = encode_bridge_marker(expected, SECRET)
+    invalid = encode_bridge_marker(expected, b"different-secret")
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {
+                "data": [
+                    {
+                        "thread": _codex_inventory(title=valid)["data"][0],
+                        "snippet": valid,
+                    }
+                ]
+            },
+            {"data": []},
+        ],
+        "thread/read": [
+            _codex_read(
+                turns=[
+                    {
+                        "id": "registration",
+                        "items": [
+                            {
+                                "type": "userMessage",
+                                "id": "item-invalid",
+                                "content": [{"type": "text", "text": invalid}],
+                            }
+                        ],
+                    }
+                ]
+            )
+        ],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.BLOCKED
+    assert evidence.match_count == 0
+    assert evidence.fixed_reason == "marker_conflict"
+    assert [method for method, _, _ in client.calls][-1] == "thread/read"
+
+
+def test_sidebar_reconcile_marker_never_uses_title_as_identity() -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    client = ExperimentalSearchClient({
+        "thread/search": [
+            {
+                "data": [
+                    {
+                        "thread": _codex_inventory(title=marker)["data"][0],
+                        "snippet": marker,
+                    }
+                ]
+            },
+            {"data": []},
+        ],
+        "thread/read": [_codex_read()],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.ABSENCE_PROVEN
+    assert evidence.match_count == 0
+    assert [method for method, _, _ in client.calls][-1] == "thread/read"
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "repeated_cursor",
+        "page_cap",
+        "deadline",
+        "malformed_result",
+        "conflicting_summary",
+        "read_error",
+    ],
+)
+def test_sidebar_reconcile_marker_never_proves_absence_from_incomplete_inventory(
+    failure: str,
+) -> None:
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    row = _codex_inventory()["data"][0]
+    if failure == "repeated_cursor":
+        responses: dict[str, list[dict[str, Any] | Exception]] = {
+            "thread/search": [
+                {"data": [], "nextCursor": "repeat"},
+                {"data": [], "nextCursor": "repeat"},
+            ]
+        }
+        page_cap = 3
+    elif failure == "page_cap":
+        responses = {
+            "thread/search": [{"data": [], "nextCursor": "more"}],
+        }
+        page_cap = 1
+    elif failure == "deadline":
+        responses = {}
+        page_cap = 3
+    elif failure == "malformed_result":
+        responses = {
+            "thread/search": [{"data": [{"thread": "not-an-object"}]}],
+        }
+        page_cap = 3
+    elif failure == "conflicting_summary":
+        conflicting = deepcopy(row)
+        conflicting["title"] = "conflicting title"
+        responses = {
+            "thread/search": [
+                {
+                    "data": [{"thread": row, "snippet": marker}],
+                    "nextCursor": "more",
+                },
+                {"data": [{"thread": conflicting, "snippet": marker}]},
+            ],
+        }
+        page_cap = 3
+    else:
+        responses = {
+            "thread/search": [
+                {"data": [{"thread": row, "snippet": marker}]},
+                {"data": []},
+            ],
+            "thread/read": [RuntimeError("synthetic read failure")],
+        }
+        page_cap = 3
+    client = ExperimentalSearchClient(responses)
+    source_monotonic = (lambda: 31.0) if failure == "deadline" else (lambda: 0.0)
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=source_monotonic),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        inventory_page_cap=page_cap,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert raised.value.code == "bridge_temporarily_unavailable"
+
+
+def test_sidebar_reconcile_marker_fallback_inventory_is_fresh_and_complete() -> None:
+    client = FakeRequestClient({
+        "thread/list": [{"data": []}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+
+    evidence = verifier.reconcile_marker(
+        _sidebar_expected(),
+        now=100.0,
+        ttl_seconds=30.0,
+    )
+
+    assert evidence.state is SidebarReconciliationState.ABSENCE_PROVEN
+    assert [method for method, _, _ in client.calls] == [
+        "thread/list",
+        "thread/list",
+    ]
+
+
 def test_sidebar_marker_search_survives_preflight_first_client_initialization() -> None:
     expected = _sidebar_expected()
     marker = encode_bridge_marker(expected, SECRET)
@@ -1521,7 +1849,7 @@ def test_sidebar_marker_search_fails_closed_on_matching_invalid_signature() -> N
     )
 
 
-def test_sidebar_marker_lookup_ignores_archived_duplicate() -> None:
+def test_sidebar_marker_lookup_blocks_archived_duplicate() -> None:
     other_id = "33333333-3333-4333-8333-333333333333"
     client = FakeRequestClient({
         "thread/list": [
@@ -1539,11 +1867,10 @@ def test_sidebar_marker_lookup_ignores_archived_duplicate() -> None:
         reconciliation_interval=0,
     )
 
-    assert verifier.find_by_marker(_sidebar_expected()) == VerifiedSidebarThread(
-        CODEX_ID,
-        "claude:source-1",
-        "bridge-1",
-    )
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.find_by_marker(_sidebar_expected())
+
+    assert raised.value.code == "marker_conflict"
     assert all(
         method not in {"thread/start", "thread/name/set"}
         for method, _, _ in client.calls
