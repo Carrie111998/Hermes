@@ -160,6 +160,13 @@ to any progressive-disclosure design, not specific to this implementation:
   sidecar and does not repeat an unchanged snapshot. If the supplied history no
   longer contains the current snapshot, Hermes attaches it again at the
   append-only edge.
+- **Compression re-anchors the current snapshot.** A turn can compress after
+  its prologue has already decided that an older catalog snapshot is present.
+  Before the compressed transcript is committed or the model is called again,
+  Hermes attaches the current snapshot to the newest surviving user message's
+  API sidecar (or a text part for multimodal content). This introduces no
+  synthetic turn and prevents same-turn compaction from erasing tool discovery
+  context.
 - **Slow MCP startup does not gate the snapshot.** The first snapshot reflects
   the catalog ready when the user turn is assembled and marks slower in-scope
   servers as initializing. When they finish, the next real user turn carries a

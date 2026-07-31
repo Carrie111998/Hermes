@@ -582,6 +582,102 @@ def test_same_agent_reannounces_snapshot_when_history_is_absent():
         registry.deregister(name)
 
 
+def test_compression_reanchors_catalog_on_latest_real_user_sidecar_once():
+    from agent.conversation_compression import (
+        _reanchor_tool_catalog_snapshot_after_compression,
+    )
+    from tools.tool_search import build_catalog_snapshot
+
+    snapshot = build_catalog_snapshot([])
+    agent = types.SimpleNamespace(
+        _tool_catalog_snapshot_id=snapshot.snapshot_id,
+        _tool_catalog_snapshot_notice=snapshot.notice,
+    )
+    compressed = [
+        {
+            "role": "user",
+            "content": "older request",
+            "api_content": snapshot.notice + "\n\nolder request",
+        },
+        {"role": "assistant", "content": "compressed summary"},
+        {
+            "role": "user",
+            "content": "current request",
+            "api_content": "current request\n\nPLUGIN-CTX",
+        },
+    ]
+
+    assert _reanchor_tool_catalog_snapshot_after_compression(agent, compressed)
+    assert compressed[-1]["content"] == "current request"
+    assert compressed[-1]["api_content"] == (
+        snapshot.notice + "\n\ncurrent request\n\nPLUGIN-CTX"
+    )
+
+    assert not _reanchor_tool_catalog_snapshot_after_compression(agent, compressed)
+    assert compressed[-1]["api_content"].count(snapshot.notice) == 1
+
+
+def test_compression_reanchors_catalog_on_synthetic_user_fallback():
+    from agent.conversation_compression import (
+        _reanchor_tool_catalog_snapshot_after_compression,
+    )
+    from tools.tool_search import build_catalog_snapshot
+
+    snapshot = build_catalog_snapshot([])
+    agent = types.SimpleNamespace(
+        _tool_catalog_snapshot_id=snapshot.snapshot_id,
+        _tool_catalog_snapshot_notice=snapshot.notice,
+    )
+    compressed = [
+        {
+            "role": "assistant",
+            "content": "summary",
+            "_compressed_summary": True,
+        },
+        {
+            "role": "user",
+            "content": (
+                "Continue from the compressed conversation context above. "
+                "This marker exists because no human user turn was available."
+            ),
+            "_empty_recovery_synthetic": True,
+        },
+    ]
+
+    assert _reanchor_tool_catalog_snapshot_after_compression(agent, compressed)
+    assert compressed[-1]["content"].startswith("Continue from")
+    assert compressed[-1]["api_content"].startswith(snapshot.notice + "\n\n")
+
+
+def test_compression_reanchors_catalog_in_multimodal_text_part():
+    from agent.conversation_compression import (
+        _reanchor_tool_catalog_snapshot_after_compression,
+    )
+    from tools.tool_search import build_catalog_snapshot
+
+    snapshot = build_catalog_snapshot([])
+    agent = types.SimpleNamespace(
+        _tool_catalog_snapshot_id=snapshot.snapshot_id,
+        _tool_catalog_snapshot_notice=snapshot.notice,
+    )
+    image_part = {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}
+    text_part = {"type": "text", "text": "inspect this image"}
+    compressed = [
+        {
+            "role": "user",
+            "content": [image_part, text_part],
+        }
+    ]
+
+    assert _reanchor_tool_catalog_snapshot_after_compression(agent, compressed)
+    assert "api_content" not in compressed[-1]
+    assert compressed[-1]["content"][0] is image_part
+    assert compressed[-1]["content"][1] is not text_part
+    assert compressed[-1]["content"][1]["text"] == (
+        snapshot.notice + "\n\ninspect this image"
+    )
+
+
 def test_pending_mcp_server_names_respect_status_and_session_scope():
     from agent.turn_context import _pending_mcp_server_names
 
