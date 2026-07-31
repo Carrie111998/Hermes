@@ -174,7 +174,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # Open-vocabulary keyword spotting: any typed phrase, zero training.
     # sentencepiece and pypinyin are required by sherpa_onnx.text2token
     # (runtime phrase tokenization) even though sherpa-onnx doesn't declare
-    # them — text2token imports both before any tokens_type branching.
+    # them, text2token imports both before any tokens_type branching.
     "wake.sherpa": (
         "sherpa-onnx==1.13.4",
         "sentencepiece==0.2.2",

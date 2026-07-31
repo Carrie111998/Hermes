@@ -296,7 +296,7 @@ def test_wake_sherpa_declares_text2token_runtime_deps():
     tokens_type branching, but sherpa-onnx does not declare them. Both the
     ``[wake]`` extra (eager desktop) and ``LAZY_DEPS['wake.sherpa']`` (CLI
     lazy path) must carry those pins so ``ensure("wake.sherpa")`` actually
-    installs them into Hermes' env (#74719 / #75241).
+    installs them into Hermes' env (#74719, #75241).
     """
     from tools.lazy_deps import LAZY_DEPS
 

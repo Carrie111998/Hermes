@@ -628,7 +628,7 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
 
 def test_sherpa_text2token_missing_module_targets_hermes_executable(monkeypatch, tmp_path):
     """Regression #75241: if text2token raises ModuleNotFoundError after
-    ensure(), the remessage must name ``sys.executable -m pip`` — never bare
+    ensure(), the remessage must name ``sys.executable -m pip``, never bare
     Homebrew ``pip install`` (PEP 668 / wrong environment).
     """
     model_dir = tmp_path / "sherpa-model"

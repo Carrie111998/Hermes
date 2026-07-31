@@ -591,11 +591,11 @@ class _SherpaKwsEngine(_Engine):
                 phrase_map.setdefault(p.strip(), prof)
 
         phrases = list(phrase_map)
-        # Runtime tokenization of the arbitrary phrases — the open-vocab core.
+        # Runtime tokenization of the arbitrary phrases, the open-vocab core.
         # sherpa_onnx.text2token imports pypinyin/sentencepiece before any
         # tokens_type branching; ensure("wake.sherpa") should have installed
         # them, but if a ModuleNotFoundError still escapes, point at the
-        # Hermes interpreter — never bare `pip install` (Homebrew PEP 668).
+        # Hermes interpreter, never bare `pip install` (Homebrew PEP 668).
         try:
             tokens = text2token(
                 [p.upper() for p in phrases],
@@ -609,7 +609,7 @@ class _SherpaKwsEngine(_Engine):
                 f"No module named {missing!r}. Install into Hermes' environment "
                 f"with: {sys.executable} -m pip install {missing}  "
                 f"(or: uv pip install --python {sys.executable} {missing}). "
-                f"Do not use system/Homebrew pip — it targets the wrong env."
+                f"Do not use system/Homebrew pip, it targets the wrong env."
             ) from e
         import tempfile
 
