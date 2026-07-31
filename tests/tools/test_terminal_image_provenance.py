@@ -7,6 +7,7 @@ pulls and runs the image), so provenance is checked at those two chokepoints,
 warn-only.
 """
 
+import json
 import logging
 
 import pytest
@@ -73,14 +74,62 @@ def test_image_is_trusted(image, trusted):
     assert image_is_trusted(image) is trusted
 
 
-def test_operator_can_extend_trusted_registries(monkeypatch):
+def test_operator_extends_trusted_registries_from_config(monkeypatch):
+    """``terminal.trusted_image_registries`` in config.yaml.
+
+    The startup bridges JSON-encode list values into the TERMINAL_* env var
+    (same as docker_volumes / docker_env), so that is the form this must
+    accept.
+    """
     assert image_is_trusted("registry.corp.internal/base:1") is False
+
     monkeypatch.setenv(
-        "HERMES_TERMINAL_TRUSTED_REGISTRIES", "registry.corp.internal, other.host"
+        "TERMINAL_TRUSTED_IMAGE_REGISTRIES",
+        json.dumps(["registry.corp.internal", "harbor.example.com"]),
+    )
+    assert image_is_trusted("registry.corp.internal/base:1") is True
+    assert image_is_trusted("harbor.example.com/base:1") is True
+    assert image_is_trusted("evil.example.com/x:1") is False
+
+
+def test_trusted_registries_accepts_comma_separated_env(monkeypatch):
+    """Hand-exported env (no config bridge) still works."""
+    monkeypatch.setenv(
+        "TERMINAL_TRUSTED_IMAGE_REGISTRIES", "registry.corp.internal, other.host"
     )
     assert image_is_trusted("registry.corp.internal/base:1") is True
     assert image_is_trusted("other.host/base:1") is True
     assert image_is_trusted("evil.example.com/x:1") is False
+
+
+def test_trusted_registries_config_key_is_bridged():
+    """The config.yaml key must reach terminal_tool through every entry point.
+
+    A key present in DEFAULT_CONFIG but missing from a bridge map silently
+    does nothing for that entry point — the bug class documented in
+    tests/tools/test_terminal_config_env_sync.py.
+    """
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert "trusted_image_registries" in DEFAULT_CONFIG["terminal"]
+    assert (
+        TERMINAL_CONFIG_ENV_MAP["trusted_image_registries"]
+        == "TERMINAL_TRUSTED_IMAGE_REGISTRIES"
+    )
+
+
+def test_config_value_reaches_the_checker(monkeypatch):
+    """End-to-end through the documented mechanism: config value → warning gone."""
+    from hermes_cli.config import TERMINAL_CONFIG_ENV_MAP
+
+    configured = {"terminal": {"trusted_image_registries": ["registry.corp.internal"]}}
+    # Mirror what the startup bridges do with a list value.
+    for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
+        if cfg_key in configured["terminal"]:
+            monkeypatch.setenv(env_var, json.dumps(configured["terminal"][cfg_key]))
+
+    assert image_is_trusted("registry.corp.internal/python:3.11") is True
 
 
 # ── Warning behaviour ─────────────────────────────────────────────────────────

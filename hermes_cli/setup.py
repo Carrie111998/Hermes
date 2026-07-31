@@ -908,14 +908,6 @@ def setup_model_provider(config: dict, *, quick: bool = False):
 # =============================================================================
 
 
-# neutts has no pyproject extra and no LAZY_DEPS entry: the package tracks the
-# upstream model code, so setup deliberately installs the newest release (`-U`)
-# rather than an exact pin. Bound the *major* anyway — an unreviewed 2.x landing
-# automatically on every user's machine is the supply-chain vector that `-U`
-# opens, and a major bound closes it without freezing the 1.x model work.
-NEUTTS_SPEC = "neutts[all]<2.0"
-
-
 def _check_espeak_ng() -> bool:
     """Check if espeak-ng is installed."""
     return shutil.which("espeak-ng") is not None or shutil.which("espeak") is not None
@@ -961,20 +953,21 @@ def _install_neutts_deps() -> bool:
 
     # Route through the canonical uv → pip → ensurepip ladder so pip-less
     # venvs (Ubuntu 25.10 `python -m venv`, `uv venv`) work out of the box.
-    from hermes_cli.tools_config import _pip_install
+    from hermes_cli.tools_config import _bounded_spec, _pip_install
 
+    spec = _bounded_spec("neutts")
     try:
-        result = _pip_install(["-U", NEUTTS_SPEC, "--quiet"], timeout=300)
+        result = _pip_install(["-U", spec, "--quiet"], timeout=300)
     except Exception as e:
         print_error(f"Failed to install neutts: {e}")
-        print_info(f"Try manually: uv pip install -U '{NEUTTS_SPEC}'")
+        print_info(f"Try manually: uv pip install -U '{spec}'")
         return False
     if result.returncode == 0:
         print_success("neutts installed successfully")
         return True
     err = (result.stderr or "").strip()
     print_error(f"Failed to install neutts: {err[:300] if err else 'install failed'}")
-    print_info(f"Try manually: uv pip install -U '{NEUTTS_SPEC}'")
+    print_info(f"Try manually: uv pip install -U '{spec}'")
     return False
 
 
@@ -989,20 +982,22 @@ def _install_kittentts_deps() -> bool:
     print_info("Installing kittentts Python package (~25-80MB model downloaded on first use)...")
     print()
 
-    from hermes_cli.tools_config import _pip_install
+    from hermes_cli.tools_config import _bounded_spec, _pip_install
 
+    # The wheel URL is itself version-locked (0.8.1); soundfile was not.
+    audio = _bounded_spec("soundfile")
     try:
-        result = _pip_install(["-U", wheel_url, "soundfile", "--quiet"], timeout=300)
+        result = _pip_install(["-U", wheel_url, audio, "--quiet"], timeout=300)
     except Exception as e:
         print_error(f"Failed to install kittentts: {e}")
-        print_info(f"Try manually: uv pip install -U '{wheel_url}' soundfile")
+        print_info(f"Try manually: uv pip install -U '{wheel_url}' '{audio}'")
         return False
     if result.returncode == 0:
         print_success("kittentts installed successfully")
         return True
     err = (result.stderr or "").strip()
     print_error(f"Failed to install kittentts: {err[:300] if err else 'install failed'}")
-    print_info(f"Try manually: uv pip install -U '{wheel_url}' soundfile")
+    print_info(f"Try manually: uv pip install -U '{wheel_url}' '{audio}'")
     return False
 
 
@@ -1473,7 +1468,7 @@ def setup_terminal_backend(config: dict):
                 # Same pin the lazy runtime path uses (LAZY_DEPS
                 # "terminal.modal" / pyproject [modal]) — setup must not
                 # resolve a floating version the rest of the app never sees.
-                specs = _pinned_specs("terminal.modal", ("modal==1.3.4",))
+                specs = _pinned_specs("terminal.modal")
                 print_info(f"Installing modal SDK ({', '.join(specs)})...")
                 result = _pip_install(specs)
                 if result.returncode == 0:
@@ -1520,7 +1515,7 @@ def setup_terminal_backend(config: dict):
 
             # Same pin the lazy runtime path uses (LAZY_DEPS
             # "terminal.daytona" / pyproject [daytona]).
-            specs = _pinned_specs("terminal.daytona", ("daytona==0.155.0",))
+            specs = _pinned_specs("terminal.daytona")
             print_info(f"Installing daytona SDK ({', '.join(specs)})...")
             result = _pip_install(specs)
             if result.returncode == 0:

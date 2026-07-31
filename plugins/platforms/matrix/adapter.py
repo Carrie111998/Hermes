@@ -4882,16 +4882,7 @@ def interactive_setup() -> None:
                 # its LAZY_DEPS["platform.matrix"] pins rather than resolving
                 # `mautrix` unpinned — this is the one Matrix install path that
                 # can't read the table itself.
-                specs = _pinned_specs(
-                    "platform.matrix",
-                    (
-                        "mautrix[encryption]==0.21.0",
-                        "aiosqlite==0.22.1",
-                        "asyncpg==0.31.0",
-                        "aiohttp-socks==0.11.0",
-                        "aiohttp==3.14.1",
-                    ),
-                )
+                specs = _pinned_specs("platform.matrix")
                 print_info(f"Installing {matrix_pkg} ({len(specs)} pinned deps)...")
                 result = _pip_install(list(specs))
                 if result.returncode == 0:

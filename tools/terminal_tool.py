@@ -1199,8 +1199,16 @@ def clear_session_cwd(session_key: str) -> None:
 # converge on.
 #
 # Warn-only, never blocking: private and air-gapped registries are legitimate
-# and a hard failure would break existing deployments. Extend the trusted set
-# via HERMES_TERMINAL_TRUSTED_REGISTRIES (comma-separated hosts).
+# and a hard failure would break existing deployments. Operators extend the
+# trusted set in config.yaml:
+#
+#   terminal:
+#     trusted_image_registries: ["registry.corp.internal"]
+#
+# which the startup bridges export as TERMINAL_TRUSTED_IMAGE_REGISTRIES —
+# every terminal setting reaches this module as a TERMINAL_* env var (see
+# TERMINAL_CONFIG_ENV_MAP); the env var is the internal transport, not the
+# user-facing knob.
 _DEFAULT_TRUSTED_IMAGE_REGISTRIES = (
     "docker.io",
     "ghcr.io",
@@ -1218,9 +1226,27 @@ _warned_images: Set[Tuple[str, str]] = set()
 
 
 def _trusted_image_registries() -> Tuple[str, ...]:
-    """Trusted registry hosts: the defaults plus any operator additions."""
-    extra = os.getenv("HERMES_TERMINAL_TRUSTED_REGISTRIES", "")
-    added = tuple(h.strip().lower() for h in extra.split(",") if h.strip())
+    """Trusted registry hosts: the defaults plus any operator additions.
+
+    Additions come from ``terminal.trusted_image_registries`` in config.yaml,
+    bridged to ``TERMINAL_TRUSTED_IMAGE_REGISTRIES``. The bridges JSON-encode
+    list values (as they do for docker_volumes / docker_env); a plain
+    comma-separated string is also accepted for hand-exported env.
+    """
+    raw = os.getenv("TERMINAL_TRUSTED_IMAGE_REGISTRIES", "").strip()
+    if not raw:
+        return _DEFAULT_TRUSTED_IMAGE_REGISTRIES
+    hosts: List[str] = []
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, list):
+            hosts = [str(h) for h in parsed]
+    if not hosts:
+        hosts = raw.split(",")
+    added = tuple(h.strip().lower() for h in hosts if h and h.strip())
     return _DEFAULT_TRUSTED_IMAGE_REGISTRIES + added
 
 
@@ -1271,7 +1297,8 @@ def _check_image_provenance(field: str, image: Any) -> None:
     logger.warning(
         "Sandbox %s=%r resolves to registry %r, which is not in the trusted "
         "set (%s). The sandbox will pull and execute this image. Add the host "
-        "to HERMES_TERMINAL_TRUSTED_REGISTRIES to silence this warning.",
+        "to terminal.trusted_image_registries in config.yaml to silence this "
+        "warning.",
         field, image, _image_registry_host(image),
         ", ".join(_trusted_image_registries()),
     )
