@@ -134,10 +134,10 @@ def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
 
 
 def _split_regex_patterns(raw: str) -> List[str]:
-    """Split legacy comma-separated or new semicolon/newline regex lists."""
+    """Split the config.yaml policy's one-regex-per-line format."""
     return [
         part.strip()
-        for part in re.split(r"[\n;,]+", raw or "")
+        for part in (raw or "").splitlines()
         if part.strip()
     ]
 

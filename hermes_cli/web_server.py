@@ -3929,26 +3929,35 @@ def _email_platform_config(config: dict) -> dict[str, Any]:
     return email_config if isinstance(email_config, dict) else {}
 
 
+def _email_auto_reply_policy_config(config: dict) -> dict[str, Any]:
+    """Return the platform-specific config block consumed by EmailAdapter."""
+    extra = _email_platform_config(config).get("extra")
+    return extra if isinstance(extra, dict) else {}
+
+
 def _email_auto_reply_policy(config: dict) -> dict[str, Any]:
     """Return the config.yaml-backed email reply policy."""
-    email = _email_platform_config(config)
+    policy_config = _email_auto_reply_policy_config(config)
     return {
-        key: email.get(key, True if key == "require_structured_response" else False)
+        key: policy_config.get(
+            key,
+            True if key == "require_structured_response" else False,
+        )
         if key in _EMAIL_POLICY_BOOLEAN_KEYS
-        else str(email.get(key, "") or "")
+        else str(policy_config.get(key, "") or "")
         for key in _EMAIL_AUTO_REPLY_POLICY_KEYS
     }
 
 
 def _email_auto_reply_policy_response(config: dict) -> dict[str, Any]:
     """Expose policy metadata only through the dedicated policy endpoint."""
-    email = _email_platform_config(config)
+    policy_config = _email_auto_reply_policy_config(config)
     policy = _email_auto_reply_policy(config)
     fields = [
         {
             "key": key,
             "required": False,
-            "is_set": key in email,
+            "is_set": key in policy_config,
             "redacted_value": None,
             "current_value": str(policy[key]).lower()
             if key in _EMAIL_POLICY_BOOLEAN_KEYS
@@ -3999,7 +4008,7 @@ def _validate_email_auto_reply_policy(
             if key == "skip_patterns":
                 for pattern in (
                     part.strip()
-                    for part in re.split(r"[\n;,]+", value)
+                    for part in value.splitlines()
                     if part.strip()
                 ):
                     try:
@@ -9375,13 +9384,19 @@ async def update_email_auto_reply_policy(
                 status_code=400,
                 detail="platforms.email must be a mapping",
             )
-        _validate_email_auto_reply_policy(email_config, body.values, body.clear)
+        policy_config = email_config.setdefault("extra", {})
+        if not isinstance(policy_config, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="platforms.email.extra must be a mapping",
+            )
+        _validate_email_auto_reply_policy(policy_config, body.values, body.clear)
         for key in body.clear:
-            email_config.pop(key, None)
+            policy_config.pop(key, None)
         for key, value in body.values.items():
-            email_config[key] = (
+            policy_config[key] = (
                 value
-                if key in _EMAIL_POLICY_BOOLEAN_KEYS
+                if key in _EMAIL_POLICY_BOOLEAN_KEYS or key == "skip_patterns"
                 else _serialize_email_keyword_groups(value)
             )
         save_config(config)

@@ -941,7 +941,7 @@ class TestWebServerEndpoints:
         assert policy["no_reply_keywords"] == no_reply
 
     def test_email_reply_skip_patterns_round_trip_and_validate_regex(self):
-        patterns = r"^out of office$\n自动回复"
+        patterns = "^out of office$\n^ref-[0-9]{1,3}$"
         saved = self.client.put(
             "/api/messaging/platforms/email/auto-reply-policy",
             json={"values": {"skip_patterns": patterns}},
@@ -1034,7 +1034,7 @@ class TestWebServerEndpoints:
         config = load_config()
         config.setdefault("platforms", {})["email"] = {
             "skip_attachments": True,
-            "force_reply_keywords": "existing",
+            "extra": {"force_reply_keywords": "existing"},
         }
         save_config(config)
 
@@ -1049,9 +1049,40 @@ class TestWebServerEndpoints:
         assert saved.status_code == 200
         email = load_config()["platforms"]["email"]
         assert email["skip_attachments"] is True
-        assert email["auto_reply_promotions"] is True
-        assert "force_reply_keywords" not in email
+        assert email["extra"]["auto_reply_promotions"] is True
+        assert "force_reply_keywords" not in email["extra"]
         assert "auto_reply_promotions" not in load_env()
+
+    def test_email_reply_policy_reaches_gateway_adapter(self):
+        from gateway.config import Platform, load_gateway_config
+        from plugins.platforms.email.adapter import EmailAdapter, _should_skip_email
+
+        skip_patterns = "^out of office$\n^ref-[0-9]{1,3}$"
+
+        saved = self.client.put(
+            "/api/messaging/platforms/email/auto-reply-policy",
+            json={
+                "values": {
+                    "auto_reply_promotions": True,
+                    "force_reply_keywords": "紧急+发票",
+                    "skip_patterns": skip_patterns,
+                }
+            },
+        )
+        assert saved.status_code == 200
+
+        gateway_config = load_gateway_config()
+        adapter = EmailAdapter(gateway_config.platforms[Platform.EMAIL])
+
+        assert adapter._category_auto_reply["promotions"] is True
+        assert adapter._force_reply_keywords == "紧急+发票"
+        assert adapter._custom_skip_patterns == skip_patterns
+        assert _should_skip_email(
+            "ref-123",
+            "",
+            category_auto_reply=adapter._category_auto_reply,
+            custom_skip_patterns=adapter._custom_skip_patterns,
+        )
 
     def test_generic_messaging_update_rejects_email_policy_fields(self):
         rejected = self.client.put(

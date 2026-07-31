@@ -126,20 +126,21 @@ Category detection is approximate. Disabling a category does not guarantee that 
 
 Configure these rules from **Dashboard → Channels → Email → Configure**, or in `config.yaml`:
 
-```bash
+```yaml
 platforms:
   email:
-    # Required when EMAIL_ALLOWED_USERS or GATEWAY_ALLOWED_USERS is set
-    # and sender authentication remains enabled (the default).
-    authserv_id: mx.your-mail-host.example
-    # Set false only when your receiving server does not stamp
-    # Authentication-Results and you accept that From: can be spoofed.
-    require_authenticated_sender: true
-    auto_reply_promotions: false
-    auto_reply_newsletters: false
-    force_reply_keywords: urgent;invoice+overdue
-    no_reply_keywords: for your information;do+not+reply
-    require_structured_response: true
+    extra:
+      # Required when EMAIL_ALLOWED_USERS or GATEWAY_ALLOWED_USERS is set
+      # and sender authentication remains enabled (the default).
+      authserv_id: mx.your-mail-host.example
+      # Set false only when your receiving server does not stamp
+      # Authentication-Results and you accept that From: can be spoofed.
+      require_authenticated_sender: true
+      auto_reply_promotions: false
+      auto_reply_newsletters: false
+      force_reply_keywords: urgent;invoice+overdue
+      no_reply_keywords: for your information;do+not+reply
+      require_structured_response: true
 ```
 
 No-reply rules win if the same message matches both lists. Matching is case-insensitive and checks the combined subject and body.
