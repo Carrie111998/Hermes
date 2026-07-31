@@ -817,3 +817,32 @@ class TestProfilesToServe:
 
 
 
+
+    def test_on_no_named_profiles_returns_just_default(self, profile_env):
+        serve = profiles_to_serve(multiplex=True)
+        assert [n for n, _ in serve] == ["default"]
+
+
+def test_clone_all_strips_only_root_owned_codex_auth_state(profile_env):
+    """Full clones retain non-Codex credentials but not shared Codex state."""
+    source = profile_env / ".hermes"
+    (source / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "openai-codex": {"tokens": {"access_token": "codex"}},
+            "openrouter": {"api_key": "openrouter"},
+        },
+        "credential_pool": {
+            "openai-codex": [{"id": "codex"}],
+            "openrouter": [{"id": "openrouter"}],
+        },
+    }))
+
+    cloned = create_profile("codex-clean", clone_all=True, no_alias=True)
+    copied = json.loads((cloned / "auth.json").read_text())
+
+    assert "openai-codex" not in copied["providers"]
+    assert "openai-codex" not in copied["credential_pool"]
+    assert copied["providers"]["openrouter"]["api_key"] == "openrouter"
+    assert copied["credential_pool"]["openrouter"] == [{"id": "openrouter"}]
+

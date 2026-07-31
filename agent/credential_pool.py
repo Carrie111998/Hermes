@@ -1096,6 +1096,14 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    root_path = auth_mod._global_auth_file_path()
+                    if root_path is not None:
+                        # Named-profile Codex state is always root-owned; do
+                        # not materialize a refreshed singleton locally.
+                        auth_mod._persist_provider_state_to_store(
+                            "openai-codex", state, root_path, set_active=False,
+                        )
+                        return
                     _store_provider_state(auth_store, "openai-codex", state, set_active=False)
 
                 elif self.provider == "xai-oauth":
@@ -1401,31 +1409,37 @@ class CredentialPool:
                 # in-memory pool.  Mirrors the xAI and Nous quarantine paths.
                 if auth_mod._is_terminal_codex_oauth_refresh_error(exc):
                     logger.debug(
-                        "Codex OAuth refresh token is terminally invalid; clearing local token state"
+                        "Codex OAuth refresh token is terminally invalid; clearing root-owned token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
-                            state = _load_provider_state(auth_store, "openai-codex") or {}
-                            if isinstance(state, dict):
-                                tokens = state.get("tokens") or {}
-                                if isinstance(tokens, dict):
-                                    store_refresh = str(tokens.get("refresh_token") or "").strip()
-                                    entry_refresh = str(entry.refresh_token or "").strip()
-                                    if not store_refresh or store_refresh == entry_refresh:
-                                        tokens.pop("access_token", None)
-                                        tokens.pop("refresh_token", None)
-                                        state["tokens"] = tokens
-                                        state["last_auth_error"] = {
-                                            "provider": "openai-codex",
-                                            "code": getattr(exc, "code", "unknown"),
-                                            "message": str(exc),
-                                            "reason": "credential_pool_refresh_failure",
-                                            "relogin_required": True,
-                                            "at": datetime.now(timezone.utc).isoformat(),
-                                        }
-                                        _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                        target_path = auth_mod._global_auth_file_path() or auth_mod._auth_file_path()
+                        with _auth_store_lock(target_path=target_path):
+                            auth_store = _load_auth_store(target_path)
+                            providers = auth_store.get("providers")
+                            state = (
+                                dict(providers.get("openai-codex"))
+                                if isinstance(providers, dict)
+                                and isinstance(providers.get("openai-codex"), dict)
+                                else {}
+                            )
+                            tokens = state.get("tokens") or {}
+                            if isinstance(tokens, dict):
+                                store_refresh = str(tokens.get("refresh_token") or "").strip()
+                                entry_refresh = str(entry.refresh_token or "").strip()
+                                if not store_refresh or store_refresh == entry_refresh:
+                                    tokens.pop("access_token", None)
+                                    tokens.pop("refresh_token", None)
+                                    state["tokens"] = tokens
+                                    state["last_auth_error"] = {
+                                        "provider": "openai-codex",
+                                        "code": getattr(exc, "code", "unknown"),
+                                        "message": str(exc),
+                                        "reason": "credential_pool_refresh_failure",
+                                        "relogin_required": True,
+                                        "at": datetime.now(timezone.utc).isoformat(),
+                                    }
+                                    _save_provider_state(auth_store, "openai-codex", state)
+                                    _save_auth_store(auth_store, target_path=target_path)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc

@@ -1226,13 +1226,25 @@ def _load_provider_state_with_source(
     the profile would leave the global/root store stale and cause the next
     process to replay an already-consumed refresh token.
     """
+    # Codex OAuth is host-shared rather than profile-scoped. Refresh tokens
+    # are single-use, so a stale named-profile copy must never shadow a
+    # healthy root grant.
+    global_path = _global_auth_file_path()
+    if provider_id == "openai-codex" and global_path is not None:
+        global_store = _load_global_auth_store()
+        global_providers = global_store.get("providers")
+        if isinstance(global_providers, dict):
+            global_state = global_providers.get(provider_id)
+            if isinstance(global_state, dict):
+                return dict(global_state), global_path
+        return None, global_path
+
     providers = auth_store.get("providers")
     if isinstance(providers, dict):
         state = providers.get(provider_id)
         if isinstance(state, dict):
             return dict(state), _auth_file_path()
 
-    global_path = _global_auth_file_path()
     global_store = _load_global_auth_store()
     if global_store:
         global_providers = global_store.get("providers")
@@ -1424,7 +1436,8 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    ``openai-codex`` is the exception: its singleton and pool are always
+    root-owned in named-profile mode, and legacy profile copies are ignored.
     See issue #18594 follow-up.
     """
     auth_store = _load_auth_store()
@@ -1432,11 +1445,18 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(pool, dict):
         pool = {}
 
+    global_path = _global_auth_file_path()
     global_pool: Dict[str, Any] = {}
     global_store = _load_global_auth_store()
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
+
+    if provider_id == "openai-codex" and global_path is not None:
+        # Codex pool bookkeeping belongs to the shared root store. Ignore any
+        # legacy profile-local shadow entirely.
+        global_entries = global_pool.get(provider_id)
+        return list(global_entries) if isinstance(global_entries, list) else []
 
     if provider_id is None:
         merged = dict(pool)
@@ -1448,6 +1468,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             if isinstance(existing, list) and existing:
                 continue
             merged[gp_key] = list(gp_entries)
+        if global_path is not None:
+            global_codex_entries = global_pool.get("openai-codex")
+            if isinstance(global_codex_entries, list):
+                merged["openai-codex"] = list(global_codex_entries)
+            else:
+                merged.pop("openai-codex", None)
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1550,8 +1576,14 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    global_path = _global_auth_file_path()
+    target_path = (
+        global_path
+        if provider_id == "openai-codex" and global_path is not None
+        else _auth_file_path()
+    )
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1589,7 +1621,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -1641,7 +1673,7 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     In profile mode, ``_load_provider_state`` already falls back to the
     global-root ``auth.json`` per-provider when the profile has no entry —
     so this is now a thin convenience wrapper. Profile state always wins
-    when present. Writes (``_save_auth_store`` / ``persist_*_credentials``)
+    when present except for root-owned ``openai-codex``. Writes (``_save_auth_store`` / ``persist_*_credentials``)
     are unchanged — they still target the profile only. This mirrors
     ``read_credential_pool``'s per-provider shadowing semantics so that
     ``_seed_from_singletons`` can reseed a profile's credential pool from
@@ -3596,9 +3628,15 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state = _load_provider_state(auth_store, "openai-codex") or {}
+    target_path = _global_auth_file_path() or _auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
+        providers = auth_store.get("providers")
+        state = (
+            dict(providers.get("openai-codex"))
+            if isinstance(providers, dict) and isinstance(providers.get("openai-codex"), dict)
+            else {}
+        )
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3617,7 +3655,7 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:

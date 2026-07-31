@@ -73,6 +73,115 @@ def profile_and_root(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.parametrize(
+    "provider",
+    ["openai-codex", "xai-oauth"],
+)
+def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
+    profile_and_root, provider
+):
+    """A profile reading root's grant must push rotated tokens back to root."""
+    profile_path, root_path = profile_and_root
+    # Profile has NO own provider block (reads root via fallback).
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = CredentialPool(provider, [])
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(provider, id="e1", access_token="new-access", refresh_token="new-refresh")
+    )
+
+    profile = _read_store(profile_path)
+    if provider == "openai-codex":
+        # Codex grants are root-owned: a profile refresh must not materialize
+        # a local singleton shadow.
+        assert provider not in profile["providers"]
+    else:
+        assert profile["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
+
+    # The global root no longer holds the revoked refresh token (#48415).
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["access_token"] == "new-access"
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["openai-codex", "xai-oauth"],
+)
+def test_pool_refresh_does_not_touch_root_when_profile_shadows(
+    profile_and_root, provider
+):
+    """A profile that genuinely shadows root must NOT clobber the root grant."""
+    profile_path, root_path = profile_and_root
+    # Profile has its OWN provider block: it shadows root legitimately.
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "profile-old",
+                        "refresh_token": "profile-old-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "root-untouched",
+                        "refresh_token": "root-untouched-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = CredentialPool(provider, [])
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(
+            provider,
+            id="e2",
+            access_token="profile-new",
+            refresh_token="profile-new-refresh",
+        )
+    )
+
+    profile = _read_store(profile_path)
+    root = _read_store(root_path)
+    if provider == "openai-codex":
+        # Legacy local Codex state is ignored and never updated. The shared
+        # root grant receives the new chain instead.
+        assert profile["providers"][provider]["tokens"]["refresh_token"] == "profile-old-refresh"
+        assert root["providers"][provider]["tokens"]["refresh_token"] == "profile-new-refresh"
+    else:
+        assert profile["providers"][provider]["tokens"]["refresh_token"] == "profile-new-refresh"
+        # Root keeps its own grant — write-through must not run when the
+        # profile owns the block.
+        assert root["providers"][provider]["tokens"]["refresh_token"] == "root-untouched-refresh"
+
+
+
 
 
 
