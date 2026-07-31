@@ -2925,6 +2925,15 @@ def create_task(
         governed_contract = _kwilo.validate_contract(
             assignee, requested_governance_contract
         )
+        required_parent_skills = governed_contract["required_parent_skills"]
+        if required_parent_skills:
+            if skills_list is None:
+                skills_list = []
+            activated_skills = set(skills_list)
+            for skill_name in required_parent_skills:
+                if skill_name not in activated_skills:
+                    skills_list.append(skill_name)
+                    activated_skills.add(skill_name)
         expected_workspace_kind = governed_contract["workspace_kind"]
         if workspace_kind == "scratch" and expected_workspace_kind != "scratch":
             # ``scratch`` is the generic API/CLI default. For governed cards,
@@ -9139,6 +9148,10 @@ def _default_spawn(
     # what the tool reads — set it explicitly here so comments are
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
+    # Platform-scoped disabled-skill policy must match the explicit --cli
+    # worker surface. Skill preloading happens after argument parsing, so pin
+    # the same platform in the environment before the child starts.
+    env["HERMES_PLATFORM"] = "cli"
 
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the

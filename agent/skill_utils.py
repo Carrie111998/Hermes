@@ -10,7 +10,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
 
@@ -463,27 +463,47 @@ def get_external_skills_dirs() -> List[Path]:
     if not parsed:
         return []
 
-    skills_cfg = parsed.get("skills")
+    from hermes_constants import get_hermes_home
+
+    result = resolve_external_skills_dirs(
+        parsed,
+        hermes_home=get_hermes_home(),
+        local_skills_dir=get_skills_dir(),
+    )
+
+    if cache_key is not None:
+        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+    return result
+
+
+def resolve_external_skills_dirs(
+    config: Dict[str, Any],
+    *,
+    hermes_home: Path,
+    local_skills_dir: Path,
+) -> List[Path]:
+    """Resolve external skill roots from an explicit profile configuration.
+
+    This is the pure counterpart of :func:`get_external_skills_dirs`. Runtime
+    skill loading and out-of-process profile attestation both call it so blank
+    entries, relative paths, duplicates, and the local-root exclusion have one
+    definition.
+    """
+    skills_cfg = config.get("skills")
     if not isinstance(skills_cfg, dict):
         return []
-
     raw_dirs = skills_cfg.get("external_dirs")
     if not raw_dirs:
-        result: List[Path] = []
-        if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
-        return result
+        return []
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
         return []
 
-    from hermes_constants import get_hermes_home
-
-    hermes_home = get_hermes_home()
-    local_skills = get_skills_dir().resolve()
+    hermes_home = Path(hermes_home).expanduser().resolve(strict=False)
+    local_skills = Path(local_skills_dir).expanduser().resolve(strict=False)
     seen: Set[Path] = set()
-    result = []
+    result: List[Path] = []
 
     for entry in raw_dirs:
         entry = str(entry).strip()
@@ -506,9 +526,6 @@ def get_external_skills_dirs() -> List[Path]:
             result.append(p)
         else:
             logger.debug("External skills dir does not exist, skipping: %s", p)
-
-    if cache_key is not None:
-        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
     return result
 
 
@@ -565,12 +582,16 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # an arbitrary absolute path that skill_view() refuses to load.
     for root in trusted_roots:
         try:
-            return str(identifier_path.relative_to(root))
+            return identifier_path.relative_to(root).as_posix()
         except ValueError:
             continue
 
     try:
-        return str(identifier_path.resolve().relative_to(primary_root.resolve()))
+        return (
+            identifier_path.resolve()
+            .relative_to(primary_root.resolve())
+            .as_posix()
+        )
     except Exception:
         logger.debug(
             "Skill identifier %r is an absolute path outside trusted skills "
@@ -805,18 +826,121 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
     """
     skills_dir_str = str(skills_dir)
     matches: list[str] = []
+    visited_dirs: set[str] = set()
     for root, dirs, files in os.walk(skills_dir_str, followlinks=True):
+        resolved_root = os.path.normcase(os.path.realpath(root))
+        if resolved_root in visited_dirs:
+            dirs[:] = []
+            continue
+        visited_dirs.add(resolved_root)
         has_skill_md = "SKILL.md" in files
         dirs[:] = [
             d
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
+            and os.path.normcase(os.path.realpath(os.path.join(root, d)))
+            not in visited_dirs
         ]
         if filename in files:
             matches.append(os.path.join(root, filename))
     for path in sorted(matches):
         yield Path(path)
+
+
+def find_local_skill_candidates(
+    name: str,
+    search_dirs: Iterable[Path],
+    *,
+    categorized_name: Optional[str] = None,
+) -> List[Tuple[Optional[Path], Path]]:
+    """Return every local skill candidate matching an explicit identifier.
+
+    Resolution mirrors ``skill_view``: direct categorized paths, recursive
+    directory names, frontmatter aliases, and legacy flat Markdown skills are
+    considered across local and external roots. Physical files are deduplicated
+    so a junction alias to the same package is not a false collision; distinct
+    packages with the same identifier remain ambiguous and therefore fail
+    closed at the caller.
+    """
+    candidates: List[Tuple[Optional[Path], Path]] = []
+    seen_files: set[Path] = set()
+
+    def _record(skill_dir: Optional[Path], skill_file: Path) -> None:
+        try:
+            key = skill_file.resolve(strict=False)
+        except (OSError, RuntimeError):
+            key = skill_file.absolute()
+        if key in seen_files:
+            return
+        seen_files.add(key)
+        candidates.append((skill_dir, skill_file))
+
+    for raw_search_dir in search_dirs:
+        search_dir = Path(raw_search_dir)
+        if not search_dir.is_dir():
+            continue
+
+        for direct_name in (name, categorized_name):
+            if not direct_name:
+                continue
+            direct_path = search_dir / direct_name
+            direct_skill = direct_path / "SKILL.md"
+            if (
+                not is_skill_support_path(direct_path)
+                and direct_path.is_dir()
+                and direct_skill.exists()
+            ):
+                _record(direct_path, direct_skill)
+            else:
+                flat_path = direct_path.with_suffix(".md")
+                if flat_path.exists() and not is_skill_support_path(flat_path):
+                    _record(None, flat_path)
+
+        for skill_file in iter_skill_index_files(search_dir, "SKILL.md"):
+            if skill_file.parent.name == name:
+                _record(skill_file.parent, skill_file)
+                continue
+            try:
+                frontmatter, _ = parse_frontmatter(
+                    skill_file.read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError, ValueError):
+                frontmatter = {}
+            if frontmatter.get("name") == name:
+                _record(skill_file.parent, skill_file)
+
+        if Path(name).name == name:
+            for flat_file in iter_skill_index_files(search_dir, f"{name}.md"):
+                if flat_file.name != "SKILL.md" and not is_skill_support_path(
+                    flat_file
+                ):
+                    _record(None, flat_file)
+
+    return candidates
+
+
+def local_skill_is_loadable(
+    name: str,
+    search_dirs: Iterable[Path],
+    *,
+    disabled: Iterable[str] = (),
+) -> bool:
+    """Whether an explicit local skill identifier will preload successfully."""
+    candidates = find_local_skill_candidates(name, search_dirs)
+    if len(candidates) != 1:
+        return False
+    _, skill_file = candidates[0]
+    try:
+        frontmatter, _ = parse_frontmatter(skill_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return False
+    if not skill_matches_platform(frontmatter):
+        return False
+    resolved_name = str(
+        frontmatter.get("name") or skill_file.parent.name
+    ).strip()
+    return bool(resolved_name) and resolved_name not in set(disabled)
 
 
 # ── Namespace helpers for plugin-provided skills ───────────────────────────

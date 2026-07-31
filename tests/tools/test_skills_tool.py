@@ -266,6 +266,19 @@ class TestFindAllSkills:
             skills = _find_all_skills()
         assert len(skills[0]["description"]) <= MAX_DESCRIPTION_LENGTH
 
+    def test_platform_gate_after_long_frontmatter_is_not_truncated(self, tmp_path):
+        skill_dir = tmp_path / "long-frontmatter"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: long-frontmatter\ndescription: |\n  "
+            + ("x" * 4500)
+            + "\nplatforms: [not-this-platform]\n---\n",
+            encoding="utf-8",
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            assert _find_all_skills() == []
+
     def test_skips_git_directories(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "real-skill")

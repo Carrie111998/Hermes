@@ -3056,6 +3056,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
 
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -3091,6 +3092,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
     assert last_skills_idx < chat_idx, (
         f"--skills must come before 'chat' in argv: {cmd}"
     )
+    assert captured["env"]["HERMES_PLATFORM"] == "cli"
 
 
 def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):

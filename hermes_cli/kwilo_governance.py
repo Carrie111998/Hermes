@@ -230,6 +230,41 @@ def _profiles_root() -> Path:
     return Path.home() / ".hermes" / "profiles"
 
 
+def _effective_profile_skill_names(
+    profile_name: str,
+    config: dict[str, Any],
+    required_names: Iterable[str],
+) -> set[str]:
+    """Return skills the profile's CLI can actually preload."""
+    profile_dir = _profiles_root() / profile_name
+    try:
+        from agent.skill_utils import (
+            local_skill_is_loadable,
+            resolve_external_skills_dirs,
+        )
+        from hermes_cli.skills_config import get_disabled_skills
+    except ImportError as exc:
+        raise ValueError(
+            f"effective profile skill discovery is unavailable for {profile_name}: {exc}"
+        ) from exc
+
+    local_skills_dir = profile_dir / "skills"
+    roots = [local_skills_dir]
+    roots.extend(
+        resolve_external_skills_dirs(
+            config,
+            hermes_home=profile_dir,
+            local_skills_dir=local_skills_dir,
+        )
+    )
+    disabled = get_disabled_skills(config, platform="cli")
+    return {
+        name
+        for name in required_names
+        if local_skill_is_loadable(name, roots, disabled=disabled)
+    }
+
+
 def _attest_effective_profile_capabilities(profile_name: str, profile: dict[str, Any]) -> None:
     config_path = _profiles_root() / profile_name / "config.yaml"
     try:
@@ -272,6 +307,19 @@ def _attest_effective_profile_capabilities(profile_name: str, profile: dict[str,
         raise ValueError(
             f"effective MCP connectors do not match capability manifest for {profile_name}: "
             f"undeclared={undeclared}, unavailable={unavailable}"
+        )
+
+    declared_skills = _string_set(
+        profile.get("configured_parent_skills", []), "profile.configured_parent_skills"
+    )
+    unavailable_skills = sorted(
+        declared_skills
+        - _effective_profile_skill_names(profile_name, config, declared_skills)
+    )
+    if unavailable_skills:
+        raise ValueError(
+            f"effective parent skills unavailable for {profile_name}: "
+            f"{', '.join(unavailable_skills)}"
         )
 
 
@@ -1012,7 +1060,10 @@ def get_task_semantics(conn: sqlite3.Connection, task_id: str) -> Optional[dict[
 
 
 def admission_error(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    row = conn.execute("SELECT assignee, created_at FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    row = conn.execute(
+        "SELECT assignee, created_at, skills FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
     if row is None or not is_kwilo_board(conn):
         return None
     semantics = get_task_semantics(conn, task_id)
@@ -1032,11 +1083,24 @@ def admission_error(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
             return str(exc)
         return "governance contract is missing for a post-activation Kwilo task"
     try:
-        validate_contract(
+        validated_contract = validate_contract(
             row["assignee"], semantics["contract"], allow_legacy=True
         )
     except ValueError as exc:
         return str(exc)
+    required_skills = set(validated_contract["required_parent_skills"])
+    activated_skills = _json_or(row["skills"], [])
+    if not isinstance(activated_skills, list):
+        activated_skills = []
+    activated_skill_names = {
+        str(name).strip() for name in activated_skills if str(name).strip()
+    }
+    missing_skills = sorted(required_skills - activated_skill_names)
+    if missing_skills:
+        return (
+            "contract-required worker skills are not activated: "
+            + ", ".join(missing_skills)
+        )
     try:
         readback = dispatch_readback(conn, task_id)
     except ValueError as exc:

@@ -103,6 +103,17 @@ def kwilo_home(tmp_path, monkeypatch):
             },
         }
         (profile_dir / "config.yaml").write_text(json.dumps(profile_config), encoding="utf-8")
+        for skill_name in profile["configured_parent_skills"]:
+            skill_dir = profile_dir / "skills" / "test-fixtures" / skill_name
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\n"
+                f"name: {skill_name}\n"
+                "description: Test-only governed profile capability.\n"
+                "platforms: [linux, macos, windows]\n"
+                "---\n",
+                encoding="utf-8",
+            )
     semantic_policy = {
         "phases": [
             "implementation", "deterministic-verification", "sentinel-review",
@@ -801,6 +812,244 @@ def test_undeclared_effective_profile_toolset_is_rejected_at_creation(kwilo_home
             conn, title="undeclared effective tool", assignee="kwilo-forge", board="kwilo",
             governance_contract=_contract(),
         )
+
+
+def test_missing_effective_profile_skill_blocks_creation_and_claim(kwilo_home):
+    home, _, _ = kwilo_home
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn, title="claim after skill drift", assignee="kwilo-forge", board="kwilo",
+            governance_contract=_contract(),
+        )
+
+        skill_path = (
+            home / "profiles" / "kwilo-forge" / "skills" / "test-fixtures"
+            / "test-driven-development" / "SKILL.md"
+        )
+        skill_path.unlink()
+
+        with pytest.raises(ValueError, match="effective parent skills unavailable"):
+            kb.create_task(
+                conn, title="missing effective skill", assignee="kwilo-forge", board="kwilo",
+                governance_contract=_contract(candidate="d" * 40),
+            )
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "blocked"
+
+
+def test_governed_creation_force_loads_contract_parent_skills(kwilo_home):
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contract skill activation",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+
+        assert kb.get_task(conn, task_id).skills == ["test-driven-development"]
+
+
+def test_governed_claim_fails_closed_if_contract_skill_activation_drifts(kwilo_home):
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contract skill drift",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+        conn.execute("UPDATE tasks SET skills = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+
+        assert kb.claim_task(conn, task_id) is None
+        task = kb.get_task(conn, task_id)
+        event = kb.list_events(conn, task_id)[-1]
+        assert task.status == "blocked"
+        assert event.kind == "capability_admission_failed"
+        assert (
+            "contract-required worker skills are not activated"
+            in event.payload["reason"]
+        )
+
+
+def test_governed_creation_unions_explicit_and_contract_parent_skills(kwilo_home):
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="contract and optional skills",
+            assignee="kwilo-forge",
+            board="kwilo",
+            skills=["optional-review"],
+            governance_contract=_contract(),
+        )
+
+        assert kb.get_task(conn, task_id).skills == [
+            "optional-review",
+            "test-driven-development",
+        ]
+
+
+def test_long_frontmatter_platform_gate_blocks_governed_creation(kwilo_home):
+    home, _, _ = kwilo_home
+    skill_path = (
+        home / "profiles" / "kwilo-forge" / "skills" / "test-fixtures"
+        / "test-driven-development" / "SKILL.md"
+    )
+    skill_path.write_text(
+        "---\nname: test-driven-development\ndescription: |\n  "
+        + ("x" * 4500)
+        + "\nplatforms: [not-this-platform]\n---\n",
+        encoding="utf-8",
+    )
+
+    with kb.connect(board="kwilo") as conn, pytest.raises(
+        ValueError, match="effective parent skills unavailable"
+    ):
+        kb.create_task(
+            conn,
+            title="long frontmatter",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+
+
+def test_blank_external_skill_dir_does_not_scan_entire_profile(kwilo_home):
+    home, _, _ = kwilo_home
+    profile_dir = home / "profiles" / "kwilo-forge"
+    local_skill = (
+        profile_dir / "skills" / "test-fixtures" / "test-driven-development"
+        / "SKILL.md"
+    )
+    local_skill.unlink()
+    stray_skill = profile_dir / "stray" / "test-driven-development" / "SKILL.md"
+    stray_skill.parent.mkdir(parents=True)
+    stray_skill.write_text(
+        "---\nname: test-driven-development\n"
+        "platforms: [linux, macos, windows]\n---\n",
+        encoding="utf-8",
+    )
+    config_path = profile_dir / "config.yaml"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["skills"] = {"external_dirs": [""]}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with kb.connect(board="kwilo") as conn, pytest.raises(
+        ValueError, match="effective parent skills unavailable"
+    ):
+        kb.create_task(
+            conn,
+            title="blank external root",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+
+
+def test_external_profile_skill_in_scripts_category_is_effective(kwilo_home):
+    home, _, _ = kwilo_home
+    profile_dir = home / "profiles" / "kwilo-forge"
+    local_skill = (
+        profile_dir / "skills" / "test-fixtures" / "test-driven-development"
+        / "SKILL.md"
+    )
+    local_skill.unlink()
+    external_skill = (
+        profile_dir / "external-skills" / "scripts" / "test-driven-development"
+        / "SKILL.md"
+    )
+    external_skill.parent.mkdir(parents=True)
+    external_skill.write_text(
+        "---\nname: test-driven-development\nplatforms: [linux, macos, windows]\n---\n",
+        encoding="utf-8",
+    )
+    config_path = profile_dir / "config.yaml"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["skills"] = {"external_dirs": ["external-skills"]}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn, title="external skill", assignee="kwilo-forge", board="kwilo",
+            governance_contract=_contract(),
+        )
+        assert kb.get_task(conn, task_id) is not None
+
+
+def test_disabled_effective_profile_skill_is_unavailable(kwilo_home):
+    home, _, _ = kwilo_home
+    profile_dir = home / "profiles" / "kwilo-forge"
+    skill_path = (
+        profile_dir / "skills" / "test-fixtures" / "test-driven-development"
+        / "SKILL.md"
+    )
+    skill_path.write_text(
+        "---\nname: canonical-disabled-skill\n"
+        "platforms: [linux, macos, windows]\n---\n",
+        encoding="utf-8",
+    )
+    config_path = profile_dir / "config.yaml"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["skills"] = {"disabled": ["canonical-disabled-skill"]}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with kb.connect(board="kwilo") as conn, pytest.raises(
+        ValueError, match="effective parent skills unavailable"
+    ):
+        kb.create_task(
+            conn, title="disabled skill", assignee="kwilo-forge", board="kwilo",
+            governance_contract=_contract(),
+        )
+
+
+def test_platform_incompatible_effective_profile_skill_is_unavailable(kwilo_home):
+    home, _, _ = kwilo_home
+    skill_path = (
+        home / "profiles" / "kwilo-forge" / "skills" / "test-fixtures"
+        / "test-driven-development" / "SKILL.md"
+    )
+    skill_path.write_text(
+        "---\nname: test-driven-development\nplatforms: [not-this-platform]\n---\n",
+        encoding="utf-8",
+    )
+
+    with kb.connect(board="kwilo") as conn, pytest.raises(
+        ValueError, match="effective parent skills unavailable"
+    ):
+        kb.create_task(
+            conn, title="wrong platform skill", assignee="kwilo-forge", board="kwilo",
+            governance_contract=_contract(),
+        )
+
+
+def test_ambiguous_effective_profile_skill_blocks_creation_and_claim(kwilo_home):
+    home, _, _ = kwilo_home
+    profile_dir = home / "profiles" / "kwilo-forge"
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn, title="claim after skill collision", assignee="kwilo-forge", board="kwilo",
+            governance_contract=_contract(),
+        )
+
+        external_skill = profile_dir / "external-skills" / "duplicate" / "SKILL.md"
+        external_skill.parent.mkdir(parents=True)
+        external_skill.write_text(
+            "---\nname: test-driven-development\nplatforms: [linux, macos, windows]\n---\n",
+            encoding="utf-8",
+        )
+        config_path = profile_dir / "config.yaml"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["skills"] = {"external_dirs": ["external-skills"]}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="effective parent skills unavailable"):
+            kb.create_task(
+                conn, title="ambiguous skill", assignee="kwilo-forge", board="kwilo",
+                governance_contract=_contract(candidate="d" * 40),
+            )
+        assert kb.claim_task(conn, task_id) is None
+        assert kb.get_task(conn, task_id).status == "blocked"
 
 
 def test_effective_profile_connector_drift_blocks_claim_and_completion(kwilo_home):

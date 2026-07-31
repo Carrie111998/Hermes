@@ -1,6 +1,9 @@
 """Tests for agent/skill_utils.py."""
 
+from pathlib import Path
 from unittest.mock import patch
+
+import pytest
 
 from agent.skill_utils import (
     extract_skill_config_vars,
@@ -109,6 +112,35 @@ def test_iter_skill_index_files_prunes_dependency_dirs(tmp_path):
     found = list(iter_skill_index_files(tmp_path, "SKILL.md"))
 
     assert found == [real / "SKILL.md"]
+
+
+def test_iter_skill_index_files_does_not_follow_directory_cycles(tmp_path):
+    skill = tmp_path / "category" / "real-skill"
+    skill.mkdir(parents=True)
+    index = skill / "SKILL.md"
+    index.write_text("---\nname: real-skill\n---\n", encoding="utf-8")
+    cycle = skill / "cycle"
+    try:
+        cycle.symlink_to(tmp_path / "category", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory links unavailable in test environment: {exc}")
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [index]
+
+
+def test_resolve_external_skills_dirs_ignores_blank_entries(tmp_path):
+    from agent.skill_utils import resolve_external_skills_dirs
+
+    profile_home = tmp_path / "profile"
+    profile_home.mkdir()
+    stray = profile_home / "stray"
+    stray.mkdir()
+
+    assert resolve_external_skills_dirs(
+        {"skills": {"external_dirs": ["", "  "]}},
+        hermes_home=profile_home,
+        local_skills_dir=profile_home / "skills",
+    ) == []
 
 
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
