@@ -741,6 +741,42 @@ describe('mergePersistedTodoProvenance', () => {
     expect(mergePersistedTodoProvenance(local, persisted)).toBe(local)
     expect((local[0]?.parts[0] as ChatMessagePart & { todoUpdatedAt?: number }).todoUpdatedAt).toBeUndefined()
   })
+
+  it('rejects malformed persisted todo rows instead of replacing valid local bytes', () => {
+    const localResult = { todos: [{ content: 'Keep local', id: 'local', status: 'completed' }] }
+
+    const local: ChatMessage[] = [
+      {
+        id: 'live-plan',
+        parts: [{ result: localResult, toolCallId: 'todo-1', toolName: 'todo', type: 'tool-call' }],
+        role: 'assistant'
+      }
+    ]
+
+    const persisted: ChatMessage[] = [
+      {
+        id: 'stored-plan',
+        parts: [
+          {
+            result: {
+              todos: [
+                { content: 'Keep local', id: 'local', status: 'completed' },
+                { content: { malformed: true }, id: 7, status: 'pending' }
+              ]
+            },
+            toolCallId: 'todo-1',
+            toolName: 'todo',
+            todoUpdatedAt: 321,
+            type: 'tool-call'
+          } as ChatMessagePart & { todoUpdatedAt: number }
+        ],
+        role: 'assistant'
+      }
+    ]
+
+    expect(mergePersistedTodoProvenance(local, persisted)).toBe(local)
+    expect((local[0]?.parts[0] as ChatMessagePart & { todoUpdatedAt?: number }).todoUpdatedAt).toBeUndefined()
+  })
 })
 
 describe('upsertToolPart', () => {

@@ -28,44 +28,87 @@ const STATUSES: readonly TodoStatus[] = ['pending', 'in_progress', 'completed', 
 const isRecord = (v: unknown): v is Record<string, unknown> => Boolean(v && typeof v === 'object' && !Array.isArray(v))
 const isStatus = (v: unknown): v is TodoStatus => (STATUSES as readonly string[]).includes(v as string)
 
-function parseArray(value: unknown[]): TodoItem[] {
-  return value.flatMap(item => {
+function parseArray(value: unknown[], strict: boolean): null | TodoItem[] {
+  const parsed: TodoItem[] = []
+
+  for (const item of value) {
     if (!isRecord(item) || !isStatus(item.status)) {
-      return []
+      if (strict) {
+        return null
+      }
+
+      continue
+    }
+
+    if (strict && (typeof item.id !== 'string' || typeof item.content !== 'string')) {
+      return null
     }
 
     const id = String(item.id ?? '').trim()
     const content = String(item.content ?? '').trim()
 
-    return id && content ? [{ content, id, status: item.status }] : []
-  })
+    if (!id || !content) {
+      if (strict) {
+        return null
+      }
+
+      continue
+    }
+
+    parsed.push({ content, id, status: item.status })
+  }
+
+  return parsed
 }
 
-function parse(value: unknown, depth: number): null | TodoItem[] {
+function parse(value: unknown, depth: number, strict: boolean): null | TodoItem[] {
   if (depth > 2) {
     return null
   }
 
   if (Array.isArray(value)) {
-    return parseArray(value)
+    return parseArray(value, strict)
   }
 
   if (typeof value === 'string' && value.trim()) {
     try {
-      return parse(JSON.parse(value), depth + 1)
+      return parse(JSON.parse(value), depth + 1, strict)
     } catch {
       return null
     }
   }
 
   if (isRecord(value) && Object.hasOwn(value, 'todos')) {
-    return parse(value.todos, depth + 1)
+    return parse(value.todos, depth + 1, strict)
   }
 
   return null
 }
 
-export const parseTodos = (value: unknown): null | TodoItem[] => parse(value, 0)
+export const parseTodos = (value: unknown): null | TodoItem[] => parse(value, 0, false)
+
+/** Parse an authoritative persisted result without silently dropping malformed
+ * entries. Empty arrays remain valid clears; any malformed item makes the whole
+ * snapshot unusable so older valid history can remain authoritative. */
+export const parsePersistedTodos = (value: unknown): null | TodoItem[] => parse(value, 0, true)
+
+/** Whether a rendered message contains a completed, strictly valid todo result.
+ * Empty arrays are valid clears and must survive interruption until persisted
+ * provenance can be merged back onto the exact tool-call identity. */
+export function messageHasValidTodoResult(message: { hidden?: unknown; parts?: unknown }): boolean {
+  if (message.hidden || !Array.isArray(message.parts)) {
+    return false
+  }
+
+  return message.parts.some(
+    part =>
+      isRecord(part) &&
+      part.type === 'tool-call' &&
+      part.toolName === 'todo' &&
+      Object.hasOwn(part, 'result') &&
+      parsePersistedTodos(part.result) !== null
+  )
+}
 
 /** Latest parseable todo list from one message's aui content parts (tool-call
  *  parts named `todo`; live parts carry `todos`, hydrated ones args/result). */
@@ -121,8 +164,9 @@ function finiteTimestamp(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null
 }
 
-/** Latest parseable todo snapshot within one rendered message, including the
- * exact persisted tool-result timestamp when hydration supplied it. */
+/** Latest strictly valid todo result within one rendered message. The timestamp
+ * remains null until hydration proves persisted provenance; that unproven result
+ * still blocks fallback to older history. */
 function todoSnapshotFromMessage(message: PlanMessage): TodoSnapshotInMessage | null {
   if (message.hidden || !Array.isArray(message.parts)) {
     return null
@@ -135,13 +179,10 @@ function todoSnapshotFromMessage(message: PlanMessage): TodoSnapshotInMessage | 
       continue
     }
 
-    const items = parseTodos(part.result)
+    const items = parsePersistedTodos(part.result)
     const updatedAt = finiteTimestamp(part.todoUpdatedAt)
 
-    // Current Plan is durable history, not an attempted call preview. A result
-    // without the persisted tool-row timestamp is still live/ephemeral and must
-    // wait for post-turn hydration before it can become the displayed plan.
-    if (items !== null && updatedAt !== null) {
+    if (items !== null) {
       snapshot = { items, updatedAt }
     }
   }
@@ -171,6 +212,13 @@ export function latestSessionPlan(
     const snapshot = todoSnapshotFromMessage(messages[index] ?? {})
 
     if (snapshot) {
+      // A newer completed result is authoritative enough to invalidate older
+      // history, but not yet proven enough to display until hydration supplies
+      // its persisted timestamp.
+      if (snapshot.updatedAt === null) {
+        return null
+      }
+
       sourceIndex = index
       latest = snapshot
 

@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
@@ -109,6 +109,29 @@ describe('CurrentPlanPanel', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false')
   })
 
+  it('provides a visible non-ring keyboard focus treatment for the disclosure', () => {
+    render(
+      <CurrentPlanPanel
+        plan={{
+          completedCount: 1,
+          hasNewerTurnWithoutTodo: false,
+          items: todos,
+          sourceMessageId: 'assistant-focus',
+          status: 'paused',
+          totalCount: 4,
+          turnNumber: 1,
+          updatedAt: 20
+        }}
+        sessionId="stored-focus"
+      />
+    )
+
+    const toggle = screen.getByRole('button', { name: /current plan/i })
+
+    expect(toggle.className).toContain('focus-visible:bg-(--ui-control-active-background)')
+    expect(toggle.className).toContain('focus-visible:text-foreground')
+  })
+
   it('localizes disclosure accessibility, status, turn, and item-state copy in Arabic', () => {
     render(
       <I18nProvider configClient={null} initialLocale="ar">
@@ -168,6 +191,23 @@ describe('CurrentPlanSurface', () => {
     expect(screen.queryByRole('button', { name: /current plan/i })).toBeNull()
   })
 
+  it('suppresses a stale selected plan on the New Chat route', () => {
+    $activeSessionId.set('runtime-a')
+    $sessionStates.set({ 'runtime-a': createClientSessionState('stored-a') })
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <SessionViewProvider
+          value={viewFor(transcript('session-a'), { runtimeId: 'runtime-a', storedId: 'stored-a' })}
+        >
+          <RoutedCurrentPlanSurface />
+        </SessionViewProvider>
+      </MemoryRouter>
+    )
+
+    expect(screen.queryByRole('button', { name: /current plan/i })).toBeNull()
+  })
+
   it('renders through the route-aware composition once route, selection, and runtime agree', () => {
     $activeSessionId.set('runtime-b')
     $sessionStates.set({ 'runtime-b': createClientSessionState('stored-b') })
@@ -206,6 +246,19 @@ describe('CurrentPlanSurface', () => {
 
     expect(screen.getByRole('button', { name: /current plan/i })).not.toBeNull()
     expect(screen.getByText('Completed')).not.toBeNull()
+  })
+
+  it('does not reveal older persisted history during an explicit empty live clear', () => {
+    const view = viewFor(transcript('older', [{ content: 'Older plan', id: 'older', status: 'completed' }]))
+    setSessionTodos('runtime-1', [])
+
+    render(
+      <SessionViewProvider value={view}>
+        <CurrentPlanSurface />
+      </SessionViewProvider>
+    )
+
+    expect(screen.queryByRole('button', { name: /current plan/i })).toBeNull()
   })
 
   it('constrains long expanded plans and scrolls the item list inside the panel', () => {

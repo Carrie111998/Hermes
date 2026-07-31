@@ -20,7 +20,7 @@ import {
   generatedImageEchoSources,
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
-import { parseTodos } from '@/lib/todos'
+import { parsePersistedTodos, parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { upsertSubagent } from '@/store/subagents'
@@ -62,6 +62,22 @@ interface QueuedStreamDeltas {
 let streamMessageSeq = 0
 
 const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++streamMessageSeq}`
+
+function currentTurnHasCompletedTodoResult(messages: readonly ChatMessage[]): boolean {
+  const lastUserIndex = messages.findLastIndex(message => message.role === 'user' && !message.hidden)
+
+  return messages.slice(lastUserIndex + 1).some(
+    message =>
+      !message.hidden &&
+      message.parts.some(
+        part =>
+          part.type === 'tool-call' &&
+          part.toolName === 'todo' &&
+          'result' in part &&
+          parsePersistedTodos(part.result) !== null
+      )
+  )
+}
 
 export function useMessageStream({
   activeGatewayProfile = 'default',
@@ -468,6 +484,7 @@ export function useMessageStream({
     (sessionId: string, text: string, responsePreviewed?: boolean, failure?: { error: string; partial: boolean }) => {
       let shouldHydrate = false
       let requiresTodoHydration = false
+      let preserveLocalScrollback = false
 
       const completedState = updateSessionState(sessionId, state => {
         // Late completion from an already-cancelled turn: cancelRun has
@@ -475,6 +492,14 @@ export function useMessageStream({
         // empty). Re-running the dedupe below would replace the partial with
         // the just-cancelled full text, so we settle and bail instead.
         if (state.interrupted) {
+          // cancelRun can remove a tool-only pending bubble before this late
+          // terminal frame arrives, so absence from local messages is not proof
+          // that the persisted turn had no todo result. Probe persisted history
+          // while preserving the already-finalized local scrollback.
+          requiresTodoHydration = true
+          shouldHydrate = true
+          preserveLocalScrollback = true
+
           return {
             ...state,
             awaitingResponse: false,
@@ -592,20 +617,13 @@ export function useMessageStream({
           message => message.role === 'assistant' && message.error && !message.hidden
         )
 
-        const hasCompletedTodoResult = currentTurnMessages.some(
-          message =>
-            !message.hidden &&
-            message.parts.some(
-              part => part.type === 'tool-call' && part.toolName === 'todo' && 'result' in part && parseTodos(part.result) !== null
-            )
-        )
+        const hasCompletedTodoResult = currentTurnHasCompletedTodoResult(nextMessages)
 
         requiresTodoHydration = hasCompletedTodoResult
         shouldHydrate =
-          !completionError &&
-          !hasInlineError &&
           !unresolvedUserTail &&
-          (hasCompletedTodoResult || !state.sawAssistantPayload || !finalText)
+          (hasCompletedTodoResult ||
+            (!completionError && !hasInlineError && (!state.sawAssistantPayload || !finalText)))
 
         return {
           ...state,
@@ -629,7 +647,7 @@ export function useMessageStream({
       }
 
       if (shouldHydrate) {
-        if (compactedTurn && requiresTodoHydration) {
+        if ((compactedTurn || preserveLocalScrollback) && requiresTodoHydration) {
           void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId, {
             preserveLocalScrollback: true
           })
@@ -650,6 +668,9 @@ export function useMessageStream({
 
   const failAssistantMessage = useCallback(
     (sessionId: string, errorMessage: string) => {
+      let shouldHydrateTodos = false
+      let storedSessionId: null | string = null
+
       updateSessionState(sessionId, state => {
         const streamId = state.streamId ?? `assistant-error-${Date.now()}`
         const groupId = state.pendingBranchGroup ?? undefined
@@ -678,6 +699,9 @@ export function useMessageStream({
               }
             ]
 
+        shouldHydrateTodos = currentTurnHasCompletedTodoResult(nextMessages)
+        storedSessionId = state.storedSessionId
+
         return {
           ...state,
           messages: nextMessages,
@@ -691,8 +715,12 @@ export function useMessageStream({
           turnStartedAt: null
         }
       })
+
+      if (shouldHydrateTodos && storedSessionId) {
+        void hydrateFromStoredSession(3, storedSessionId, sessionId)
+      }
     },
-    [updateSessionState]
+    [hydrateFromStoredSession, updateSessionState]
   )
 
   const handleGatewayEvent = useGatewayEventHandler({

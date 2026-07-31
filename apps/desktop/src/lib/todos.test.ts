@@ -200,6 +200,22 @@ describe('latestSessionTodos', () => {
       expect(latestSessionPlan([user('u1', 10), attempted, resultWithoutTimestamp], { busy: false, hasRuntime: true })).toBeNull()
     })
 
+    it.each([
+      ['a newer todo result', [{ content: 'New plan', id: 'new', status: 'completed' }]],
+      ['an explicit empty clear', []]
+    ])('does not fall back to older persisted history while %s awaits provenance', (_label, items) => {
+      const older = plan('older', [{ content: 'Older plan', id: 'older', status: 'pending' }], 20)
+
+      const unproven = {
+        id: 'unproven-newer',
+        parts: [todoPart([], { result: { todos: items } })],
+        role: 'assistant',
+        timestamp: 40
+      }
+
+      expect(latestSessionPlan([user('u1', 10), older, user('u2', 30), unproven], { busy: false, hasRuntime: true })).toBeNull()
+    })
+
     it('labels only fully completed non-empty lists completed', () => {
       const completed = latestSessionPlan(
         [user('u1', 10), plan('done', [{ content: 'Done', id: 'done', status: 'completed' }], 20)],
@@ -216,6 +232,36 @@ describe('latestSessionTodos', () => {
       expect(completed?.status).toBe('completed')
       expect(cancelled).toMatchObject({ completedCount: 0, status: 'paused', totalCount: 1 })
       expect(empty).toBeNull()
+    })
+
+    it('ignores a newer malformed persisted result instead of clearing the last valid plan', () => {
+      const older = plan('valid', [{ content: 'Keep this plan', id: 'kept', status: 'pending' }], 20)
+      const malformed = plan('malformed', [{ content: 'Broken', id: 'broken', status: 'invalid' }], 30)
+
+      const snapshot = latestSessionPlan([user('u1', 10), older, user('u2', 25), malformed], {
+        busy: false,
+        hasRuntime: true
+      })
+
+      expect(snapshot).toMatchObject({
+        hasNewerTurnWithoutTodo: true,
+        sourceMessageId: 'valid',
+        status: 'superseded'
+      })
+      expect(snapshot?.items).toEqual([{ content: 'Keep this plan', id: 'kept', status: 'pending' }])
+    })
+
+    it('rejects persisted entries whose id or content is not a string', () => {
+      const older = plan('valid', [{ content: 'Keep this plan', id: 'kept', status: 'pending' }], 20)
+      const malformed = plan('malformed-scalars', [{ content: { nested: true }, id: 7, status: 'pending' }], 30)
+
+      const snapshot = latestSessionPlan([user('u1', 10), older, user('u2', 25), malformed], {
+        busy: false,
+        hasRuntime: true
+      })
+
+      expect(snapshot).toMatchObject({ sourceMessageId: 'valid', status: 'superseded' })
+      expect(snapshot?.items).toEqual([{ content: 'Keep this plan', id: 'kept', status: 'pending' }])
     })
 
     it('returns null for sessions with no todo history', () => {

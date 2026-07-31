@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useId, useMemo, useState } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation } from 'react-router'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -16,7 +16,7 @@ import {
 import { cn } from '@/lib/utils'
 import { $todosBySession } from '@/store/todos'
 
-import { routeSessionId } from '../routes'
+import { isNewChatRoute, routeSessionId } from '../routes'
 
 import { $primaryRuntimeStoredId, routeSessionIdentityMismatch, useSessionView } from './session-view'
 
@@ -73,7 +73,7 @@ export function CurrentPlanPanel({ plan, sessionId }: CurrentPlanPanelProps) {
         aria-controls={detailsId}
         aria-expanded={expanded}
         aria-label={copy.toggle(expanded, status, completion)}
-        className="w-full justify-start text-left"
+        className="w-full justify-start text-left focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground"
         onClick={() => setExpanded(value => !value)}
         size="sm"
         type="button"
@@ -164,7 +164,7 @@ export function CurrentPlanSurface({ suppressed = false }: { suppressed?: boolea
   const todosBySession = useStore($todosBySession)
   const transientTodos = runtimeId ? todosBySession[runtimeId] : undefined
 
-  if (suppressed || busy || transientTodos?.length || !storedId) {
+  if (suppressed || busy || transientTodos !== undefined || !storedId) {
     return null
   }
 
@@ -182,8 +182,8 @@ export function RoutedCurrentPlanSurface() {
 
   const suppressed =
     view.kind === 'primary' &&
-    Boolean(routedStoredId) &&
-    routeSessionIdentityMismatch(routedStoredId, selectedStoredId, runtimeStoredId)
+    (isNewChatRoute(location.pathname) ||
+      (Boolean(routedStoredId) && routeSessionIdentityMismatch(routedStoredId, selectedStoredId, runtimeStoredId)))
 
   return <CurrentPlanSurface suppressed={suppressed} />
 }
