@@ -182,6 +182,14 @@ class DistributionManifest:
     # ``list`` can show when a distribution landed on disk.  Empty for
     # manifests that ship in a repo (authors don't populate this).
     installed_at: str = ""
+    # Full set of relative file paths (POSIX-style, e.g. "skills/demo/SKILL.md")
+    # that THIS install/update's owned-paths copy actually wrote, tracked so
+    # a LATER update can tell a stale distributed file (present in this
+    # revision, absent from the next one -- must be deleted) apart from a
+    # genuine target-only user file (never in this list -- must be
+    # preserved). Populated by _copy_dist_payload() itself after each
+    # successful copy; not meant to be hand-authored (issue #74409 review).
+    installed_files: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Any) -> "DistributionManifest":
@@ -211,6 +219,11 @@ class DistributionManifest:
             distribution_owned=distribution_owned,
             source=str(data.get("source") or ""),
             installed_at=str(data.get("installed_at") or ""),
+            installed_files=[
+                str(p).strip().replace("\\", "/").lstrip("/")
+                for p in (data.get("installed_files") or [])
+                if str(p).strip()
+            ],
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -234,6 +247,8 @@ class DistributionManifest:
             out["source"] = self.source
         if self.installed_at:
             out["installed_at"] = self.installed_at
+        if self.installed_files:
+            out["installed_files"] = sorted(self.installed_files)
         return out
 
     def owned_paths(self) -> List[str]:
@@ -557,37 +572,118 @@ def _copy_dist_payload(
     ``preserve_config`` is False (fresh install or ``--force-config`` update).
     ``.env.template`` is renamed to ``.env.EXAMPLE`` in the target to avoid
     shadowing a real ``.env``.
+
+    Each entry in ``manifest.owned_paths()`` is a manifest-relative path
+    (POSIX-style, e.g. ``"SOUL.md"``, ``"skills"``, or the narrower
+    ``"skills/research"`` / ``"cron/digest.json"`` forms the docs promise
+    are supported) resolved directly against staged/target -- NOT a bare
+    top-level name compared against ``staged.iterdir()``, which could only
+    ever match root entries and silently skipped any nested owned path
+    (issue #74409 review). A top-level path component in
+    ``USER_OWNED_EXCLUDE`` is rejected regardless of what the manifest
+    claims -- that floor cannot be overridden by an owned_paths entry.
+
+    An owned directory is merge-copied (new/changed content overlaid, never
+    an upfront wholesale delete of the directory) so content the manifest
+    doesn't track as distributed -- including a genuine user addition sitting
+    INSIDE an otherwise-owned directory like the default ``skills`` -- is
+    never destroyed by the copy step itself. To still honor the documented
+    "replaced from the new clone" contract and correctly distinguish a
+    STALE distributed file (shipped in an earlier revision, removed from
+    this one -- must be deleted) from that target-only user file (never
+    distributed -- must survive), this function tracks every file path it
+    writes in ``manifest.installed_files`` and, before overwriting the
+    on-disk manifest, diffs against the PREVIOUS installation's own
+    tracked list: anything that was tracked before but isn't part of this
+    copy is surgically removed (that file only, plus now-empty parent
+    directories up to the profile root); anything never tracked is left
+    alone regardless of where it lives.
     """
     target.mkdir(parents=True, exist_ok=True)
+    owned = manifest.owned_paths()
+    newly_installed: set[str] = set()
 
-    for entry in staged.iterdir():
-        name = entry.name
+    # Read the PREVIOUS installation's tracked file list before any
+    # copying happens. This must happen first: distribution.yaml
+    # (MANIFEST_FILENAME) is itself one of DEFAULT_DIST_OWNED, so the
+    # owned-path copy loop below overwrites target's manifest with the
+    # raw staged source's version (no installed_files) as part of normal
+    # processing -- reading this any later would always see that
+    # just-copied, untracked version instead of what a prior
+    # install/update actually wrote.
+    try:
+        previous_installed = set(read_manifest(target).installed_files)
+    except Exception:
+        previous_installed = set()
 
-        if name in USER_OWNED_EXCLUDE:
+    if (staged / ENV_TEMPLATE_FILENAME).is_file():
+        # .env.template ships alongside the payload to document required
+        # variables; it is not itself a content path subject to the
+        # owned_paths() allowlist.
+        shutil.copy2(staged / ENV_TEMPLATE_FILENAME, target / ENV_EXAMPLE_FILENAME)
+
+    for owned_path in owned:
+        owned_path = owned_path.strip().strip("/")
+        if not owned_path:
             continue
-        if name == ENV_TEMPLATE_FILENAME:
-            shutil.copy2(entry, target / ENV_EXAMPLE_FILENAME)
-            continue
-        if name == "config.yaml" and preserve_config and (target / "config.yaml").exists():
-            # Leave user's config.yaml alone on update
+        top_level = owned_path.split("/", 1)[0]
+        if top_level in USER_OWNED_EXCLUDE:
             continue
 
-        dest = target / name
-        if entry.is_dir():
-            if dest.exists():
-                shutil.rmtree(dest)
-            staged_resolved = staged.resolve()
-            shutil.copytree(
-                entry,
-                dest,
-                ignore=lambda d, names: (
-                    [n for n in names if n in USER_OWNED_EXCLUDE]
-                    if Path(d).resolve() == staged_resolved
-                    else []
-                ),
-            )
+        src = staged / owned_path
+        if not src.exists():
+            continue  # nothing staged for this owned entry
+        if owned_path == "config.yaml" and preserve_config and (target / "config.yaml").exists():
+            # Leave user's config.yaml alone on update -- but still count
+            # it as present in this revision, or the stale-file prune
+            # below (which only sees what's newly_installed) would treat
+            # the intentionally-untouched file as removed and delete it.
+            newly_installed.add(owned_path)
+            continue
+
+        dest = target / owned_path
+        if src.is_dir():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # Merge, don't rmtree-then-copy: an upfront rmtree of the
+            # WHOLE owned directory (e.g. the default "skills") would
+            # wipe out any content inside it that was never part of any
+            # distributed revision (a genuine user addition), before the
+            # installed_files diff below even runs. dirs_exist_ok=True
+            # here is safe -- unlike the ORIGINAL bug this review flagged
+            # (a blanket merge with no cleanup at all), staleness is
+            # handled correctly afterward by the surgical per-file prune,
+            # which only removes files this function itself tracked as
+            # distributed in a PREVIOUS revision.
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+            for f in src.rglob("*"):
+                if f.is_file():
+                    newly_installed.add(
+                        (Path(owned_path) / f.relative_to(src)).as_posix()
+                    )
         else:
-            shutil.copy2(entry, dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            newly_installed.add(owned_path)
+
+    # Prune stale distributed files: present in the PREVIOUS on-disk
+    # manifest's own installed_files (i.e. this profile's state before we
+    # overwrite the manifest below) but absent from what was just
+    # installed. A file never tracked as distributed (a genuine user
+    # addition inside an owned directory) is never in this set and is
+    # therefore never touched.
+    for stale_rel in previous_installed - newly_installed:
+        stale_path = target / stale_rel
+        try:
+            if stale_path.is_file():
+                stale_path.unlink()
+                parent = stale_path.parent
+                while parent != target and parent.exists() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+        except Exception:
+            pass  # best-effort cleanup — never fail the install/update over this
+
+    manifest.installed_files = sorted(newly_installed)
 
     # Emit .env.EXAMPLE from manifest if the staged tree didn't ship one
     if manifest.env_requires and not (target / ENV_EXAMPLE_FILENAME).exists():
