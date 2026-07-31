@@ -322,8 +322,8 @@ class RelayAdapter(BasePlatformAdapter):
         self._stamp_slack_session_thread(event)
         # Phase 3: a structured prompt answer resolves its waiting primitive
         # (approval/confirm/clarify) and is CONSUMED — it must not also
-        # dispatch as a chat message. Unknown/expired prompt ids fall through
-        # (the command-shaped text then behaves like a typed reply).
+        # dispatch as a chat message. Unknown/expired prompt ids are also
+        # consumed so their command-shaped fallback cannot resolve newer state.
         if await self._consume_prompt_response(event):
             return
         await self._localize_inbound_media(event)
@@ -1836,11 +1836,9 @@ class RelayAdapter(BasePlatformAdapter):
         """Route an inbound prompt_response to its waiting primitive.
 
         Returns True when the event was a prompt answer (consumed — do NOT
-        dispatch it as a chat message), False otherwise. Unknown/expired
-        prompt ids fall through to normal dispatch: the command-shaped text
-        ("/once", "/deny", …) then behaves like a typed reply, which the
-        approval/confirm text lanes already understand — the same stale-tap
-        degradation the native adapters implement with an "expired" edit.
+        dispatch it as a chat message), False otherwise. Unknown or expired
+        structured answers are consumed because their command-shaped text may
+        otherwise act on a newer prompt that reused the same session.
         """
         pr = getattr(event, "prompt_response", None)
         if not isinstance(pr, dict):
@@ -1853,11 +1851,11 @@ class RelayAdapter(BasePlatformAdapter):
         if state is None:
             logger.info(
                 "relay prompt_response for unknown/expired prompt %s (option=%s) — "
-                "falling through to text dispatch",
+                "ignoring stale structured response",
                 prompt_id,
                 option_id,
             )
-            return False
+            return True
 
         kind = state.get("kind")
         chat_id = str(state.get("chat_id") or getattr(event.source, "chat_id", ""))
