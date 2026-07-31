@@ -6153,6 +6153,8 @@ def run_conversation(
                 # cheap RPC-style calls that shouldn't eat the budget.
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
                     agent.iteration_budget.refund()
                 
                 # Use real token counts from the API response to decide
