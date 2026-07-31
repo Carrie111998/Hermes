@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -105,6 +106,52 @@ def require_skills_content_writable(operation: str) -> None:
             SKILLS_CONTENT_READ_ONLY,
             f"{operation} is disabled because skills.content_mode is read_only",
         )
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _targets_skills_content(path: str | Path) -> bool:
+    """Return whether *path* names content below the active discovery root.
+
+    Check both the lexical and resolved forms. The lexical check refuses a
+    path entered through the discovery root even when an internal symlink
+    points out of it; the resolved check catches aliases outside the discovery
+    tree that point back into managed content.
+    """
+    candidate = Path(path).expanduser()
+    root = get_skills_dir().expanduser()
+    lexical_candidate = Path(
+        os.path.normpath(os.path.abspath(os.fspath(candidate)))
+    )
+    lexical_root = Path(os.path.normpath(os.path.abspath(os.fspath(root))))
+    if _is_within(lexical_candidate, lexical_root):
+        return True
+
+    try:
+        resolved_candidate = candidate.resolve(strict=False)
+        resolved_root = root.resolve(strict=False)
+    except OSError:
+        return False
+    return _is_within(resolved_candidate, resolved_root)
+
+
+def require_skills_path_writable(path: str | Path, operation: str) -> None:
+    """Refuse a generic mutation that targets the discovery/content root.
+
+    This policy is intentionally narrower than ``HERMES_HOME``: relocated
+    runtime metadata under ``HERMES_HOME/state/skills`` must remain writable
+    in read-only content mode.
+    """
+    if not os.path.isabs(os.fspath(path)):
+        raise ValueError("skills content policy requires an absolute path")
+    if _targets_skills_content(path):
+        require_skills_content_writable(operation)
 
 
 def skills_state_path(*parts: str) -> Path:

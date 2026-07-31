@@ -35,6 +35,14 @@ from typing import List, Optional, Tuple, Any
 from enum import Enum
 
 
+_UPDATE_FILE_PATTERN = re.compile(r'\*\*\*\s*Update\s+File:\s*(.+)')
+_ADD_FILE_PATTERN = re.compile(r'\*\*\*\s*Add\s+File:\s*(.+)')
+_DELETE_FILE_PATTERN = re.compile(r'\*\*\*\s*Delete\s+File:\s*(.+)')
+_MOVE_FILE_PATTERN = re.compile(
+    r'\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)'
+)
+
+
 class OperationType(Enum):
     ADD = "add"
     UPDATE = "update"
@@ -66,6 +74,57 @@ class PatchOperation:
     content: Optional[str] = None  # For add file operations
 
 
+def _patch_bounds(lines: List[str]) -> Tuple[int, int]:
+    """Return the parser's inclusive-start/exclusive-end patch boundaries."""
+    start_idx = None
+    end_idx = None
+    for i, line in enumerate(lines):
+        if '*** Begin Patch' in line or '***Begin Patch' in line:
+            start_idx = i
+        elif '*** End Patch' in line or '***End Patch' in line:
+            end_idx = i
+            break
+    return (
+        -1 if start_idx is None else start_idx,
+        len(lines) if end_idx is None else end_idx,
+    )
+
+
+def extract_v4a_target_paths(patch_content: str) -> List[str]:
+    """Extract every mutation target without parsing or touching the filesystem.
+
+    This intentionally shares marker patterns and boundaries with
+    :func:`parse_v4a_patch` so policy callers can preflight every target before
+    parser work or the first mutation. Move operations contribute both their
+    source and destination.
+    """
+    lines = patch_content.split('\n')
+    start_idx, end_idx = _patch_bounds(lines)
+    targets: List[str] = []
+
+    for line in lines[start_idx + 1:end_idx]:
+        move_match = _MOVE_FILE_PATTERN.match(line)
+        if move_match:
+            targets.extend(
+                [
+                    move_match.group(1).strip(),
+                    move_match.group(2).strip(),
+                ]
+            )
+            continue
+        for pattern in (
+            _UPDATE_FILE_PATTERN,
+            _ADD_FILE_PATTERN,
+            _DELETE_FILE_PATTERN,
+        ):
+            match = pattern.match(line)
+            if match:
+                targets.append(match.group(1).strip())
+                break
+
+    return targets
+
+
 def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[str]]:
     """
     Parse a V4A format patch.
@@ -81,23 +140,7 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
     lines = patch_content.split('\n')
     operations: List[PatchOperation] = []
     
-    # Find patch boundaries
-    start_idx = None
-    end_idx = None
-    
-    for i, line in enumerate(lines):
-        if '*** Begin Patch' in line or '***Begin Patch' in line:
-            start_idx = i
-        elif '*** End Patch' in line or '***End Patch' in line:
-            end_idx = i
-            break
-    
-    if start_idx is None:
-        # Try to parse without explicit begin marker
-        start_idx = -1
-    
-    if end_idx is None:
-        end_idx = len(lines)
+    start_idx, end_idx = _patch_bounds(lines)
     
     # Parse operations between boundaries
     i = start_idx + 1
@@ -108,10 +151,10 @@ def parse_v4a_patch(patch_content: str) -> Tuple[List[PatchOperation], Optional[
         line = lines[i]
         
         # Check for file operation markers
-        update_match = re.match(r'\*\*\*\s*Update\s+File:\s*(.+)', line)
-        add_match = re.match(r'\*\*\*\s*Add\s+File:\s*(.+)', line)
-        delete_match = re.match(r'\*\*\*\s*Delete\s+File:\s*(.+)', line)
-        move_match = re.match(r'\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)', line)
+        update_match = _UPDATE_FILE_PATTERN.match(line)
+        add_match = _ADD_FILE_PATTERN.match(line)
+        delete_match = _DELETE_FILE_PATTERN.match(line)
+        move_match = _MOVE_FILE_PATTERN.match(line)
         
         if update_match:
             # Save previous operation
