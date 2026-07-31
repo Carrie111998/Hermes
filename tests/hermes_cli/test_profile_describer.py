@@ -30,6 +30,31 @@ def profile_env(tmp_path, monkeypatch):
 
 
 
+def test_read_profile_meta_coerces_string_false(profile_env):
+    (profile_env / "profile.yaml").write_text(
+        'description: curated\ndescription_auto: "false"\n',
+        encoding="utf-8",
+    )
+    meta = profiles_mod.read_profile_meta(profile_env)
+    assert meta["description"] == "curated"
+    assert meta["description_auto"] is False
+
+
+def test_describer_respects_string_false_as_user_authored(profile_env, monkeypatch):
+    (profile_env / "profile.yaml").write_text(
+        'description: curated\ndescription_auto: "false"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+
+    outcome = describer.describe_profile("myprof")
+    assert outcome.ok is False
+    assert "already has a user-authored description" in outcome.reason
+    assert profiles_mod.read_profile_meta(profile_env)["description"] == "curated"
+
+
 # ---------------------------------------------------------------------------
 # profile_describer module
 # ---------------------------------------------------------------------------
