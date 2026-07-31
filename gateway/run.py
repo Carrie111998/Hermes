@@ -13508,7 +13508,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                adapter._pending_messages[quick_key] = queued_event
+                # Route through the FIFO contract so a pre-queued head is
+                # preserved instead of being clobbered (#75164).
+                self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -13531,7 +13533,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            adapter._pending_messages[quick_key] = queued_event
+            # Route through the FIFO contract so a pre-queued head is
+            # preserved instead of being clobbered (#75164).
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
