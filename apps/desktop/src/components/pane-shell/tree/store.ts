@@ -31,12 +31,10 @@ import {
   normalize,
   removePane,
   reorderPaneInGroup as reorderPaneInGroupOp,
-  type RootEdge,
   setActivePane as setActivePaneOp,
   setGroupHeaderHidden as setGroupHeaderHiddenOp,
   setGroupMinimized,
   setSplitWeights as setSplitWeightsOp,
-  splitGroupZone as splitGroupZoneOp,
   type SplitNode
 } from './model'
 import { FLOATING_PLACEMENT } from './renderer/floating-rect'
@@ -200,9 +198,24 @@ function setDismissed(paneId: string, dismissed: boolean) {
 const paneClosers: Record<string, () => void> = {}
 const paneOpeners: Record<string, () => void> = {}
 
-/** Route a pane's Close through the app store that owns its visibility. */
-export function registerPaneCloser(paneId: string, close: () => void) {
-  paneClosers[paneId] = close
+/** Pane ids whose Close an app store owns. True for the main workspace, whose
+ *  pane can't leave the tree but whose TAB can still be emptied — the close
+ *  GESTURE (⌘-click / middle-click) keys off this rather than `uncloseable`.
+ *  An atom, not a lookup: a closer registered by a wiring EFFECT lands after
+ *  the strip's first paint, and a plain read would leave that tab gestureless
+ *  until something else happened to re-render it. */
+export const $panesWithCloser = atom<ReadonlySet<string>>(new Set())
+
+/** Route a pane's Close through the app store that owns its visibility.
+ *  Passing no closer unregisters (a wiring effect's cleanup). */
+export function registerPaneCloser(paneId: string, close?: () => void) {
+  if (close) {
+    paneClosers[paneId] = close
+  } else {
+    delete paneClosers[paneId]
+  }
+
+  $panesWithCloser.set(new Set(Object.keys(paneClosers)))
 }
 
 /**
@@ -1202,18 +1215,6 @@ export function reorderTreePane(groupId: string, paneId: string, toIndex: number
   if (tree) {
     commit(reorderPaneInGroupOp(tree, groupId, paneId, toIndex))
     markActivePreset('custom')
-  }
-}
-
-/** Split a zone on `side`, moving `movePaneId` out of its stack into the new
- *  zone (VS Code split-and-move — the zone menu's Split actions). */
-export function splitTreeZone(groupId: string, side: RootEdge, movePaneId: string) {
-  const tree = $layoutTree.get()
-
-  if (tree) {
-    commit(splitGroupZoneOp(tree, groupId, side, movePaneId))
-    markActivePreset('custom')
-    markPaneUserPlaced(movePaneId)
   }
 }
 

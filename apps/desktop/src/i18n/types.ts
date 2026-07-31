@@ -2305,12 +2305,6 @@ export interface Translations {
     closeToRight: string
     closeAll: string
     newSessionTab: string
-    split: (dir: string) => string
-    move: (dir: string) => string
-    dirUp: string
-    dirDown: string
-    dirLeft: string
-    dirRight: string
     pluginDisabled: (pluginId: string) => string
     pluginDisabledBody: string
     missingPane: (paneId: string) => string
@@ -2357,6 +2351,8 @@ export interface Translations {
       branchNewChat: string
       react: string
       dismissError: string
+      filesChanged: (count: number) => string
+      reviewChanges: string
       readAloudFailed: string
       preparingAudio: string
       stopReading: string
