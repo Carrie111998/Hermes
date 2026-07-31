@@ -137,9 +137,12 @@ def resolve_email_extraction_brief(
             spec = wf_engine._load_json(row["spec"], None)
         except Exception:
             return None
-        if not isinstance(spec, dict) or "email_extraction" not in spec:
+        if not isinstance(spec, dict):
             continue
-        brief = spec["email_extraction"]
+        workflow = wf_engine._workflow_spec(spec)
+        if "email_extraction" not in workflow:
+            continue
+        brief = workflow["email_extraction"]
         if not isinstance(brief, (dict, str)):
             return None
         try:
@@ -189,18 +192,17 @@ def _extract_received_email_events(
         if brief is not None and callable(email_extractor)
         else _missing_email_extractor
     )
-    for event_id in event_ids:
+    for event_id in event_ids[:5]:
         # extract_event owns durable classification, validation and all
         # failures.  Do not catch and re-route here: that would create a
         # second state machine beside the engine's fail-closed path.
-        wf_engine.extract_event(
-            conn,
-            event_id,
-            brief if brief is not None else {},
-            extractor,
-            email_schema_validator,
-        )
-    return event_ids
+        try:
+            wf_engine.extract_event(conn, event_id, brief if brief is not None else {}, extractor, email_schema_validator)
+        except Exception:
+            logger.exception("workflow email extraction failed for event %s", event_id)
+            with kanban_db.write_txn(conn):
+                wf_engine._record_match(conn, event_id, "needs_review", reason="email extraction runner failed")
+    return event_ids[:5]
 
 
 def _probe_targets(conn: sqlite3.Connection) -> dict[str, tuple[ProbeTarget, ...]]:

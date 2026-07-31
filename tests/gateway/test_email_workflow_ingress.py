@@ -252,7 +252,7 @@ def test_gateway_email_extractor_uses_configured_auxiliary_runtime(
     """The live extractor uses the host auxiliary slot, never a second client."""
     from agent import auxiliary_client
 
-    body_path = isolated_email_env / "body.txt"
+    body_path = isolated_email_env / "workflow" / "ingress" / "email" / "bodies" / "body.txt"
     body_path.parent.mkdir(parents=True, exist_ok=True)
     body_path.write_text("typed input", encoding="utf-8")
     calls = {}
@@ -280,7 +280,7 @@ def test_gateway_email_extractor_uses_configured_auxiliary_runtime(
         {
             "payload": {
                 "body_ref": str(body_path), "external_id": "<one@example.test>",
-                "sender_addr": "user@example.test", "subject": "status",
+                "sender": "user@example.test", "subject": "status",
             }
         },
     )
