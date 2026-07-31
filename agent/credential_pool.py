@@ -145,11 +145,12 @@ NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS = 60.0
 CUSTOM_POOL_PREFIX = "custom:"
 
 
-# Fields that are only round-tripped through JSON — never used for logic as attributes.
+# Optional provider metadata round-tripped through JSON and exposed via __getattr__.
 _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "account_uuid",
 })
 
 

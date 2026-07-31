@@ -24,6 +24,27 @@ def _jwt_with_claims(claims: dict) -> str:
     return f"{_part({'alg': 'none', 'typ': 'JWT'})}.{_part(claims)}.sig"
 
 
+def test_anthropic_account_uuid_survives_pool_round_trip():
+    from agent.credential_pool import PooledCredential
+
+    account_uuid = "91c44813-4ecc-4c5b-9dd7-878b3ff2bab8"
+    credential = PooledCredential.from_dict(
+        "anthropic",
+        {
+            "id": "casper",
+            "label": "anthropic-casper",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:hermes_pkce",
+            "access_token": "sk-ant-oat-test",
+            "account_uuid": account_uuid,
+        },
+    )
+
+    assert credential.account_uuid == account_uuid
+    assert credential.to_dict()["account_uuid"] == account_uuid
+
+
 
 
 
