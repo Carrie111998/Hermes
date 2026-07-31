@@ -608,3 +608,65 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
     mock_run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_patch_session_persists_pin_and_archive_flags(adapter, session_db):
+    session_id = session_db.create_session("durable-session-flags", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.patch(
+            f"/api/sessions/{session_id}",
+            json={"pinned": True, "archived": True},
+        )
+        assert response.status == 200, await response.text()
+        patched = await response.json()
+
+        fetched = await cli.get(f"/api/sessions/{session_id}")
+        assert fetched.status == 200, await fetched.text()
+        fetched_session = (await fetched.json())["session"]
+
+    assert patched["session"]["pinned"] is True
+    assert patched["session"]["archived"] is True
+    assert fetched_session["pinned"] is True
+    assert fetched_session["archived"] is True
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.patch(f"/api/sessions/{session_id}", json={"pinned": False})
+        assert response.status == 200, await response.text()
+        patched = await response.json()
+
+        response = await cli.patch(f"/api/sessions/{session_id}", json={"archived": False})
+        assert response.status == 200, await response.text()
+        unarchived = await response.json()
+
+        listed = await cli.get("/api/sessions")
+        assert listed.status == 200, await listed.text()
+        listed_sessions = (await listed.json())["data"]
+
+    assert patched["session"]["pinned"] is False
+    assert patched["session"]["archived"] is True
+    assert unarchived["session"]["pinned"] is False
+    assert unarchived["session"]["archived"] is False
+    listed_session = next(row for row in listed_sessions if row["id"] == session_id)
+    assert listed_session["pinned"] is False
+    assert listed_session["archived"] is False
+    stored = session_db.get_session(session_id)
+    assert stored["pinned"] == 0
+    assert stored["archived"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field, value", [("pinned", 1), ("archived", "true"), ("pinned", None)])
+async def test_patch_session_rejects_non_boolean_flags(adapter, session_db, field, value):
+    session_id = session_db.create_session("invalid-session-flags", "api_server")
+    app = _create_session_app(adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.patch(f"/api/sessions/{session_id}", json={field: value})
+        assert response.status == 400, await response.text()
+        error = (await response.json())["error"]
+
+    assert error["code"] == "invalid_session_field"
+    assert field in error["message"]
+
+

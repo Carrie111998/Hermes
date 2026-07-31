@@ -3026,9 +3026,11 @@ class APIServerAdapter(BasePlatformAdapter):
             "output_tokens", "cache_read_tokens", "cache_write_tokens",
             "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
             "api_call_count", "parent_session_id", "last_active", "preview",
-            "_lineage_root_id",
+            "archived", "pinned", "_lineage_root_id",
         )
         payload = {key: session.get(key) for key in safe_keys if key in session}
+        for flag in ("archived", "pinned"):
+            payload[flag] = bool(session.get(flag, False))
         # Avoid exposing full system prompts/model_config through the client API;
         # callers only need to know whether those snapshots exist.
         payload["has_system_prompt"] = bool(session.get("system_prompt"))
@@ -3238,10 +3240,16 @@ class APIServerAdapter(BasePlatformAdapter):
         body, err = await self._read_json_body(request)
         if err:
             return err
-        allowed = {"title", "end_reason"}
+        allowed = {"title", "end_reason", "archived", "pinned"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+        invalid_flags = [name for name in ("archived", "pinned") if name in body and not isinstance(body[name], bool)]
+        if invalid_flags:
+            return web.json_response(
+                _openai_error(f"Session fields must be booleans: {', '.join(invalid_flags)}", code="invalid_session_field"),
+                status=400,
+            )
 
         db = await self._ensure_session_db_async()
         if "title" in body:
@@ -3251,6 +3259,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
         if body.get("end_reason"):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
+        if "archived" in body:
+            await asyncio.to_thread(db.set_session_archived, session_id, body["archived"])
+        if "pinned" in body:
+            await asyncio.to_thread(db.set_session_pinned, session_id, body["pinned"])
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
