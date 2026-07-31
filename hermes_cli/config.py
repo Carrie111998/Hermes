@@ -1678,6 +1678,8 @@ def get_custom_provider_extra_headers(
     selected_key = (provider_key or "").strip().lower()
     if selected_key.startswith("custom:"):
         selected_key = selected_key.split(":", 1)[1].strip()
+    else:
+        selected_key = ""
 
     for entry in custom_providers:
         if not isinstance(entry, dict):
@@ -1686,8 +1688,11 @@ def get_custom_provider_extra_headers(
         if not entry_url or entry_url != target_url:
             continue
         if selected_key:
-            entry_key = str(entry.get("provider_key", "") or "").strip().lower()
-            if entry_key != selected_key:
+            entry_keys = {
+                str(entry.get("provider_key", "") or "").strip().lower(),
+                str(entry.get("name", "") or "").strip().lower(),
+            }
+            if selected_key not in entry_keys:
                 continue
         return normalize_extra_headers(entry.get("extra_headers"))
     return {}
