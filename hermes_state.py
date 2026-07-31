@@ -21,6 +21,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import sys
 import threading
@@ -7031,7 +7032,90 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # Continue to include later compression tips only when the
                 # requested session itself was compacted.
                 continue
-        return lineage if session_id in lineage else [session_id]
+        return lineage
+
+    def is_verified_compression_descendant(
+        self,
+        expected_session_id: str,
+        observed_session_id: str,
+    ) -> bool:
+        """Prove that ``observed`` is an unambiguous compression descendant.
+
+        This is deliberately stricter than the UI-oriented lineage helpers:
+        every parent must have ended via compression and must have exactly one
+        non-branch, non-delegate continuation.  Missing, malformed, cyclic, or
+        ambiguous persisted state fails closed.
+        """
+        if (
+            not isinstance(expected_session_id, str)
+            or not expected_session_id
+            or not isinstance(observed_session_id, str)
+            or not observed_session_id
+            or expected_session_id == observed_session_id
+        ):
+            return False
+
+        def _is_continuation(row: sqlite3.Row) -> Optional[bool]:
+            if row["source"] == "tool":
+                return False
+            raw_config = row["model_config"]
+            if raw_config in (None, ""):
+                config: Dict[str, Any] = {}
+            else:
+                try:
+                    config = json.loads(raw_config)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None
+                if not isinstance(config, dict):
+                    return None
+            if config.get("_branched_from") or config.get("_delegated_from"):
+                return False
+            return True
+
+        current_id = observed_session_id
+        visited: set[str] = set()
+        with self._lock:
+            for _ in range(100):
+                if current_id in visited:
+                    return False
+                visited.add(current_id)
+
+                current = self._conn.execute(
+                    "SELECT id, parent_session_id, source, model_config "
+                    "FROM sessions WHERE id = ?",
+                    (current_id,),
+                ).fetchone()
+                if current is None or _is_continuation(current) is not True:
+                    return False
+
+                parent_id = current["parent_session_id"]
+                if not isinstance(parent_id, str) or not parent_id:
+                    return False
+                parent = self._conn.execute(
+                    "SELECT end_reason FROM sessions WHERE id = ?",
+                    (parent_id,),
+                ).fetchone()
+                if parent is None or parent["end_reason"] != "compression":
+                    return False
+
+                children = self._conn.execute(
+                    "SELECT id, source, model_config FROM sessions "
+                    "WHERE parent_session_id = ?",
+                    (parent_id,),
+                ).fetchall()
+                continuations: List[str] = []
+                for child in children:
+                    is_continuation = _is_continuation(child)
+                    if is_continuation is None:
+                        return False
+                    if is_continuation:
+                        continuations.append(child["id"])
+                if continuations != [current_id]:
+                    return False
+                if parent_id == expected_session_id:
+                    return True
+                current_id = parent_id
+        return False
 
     def clear_messages(self, session_id: str) -> None:
         """Delete all messages for a session and reset its counters."""
@@ -7782,6 +7866,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return retagged
 
         return self._execute_write(_do)
+
+    def get_or_create_provider_credential_generation(
+        self,
+        profile: str,
+        provider: str,
+    ) -> int:
+        """Return one opaque, non-secret generation for a loaded auth scope.
+
+        The caller is the credential-loading authority and must invoke this
+        only after a usable credential has been resolved. The random token is
+        profile/provider metadata; it is never derived from credential bytes.
+        """
+        scope_part = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}\Z")
+        if not isinstance(profile, str) or scope_part.fullmatch(profile) is None:
+            raise ValueError("provider credential profile must be normalized")
+        if not isinstance(provider, str) or scope_part.fullmatch(provider) is None:
+            raise ValueError("provider credential provider must be normalized")
+        key = f"provider_credential_generation:{profile}:{provider}"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+                try:
+                    generation = int(raw)
+                except (TypeError, ValueError):
+                    raise ValueError("provider credential generation is malformed")
+                if generation <= 0:
+                    raise ValueError("provider credential generation is malformed")
+                return generation
+
+            generation = secrets.randbits(63) or 1
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                (key, str(generation)),
+            )
+            return generation
+
+        return int(self._execute_write(_do))
 
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.

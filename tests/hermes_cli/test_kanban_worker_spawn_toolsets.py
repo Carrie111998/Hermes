@@ -134,6 +134,113 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
+def test_supervised_attempt_one_precreates_and_resumes_exact_session(monkeypatch, tmp_path):
+    """Attempt one is durably selected by --resume, not its evidence env."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    board_db = tmp_path / "kanban.db"
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli._parser import build_top_level_parser
+    from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
+    from hermes_state import SessionDB
+
+    kb.init_db(board_db)
+    conn = kb.connect(board_db)
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="bound worker",
+            assignee="elias",
+            workspace_kind="worktree",
+            workspace_path=str(workspace),
+            initial_status="running",
+        )
+        task = kb.claim_task(conn, task_id)
+        assert task is not None
+    finally:
+        conn.close()
+
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    class FakeSupervisor:
+        def allocate_event_path(self, identity, attempt):
+            captured["identity"] = identity
+            assert attempt == 1
+            return tmp_path / "attempt-1.jsonl"
+
+        def start(self, identity, launch, **kwargs):
+            event_path = self.allocate_event_path(identity, 1)
+            proc = launch(
+                identity, 1, event_path, start_nonce="test-nonce",
+            )
+            assert isinstance(proc, FakeProc)
+            captured["proc"] = proc
+            return proc
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(kb, "_dispatcher_worker_supervisor", lambda **kwargs: FakeSupervisor())
+
+    assert kb._start_supervised_worker(task, str(workspace)) == FakeProc.pid
+    session_id = captured["identity"].session_id
+    assert captured["env"]["HERMES_WORKER_SESSION_ID"] == session_id
+    assert captured["cmd"].count("--resume") == 1
+    assert captured["cmd"][captured["cmd"].index("--resume") + 1] == session_id
+
+    parser, _subparsers, _chat_parser = build_top_level_parser()
+    assert captured["cmd"][1:3] == ["-p", "elias"]
+    parsed = parser.parse_args(captured["cmd"][3:])
+    assert parsed.resume == session_id
+
+    session_db = SessionDB(profile / "state.db")
+    try:
+        stored = session_db.get_session(session_id)
+        assert stored["source"] == "cli"
+        assert stored["profile_name"] == "elias"
+        assert stored["cwd"] == str(workspace.resolve())
+        assert stored["git_repo_root"] == str(workspace.resolve())
+
+        output = []
+        probe = CLIAgentSetupMixin()
+        probe._resumed = True
+        probe._session_db = session_db
+        probe.session_id = parsed.resume
+        probe.conversation_history = []
+        probe._console_print = output.append
+        probe._restore_session_cwd = lambda _meta: None
+        assert probe._preload_resumed_session() is False
+        assert any("found but has no messages" in line for line in output)
+        assert not any("Session not found" in line for line in output)
+    finally:
+        session_db.close()
+
+    conn = kb.connect(board_db)
+    try:
+        assert kb.get_task(conn, task_id).session_id == session_id
+    finally:
+        conn.close()
+
+    # Negative control: expected-evidence env does not populate parser.resume.
+    env_only = parser.parse_args(["--cli", "chat", "-q", "hello", "-Q"])
+    assert env_only.resume is None
+
+
 def test_resolve_worker_cli_toolsets_uses_profile_home_not_parent_config(monkeypatch, tmp_path):
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"

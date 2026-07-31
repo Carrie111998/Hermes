@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from rich.markup import escape as _escape
@@ -96,6 +97,9 @@ class CLIAgentSetupMixin:
         # invokes it before every request. Skip the string-only validation
         # and placeholder substitution for callables.
         _is_callable_provider = callable(api_key) and not isinstance(api_key, str)
+        _credential_loaded = _is_callable_provider or (
+            isinstance(api_key, str) and bool(api_key)
+        )
         if not _is_callable_provider and (not isinstance(api_key, str) or not api_key):
             # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
             # don't require authentication.  When a base_url IS configured but
@@ -134,6 +138,44 @@ class CLIAgentSetupMixin:
         self._provider_source = runtime.get("source")
         self.api_key = api_key
         self.base_url = base_url
+
+        # Bind provider recovery only after this exact worker loaded a usable
+        # credential. The generation is opaque profile metadata and is never
+        # derived from, or logged with, credential data.
+        os.environ.pop("HERMES_PROVIDER", None)
+        os.environ.pop("HERMES_PROVIDER_CREDENTIAL_GENERATION", None)
+        _worker_scope = (
+            os.environ.get("HERMES_KANBAN_TASK", "").strip(),
+            os.environ.get("HERMES_KANBAN_RUN_ID", "").strip(),
+            os.environ.get("HERMES_WORKER_SESSION_ID", "").strip(),
+            os.environ.get("HERMES_PROFILE", "").strip(),
+        )
+        if _credential_loaded and all(_worker_scope):
+            try:
+                from hermes_cli.profiles import normalize_profile_name
+
+                _profile = normalize_profile_name(_worker_scope[3])
+                _provider = str(resolved_provider or "").strip().lower()
+                _state_db = getattr(self, "_session_db", None)
+                if (
+                    _profile == _worker_scope[3]
+                    and _provider
+                    and _provider != "auto"
+                    and _state_db is not None
+                ):
+                    _generation = _state_db.get_or_create_provider_credential_generation(
+                        _profile,
+                        _provider,
+                    )
+                    os.environ["HERMES_PROVIDER"] = _provider
+                    os.environ["HERMES_PROVIDER_CREDENTIAL_GENERATION"] = str(
+                        _generation
+                    )
+            except Exception as _scope_exc:
+                logger.debug(
+                    "Provider recovery scope binding failed (%s)",
+                    type(_scope_exc).__name__,
+                )
 
         # When a custom_provider entry carries an explicit `model` field,
         # use it as the effective model name.  Without this, running
@@ -461,7 +503,7 @@ class CLIAgentSetupMixin:
             ChatConsole().print(f"[bold red]Failed to initialize agent: {e}[/]")
             return False
 
-    def _preload_resumed_session(self) -> bool:
+    def _preload_resumed_session(self, *, exact: bool = False) -> bool:
         """Load a resumed session's history from the DB early (before first chat).
 
         Called from run() so the conversation history is available for display
@@ -473,6 +515,7 @@ class CLIAgentSetupMixin:
         already populated and skips the DB round-trip.
         """
         from cli import _accent_hex
+        self._resume_session_validated = False
         if not self._resumed or not self._session_db:
             return False
 
@@ -487,21 +530,26 @@ class CLIAgentSetupMixin:
             )
             return False
 
-        # If the requested session is the (empty) head of a compression chain,
-        # walk to the descendant that actually holds the messages. See #15000.
-        try:
-            resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
-        except Exception:
-            resolved_id = self.session_id
-        if resolved_id and resolved_id != self.session_id:
-            self._console_print(
-                f"[dim]Session {self.session_id} was compressed into "
-                f"{resolved_id}; resuming the descendant with your transcript.[/]"
-            )
-            self.session_id = resolved_id
-            resolved_meta = self._session_db.get_session(self.session_id)
-            if resolved_meta:
-                session_meta = resolved_meta
+        if not exact:
+            # If the requested session is the (empty) head of a compression
+            # chain, walk to the descendant that actually holds the messages.
+            # Supervised starts deliberately disable this fuzzy resolution:
+            # their nonce contract binds one exact pre-created session.
+            try:
+                resolved_id = self._session_db.resolve_resume_session_id(self.session_id)
+            except Exception:
+                resolved_id = self.session_id
+            if resolved_id and resolved_id != self.session_id:
+                self._console_print(
+                    f"[dim]Session {self.session_id} was compressed into "
+                    f"{resolved_id}; resuming the descendant with your transcript.[/]"
+                )
+                self.session_id = resolved_id
+                resolved_meta = self._session_db.get_session(self.session_id)
+                if resolved_meta:
+                    session_meta = resolved_meta
+
+        self._resume_session_validated = True
 
         model_history, display_history = self._session_db.get_resume_conversations(self.session_id)
         restored = model_history

@@ -122,6 +122,44 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
+def test_provider_recovery_schema_is_added_to_legacy_database(tmp_path, monkeypatch):
+    """Recovery durability is an additive migration for existing boards."""
+    db_path = _setup_home(tmp_path, monkeypatch)
+    _make_legacy_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "provider_recovery_waits",
+            "provider_recovery_events",
+            "provider_recovery_deliveries",
+        } <= tables
+
+        event_indexes = {
+            row["name"]
+            for row in conn.execute("PRAGMA index_list(provider_recovery_events)")
+        }
+        assert "idx_provider_recovery_event_scope" in event_indexes
+        assert any(
+            row["unique"]
+            for row in conn.execute("PRAGMA index_list(provider_recovery_events)")
+        )
+
+        delivery_pk = {
+            row["name"]: row["pk"]
+            for row in conn.execute("PRAGMA table_info(provider_recovery_deliveries)")
+        }
+        assert delivery_pk["event_id"] == 1
+        assert delivery_pk["task_id"] == 2
+        assert delivery_pk["run_id"] == 3
+        assert delivery_pk["session_id"] == 4
+
+
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
     """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
     gone after migration; the notifier query returns an integer cursor."""

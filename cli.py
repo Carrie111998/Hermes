@@ -4533,6 +4533,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self._resumed = False
+        self._resume_session_validated = False
         # Per-prompt elapsed timer — started at the beginning of each chat turn,
         # frozen when the agent thread completes, displayed in the status bar.
         self._prompt_start_time: Optional[float] = None  # time.time() when turn started
@@ -17746,6 +17747,27 @@ def main(
     if query or image:
         if not cli._claim_active_session("cli", stderr=bool(quiet)):
             sys.exit(1)
+        from hermes_cli.worker_lifecycle import (
+            emit_start_identity_event,
+            worker_start_contract_configured,
+        )
+
+        _supervised_start = worker_start_contract_configured()
+        if _supervised_start:
+            # This is the child side of the dispatcher handshake.  Validate
+            # and preload the exact resume target before any credential,
+            # provider, model, image-analysis, or agent initialization work.
+            cli.tool_progress_mode = "off"
+            if not quiet or not cli._resumed:
+                print("Invalid supervised worker start contract.", file=sys.stderr)
+                sys.exit(1)
+            cli._preload_resumed_session(exact=True)
+            if not getattr(cli, "_resume_session_validated", False):
+                print("Supervised worker resume session was not found.", file=sys.stderr)
+                sys.exit(1)
+            if not emit_start_identity_event(session_id=cli.session_id):
+                print("Supervised worker identity emission failed.", file=sys.stderr)
+                sys.exit(1)
         try:
             query, single_query_images = _collect_query_images(query, image)
             # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;

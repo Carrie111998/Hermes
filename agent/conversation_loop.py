@@ -2236,6 +2236,10 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                # Snapshot the concrete provider used by this request. A later
+                # fallback may mutate agent.provider before another attempt.
+                _request_provider = agent.provider
+
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -5474,6 +5478,21 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            # Core authority: only this real, non-None provider response path,
+            # after transport normalization and content normalization, may
+            # publish durable recovery proof. Optional plugin hooks below are
+            # observational and cannot synthesize this call.
+            from agent.provider_recovery import (
+                publish_successful_live_provider_request,
+            )
+
+            publish_successful_live_provider_request(
+                provider=_request_provider,
+                request_id=api_request_id,
+                session_id=agent.session_id or "",
+                provider_observed_at=int(api_start_time + api_duration),
+            )
 
             try:
                 from hermes_cli.lifecycle import (
