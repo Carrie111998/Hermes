@@ -3,6 +3,8 @@
 import pytest
 
 from hermes_cli.session_listing import (
+    _compression_root,
+    dedup_compression_chains,
     last_active_of,
     parse_session_listing_args,
     query_session_listing,
@@ -411,5 +413,67 @@ class TestSessionRank:
             # The root resolves through the tip, never the branch.
             assert session_rank(db, "rb_root", rank_of) == rank_of["rb_tip"]
             assert session_rank(db, "rb_branch", rank_of) == rank_of["rb_branch"]
+        finally:
+            db.close()
+
+
+class TestCompressionRoot:
+    """`_compression_root` must stop at branch/delegate/tool children —
+    they are their own conversations and must never be collapsed into a
+    source chain by dedup.
+    """
+
+    def test_delegate_child_is_own_root(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "cr.db")
+        db.create_session("cr_root", "cli")
+        db.end_session("cr_root", end_reason="compression")
+        db.create_session("cr_tip", "cli", parent_session_id="cr_root")
+        db.create_session("cr_delegate", "cli", parent_session_id="cr_root")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_delegate_from\": \"cr_root\"}' "
+            "WHERE id='cr_delegate'"
+        )
+        conn.execute("UPDATE sessions SET source='subagent' WHERE id='cr_delegate'")
+        conn.commit()
+        try:
+            assert _compression_root(db, "cr_delegate") == "cr_delegate"
+            assert _compression_root(db, "cr_tip") == "cr_root"
+            assert _compression_root(db, "cr_root") == "cr_root"
+        finally:
+            db.close()
+
+    def test_tool_child_is_own_root(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "cr2.db")
+        db.create_session("ct_root", "cli")
+        db.end_session("ct_root", end_reason="compression")
+        db.create_session("ct_tool", "tool", parent_session_id="ct_root")
+        try:
+            assert _compression_root(db, "ct_tool") == "ct_tool"
+            assert _compression_root(db, "ct_root") == "ct_root"
+        finally:
+            db.close()
+
+    def test_dedup_does_not_collapse_delegate_into_chain(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "cr3.db")
+        db.create_session("cd_root", "cli")
+        db.end_session("cd_root", end_reason="compression")
+        db.create_session("cd_tip", "cli", parent_session_id="cd_root")
+        db.create_session("cd_delegate", "cli", parent_session_id="cd_root")
+        conn = db._conn
+        conn.execute(
+            "UPDATE sessions SET model_config='{\"_delegate_from\": \"cd_root\"}' "
+            "WHERE id='cd_delegate'"
+        )
+        conn.commit()
+        try:
+            kept = dedup_compression_chains(db, ["cd_root", "cd_tip", "cd_delegate"])
+            assert kept == {"cd_tip", "cd_delegate"}
         finally:
             db.close()

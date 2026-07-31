@@ -194,15 +194,16 @@ def _compression_root(session_db: Any, sid: str, max_hops: int = 50) -> str:
 
     Follows ``parent_session_id`` upward only across compression edges —
     a child counts only if the parent ended with ``end_reason ==
-    "compression"`` and the child is not a branch (branches are their own
-    conversation). Does not rely on ``get_compression_lineage``, whose
-    forward walk assumes a linear chain and can fragment on divergent
-    children.
+    "compression"`` and the child is a real chain generation. Branch,
+    delegate, and tool children are their own conversations (mirroring
+    ``get_compression_tip``'s edge exclusions). Does not rely on
+    ``get_compression_lineage``, whose forward walk assumes a linear chain
+    and can fragment on divergent children.
     """
     current = sid
     for _ in range(max_hops):
         meta = session_db.get_session(current) or {}
-        if session_db._is_branch_child_row(meta):
+        if not session_db._is_compression_edge_child_row(meta):
             return current
         parent_id = meta.get("parent_session_id")
         if not parent_id:
