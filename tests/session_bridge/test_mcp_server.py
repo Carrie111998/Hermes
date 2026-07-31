@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -2349,12 +2350,27 @@ def test_sidebar_status_preserves_all_fixed_terminal_resolution_codes() -> None:
     assert status["execution_blockers"] == []
 
 
-def test_sidebar_status_canonicalizes_needs_attention_from_failed_count() -> None:
-    status = _sidebar_status({
+def test_sidebar_status_canonicalizes_needs_attention_without_mutating_payload() -> None:
+    payload = {
         "counts": {"sidebar_failed": 3, "needs_attention": 1},
-    })
+        "blocking_failed_count": 2,
+    }
+    original = json.dumps(payload, sort_keys=True)
 
-    assert status["counts"]["needs_attention"] == 3
+    status = _sidebar_status(payload)
+
+    assert status["counts"]["needs_attention"] == status["blocking_failed_count"] == 2
+    assert json.dumps(payload, sort_keys=True) == original
+
+
+def test_sidebar_status_accepts_immutable_counts_without_mutating_them() -> None:
+    counts = MappingProxyType({"sidebar_failed": 3, "needs_attention": 1})
+    payload = {"counts": counts, "blocking_failed_count": 2}
+
+    status = _sidebar_status(payload)
+
+    assert status["counts"]["needs_attention"] == status["blocking_failed_count"] == 2
+    assert payload["counts"] == counts
 
 
 @pytest.mark.parametrize(

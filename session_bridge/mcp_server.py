@@ -1483,7 +1483,6 @@ def _sidebar_status(value: object) -> dict[str, Any]:
     blocking_failed_count = _nonnegative_status_int(
         source.get("blocking_failed_count"), failed_count
     )
-    state_counts["needs_attention"] = blocking_failed_count
     terminally_resolved_failed_count = _nonnegative_status_int(
         source.get("terminally_resolved_failed_count"), 0
     )
@@ -1592,27 +1591,27 @@ def _sidebar_status(value: object) -> dict[str, Any]:
         if isinstance(raw_degraded_reasons, (list, tuple))
         else []
     )
+    public_counts = {
+        **{
+            state.value: _nonnegative_status_int(state_counts.get(state.value), 0)
+            for state in SidebarJobState
+        },
+        **{
+            field: _nonnegative_status_int(state_counts.get(field), 0)
+            for field in (
+                "ambiguous",
+                "needs_attention",
+                "projectless_legacy_count",
+            )
+        },
+    }
+    public_counts["needs_attention"] = blocking_failed_count
     result = {
         "eligible_by_provider": {
             provider: _nonnegative_status_int(provider_counts.get(provider), 0)
             for provider in (Provider.CLAUDE.value, Provider.HERMES.value)
         },
-        "counts": {
-            **{
-                state.value: _nonnegative_status_int(
-                    state_counts.get(state.value), 0
-                )
-                for state in SidebarJobState
-            },
-            **{
-                field: _nonnegative_status_int(state_counts.get(field), 0)
-                for field in (
-                    "ambiguous",
-                    "needs_attention",
-                    "projectless_legacy_count",
-                )
-            },
-        },
+        "counts": public_counts,
         "blocking_failed_count": blocking_failed_count,
         "terminally_resolved_failed_count": terminally_resolved_failed_count,
         "ineffective_terminal_resolution_count": (
