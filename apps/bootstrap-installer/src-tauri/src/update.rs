@@ -304,7 +304,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         None
     };
 
-    let hermes = resolve_hermes(&install_root).ok_or_else(|| {
+    let hermes = resolve_hermes(&install_root).await.ok_or_else(|| {
         let msg = format!(
             "Could not find the hermes CLI under {}. Is Hermes installed? \
              Re-run the installer to repair the install.",
@@ -904,6 +904,33 @@ impl HermesInvocation {
     }
 }
 
+/// How long the import-probe child gets before we give up on it. This runs
+/// synchronously inside `resolve_hermes`, ahead of the update's stage
+/// manifest — an unbounded probe can hang the whole updater (and hold the
+/// update-in-progress marker) on a wedged/antivirus-stalled interpreter.
+/// Mirrors the timeout/retry spirit of the Electron desktop's
+/// `canImportHermesCli()` probe (apps/desktop/electron/backend-probes.ts),
+/// which bounds its own child the same way.
+const IMPORT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait for `child` up to `timeout`. On timeout, kill and reap it (never
+/// leave a zombie/hung process behind) and report `false` — the same value
+/// as a clean non-zero exit — so callers can treat "no answer in time" the
+/// same as "no". Extracted from `venv_python_can_import_hermes_cli` so the
+/// bounding behavior itself can be unit-tested against a real, controllable
+/// long-lived process instead of depending on the hardcoded `-c` probe args.
+async fn wait_for_child_success(mut child: tokio::process::Child, timeout: Duration) -> bool {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        Ok(Err(_)) => false,
+        Err(_timed_out) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            false
+        }
+    }
+}
+
 /// Same probe as the Electron desktop's `canImportHermesCli()`
 /// (apps/desktop/electron/backend-probes.ts): a venv can have `python.exe` on
 /// disk but be dead (missing deps from an update that died mid-`pip
@@ -911,7 +938,13 @@ impl HermesInvocation {
 /// package) is required before trusting it as a fallback interpreter.
 /// `install_root` is added to `PYTHONPATH` so a source-tree checkout resolves
 /// `hermes_cli` even if the editable install's `.pth`/egg-link is stale.
-fn venv_python_can_import_hermes_cli(python: &Path, install_root: &Path) -> bool {
+///
+/// Bounded by `IMPORT_PROBE_TIMEOUT` (see `wait_for_child_success`): a wedged
+/// interpreter is killed and reaped rather than left to hang `resolve_hermes`
+/// (and therefore the whole update) indefinitely. A timeout is treated the
+/// same as "can't import" — resolution just continues to the next rung
+/// (PATH).
+async fn venv_python_can_import_hermes_cli(python: &Path, install_root: &Path) -> bool {
     if !python.exists() {
         return false;
     }
@@ -920,20 +953,77 @@ fn venv_python_can_import_hermes_cli(python: &Path, install_root: &Path) -> bool
         python_path.push(if cfg!(target_os = "windows") { ";" } else { ":" });
         python_path.push(existing);
     }
-    std::process::Command::new(python)
-        .args(["-c", "import yaml; import dotenv; import hermes_cli.config"])
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", "import yaml; import dotenv; import hermes_cli.config"])
         .env("PYTHONPATH", python_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NO_WINDOW — same as run_streamed's child spawns, no flashing
+        // console behind the GUI for this probe either. tokio::process::Command
+        // exposes this natively on Windows (no CommandExt import needed).
+        cmd.creation_flags(0x0800_0000);
+    }
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let passed = wait_for_child_success(child, IMPORT_PROBE_TIMEOUT).await;
+    if !passed {
+        tracing::debug!(python = %python.display(), "hermes_cli import probe did not succeed");
+    }
+    passed
+}
+
+/// Ordered resolution decision. Pulled out of `resolve_hermes` so the
+/// ordering itself — the actual thing #75584's review flagged — can be unit
+/// tested without a real venv, a real python subprocess, or a mutated PATH.
+/// `resolve_hermes` gathers the real signals (shim presence, the bounded
+/// import probe, PATH) and hands them here.
+fn resolve_hermes_from_signals(
+    install_root: &Path,
+    shim_exists: bool,
+    python_import_probe_passed: bool,
+    path_dirs: &[PathBuf],
+) -> Option<HermesInvocation> {
+    // 1. Target install's own venv shim — the fast, common, already-correct
+    //    path when the install isn't broken.
+    if shim_exists {
+        return Some(HermesInvocation::direct(venv_hermes(install_root)));
+    }
+    // 2. Target install's own venv python, run as a module — the #75584
+    //    recovery path for a shim deleted by an interrupted update, but
+    //    ONLY once validated (see venv_python_can_import_hermes_cli). This
+    //    must outrank PATH: it is still THIS install, just invoked
+    //    differently, whereas a PATH hermes.exe may belong to an entirely
+    //    unrelated install and would silently update the wrong checkout.
+    if python_import_probe_passed {
+        return Some(HermesInvocation {
+            program: venv_python(install_root),
+            prefix_args: vec!["-m".to_string(), "hermes_cli.main".to_string()],
+        });
+    }
+    // 3. PATH fallback — last resort only. which-style probe via env, kept
+    //    dependency-free. We can't cheaply prove a PATH hermes.exe belongs to
+    //    `install_root` (a real one could be a symlink/shim into any venv),
+    //    so treat it as the least-trusted rung rather than rejecting it
+    //    outright: with no working shim and no importable venv python, it is
+    //    still better than failing the update entirely.
+    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+    for dir in path_dirs {
+        let cand = dir.join(exe);
+        if cand.exists() {
+            return Some(HermesInvocation::direct(cand));
+        }
+    }
+    None
 }
 
 /// Resolve the hermes CLI to drive. Prefer the venv shim in the install we
-/// just updated; fall back to `hermes` on PATH; finally fall back to the
-/// venv's own python run as `python -m hermes_cli.main` when the shim is
-/// missing but the venv is otherwise intact.
+/// just updated; then the venv's own python run as `python -m
+/// hermes_cli.main` when the shim is missing but the venv is otherwise
+/// intact; finally fall back to `hermes` on PATH.
 ///
 /// The shim-missing-but-venv-intact case is exactly issue #75584: an
 /// interrupted `hermes update` can leave `venv/Scripts/hermes.exe` deleted
@@ -946,30 +1036,31 @@ fn venv_python_can_import_hermes_cli(python: &Path, install_root: &Path) -> bool
 /// run at all. Mirrors `resolveVenvHermesCommand()` in
 /// apps/desktop/electron/windows-hermes-path.ts, which the Electron desktop
 /// backend launcher already uses for the same recovery.
-fn resolve_hermes(install_root: &Path) -> Option<HermesInvocation> {
+///
+/// PATH is deliberately the LAST rung, not the second one: a `hermes.exe`
+/// resolved from PATH can belong to a completely different install than
+/// `install_root` (another checkout, another profile, a stale global
+/// install). Trying it before the validated venv-python fallback would let a
+/// foreign hermes.exe silently update the wrong checkout while leaving this
+/// (actually recoverable) install broken — the bug this ordering fixes.
+async fn resolve_hermes(install_root: &Path) -> Option<HermesInvocation> {
     let shim = venv_hermes(install_root);
-    if shim.exists() {
-        return Some(HermesInvocation::direct(shim));
-    }
-    // PATH fallback. which-style probe via env, kept dependency-free.
-    let exe = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
-    if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
-        for dir in path.split(sep) {
-            let cand = Path::new(dir).join(exe);
-            if cand.exists() {
-                return Some(HermesInvocation::direct(cand));
-            }
-        }
-    }
-    let python = venv_python(install_root);
-    if venv_python_can_import_hermes_cli(&python, install_root) {
-        return Some(HermesInvocation {
-            program: python,
-            prefix_args: vec!["-m".to_string(), "hermes_cli.main".to_string()],
-        });
-    }
-    None
+    let shim_exists = shim.exists();
+    // Skip the subprocess probe entirely when the shim already resolves —
+    // avoids paying its cost (even bounded) on the common healthy-install path.
+    let python_import_probe_passed = if shim_exists {
+        false
+    } else {
+        let python = venv_python(install_root);
+        venv_python_can_import_hermes_cli(&python, install_root).await
+    };
+    let path_dirs: Vec<PathBuf> = std::env::var("PATH")
+        .map(|path| {
+            let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+            path.split(sep).map(PathBuf::from).collect()
+        })
+        .unwrap_or_default();
+    resolve_hermes_from_signals(install_root, shim_exists, python_import_probe_passed, &path_dirs)
 }
 
 fn update_child_env(install_root: &Path, hermes: &HermesInvocation) -> Vec<(String, OsString)> {
@@ -1348,14 +1439,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn venv_python_can_import_hermes_cli_false_when_interpreter_missing() {
+    #[tokio::test]
+    async fn venv_python_can_import_hermes_cli_false_when_interpreter_missing() {
         let ghost = Path::new("/nonexistent/does/not/exist/python.exe");
-        assert!(!venv_python_can_import_hermes_cli(ghost, Path::new("/nonexistent")));
+        assert!(!venv_python_can_import_hermes_cli(ghost, Path::new("/nonexistent")).await);
     }
 
-    #[test]
-    fn resolve_hermes_prefers_existing_shim_over_python_fallback() {
+    /// Spawn a real, long-lived (30s) sibling process, independent of the
+    /// hardcoded `-c "import ..."` probe args, so timeout tests can exercise
+    /// `wait_for_child_success` directly with a short test-local timeout.
+    fn spawn_long_lived_process() -> tokio::process::Child {
+        let mut cmd = if cfg!(windows) {
+            let mut c = Command::new("timeout");
+            c.args(["/T", "30", "/nobreak"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn long-lived helper process")
+    }
+
+    #[tokio::test]
+    async fn wait_for_child_success_kills_and_returns_false_on_timeout() {
+        // P2 regression: a wedged interpreter (e.g. antivirus-stalled, or a
+        // subprocess-startup deadlock) must not hang resolve_hermes forever.
+        // Use a short local timeout against a real 30s-lived process so the
+        // test itself stays fast while still proving the kill-on-timeout path.
+        let child = spawn_long_lived_process();
+        let pid = child.id();
+
+        let started = Instant::now();
+        let result = wait_for_child_success(child, Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(!result, "a wedged/slow child must resolve to false, not hang");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "must bail out at the local timeout, not wait for the 30s child; took {elapsed:?}"
+        );
+        if let Some(pid) = pid {
+            assert!(
+                !pid_is_alive(pid),
+                "a timed-out child must be killed and reaped, not left running"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_child_success_true_for_a_fast_clean_exit() {
+        let child = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        } else {
+            Command::new("true").spawn().unwrap()
+        };
+        assert!(wait_for_child_success(child, Duration::from_secs(10)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_child_success_false_for_a_fast_nonzero_exit() {
+        let child = if cfg!(windows) {
+            Command::new("cmd").args(["/C", "exit 1"]).spawn().unwrap()
+        } else {
+            Command::new("false").spawn().unwrap()
+        };
+        assert!(!wait_for_child_success(child, Duration::from_secs(10)).await);
+    }
+
+    #[tokio::test]
+    async fn import_probe_timeout_is_a_small_bounded_duration() {
+        // Invariant, not a change-detector: the probe must actually be
+        // bounded (not zero, not accidentally huge) without pinning an exact
+        // literal that would break on a deliberate future retune.
+        assert!(IMPORT_PROBE_TIMEOUT >= Duration::from_secs(1));
+        assert!(IMPORT_PROBE_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn resolve_hermes_prefers_existing_shim_over_python_fallback() {
         // When the console-script shim is present, resolve_hermes must return
         // it directly (no `-m hermes_cli.main` prefix) regardless of whether a
         // venv python or a hermes on PATH would also resolve.
@@ -1366,11 +1531,74 @@ mod tests {
         }
         std::fs::write(&shim, "").unwrap();
 
-        let resolved = resolve_hermes(&dir).expect("shim on disk must resolve");
+        let resolved = resolve_hermes(&dir).await.expect("shim on disk must resolve");
         assert_eq!(resolved.program, shim);
         assert!(resolved.prefix_args.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_hermes_from_signals_prefers_venv_python_over_foreign_path_hermes() {
+        // P1 regression (#75584 review): target shim missing, target venv
+        // python passes the import probe, AND a foreign hermes.exe sits on
+        // PATH. The target's own validated venv python must win — a PATH
+        // hermes.exe can belong to a totally unrelated install and would
+        // silently update the wrong checkout while leaving this (recoverable)
+        // install broken.
+        let install_root = unique_tmp_dir("resolve-signals-install-root");
+        let foreign_dir = unique_tmp_dir("resolve-signals-foreign-path");
+        let exe_name = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+        let foreign_hermes = foreign_dir.join(exe_name);
+        std::fs::write(&foreign_hermes, "").unwrap();
+
+        let resolved = resolve_hermes_from_signals(
+            &install_root,
+            false, // target shim missing
+            true,  // target venv python passed the import probe
+            &[foreign_dir.clone()],
+        )
+        .expect("validated venv python fallback must resolve");
+
+        assert_eq!(
+            resolved.program,
+            venv_python(&install_root),
+            "target install's own venv python must win over a foreign PATH hermes.exe"
+        );
+        assert_eq!(
+            resolved.prefix_args,
+            vec!["-m".to_string(), "hermes_cli.main".to_string()]
+        );
+
+        let _ = std::fs::remove_dir_all(&install_root);
+        let _ = std::fs::remove_dir_all(&foreign_dir);
+    }
+
+    #[test]
+    fn resolve_hermes_from_signals_falls_back_to_path_only_as_last_resort() {
+        // When neither the shim nor the venv python probe resolve, PATH
+        // remains the final rung (better than failing the update outright).
+        let install_root = unique_tmp_dir("resolve-signals-path-fallback");
+        let path_dir = unique_tmp_dir("resolve-signals-path-only");
+        let exe_name = if cfg!(target_os = "windows") { "hermes.exe" } else { "hermes" };
+        let path_hermes = path_dir.join(exe_name);
+        std::fs::write(&path_hermes, "").unwrap();
+
+        let resolved = resolve_hermes_from_signals(&install_root, false, false, &[path_dir.clone()])
+            .expect("PATH fallback must resolve when nothing else does");
+
+        assert_eq!(resolved.program, path_hermes);
+        assert!(resolved.prefix_args.is_empty());
+
+        let _ = std::fs::remove_dir_all(&install_root);
+        let _ = std::fs::remove_dir_all(&path_dir);
+    }
+
+    #[test]
+    fn resolve_hermes_from_signals_none_when_nothing_resolves() {
+        let install_root = unique_tmp_dir("resolve-signals-none");
+        assert!(resolve_hermes_from_signals(&install_root, false, false, &[]).is_none());
+        let _ = std::fs::remove_dir_all(&install_root);
     }
 
     #[test]
