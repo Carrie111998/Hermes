@@ -28,6 +28,7 @@ Usage:
 import os
 import re
 import difflib
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -40,6 +41,12 @@ from agent.file_safety import (
     get_write_denied_error,
     is_write_denied as _shared_is_write_denied,
 )
+
+# File tools are a high-frequency hot path and must fail fast when a mounted
+# repository, language server, or shell backend wedges.  Callers can still
+# request a smaller/larger explicit timeout, but an omitted timeout must never
+# inherit the gateway's much longer agent-level inactivity window.
+FILE_OPERATION_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -851,8 +858,26 @@ class ShellFileOperations(FileOperations):
         originally created in.  See test_file_ops_cwd_tracking.py.
         """
         kwargs = {}
-        if timeout:
-            kwargs['timeout'] = timeout
+        effective_timeout = (
+            FILE_OPERATION_TIMEOUT_SECONDS if timeout is None else timeout
+        )
+        operation_deadline = getattr(self, "_operation_deadline", None)
+        if operation_deadline is not None:
+            remaining = float(operation_deadline) - time.monotonic()
+            if remaining <= 0:
+                return ExecuteResult(
+                    stdout="Patch operation deadline exceeded",
+                    exit_code=124,
+                )
+            # Environment backends accept numeric seconds. A one-second floor
+            # avoids rounding a live sub-second budget down to "no timeout".
+            remaining_timeout = max(1, int(remaining + 0.999))
+            if effective_timeout is None or effective_timeout <= 0:
+                effective_timeout = remaining_timeout
+            else:
+                effective_timeout = min(effective_timeout, remaining_timeout)
+        if effective_timeout:
+            kwargs['timeout'] = effective_timeout
         if stdin_data is not None:
             kwargs['stdin_data'] = stdin_data
 
@@ -866,9 +891,20 @@ class ShellFileOperations(FileOperations):
         )
     
     def _has_command(self, cmd: str) -> bool:
-        """Check if a command exists in the environment (cached)."""
+        """Check if a command is callable in the environment (cached).
+
+        ``command -v`` can return a concrete PATH entry that the current
+        environment cannot execute (for example a non-executable WindowsApps
+        shim visible inside WSL).  Treat shell builtins as available, but
+        require executable permission whenever resolution returns a path.
+        """
         if cmd not in self._command_cache:
-            result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
+            escaped_cmd = self._escape_shell_arg(cmd)
+            result = self._exec(
+                f'resolved="$(command -v {escaped_cmd} 2>/dev/null)" || exit 1; '
+                'case "$resolved" in */*) [ -x "$resolved" ] ;; *) true ;; esac '
+                "&& echo 'yes'"
+            )
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
@@ -1528,6 +1564,35 @@ class ShellFileOperations(FileOperations):
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
 
+        # A successful rename is not sufficient proof that the requested bytes
+        # are now durable at the target path (remote/mounted backends can report
+        # success before a stale or transformed read becomes visible).  Read the
+        # source back immediately and compare the exact logical text.  BOM and
+        # line-ending conventions are normalized because write_file deliberately
+        # preserves those transport-level details.
+        verify_result = self.read_file_raw(path)
+        if verify_result.error:
+            return WriteResult(
+                error=(
+                    f"Post-write verification failed for {path}: "
+                    f"{verify_result.error}. The write outcome is unknown; "
+                    "re-read the file before retrying."
+                )
+            )
+        expected_text, _ = _strip_bom(content)
+        expected_text = expected_text.replace("\r\n", "\n").replace("\r", "\n")
+        actual_text = (verify_result.content or "").replace(
+            "\r\n", "\n"
+        ).replace("\r", "\n")
+        if actual_text != expected_text:
+            return WriteResult(
+                error=(
+                    f"Post-write verification failed for {path}: on-disk "
+                    "content differs from the requested content. The write "
+                    "outcome is unknown; re-read the file before retrying."
+                )
+            )
+
         # Get bytes written (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
@@ -2045,7 +2110,20 @@ class ShellFileOperations(FileOperations):
                 line_shift = None
 
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
+            operation_deadline = getattr(self, "_operation_deadline", None)
+            lsp_timeout = None
+            if operation_deadline is not None:
+                remaining = float(operation_deadline) - time.monotonic()
+                if remaining <= 0:
+                    return ""
+                lsp_timeout = max(0.1, remaining)
+            diagnostics_kwargs: dict[str, Any] = {
+                "delta": True,
+                "line_shift": line_shift,
+            }
+            if lsp_timeout is not None:
+                diagnostics_kwargs["timeout"] = lsp_timeout
+            diagnostics = svc.get_diagnostics_sync(path, **diagnostics_kwargs)
         except Exception:  # noqa: BLE001
             return ""
         if not diagnostics:

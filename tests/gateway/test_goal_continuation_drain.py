@@ -196,3 +196,5 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+    assert adapter._pending_messages[adapter_key].message_id is None
+    assert adapter._pending_messages[adapter_key].internal is True

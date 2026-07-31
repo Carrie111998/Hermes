@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import threading
 import time
+import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -38,6 +40,9 @@ from agent.transports.codex_app_server import (
     CodexAppServerError,
 )
 from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.turn_policy_channel import (
+    CodexTurnPolicyChannel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,69 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+def _toml_key_segment(value: str) -> str:
+    """Quote one TOML dotted-key segment for a Codex config override."""
+
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _restricted_external_tool_args(codex_home: Optional[str]) -> list[str]:
+    """Disable effect-capable tools that bypass Hermes' turn-policy channel.
+
+    Codex's shell and file tools are governed by the protocol sandbox. The
+    built-in ``hermes-tools`` MCP callback is governed by our authenticated
+    per-turn policy channel. Other MCP servers and plugin/app tools run outside
+    both boundaries, and their self-declared read-only annotations are not a
+    trustworthy effect control. Investigation and source-implementation turns
+    therefore start Codex with those direct surfaces disabled. Operation turns
+    retain the user's normal native tool configuration.
+    """
+
+    args = [
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.plugins=false",
+    ]
+    home = Path(
+        codex_home
+        or os.environ.get("CODEX_HOME")
+        or (Path.home() / ".codex")
+    ).expanduser()
+    config_path = home / "config.toml"
+    if not config_path.exists():
+        return args
+
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(
+            "Cannot enforce the request-phase boundary because Codex's "
+            f"MCP configuration could not be read: {exc}"
+        ) from exc
+
+    servers = config.get("mcp_servers") or {}
+    if not isinstance(servers, dict):
+        raise RuntimeError(
+            "Cannot enforce the request-phase boundary because Codex's "
+            "mcp_servers configuration is not a table."
+        )
+    for server_name in sorted(str(name) for name in servers):
+        if server_name == "hermes-tools":
+            continue
+        args.extend(
+            [
+                "-c",
+                (
+                    "mcp_servers."
+                    f"{_toml_key_segment(server_name)}.enabled=false"
+                ),
+            ]
+        )
+    return args
 
 
 @dataclass
@@ -278,6 +346,9 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        request_phase: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
+        enforce_read_only: bool = False,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -292,12 +363,16 @@ class CodexAppServerSession:
                 "workspace-write",
             )
         )
+        self.request_phase = request_phase
+        self.developer_instructions = developer_instructions
+        self.enforce_read_only = bool(enforce_read_only)
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
         self._client: Optional[CodexAppServerClient] = None
+        self._turn_policy_channel: Optional[CodexTurnPolicyChannel] = None
         self._thread_id: Optional[str] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
@@ -318,10 +393,24 @@ class CodexAppServerSession:
         return the same thread id."""
         if self._thread_id is not None:
             return self._thread_id
+        if self.request_phase and (
+            self._turn_policy_channel is None
+            or not self._turn_policy_channel.published
+        ):
+            self._publish_turn_policy("")
         if self._client is None:
-            self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
-            )
+            client_kwargs: dict[str, Any] = {
+                "codex_bin": self._codex_bin,
+                "codex_home": self._codex_home,
+            }
+            if self.request_phase and self.request_phase != "operation":
+                client_kwargs["extra_args"] = _restricted_external_tool_args(
+                    self._codex_home
+                )
+            if self._turn_policy_channel is not None:
+                policy_environment = self._turn_policy_channel.environment
+                client_kwargs["env"] = policy_environment
+            self._client = self._client_factory(**client_kwargs)
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
@@ -343,6 +432,17 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
+        if self.developer_instructions:
+            params["developerInstructions"] = self.developer_instructions
+        if self.request_phase:
+            # This protocol-level sandbox is the enforcement point for Codex
+            # configurations that execute without emitting approval requests.
+            # Clean implementation retains native write power inside its
+            # isolated worktree, but cannot wander into another dirty checkout.
+            params["sandbox"] = (
+                "read-only" if self.enforce_read_only else "workspace-write"
+            )
+            params["approvalPolicy"] = "never"
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
@@ -384,7 +484,26 @@ class CodexAppServerSession:
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._client = None
+        if self._turn_policy_channel is not None:
+            self._turn_policy_channel.close()
+            self._turn_policy_channel = None
         self._thread_id = None
+
+    def _publish_turn_policy(self, user_input: str) -> None:
+        """Publish the parent ContextVar state for the Codex MCP subprocess."""
+
+        if not self.request_phase:
+            return
+        if self._turn_policy_channel is None:
+            self._turn_policy_channel = CodexTurnPolicyChannel()
+        from agent.request_phase import current_turn_policy
+
+        self._turn_policy_channel.publish(
+            current_turn_policy(),
+            fallback_phase=self.request_phase,
+            fallback_request_text=user_input,
+            fallback_workspace=self._cwd,
+        )
 
     def __enter__(self) -> "CodexAppServerSession":
         return self
@@ -491,6 +610,17 @@ class CodexAppServerSession:
         # the caller can render — instead of bubbling raw codex exceptions
         # up to AIAgent.run_conversation.
         result = TurnResult()
+        user_input_text = _coerce_turn_input_text(user_input)
+        try:
+            self._publish_turn_policy(user_input_text)
+        except Exception as exc:
+            result.error = (
+                "codex app-server safety initialization failed: "
+                f"{exc}"
+            )
+            result.should_retire = True
+            self._interrupt_event.clear()
+            return result
         try:
             self.ensure_started()
         except (CodexAppServerError, TimeoutError) as exc:
@@ -513,8 +643,6 @@ class CodexAppServerSession:
             self._interrupt_event.clear()
             return result
         projector = CodexEventProjector()
-
-        user_input_text = _coerce_turn_input_text(user_input)
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
@@ -1066,13 +1194,31 @@ class CodexAppServerSession:
         gate (mode + ``approvals.timeout``) in ``tools/approval.py``.
         Keep it that way — do not re-read approval config here.
         """
-        if self._routing.auto_approve_exec:
-            return "accept"
         command = params.get("command") or ""
         # Codex's CommandExecutionRequestApprovalParams has cwd as Optional —
         # fall back to the session's cwd when codex doesn't include it so the
         # approval prompt is never empty (quirk #10 fix).
         cwd = params.get("cwd") or self._cwd or "<unknown>"
+        try:
+            from agent.request_phase import guard_tool_call
+
+            normalized_command = (
+                " ".join(str(part) for part in command)
+                if isinstance(command, (list, tuple))
+                else str(command)
+            )
+            phase_block = guard_tool_call(
+                "terminal",
+                {"command": normalized_command, "workdir": str(cwd)},
+            )
+        except Exception:
+            logger.exception("request-phase guard failed for codex exec")
+            return "decline"
+        if phase_block is not None:
+            logger.warning("codex exec declined by request phase: %s", phase_block)
+            return "decline"
+        if self._routing.auto_approve_exec:
+            return "accept"
         reason = params.get("reason")
         description = f"Codex requests exec in {cwd}"
         if reason:
@@ -1095,6 +1241,23 @@ class CodexAppServerSession:
         resolution is delegated to ``tools/approval.py`` upstream — see
         the docstring on ``_decide_exec_approval``.
         """
+        try:
+            from agent.request_phase import guard_tool_call
+
+            patch_root = params.get("grantRoot") or self._cwd
+            phase_block = guard_tool_call(
+                "patch",
+                {"mode": "replace", "path": str(patch_root)},
+            )
+        except Exception:
+            logger.exception("request-phase guard failed for codex apply_patch")
+            return "decline"
+        if phase_block is not None:
+            logger.warning(
+                "codex apply_patch declined by request phase: %s",
+                phase_block,
+            )
+            return "decline"
         if self._routing.auto_approve_apply_patch:
             return "accept"
         if self._approval_callback is not None:

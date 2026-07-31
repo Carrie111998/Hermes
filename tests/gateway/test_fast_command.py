@@ -30,6 +30,7 @@ class _CapturingAgent:
         task_id=None,
         persist_user_message=None,
         persist_user_timestamp=None,
+        persist_user_platform_message_id=None,
     ):
         type(self).last_run = {
             "user_message": user_message,
@@ -37,6 +38,9 @@ class _CapturingAgent:
             "task_id": task_id,
             "persist_user_message": persist_user_message,
             "persist_user_timestamp": persist_user_timestamp,
+            "persist_user_platform_message_id": (
+                persist_user_platform_message_id
+            ),
         }
         return {
             "final_response": "ok",
@@ -102,6 +106,49 @@ def _make_discord_auto_thread_source() -> SessionSource:
 
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+def test_telegram_provenance_uses_only_original_inbound_message_id():
+    event = _make_event("do this")
+    event.message_id = "42197"
+    event.reply_to_message_id = "99999"
+    event.source.message_id = "88888"
+
+    assert (
+        gateway_run._required_inbound_platform_message_id(event)
+        == "42197"
+    )
+
+
+@pytest.mark.parametrize("message_id", [None, "", " 42197", "42197 "])
+def test_telegram_provenance_fails_closed_without_exact_message_id(message_id):
+    event = _make_event("do this")
+    event.message_id = message_id
+    event.reply_to_message_id = "99999"
+
+    with pytest.raises(
+        RuntimeError,
+        match="original message ID is unavailable",
+    ):
+        gateway_run._required_inbound_platform_message_id(event)
+
+
+def test_non_telegram_turn_does_not_require_platform_message_id():
+    event = MessageEvent(
+        text="do this",
+        source=_make_discord_auto_thread_source(),
+        message_id=None,
+    )
+
+    assert gateway_run._required_inbound_platform_message_id(event) is None
+
+
+def test_internal_synthetic_telegram_turn_does_not_require_message_id():
+    event = _make_event("Resume the interrupted task.")
+    event.message_id = None
+    event.internal = True
+
+    assert gateway_run._required_inbound_platform_message_id(event) is None
 
 
 def test_turn_route_injects_priority_processing_without_changing_runtime():

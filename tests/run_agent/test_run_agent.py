@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -2551,6 +2554,351 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+        assert result["run_terminal_state"] == "done"
+        assert result["run_end_reason"] == "text_response(finish_reason=stop)"
+        assert result["final_generated"] is True
+        assert isinstance(result["run_ended_at"], float)
+
+    @pytest.mark.parametrize(
+        ("inner_result", "expected_state", "expected_relay_outcome"),
+        [
+            (
+                {
+                    "final_response": "Done with proof.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+                "done",
+                "success",
+            ),
+            (
+                {
+                    "final_response": "One exact approval is required.",
+                    "completed": False,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "guardrail_halt",
+                    "guardrail": {"reason": "protected_effect"},
+                },
+                "blocked",
+                "failed",
+            ),
+            (
+                {
+                    "final_response": "The run failed explicitly.",
+                    "completed": False,
+                    "failed": True,
+                    "interrupted": False,
+                    "turn_exit_reason": "system_aborted",
+                },
+                "failed",
+                "failed",
+            ),
+            (
+                {
+                    "final_response": "The run was cancelled.",
+                    "completed": False,
+                    "failed": False,
+                    "interrupted": True,
+                    "turn_exit_reason": "interrupted_by_user",
+                },
+                "cancelled",
+                "cancelled",
+            ),
+        ],
+    )
+    def test_each_returned_run_gets_one_terminal_receipt(
+        self,
+        agent,
+        inner_result,
+        expected_state,
+        expected_relay_outcome,
+    ):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=dict(inner_result),
+            ),
+        ):
+            result = agent.run_conversation("hello", task_id="terminal-task")
+
+        assert result["run_terminal_state"] == expected_state
+        assert result["run_end_reason"] == inner_result["turn_exit_reason"]
+        assert result["final_generated"] is True
+        assert isinstance(result["run_ended_at"], float)
+        finish_task_run.assert_called_once()
+        assert finish_task_run.call_args.kwargs["result"] is result
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(result["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == expected_state
+        assert durable["run_end_reason"] == inner_result["turn_exit_reason"]
+        assert durable["run_ended_at"] == result["run_ended_at"]
+        assert durable["final_generated"] is True
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome=expected_relay_outcome,
+        )
+        coordinator.release_conversation.assert_called_once_with(relay_lease)
+
+    def test_telemetry_disabled_still_writes_local_terminal_receipt(
+        self,
+        agent,
+    ):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = object()
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run",
+                return_value=None,
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value={
+                    "final_response": "Done with local proof.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+            ),
+        ):
+            result = agent.run_conversation(
+                "hello",
+                task_id="telemetry-disabled",
+            )
+
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(result["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "done"
+        assert durable["run_end_reason"] == result["run_end_reason"]
+        assert durable["run_ended_at"] == result["run_ended_at"]
+        assert durable["final_generated"] is True
+
+    def test_deferred_terminal_receipt_stays_running_until_gateway_owner_closes(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from gateway import delivery_ledger as dl
+
+        receipt_id = "gateway-owned-background-receipt"
+        dl.begin_run_receipt(
+            run_receipt_id=receipt_id,
+            session_id="background-session",
+            task_id="background-task",
+            session_key="gateway:background:task",
+            platform="telegram",
+            run_generation=0,
+            message_ref="incoming-1",
+        )
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = object()
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value={
+                    "final_response": "Generated, awaiting gateway effects.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+            ),
+        ):
+            result = agent.run_conversation(
+                "hello",
+                task_id="background-task",
+                run_receipt_id=receipt_id,
+                persist_terminal_receipt=False,
+            )
+
+        assert result["run_receipt_id"] == receipt_id
+        assert result["run_terminal_state"] == "done"
+        assert result["final_generated"] is True
+        durable = dl.get_run_terminal_receipt(receipt_id)
+        assert durable is not None
+        assert durable["run_terminal_state"] == "running"
+        assert durable["run_end_reason"] is None
+        assert durable["run_ended_at"] is None
+        assert durable["final_generated"] is False
+
+        monkeypatch.setattr(dl, "_owner_alive", lambda *_args: False)
+        closed = dl.sweep_dead_run_receipts(now=9000.0)
+        assert closed == [receipt_id]
+        swept = dl.get_run_terminal_receipt(receipt_id)
+        assert swept is not None
+        assert swept["run_terminal_state"] == "failed"
+        assert swept["run_end_reason"] == "process_terminated_unknown_outcome"
+        assert swept["run_ended_at"] == 9000.0
+        assert swept["final_generated"] is False
+
+    def test_exception_path_closes_run_as_explicit_failure(self, agent):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        run_error = RuntimeError("producer failed")
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                side_effect=run_error,
+            ),
+        ):
+            with pytest.raises(RuntimeError, match="producer failed"):
+                agent.run_conversation("hello", task_id="terminal-error")
+
+        finish_task_run.assert_called_once()
+        receipt = finish_task_run.call_args.kwargs["result"]
+        assert receipt["run_terminal_state"] == "failed"
+        assert receipt["run_end_reason"] == "system_aborted"
+        assert receipt["final_generated"] is False
+        assert receipt["failed"] is True
+        assert receipt["interrupted"] is False
+        assert isinstance(receipt["run_ended_at"], float)
+        assert run_error.hermes_terminal_receipt == receipt
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(receipt["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "failed"
+        assert durable["run_end_reason"] == "system_aborted"
+        assert durable["run_ended_at"] == receipt["run_ended_at"]
+        assert durable["final_generated"] is False
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome="failed",
+        )
+        coordinator.release_conversation.assert_called_once_with(relay_lease)
+
+    def test_cancelled_exception_closes_run_as_cancelled_receipt(self, agent):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        run_error = InterruptedError("owner cancelled")
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                side_effect=run_error,
+            ),
+        ):
+            with pytest.raises(InterruptedError, match="owner cancelled"):
+                agent.run_conversation("hello", task_id="terminal-cancel")
+
+        receipt = finish_task_run.call_args.kwargs["result"]
+        assert receipt["run_terminal_state"] == "cancelled"
+        assert receipt["run_end_reason"] == "interrupted_by_user"
+        assert receipt["final_generated"] is False
+        assert receipt["failed"] is False
+        assert receipt["interrupted"] is True
+        assert run_error.hermes_terminal_receipt == receipt
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(receipt["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "cancelled"
+        assert durable["run_end_reason"] == "interrupted_by_user"
+        assert durable["run_ended_at"] == receipt["run_ended_at"]
+        assert durable["final_generated"] is False
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome="cancelled",
+        )
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
@@ -3670,7 +4018,9 @@ class TestRunConversation:
             agent.client.chat.completions.create.side_effect = [
                 truncated_resp, good_resp, final_resp,
             ]
-            result = agent.run_conversation("write the report")
+            result = agent.run_conversation(
+                "Implement the report file in the repository."
+            )
 
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
@@ -3712,7 +4062,9 @@ class TestRunConversation:
             agent.client.chat.completions.create.side_effect = [
                 stall1, stall2, good_resp, final_resp,
             ]
-            result = agent.run_conversation("write the report")
+            result = agent.run_conversation(
+                "Implement the report file in the repository."
+            )
 
         # Recovered on the 3rd attempt instead of refusing after the 1st.
         mock_hfc.assert_called_once()
@@ -5712,5 +6064,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
-

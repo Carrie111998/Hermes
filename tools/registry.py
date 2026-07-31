@@ -21,10 +21,32 @@ import logging
 import sys
 import threading
 import time
+from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+
+class ToolEffect(str, Enum):
+    """Durable-effect classification enforced by request-phase policy."""
+
+    READ_ONLY = "read_only"
+    EFFECTFUL = "effectful"
+    UNKNOWN = "unknown"
+
+
+ToolEffectResolver = ToolEffect | str | Callable[
+    [Mapping[str, Any]],
+    ToolEffect | str,
+]
+
+
+def _coerce_tool_effect(value: Any) -> ToolEffect:
+    try:
+        return value if isinstance(value, ToolEffect) else ToolEffect(str(value))
+    except (TypeError, ValueError):
+        return ToolEffect.UNKNOWN
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -163,12 +185,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "effect",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 effect=ToolEffect.UNKNOWN):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +210,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.effect = effect
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +472,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        effect: ToolEffectResolver = ToolEffect.UNKNOWN,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -508,6 +533,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                effect=effect,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -687,12 +713,53 @@ class ToolRegistry:
         if not entry:
             return tool_error(f"Unknown tool: {name}")
         try:
+            from agent.request_phase import guard_tool_call
+
+            phase_block = guard_tool_call(
+                name,
+                args,
+                trusted_cwd=kwargs.get("trusted_cwd"),
+            )
+        except Exception as exc:
+            try:
+                from agent.request_phase import current_turn_policy
+
+                policy_active = current_turn_policy() is not None
+            except Exception:
+                policy_active = True
+            if policy_active:
+                return tool_error(
+                    "Request-phase safety block: the final tool-effect "
+                    f"classification failed ({exc}). No effect was executed."
+                )
+            phase_block = None
+        if phase_block is not None:
+            return tool_error(
+                phase_block,
+                error_type="request_phase_block",
+                tool=name,
+            )
+        try:
             if entry.is_async:
                 from model_tools import _run_async
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            normalized = self._normalize_handler_result(name, result)
+            try:
+                from agent.request_phase import record_tool_effect_result
+
+                record_tool_effect_result(
+                    name,
+                    args,
+                    normalized,
+                    trusted_cwd=kwargs.get("trusted_cwd"),
+                )
+            except Exception:
+                logger.exception(
+                    "Tool %s post-effect repository receipt failed", name
+                )
+            return normalized
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
             # Route through the sanitizer so framing tokens / CDATA / fences
@@ -704,7 +771,22 @@ class ToolRegistry:
                 sanitized = _sanitize_tool_error(raw)
             except Exception:
                 sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return tool_error(sanitized)
+            failed_result = tool_error(sanitized)
+            try:
+                from agent.request_phase import record_tool_effect_result
+
+                record_tool_effect_result(
+                    name,
+                    args,
+                    failed_result,
+                    trusted_cwd=kwargs.get("trusted_cwd"),
+                )
+            except Exception:
+                logger.exception(
+                    "Tool %s failed-effect repository receipt failed",
+                    name,
+                )
+            return failed_result
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)
@@ -737,6 +819,25 @@ class ToolRegistry:
         """Return the toolset a tool belongs to, or None."""
         entry = self.get_entry(name)
         return entry.toolset if entry else None
+
+    def get_effect(
+        self,
+        name: str,
+        args: Optional[Mapping[str, Any]] = None,
+    ) -> ToolEffect:
+        """Return the registered tool's effect, failing closed on ambiguity."""
+
+        entry = self.get_entry(name)
+        if entry is None:
+            return ToolEffect.UNKNOWN
+        effect = entry.effect
+        if callable(effect):
+            try:
+                effect = effect(args or {})
+            except Exception:
+                logger.exception("Tool %s effect classifier failed", name)
+                return ToolEffect.UNKNOWN
+        return _coerce_tool_effect(effect)
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""

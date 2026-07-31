@@ -564,6 +564,12 @@ def _build_hermes_tools_mcp_entry() -> dict:
     HERMES_HOME and PYTHONPATH are passed through so the spawned process
     sees the same config + module layout the user is running."""
     import sys
+    from agent.transports.turn_policy_channel import (
+        POLICY_DB_ENV,
+        POLICY_ID_ENV,
+        POLICY_KEY_ENV,
+        POLICY_REQUIRED_ENV,
+    )
 
     env: dict[str, str] = {}
     # HERMES_HOME passes through IF SET so the MCP subprocess sees the same
@@ -592,10 +598,23 @@ def _build_hermes_tools_mcp_entry() -> dict:
     # Quiet mode + redaction defaults so the MCP wire stays clean.
     env["HERMES_QUIET"] = "1"
     env["HERMES_REDACT_SECRETS"] = env.get("HERMES_REDACT_SECRETS", "true")
+    # A fixed marker makes a missing/partial dynamic policy channel fail
+    # closed for every MCP effect instead of silently falling back to the
+    # standalone-server compatibility path.
+    env[POLICY_REQUIRED_ENV] = "1"
 
     out: dict[str, Any] = {
         "command": sys.executable,
         "args": ["-m", "agent.transports.hermes_tools_mcp_server"],
+        # Values are generated per Codex session and placed only in the
+        # app-server environment. Codex forwards these named variables to
+        # this built-in MCP child without persisting secrets or temp paths in
+        # config.toml and without exposing them in command-line overrides.
+        "env_vars": [
+            POLICY_DB_ENV,
+            POLICY_ID_ENV,
+            POLICY_KEY_ENV,
+        ],
     }
     if env:
         out["env"] = env

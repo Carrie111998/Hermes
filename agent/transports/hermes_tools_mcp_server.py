@@ -211,7 +211,20 @@ def _build_server() -> Any:
                     # Filter out None values before dispatch so unset optionals
                     # aren't forwarded to the handler.
                     args = {k: v for k, v in kwargs.items() if v is not None}
-                    return handle_function_call(tool_name, args or {})
+                    # The Codex app-server and this MCP callback are separate
+                    # processes, so the parent's request-policy ContextVar is
+                    # not inherited. Route through the authenticated
+                    # per-session channel to preserve skill selection and
+                    # payload ceilings across that process boundary.
+                    from agent.transports.turn_policy_channel import (
+                        dispatch_with_turn_policy,
+                    )
+
+                    return dispatch_with_turn_policy(
+                        tool_name,
+                        args or {},
+                        handle_function_call,
+                    )
                 except Exception as exc:
                     logger.exception("tool %s raised", tool_name)
                     return json.dumps({"error": str(exc), "tool": tool_name})

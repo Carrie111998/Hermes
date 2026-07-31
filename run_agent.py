@@ -367,6 +367,90 @@ def _safe_session_filename_component(session_id: str) -> str:
     return f"{sanitized}_{digest}"
 
 
+def _apply_run_terminal_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the exact terminal truth for one agent invocation.
+
+    Conversation sessions intentionally remain open across user messages. The
+    per-run receipt is the terminal boundary: every returned invocation is
+    ``done``, ``blocked``, ``failed``, or ``cancelled`` and separately reports
+    whether a visible final was generated. Platform delivery proof is added
+    later by the gateway and must never be inferred from generation alone.
+    """
+
+    reason = str(
+        result.get("turn_exit_reason")
+        or result.get("failure_reason")
+        or ""
+    ).strip()
+    final_response = result.get("final_response")
+    final_generated = bool(
+        isinstance(final_response, str)
+        and final_response.strip()
+        and final_response.strip() != "(empty)"
+    )
+    reason_lower = reason.lower()
+    if (
+        result.get("interrupted") is True
+        or "interrupt" in reason_lower
+        or "cancel" in reason_lower
+    ):
+        terminal_state = "cancelled"
+    elif (
+        result.get("guardrail") is not None
+        or "guardrail" in reason_lower
+        or (
+            "approval" in reason_lower
+            and ("denied" in reason_lower or "rejected" in reason_lower)
+        )
+    ):
+        terminal_state = "blocked"
+    elif (
+        result.get("failed") is True
+        or result.get("interrupted") is True
+        or result.get("completed") is False
+        or not final_generated
+    ):
+        terminal_state = "failed"
+    else:
+        terminal_state = "done"
+
+    result["run_terminal_state"] = terminal_state
+    result["run_ended_at"] = time.time()
+    result["run_end_reason"] = (
+        reason
+        or ("completed" if terminal_state == "done" else terminal_state)
+    )
+    result["final_generated"] = final_generated
+    return result
+
+
+def _exception_run_terminal_receipt(exc: BaseException) -> Dict[str, Any]:
+    """Build a bounded structured receipt before propagating an exception."""
+
+    cancelled = isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
+        type(exc).__name__ == "CancelledError"
+    )
+    timed_out = isinstance(exc, TimeoutError)
+    terminal_state = "cancelled" if cancelled else "failed"
+    reason = (
+        "interrupted_by_user"
+        if cancelled
+        else "timed_out"
+        if timed_out
+        else "system_aborted"
+    )
+    return {
+        "completed": False,
+        "failed": not cancelled,
+        "interrupted": cancelled,
+        "turn_exit_reason": reason,
+        "run_terminal_state": terminal_state,
+        "run_ended_at": time.time(),
+        "run_end_reason": reason,
+        "final_generated": False,
+    }
+
+
 class _StreamErrorEvent(Exception):
     """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
 
@@ -2150,6 +2234,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                platform_message_id = msg.get("platform_message_id")
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -2163,6 +2248,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    platform_message_id=platform_message_id,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                     display_kind=(
@@ -7018,11 +7104,19 @@ class AIAgent:
         stream_callback: Optional[callable] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        run_receipt_id: Optional[str] = None,
+        persist_terminal_receipt: bool = True,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        ``persist_terminal_receipt=False`` transfers durable receipt ownership
+        to the caller. The agent still returns or attaches exact terminal
+        fields, but it does not begin or close the supplied receipt.
+        """
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -7037,6 +7131,7 @@ class AIAgent:
             finish_task_run,
             start_task_run,
         )
+        from agent.request_phase import push_turn_policy, reset_turn_policy
         from agent.subagent_lifecycle import bind_subagent_parent
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
@@ -7048,6 +7143,20 @@ class AIAgent:
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
+        pending_run_receipt_id = getattr(
+            self,
+            "_pending_run_receipt_id",
+            None,
+        )
+        supplied_run_receipt_id = run_receipt_id or pending_run_receipt_id
+        local_run_receipt_id = (
+            str(supplied_run_receipt_id).strip()
+            if isinstance(supplied_run_receipt_id, str)
+            and supplied_run_receipt_id.strip()
+            else relay_turn_id
+        )
+        if pending_run_receipt_id is not None:
+            self._pending_run_receipt_id = None
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -7058,10 +7167,27 @@ class AIAgent:
         relay_turn = None
         token = None
         acct_token = None
+        phase_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
         try:
+            if persist_terminal_receipt:
+                from gateway.delivery_ledger import begin_run_receipt
+
+                begin_run_receipt(
+                    run_receipt_id=local_run_receipt_id,
+                    session_id=session_id,
+                    task_id=effective_task_id,
+                    platform=task_context["platform"],
+                )
+            phase_token = push_turn_policy(
+                persist_user_message
+                if persist_user_message is not None
+                else user_message,
+                cwd=getattr(self, "session_cwd", None),
+                prior_context=conversation_history,
+            )
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
                 session_id=task_context["session_id"],
@@ -7109,14 +7235,23 @@ class AIAgent:
                     stream_callback,
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
+                    persist_user_platform_message_id=(
+                        persist_user_platform_message_id
+                    ),
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                 )
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "Agent run returned without a structured terminal result."
+                )
+            result = _apply_run_terminal_receipt(result)
+            result["run_receipt_id"] = local_run_receipt_id
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
-            elif terminal.get("failed") is True:
+            elif terminal.get("run_terminal_state") in {"blocked", "failed"}:
                 relay_outcome = "failed"
             else:
                 relay_outcome = "success"
@@ -7125,9 +7260,60 @@ class AIAgent:
                 outcome=relay_outcome,
             )
             task_finished = True
+            if persist_terminal_receipt:
+                from gateway.delivery_ledger import record_run_terminal_receipt
+
+                record_run_terminal_receipt(
+                    run_receipt_id=local_run_receipt_id,
+                    session_id=session_id,
+                    task_id=effective_task_id,
+                    platform=task_context["platform"],
+                    run_terminal_state=result["run_terminal_state"],
+                    run_end_reason=result["run_end_reason"],
+                    run_ended_at=result["run_ended_at"],
+                    final_generated=result["final_generated"],
+                )
             finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            terminal_receipt = _exception_run_terminal_receipt(exc)
+            terminal_receipt["run_receipt_id"] = local_run_receipt_id
+            if persist_terminal_receipt:
+                try:
+                    from gateway.delivery_ledger import (
+                        record_run_terminal_receipt,
+                    )
+
+                    record_run_terminal_receipt(
+                        run_receipt_id=local_run_receipt_id,
+                        session_id=session_id,
+                        task_id=effective_task_id,
+                        platform=task_context["platform"],
+                        run_terminal_state=terminal_receipt[
+                            "run_terminal_state"
+                        ],
+                        run_end_reason=terminal_receipt["run_end_reason"],
+                        run_ended_at=terminal_receipt["run_ended_at"],
+                        final_generated=terminal_receipt["final_generated"],
+                    )
+                except Exception:
+                    # The locally owned receipt already exposes "running".
+                    # A terminal update failure must not hide the run exception
+                    # or replace it with observability machinery.
+                    logger.exception(
+                        "Failed to finalize local run terminal receipt %s",
+                        local_run_receipt_id,
+                    )
+            try:
+                setattr(
+                    exc,
+                    "hermes_terminal_receipt",
+                    dict(terminal_receipt),
+                )
+            except Exception:
+                # Some foreign exception types may reject custom attributes.
+                # The durable task receipt below still closes the run.
+                pass
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):
@@ -7141,7 +7327,10 @@ class AIAgent:
                 )
             if task_started and not task_finished:
                 task_finished = True
-                finish_task_run(**task_context, error=exc)
+                finish_task_run(
+                    **task_context,
+                    result=terminal_receipt,
+                )
             raise
         finally:
             try:
@@ -7159,6 +7348,8 @@ class AIAgent:
                 finally:
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    if phase_token is not None:
+                        reset_turn_policy(phase_token)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

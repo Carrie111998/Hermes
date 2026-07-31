@@ -5049,12 +5049,14 @@ class BasePlatformAdapter(ABC):
             return result
 
         error_str = result.error or ""
-        is_network = result.retryable or self._is_retryable_error(error_str)
+        from gateway.delivery_ledger import delivery_result_is_unknown
 
-        # Timeout errors are not safe to retry (message may have been
-        # delivered) and not formatting errors — return the failure as-is.
-        if not is_network and self._is_timeout_error(error_str):
+        # A timeout or explicitly unclassified effect may already have reached
+        # the platform. Never retry it inside the same producer run.
+        if delivery_result_is_unknown(result):
             return result
+
+        is_network = result.retryable or self._is_retryable_error(error_str)
 
         if is_network:
             # Retry with exponential backoff for transient errors.
@@ -5082,6 +5084,8 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
                     return result
                 error_str = result.error or ""
+                if delivery_result_is_unknown(result):
+                    return result
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
                 if not (result.retryable or self._is_retryable_error(error_str)):
@@ -5759,6 +5763,32 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    @staticmethod
+    def _group_diagnostic_replacement(event: MessageEvent, text: str | None) -> str | None:
+        """Return a concise group-safe failure notice for internal diagnostics.
+
+        Group channels are operator surfaces. Raw provider diagnostics are noisy,
+        but dropping them is worse for explicitly addressed operational tasks: the
+        group sees no reply and assumes the task may have happened. Convert known
+        model-empty failures into a short, action-safe notice instead.
+        """
+        if not text:
+            return None
+        source = getattr(event, "source", None)
+        if getattr(source, "chat_type", None) not in {"group", "channel", "thread"}:
+            return None
+        lowered = text.lower()
+        diagnostic_markers = (
+            "empty response from model",
+            "empty response (no content",
+            "empty response after",
+            "no fallback available",
+            "model returned empty",
+        )
+        if not any(marker in lowered for marker in diagnostic_markers):
+            return None
+        return "Hank hit a model error before completing this. No change was made — please retry or tag Hank again."
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -5919,6 +5949,15 @@ class BasePlatformAdapter(ABC):
                         )
                         text_content = _recovered
 
+                _group_diag_replacement = self._group_diagnostic_replacement(event, text_content)
+                if _group_diag_replacement:
+                    logger.info(
+                        "[%s] Rewriting group diagnostic response for %s",
+                        self.name, event.source.chat_id,
+                    )
+                    text_content = _group_diag_replacement
+                    response = _group_diag_replacement
+
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
@@ -6026,11 +6065,13 @@ class BasePlatformAdapter(ABC):
                     # response BEFORE the send attempt so a gateway crash
                     # between finalize and platform ACK can redeliver it on
                     # the next boot instead of silently losing the turn's
-                    # output (#58818). Best-effort at every step — ledger
-                    # trouble must never block or delay the actual send.
+                    # output (#58818). Generated + attempting checkpoints are
+                    # a precondition for the effect; an untracked final would
+                    # recreate the silent-loss window this ledger closes.
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _delivery_ledger_error = ""
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -6058,32 +6099,57 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    run_receipt_id=getattr(
+                                        event,
+                                        "_hermes_run_receipt_id",
+                                        None,
+                                    ),
                                 )
                                 mark_attempting(_obligation_id)
-                        except Exception:
-                            logger.debug("delivery ledger record failed", exc_info=True)
+                        except Exception as exc:
+                            _delivery_ledger_error = (
+                                "Final delivery was blocked before send because "
+                                "Hermes could not persist its generated/"
+                                "attempting delivery receipt "
+                                f"({type(exc).__name__})."
+                            )
+                            logger.error(
+                                "delivery ledger checkpoint failed; blocking "
+                                "turn-final send",
+                                exc_info=True,
+                            )
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if _delivery_ledger_error:
+                        result = SendResult(
+                            success=False,
+                            error=_delivery_ledger_error,
+                            error_kind="transient",
+                            retryable=True,
+                        )
+                    else:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
+                                delivery_result_is_unknown,
                                 mark_delivered,
                                 mark_failed,
                             )
 
                             if getattr(result, "success", False):
                                 mark_delivered(_obligation_id)
-                            else:
+                            elif not delivery_result_is_unknown(result):
                                 mark_failed(
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
                                 )
+                            # Unknown outcomes deliberately remain attempting.
                         except Exception:
                             logger.debug(
                                 "delivery ledger update failed", exc_info=True
@@ -6317,6 +6383,26 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            _cancelled_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _cancelled_receipt_id:
+                try:
+                    from gateway.delivery_ledger import amend_run_terminal_receipt
+
+                    amend_run_terminal_receipt(
+                        _cancelled_receipt_id,
+                        run_terminal_state="cancelled",
+                        run_end_reason="gateway_processing_cancelled",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to persist cancelled run receipt %s",
+                        self.name,
+                        _cancelled_receipt_id,
+                    )
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6324,6 +6410,26 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            _failed_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _failed_receipt_id:
+                try:
+                    from gateway.delivery_ledger import amend_run_terminal_receipt
+
+                    amend_run_terminal_receipt(
+                        _failed_receipt_id,
+                        run_terminal_state="failed",
+                        run_end_reason=f"gateway_delivery_exception:{type(e).__name__}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to persist failed run receipt %s",
+                        self.name,
+                        _failed_receipt_id,
+                    )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence

@@ -19,6 +19,17 @@ from gateway.restart import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_hygiene_migration(monkeypatch):
+    """Service-control unit tests must never migrate unmanaged live files."""
+
+    monkeypatch.setattr(
+        gateway_cli,
+        "_migrate_gateway_hygiene_hold_support",
+        lambda **_kwargs: None,
+    )
+
+
 class TestUserSystemdPrivateSocketPreflight:
     def test_preflight_accepts_private_socket_without_dbus_bus(self, monkeypatch):
         monkeypatch.setattr(gateway_cli, "_ensure_user_systemd_env", lambda: None)
@@ -503,6 +514,11 @@ class TestGatewaySystemServiceRouting:
         )
         monkeypatch.setattr(
             gateway_cli,
+            "_systemd_main_pid",
+            lambda system=False: 654,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
             "_graceful_restart_via_sigusr1",
             lambda pid, timeout: calls.append(("graceful", pid, timeout)) or True,
         )
@@ -524,6 +540,11 @@ class TestGatewaySystemServiceRouting:
             gateway_cli,
             "_wait_for_systemd_service_restart",
             lambda system=False, previous_pid=None: calls.append(("wait", system, previous_pid)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_systemd_active_main_pid",
+            lambda system=False: 777,
         )
 
         gateway_cli.systemd_restart()
@@ -742,8 +763,13 @@ class TestSystemUnitRefreshSyncsHermesHome:
                 "refresh_systemd_unit_if_needed",
                 lambda system=False: calls.append("refresh"),
             )
-            monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-            monkeypatch.setattr(gateway_cli, "_systemd_main_pid", lambda system=False: None)
+            monkeypatch.setattr("gateway.status.get_running_pid", lambda: 111)
+            monkeypatch.setattr(gateway_cli, "_systemd_main_pid", lambda system=False: 111)
+            monkeypatch.setattr(
+                gateway_cli,
+                "_systemd_active_main_pid",
+                lambda system=False: 222,
+            )
             monkeypatch.setattr(
                 gateway_cli,
                 "_run_systemctl",
@@ -1484,6 +1510,225 @@ class TestSystemdInstallOffersLegacyRemoval:
 
         assert prompt_called["count"] == 0
         assert remove_called["invoked"] is False
+
+
+class TestSystemdInstallActivationPolicy:
+    def test_noninteractive_gateway_install_defaults_to_inert(
+        self,
+        monkeypatch,
+    ):
+        calls: list[object] = []
+        monkeypatch.setattr(
+            gateway_cli.sys,
+            "stdin",
+            SimpleNamespace(isatty=lambda: False),
+        )
+        monkeypatch.setattr(gateway_cli, "is_managed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_install",
+            lambda **kwargs: calls.append(("install", kwargs)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_start",
+            lambda **kwargs: calls.append(("start", kwargs)),
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="install",
+                force=False,
+                system=False,
+                run_as_user=None,
+                start_now=None,
+                start_on_login=None,
+            )
+        )
+
+        assert calls == [
+            (
+                "install",
+                {
+                    "force": False,
+                    "system": False,
+                    "run_as_user": None,
+                    "enable_on_startup": False,
+                    "non_interactive": True,
+                },
+            )
+        ]
+
+    def test_explicit_noninteractive_activation_flags_are_preserved(
+        self,
+        monkeypatch,
+    ):
+        calls: list[object] = []
+        monkeypatch.setattr(
+            gateway_cli.sys,
+            "stdin",
+            SimpleNamespace(isatty=lambda: False),
+        )
+        monkeypatch.setattr(gateway_cli, "is_managed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_install",
+            lambda **kwargs: calls.append(("install", kwargs)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_start",
+            lambda **kwargs: calls.append(("start", kwargs)),
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="install",
+                force=False,
+                system=False,
+                run_as_user=None,
+                start_now=True,
+                start_on_login=True,
+            )
+        )
+
+        assert calls[0][0] == "install"
+        assert calls[0][1]["enable_on_startup"] is True
+        assert calls[1] == ("start", {"system": False})
+
+    def test_interactive_install_keeps_opt_in_prompts(
+        self,
+        monkeypatch,
+    ):
+        calls: list[object] = []
+        prompts: list[str] = []
+        monkeypatch.setattr(
+            gateway_cli.sys,
+            "stdin",
+            SimpleNamespace(isatty=lambda: True),
+        )
+        monkeypatch.setattr(gateway_cli, "is_managed", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: True)
+        monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "prompt_yes_no",
+            lambda question, _default: prompts.append(question) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_install",
+            lambda **kwargs: calls.append(("install", kwargs)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_start",
+            lambda **kwargs: calls.append(("start", kwargs)),
+        )
+
+        gateway_cli.gateway_command(
+            SimpleNamespace(
+                gateway_command="install",
+                force=False,
+                system=False,
+                run_as_user=None,
+                start_now=None,
+                start_on_login=None,
+            )
+        )
+
+        assert len(prompts) == 2
+        assert calls[0][0] == "install"
+        assert calls[0][1]["enable_on_startup"] is True
+        assert calls[0][1]["non_interactive"] is False
+        assert calls[1] == ("start", {"system": False})
+
+    def test_explicit_no_start_on_login_disables_existing_unit(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        unit_path.write_text("[Service]\n", encoding="utf-8")
+        calls: list[tuple[str, ...]] = []
+        monkeypatch.setattr(gateway_cli, "has_legacy_hermes_units", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: unit_path,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_sync_hermes_home_from_systemd_unit",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "systemd_unit_is_current",
+            lambda **_kwargs: True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_run_systemctl",
+            lambda args, **_kwargs: calls.append(tuple(args)),
+        )
+
+        gateway_cli.systemd_install(enable_on_startup=False)
+
+        assert calls == [("disable", gateway_cli.get_service_name())]
+
+    def test_direct_noninteractive_install_defaults_to_disabled(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        unit_path = tmp_path / "hermes-gateway.service"
+        calls: list[tuple[str, ...]] = []
+        linger_calls: list[bool] = []
+        monkeypatch.setattr(gateway_cli, "has_legacy_hermes_units", lambda: False)
+        monkeypatch.setattr(
+            gateway_cli,
+            "get_systemd_unit_path",
+            lambda system=False: unit_path,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "generate_systemd_unit",
+            lambda **_kwargs: (
+                '[Service]\nEnvironment="HERMES_HOME=/home/alice/.hermes"\n'
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_run_systemctl",
+            lambda args, **_kwargs: calls.append(tuple(args)),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_ensure_linger_enabled",
+            lambda: linger_calls.append(True),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "print_systemd_scope_conflict_warning",
+            lambda: None,
+        )
+        monkeypatch.setattr(gateway_cli, "print_legacy_unit_warning", lambda: None)
+
+        gateway_cli.systemd_install(non_interactive=True)
+
+        assert calls == [
+            ("daemon-reload",),
+            ("disable", gateway_cli.get_service_name()),
+        ]
+        assert linger_calls == []
 
 
 class TestSystemScopeRequiresRootError:

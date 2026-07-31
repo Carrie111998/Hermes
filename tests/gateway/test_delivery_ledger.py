@@ -65,6 +65,13 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_state_update_requires_a_durable_row(self):
+        with pytest.raises(
+            RuntimeError,
+            match="matched no durable row",
+        ):
+            dl.mark_attempting("missing-obligation")
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):

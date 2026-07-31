@@ -17,6 +17,12 @@ from hermes_cli.codex_runtime_plugin_migration import (
     migrate,
     render_codex_toml_section,
 )
+from agent.transports.turn_policy_channel import (
+    POLICY_DB_ENV,
+    POLICY_ID_ENV,
+    POLICY_KEY_ENV,
+    POLICY_REQUIRED_ENV,
+)
 
 
 # ---- per-server translation ----
@@ -391,6 +397,20 @@ class TestHermesHomeLeakGuard:
     leak a transient tempdir path into the user's real ``~/.codex/config.toml``
     once codex spawned the hermes-tools MCP subprocess.
     """
+
+    def test_policy_channel_uses_name_only_mcp_environment_forwarding(self):
+        entry = _build_hermes_tools_mcp_entry()
+
+        assert entry["env_vars"] == [
+            POLICY_DB_ENV,
+            POLICY_ID_ENV,
+            POLICY_KEY_ENV,
+        ]
+        rendered = render_codex_toml_section({"hermes-tools": entry})
+        assert "env_vars = [" in rendered
+        assert POLICY_DB_ENV in rendered
+        assert "hermes-codex-turn-policy-" not in rendered
+        assert entry["env"][POLICY_REQUIRED_ENV] == "1"
 
 
 

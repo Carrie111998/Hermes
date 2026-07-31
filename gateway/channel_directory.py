@@ -32,11 +32,13 @@ _slack_directory_warning_last: Dict[tuple[str, str], float] = {}
 # channel_directory.json don't survive. Aliases declared here are re-applied
 # on every build AND every load, giving durable human-friendly names (and
 # letting you pre-name a chat before it has produced any traffic).
-# Format: {"<platform>": {"<chat_id>": "<friendly name>", ...}, ...}
+# A string value assigns a friendly name. A null value hides a retired target
+# while preserving its historical session records.
+# Format: {"<platform>": {"<chat_id>": "<friendly name>" | null, ...}, ...}
 CHANNEL_ALIASES_PATH = get_hermes_home() / "channel_aliases.json"
 
 
-def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
+def _load_channel_aliases() -> Dict[str, Dict[str, Any]]:
     if not CHANNEL_ALIASES_PATH.exists():
         return {}
     try:
@@ -48,11 +50,13 @@ def _load_channel_aliases() -> Dict[str, Dict[str, str]]:
 
 
 def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
-    """Overlay friendly names onto directory entries by chat_id.
+    """Overlay friendly names or hide retired entries by chat_id.
 
     Renames matching entries in place; injects a placeholder entry for an
     aliased id that hasn't been discovered yet (so a freshly-created group is
-    addressable by name before its first message). Mutates *platforms*.
+    addressable by name before its first message). A null alias removes every
+    matching entry without deleting its historical session. Mutates
+    *platforms*.
     """
     aliases = _load_channel_aliases()
     for plat_name, id_map in aliases.items():
@@ -62,9 +66,16 @@ def _apply_channel_aliases(platforms: Dict[str, Any]) -> None:
         if not isinstance(entries, list):
             continue
         for chat_id, friendly in id_map.items():
+            chat_id = str(chat_id)
+            if friendly is None:
+                entries[:] = [
+                    entry
+                    for entry in entries
+                    if not (isinstance(entry, dict) and entry.get("id") == chat_id)
+                ]
+                continue
             if not isinstance(friendly, str) or not friendly.strip():
                 continue
-            chat_id = str(chat_id)
             friendly = friendly.strip()
             matched = False
             for e in entries:

@@ -71,6 +71,41 @@ class TestFlushDeduplication:
             finally:
                 db.close()
 
+    def test_flush_persists_explicit_platform_message_id_in_state_db(self):
+        """The agent-owned write retains authenticated platform provenance."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            try:
+                agent = self._make_agent(db)
+                messages = [
+                    {
+                        "role": "user",
+                        "content": "Move the exact schedule occurrence.",
+                        "platform_message_id": "42197",
+                    },
+                ]
+
+                assert agent._flush_messages_to_session_db(messages, []) is True
+
+                row = db._conn.execute(
+                    """
+                    SELECT role, content, platform_message_id
+                    FROM messages
+                    WHERE session_id = ?
+                    """,
+                    (agent.session_id,),
+                ).fetchone()
+                assert row is not None
+                assert row["role"] == "user"
+                assert row["content"] == "Move the exact schedule occurrence."
+                assert row["platform_message_id"] == "42197"
+                assert db.has_platform_message_id(agent.session_id, "42197")
+            finally:
+                db.close()
+
 
 
     def test_flush_reset_after_compression(self):

@@ -390,6 +390,55 @@ class TestShellFileOpsHelpers:
 class TestSearchPathValidation:
     """Test that search() returns an error for non-existent paths."""
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX executable-bit probe")
+    def test_search_falls_back_when_rg_path_entry_is_not_executable(self, tmp_path):
+        fake_bin = tmp_path / "fake-bin"
+        fake_bin.mkdir()
+        fake_rg = fake_bin / "rg"
+        fake_rg.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        fake_rg.chmod(0o444)
+        searchable = tmp_path / "searchable"
+        searchable.mkdir()
+        (searchable / "sample.txt").write_text(
+            "exact fallback needle\n",
+            encoding="utf-8",
+        )
+
+        command_env = os.environ.copy()
+        command_env["PATH"] = f"{fake_bin}:{command_env['PATH']}"
+        env = MagicMock()
+        env.cwd = str(tmp_path)
+
+        def execute(command, cwd=None, **kwargs):
+            completed = subprocess.run(
+                ["bash", "-c", command],
+                cwd=cwd or str(tmp_path),
+                env=command_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=kwargs.get("timeout", 15),
+                check=False,
+            )
+            return {
+                "output": completed.stdout,
+                "returncode": completed.returncode,
+            }
+
+        env.execute.side_effect = execute
+        ops = ShellFileOperations(env, cwd=str(tmp_path))
+
+        assert ops._has_command("rg") is False
+        assert ops._has_command("grep") is True
+        result = ops.search(
+            "exact fallback needle",
+            path=str(searchable),
+            target="content",
+        )
+        assert result.error is None
+        assert result.total_count == 1
+        assert result.matches[0].content == "exact fallback needle"
+
     def test_search_nonexistent_path_returns_error(self, mock_env):
         """search() should return an error when the path doesn't exist."""
         def side_effect(command, **kwargs):
@@ -523,8 +572,9 @@ class TestPatchReplacePostWriteVerification:
             "Silent persistence failure must surface as error, got: "
             f"success={result.success}, diff={result.diff}"
         )
-        assert "verification failed" in result.error.lower()
-        assert "did not persist" in result.error.lower()
+        assert "post-write verification failed" in result.error.lower()
+        assert "write outcome is unknown" in result.error.lower()
+        assert "re-read the file before retrying" in result.error.lower()
 
 
     def test_patch_replace_fails_when_verify_read_errors(self, mock_env):
@@ -552,7 +602,9 @@ class TestPatchReplacePostWriteVerification:
         ops = ShellFileOperations(mock_env)
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is not None
-        assert "could not re-read" in result.error.lower()
+        assert "post-write verification failed" in result.error.lower()
+        assert "write outcome is unknown" in result.error.lower()
+        assert "re-read the file before retrying" in result.error.lower()
 
 
 # =========================================================================

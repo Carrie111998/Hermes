@@ -48,9 +48,14 @@ def _make_turn():
 
 def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
+    cwd = str(Path.cwd())
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
     agent._codex_session.run_turn.return_value = _make_turn()
+    agent._codex_session.request_phase = "operation"
+    agent._codex_session.enforce_read_only = True
+    agent._codex_session._cwd = cwd
+    agent.session_cwd = cwd
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -128,6 +133,10 @@ def test_codex_turn_persists_each_message_exactly_once():
         agent._session_db_created = True
         agent._codex_session = MagicMock()
         agent._codex_session.run_turn.return_value = _make_turn()
+        agent._codex_session.request_phase = "operation"
+        agent._codex_session.enforce_read_only = True
+        agent._codex_session._cwd = str(Path.cwd())
+        agent.session_cwd = str(Path.cwd())
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start

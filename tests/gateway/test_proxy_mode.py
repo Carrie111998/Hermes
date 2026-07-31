@@ -165,6 +165,80 @@ class TestRunAgentProxyDispatch:
         runner._run_agent_via_proxy.assert_called_once()
         assert runner._run_agent_via_proxy.call_args.kwargs["run_generation"] == 7
 
+    @pytest.mark.asyncio
+    async def test_telegram_proxy_persists_and_reads_back_provenance_first(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from hermes_state import AsyncSessionDB, SessionDB
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.multiplex_profiles = False
+        source = _make_source(Platform.TELEGRAM)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session(session_id="test-session-123", source="telegram")
+        runner._session_db = AsyncSessionDB(db)
+        runner._run_agent_via_proxy = AsyncMock(
+            return_value={
+                "final_response": "ok",
+                "messages": [],
+                "api_calls": 1,
+                "tools": [],
+            }
+        )
+
+        try:
+            result = await runner._run_agent(
+                message="API-enriched owner instruction",
+                context_prompt="",
+                history=[],
+                source=source,
+                session_id="test-session-123",
+                session_key="test-key",
+                persist_user_message="Original owner instruction",
+                persist_user_timestamp=1_785_400_000.0,
+                persist_user_platform_message_id="42197",
+            )
+
+            assert result["final_response"] == "ok"
+            rows = db.get_messages("test-session-123")
+            assert len(rows) == 1
+            assert rows[0]["role"] == "user"
+            assert rows[0]["content"] == "Original owner instruction"
+            assert rows[0]["platform_message_id"] == "42197"
+            runner._run_agent_via_proxy.assert_awaited_once()
+        finally:
+            db.close()
+
+    @pytest.mark.asyncio
+    async def test_telegram_proxy_fails_closed_without_local_state_store(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        runner = _make_runner()
+        runner.config.multiplex_profiles = False
+        runner._session_db = None
+        runner._run_agent_via_proxy = AsyncMock()
+
+        with pytest.raises(
+            RuntimeError,
+            match="Required inbound platform provenance could not be persisted",
+        ):
+            await runner._run_agent(
+                message="Owner instruction",
+                context_prompt="",
+                history=[],
+                source=_make_source(Platform.TELEGRAM),
+                session_id="test-session-123",
+                session_key="test-key",
+                persist_user_platform_message_id="42197",
+            )
+
+        runner._run_agent_via_proxy.assert_not_awaited()
+
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""

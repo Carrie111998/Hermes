@@ -17,14 +17,407 @@ compatibility.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import os
+from pathlib import Path
+import re
+import subprocess
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
+import uuid
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+
+def _codex_phase_contract() -> tuple[str, str, bool]:
+    """Return the sticky Codex thread contract for the active Hermes turn.
+
+    The contract is sent as developer instructions, not concatenated to the
+    user's text.  Non-implementation turns and dirty implementation
+    workspaces also receive a protocol-level read-only sandbox, so the
+    boundary remains effective even when Codex is configured with
+    ``approval_policy=never`` and therefore emits no approval request.
+    """
+
+    from agent.request_phase import current_turn_policy
+
+    phase_policy = current_turn_policy()
+    phase_name = phase_policy.phase.value if phase_policy is not None else "operation"
+    dirty_workspace = bool(
+        phase_policy is not None
+        and any(snapshot.dirty for snapshot in phase_policy.repo_snapshots.values())
+    )
+    enforce_read_only = phase_name != "implementation" or dirty_workspace
+    phase_brief = (
+        "Hermes request boundary: "
+        f"phase={phase_name}. Use the smallest directly governing skill set. "
+        "Investigation is read-only for repositories and skills; operation "
+        "executes the business outcome without rewriting source; implementation "
+        "may edit only a clean isolated worktree. Do not escalate phase from "
+        "your own analysis."
+    )
+    if dirty_workspace:
+        phase_brief += (
+            " The implementation workspace was already dirty at turn intake; "
+            "preserve it and move implementation to a clean isolated worktree."
+        )
+    return phase_name, phase_brief, enforce_read_only
+
+
+def _run_workspace_git(
+    cwd: Path,
+    *args: str,
+    timeout: float = 30.0,
+) -> subprocess.CompletedProcess[str]:
+    kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": timeout,
+        "check": False,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        stdin=subprocess.DEVNULL,
+        **kwargs,
+    )
+
+
+def _workspace_commit_identity(cwd: Path) -> tuple[str, str]:
+    """Return the exact committed HEAD and tree identity for a worktree."""
+
+    head_result = _run_workspace_git(
+        cwd,
+        "rev-parse",
+        "--verify",
+        "HEAD",
+        timeout=5.0,
+    )
+    if head_result.returncode != 0 or not head_result.stdout.strip():
+        raise RuntimeError(
+            head_result.stderr.strip()
+            or "could not resolve the worktree HEAD"
+        )
+    tree_result = _run_workspace_git(
+        cwd,
+        "rev-parse",
+        "--verify",
+        "HEAD^{tree}",
+        timeout=5.0,
+    )
+    if tree_result.returncode != 0 or not tree_result.stdout.strip():
+        raise RuntimeError(
+            tree_result.stderr.strip()
+            or "could not resolve the worktree tree"
+        )
+    return head_result.stdout.strip(), tree_result.stdout.strip()
+
+
+def _create_codex_isolated_worktree(
+    source_cwd: str,
+    *,
+    isolation_root: Path | None = None,
+) -> str:
+    """Create a detached clean worktree without altering the dirty checkout."""
+
+    source = Path(source_cwd).expanduser().resolve(strict=False)
+    root_result = _run_workspace_git(
+        source,
+        "rev-parse",
+        "--show-toplevel",
+        timeout=5.0,
+    )
+    if root_result.returncode != 0 or not root_result.stdout.strip():
+        raise RuntimeError(
+            root_result.stderr.strip() or "working directory is not a git repository"
+        )
+    repo_root = Path(root_result.stdout.strip()).resolve(strict=False)
+
+    if isolation_root is None:
+        from hermes_constants import get_hermes_home
+
+        isolation_root = Path(get_hermes_home()) / "worktrees" / "codex"
+    isolation_root = isolation_root.expanduser().resolve(strict=False)
+    isolation_root.mkdir(parents=True, exist_ok=True)
+
+    repo_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", repo_root.name).strip("-")
+    repo_slug = repo_slug or "repository"
+    repo_key = hashlib.sha256(
+        os.path.normcase(str(repo_root)).encode("utf-8", "replace")
+    ).hexdigest()[:8]
+    destination = isolation_root / (
+        f"{repo_slug}-{repo_key}-{uuid.uuid4().hex[:8]}"
+    )
+    create_result = _run_workspace_git(
+        repo_root,
+        "worktree",
+        "add",
+        "--detach",
+        str(destination),
+        "HEAD",
+    )
+    if create_result.returncode != 0:
+        raise RuntimeError(
+            create_result.stderr.strip()
+            or create_result.stdout.strip()
+            or "git worktree add failed"
+        )
+
+    verify_result = _run_workspace_git(
+        destination,
+        "status",
+        "--porcelain",
+        "--untracked-files=normal",
+        timeout=5.0,
+    )
+    if verify_result.returncode != 0 or verify_result.stdout.strip():
+        raise RuntimeError(
+            verify_result.stderr.strip()
+            or "isolated worktree did not verify clean"
+        )
+    return str(destination)
+
+
+def _select_codex_turn_workspace(
+    agent: Any,
+    *,
+    source_cwd: str,
+    phase_name: str,
+    phase_instructions: str,
+    enforce_read_only: bool,
+    isolation_root: Path | None = None,
+) -> tuple[str, str, bool]:
+    """Give every implementation turn a dedicated Codex-owned worktree."""
+
+    if phase_name != "implementation":
+        return source_cwd, phase_instructions, enforce_read_only
+
+    source_path = Path(source_cwd).expanduser().resolve(strict=False)
+    try:
+        root_result = _run_workspace_git(
+            source_path,
+            "rev-parse",
+            "--show-toplevel",
+            timeout=5.0,
+        )
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: "
+            + str(exc)
+            + ". Remain read-only and end with this exact blocker.",
+            True,
+        )
+    if root_result.returncode != 0 or not root_result.stdout.strip():
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: "
+            + (
+                root_result.stderr.strip()
+                or "working directory is not a git repository"
+            )
+            + ". Remain read-only and end with this exact blocker.",
+            True,
+        )
+    source_root = Path(root_result.stdout.strip()).resolve(strict=False)
+    try:
+        source_head, source_tree = _workspace_commit_identity(source_root)
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: source committed "
+            + f"identity could not be verified ({exc}). Remain read-only and "
+            "end with this exact blocker.",
+            True,
+        )
+    source_key = os.path.normcase(str(source_root))
+    cached_source = getattr(agent, "_codex_isolated_source_cwd", None)
+    cached_workspace = getattr(agent, "_codex_isolated_workspace", None)
+    cached_owned_source = (
+        cached_source == source_key
+        and getattr(agent, "_codex_isolated_workspace_owned", False) is True
+        and isinstance(cached_workspace, str)
+    )
+    preserved_cached_workspace = ""
+    cached_reuse_issue = ""
+    if cached_owned_source:
+        cached_path = Path(cached_workspace).expanduser().resolve(strict=False)
+        if cached_path.is_dir() and (cached_path / ".git").exists():
+            preserved_cached_workspace = str(cached_path)
+            try:
+                cached_status = _run_workspace_git(
+                    cached_path,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                cached_reuse_issue = f"cleanliness check failed: {exc}"
+            else:
+                if cached_status.returncode == 0 and not cached_status.stdout.strip():
+                    try:
+                        cached_head, cached_tree = (
+                            _workspace_commit_identity(cached_path)
+                        )
+                    except Exception as exc:
+                        cached_reuse_issue = (
+                            f"committed identity check failed: {exc}"
+                        )
+                    else:
+                        prior_source_identity = (
+                            getattr(
+                                agent,
+                                "_codex_isolated_source_head",
+                                None,
+                            ),
+                            getattr(
+                                agent,
+                                "_codex_isolated_source_tree",
+                                None,
+                            ),
+                        )
+                        prior_lane_identity = (
+                            getattr(
+                                agent,
+                                "_codex_isolated_workspace_head",
+                                None,
+                            ),
+                            getattr(
+                                agent,
+                                "_codex_isolated_workspace_tree",
+                                None,
+                            ),
+                        )
+                        if prior_source_identity != (source_head, source_tree):
+                            cached_reuse_issue = (
+                                "the source repository committed identity "
+                                "advanced"
+                            )
+                        elif prior_lane_identity != (cached_head, cached_tree):
+                            cached_reuse_issue = (
+                                "the cached worktree committed identity changed"
+                            )
+                        elif (cached_head, cached_tree) != (
+                            source_head,
+                            source_tree,
+                        ):
+                            cached_reuse_issue = (
+                                "the cached worktree no longer matches the "
+                                "source committed identity"
+                            )
+                        else:
+                            return (
+                                str(cached_path),
+                                phase_instructions
+                                + " Continue in the freshly revalidated clean "
+                                "owner-isolated Codex worktree at the current "
+                                "source commit; the original checkout remains "
+                                "untouched.",
+                                False,
+                            )
+                else:
+                    cached_reuse_issue = (
+                        "uncommitted or untracked changes are present"
+                        if cached_status.returncode == 0
+                        else (
+                            cached_status.stderr.strip()
+                            or cached_status.stdout.strip()
+                            or "git status failed"
+                        )
+                    )
+        else:
+            cached_reuse_issue = "cached worktree path is no longer valid"
+
+    try:
+        isolated = _create_codex_isolated_worktree(
+            str(source_root),
+            isolation_root=isolation_root,
+        )
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: "
+            + (
+                "the prior cached lane was preserved at "
+                + preserved_cached_workspace
+                + " because "
+                + cached_reuse_issue
+                + "; replacement failed: "
+                if preserved_cached_workspace
+                else ""
+            )
+            + str(exc)
+            + ". Remain read-only and end with this exact blocker.",
+            True,
+        )
+
+    agent._codex_isolated_source_cwd = source_key
+    agent._codex_isolated_workspace = isolated
+    agent._codex_isolated_workspace_owned = True
+    agent._codex_isolated_source_head = source_head
+    agent._codex_isolated_source_tree = source_tree
+    try:
+        isolated_head, isolated_tree = _workspace_commit_identity(
+            Path(isolated)
+        )
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: the new isolated "
+            + f"worktree identity could not be verified ({exc}). The new "
+            "worktree was preserved for inspection. Remain read-only and end "
+            "with this exact blocker.",
+            True,
+        )
+    if (isolated_head, isolated_tree) != (source_head, source_tree):
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: the new isolated "
+            "worktree did not match the source committed identity. The new "
+            "worktree was preserved for inspection. Remain read-only and end "
+            "with this exact blocker.",
+            True,
+        )
+    agent._codex_isolated_workspace_head = isolated_head
+    agent._codex_isolated_workspace_tree = isolated_tree
+    replacement_note = (
+        " Hermes preserved the prior cached Codex worktree at "
+        + preserved_cached_workspace
+        + " because "
+        + cached_reuse_issue
+        + "; it was not deleted or overwritten."
+        if preserved_cached_workspace
+        else ""
+    )
+    return (
+        isolated,
+        phase_instructions
+        + " Hermes created a clean detached Codex worktree automatically at "
+        + isolated
+        + "; work there and preserve the original checkout."
+        + replacement_note,
+        False,
+    )
+
+
+def _codex_phase_user_input(user_message: Any) -> Any:
+    """Compatibility helper: phase policy no longer contaminates user text."""
+
+    return user_message
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -636,13 +1029,41 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    phase_name, phase_instructions, enforce_read_only = _codex_phase_contract()
+    from agent.runtime_cwd import resolve_agent_cwd
+
+    source_cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+    cwd, phase_instructions, enforce_read_only = _select_codex_turn_workspace(
+        agent,
+        source_cwd=source_cwd,
+        phase_name=phase_name,
+        phase_instructions=phase_instructions,
+        enforce_read_only=enforce_read_only,
+    )
+    existing_codex_session = getattr(agent, "_codex_session", None)
+    if existing_codex_session is not None and (
+        getattr(existing_codex_session, "request_phase", None) != phase_name
+        or bool(getattr(existing_codex_session, "enforce_read_only", False))
+        != enforce_read_only
+        or os.path.normcase(str(getattr(existing_codex_session, "_cwd", "")))
+        != os.path.normcase(str(cwd))
+    ):
+        # Sandbox/developer instructions are sticky at thread/start. Never
+        # carry a write-capable implementation thread into a later analysis
+        # turn (or vice versa).
+        try:
+            existing_codex_session.close()
+        except Exception:
+            logger.debug(
+                "codex app-server: failed to retire phase-mismatched session",
+                exc_info=True,
+            )
+        agent._codex_session = None
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
     if not hasattr(agent, "_codex_session") or agent._codex_session is None:
-        from agent.runtime_cwd import resolve_agent_cwd
-
-        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
         # Approval callback: defer to Hermes' standard prompt flow if a
         # CLI thread has installed one. Gateway / cron contexts get the
         # codex-side fail-closed default.
@@ -682,6 +1103,9 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            request_phase=phase_name,
+            developer_instructions=phase_instructions,
+            enforce_read_only=enforce_read_only,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -695,7 +1119,9 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

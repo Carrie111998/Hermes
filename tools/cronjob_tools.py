@@ -1069,7 +1069,15 @@ def check_cronjob_requirements() -> bool:
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
+
+
+def _cronjob_effect(args):
+    return (
+        ToolEffect.READ_ONLY
+        if str(args.get("action", "") or "").lower() == "list"
+        else ToolEffect.EFFECTFUL
+    )
 
 registry.register(
     name="cronjob",
@@ -1100,5 +1108,6 @@ registry.register(
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,
+    effect=_cronjob_effect,
     emoji="⏰",
 )

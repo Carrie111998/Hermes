@@ -174,10 +174,9 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         # Lower values mean faster feedback on slow tasks but more chat
-        # noise; 180s is a compromise that catches spinning weak-model runs
-        # (60+ tool iterations with tiny output) before users assume the
-        # bot is dead and /restart.
-        "gateway_notify_interval": 180,
+        # noise. Enabled values above 90s are capped by the gateway so a
+        # long operational turn always gives a useful receipt by then.
+        "gateway_notify_interval": 90,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was

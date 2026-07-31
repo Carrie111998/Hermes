@@ -2570,6 +2570,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
+    try:
+        from agent.request_phase import guard_tool_call
+
+        phase_block = guard_tool_call(function_name, function_args)
+    except Exception as exc:
+        phase_block = (
+            "Request-phase safety block: the final tool-effect "
+            f"classification failed ({exc}). No effect was executed."
+        )
+    if phase_block is not None:
+        return json.dumps({"error": phase_block}, ensure_ascii=False)
+
     # Check plugin hooks for a block or approval directive before executing.
     block_message: Optional[str] = None
     if not pre_tool_block_checked:

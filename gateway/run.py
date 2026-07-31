@@ -79,6 +79,333 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _required_inbound_platform_message_id(event: Any) -> Optional[str]:
+    """Return Telegram's exact inbound message ID or fail closed.
+
+    Internal synthetic events are not owner instructions and therefore carry
+    no platform provenance obligation. For authenticated inbound Telegram
+    events, only the event field is accepted: reply anchors, update IDs, source
+    metadata, and generated IDs are intentionally not substitutes.
+    """
+    if bool(getattr(event, "internal", False)):
+        return None
+
+    source = getattr(event, "source", None)
+    platform = getattr(source, "platform", None)
+    platform_name = getattr(platform, "value", platform)
+    if str(platform_name or "").lower() != "telegram":
+        return None
+
+    message_id = getattr(event, "message_id", None)
+    if (
+        not isinstance(message_id, str)
+        or not message_id
+        or message_id.strip() != message_id
+    ):
+        raise RuntimeError(
+            "Telegram turn blocked because its original message ID is unavailable."
+        )
+    return message_id
+
+
+def _delivery_message_ref(
+    platform_message_id: Optional[str],
+    reply_anchor: Optional[str],
+    *,
+    session_id: Optional[str],
+    run_generation: Optional[int],
+) -> str:
+    """Return a stable per-run ledger key without inventing provenance.
+
+    Real inbound message IDs remain the first choice. Internal continuations
+    deliberately have no platform provenance, so they use the durable session
+    identity plus its monotonic run generation. This keeps delivery proof
+    complete without feeding a synthetic message ID back to platform reply
+    routing.
+    """
+
+    for candidate in (platform_message_id, reply_anchor):
+        if isinstance(candidate, str) and candidate.strip() == candidate and candidate:
+            return candidate
+    stable_session = str(session_id or "unknown-session")
+    stable_generation = int(run_generation or 0)
+    return f"internal:{stable_session}:{stable_generation}"
+
+
+def _gateway_run_receipt_identity(
+    *,
+    session_key: str,
+    session_id: str,
+    run_generation: Optional[int],
+    run_index: int,
+    platform_message_id: Optional[str],
+    reply_anchor: Optional[str],
+) -> tuple[str, str]:
+    """Return the durable run receipt id and its delivery message reference."""
+
+    from gateway.delivery_ledger import compute_run_receipt_id
+
+    message_ref = _delivery_message_ref(
+        platform_message_id,
+        reply_anchor,
+        session_id=session_id,
+        run_generation=run_generation,
+    )
+    return (
+        compute_run_receipt_id(
+            session_key,
+            message_ref,
+            run_generation,
+            run_index=run_index,
+        ),
+        message_ref,
+    )
+
+
+def _apply_gateway_terminal_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill terminal fields only when an agent/proxy path did not supply them."""
+
+    state = str(result.get("run_terminal_state") or "").strip().lower()
+    reason = str(
+        result.get("run_end_reason")
+        or result.get("turn_exit_reason")
+        or result.get("failure_reason")
+        or ""
+    ).strip()
+    final_response = result.get("final_response")
+    explicit_generated = result.get("final_generated")
+    final_generated = (
+        bool(explicit_generated)
+        if explicit_generated is not None
+        else bool(
+            isinstance(final_response, str)
+            and final_response.strip()
+            and final_response.strip() != "(empty)"
+        )
+    )
+    reason_lower = reason.lower()
+    if state not in {"done", "blocked", "failed", "cancelled"}:
+        if (
+            result.get("interrupted") is True
+            or "interrupt" in reason_lower
+            or "cancel" in reason_lower
+        ):
+            state = "cancelled"
+        elif result.get("guardrail") is not None or "guardrail" in reason_lower:
+            state = "blocked"
+        elif (
+            result.get("failed") is True
+            or result.get("completed") is False
+            or not final_generated
+        ):
+            state = "failed"
+        else:
+            state = "done"
+    ended_at = result.get("run_ended_at")
+    if not isinstance(ended_at, (int, float)):
+        ended_at = time.time()
+    result["run_terminal_state"] = state
+    result["run_end_reason"] = reason or (
+        "completed" if state == "done" else state
+    )
+    result["run_ended_at"] = float(ended_at)
+    result["final_generated"] = final_generated
+    return result
+
+
+def _record_gateway_run_terminal(
+    result: Dict[str, Any],
+    *,
+    run_receipt_id: str,
+    session_id: str,
+    task_id: str,
+    session_key: str,
+    platform: Any,
+    run_generation: Optional[int],
+    message_ref: str,
+) -> Dict[str, Any]:
+    """Persist and return one gateway terminal result."""
+
+    from gateway.delivery_ledger import record_run_terminal_receipt
+
+    result = _apply_gateway_terminal_fields(result)
+    result["run_receipt_id"] = run_receipt_id
+    record_run_terminal_receipt(
+        run_receipt_id=run_receipt_id,
+        session_id=session_id,
+        task_id=task_id,
+        session_key=session_key,
+        platform=str(getattr(platform, "value", platform) or ""),
+        run_generation=run_generation,
+        message_ref=message_ref,
+        run_terminal_state=result["run_terminal_state"],
+        run_end_reason=result["run_end_reason"],
+        run_ended_at=result["run_ended_at"],
+        final_generated=result["final_generated"],
+    )
+    return result
+
+
+def _gateway_exception_terminal_fields(exc: BaseException) -> Dict[str, Any]:
+    """Return structured terminal truth for a gateway exception/cancellation."""
+
+    attached = getattr(exc, "hermes_terminal_receipt", None)
+    if isinstance(attached, dict):
+        return _apply_gateway_terminal_fields(dict(attached))
+    cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, InterruptedError))
+    reason = "gateway_cancelled" if cancelled else f"gateway_exception:{type(exc).__name__}"
+    return {
+        "completed": False,
+        "failed": not cancelled,
+        "interrupted": cancelled,
+        "run_terminal_state": "cancelled" if cancelled else "failed",
+        "run_end_reason": reason,
+        "run_ended_at": time.time(),
+        "final_generated": False,
+    }
+
+
+def _delivery_result_is_unknown(result: Any) -> bool:
+    """Return True when a send may have reached the platform without an ACK."""
+
+    from gateway.delivery_ledger import delivery_result_is_unknown
+
+    return delivery_result_is_unknown(result)
+
+
+def _apply_stream_final_delivery_status(
+    response: dict[str, Any],
+    *,
+    has_final: bool,
+    transformed: bool,
+    outcome_unknown: bool,
+    delivery_confirmed: bool,
+    ledger_error: str = "",
+) -> Optional[str]:
+    """Record stream delivery truth while preserving duplicate suppression.
+
+    An ambiguous platform timeout must suppress an automatic resend, but it is
+    not evidence that the final reached the user.  Keep that state distinct
+    from confirmed delivery in the task result so generated, unknown, and
+    delivered outcomes cannot collapse into the same receipt.
+    """
+
+    if not has_final:
+        return None
+    if ledger_error:
+        response["final_delivery_status"] = "failed"
+        response["final_delivery_error"] = ledger_error
+        return "failed"
+    if outcome_unknown:
+        response["already_sent"] = True
+        response["final_delivery_status"] = "unknown"
+        return "unknown"
+    if not transformed and delivery_confirmed:
+        response["already_sent"] = True
+        response["final_delivery_status"] = "delivered"
+        return "delivered"
+    return None
+
+
+async def _send_final_with_delivery_proof(
+    *,
+    adapter: Any,
+    chat_id: str,
+    content: str,
+    metadata: Optional[dict],
+    session_key: str,
+    message_ref: str,
+    platform: Any,
+    thread_id: Optional[str],
+    run_receipt_id: Optional[str] = None,
+) -> Any:
+    """Send one generated final under the durable delivery-ledger contract."""
+
+    obligation_id = None
+    ledger_error = ""
+    ledger_error_detail = ""
+    try:
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            record_obligation,
+        )
+
+        if ledger_enabled():
+            platform_value = getattr(platform, "value", platform)
+            obligation_id = compute_obligation_id(
+                session_key,
+                message_ref,
+                content,
+            )
+            record_obligation(
+                obligation_id=obligation_id,
+                session_key=session_key,
+                platform=str(platform_value),
+                chat_id=str(chat_id),
+                thread_id=str(thread_id) if thread_id is not None else None,
+                content=content,
+                run_receipt_id=run_receipt_id,
+            )
+            mark_attempting(obligation_id)
+    except Exception as exc:
+        ledger_error = (
+            "Final delivery was blocked before send because Hermes could not "
+            "persist its generated/attempting delivery receipt."
+        )
+        ledger_error_detail = type(exc).__name__
+        logging.getLogger(__name__).error(
+            "queued final delivery ledger checkpoint failed; blocking send",
+            exc_info=True,
+        )
+        obligation_id = None
+    if ledger_error:
+        from gateway.platforms.base import SendResult
+
+        return SendResult(
+            success=False,
+            error=f"{ledger_error} ({ledger_error_detail})",
+            error_kind="transient",
+            retryable=True,
+        )
+
+    try:
+        # One platform attempt only. Base adapter retries are useful for
+        # clearly rejected transient errors, but a timeout can mean the
+        # platform accepted the message without returning an ACK. Retrying
+        # that outcome here would create an unmarked duplicate.
+        result = await adapter.send(
+            chat_id=chat_id,
+            content=content,
+            metadata=metadata,
+        )
+    except BaseException:
+        # The platform may have accepted the request before the await failed.
+        # Leave the row attempting so recovery is visibly marked.
+        raise
+
+    if obligation_id is not None:
+        try:
+            from gateway.delivery_ledger import mark_delivered, mark_failed
+
+            if getattr(result, "success", False):
+                mark_delivered(obligation_id)
+            elif not _delivery_result_is_unknown(result):
+                mark_failed(
+                    obligation_id,
+                    str(getattr(result, "error", "") or "send rejected"),
+                )
+            # Unknown outcomes deliberately remain attempting.
+        except Exception:
+            logging.getLogger(__name__).debug(
+                "queued final delivery ledger update failed",
+                exc_info=True,
+            )
+    return result
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -92,6 +419,8 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|auto-lowered\s+(?:this\s+)?session'?s?\s+threshold"
     r"|configured\s+auxiliary\s+compression\s+provider\s+.+\s+unavailable"
     r"|skipping\s+concurrent\s+compression"
+    r"|codex\s+gpt-5\.5\s+caps\s+context"
+    r"|auto-compaction\s+was\s+raised"
     r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
@@ -864,6 +1193,58 @@ def _float_env(name: str, default: float) -> float:
         return float(raw)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _bounded_progress_interval(value: float) -> Optional[float]:
+    """Return the enabled heartbeat cadence, capped at the operator SLA."""
+
+    return min(float(value), 90.0) if value > 0 else None
+
+
+async def _deliver_progress_receipt_after_interval(
+    *,
+    interval: float,
+    adapter: Any,
+    chat_id: str,
+    should_emit: Callable[[], bool],
+    build_content: Callable[[], str],
+    metadata: Optional[dict],
+    message_id: Optional[str] = None,
+) -> tuple[bool, Any, Optional[str]]:
+    """Wait one cadence and deliver one visible long-run receipt.
+
+    The return tuple is ``(run_still_active, send_result, message_id)``. A
+    supported platform edits the prior heartbeat in place; otherwise this
+    sends one new receipt. Keeping the sleep and effect in one testable seam
+    proves the configured 90-second policy reaches a real adapter call.
+    """
+
+    await asyncio.sleep(interval)
+    if not should_emit():
+        return False, None, message_id
+
+    content = build_content()
+    result = None
+    if message_id:
+        try:
+            result = await adapter.edit_message(
+                chat_id,
+                message_id,
+                content,
+            )
+        except Exception as exc:
+            logger.debug("Heartbeat edit failed: %s", exc)
+            result = None
+    if not (result and getattr(result, "success", False)):
+        result = await adapter.send(
+            chat_id,
+            content,
+            metadata=metadata,
+        )
+    next_message_id = message_id
+    if getattr(result, "success", False) and getattr(result, "message_id", None):
+        next_message_id = str(result.message_id)
+    return True, result, next_message_id
 
 
 def _is_fresh_gateway_interruption(
@@ -4192,6 +4573,20 @@ class TurnRunner:
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=ctx.event_message_id,
                         run_still_current=ctx._run_still_current,
+                        delivery_session_key=ctx.session_key,
+                        delivery_message_ref=_delivery_message_ref(
+                            ctx.persist_user_platform_message_id,
+                            ctx.event_message_id,
+                            session_id=ctx.session_id,
+                            run_generation=ctx.run_generation,
+                        ),
+                        delivery_platform=getattr(
+                            ctx.source.platform,
+                            "value",
+                            ctx.source.platform,
+                        ),
+                        delivery_thread_id=ctx.source.thread_id,
+                        delivery_run_receipt_id=ctx.run_receipt_id,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -4525,6 +4920,10 @@ class TurnRunner:
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
+        # Carry the pre-registered local receipt identity without widening the
+        # public run_conversation call shape used by alternate/fake runtimes.
+        # AIAgent consumes and clears this value at the start of the turn.
+        agent._pending_run_receipt_id = ctx.run_receipt_id
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via
@@ -5082,6 +5481,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_platform_message_id is not None:
+                _conversation_kwargs["persist_user_platform_message_id"] = (
+                    ctx.persist_user_platform_message_id
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -5256,6 +5659,11 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "run_terminal_state": result.get("run_terminal_state"),
+                "run_end_reason": result.get("run_end_reason"),
+                "run_ended_at": result.get("run_ended_at"),
+                "final_generated": result.get("final_generated"),
+                "run_receipt_id": result.get("run_receipt_id"),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5393,6 +5801,11 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
+            "run_terminal_state": result.get("run_terminal_state"),
+            "run_end_reason": result.get("run_end_reason"),
+            "run_ended_at": result.get("run_ended_at"),
+            "final_generated": result.get("final_generated"),
+            "run_receipt_id": result.get("run_receipt_id"),
         }
 
 
@@ -7473,6 +7886,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         best-effort status re-write. In-flight turns are NOT interrupted (the
         whole point is to let them finish); only NEW turns are refused.
         """
+        from agent.request_phase import suspend_local_mutations
+
+        suspend_local_mutations("gateway external drain")
         if self._external_drain_active:
             return
         self._external_drain_active = True
@@ -7504,6 +7920,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "to running (shutdown takes precedence)."
             )
             return
+        from agent.request_phase import resume_local_mutations
+
+        resume_local_mutations()
         logger.info(
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
@@ -9891,9 +10310,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                sweep_dead_run_receipts,
                 sweep_recoverable,
             )
 
+            try:
+                closed_runs = await asyncio.to_thread(
+                    sweep_dead_run_receipts
+                )
+                if closed_runs:
+                    logger.warning(
+                        "Closed %d run receipt(s) left active by a dead "
+                        "gateway process with explicit unknown outcomes.",
+                        len(closed_runs),
+                    )
+            except Exception:
+                logger.debug(
+                    "dead-owner run receipt sweep failed",
+                    exc_info=True,
+                )
             if not ledger_enabled():
                 return 0
             # Only claim rows we can actually send this boot: self.adapters
@@ -11911,6 +12346,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         service_restart: bool = False,
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
+        from agent.request_phase import suspend_local_mutations
+
+        # Freeze only local source/skill effects. Business/provider calls that
+        # are already in flight may still finish during the bounded drain.
+        suspend_local_mutations("gateway shutdown/drain")
         # getattr-guard: shutdown-path tests build bare runners via
         # object.__new__ that lack the liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
@@ -14909,9 +15349,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _run_receipt_id, _run_message_ref = _gateway_run_receipt_identity(
+            session_key=_quick_key,
+            session_id="",
+            run_generation=_run_generation,
+            run_index=0,
+            platform_message_id=getattr(event, "message_id", None),
+            reply_anchor=self._reply_anchor_for_event(event),
+        )
+        from gateway.delivery_ledger import begin_run_receipt
+
+        begin_run_receipt(
+            run_receipt_id=_run_receipt_id,
+            task_id=f"{_quick_key}:{_run_generation}",
+            session_key=_quick_key,
+            platform=str(getattr(source.platform, "value", source.platform) or ""),
+            run_generation=_run_generation,
+            message_ref=_run_message_ref,
+        )
+        setattr(event, "_hermes_run_receipt_id", _run_receipt_id)
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            from gateway.delivery_ledger import get_run_terminal_receipt
+
+            _durable_terminal = get_run_terminal_receipt(_run_receipt_id)
+            if (
+                _durable_terminal is None
+                or _durable_terminal.get("run_terminal_state") == "running"
+            ):
+                _event_terminal = getattr(
+                    event,
+                    "_hermes_run_terminal_fields",
+                    None,
+                )
+                if isinstance(_event_terminal, dict):
+                    _fallback_terminal = dict(_event_terminal)
+                    if isinstance(_agent_result, str):
+                        _fallback_terminal["final_response"] = _agent_result
+                elif isinstance(_agent_result, dict):
+                    _fallback_terminal = dict(_agent_result)
+                else:
+                    _fallback_terminal = {
+                        "final_response": (
+                            _agent_result
+                            if isinstance(_agent_result, str)
+                            else ""
+                        ),
+                        "completed": bool(_agent_result),
+                        "failed": not bool(_agent_result),
+                        "run_end_reason": (
+                            "gateway_response_completed"
+                            if _agent_result
+                            else "gateway_returned_without_terminal_result"
+                        ),
+                    }
+                _record_gateway_run_terminal(
+                    _fallback_terminal,
+                    run_receipt_id=_run_receipt_id,
+                    session_id="",
+                    task_id=f"{_quick_key}:{_run_generation}",
+                    session_key=_quick_key,
+                    platform=source.platform,
+                    run_generation=_run_generation,
+                    message_ref=_run_message_ref,
+                )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -14941,6 +15443,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except BaseException as exc:
+            try:
+                _record_gateway_run_terminal(
+                    _gateway_exception_terminal_fields(exc),
+                    run_receipt_id=_run_receipt_id,
+                    session_id="",
+                    task_id=f"{_quick_key}:{_run_generation}",
+                    session_key=_quick_key,
+                    platform=source.platform,
+                    run_generation=_run_generation,
+                    message_ref=_run_message_ref,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to finalize outer gateway receipt %s",
+                    _run_receipt_id,
+                )
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -15498,6 +16018,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        persist_user_platform_message_id = (
+            _required_inbound_platform_message_id(event)
+        )
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -16667,7 +17190,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
                 message_type=event.message_type,
+                run_receipt_id=getattr(
+                    event,
+                    "_hermes_run_receipt_id",
+                    None,
+                ),
+            )
+            if agent_result.get("run_receipt_id"):
+                setattr(
+                    event,
+                    "_hermes_run_receipt_id",
+                    agent_result["run_receipt_id"],
+                )
+            setattr(
+                event,
+                "_hermes_run_terminal_fields",
+                {
+                    key: agent_result.get(key)
+                    for key in (
+                        "run_terminal_state",
+                        "run_end_reason",
+                        "run_ended_at",
+                        "final_generated",
+                    )
+                },
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -17283,6 +17833,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            _failed_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _failed_receipt_id:
+                try:
+                    _failed_session_entry = locals().get("session_entry")
+                    _failed_session_key = (
+                        locals().get("session_key") or _quick_key
+                    )
+                    _failed_session_id = str(
+                        getattr(_failed_session_entry, "session_id", "") or ""
+                    )
+                    _, _failed_message_ref = _gateway_run_receipt_identity(
+                        session_key=_failed_session_key,
+                        session_id=_failed_session_id,
+                        run_generation=run_generation,
+                        run_index=0,
+                        platform_message_id=persist_user_platform_message_id,
+                        reply_anchor=self._reply_anchor_for_event(event),
+                    )
+                    _record_gateway_run_terminal(
+                        _gateway_exception_terminal_fields(e),
+                        run_receipt_id=_failed_receipt_id,
+                        session_id=_failed_session_id,
+                        task_id=f"{_failed_session_key}:{run_generation}",
+                        session_key=_failed_session_key,
+                        platform=source.platform,
+                        run_generation=run_generation,
+                        message_ref=_failed_message_ref,
+                    )
+                    setattr(
+                        event,
+                        "_hermes_run_terminal_fields",
+                        _gateway_exception_terminal_fields(e),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize handled gateway exception receipt %s",
+                        _failed_receipt_id,
+                    )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -17970,6 +18562,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    # Goal continuation is generated by Hermes after an
+                    # authenticated turn; it has no new Telegram message ID
+                    # and must use the explicit internal-event path.
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -18503,31 +19099,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
-        from run_agent import AIAgent
-
         media_urls = media_urls or []
         media_types = media_types or []
+        _run_generation = 0
+        try:
+            _source_session_key = self._session_key_for_source(source)
+        except Exception:
+            _source_session_key = (
+                f"{getattr(source.platform, 'value', source.platform)}:"
+                f"{source.chat_id or 'unknown-chat'}"
+            )
+        _background_session_key = f"{_source_session_key}:background:{task_id}"
+        _run_receipt_id, _run_message_ref = _gateway_run_receipt_identity(
+            session_key=_background_session_key,
+            session_id=task_id,
+            run_generation=_run_generation,
+            run_index=0,
+            platform_message_id=event_message_id,
+            reply_anchor=None,
+        )
+        from gateway.delivery_ledger import begin_run_receipt
 
-        adapter = self._adapter_for_source(source)
-        if not adapter:
-            logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
-            return
+        begin_run_receipt(
+            run_receipt_id=_run_receipt_id,
+            session_id=task_id,
+            task_id=task_id,
+            session_key=_background_session_key,
+            platform=str(
+                getattr(source.platform, "value", source.platform) or ""
+            ),
+            run_generation=_run_generation,
+            message_ref=_run_message_ref,
+        )
 
-        _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        adapter = None
+        _thread_metadata = None
+        _terminal_closed = False
+        _final_delivery_started = False
+
+        def _close_terminal(result: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal _terminal_closed
+            closed = _record_gateway_run_terminal(
+                result,
+                run_receipt_id=_run_receipt_id,
+                session_id=task_id,
+                task_id=task_id,
+                session_key=_background_session_key,
+                platform=source.platform,
+                run_generation=_run_generation,
+                message_ref=_run_message_ref,
+            )
+            _terminal_closed = True
+            return closed
+
+        async def _deliver_terminal(
+            content: str,
+            terminal: Dict[str, Any],
+        ) -> Any:
+            nonlocal _final_delivery_started
+            final_content = str(content or "").strip()
+            terminal = dict(terminal)
+            terminal["final_response"] = final_content
+            terminal["final_generated"] = bool(final_content)
+            _final_delivery_started = True
+            try:
+                delivery_result = await _send_final_with_delivery_proof(
+                    adapter=adapter,
+                    chat_id=source.chat_id,
+                    content=final_content,
+                    metadata=_thread_metadata,
+                    session_key=_background_session_key,
+                    message_ref=_run_message_ref,
+                    platform=source.platform,
+                    thread_id=source.thread_id,
+                    run_receipt_id=_run_receipt_id,
+                )
+            except BaseException as send_exc:
+                failed = _gateway_exception_terminal_fields(send_exc)
+                failed["run_end_reason"] = (
+                    "background_final_delivery_cancelled"
+                    if failed["run_terminal_state"] == "cancelled"
+                    else (
+                        "background_final_delivery_exception:"
+                        f"{type(send_exc).__name__}"
+                    )
+                )
+                failed["final_response"] = final_content
+                failed["final_generated"] = bool(final_content)
+                _close_terminal(failed)
+                raise
+            _close_terminal(terminal)
+            return delivery_result
 
         try:
+            _thread_metadata = self._thread_metadata_for_source(
+                source, event_message_id
+            )
+            adapter = self._adapter_for_source(source)
+            if not adapter:
+                logger.warning(
+                    "No adapter for platform %s in background task %s",
+                    source.platform,
+                    task_id,
+                )
+                _close_terminal(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_adapter_unavailable",
+                        "final_generated": False,
+                    }
+                )
+                return
+
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
-                    f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                await _deliver_terminal(
+                    (
+                        f"❌ Background task {task_id} failed: "
+                        "no provider credentials configured."
+                    ),
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_missing_credentials",
+                    },
                 )
                 return
+
+            from run_agent import AIAgent
 
             platform_key = _platform_config_key(source.platform)
 
@@ -18598,106 +19304,220 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        run_receipt_id=_run_receipt_id,
+                        persist_terminal_receipt=False,
                     )
                 finally:
                     self._cleanup_agent_resources(agent)
 
-            result = await self._run_in_executor_with_context(run_sync)
+            raw_result = await self._run_in_executor_with_context(run_sync)
+            result = dict(raw_result) if isinstance(raw_result, dict) else {}
+            response = str(result.get("final_response") or "")
+            agent_error = str(result.get("error") or "")
+            if (not response or response == "(empty)") and agent_error:
+                response = f"Error: {agent_error}"
+            _agent_response_generated = bool(
+                response and response != "(empty)"
+            )
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
-
-            # Extract media files from the response
-            if response:
-                media_files, response = adapter.extract_media(response)
+            media_files = []
+            extracted_media_files = []
+            images = []
+            text_content = ""
+            if response and response != "(empty)":
+                extracted_media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    extracted_media_files
+                )
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            terminal = result
+            if not _agent_response_generated:
+                terminal.update(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_agent_empty_response",
+                    }
+                )
+            elif agent_error and terminal.get("run_terminal_state") not in {
+                "blocked",
+                "failed",
+                "cancelled",
+            }:
+                terminal.update(
+                    {
+                        "completed": False,
+                        "failed": True,
+                        "run_terminal_state": "failed",
+                        "run_end_reason": "background_agent_error",
+                    }
+                )
 
-                if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
-                    )
-                elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
-                    )
+            has_attachments = bool(images or extracted_media_files)
+            if not has_attachments:
+                header = (
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                )
+                final_content = (
+                    header + text_content
+                    if text_content
+                    else header + "(No response generated)"
+                )
+                await _deliver_terminal(final_content, terminal)
+            else:
+                attachment_rejected = (
+                    len(media_files) != len(extracted_media_files)
+                )
+                attachment_unknown = False
+                attachment_error_types: List[str] = []
 
-                # Send extracted images
-                for image_url, alt_text in (images or []):
+                async def _capture_attachment(send_awaitable: Any) -> None:
+                    nonlocal attachment_rejected, attachment_unknown
                     try:
-                        await adapter.send_image(
+                        send_result = await send_awaitable
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as attachment_exc:
+                        attachment_unknown = True
+                        attachment_error_types.append(
+                            type(attachment_exc).__name__
+                        )
+                        logger.warning(
+                            "Background task %s attachment delivery raised %s",
+                            task_id,
+                            type(attachment_exc).__name__,
+                        )
+                        return
+                    if getattr(send_result, "success", False):
+                        return
+                    if _delivery_result_is_unknown(send_result):
+                        attachment_unknown = True
+                    else:
+                        attachment_rejected = True
+
+                for image_url, alt_text in (images or []):
+                    await _capture_attachment(
+                        adapter.send_image(
                             chat_id=source.chat_id,
                             image_url=image_url,
                             caption=alt_text,
                             metadata=_thread_metadata,
                         )
-                    except Exception:
-                        pass
+                    )
 
-                # Send media files, routing each by type so a TTS clip
-                # arrives as a voice bubble / a clip as a video rather than
-                # a generic document. Mirrors the streaming + kanban paths.
                 from gateway.platforms.base import (
                     should_send_media_as_audio as _should_send_media_as_audio,
                 )
+
                 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-                _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
+                _VIDEO_EXTS = {
+                    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"
+                }
                 for media_path, _is_voice in (media_files or []):
                     _ext = os.path.splitext(media_path)[1].lower()
-                    try:
-                        if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
-                                audio_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
-                                video_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
-                                image_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                        else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
-                                file_path=media_path,
-                                metadata=_thread_metadata,
-                            )
-                    except Exception:
-                        pass
-            else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
-                )
+                    if _should_send_media_as_audio(
+                        source.platform, _ext, _is_voice
+                    ):
+                        send_awaitable = adapter.send_voice(
+                            chat_id=source.chat_id,
+                            audio_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    elif _ext in _VIDEO_EXTS:
+                        send_awaitable = adapter.send_video(
+                            chat_id=source.chat_id,
+                            video_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    elif _ext in _IMAGE_EXTS:
+                        send_awaitable = adapter.send_image_file(
+                            chat_id=source.chat_id,
+                            image_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    else:
+                        send_awaitable = adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                            metadata=_thread_metadata,
+                        )
+                    await _capture_attachment(send_awaitable)
 
-        except Exception as e:
+                if attachment_unknown:
+                    reason = "background_media_delivery_unknown"
+                    if attachment_error_types:
+                        reason += f":{attachment_error_types[0]}"
+                    terminal.update(
+                        {
+                            "completed": False,
+                            "failed": True,
+                            "run_terminal_state": "failed",
+                            "run_end_reason": reason,
+                        }
+                    )
+                    status_line = (
+                        "⚠️ Background task finished, but attachment "
+                        "delivery could not be confirmed."
+                    )
+                elif attachment_rejected:
+                    terminal.update(
+                        {
+                            "completed": False,
+                            "failed": True,
+                            "run_terminal_state": "failed",
+                            "run_end_reason": (
+                                "background_media_delivery_rejected"
+                            ),
+                        }
+                    )
+                    status_line = (
+                        "❌ Background task finished, but one or more "
+                        "required attachments were not delivered."
+                    )
+                else:
+                    status_line = "✅ Background task complete"
+
+                final_content = f'{status_line}\nPrompt: "{preview}"'
+                if text_content:
+                    final_content += f"\n\n{text_content}"
+                if not attachment_unknown and not attachment_rejected:
+                    final_content += (
+                        "\n\n(All required attachments were delivered.)"
+                    )
+                await _deliver_terminal(final_content, terminal)
+
+        except BaseException as e:
             logger.exception("Background task %s failed", task_id)
-            try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
+            is_control_exit = isinstance(
+                e,
+                (asyncio.CancelledError, KeyboardInterrupt, InterruptedError),
+            ) or not isinstance(e, Exception)
+            if not _terminal_closed:
+                terminal = _gateway_exception_terminal_fields(e)
+                terminal["run_end_reason"] = (
+                    "background_cancelled"
+                    if terminal["run_terminal_state"] == "cancelled"
+                    else f"background_exception:{type(e).__name__}"
                 )
-            except Exception:
-                pass
+                if is_control_exit:
+                    _close_terminal(terminal)
+                elif adapter is not None and not _final_delivery_started:
+                    try:
+                        await _deliver_terminal(
+                            f"❌ Background task {task_id} failed: {e}",
+                            terminal,
+                        )
+                    except BaseException:
+                        pass
+                else:
+                    _close_terminal(terminal)
+            if is_control_exit:
+                raise
 
 
 
@@ -22697,6 +23517,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        persist_user_platform_message_id: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -22813,6 +23635,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         on_before_finalize=_pause_typing_before_finalize,
                         initial_reply_to_id=event_message_id,
                         run_still_current=_run_still_current,
+                        delivery_session_key=session_key,
+                        delivery_message_ref=_delivery_message_ref(
+                            persist_user_platform_message_id,
+                            event_message_id,
+                            session_id=session_id,
+                            run_generation=run_generation,
+                        ),
+                        delivery_platform=getattr(
+                            source.platform,
+                            "value",
+                            source.platform,
+                        ),
+                        delivery_thread_id=source.thread_id,
+                        delivery_run_receipt_id=run_receipt_id,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -22976,7 +23812,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -22987,28 +23825,95 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        computed_receipt_id, message_ref = _gateway_run_receipt_identity(
+            session_key=session_key or "",
+            session_id=session_id,
+            run_generation=run_generation,
+            run_index=_interrupt_depth,
+            platform_message_id=persist_user_platform_message_id,
+            reply_anchor=event_message_id,
+        )
+        effective_receipt_id = run_receipt_id or computed_receipt_id
+        task_id = f"{session_id}:{int(_interrupt_depth or 0)}"
+
+        async def _execute() -> Dict[str, Any]:
             return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
+                message,
+                context_prompt,
+                history,
+                source,
+                session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
                 message_type=message_type,
+                run_receipt_id=effective_receipt_id,
             )
+
+        async def _execute_with_receipt() -> Dict[str, Any]:
+            from gateway.delivery_ledger import begin_run_receipt
+
+            begin_run_receipt(
+                run_receipt_id=effective_receipt_id,
+                session_id=session_id,
+                task_id=task_id,
+                session_key=session_key or "",
+                platform=str(
+                    getattr(source.platform, "value", source.platform) or ""
+                ),
+                run_generation=run_generation,
+                message_ref=message_ref,
+            )
+            try:
+                result = await _execute()
+            except BaseException as exc:
+                try:
+                    _record_gateway_run_terminal(
+                        _gateway_exception_terminal_fields(exc),
+                        run_receipt_id=effective_receipt_id,
+                        session_id=session_id,
+                        task_id=task_id,
+                        session_key=session_key or "",
+                        platform=source.platform,
+                        run_generation=run_generation,
+                        message_ref=message_ref,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize gateway run receipt %s",
+                        effective_receipt_id,
+                    )
+                raise
+
+            return _record_gateway_run_terminal(
+                result,
+                run_receipt_id=effective_receipt_id,
+                session_id=session_id,
+                task_id=task_id,
+                session_key=session_key or "",
+                platform=source.platform,
+                run_generation=run_generation,
+                message_ref=message_ref,
+            )
+
+        if not getattr(
+            getattr(self, "config", None),
+            "multiplex_profiles",
+            False,
+        ):
+            return await _execute_with_receipt()
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-            )
+            return await _execute_with_receipt()
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -23129,7 +24034,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23145,6 +24052,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
+            if persist_user_platform_message_id is not None:
+                if (
+                    not isinstance(persist_user_platform_message_id, str)
+                    or not persist_user_platform_message_id
+                    or persist_user_platform_message_id.strip()
+                    != persist_user_platform_message_id
+                ):
+                    raise RuntimeError(
+                        "Required inbound platform provenance is not one exact message ID."
+                    )
+                if self._session_db is None:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be persisted."
+                    )
+                persisted_content = (
+                    persist_user_message
+                    if persist_user_message is not None
+                    else message
+                )
+                try:
+                    already_persisted = await self._session_db.has_platform_message_id(
+                        session_id,
+                        persist_user_platform_message_id,
+                    )
+                    if not already_persisted:
+                        await self._session_db.append_message(
+                            session_id=session_id,
+                            role="user",
+                            content=persisted_content,
+                            platform_message_id=persist_user_platform_message_id,
+                            timestamp=persist_user_timestamp,
+                        )
+                    provenance_persisted = (
+                        await self._session_db.has_platform_message_id(
+                            session_id,
+                            persist_user_platform_message_id,
+                        )
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be persisted."
+                    ) from exc
+                if not provenance_persisted:
+                    raise RuntimeError(
+                        "Required inbound platform provenance could not be read back."
+                    )
             return await self._run_agent_via_proxy(
                 message=message,
                 context_prompt=context_prompt,
@@ -23154,6 +24107,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                persist_user_platform_message_id=(
+                    persist_user_platform_message_id
+                ),
+                run_receipt_id=run_receipt_id,
             )
 
         from run_agent import AIAgent
@@ -23414,6 +24371,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_platform_message_id=(
+                persist_user_platform_message_id
+            ),
+            run_receipt_id=run_receipt_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -23782,10 +24743,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Periodic "still working" notifications for long-running tasks.
         # Fires every N seconds so the user knows the agent hasn't died.
         # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
+        # HERMES_AGENT_NOTIFY_INTERVAL env var. Default 90s.
         # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        _NOTIFY_INTERVAL_RAW = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 90)
+        # A configured slower cadence must not recreate the silent-run failure
+        # this heartbeat closes. Preserve 0 as the explicit off switch, but
+        # cap every enabled interval at the 90-second operator receipt SLA.
+        _NOTIFY_INTERVAL = _bounded_progress_interval(_NOTIFY_INTERVAL_RAW)
         _long_running_mode = _display_surface_mode(
             "long_running_notifications",
             default=True,
@@ -23807,22 +24771,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
-            while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
-                # Stop heartbeating once this run no longer owns the session
-                # slot or the executor has finished — otherwise a stale
-                # "running: delegate_task" bubble can outlive the run that
-                # spawned it (#12029). _executor_task is a closure var bound
-                # just after this task is scheduled; tolerate the brief window
-                # before then (the first wake is _NOTIFY_INTERVAL away anyway).
+
+            def _run_still_active() -> bool:
+                # _executor_task is bound just after the notifier is
+                # scheduled. The first callback is one full interval later.
                 try:
                     _exec_ref = _executor_task
                 except NameError:
                     _exec_ref = None
-                if not self._should_emit_long_running_notification(
-                    session_key, agent_holder[0], _exec_ref
-                ):
-                    break
+                return self._should_emit_long_running_notification(
+                    session_key,
+                    agent_holder[0],
+                    _exec_ref,
+                )
+
+            def _heartbeat_content() -> str:
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available. Default
                 # heartbeat is terse: elapsed + current tool. Verbose
@@ -23846,42 +24809,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _parts.append(
                                 f"iteration {_a['api_call_count']}/{_a['max_iterations']}"
                             )
-                        _action = _a.get("current_tool") or _a.get("last_activity_desc")
+                        _action = _a.get("current_tool") or _a.get(
+                            "last_activity_desc"
+                        )
                         if _action:
                             _parts.append(str(_action))
                         if _parts:
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
+                return (
                     _generic_status_phrase("status")
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+
+            while True:
                 try:
-                    _notify_res = None
-                    if _heartbeat_msg_id:
-                        try:
-                            _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
-                                _heartbeat_msg_id,
-                                _heartbeat_text,
-                            )
-                        except Exception as _ee:
-                            logger.debug("Heartbeat edit failed: %s", _ee)
-                            _notify_res = None
-                    if not (_notify_res and getattr(_notify_res, "success", False)):
-                        _notify_res = await _notify_adapter.send(
-                            source.chat_id,
-                            _heartbeat_text,
-                            metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
-                        )
-                        if getattr(_notify_res, "success", False) and getattr(
-                            _notify_res, "message_id", None
-                        ):
-                            _heartbeat_msg_id = str(_notify_res.message_id)
-                            if _cleanup_progress:
-                                _cleanup_msg_ids.append(_heartbeat_msg_id)
+                    _prior_heartbeat_id = _heartbeat_msg_id
+                    (
+                        _still_active,
+                        _notify_res,
+                        _heartbeat_msg_id,
+                    ) = await _deliver_progress_receipt_after_interval(
+                        interval=_NOTIFY_INTERVAL,
+                        adapter=_notify_adapter,
+                        chat_id=source.chat_id,
+                        should_emit=_run_still_active,
+                        build_content=_heartbeat_content,
+                        metadata=_non_conversational_metadata(
+                            _status_thread_metadata,
+                            platform=source.platform,
+                        ),
+                        message_id=_heartbeat_msg_id,
+                    )
+                    if not _still_active:
+                        break
+                    if (
+                        _cleanup_progress
+                        and _heartbeat_msg_id
+                        and _heartbeat_msg_id != _prior_heartbeat_id
+                        and getattr(_notify_res, "success", False)
+                    ):
+                        _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -24115,6 +25085,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    "completed": False,
+                    "run_terminal_state": "failed",
+                    "run_end_reason": "gateway_inactivity_timeout",
+                    "run_ended_at": time.time(),
+                    "final_generated": False,
                 }
 
             # Track fallback model state: if the agent switched to a
@@ -24337,9 +25312,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     except Exception:
                         _intentional_silence = False
+                    _stream_outcome_unknown = bool(
+                        _sc
+                        and getattr(
+                            _sc,
+                            "final_delivery_outcome_unknown",
+                            False,
+                        )
+                    )
                     if _intentional_silence:
                         logger.info(
                             "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
+                            session_key or "?",
+                        )
+                    elif _stream_outcome_unknown:
+                        logger.warning(
+                            "Queued follow-up for session %s: prior final "
+                            "delivery outcome is unknown; preserving its "
+                            "attempting receipt and refusing a silent resend.",
                             session_key or "?",
                         )
                     elif first_response and not _already_streamed:
@@ -24348,11 +25338,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
-                                first_response,
+                            _first_send_result = await _send_final_with_delivery_proof(
+                                adapter=adapter,
+                                chat_id=source.chat_id,
+                                content=first_response,
                                 metadata=_status_thread_metadata,
+                                session_key=session_key or "",
+                                message_ref=_delivery_message_ref(
+                                    persist_user_platform_message_id,
+                                    event_message_id,
+                                    session_id=session_id,
+                                    run_generation=run_generation,
+                                ),
+                                platform=source.platform,
+                                thread_id=source.thread_id,
+                                run_receipt_id=_delivery_result.get(
+                                    "run_receipt_id"
+                                ),
                             )
+                            if not getattr(_first_send_result, "success", False):
+                                logger.warning(
+                                    "First response before queued message was "
+                                    "not confirmed delivered: %s",
+                                    getattr(
+                                        _first_send_result,
+                                        "error",
+                                        "send returned success=False",
+                                    ),
+                                )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                     elif first_response:
@@ -24393,6 +25406,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_source = source
                 next_message = pending
                 next_message_id = None
+                next_platform_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
                 # #60671 — carry the pending event's message_type into the
@@ -24429,6 +25443,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if next_message is None:
                         return result
                     next_message_id = self._reply_anchor_for_event(pending_event)
+                    next_platform_message_id = (
+                        _required_inbound_platform_message_id(pending_event)
+                    )
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
 
@@ -24485,6 +25502,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_platform_message_id=(
+                        next_platform_message_id
+                    ),
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
@@ -24583,6 +25603,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _content_delivered = bool(
                 _sc and getattr(_sc, "final_content_delivered", False)
             )
+            _delivery_outcome_unknown = bool(
+                _sc
+                and getattr(
+                    _sc,
+                    "final_delivery_outcome_unknown",
+                    False,
+                )
+            )
+            _delivery_ledger_error = str(
+                getattr(_sc, "final_delivery_ledger_error", "") or ""
+            )
             # Plugin hooks (e.g. transform_llm_output) may have appended content
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
@@ -24598,7 +25629,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            _stream_delivery_status = _apply_stream_final_delivery_status(
+                response,
+                has_final=not _is_empty_sentinel,
+                transformed=_transformed,
+                outcome_unknown=_delivery_outcome_unknown,
+                delivery_confirmed=(_streamed or _content_delivered),
+                ledger_error=_delivery_ledger_error,
+            )
+            if _stream_delivery_status == "failed":
+                logger.error(
+                    "Stream final delivery blocked for session %s: %s",
+                    session_key or "?",
+                    _delivery_ledger_error,
+                )
+            elif _stream_delivery_status == "unknown":
+                logger.warning(
+                    "Suppressing normal final resend for session %s: final "
+                    "delivery outcome is unknown; durable receipt remains "
+                    "attempting and delivery is not reported as confirmed.",
+                    session_key or "?",
+                )
+            elif _stream_delivery_status == "delivered":
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",
@@ -24606,28 +25658,81 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _previewed,
                     _content_delivered,
                 )
-                response["already_sent"] = True
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
                 # existing streamed message instead of sending a duplicate.
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
+                    _transformed_edit_result = None
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
-                        )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
+                        _transformed_edit_result = (
+                            await _sc.replace_final_with_delivery_proof(
+                                message_id=_sc_msg_id,
+                                content=response["final_response"],
+                            )
                         )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
+                        )
+                    _transformed_delivery_status = (
+                        _apply_stream_final_delivery_status(
+                            response,
+                            has_final=True,
+                            transformed=False,
+                            outcome_unknown=bool(
+                                getattr(
+                                    _sc,
+                                    "final_delivery_outcome_unknown",
+                                    False,
+                                )
+                            ),
+                            delivery_confirmed=bool(
+                                _transformed_edit_result
+                                and getattr(
+                                    _transformed_edit_result,
+                                    "success",
+                                    False,
+                                )
+                            ),
+                            ledger_error=str(
+                                getattr(
+                                    _sc,
+                                    "final_delivery_ledger_error",
+                                    "",
+                                )
+                                or ""
+                            ),
+                        )
+                    )
+                    if _transformed_delivery_status == "delivered":
+                        logger.info(
+                            "Edited streamed message %s for session %s to "
+                            "include plugin-transformed content with exact "
+                            "delivery proof.",
+                            _sc_msg_id,
+                            session_key or "?",
+                        )
+                    elif _transformed_delivery_status == "unknown":
+                        logger.warning(
+                            "Transformed final edit outcome is unknown for "
+                            "session %s; refusing an unmarked resend.",
+                            session_key or "?",
+                        )
+                    elif _transformed_delivery_status == "failed":
+                        logger.error(
+                            "Transformed final edit was blocked before send "
+                            "for session %s: %s",
+                            session_key or "?",
+                            response.get("final_delivery_error", ""),
+                        )
+                    else:
+                        logger.warning(
+                            "Transformed final edit was definitively rejected "
+                            "for session %s; leaving normal final delivery "
+                            "eligible.",
+                            session_key or "?",
                         )
 
         # Schedule deletion of tracked temporary progress bubbles after the
@@ -24991,6 +26096,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
     """
+    from agent.request_phase import resume_local_mutations
+
+    resume_local_mutations()
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
     # risky work like model switching refused) instead of crashing on a stale
@@ -25223,6 +26331,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Set up signal handlers
     def shutdown_signal_handler(received_signal=None):
         nonlocal _signal_initiated_shutdown
+        from agent.request_phase import suspend_local_mutations
+
+        suspend_local_mutations("gateway shutdown signal")
         # Planned --replace takeover check: when a sibling gateway is
         # taking over via --replace, it wrote a marker naming this PID
         # before sending SIGTERM. If present, treat the signal as a

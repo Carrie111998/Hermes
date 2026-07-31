@@ -77,7 +77,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
@@ -775,6 +775,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # shallow-copy contract as the hit path — the caller may mutate.
     _SKILLS_CACHE[cache_key] = (signature, now, skills)
     return [dict(s) for s in skills]
+
+
+def available_skill_names() -> frozenset[str]:
+    """Return the names Hermes can actually load from its active registry."""
+
+    return frozenset(
+        str(skill.get("name", "")).strip()
+        for skill in _find_all_skills()
+        if str(skill.get("name", "")).strip()
+    )
 
 
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1791,18 +1801,67 @@ registry.register(
         category=args.get("category"), task_id=kw.get("task_id")
     ),
     check_fn=check_skills_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="📚",
 )
+
+
+def _may_record_skill_usage() -> bool:
+    """Return whether recording skill telemetry is safe for this turn."""
+    try:
+        from agent.request_phase import RequestPhase, current_turn_policy
+
+        policy = current_turn_policy()
+    except Exception:
+        # Never let observability turn a read-only investigation into a write
+        # when the governing request-phase state is unavailable.
+        return False
+    return policy is None or policy.phase is not RequestPhase.INVESTIGATION
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
+    try:
+        from agent.request_phase import guard_tool_call
+
+        phase_block = guard_tool_call("skill_view", args)
+    except Exception:
+        phase_block = (
+            "Skill-selection safety block: the per-turn skill guard failed "
+            "closed."
+        )
+    if phase_block is not None:
+        return json.dumps(
+            {"success": False, "error": phase_block},
+            ensure_ascii=False,
+        )
     name = args.get("name", "")
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=kw.get("task_id")
     )
     try:
+        from agent.request_phase import enforce_skill_payload_budget
+
+        result = enforce_skill_payload_budget(args, result)
+    except Exception:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    "Skill payload safety block: the per-turn payload guard "
+                    "failed closed."
+                ),
+            },
+            ensure_ascii=False,
+        )
+    try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("success")
+            and _may_record_skill_usage()
+        ):
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name
@@ -1824,5 +1883,6 @@ registry.register(
     schema=SKILL_VIEW_SCHEMA,
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="📚",
 )

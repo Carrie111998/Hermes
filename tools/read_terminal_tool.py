@@ -11,7 +11,7 @@ over the platform-injected callback.
 import json
 from typing import Callable, Optional
 
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 from utils import env_var_enabled
 
 
@@ -89,5 +89,6 @@ registry.register(
         callback=kw.get("callback"),
     ),
     check_fn=check_read_terminal_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="🖥️",
 )

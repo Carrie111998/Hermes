@@ -1090,6 +1090,7 @@ def run_conversation(
     stream_callback: Optional[callable] = None,
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
+    persist_user_platform_message_id: Optional[str] = None,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
@@ -1110,6 +1111,9 @@ def run_conversation(
             synthetic prefixes.
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
+        persist_user_platform_message_id: Authenticated external message ID
+            that must be durably stored on the current user turn before the
+            model or any tool runs.
         persist_user_display_kind: Optional presentation type for a
             synthesized user turn (``auto_continue``, ``model_switch``, …).
             Display-only: transcript surfaces render the row as a timeline
@@ -1159,6 +1163,7 @@ def run_conversation(
         stream_callback,
         persist_user_message,
         persist_user_timestamp,
+        persist_user_platform_message_id,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,

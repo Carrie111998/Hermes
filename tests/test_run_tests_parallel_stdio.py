@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -67,3 +68,27 @@ def test_glyph_safe_stdio_noop_without_reconfigure(monkeypatch) -> None:
     print("✓ still fine")
 
     assert "✓ still fine" in plain.getvalue()
+
+
+def test_parallel_file_can_use_an_isolated_hermes_home(tmp_path, monkeypatch) -> None:
+    mod = _load_runner()
+    live_home = tmp_path / "live-profile"
+    monkeypatch.setenv("HERMES_HOME", str(live_home))
+    monkeypatch.setenv("HERMES_TEST_ISOLATE_HERMES_HOME", "1")
+
+    env_a, home_a = mod._pytest_subprocess_env()
+    env_b, home_b = mod._pytest_subprocess_env()
+
+    try:
+        assert env_a["HERMES_HOME"] != str(live_home)
+        assert env_b["HERMES_HOME"] != str(live_home)
+        assert env_a["HERMES_HOME"] != env_b["HERMES_HOME"]
+        assert Path(env_a["HERMES_HOME"]).is_dir()
+        assert Path(env_b["HERMES_HOME"]).is_dir()
+        assert os.environ["HERMES_HOME"] == str(live_home)
+    finally:
+        home_a.cleanup()
+        home_b.cleanup()
+
+    assert not Path(env_a["HERMES_HOME"]).exists()
+    assert not Path(env_b["HERMES_HOME"]).exists()

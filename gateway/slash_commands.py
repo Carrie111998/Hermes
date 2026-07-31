@@ -2586,6 +2586,11 @@ class GatewaySlashCommandsMixin:
             message_type=MessageType.TEXT,
             source=source,
             raw_message=event.raw_message,
+            # Preserve the authenticated /retry command's exact platform
+            # provenance. The replayed text is synthetic, but the authority
+            # to request that replay came from this concrete inbound message.
+            message_id=event.message_id,
+            platform_update_id=event.platform_update_id,
             channel_prompt=event.channel_prompt,
         )
         

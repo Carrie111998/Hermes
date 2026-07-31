@@ -13,9 +13,11 @@ the whole tree as modified. These tests pin down that coupling.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -59,6 +61,12 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
     for name in files:
         (repo / name).unlink()
     _git(repo, "checkout", "--", ".")
+    # Force a worktree re-stat. Large fixtures can span a filesystem timestamp
+    # tick, otherwise Git may trust only part of the freshly written CRLF tree
+    # and make this regression depend on machine speed.
+    future_mtime = time.time() + 2
+    for name in files:
+        os.utime(repo / name, (future_mtime, future_mtime))
     return repo
 
 
