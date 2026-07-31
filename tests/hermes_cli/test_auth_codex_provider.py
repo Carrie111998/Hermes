@@ -54,16 +54,26 @@ def _jwt_with_exp(exp_epoch: int) -> str:
 
 
 
-def test_resolve_codex_runtime_credentials_missing_access_token(tmp_path, monkeypatch):
+def test_resolve_codex_runtime_credentials_missing_access_token_refreshes(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
-    _setup_hermes_auth(hermes_home, access_token="")
+    _setup_hermes_auth(hermes_home, access_token="", refresh_token="refresh-old")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
 
-    with pytest.raises(AuthError) as exc:
-        resolve_codex_runtime_credentials()
-    assert exc.value.code == "codex_auth_missing_access_token"
-    assert exc.value.relogin_required is True
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        assert tokens["access_token"] == ""
+        assert tokens["refresh_token"] == "refresh-old"
+        return {"access_token": "access-new", "refresh_token": "refresh-new"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+
+    assert called["count"] == 1
+    assert resolved["api_key"] == "access-new"
 
 
 def test_resolve_codex_runtime_credentials_falls_back_to_pool_when_singleton_empty(tmp_path, monkeypatch):
