@@ -5,7 +5,6 @@ Follows the same pattern as test_whatsapp_group_gating.py.
 """
 
 import sys
-import inspect
 import logging
 from unittest.mock import AsyncMock, MagicMock
 
@@ -60,7 +59,7 @@ OTHER_CHANNEL_ID = "C9999999999"
 
 
 def _make_adapter(require_mention=None, strict_mention=None, free_response_channels=None,
-                  allowed_channels=None, mention_patterns=None):
+                  allowed_channels=None, mention_patterns=None, reaction_ack_scope=None):
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
@@ -72,6 +71,8 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
         extra["allowed_channels"] = allowed_channels
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
+    if reaction_ack_scope is not None:
+        extra["reaction_ack_scope"] = reaction_ack_scope
 
     adapter = object.__new__(SlackAdapter)
     adapter.platform = Platform.SLACK
@@ -254,20 +255,28 @@ def test_mpim_unmentioned_does_not_react():
     assert _reaction_guard("", False) is False         # channel, unmentioned
 
 
-def test_reaction_guard_pinned_to_production_expression():
-    """Default reaction scope must retain the MPIM spam guard.
-
-    ``processed`` deliberately expands ACKs only when configured. The default
-    ``addressed`` branch must continue to key off 1:1 IMs or explicit mentions,
-    never the broader ``is_dm`` value that also includes MPIMs.
-    """
-    src = inspect.getsource(SlackAdapter._should_ack_processed_message)
-    assert "return is_one_to_one_dm or is_mentioned" in src, (
-        "default reaction scope no longer keys off is_one_to_one_dm — an "
-        "unmentioned MPIM would react again"
-    )
-    assert "return is_dm or is_mentioned" not in src, (
-        "reaction guard reverted to is_dm — MPIMs would react when unmentioned"
+@pytest.mark.parametrize(
+    ("scope", "is_one_to_one_dm", "is_mentioned", "expected"),
+    [
+        ("addressed", False, False, False),  # unmentioned MPIM/channel
+        ("addressed", False, True, True),
+        ("addressed", True, False, True),
+        ("processed", False, False, True),
+        ("off", True, True, False),
+        ("invalid", False, False, False),  # fail back to addressed
+    ],
+)
+def test_reaction_ack_scope_runtime_behavior(
+    monkeypatch, scope, is_one_to_one_dm, is_mentioned, expected
+):
+    monkeypatch.setenv("SLACK_REACTIONS", "true")
+    adapter = _make_adapter(reaction_ack_scope=scope)
+    assert (
+        adapter._should_ack_processed_message(
+            is_one_to_one_dm=is_one_to_one_dm,
+            is_mentioned=is_mentioned,
+        )
+        is expected
     )
 
 
@@ -351,6 +360,26 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
     _os.environ.pop("SLACK_REQUIRE_MENTION", None)
     _os.environ.pop("SLACK_FREE_RESPONSE_CHANNELS", None)
+
+
+def test_config_bridges_slack_reaction_ack_scope(monkeypatch, tmp_path):
+    from gateway.config import load_gateway_config
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "slack:\n"
+        "  reaction_ack_scope: processed\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = load_gateway_config()
+
+    slack_extra = config.platforms[Platform.SLACK].extra
+    assert slack_extra["reaction_ack_scope"] == "processed"
+    adapter = _make_adapter(reaction_ack_scope=slack_extra["reaction_ack_scope"])
+    assert adapter._reaction_ack_scope() == "processed"
 
 
 def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tmp_path):
