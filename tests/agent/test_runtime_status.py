@@ -70,6 +70,13 @@ def test_runtime_status_clamps_invalid_counters_without_leaking_other_agent_stat
     assert payload["compression_count"] == 0
 
 
+def test_runtime_status_invalid_home_expansion_is_non_fatal():
+    agent = _agent()
+    agent.runtime_status_file = "~hermes-agent-user-that-must-not-exist/status.json"
+
+    assert emit_runtime_status(agent) is False
+
+
 def test_runtime_status_file_is_accepted_before_or_after_chat_subcommand():
     parser, _, chat_parser = build_top_level_parser()
     top = parser.parse_args(["--runtime-status-file", "/tmp/role-status.json"])

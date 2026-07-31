@@ -52,9 +52,10 @@ def emit_runtime_status(agent: Any) -> bool:
     if not isinstance(raw_target, str) or not raw_target.strip():
         return False
 
-    target = Path(raw_target).expanduser()
+    target = Path(raw_target)
     temporary: Path | None = None
     try:
+        target = target.expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
             prefix=f".{target.name}.",
@@ -77,6 +78,6 @@ def emit_runtime_status(agent: Any) -> bool:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         return True
-    except (OSError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
         logger.debug("runtime status write failed for %s: %s", target, exc)
         return False
