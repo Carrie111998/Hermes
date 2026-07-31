@@ -138,6 +138,11 @@ except ImportError:
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.response_turn_boundary import (
+    FULL_TRANSCRIPT_MODE,
+    build_response_conversation_history,
+    response_messages_turn_start_index,
+)
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -6110,15 +6115,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
-                full_history = self._build_response_conversation_history(
+                full_history = build_response_conversation_history(
                     conversation_history,
                     user_message,
                     result,
                     final_response_text,
                 )
-                # Compression-aware transcript substitution happens inside
-                # _build_response_conversation_history (result["_compressed"]);
-                # here we only propagate a compression-rotated session_id so
+                # Transcript substitution happens inside the focused boundary
+                # policy; here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
                 _persist_response_snapshot(
@@ -6462,7 +6466,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Build the full conversation history for storage
         # (includes tool calls from the agent run)
-        full_history = self._build_response_conversation_history(
+        full_history = build_response_conversation_history(
             conversation_history,
             user_message,
             result,
@@ -6482,7 +6486,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Build output items from the current turn only.  AIAgent returns a
         # full transcript in result["messages"], while older/mocked paths may
         # return only the current turn suffix.
-        output_start_index = self._response_messages_turn_start_index(
+        output_start_index = response_messages_turn_start_index(
             conversation_history,
             user_message,
             result,
@@ -6950,76 +6954,6 @@ class APIServerAdapter(BasePlatformAdapter):
     # Output extraction helper
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _build_response_conversation_history(
-        conversation_history: List[Dict[str, Any]],
-        user_message: Any,
-        result: Dict[str, Any],
-        final_response: Any,
-    ) -> List[Dict[str, Any]]:
-        """Build the stored Responses transcript without duplicating history.
-
-        When context compression occurs during a turn the agent returns a
-        compressed full transcript in ``result["messages"]`` (starting with a
-        summary) and sets ``result["_compressed"] = True``.  Because the
-        compressed transcript does not share the input ``conversation_history``
-        prefix, the normal turn-start detection fails and old code would
-        concatenate the uncompressed history on front, bloating the stored
-        context and re-triggering compression on every subsequent request.
-        """
-        prior = list(conversation_history)
-        current_user = {"role": "user", "content": user_message}
-        agent_messages = result.get("messages") if isinstance(result, dict) else None
-
-        if isinstance(agent_messages, list) and agent_messages:
-            turn_start = APIServerAdapter._response_messages_turn_start_index(
-                conversation_history,
-                user_message,
-                result,
-            )
-            if turn_start:
-                return list(agent_messages)
-
-            # turn_start == 0: agent_messages does not start with prior.
-            # This can happen because compression rewrote the transcript
-            # (summary prefix replaces original history), OR because
-            # agent_messages only carries the current turn without prior.
-            # The ``_compressed`` flag (set by _run_agent after compaction)
-            # distinguishes — skip the concatenation and use the compressed
-            # transcript directly.
-            if result.get("_compressed"):
-                return list(agent_messages)
-
-            full_history = prior
-            full_history.append(current_user)
-            full_history.extend(agent_messages)
-            return full_history
-
-        full_history = prior
-        full_history.append(current_user)
-        full_history.append({"role": "assistant", "content": final_response})
-        return full_history
-
-    @staticmethod
-    def _response_messages_turn_start_index(
-        conversation_history: List[Dict[str, Any]],
-        user_message: Any,
-        result: Dict[str, Any],
-    ) -> int:
-        """Detect transcript-shaped result["messages"] and return turn start."""
-        agent_messages = result.get("messages") if isinstance(result, dict) else None
-        if not isinstance(agent_messages, list) or not agent_messages:
-            return 0
-
-        prior = list(conversation_history)
-        current_user = {"role": "user", "content": user_message}
-        expected_prefix = prior + [current_user]
-        if agent_messages[:len(expected_prefix)] == expected_prefix:
-            return len(expected_prefix)
-        if prior and agent_messages[:len(prior)] == prior:
-            return len(prior)
-        return 0
-
     @classmethod
     def _turn_transcript_messages(
         cls,
@@ -7045,7 +6979,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(agent_messages, list) or not agent_messages:
             return []
-        start = cls._response_messages_turn_start_index(
+        start = response_messages_turn_start_index(
             conversation_history, user_message, result
         )
         turn = agent_messages[start:]
@@ -7313,6 +7247,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
                     )
+                    if isinstance(result.get("messages"), list):
+                        result["_transcript_mode"] = FULL_TRANSCRIPT_MODE
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                         "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -7324,10 +7260,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     _eff_sid = getattr(agent, "session_id", session_id)
                     if isinstance(_eff_sid, str) and _eff_sid:
                         result["session_id"] = _eff_sid
-                    # Signal whether context compression occurred during this turn
-                    # so _build_response_conversation_history can skip the
-                    # prior-concatenation path and store the compressed transcript
-                    # directly.  Rotation mode changes agent.session_id; in-place
+                    # Preserve the legacy compression marker for compatibility;
+                    # the explicit full-transcript mode above remains authoritative.
+                    # Rotation mode changes agent.session_id; in-place
                     # mode sets _last_compaction_in_place (see #38763).
                     _compacted_in_place = bool(getattr(agent, "_last_compaction_in_place", False))
                     _session_rotated = (
