@@ -13,6 +13,7 @@ the whole tree as modified. These tests pin down that coupling.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,20 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
     for name in files:
         (repo / name).unlink()
     _git(repo, "checkout", "--", ".")
+    # Age the checked-out files past git's "racy clean" window. ``checkout``
+    # records the freshly written (CRLF) worktree stat in the index; any file
+    # whose mtime lands in the same clock tick as that index write is resolved
+    # by content on the next ``diff``, but the rest are trusted from stat alone
+    # and their CRLF-vs-LF churn is silently missed. That makes a dirty count
+    # over the whole tree nondeterministic — observed anywhere from a couple
+    # hundred paths up to all of them across runs. A real managed checkout's
+    # files aged past that window long ago; do the same here so every path is
+    # reliably visible to the ``autocrlf=false`` probe. This changes nothing the
+    # code under test sees: under ``autocrlf=true`` the tree still reads clean
+    # via content normalization, independent of mtime.
+    stale = (1_000_000_000, 1_000_000_000)
+    for name in files:
+        os.utime(repo / name, stale)
     return repo
 
 
