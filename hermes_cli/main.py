@@ -17997,19 +17997,6 @@ def main():
                 db.close()
                 return
 
-            # Strip compression children (keep latest descendant only)
-            result_ids = set(seen.keys())
-            ancestors = set()
-            for sid in result_ids:
-                meta = db.get_session(sid) or {}
-                parent_id = meta.get("parent_session_id")
-                while parent_id and parent_id in result_ids:
-                    ancestors.add(parent_id)
-                    parent_meta = db.get_session(parent_id) or {}
-                    parent_id = parent_meta.get("parent_session_id")
-            for sid in ancestors:
-                seen.pop(sid, None)
-
             if not seen:
                 print(f"No sessions matching \"{query}\".")
                 db.close()
@@ -18017,27 +18004,26 @@ def main():
 
             print(f"⚙️  sessions search {query}\n")
             from datetime import datetime as _dt
-            print(f"  {'#':>2}  {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<30} {'Last Active':<12} {'ID'}")
-            print(f"  {'─'*2}  {'─'*28} {'─'*12} {'─'*4}  {'─'*30} {'─'*12} {'─'*24}")
+            print(f"  {'#':>2}  {'Title':<26} {'Model':<12} {'Msgs':>4}  {'Source':<6} {'Preview':<30} {'Last Active':<12} {'ID'}")
+            print(f"  {'─'*2}  {'─'*26} {'─'*12} {'─'*4}  {'─'*6} {'─'*30} {'─'*12} {'─'*24}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
-                title = (meta.get("title") or "—")[:26]
-                if len(title) >= 26:
-                    title = title[:25] + "…"
+                title = (meta.get("title") or "—")[:24]
+                if len(meta.get("title") or "") >= 24:
+                    title = title[:23] + "…"
                 started = meta.get("started_at")
                 when = _dt.fromtimestamp(started).strftime("%b %d") if started else "?"
+                source = r.get("source", "?")[:6]
                 model_raw = (r.get("model") or "—")
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
                 if len(model) > 12:
                     model = model[:11] + "…"
                 mc = meta.get("message_count")
                 msgs_str = str(mc) if mc is not None else "—"
-                snip_raw = r.get("snippet", "") or ""
-                snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snip_raw))
-                preview = snip_clean.replace("\n", " ").strip()
-                if len(preview) > 30:
-                    preview = preview[:27] + "..."
-                print(f"  {idx:>2}  {title:<28} {model:<12} {msgs_str:>4}  {preview:<30} {when:<12} {sid}")
+                preview = (meta.get("preview") or "")[:28]
+                if len(meta.get("preview") or "") >= 28:
+                    preview = preview[:27] + "…"
+                print(f"  {idx:>2}  {title:<26} {model:<12} {msgs_str:>4}  {source:<6} {preview:<30} {when:<12} {sid}")
             print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 

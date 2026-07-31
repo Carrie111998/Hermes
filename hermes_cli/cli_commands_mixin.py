@@ -1136,20 +1136,6 @@ class CLICommandsMixin:
             _cprint(f"  Sessions matching \"{search_query}\":")
             _cprint("")
 
-            # Strip compression children: if A → A #2 → A #3 all match,
-            # keep only the latest descendant (the one with no child in results).
-            result_ids = set(seen.keys())
-            ancestors = set()
-            for sid in result_ids:
-                meta = self._session_db.get_session(sid) or {}
-                parent_id = meta.get("parent_session_id")
-                while parent_id and parent_id in result_ids:
-                    ancestors.add(parent_id)
-                    parent_meta = self._session_db.get_session(parent_id) or {}
-                    parent_id = parent_meta.get("parent_session_id")
-            for sid in ancestors:
-                seen.pop(sid, None)
-
             if not seen:
                 _cprint("")
                 _cprint(f"  No sessions matching \"{search_query}\".")
@@ -1157,35 +1143,32 @@ class CLICommandsMixin:
 
             _cprint("")
             _cprint(f"  ⚙️  /sessions search {search_query}")
-            _cprint("  Sessions matching \"{search_query}\":")
+            _cprint(f"  Sessions matching \"{search_query}\":")
             _cprint("")
-            _cprint(f"  {'#':>2}  {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<30} {'Last Active':<12} {'ID'}")
-            _cprint(f"  {'─'*2}  {'─'*28} {'─'*12} {'─'*4}  {'─'*30} {'─'*12} {'─'*24}")
+            _cprint(f"  {'#':>2}  {'Title':<26} {'Model':<12} {'Msgs':>4}  {'Source':<6} {'Preview':<30} {'Last Active':<12} {'ID'}")
+            _cprint(f"  {'─'*2}  {'─'*26} {'─'*12} {'─'*4}  {'─'*6} {'─'*30} {'─'*12} {'─'*24}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = self._session_db.get_session(sid) or {}
-                title = (meta.get("title") or "—")[:26]
-                if len(title) >= 26:
-                    title = title[:25] + "…"
+                title = (meta.get("title") or "—")[:24]
+                if len(meta.get("title") or "") >= 24:
+                    title = title[:23] + "…"
                 started = meta.get("started_at")
                 if started:
                     when = _dt.fromtimestamp(started).strftime("%b %d")
                 else:
                     when = "?"
+                source = r.get("source", "?")[:6]
                 model_raw = (r.get("model") or "—")
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
                 if len(model) > 12:
                     model = model[:11] + "…"
                 mc = meta.get("message_count")
                 msgs_str = str(mc) if mc is not None else "—"
-
-                # Clean FTS5 snippet for preview
-                snippet = r.get("snippet", "") or ""
-                snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snippet))
-                preview = snip_clean.replace("\n", " ").strip()
-                if len(preview) > 30:
-                    preview = preview[:27] + "..."
-
-                _cprint(f"  {idx:>2}  {title:<28} {model:<12} {msgs_str:>4}  {preview:<30} {when:<12} {sid}")
+                # Use session preview (first user message) like /resume does
+                preview = (meta.get("preview") or "")[:28]
+                if len(meta.get("preview") or "") >= 28:
+                    preview = preview[:27] + "…"
+                _cprint(f"  {idx:>2}  {title:<26} {model:<12} {msgs_str:>4}  {source:<6} {preview:<30} {when:<12} {sid}")
 
             _cprint("")
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
