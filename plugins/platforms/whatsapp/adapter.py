@@ -1414,6 +1414,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get(
                 "thread_sessions_per_user", False
             ),
+            profile=event.source.profile,
         )
         return f"{session_key}:media:{event.message_type.value}"
 
