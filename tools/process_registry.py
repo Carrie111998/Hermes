@@ -108,6 +108,7 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     output_log_path: str = ""                    # Durable append-only output log
+    exit_code_path: str = ""                     # Child-written exit status sidecar
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
@@ -228,10 +229,12 @@ class ProcessRegistry:
             lines.pop(0)
         return "\n".join(lines)
 
-    def _emit_output(self, session: ProcessSession, chunk: str) -> None:
+    def _emit_output(
+        self, session: ProcessSession, chunk: str, *, persist: bool = True,
+    ) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
         Called from reader threads; never raise into the read loop."""
-        if chunk and session.output_log_path:
+        if persist and chunk and session.output_log_path:
             try:
                 path = Path(session.output_log_path)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -542,12 +545,27 @@ class ProcessRegistry:
             if session.exited:
                 return session
             session.exited = True
-            # Recovered sessions no longer have a waitable handle, so the real
-            # exit code is unavailable once the original process object is gone.
-            session.exit_code = None
+            session.exit_code = self._read_exit_code(session)
 
         self._move_to_finished(session)
         return session
+
+    @staticmethod
+    def _read_exit_code(session: ProcessSession) -> Optional[int]:
+        """Read the status written by the child-owned durable shell wrapper."""
+        if session.exit_code_path:
+            try:
+                value = Path(session.exit_code_path).read_text(
+                    encoding="utf-8", errors="replace"
+                ).strip().splitlines()[-1]
+                return int(value)
+            except (OSError, ValueError, IndexError):
+                pass
+        if session.process is not None:
+            return session.process.returncode
+        if session._pty is not None:
+            return getattr(session._pty, "exitstatus", None)
+        return None
 
     @staticmethod
     def _proc_alive(proc) -> bool:
@@ -790,7 +808,32 @@ class ProcessRegistry:
         session.output_log_path = str(
             get_hermes_home() / "cache" / "processes" / f"{session.id}.log"
         )
+        session.exit_code_path = str(
+            get_hermes_home() / "cache" / "processes" / f"{session.id}.exit"
+        )
         self._apply_watcher_config(session, watcher_config)
+        durable_child_sink = bool(
+            session.notify_on_complete or session.watcher_interval > 0
+        )
+        if durable_child_sink:
+            output_path = Path(session.output_log_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            output_path.touch(mode=0o600, exist_ok=True)
+            try:
+                output_path.chmod(0o600)
+            except OSError:
+                pass
+            Path(session.exit_code_path).unlink(missing_ok=True)
+
+        def _shell_command() -> str:
+            if not durable_child_sink:
+                return f"set +m; {safe_command}"
+            quoted_log = shlex.quote(session.output_log_path)
+            quoted_exit = shlex.quote(session.exit_code_path)
+            return (
+                f"set +m; {{ {safe_command}; }} >> {quoted_log} 2>&1; "
+                f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit}; exit \"$rc\""
+            )
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
@@ -803,7 +846,7 @@ class ProcessRegistry:
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {safe_command}"],
+                    [user_shell, "-lic", _shell_command()],
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -813,21 +856,25 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
-                # PTY reader thread
+                # Register and checkpoint before the reader can observe exit.
+                # This closes the fast-exit race where _move_to_finished saw
+                # no running producer and the spawn path reinserted it later.
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+                self._write_checkpoint()
+
                 reader = threading.Thread(
-                    target=self._pty_reader_loop,
+                    target=(
+                        self._local_log_poller_loop
+                        if durable_child_sink else self._pty_reader_loop
+                    ),
                     args=(session,),
                     daemon=True,
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
                 reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
-                self._write_checkpoint()
                 return session
 
             except ImportError:
@@ -847,13 +894,13 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
+            [user_shell, "-lic", _shell_command()],
             text=True,
             cwd=session.cwd,
             env=bg_env,
             encoding="utf-8",
             errors="replace",
-            stdout=subprocess.PIPE,
+            stdout=(subprocess.DEVNULL if durable_child_sink else subprocess.PIPE),
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
@@ -865,21 +912,24 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
-            # Start output reader thread
+            # Register and checkpoint before starting any thread capable of
+            # moving this producer to finished.
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+            self._write_checkpoint()
+
             reader = threading.Thread(
-                target=self._reader_loop,
+                target=(
+                    self._local_log_poller_loop
+                    if durable_child_sink else self._reader_loop
+                ),
                 args=(session,),
                 daemon=True,
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
-            self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -899,6 +949,9 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            with self._lock:
+                self._running.pop(session.id, None)
+            self._write_checkpoint()
             raise
 
         return session
@@ -988,7 +1041,13 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            # Register/checkpoint before the poller can observe an immediate
+            # sandbox exit and move the producer to finished.
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+            self._write_checkpoint()
+
             reader = threading.Thread(
                 target=self._env_poller_loop,
                 args=(session, env, log_path, pid_path, exit_path),
@@ -998,17 +1057,65 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
 
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
-            self._write_checkpoint()
-
         return session
 
     # ----- Reader / Poller Threads -----
+
+    def _local_log_poller_loop(self, session: ProcessSession) -> None:
+        """Tail a child-owned log so output survives a gateway process restart."""
+        offset = 0
+        first_chunk = True
+
+        def _read_delta() -> None:
+            nonlocal offset, first_chunk
+            try:
+                path = Path(session.output_log_path)
+                with path.open("r", encoding="utf-8", errors="replace") as fh:
+                    fh.seek(offset)
+                    chunk = fh.read()
+                    offset = fh.tell()
+            except Exception:
+                return
+            if not chunk:
+                return
+            if first_chunk:
+                chunk = self._clean_shell_noise(chunk)
+                first_chunk = False
+            with session._lock:
+                session.output_buffer += chunk
+                if len(session.output_buffer) > session.max_output_chars:
+                    session.output_buffer = session.output_buffer[-session.max_output_chars:]
+            self._check_watch_patterns(session, chunk)
+            self._emit_output(session, chunk, persist=False)
+
+        try:
+            while True:
+                _read_delta()
+                proc = session.process
+                pty = session._pty
+                alive = pty.isalive() if pty is not None else bool(
+                    proc is not None and proc.poll() is None
+                )
+                if not alive:
+                    break
+                time.sleep(0.2)
+            _read_delta()
+            if session._pty is not None:
+                try:
+                    session._pty.wait()
+                except Exception:
+                    pass
+            elif session.process is not None:
+                try:
+                    session.process.wait(timeout=5)
+                except Exception:
+                    pass
+        finally:
+            session.exited = True
+            if session.completion_reason != "killed":
+                session.exit_code = self._read_exit_code(session)
+                session.completion_reason = "exited"
+            self._move_to_finished(session)
 
     def _reader_loop(self, session: ProcessSession):
         """Background thread: read stdout from a local Popen process.
@@ -1268,13 +1375,17 @@ class ProcessRegistry:
     def mark_notification_delivered(self, session_id: str) -> None:
         """Acknowledge a terminal notification after adapter/consumer acceptance."""
         output_log_path = ""
+        exit_code_path = ""
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
             if session is not None:
                 session.notification_delivered = True
                 output_log_path = session.output_log_path
+                exit_code_path = session.exit_code_path
                 session.output_log_path = ""
+                session.exit_code_path = ""
         self._delete_output_log(output_log_path)
+        self._delete_output_log(exit_code_path)
         self._write_checkpoint()
 
     def _mark_completion_consumed(self, session_id: str) -> None:
@@ -2022,19 +2133,34 @@ class ProcessRegistry:
         expired = [
             sid for sid, s in self._finished.items()
             if (now - s.started_at) > FINISHED_TTL_SECONDS
+            and not (
+                s.notify_on_complete
+                and not s.notification_delivered
+                and sid not in self._completion_consumed
+            )
         ]
         for sid in expired:
             removed = self._finished.pop(sid)
             self._delete_output_log(removed.output_log_path)
+            self._delete_output_log(removed.exit_code_path)
             self._completion_consumed.discard(sid)
             self._poll_observed.discard(sid)
 
         # If still over limit, remove oldest finished
         total = len(self._running) + len(self._finished)
-        if total >= MAX_PROCESSES and self._finished:
-            oldest_id = min(self._finished, key=lambda sid: self._finished[sid].started_at)
+        pruneable = {
+            sid: session for sid, session in self._finished.items()
+            if not (
+                session.notify_on_complete
+                and not session.notification_delivered
+                and sid not in self._completion_consumed
+            )
+        }
+        if total >= MAX_PROCESSES and pruneable:
+            oldest_id = min(pruneable, key=lambda sid: pruneable[sid].started_at)
             removed = self._finished.pop(oldest_id)
             self._delete_output_log(removed.output_log_path)
+            self._delete_output_log(removed.exit_code_path)
             self._completion_consumed.discard(oldest_id)
             self._poll_observed.discard(oldest_id)
 
@@ -2079,6 +2205,7 @@ class ProcessRegistry:
             "termination_source": s.termination_source,
             "output_tail": s.output_buffer[-2000:] if s.exited else "",
             "output_log_path": s.output_log_path,
+            "exit_code_path": s.exit_code_path,
             "watcher_platform": s.watcher_platform,
             "watcher_chat_id": s.watcher_chat_id,
             "watcher_user_id": s.watcher_user_id,
@@ -2148,6 +2275,7 @@ class ProcessRegistry:
                     termination_source=entry.get("termination_source", ""),
                     output_buffer=entry.get("output_tail", ""),
                     output_log_path=entry.get("output_log_path", ""),
+                    exit_code_path=entry.get("exit_code_path", ""),
                     watcher_platform=entry.get("watcher_platform", ""),
                     watcher_chat_id=entry.get("watcher_chat_id", ""),
                     watcher_user_id=entry.get("watcher_user_id", ""),
@@ -2204,15 +2332,32 @@ class ProcessRegistry:
                 # restart never silently drops the user's completion signal.
                 if not entry.get("notify_on_complete"):
                     continue
+                recovered_exit_code = None
+                exit_code_path = entry.get("exit_code_path", "")
+                if exit_code_path:
+                    try:
+                        recovered_exit_code = int(
+                            Path(exit_code_path).read_text(
+                                encoding="utf-8", errors="replace"
+                            ).strip().splitlines()[-1]
+                        )
+                    except (OSError, ValueError, IndexError):
+                        pass
                 session = ProcessSession(
                     id=entry["session_id"], command=entry.get("command", "unknown"),
                     task_id=entry.get("task_id", ""), session_key=entry.get("session_key", ""),
                     pid=pid, host_start_time=recorded_start,
                     cwd=entry.get("cwd"), started_at=entry.get("started_at", time.time()),
-                    detached=True, exited=True, exit_code=None,
-                    completion_reason="lost", termination_source="restart_recovery",
+                    detached=True, exited=True, exit_code=recovered_exit_code,
+                    completion_reason=(
+                        "exited" if recovered_exit_code is not None else "lost"
+                    ),
+                    termination_source=(
+                        "" if recovered_exit_code is not None else "restart_recovery"
+                    ),
                     output_buffer=entry.get("output_tail", ""),
                     output_log_path=entry.get("output_log_path", ""),
+                    exit_code_path=entry.get("exit_code_path", ""),
                     watcher_platform=entry.get("watcher_platform", ""),
                     watcher_chat_id=entry.get("watcher_chat_id", ""),
                     watcher_user_id=entry.get("watcher_user_id", ""),
@@ -2244,6 +2389,7 @@ class ProcessRegistry:
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 output_log_path=entry.get("output_log_path", ""),
+                exit_code_path=entry.get("exit_code_path", ""),
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),

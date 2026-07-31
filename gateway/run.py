@@ -21399,9 +21399,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delivered = await self._deliver_completion_notification(
                         synth_text, completion_evt,
                     )
-                    if delivered is False:
-                        # The process remains terminal; retry after failed
-                        # adapter injection instead of suppressing the result.
+                    if delivered is not True:
+                        # Only explicit adapter acceptance acknowledges and
+                        # deletes durable producer state. ``None`` includes an
+                        # unroutable/missing-profile adapter and must remain
+                        # pending just like a retryable delivery failure.
                         continue
                     _pr_check.mark_notification_delivered(session_id)
                     break
@@ -21443,7 +21445,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     delivered = await self._deliver_process_status_direct(
                         message_text, watcher, status_key=f"process:{session_id}:final"
                     )
-                    if delivered is False:
+                    if delivered is not True:
                         continue
                 _pr_check.mark_notification_delivered(session_id)
                 break

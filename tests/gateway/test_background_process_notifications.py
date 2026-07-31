@@ -261,6 +261,35 @@ async def test_periodic_output_is_throttled_profile_safe_and_final_only_syntheti
 
 
 @pytest.mark.asyncio
+async def test_unroutable_final_is_not_acknowledged(monkeypatch, tmp_path):
+    """Missing routing/profile adapter must leave durable completion pending."""
+    import tools.process_registry as pr_module
+
+    session = SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0,
+        command="codex exec task", started_at=1.0,
+        completion_reason="exited", termination_source="",
+    )
+    registry = _FakeRegistry([session, None])
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._deliver_completion_notification = AsyncMock(return_value=None)
+
+    await runner._run_process_watcher({
+        **_watcher_dict("proc-unroutable"),
+        "notify_on_complete": True,
+    })
+
+    runner._deliver_completion_notification.assert_awaited_once()
+    assert not hasattr(registry, "delivered_session_id")
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 
