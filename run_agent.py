@@ -66,16 +66,13 @@ from types import SimpleNamespace
 from hermes_constants import get_hermes_home
 
 
-def _compute_tool_call_stats(messages: Any) -> Dict[str, Any]:
+def _compute_tool_call_stats(messages: Any, start_index: int = 0) -> Dict[str, Any]:
     """Count tool-call requests and success/failure results from turn messages.
 
-    Returns a small dict safe to surface in upstream API responses.  The
-    counts are conservative: we treat any ``tool``-role message whose content
-    parses as JSON with ``{"success": false}`` or whose content begins with
-    ``"Error:"`` / ``"Skipped:"`` / ``"Invalid JSON arguments"`` as a failure;
-    everything else is a success (including plain-string tool outputs for
-    primitive tools like ``web_search`` which do not wrap their payloads in
-    ``tool_result()``).
+    ``start_index`` trims any shared prefix of ``messages`` (typically the
+    prior-turn ``conversation_history`` list) so only the current turn's
+    appended messages are counted.  Passing ``len(conversation_history)``
+    prevents leaking prior-turn tool activity into the current turn's stats.
     """
     stats: Dict[str, Any] = {
         "requests": 0,
@@ -87,7 +84,8 @@ def _compute_tool_call_stats(messages: Any) -> Dict[str, Any]:
     if not isinstance(messages, list):
         return stats
     error_prefixes = ("error:", "skipped:", "invalid json arguments")
-    for m in messages:
+    iterable = messages[start_index:] if start_index > 0 else messages
+    for m in iterable:
         if not isinstance(m, dict):
             continue
         role = m.get("role")
@@ -7937,7 +7935,8 @@ class AIAgent:
             if isinstance(result, dict):
                 msgs = result.get("messages")
                 if isinstance(msgs, list):
-                    stats = _compute_tool_call_stats(msgs)
+                    history_len = len(conversation_history) if isinstance(conversation_history, list) else 0
+                    stats = _compute_tool_call_stats(msgs, start_index=history_len)
                     result["tool_call_stats"] = stats
             return result
         except BaseException as exc:

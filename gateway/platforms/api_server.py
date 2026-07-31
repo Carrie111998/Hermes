@@ -4415,6 +4415,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
                 }
+            # Surface tool-call statistics in the SSE terminal chunk,
+            # matching the non-streaming response's ``hermes.tool_calls``
+            # block (issue #73389).
+            tool_call_stats = (
+                result.get("tool_call_stats") if isinstance(result, dict) else None
+            )
+            if isinstance(tool_call_stats, dict) and tool_call_stats.get("used"):
+                if "hermes" not in finish_chunk:
+                    finish_chunk["hermes"] = {}
+                finish_chunk["hermes"]["tool_calls"] = {
+                    "requests": int(tool_call_stats.get("requests", 0)),
+                    "successful": int(tool_call_stats.get("successful", 0)),
+                    "failed": int(tool_call_stats.get("failed", 0)),
+                }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):

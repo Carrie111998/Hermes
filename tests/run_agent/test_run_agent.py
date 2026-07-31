@@ -6272,3 +6272,30 @@ class TestToolCallStats:
         stats = _compute_tool_call_stats(messages)
         assert stats["failed"] == 1
         assert stats["used"] is True
+
+    def test_start_index_excludes_conversation_history(self):
+        """start_index must skip prior-turn conversation_history messages."""
+        import json
+        from run_agent import _compute_tool_call_stats
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "h1", "function": {"name": "web_search", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "h1", "name": "web_search",
+             "content": json.dumps({"success": True})},
+            {"role": "user", "content": "Follow up"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "function": {"name": "read_file", "arguments": "{}"}},
+            ]},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file",
+             "content": json.dumps({"success": True})},
+        ]
+        # Without start_index: 2 requests, 2 successful
+        assert _compute_tool_call_stats(messages)["requests"] == 2
+        assert _compute_tool_call_stats(messages)["successful"] == 2
+        # With start_index=3 (first-turn history): only current turn counted
+        stats = _compute_tool_call_stats(messages, start_index=3)
+        assert stats["requests"] == 1
+        assert stats["successful"] == 1
+        assert stats["used"] is True
