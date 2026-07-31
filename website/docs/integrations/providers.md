@@ -118,6 +118,8 @@ Purchased "extra usage" credits are **not** required. Verified against a Claude 
 To check your own account, inspect the `anthropic-ratelimit-unified-*` response headers, or run `/usage` in an interactive session to see your remaining plan windows.
 
 Because OAuth spends your subscription allowance, heavy Hermes use competes with your own Claude Code and claude.ai usage for the same budget. Use an `ANTHROPIC_API_KEY` instead if you'd rather bill pay-per-token against an organization's API account, independent of any subscription.
+
+Credits are not required to *use* OAuth, but they are still the spillover once an allowance runs out: Anthropic's own wording is "usage credits cover you when you hit your plan limits." If you exhaust the allowance you will start seeing `You're out of extra usage` — that means a limit was reached and there are no credits to spill into, not that OAuth requires credits to work.
 :::
 
 :::note Untested tiers
