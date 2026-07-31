@@ -94,6 +94,10 @@ export interface Translations {
     mustReplyDescription: string;
     keywordPlaceholder: string;
     keywordSyntax: string;
+    skipPatternsTitle: string;
+    skipPatternsDescription: string;
+    skipPatternsPlaceholder: string;
+    skipPatternsSyntax: string;
     decisionTitle: string;
     strictDecision: string;
     strictDecisionDescription: string;

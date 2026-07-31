@@ -1253,6 +1253,11 @@ export interface Translations {
       clearKeywords: string
       keywordConflictTitle: string
       keywordConflictDescription: (group: string) => string
+      skipPatternsTitle: string
+      skipPatternsDescription: string
+      skipPatternsPlaceholder: string
+      skipPatternsSyntax: string
+      clearSkipPatterns: string
       decisionTitle: string
       strictDecision: string
       strictDecisionDescription: string

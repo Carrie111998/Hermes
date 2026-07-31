@@ -1413,6 +1413,11 @@ export const ja = defineLocale({
       keywordConflictTitle: 'キーワードルールの競合',
       keywordConflictDescription: group =>
         `「${group}」を「必ず返信」と「返信しない」の両方に設定することはできません。片方から削除してください。`,
+      skipPatternsTitle: 'スキップ正規表現',
+      skipPatternsDescription: '一致したメールは Agent を呼び出す前に停止します。',
+      skipPatternsPlaceholder: '1 行につき 1 つの正規表現',
+      skipPatternsSyntax: '大文字と小文字を区別せず、件名と本文に一致します。',
+      clearSkipPatterns: 'スキップ正規表現を消去',
       decisionTitle: 'Agent の判断',
       strictDecision: '構造化された返信判断を必須にする',
       strictDecisionDescription: '有効な構造で need_response: true が返された場合のみ送信します。',

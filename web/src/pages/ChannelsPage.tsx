@@ -79,20 +79,26 @@ const EMAIL_PRIMARY_CONNECTION_KEYS = new Set([
 ]);
 
 const EMAIL_CATEGORY_FIELDS = [
-  ["EMAIL_AUTO_REPLY_PROMOTIONS", "promotions"],
-  ["EMAIL_AUTO_REPLY_NEWSLETTERS", "newsletters"],
-  ["EMAIL_AUTO_REPLY_TRANSACTIONS", "transactions"],
-  ["EMAIL_AUTO_REPLY_SECURITY", "security"],
-  ["EMAIL_AUTO_REPLY_SOCIAL", "social"],
-  ["EMAIL_AUTO_REPLY_CALENDAR", "calendar"],
-  ["EMAIL_AUTO_REPLY_REPORTS", "reports"],
+  ["auto_reply_promotions", "promotions"],
+  ["auto_reply_newsletters", "newsletters"],
+  ["auto_reply_transactions", "transactions"],
+  ["auto_reply_security", "security"],
+  ["auto_reply_social", "social"],
+  ["auto_reply_calendar", "calendar"],
+  ["auto_reply_reports", "reports"],
 ] as const;
 
 const EMAIL_POLICY_KEYS = new Set([
   ...EMAIL_CATEGORY_FIELDS.map(([key]) => key),
-  "EMAIL_FORCE_REPLY_KEYWORDS",
-  "EMAIL_NO_REPLY_KEYWORDS",
-  "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
+  "force_reply_keywords",
+  "no_reply_keywords",
+  "skip_patterns",
+  "require_structured_response",
+]);
+
+const EMAIL_POLICY_BOOLEAN_KEYS = new Set([
+  ...EMAIL_CATEGORY_FIELDS.map(([key]) => key),
+  "require_structured_response",
 ]);
 
 function normalizedKeywordGroups(raw: string): Map<string, string> {
@@ -215,10 +221,22 @@ export default function ChannelsPage() {
   const gatewayRunning = platforms.length > 0 && platforms[0].gateway_running;
 
   const load = useCallback(() => {
-    return api
-      .getMessagingPlatforms()
-      .then((res) => {
-        setPlatforms(res.platforms);
+    return Promise.all([
+      api.getMessagingPlatforms(),
+      api.getEmailAutoReplyPolicy().catch(() => null),
+    ])
+      .then(([res, policyResult]) => {
+        const policyFields = policyResult?.fields ?? [];
+        setPlatforms(
+          res.platforms.map((platform) =>
+            platform.id !== "email"
+              ? platform
+              : {
+                  ...platform,
+                  env_vars: [...platform.env_vars, ...policyFields],
+                },
+          ),
+        );
         setEnvPath(res.env_path || "~/.hermes/.env");
         setGatewayStartCommand(res.gateway_start_command || "hermes gateway start");
       })
@@ -259,8 +277,8 @@ export default function ChannelsPage() {
     if (!editing) return;
     if (editing.id === "email") {
       const conflict = replyKeywordConflict(
-        draftEnv.EMAIL_FORCE_REPLY_KEYWORDS || "",
-        draftEnv.EMAIL_NO_REPLY_KEYWORDS || "",
+        draftEnv.force_reply_keywords || "",
+        draftEnv.no_reply_keywords || "",
       );
       if (conflict) {
         showToast(
@@ -274,6 +292,8 @@ export default function ChannelsPage() {
     // secrets, while clearing a touched keyword field removes that rule.
     const env: Record<string, string> = {};
     const clear_env: string[] = [];
+    const policyValues: Record<string, boolean | string> = {};
+    const policyClear: string[] = [];
     touchedEnv.forEach((key) => {
       const field = editing.env_vars.find((item) => item.key === key);
       let value = draftEnv[key] || "";
@@ -286,10 +306,26 @@ export default function ChannelsPage() {
       } else {
         value = value.trim();
       }
-      if (value) env[key] = value;
-      else clear_env.push(key);
+      if (editing.id === "email" && EMAIL_POLICY_KEYS.has(key)) {
+        if (value) {
+          policyValues[key] = EMAIL_POLICY_BOOLEAN_KEYS.has(key)
+            ? value.toLowerCase() === "true"
+            : value;
+        } else {
+          policyClear.push(key);
+        }
+      } else if (value) {
+        env[key] = value;
+      } else {
+        clear_env.push(key);
+      }
     });
-    if (Object.keys(env).length === 0 && clear_env.length === 0) {
+    if (
+      Object.keys(env).length === 0 &&
+      clear_env.length === 0 &&
+      Object.keys(policyValues).length === 0 &&
+      policyClear.length === 0
+    ) {
       showToast("Nothing to save — fill in at least one field.", "error");
       return;
     }
@@ -312,8 +348,18 @@ export default function ChannelsPage() {
     }
     setSaving(true);
     try {
-      const body: MessagingPlatformUpdate = { env, clear_env, enabled: true };
-      await api.updateMessagingPlatform(editing.id, body);
+      const body: MessagingPlatformUpdate = { env, clear_env };
+      await Promise.all([
+        Object.keys(env).length > 0 || clear_env.length > 0
+          ? api.updateMessagingPlatform(editing.id, body)
+          : Promise.resolve(),
+        Object.keys(policyValues).length > 0 || policyClear.length > 0
+          ? api.updateEmailAutoReplyPolicy({
+              values: policyValues,
+              clear: policyClear,
+            })
+          : Promise.resolve(),
+      ]);
       showToast(`${editing.name} saved`, "success");
       setEditing(null);
       setRestartNeeded(true);
@@ -760,13 +806,13 @@ export default function ChannelsPage() {
                       <div className="grid gap-3 sm:grid-cols-2">
                         {[
                           {
-                            key: "EMAIL_NO_REPLY_KEYWORDS",
+                            key: "no_reply_keywords",
                             title: emailCopy.neverReply,
                             description: emailCopy.neverReplyDescription,
                             tone: "border-destructive/35 bg-destructive/5",
                           },
                           {
-                            key: "EMAIL_FORCE_REPLY_KEYWORDS",
+                            key: "force_reply_keywords",
                             title: emailCopy.mustReply,
                             description: emailCopy.mustReplyDescription,
                             tone: "border-primary/35 bg-primary/5",
@@ -802,8 +848,37 @@ export default function ChannelsPage() {
                     </div>
 
                     {(() => {
+                      const field = editingFieldMap.get("skip_patterns");
+                      if (!field) return null;
+                      return (
+                        <div className="grid gap-2 border-t border-border pt-4">
+                          <div>
+                            <Label htmlFor={`field-${field.key}`}>
+                              {emailCopy.skipPatternsTitle}
+                            </Label>
+                            <p className="mt-0.5 text-xs text-muted-foreground">
+                              {emailCopy.skipPatternsDescription}
+                            </p>
+                          </div>
+                          <textarea
+                            id={`field-${field.key}`}
+                            className="min-h-28 w-full resize-y border border-input bg-background px-3 py-2 text-base leading-6 outline-none focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 sm:text-xs sm:leading-4"
+                            placeholder={emailCopy.skipPatternsPlaceholder}
+                            value={draftEnv[field.key] ?? ""}
+                            onChange={(event) =>
+                              updateDraftField(field.key, event.target.value)
+                            }
+                          />
+                          <span className="text-[11px] text-muted-foreground">
+                            {emailCopy.skipPatternsSyntax}
+                          </span>
+                        </div>
+                      );
+                    })()}
+
+                    {(() => {
                       const strictField = editingFieldMap.get(
-                        "EMAIL_REQUIRE_STRUCTURED_RESPONSE",
+                        "require_structured_response",
                       );
                       if (!strictField) return null;
                       const checked =
