@@ -506,6 +506,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        profile_home: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -522,6 +523,7 @@ class AIAgent:
             api_key=api_key,
             provider=provider,
             requested_provider=requested_provider,
+            profile_home=profile_home,
             api_mode=api_mode,
             acp_command=acp_command,
             acp_args=acp_args,

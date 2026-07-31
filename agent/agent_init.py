@@ -529,6 +529,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    profile_home: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -616,6 +617,7 @@ def init_agent(
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
     agent.provider = provider_name or ""
+    agent.profile_home = profile_home
     agent.requested_provider = (
         requested_provider.strip().lower()
         if isinstance(requested_provider, str) and requested_provider.strip()

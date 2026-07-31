@@ -7824,9 +7824,14 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _find_live_session_by_key(
+    session_key: str,
+    profile_home: str | None = None,
+) -> tuple[str, dict] | None:
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if profile_home is not None and session.get("profile_home") != profile_home:
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session

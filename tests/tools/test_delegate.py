@@ -47,6 +47,7 @@ def _make_mock_parent(depth=0):
     parent.providers_order = None
     parent.provider_sort = None
     parent._session_db = None
+    parent.profile_home = None
     parent._delegate_depth = depth
     parent._active_children = []
     parent._active_children_lock = threading.Lock()
@@ -290,6 +291,35 @@ class TestDelegateTask(unittest.TestCase):
     def test_nous_child_rederives_api_mode_from_model(self):
         """Portal is dual-wire — same provider + different model prefix must
         not inherit the parent's Messages/chat_completions mode verbatim."""
+
+    def test_child_inherits_profile_home(self):
+        """Delegated children should keep the parent profile context."""
+        parent = _make_mock_parent(depth=0)
+        parent.profile_home = "/tmp/hermes-test-profile"
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="profile inheritance check",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+            _, kwargs = MockAgent.call_args
+
+        self.assertEqual(
+            kwargs.get("profile_home"),
+            parent.profile_home,
+        )
+
+    def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         parent.base_url = "https://inference-api.nousresearch.com/v1"
         parent.api_key = "portal-jwt"
