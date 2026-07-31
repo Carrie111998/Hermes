@@ -2209,6 +2209,12 @@ def test_personality_marker_survives_alternation_repair_merge():
     # `content` is rewritten) — the structural precondition the fix relies on.
     assert merged["display_kind"] == "personality_switch"
     assert merged["display_metadata"] == {"marker_text": marker}
+    # merged_real_turn distinguishes this row (a real prompt riding on the
+    # marker's tail) from a bare marker for /undo, /retry, and rewind
+    # ordinal selection, which otherwise treat any role=user row carrying
+    # display_kind as pure bookkeeping and would skip this visible prompt
+    # entirely (#74350 review feedback).
+    assert merged["merged_real_turn"] is True
 
     projected = server._history_to_messages(history)
 
@@ -8522,6 +8528,46 @@ def test_session_undo_allowed_when_idle():
         server._sessions.pop("sid", None)
 
 
+def test_session_undo_does_not_skip_prompt_merged_onto_marker():
+    """/undo must truncate through a real prompt alternation-repair merged
+    onto a bookkeeping marker's tail, not treat the merged row as pure
+    bookkeeping and remove an earlier real exchange instead (#74350).
+    """
+    marker = (
+        "[System: The user has changed the assistant's personality. "
+        "From this point forward, adopt the following persona and respond "
+        "accordingly: You are a pirate.]"
+    )
+    server._sessions["sid"] = _session(
+        running=False,
+        history=[
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+            {
+                "role": "user",
+                "content": marker + "\n\n" + "what's the weather like today?",
+                "display_kind": "personality_switch",
+                "display_metadata": {"marker_text": marker},
+                "merged_real_turn": True,
+            },
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        # Only the merged row is removed — undo must not reach back past it
+        # into the "hi"/"hello" exchange.
+        assert resp["result"]["removed"] == 1
+        assert server._sessions["sid"]["history"] == [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_session_compress_rejects_while_running(monkeypatch):
     server._sessions["sid"] = _session(running=True)
     try:
@@ -8873,6 +8919,96 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         # Without the filter: user_indices = [0, 2, 4] (includes the marker),
         # ordinal=1 → user_indices[1] = 2, same result by luck — but ordinal=0
         # would truncate to history[:0] vs history[:0], and higher ordinals shift.
+        assert seen["history"] == original_history[:2], (
+            f"Expected truncation to first 2 messages, got {seen['history']}"
+        )
+        assert stub_db.replaced == [("session-key", original_history[:2])], (
+            f"Expected DB replace with first 2 messages, got {stub_db.replaced}"
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_truncate_ordinal_counts_merged_real_turn(monkeypatch):
+    """truncate_before_user_ordinal must count a row where a real prompt was
+    alternation-repair-merged onto a bookkeeping marker's tail as a real
+    user turn (merged_real_turn=True), not skip it as pure bookkeeping and
+    miscount every ordinal after it (#74350).
+    """
+
+    seen = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            seen["prompt"] = prompt
+            seen["history"] = conversation_history
+            return {
+                "final_response": "reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    marker = (
+        "[System: The user has changed the assistant's personality. "
+        "From this point forward, adopt the following persona and respond "
+        "accordingly: You are a pirate.]"
+    )
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {
+            "role": "user",
+            "content": marker + "\n\n" + "second",
+            "display_kind": "personality_switch",
+            "display_metadata": {"marker_text": marker},
+            "merged_real_turn": True,
+        },
+        {"role": "assistant", "content": "second reply"},
+    ]
+    server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
+
+    class _StubDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    stub_db = _StubDb()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+
+        # ordinal=1 means "truncate before the 2nd-from-last real user turn"
+        # which is the merged marker row. If merged_real_turn were ignored,
+        # user_indices would be [0] only (just "first") and ordinal=1 would
+        # be rejected as out of range instead of resolving to index 2.
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited second",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
         assert seen["history"] == original_history[:2], (
             f"Expected truncation to first 2 messages, got {seen['history']}"
         )

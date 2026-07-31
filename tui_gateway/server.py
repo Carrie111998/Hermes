@@ -10446,15 +10446,19 @@ def _(rid, params: dict) -> dict:
     removed = 0
     with session["history_lock"]:
         history = session.get("history", [])
-        # Truncate from the last *real* user turn (no display_kind). Popping
-        # only trailing assistant/tool then one user left timeline markers
-        # (async_delegation_complete, model_switch, …) as the undo target —
-        # so session.undo removed bookkeeping instead of the last exchange.
-        # Match list_recent_user_messages / CLI turn counting.
+        # Truncate from the last *real* user turn (no display_kind, or a
+        # merged row where alternation-repair concatenated a real prompt
+        # onto a bookkeeping marker's tail — see merged_real_turn, #74350).
+        # Popping only trailing assistant/tool then one user left timeline
+        # markers (async_delegation_complete, model_switch, …) as the undo
+        # target — so session.undo removed bookkeeping instead of the last
+        # exchange. Match list_recent_user_messages / CLI turn counting.
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if msg.get("role") == "user" and (
+                not msg.get("display_kind") or msg.get("merged_real_turn")
+            ):
                 last_user_idx = i
                 break
         if last_user_idx is not None:
@@ -11330,7 +11334,9 @@ def _(rid, params: dict) -> dict:
             history = session.get("history", [])
             user_indices = [
                 i for i, m in enumerate(history)
-                if m.get("role") == "user" and not m.get("display_kind")
+                if m.get("role") == "user" and (
+                    not m.get("display_kind") or m.get("merged_real_turn")
+                )
             ]
             # Reject out-of-range ordinals on BOTH ends. A negative value would
             # otherwise sail past the upper-bound check and hit Python's negative
@@ -16184,11 +16190,16 @@ def _(rid, params: dict) -> dict:
         # them as user turns — same predicate as CLI resume/count and the
         # prompt.submit ordinal fix. Without this, /retry re-sends opaque
         # markers (model_switch / async_delegation_complete / auto_continue)
-        # and truncates only the marker instead of the failed exchange.
+        # and truncates only the marker instead of the failed exchange. A
+        # merged row (real prompt concatenated onto a marker's tail by
+        # alternation-repair) still counts as real via merged_real_turn
+        # (#74350).
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
-            if msg.get("role") == "user" and not msg.get("display_kind"):
+            if msg.get("role") == "user" and (
+                not msg.get("display_kind") or msg.get("merged_real_turn")
+            ):
                 last_user_idx = i
                 break
         if last_user_idx is None:
@@ -18948,12 +18959,15 @@ def _(rid, params: dict) -> dict:
                 removed = 0
                 with session["history_lock"]:
                     history = session.get("history", [])
-                    # Truncate from the last *real* user turn (no display_kind).
+                    # Truncate from the last *real* user turn (no display_kind,
+                    # or a merged row via merged_real_turn, #74350).
                     # Same predicate as list_recent_user_messages / /undo / /retry.
                     last_user_idx = None
                     for i in range(len(history) - 1, -1, -1):
                         msg = history[i]
-                        if msg.get("role") == "user" and not msg.get("display_kind"):
+                        if msg.get("role") == "user" and (
+                            not msg.get("display_kind") or msg.get("merged_real_turn")
+                        ):
                             last_user_idx = i
                             break
                     if last_user_idx is not None:
