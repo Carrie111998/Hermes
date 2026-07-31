@@ -7238,6 +7238,29 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            prepared = None
+            try:
+                from gateway.outbound_text_hook import prepare_outbound_text_file
+
+                prepared = prepare_outbound_text_file(file_path, file_name)
+                file_path = prepared.path
+                file_name = prepared.file_name
+                if prepared.changed:
+                    logger.info(
+                        "[%s] Outbound text hook normalized document (%s -> %s)",
+                        self.name,
+                        prepared.source_encoding,
+                        prepared.output_encoding,
+                    )
+            except Exception as hook_error:
+                # Delivery must remain available even if the optional
+                # normalization hook itself fails.
+                logger.warning(
+                    "[%s] Outbound text hook failed: %s",
+                    self.name,
+                    hook_error,
+                )
+
             if not os.path.exists(file_path):
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
 
