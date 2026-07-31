@@ -2468,7 +2468,17 @@ def _compress_context_via_codex_app_server(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         _activity_heartbeat = _CompressionActivityHeartbeat(agent).start()
-        result = codex_session.compact_thread()
+        compact_kwargs = {}
+        budget = getattr(agent, "provider_request_budget", None)
+        if budget is not None and budget.enabled is True:
+            from agent.provider_request_budget import (
+                capture_provider_request_reservation,
+            )
+
+            compact_kwargs["before_request"] = (
+                capture_provider_request_reservation(agent)
+            )
+        result = codex_session.compact_thread(**compact_kwargs)
     except BaseException:
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression failed")

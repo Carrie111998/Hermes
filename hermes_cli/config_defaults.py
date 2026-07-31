@@ -67,6 +67,10 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Optional hard ceiling on covered main-agent physical provider
+        # requests per user turn. 0 disables the budget. This is separate from
+        # max_turns/tool iterations and from token/cost telemetry.
+        "max_provider_requests_per_turn": 0,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

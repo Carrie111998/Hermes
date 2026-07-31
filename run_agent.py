@@ -503,6 +503,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        provider_request_budget_exempt: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -586,6 +587,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            provider_request_budget_exempt=provider_request_budget_exempt,
         )
 
     def _get_session_db_for_recall(self):
@@ -5017,10 +5019,22 @@ class AIAgent:
                 exc,
             )
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+        reserve_request=None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(
+            self,
+            api_kwargs,
+            client,
+            on_first_delta,
+            reserve_request,
+        )
 
     def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
@@ -5548,7 +5562,13 @@ class AIAgent:
             return False
         return pool.has_available()
 
-    def _anthropic_messages_create(self, api_kwargs: dict, *, client: Any = None):
+    def _anthropic_messages_create(
+        self,
+        api_kwargs: dict,
+        *,
+        client: Any = None,
+        before_request=None,
+    ):
         # When a request-local client is supplied it was already credential-
         # refreshed in ``_create_request_anthropic_client``; only the shared
         # fallback path refreshes here.
@@ -5563,6 +5583,7 @@ class AIAgent:
             api_kwargs,
             log_prefix=getattr(self, "log_prefix", ""),
             prefer_stream=not bool(getattr(self, "_disable_streaming", False)),
+            before_request=before_request,
             # Rate-limit + credits state live in response headers, which the
             # parsed Message drops. No-ops on providers that don't send the
             # matching header families (x-ratelimit-* / x-nous-credits-*).
@@ -7170,6 +7191,7 @@ class AIAgent:
         )
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
+        from agent.provider_request_budget import ProviderRequestBudgetExceeded
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -7241,20 +7263,45 @@ class AIAgent:
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
-                result = run_conversation(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    effective_task_id,
-                    stream_callback,
-                    persist_user_message,
-                    persist_user_timestamp=persist_user_timestamp,
-                    persist_user_display_kind=persist_user_display_kind,
-                    persist_user_display_metadata=persist_user_display_metadata,
-                    moa_config=moa_config,
-                )
+                try:
+                    result = run_conversation(
+                        self,
+                        user_message,
+                        system_message,
+                        conversation_history,
+                        effective_task_id,
+                        stream_callback,
+                        persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
+                        moa_config=moa_config,
+                    )
+                except ProviderRequestBudgetExceeded as exc:
+                    from agent.turn_finalizer import (
+                        finalize_provider_request_budget_exhaustion,
+                    )
+
+                    result = finalize_provider_request_budget_exhaustion(
+                        self,
+                        error=exc,
+                        user_message=user_message,
+                        conversation_history=conversation_history,
+                        effective_task_id=effective_task_id,
+                        persist_user_message=persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        persist_user_display_metadata=persist_user_display_metadata,
+                    )
             terminal = result if isinstance(result, dict) else {}
+            budget = getattr(self, "provider_request_budget", None)
+            if isinstance(result, dict) and budget is not None:
+                result["provider_requests"] = budget.used
+                result["provider_request_limit"] = budget.max_total
+                result["provider_requests_remaining"] = budget.remaining
+                result["provider_request_budget_exhausted"] = budget.exhausted
+                if budget.exhausted:
+                    result["failure_reason"] = "provider_request_budget_exhausted"
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
             elif terminal.get("failed") is True:

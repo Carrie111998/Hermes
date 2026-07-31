@@ -517,6 +517,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    provider_request_budget_exempt: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -580,6 +581,7 @@ def init_agent(
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
+    agent._provider_request_budget_exempt = provider_request_budget_exempt
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
@@ -1748,6 +1750,18 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+    # Optional per-user-turn main-agent provider request ceiling. Keep this
+    # separate from tool iterations and session token/cost accounting.
+    from agent.provider_request_budget import (
+        parse_provider_request_limit,
+        reset_provider_request_budget,
+    )
+
+    agent.max_provider_requests_per_turn = parse_provider_request_limit(
+        _agent_section.get("max_provider_requests_per_turn", 0)
+    )
+    reset_provider_request_budget(agent)
 
     # Intent-ack continuation config: "auto" (default — codex_responses only,
     # the historical gate), true (all api_modes), false (never), or a list of

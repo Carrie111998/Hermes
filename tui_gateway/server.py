@@ -5820,6 +5820,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
+        "provider_request_budget_exempt": True,
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
     }

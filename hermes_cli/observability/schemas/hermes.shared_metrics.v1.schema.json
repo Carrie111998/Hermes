@@ -239,6 +239,7 @@
                 "failed",
                 "guardrail_blocked",
                 "iteration_limit",
+                "provider_request_limit",
                 "system_aborted",
                 "timed_out",
                 "unknown",

@@ -1911,6 +1911,7 @@ class CLICommandsMixin:
                     verbose_logging=False,
                     session_id=task_id,
                     platform="cli",
+                    provider_request_budget_exempt=True,
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,

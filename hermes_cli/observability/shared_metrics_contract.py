@@ -52,6 +52,7 @@ TASK_END_REASONS: frozenset[str] = frozenset({
     "failed",
     "guardrail_blocked",
     "iteration_limit",
+    "provider_request_limit",
     "system_aborted",
     "timed_out",
     "unknown",
@@ -377,6 +378,8 @@ def task_terminal_state(kwargs: dict[str, Any]) -> tuple[str, str, str]:
         return "cancelled", "user_cancelled", "user_cancelled"
     if "timeout" in reason or "timed_out" in reason:
         return "timed_out", "timed_out", "timed_out"
+    if "provider_request_budget_exhausted" in reason:
+        return "failed", "provider_request_limit", "system_aborted"
     if "max_iterations" in reason or "budget_exhausted" in reason:
         return "failed", "iteration_limit", "system_aborted"
     if "approval" in reason and ("denied" in reason or "rejected" in reason):

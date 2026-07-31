@@ -2981,6 +2981,7 @@ def create_anthropic_message(
     prefer_stream: bool = True,
     on_stream_event=None,
     on_response=None,
+    before_request=None,
 ) -> Any:
     """Create an Anthropic message, aggregating via stream when available.
 
@@ -3013,6 +3014,8 @@ def create_anthropic_message(
         stream_kwargs = dict(api_kwargs)
         stream_kwargs.pop("stream", None)
         try:
+            if callable(before_request):
+                before_request(reason="anthropic messages stream request")
             with stream_fn(**stream_kwargs) as stream:
                 if callable(on_response):
                     try:
@@ -3047,4 +3050,6 @@ def create_anthropic_message(
 
     create_kwargs = dict(api_kwargs)
     create_kwargs.pop("stream", None)
+    if callable(before_request):
+        before_request(reason="anthropic messages create fallback")
     return messages_api.create(**create_kwargs)

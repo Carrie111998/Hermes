@@ -159,6 +159,7 @@ class TestRunBackgroundTask:
         assert "Background task complete" in content
         assert "Hello from background!" in content
         agent_kwargs = MockAgent.call_args.kwargs
+        assert agent_kwargs["provider_request_budget_exempt"] is True
         assert agent_kwargs["checkpoints_enabled"] is True
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
