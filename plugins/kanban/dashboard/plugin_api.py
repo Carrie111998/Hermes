@@ -137,11 +137,42 @@ def _default_boardd_sock() -> str:
     )
 
 
-def _boardd_active() -> bool:
-    """Check if boardd broker is available and should be used."""
+def _boardd_active(board: Optional[str] = None) -> bool:
+    """Check if boardd broker custody is active for the requested board.
+
+    Custody is active when the requested board resolves to the fleet DB
+    (the canonical production signal used by ``boardd_shim``) or when its
+    DB path lives under ``/var/lib/boardd/``.  When custody is active, the
+    broker must be reachable; otherwise we fail closed rather than silently
+    opening the read-only mirror.
+    """
+    if boardd_shim is None:
+        return False
+
+    custody = False
+    try:
+        is_fleet, _req, _fleet = boardd_shim.routes_to_fleet(board=board)
+        if is_fleet:
+            custody = True
+    except Exception:
+        pass
+
+    if not custody:
+        try:
+            req_path = kanban_db.kanban_db_path(board=board)
+            if str(req_path.resolve()).startswith("/var/lib/boardd/"):
+                custody = True
+        except Exception:
+            pass
+
+    if not custody:
+        return False
+
     sock_path = _default_boardd_sock()
     if not os.path.exists(sock_path):
-        return False
+        raise boardd_shim.BoarddUnavailableError(
+            f"boardd custody active but broker socket missing: {sock_path}"
+        )
     try:
         from hermes_cli.kb_client import Client
 
@@ -150,7 +181,7 @@ def _boardd_active() -> bool:
         c.close()
         return True
     except Exception as exc:
-        raise RuntimeError(
+        raise boardd_shim.BoarddUnavailableError(
             f"boardd custody active but broker unreachable ({sock_path}): {exc}"
         ) from exc
 
@@ -166,7 +197,7 @@ def _conn(board: Optional[str] = None) -> Any:
     In standalone mode (no broker socket), this keeps the previous behavior:
     initialise the local DB and open a direct SQLite connection.
     """
-    if _boardd_active():
+    if _boardd_active(board=board):
         from hermes_cli.boardd_shim import BrokerConnection
         from hermes_cli import kb_client
 
