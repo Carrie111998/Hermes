@@ -45,6 +45,15 @@ class FactRetriever:
         self.jaccard_weight = jaccard_weight
         self.hrr_weight = hrr_weight
 
+        # Check if any facts have SBERT vectors (for cosine rerank)
+        try:
+            row = self.store._conn.execute(
+                "SELECT 1 FROM facts WHERE sbert_vector IS NOT NULL LIMIT 1"
+            ).fetchone()
+            self._has_sbert_vectors = row is not None
+        except Exception:
+            self._has_sbert_vectors = False
+
     def search(
         self,
         query: str,
@@ -100,16 +109,46 @@ class FactRetriever:
             if self.half_life > 0:
                 score *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
 
+            # Stage 3: Cosine similarity boost (when SBERT vectors available)
+            sbert_vector = fact.get("sbert_vector")
+            if self._has_sbert_vectors and sbert_vector:
+                try:
+                    from .embeddings import unpack_vector, cosine_similarity
+                    fact_vec = unpack_vector(sbert_vector)
+                    query_vec = self._get_query_embedding(query)
+                    if query_vec is not None:
+                        cos_sim = cosine_similarity(query_vec, fact_vec)
+                        # Blend: 0.4 * base_score + 0.6 * cosine_score
+                        cos_score = (cos_sim + 1.0) / 2.0  # shift [-1,1] to [0,1]
+                        score = 0.4 * score + 0.6 * cos_score * fact["trust_score"]
+                except Exception:
+                    pass
+
             fact["score"] = score
             scored.append(fact)
 
         # Sort by score descending, return top limit
         scored.sort(key=lambda x: x["score"], reverse=True)
         results = scored[:limit]
-        # Strip raw HRR bytes — callers expect JSON-serializable dicts
+        # Strip raw HRR bytes and SBERT blobs — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+            fact.pop("sbert_vector", None)
         return results
+
+    def _get_query_embedding(self, query: str):
+        """Get or compute SBERT query embedding (cached per search call)."""
+        if getattr(self, "_query_embedding", None) is not None:
+            return self._query_embedding
+        from .embeddings import get_embedder
+        embed = get_embedder()
+        if embed is None:
+            return None
+        try:
+            self._query_embedding = embed([query])[0]
+            return self._query_embedding
+        except Exception:
+            return None
 
     def probe(
         self,
@@ -187,6 +226,8 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        for fact in scored:
+            fact.pop("sbert_vector", None)
         return scored[:limit]
 
     def related(
@@ -255,6 +296,8 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        for fact in scored:
+            fact.pop("sbert_vector", None)
         return scored[:limit]
 
     def reason(
@@ -333,6 +376,8 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        for fact in scored:
+            fact.pop("sbert_vector", None)
         return scored[:limit]
 
     def contradict(
@@ -476,7 +521,10 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
+        for fact in scored:
+            fact.pop("sbert_vector", None)
         return scored[:limit]
+
 
     def _fts_candidates(
         self,
