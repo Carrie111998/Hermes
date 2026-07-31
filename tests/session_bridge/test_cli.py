@@ -664,6 +664,115 @@ def test_sidebar_broker_configure_persists_only_canonical_identity(
     ]
 
 
+def test_production_sidebar_broker_configuration_persists_exact_leaves_and_reloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "delivery_mode": "desktop_broker",
+        "broker_thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "broker_project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "broker_cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+        "heartbeat_interval_seconds": 60,
+        "heartbeat_grace_seconds": 120,
+        "oldest_job_alert_seconds": 300,
+        "readable_preview_enabled": True,
+    }
+    original = {
+        "theme": "midnight",
+        "session_bridge": {
+            "sidebar": {
+                "enabled": False,
+                "continuous": True,
+                "legacy_hydration_enabled": True,
+                "unrelated": "preserve",
+            },
+        },
+    }
+    persisted: list[tuple[dict[str, Any], set[tuple[str, ...]] | None]] = []
+
+    def mutate_config(mutator, **kwargs):
+        document = json.loads(json.dumps(original))
+        mutator(document)
+        persisted.append((document, kwargs.get("preserve_keys")))
+        return document
+
+    reloaded = BridgeConfig(
+        sidebar=replace(
+            SidebarConfig(),
+            continuous=True,
+            legacy_hydration_enabled=True,
+            **expected,
+        )
+    )
+    reloads: list[None] = []
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
+    monkeypatch.setattr(
+        "session_bridge.cli.BridgeConfig.load",
+        lambda: reloads.append(None) or reloaded,
+    )
+    backend = ProductionBackend(BridgeConfig())
+
+    result = backend.configure_sidebar_broker(
+        thread_id=expected["broker_thread_id"],
+        project_id=expected["broker_project_id"],
+        cwd=expected["broker_cwd"],
+        inbox_cwd=expected["inbox_cwd"],
+    )
+
+    assert result == expected
+    assert set(result) == set(expected)
+    assert reloads == [None]
+    assert backend.config is reloaded
+    assert persisted == [
+        (
+            {
+                "theme": "midnight",
+                "session_bridge": {
+                    "sidebar": {
+                        "enabled": False,
+                        "continuous": True,
+                        "legacy_hydration_enabled": True,
+                        "unrelated": "preserve",
+                        **expected,
+                    },
+                },
+            },
+            {("session_bridge", "sidebar", key) for key in expected},
+        )
+    ]
+
+
+def test_production_sidebar_broker_configuration_fails_closed_on_reload_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+    }
+
+    def mutate_config(mutator, **_kwargs):
+        document: dict[str, Any] = {}
+        mutator(document)
+        return document
+
+    monkeypatch.setattr("hermes_cli.config.mutate_config", mutate_config)
+    monkeypatch.setattr(
+        "session_bridge.cli.BridgeConfig.load",
+        lambda: BridgeConfig(
+            sidebar=replace(
+                SidebarConfig(),
+                broker_thread_id="different-thread",
+            )
+        ),
+    )
+
+    with pytest.raises(ConfigurationFailure, match="sidebar_broker_reload_mismatch"):
+        ProductionBackend(BridgeConfig()).configure_sidebar_broker(**expected)
+
+
 def test_sidebar_readable_hydration_commands_are_explicit_and_never_schedule(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
