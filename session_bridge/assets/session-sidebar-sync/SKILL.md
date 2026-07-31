@@ -53,6 +53,8 @@ Each fallback invocation counts as the exact single bridge call required by the 
 
 Call `session_status` exactly once. Validate scanner health and the configured broker/inbox identity. Then call `read_thread({"threadId":"019f9b71-7109-7ed0-943a-d7291190245c","turnLimit":10,"includeOutputs":false})` exactly once and require its local host, title `Fix Claude session translation`, and cwd `C:\Users\diego\Developer\session-sidebar-broker`. Then call the native tool `list_projects({})` exactly once. Require exactly one local saved project whose canonical path equals `C:\Users\diego\.hermes`, whose returned ID equals configured `broker_project_id`, and whose production ID is `local-e59c279a6cdda9313cf111e46a80b027`. If the ID differs, preflight stops before lease. Preflight failure ends before leasing and no job attempt is consumed.
 
+One provider's non-null `degraded_reason` must not globally block healthy queued delivery from another provider.
+
 After successful preflight, always call hydration pending once; if it is empty, always call registration pending once regardless of status counts. Status counts never authorize skipping either persisted-heartbeat call. Call `session_sidebar_hydration_pending(limit=1)`. If it returns a job, process that one hydration lease and do not call registration pending. If it returns no job, call `session_sidebar_pending(limit=1)`. If registration is empty, end silently. Claim and process at most one total lease per wake.
 
 ## In-place Hydration Procedure
