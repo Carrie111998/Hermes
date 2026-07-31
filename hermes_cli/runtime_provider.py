@@ -1805,13 +1805,8 @@ def resolve_runtime_provider(
         )
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = str(model_cfg.get("base_url") or "").strip()
-        env_openai_base_url = _getenv("OPENAI_BASE_URL", "").strip()
         env_openrouter_base_url = _getenv("OPENROUTER_BASE_URL", "").strip()
-        has_custom_endpoint = bool(
-            explicit_base_url
-            or env_openrouter_base_url
-            or (not explicit_openrouter_request and env_openai_base_url)
-        )
+        has_custom_endpoint = bool(explicit_base_url or env_openrouter_base_url)
         if (
             not explicit_openrouter_request
             and cfg_base_url

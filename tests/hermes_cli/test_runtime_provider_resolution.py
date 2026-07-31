@@ -408,6 +408,12 @@ def _write_openrouter_pool(hermes_home):
             id="environment",
         ),
         pytest.param(
+            "auto",
+            "{}\n",
+            "https://stale-openai.example/v1",
+            id="auto-ignores-stale-openai-environment",
+        ),
+        pytest.param(
             "or",
             "model:\n"
             "  provider: custom\n"
@@ -418,7 +424,7 @@ def _write_openrouter_pool(hermes_home):
         ),
     ],
 )
-def test_explicit_openrouter_uses_pool_despite_unrelated_custom_endpoint(
+def test_openrouter_pool_ignores_unrelated_custom_endpoint(
     tmp_path,
     monkeypatch,
     requested,
