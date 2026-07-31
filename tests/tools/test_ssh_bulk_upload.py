@@ -554,3 +554,86 @@ class TestSSHBulkUploadEdgeCases:
 
         mock_tar.kill.assert_called_once()
         mock_tar.wait.assert_called_once()
+
+
+class TestScpUpload:
+    """Unit tests for SSHEnvironment._scp_upload — ControlPath platform guard."""
+
+    def _make_env(self, monkeypatch, **kwargs):
+        """Create an SSHEnvironment with mocked connection plumbing."""
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/testuser")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_ensure_remote_dirs", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(
+            ssh_env, "FileSyncManager",
+            lambda **kw: type("M", (), {"sync": lambda self, **k: None})(),
+        )
+        return SSHEnvironment(host="example.com", user="testuser", **kwargs)
+
+    def test_scp_unix_includes_control_path(self, monkeypatch):
+        """On non-Windows, scp_cmd must include -o ControlPath=<socket>.
+
+        Monkeypatches _is_windows() to return False so the non-Windows branch
+        is exercised without altering the global os.name (which would confuse
+        pytest's own path-handling on Windows).
+        """
+        import tempfile
+        env = self._make_env(monkeypatch)
+
+        captured_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Simulate non-Windows: _is_windows() returns False
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_is_windows", staticmethod(lambda: False))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "file.txt")
+            with open(src, "w") as f:
+                f.write("hello")
+            env._scp_upload(src, "/home/testuser/.hermes/skills/file.txt")
+
+        # Second run() call is the scp command (first is mkdir)
+        assert len(captured_cmds) == 2, "Expected mkdir + scp subprocess.run calls"
+        scp_cmd = captured_cmds[1]
+        scp_str = " ".join(scp_cmd)
+        assert scp_cmd[0] == "scp"
+        assert "-o" in scp_cmd
+        assert f"ControlPath={env.control_socket}" in scp_str
+
+    def test_scp_windows_omits_control_path(self, monkeypatch):
+        """On Windows, scp_cmd must NOT include ControlPath.
+
+        Monkeypatches _is_windows() to return True so the Windows branch
+        is exercised regardless of the actual host OS.
+        """
+        import tempfile
+        env = self._make_env(monkeypatch)
+
+        captured_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            captured_cmds.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Simulate Windows: _is_windows() returns True
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_is_windows", staticmethod(lambda: True))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = os.path.join(tmpdir, "file.txt")
+            with open(src, "w") as f:
+                f.write("hello")
+            env._scp_upload(src, "/home/testuser/.hermes/skills/file.txt")
+
+        # Second run() call is the scp command (first is mkdir)
+        assert len(captured_cmds) == 2, "Expected mkdir + scp subprocess.run calls"
+        scp_cmd = captured_cmds[1]
+        scp_str = " ".join(scp_cmd)
+        assert scp_cmd[0] == "scp"
+        assert "ControlPath" not in scp_str

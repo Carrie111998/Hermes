@@ -7,7 +7,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.file_sync import (
@@ -160,9 +160,14 @@ class SSHEnvironment(BaseEnvironment):
 
     # _get_sync_files provided via iter_sync_files in FileSyncManager init
 
+    @staticmethod
+    def _is_windows() -> bool:
+        """Return True when running on Windows (os.name == 'nt')."""
+        return os.name == "nt"
+
     def _scp_upload(self, host_path: str, remote_path: str) -> None:
         """Upload a single file via scp over ControlMaster."""
-        parent = str(Path(remote_path).parent)
+        parent = str(PurePosixPath(remote_path).parent)
         mkdir_cmd = self._build_ssh_command()
         mkdir_cmd.append(f"mkdir -p {shlex.quote(parent)}")
         subprocess.run(
@@ -175,7 +180,7 @@ class SSHEnvironment(BaseEnvironment):
 
         scp_cmd = ["scp"]
         # Windows OpenSSH does not support Unix-domain ControlMaster sockets.
-        if os.name != "nt":
+        if not self._is_windows():
             scp_cmd.extend(["-o", f"ControlPath={self.control_socket}"])
         if self.port != 22:
             scp_cmd.extend(["-P", str(self.port)])
