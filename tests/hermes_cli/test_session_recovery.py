@@ -11,7 +11,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import cli as cli_module
 import hermes_state
+from hermes_cli import active_sessions
+from hermes_cli import config as cli_config
 from hermes_state import FTS_STORAGE_VERSION, SCHEMA_VERSION, SessionDB
 from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
@@ -594,6 +597,53 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
         min(_btree_leaf_pages(source, messages_root)[1]),
         max(_btree_leaf_pages(source, messages_root)[1]),
     }
+
+
+def test_startup_lifecycle_recovery_runs_before_native_prune(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    events = []
+
+    class FakeSessionDB:
+        def get_meta(self, key):
+            return "1"
+
+        def maybe_auto_prune_and_vacuum(self, **kwargs):
+            events.append(("prune", kwargs))
+
+    db = FakeSessionDB()
+    monkeypatch.setattr(
+        cli_config,
+        "load_config",
+        lambda: {
+            "sessions": {
+                "auto_archive": False,
+                "auto_prune": True,
+                "retention_days": 90,
+                "min_interval_hours": 2,
+                "vacuum_after_prune": False,
+            }
+        },
+    )
+
+    def fake_recover(session_db, **kwargs):
+        assert session_db is db
+        events.append(("recover", kwargs))
+        return {"candidate_ids": [], "recovered_ids": [], "excluded": {}}
+
+    monkeypatch.setattr(active_sessions, "recover_abandoned_session_rows", fake_recover)
+
+    cli_module._run_state_db_auto_maintenance(db)
+
+    assert events[0] == (
+        "recover",
+        {
+            "apply": True,
+            "older_than_seconds": 86400.0,
+            "limit": 100,
+            "respect_interval_seconds": 7200.0,
+        },
+    )
+    assert events[1][0] == "prune"
 
 
 

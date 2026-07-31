@@ -17,6 +17,42 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+def test_tui_owner_registration_exception_rejects_turn(monkeypatch):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    def fail_registration(**_kwargs):
+        raise OSError("registry unavailable")
+
+    monkeypatch.setattr(active_sessions, "try_acquire_active_session", fail_registration)
+    session = {"session_key": "session", "source": "tui"}
+
+    message = server._ensure_active_session_slot("live", session)
+
+    assert message is not None
+    assert "ownership" in message.lower()
+    assert session.get("active_session_lease") is None
+
+
+def test_tui_missing_owner_lease_rejects_turn(monkeypatch):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        active_sessions,
+        "try_acquire_active_session",
+        lambda **_kwargs: (None, None),
+    )
+    session = {"session_key": "session", "source": "tui"}
+
+    message = server._ensure_active_session_slot("live", session)
+
+    assert message is not None
+    assert "ownership" in message.lower()
+    assert session.get("active_session_lease") is None
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.

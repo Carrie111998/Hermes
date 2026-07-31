@@ -224,13 +224,128 @@ def cmd_sessions(args, sessions_parser=None):
         print("  Do not install it. Review the JSON report for partial data or errors.")
         return 1
 
+    min_age_hours = 24.0
+    limit = 100
+    if action == "finalize-orphans":
+        min_age_hours = float(getattr(args, "min_age_hours", 24.0))
+        limit = int(getattr(args, "limit", 100))
+        if min_age_hours <= 0:
+            print("Error: --min-age-hours must be greater than zero.")
+            return 2
+        if limit <= 0:
+            print("Error: --limit must be greater than zero.")
+            return 2
+
     try:
         from hermes_state import SessionDB
 
-        db = SessionDB()
+        if action == "finalize-orphans":
+            db = SessionDB(read_only=True, immutable=True)
+        else:
+            db = SessionDB()
     except Exception as e:
         print(f"Error: Could not open session database: {e}")
-        return
+        return 1 if action == "finalize-orphans" else None
+
+    # Audit-first abandoned-row maintenance. Always classify read-only before
+    # any confirmation or apply; apply then reclassifies under the registry
+    # lock so stale preview evidence can never authorize a write.
+    if action == "finalize-orphans":
+        from collections import Counter as _Counter
+        from hermes_cli.active_sessions import recover_abandoned_session_rows
+
+        try:
+            dry_report = recover_abandoned_session_rows(
+                db,
+                apply=False,
+                older_than_seconds=min_age_hours * 3600.0,
+                limit=limit,
+            )
+        except Exception as e:
+            print(f"Error: Could not audit abandoned sessions: {e}")
+            db.close()
+            return 1
+        candidates = list(dry_report.get("candidate_ids") or [])
+        excluded = dict(dry_report.get("excluded") or {})
+        report = {
+            "mode": "dry_run",
+            "min_age_hours": min_age_hours,
+            "limit": limit,
+            **dry_report,
+        }
+
+        if not getattr(args, "apply", False):
+            if getattr(args, "json", False):
+                print(_json.dumps(report, indent=2, sort_keys=True))
+            else:
+                reason_counts = _Counter(
+                    reason
+                    for reasons in excluded.values()
+                    for reason in reasons
+                )
+                print("Dry run — no session rows were changed.")
+                print(f"  proven candidates: {len(candidates)}")
+                print(f"  excluded/ambiguous: {len(excluded)}")
+                for reason, count in sorted(reason_counts.items()):
+                    print(f"    {reason}: {count}")
+                if candidates:
+                    print("  candidate session IDs:")
+                    for session_id in candidates:
+                        print(f"    {session_id}")
+                print(
+                    "Use --apply --yes to reclassify and finalize proven candidates."
+                )
+            db.close()
+            return 0
+
+        if not getattr(args, "yes", False):
+            print("Error: --apply requires --yes after reviewing the dry-run report.")
+            db.close()
+            return 2
+
+        if not candidates:
+            report["mode"] = "apply"
+            report["apply_skipped"] = "no_proven_candidates"
+            if getattr(args, "json", False):
+                print(_json.dumps(report, indent=2, sort_keys=True))
+            else:
+                print("No proven abandoned session rows to finalize.")
+            db.close()
+            return 0
+
+        db.close()
+        try:
+            db = SessionDB()
+        except Exception as e:
+            print(f"Error: Could not reopen session database for apply: {e}")
+            return 1
+        try:
+            applied = recover_abandoned_session_rows(
+                db,
+                apply=True,
+                older_than_seconds=min_age_hours * 3600.0,
+                limit=limit,
+            )
+        except Exception as e:
+            print(f"Error: Could not finalize abandoned sessions: {e}")
+            db.close()
+            return 1
+        report = {
+            "mode": "apply",
+            "min_age_hours": min_age_hours,
+            "limit": limit,
+            "dry_run": dry_report,
+            "apply": applied,
+        }
+        if getattr(args, "json", False):
+            print(_json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(
+                f"Finalized {len(applied.get('recovered_ids') or [])} "
+                "proven abandoned session row(s); transcripts were preserved."
+            )
+        db.close()
+        return 0
 
     # Hide third-party tool sessions by default, but honour explicit --source
     _source = getattr(args, "source", None)

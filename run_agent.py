@@ -1818,7 +1818,11 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(
+        self,
+        messages: List[Dict],
+        conversation_history: Optional[List[Dict]] = None,
+    ) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -1839,24 +1843,25 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            if self._flush_messages_to_session_db(messages, conversation_history) is False:
+                return False
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return True
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.

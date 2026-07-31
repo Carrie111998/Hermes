@@ -16,15 +16,19 @@ Key design decisions:
 
 import asyncio
 import atexit
+import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
+import shutil
 import sqlite3
 import sys
 import threading
 import time
+import tempfile
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,6 +81,71 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+def _validated_lifecycle_timestamp(
+    value: Any, *, upper_bound: float
+) -> Optional[float]:
+    """Return a trustworthy lifecycle marker, or ``None`` when ambiguous."""
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp) or timestamp <= 0 or timestamp > upper_bound:
+        return None
+    return timestamp
+
+
+def _copy_file_for_immutable_audit(source: Path, destination: Path) -> None:
+    """Copy hook kept separate so concurrent-writer behavior is testable."""
+    shutil.copyfile(source, destination)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sqlite_audit_source_state(path: Path) -> tuple[Any, ...]:
+    stat = path.stat()
+    sidecars = []
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecar_stat = sidecar.stat()
+            sidecars.append((suffix, sidecar_stat.st_size, sidecar_stat.st_mtime_ns))
+        else:
+            sidecars.append((suffix, None, None))
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, *sidecars)
+
+
+def _stable_immutable_audit_snapshot(source: Path) -> tuple[Path, Path]:
+    """Copy a quiescent SQLite main file, refusing any concurrent change."""
+    before = _sqlite_audit_source_state(source)
+    for suffix, size, _mtime in before[4:]:
+        if suffix in ("-wal", "-journal") and size:
+            label = "active WAL" if suffix == "-wal" else "active rollback journal"
+            raise RuntimeError(
+                f"read-only lifecycle audit refused: {label} contains uncheckpointed state"
+            )
+
+    snapshot_dir = Path(tempfile.mkdtemp(prefix="hermes-lifecycle-audit-"))
+    snapshot_path = snapshot_dir / "state.db"
+    try:
+        _copy_file_for_immutable_audit(source, snapshot_path)
+        after = _sqlite_audit_source_state(source)
+        if before != after or _file_sha256(source) != _file_sha256(snapshot_path):
+            raise RuntimeError(
+                "read-only lifecycle audit refused: database changed during immutable "
+                "audit snapshot"
+            )
+        return snapshot_dir, snapshot_path
+    except Exception:
+        shutil.rmtree(snapshot_dir, ignore_errors=True)
+        raise
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
@@ -1788,9 +1857,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _IMPORT_MAX_SESSION_BYTES = 5 * 1024 * 1024
     _IMPORT_MAX_TOTAL_BYTES = 25 * 1024 * 1024
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        read_only: bool = False,
+        immutable: bool = False,
+    ):
         self.db_path = db_path or _default_db_path()
         self.read_only = read_only
+        self.immutable = immutable
+        self._immutable_snapshot_dir: Optional[Path] = None
+        self._immutable_snapshot_path: Optional[Path] = None
+        if immutable and not read_only:
+            raise ValueError("immutable SessionDB access requires read_only=True")
 
         self._lock = threading.Lock()
         # Read-path split (WAL only): recall/browse queries run on per-thread
@@ -1846,9 +1925,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
+                connect_path = self.db_path
+                if immutable:
+                    (
+                        self._immutable_snapshot_dir,
+                        self._immutable_snapshot_path,
+                    ) = _stable_immutable_audit_snapshot(self.db_path)
+                    connect_path = self._immutable_snapshot_path
+                immutable_query = "&immutable=1" if immutable else ""
                 self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
-                    tracking_path=self.db_path,
+                    f"file:{connect_path}?mode=ro{immutable_query}",
+                    tracking_path=connect_path,
                     uri=True,
                     check_same_thread=False,
                     timeout=1.0,
@@ -2002,6 +2089,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Tests that need to reset the state can call
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
+            if self._immutable_snapshot_dir is not None:
+                shutil.rmtree(self._immutable_snapshot_dir, ignore_errors=True)
+                self._immutable_snapshot_dir = None
+                self._immutable_snapshot_path = None
             raise
 
     # ── Read-path split ──
@@ -2544,6 +2635,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
+        if self._immutable_snapshot_dir is not None:
+            shutil.rmtree(self._immutable_snapshot_dir, ignore_errors=True)
+            self._immutable_snapshot_dir = None
+            self._immutable_snapshot_path = None
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #
@@ -3230,6 +3325,365 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (time.time(), end_reason, session_id),
             )
         self._execute_write(_do)
+
+    def get_lifecycle_recovery_epoch(self) -> Optional[float]:
+        """Read the always-on owner-lease epoch without creating state."""
+        with self._read_ctx() as conn:
+            if conn is None:
+                return None
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                ("session_lifecycle_owner_registry_epoch",),
+            ).fetchone()
+        if row is None:
+            return None
+        value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+        return _validated_lifecycle_timestamp(value, upper_bound=time.time())
+
+    def get_or_create_lifecycle_recovery_epoch(
+        self, *, now: Optional[float] = None
+    ) -> float:
+        """Return the first instant always-on process-owner leases were active."""
+        wall_time = time.time()
+        epoch = wall_time if now is None else float(now)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                ("session_lifecycle_owner_registry_epoch",),
+            ).fetchone()
+            if row is None:
+                if _validated_lifecycle_timestamp(epoch, upper_bound=wall_time) is None:
+                    raise ValueError(
+                        "lifecycle recovery epoch must be a finite past timestamp"
+                    )
+                conn.execute(
+                    "INSERT INTO state_meta(key, value) VALUES (?, ?)",
+                    ("session_lifecycle_owner_registry_epoch", repr(epoch)),
+                )
+                return epoch
+            value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+            stored_epoch = _validated_lifecycle_timestamp(
+                value, upper_bound=time.time()
+            )
+            if stored_epoch is None:
+                raise RuntimeError("stored lifecycle recovery epoch is invalid")
+            return stored_epoch
+
+        return self._execute_write(_do)
+
+    def claim_lifecycle_recovery_attempt(
+        self,
+        *,
+        now: Optional[float] = None,
+        interval_seconds: float = 86400.0,
+    ) -> bool:
+        """Atomically claim the bounded startup-recovery interval."""
+        wall_time = time.time()
+        current_time = wall_time if now is None else float(now)
+        if _validated_lifecycle_timestamp(current_time, upper_bound=wall_time) is None:
+            return False
+        interval = float(interval_seconds)
+        if not math.isfinite(interval) or interval < 0:
+            return False
+        key = "session_lifecycle_recovery_last_attempt_at"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is not None:
+                value = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+                last_attempt = _validated_lifecycle_timestamp(
+                    value, upper_bound=current_time
+                )
+                if last_attempt is None:
+                    # Unknown marker state is ambiguous: suppress unattended work.
+                    return False
+                if current_time - last_attempt < interval:
+                    return False
+            conn.execute(
+                "INSERT INTO state_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, repr(current_time)),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def recover_abandoned_sessions(
+        self,
+        *,
+        older_than_seconds: float = 86400,
+        active_session_ids: Optional[set[str]] = None,
+        eligible_started_after: Optional[float] = None,
+        source_allowlist: tuple[str, ...] = ("cli",),
+        limit: int = 100,
+        now: Optional[float] = None,
+        apply: bool = True,
+        report_legacy_exclusions: bool = True,
+    ) -> Dict[str, Any]:
+        """Mark proven abandoned process-owned sessions ended, deleting nothing."""
+        current_time = time.time() if now is None else float(now)
+        if not math.isfinite(current_time) or current_time <= 0:
+            return {
+                "candidate_ids": [],
+                "recovered_ids": [],
+                "excluded": {},
+                "skipped": "invalid_time",
+            }
+        if apply and active_session_ids is None:
+            return {
+                "candidate_ids": [],
+                "recovered_ids": [],
+                "excluded": {},
+                "skipped": "missing_active_session_snapshot",
+            }
+        if apply and eligible_started_after is None:
+            return {
+                "candidate_ids": [],
+                "recovered_ids": [],
+                "excluded": {},
+                "skipped": "missing_epoch",
+            }
+        if eligible_started_after is not None:
+            validated_epoch = _validated_lifecycle_timestamp(
+                eligible_started_after, upper_bound=current_time
+            )
+            if validated_epoch is None:
+                return {
+                    "candidate_ids": [],
+                    "recovered_ids": [],
+                    "excluded": {},
+                    "skipped": "invalid_epoch",
+                }
+            eligible_started_after = validated_epoch
+        cutoff = current_time - float(older_than_seconds)
+        active_ids = {str(value) for value in (active_session_ids or set())}
+        sources = tuple(str(value) for value in source_allowlist if str(value))
+        bounded_limit = max(1, min(int(limit), 1000))
+        if not sources:
+            return {"candidate_ids": [], "recovered_ids": [], "excluded": {}}
+
+        source_placeholders = ",".join("?" for _ in sources)
+
+        def _do(conn):
+            params: list[Any] = [*sources, cutoff]
+            epoch_clause = ""
+            if eligible_started_after is not None:
+                epoch_clause = " AND s.started_at >= ?"
+                params.append(float(eligible_started_after))
+            active_values = sorted(active_ids)
+            active_placeholders = ",".join("?" for _ in active_values)
+            active_reference_sql = (
+                f"id IN ({active_placeholders})" if active_values else "0"
+            )
+            topic_table_exists = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'telegram_dm_topic_bindings'"
+            ).fetchone()
+            topic_reference_sql = (
+                "EXISTS(SELECT 1 FROM telegram_dm_topic_bindings t "
+                "WHERE t.session_id = s.id)"
+                if topic_table_exists
+                else "0"
+            )
+            delegation_columns = {
+                str(row["name"] if isinstance(row, sqlite3.Row) else row[1])
+                for row in conn.execute("PRAGMA table_info(async_delegations)")
+            }
+            delegation_origin_id_sql = (
+                " OR ad.origin_session_id = s.id"
+                if "origin_session_id" in delegation_columns
+                else ""
+            )
+            rows = conn.execute(
+                f"""
+                WITH classified AS (
+                SELECT s.id, s.started_at, s.session_key, s.user_id,
+                       s.chat_id, s.chat_type, s.thread_id, s.origin_json,
+                       s.archived, s.pinned, s.handoff_state,
+                       EXISTS(
+                           SELECT 1 FROM compression_locks cl
+                           WHERE cl.session_id = s.id AND cl.expires_at > ?
+                       ) AS compression_active,
+                       EXISTS(
+                           SELECT 1 FROM async_delegations ad
+                           WHERE (
+                                   ad.state IN ('pending', 'running', 'queued', 'finalizing')
+                                   OR ad.delivery_state = 'pending'
+                                 )
+                             AND (ad.origin_session = s.id
+                                  OR ad.origin_ui_session_id = s.id
+                                  OR ad.parent_session_id = s.id
+                                  {delegation_origin_id_sql})
+                       ) AS delegation_active,
+                       EXISTS(
+                           SELECT 1 FROM sessions parent
+                           WHERE parent.id = s.parent_session_id
+                             AND parent.ended_at IS NULL
+                       ) AS live_parent,
+                       EXISTS(
+                           SELECT 1 FROM sessions child
+                           WHERE child.parent_session_id = s.id
+                             AND child.ended_at IS NULL
+                       ) AS live_child,
+                       EXISTS(
+                           SELECT 1 FROM gateway_routing gr,
+                                        json_tree(gr.entry_json) route_value
+                           WHERE route_value.value = s.id
+                             AND route_value.key IN ('session_id', 'current_session_id')
+                       ) AS gateway_routing_reference,
+                       {topic_reference_sql} AS telegram_topic_binding
+                FROM sessions s
+                WHERE s.ended_at IS NULL
+                  AND s.source IN ({source_placeholders})
+                  AND COALESCE(
+                        (SELECT MAX(m.timestamp) FROM messages m
+                         WHERE m.session_id = s.id),
+                        s.started_at
+                      ) < ?
+                  {epoch_clause}
+                ), ranked AS (
+                    SELECT classified.*,
+                           (
+                               COALESCE(session_key, '') <> ''
+                               OR COALESCE(user_id, '') <> ''
+                               OR COALESCE(chat_id, '') <> ''
+                               OR COALESCE(chat_type, '') <> ''
+                               OR COALESCE(thread_id, '') <> ''
+                               OR COALESCE(origin_json, '') <> ''
+                               OR {active_reference_sql}
+                               OR pinned
+                               OR archived
+                               OR COALESCE(handoff_state, '') <> ''
+                               OR compression_active
+                               OR delegation_active
+                               OR live_parent
+                               OR live_child
+                               OR gateway_routing_reference
+                               OR telegram_topic_binding
+                           ) AS recovery_protected
+                    FROM classified
+                ), candidate_rows AS (
+                    SELECT * FROM ranked
+                    WHERE NOT recovery_protected
+                    ORDER BY started_at ASC, id ASC
+                    LIMIT ?
+                ), excluded_rows AS (
+                    SELECT * FROM ranked
+                    WHERE recovery_protected
+                    ORDER BY started_at ASC, id ASC
+                    LIMIT ?
+                )
+                SELECT * FROM candidate_rows
+                UNION ALL
+                SELECT * FROM excluded_rows
+                """,
+                [
+                    current_time,
+                    *params,
+                    *active_values,
+                    bounded_limit,
+                    bounded_limit,
+                ],
+            ).fetchall()
+            recovered_ids: list[str] = []
+            candidate_ids: list[str] = []
+            excluded: dict[str, list[str]] = {}
+            for row in rows:
+                session_id = str(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                if any(
+                    row[key]
+                    for key in (
+                        "session_key", "user_id", "chat_id", "chat_type",
+                        "thread_id", "origin_json",
+                    )
+                ):
+                    excluded[session_id] = ["gateway_owned"]
+                    continue
+                if session_id in active_ids:
+                    excluded[session_id] = ["active_lease"]
+                    continue
+                if row["pinned"]:
+                    excluded[session_id] = ["pinned"]
+                    continue
+                if row["archived"]:
+                    excluded[session_id] = ["archived"]
+                    continue
+                if row["handoff_state"]:
+                    reason = (
+                        "handoff_active"
+                        if row["handoff_state"] in ("pending", "running")
+                        else "handoff_related"
+                    )
+                    excluded[session_id] = [reason]
+                    continue
+                if row["compression_active"]:
+                    excluded[session_id] = ["compression_active"]
+                    continue
+                if row["delegation_active"]:
+                    excluded[session_id] = ["delegation_active"]
+                    continue
+                if row["live_parent"]:
+                    excluded[session_id] = ["live_parent"]
+                    continue
+                if row["live_child"]:
+                    excluded[session_id] = ["live_child"]
+                    continue
+                if row["gateway_routing_reference"]:
+                    excluded[session_id] = ["gateway_routing_reference"]
+                    continue
+                if row["telegram_topic_binding"]:
+                    excluded[session_id] = ["telegram_topic_binding"]
+                    continue
+                candidate_ids.append(session_id)
+                if not apply:
+                    continue
+                updated = conn.execute(
+                    "UPDATE sessions SET ended_at = ?, end_reason = 'orphan_recovered' "
+                    "WHERE id = ? AND ended_at IS NULL",
+                    (current_time, session_id),
+                )
+                if updated.rowcount == 1:
+                    recovered_ids.append(session_id)
+            if report_legacy_exclusions and eligible_started_after is not None:
+                legacy_rows = conn.execute(
+                    f"""
+                    SELECT s.id
+                    FROM sessions s
+                    WHERE s.ended_at IS NULL
+                      AND s.source IN ({source_placeholders})
+                      AND COALESCE(
+                            (SELECT MAX(m.timestamp) FROM messages m
+                             WHERE m.session_id = s.id),
+                            s.started_at
+                          ) < ?
+                      AND s.started_at < ?
+                    ORDER BY s.started_at ASC, s.id ASC
+                    LIMIT ?
+                    """,
+                    [*sources, cutoff, float(eligible_started_after), bounded_limit],
+                ).fetchall()
+                for legacy_row in legacy_rows:
+                    legacy_id = str(
+                        legacy_row["id"]
+                        if isinstance(legacy_row, sqlite3.Row)
+                        else legacy_row[0]
+                    )
+                    excluded[legacy_id] = ["before_recovery_epoch"]
+            return {
+                "candidate_ids": candidate_ids,
+                "recovered_ids": recovered_ids,
+                "excluded": excluded,
+            }
+
+        if apply:
+            return self._execute_write(_do)
+        with self._read_ctx() as conn:
+            if conn is None:
+                return {"candidate_ids": [], "recovered_ids": [], "excluded": {}}
+            return _do(conn)
 
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed."""
