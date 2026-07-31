@@ -17,7 +17,9 @@ contract: the plugin scans ALL of your sessions, not the first 200.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib.util
+import re
 import sys
 import threading
 import time
@@ -125,6 +127,84 @@ def _install_fake_session_db(plugin_api, fake_db):
     fake_module = type(sys)("hermes_state")
     fake_module.SessionDB = lambda: fake_db
     plugin_api._test_monkeypatch.setitem(sys.modules, "hermes_state", fake_module)
+
+
+class _Request:
+    def __init__(self, query=None, header=""):
+        self.query_params = query or {}
+        self.headers = {"accept-language": header}
+
+
+def _fixed_snapshot(plugin_api):
+    achievements = []
+    unlocked_count = 0
+    secret_count = 0
+    for index, definition in enumerate(plugin_api.ACHIEVEMENTS):
+        is_secret = bool(definition.get("secret"))
+        state = "secret" if is_secret else "unlocked"
+        if is_secret:
+            secret_count += 1
+        else:
+            unlocked_count += 1
+        achievements.append(
+            plugin_api.display_achievement(
+                {
+                    **definition,
+                    "unlocked": not is_secret,
+                    "discovered": not is_secret,
+                    "state": state,
+                    "progress": 1 if not is_secret else 0,
+                    "progress_pct": 100 if not is_secret else 0,
+                    "tier": "Bronze" if not is_secret else None,
+                    "unlocked_at": len(plugin_api.ACHIEVEMENTS) - index,
+                }
+            )
+        )
+    return {
+        "achievements": achievements,
+        "sessions": [
+            {
+                "session_id": "session-1",
+                "tool_call_count": 100_000,
+                "distinct_tool_count": 100,
+                "message_count": 100_000,
+                "terminal_calls": 100_000,
+                "file_tool_calls": 100_000,
+                "web_calls": 100_000,
+                "web_browser_calls": 100_000,
+                "files_touched_count": 100_000,
+            }
+        ],
+        "aggregate": {},
+        "scan_meta": {"mode": "full", "sessions_total": 1},
+        "error": None,
+        "unlocked_count": unlocked_count,
+        "discovered_count": 0,
+        "secret_count": secret_count,
+        "total_count": len(achievements),
+        "generated_at": 1,
+    }
+
+
+def _stub_evaluate_all(plugin_api, snapshot):
+    plugin_api._test_monkeypatch.setattr(
+        plugin_api, "evaluate_all", lambda force=False: snapshot
+    )
+
+
+def _contains_cjk(value):
+    return bool(re.search(r"[\u3400-\u9fff]", value))
+
+
+def _string_values(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _string_values(item)
 
 
 def test_scan_sessions_default_scans_all_history_not_first_200(plugin_api):
@@ -328,12 +408,116 @@ def test_achievements_locale_keeps_secret_cards_hidden(plugin_api):
 
 
 def test_achievements_locale_resolution_accepts_query_and_header(plugin_api):
-    class Req:
-        def __init__(self, query=None, header=""):
-            self.query_params = query or {}
-            self.headers = {"accept-language": header}
+    assert plugin_api._resolve_locale_from_request(_Request({"locale": "zh"})) == "zh-CN"
+    assert plugin_api._resolve_locale_from_request(_Request(header="zh-CN,zh;q=0.9,en;q=0.8")) == "zh-CN"
+    assert plugin_api._resolve_locale_from_request(_Request({"locale": "en"}, "zh-CN")) == "en"
+    assert plugin_api._resolve_locale_from_request(_Request(header="fr,en;q=0.8")) == "en"
 
-    assert plugin_api._resolve_locale_from_request(Req({"locale": "zh"})) == "zh-CN"
-    assert plugin_api._resolve_locale_from_request(Req(header="zh-CN,zh;q=0.9,en;q=0.8")) == "zh-CN"
-    assert plugin_api._resolve_locale_from_request(Req({"locale": "en"}, "zh-CN")) == "en"
-    assert plugin_api._resolve_locale_from_request(Req(header="fr,en;q=0.8")) == "en"
+
+def test_explicit_locale_param_wins_over_accept_language(plugin_api):
+    request = _Request({"locale": "ja"}, "zh-CN")
+
+    assert plugin_api._resolve_locale_from_request(request) == "en"
+
+
+def test_zh_hant_does_not_fall_back_to_simplified(plugin_api):
+    request = _Request({"locale": "zh-hant"}, "zh-CN")
+
+    assert plugin_api._resolve_locale_from_request(request) == "en"
+
+
+def test_achievements_route_returns_localized_payload(plugin_api):
+    snapshot = _fixed_snapshot(plugin_api)
+    _stub_evaluate_all(plugin_api, snapshot)
+
+    chinese = asyncio.run(plugin_api.achievements(_Request({"locale": "zh-CN"})))
+    english = asyncio.run(plugin_api.achievements(_Request({"locale": "en"})))
+
+    assert all("criteria" in item for item in chinese["achievements"])
+    assert all(
+        _contains_cjk(item["name"])
+        for item in chinese["achievements"]
+        if item["state"] != "secret"
+    )
+    assert english["achievements"][0]["name"] == "Let Him Cook"
+    assert not any(_contains_cjk(item["name"]) for item in english["achievements"])
+
+
+def test_achievements_route_honors_accept_language_header(plugin_api):
+    _stub_evaluate_all(plugin_api, _fixed_snapshot(plugin_api))
+
+    payload = asyncio.run(plugin_api.achievements(_Request(header="zh-CN,zh;q=0.9")))
+
+    assert payload["achievements"][0]["name"] == "放手一搏"
+    assert "要求" in payload["achievements"][0]["criteria"]
+
+
+def test_recent_unlocks_route_localized(plugin_api):
+    _stub_evaluate_all(plugin_api, _fixed_snapshot(plugin_api))
+
+    payload = asyncio.run(plugin_api.recent_unlocks(_Request({"locale": "zh-CN"})))
+
+    assert payload[0]["name"] == "放手一搏"
+    assert "要求" in payload[0]["criteria"]
+
+
+def test_session_badges_route_localized(plugin_api):
+    _stub_evaluate_all(plugin_api, _fixed_snapshot(plugin_api))
+
+    payload = asyncio.run(
+        plugin_api.session_badges("session-1", _Request({"locale": "zh-CN"}))
+    )
+
+    assert set(payload) == {"session_id", "badges"}
+    badge = next(item for item in payload["badges"] if item["id"] == "let_him_cook")
+    assert badge["name"] == "放手一搏"
+    assert "要求" in badge["criteria"]
+
+
+def test_rescan_route_localized(plugin_api):
+    snapshot = _fixed_snapshot(plugin_api)
+    force_values = []
+
+    def evaluate_all(force=False):
+        force_values.append(force)
+        return snapshot
+
+    plugin_api._test_monkeypatch.setattr(plugin_api, "evaluate_all", evaluate_all)
+
+    payload = asyncio.run(plugin_api.rescan(_Request({"locale": "zh-CN"})))
+
+    assert payload["ok"] is True
+    assert payload["achievements"][0]["name"] == "放手一搏"
+    assert force_values == [True]
+
+
+def test_secret_cards_stay_hidden_through_route(plugin_api):
+    _stub_evaluate_all(plugin_api, _fixed_snapshot(plugin_api))
+    definition = next(item for item in plugin_api.ACHIEVEMENTS if item.get("secret"))
+
+    payload = asyncio.run(plugin_api.achievements(_Request({"locale": "zh-CN"})))
+    secret_card = next(
+        item for item in payload["achievements"] if item["id"] == definition["id"]
+    )
+
+    assert secret_card["name"] == "???"
+    assert secret_card["icon"] == "secret"
+    assert "秘密成就" in secret_card["description"]
+    assert "秘密成就" in secret_card["criteria"]
+    assert all(definition["name"] not in value for value in _string_values(secret_card))
+
+
+def test_scan_poll_effect_recreated_on_locale_change():
+    bundle_path = PLUGIN_MODULE_PATH.parent / "dist" / "index.js"
+    bundle = bundle_path.read_text(encoding="utf-8")
+    poll_effect = re.search(
+        r"hooks\.useEffect\(function \(\) \{\s*"
+        r"if \(!scanInFlight\).*?setInterval\(refresh, 4000\);.*?"
+        r"\}, \[([^\]]*)\]\);",
+        bundle,
+        re.DOTALL,
+    )
+
+    assert poll_effect is not None, "scan polling effect was not found in the bundle"
+    dependencies = {item.strip() for item in poll_effect.group(1).split(",")}
+    assert "locale" in dependencies
