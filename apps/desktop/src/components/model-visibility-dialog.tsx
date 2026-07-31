@@ -12,6 +12,7 @@ import { Switch } from '@/components/ui/switch'
 import { getHermesConfigRecord, type HermesGateway, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
+  excludedProviderName,
   isProviderExcluded,
   readExcludedProviders,
   withExcludedProviders,
@@ -96,7 +97,10 @@ export function ModelVisibilityDialog({
       ...providers.map(provider => ({ off: isProviderExcluded(excluded, provider.slug), provider })),
       ...excluded
         .filter(slug => !providers.some(provider => provider.slug.toLowerCase() === slug.toLowerCase()))
-        .map(slug => ({ off: true, provider: { models: [], name: slug, slug } as ModelOptionProvider }))
+        .map(slug => ({
+          off: true,
+          provider: { models: [], name: excludedProviderName(slug), slug } as ModelOptionProvider
+        }))
     ],
     [providers, excluded]
   )

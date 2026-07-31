@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  excludedProviderName,
   isProviderExcluded,
   readExcludedProviders,
   withExcludedProviders,
@@ -30,6 +31,17 @@ describe('readExcludedProviders', () => {
     expect(readExcludedProviders({ model_catalog: { excluded_providers: ['copilot', 7, null, ' '] } })).toEqual([
       'copilot'
     ])
+  })
+})
+
+describe('excludedProviderName', () => {
+  it("strips the picker's custom: prefix and separators so the row reads as before", () => {
+    expect(excludedProviderName('custom:second-mock')).toBe('second mock')
+    expect(excludedProviderName('my_llm')).toBe('my llm')
+  })
+
+  it('leaves a plain slug alone', () => {
+    expect(excludedProviderName('copilot')).toBe('copilot')
   })
 })
 

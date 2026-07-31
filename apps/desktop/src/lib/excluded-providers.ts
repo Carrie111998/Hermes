@@ -27,6 +27,19 @@ export function readExcludedProviders(config: HermesConfigRecord | undefined): s
   return entries.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== '')
 }
 
+/** Readable label for an excluded provider. Its catalog row is gone, so the
+ *  slug is all we have: drop the `custom:` prefix the picker adds to
+ *  user-defined endpoints and space out the separators, so the row reads the
+ *  same as it did before it was switched off (headers are uppercased in CSS). */
+export function excludedProviderName(slug: string): string {
+  return (
+    slug
+      .replace(/^custom:/i, '')
+      .replace(/[-_]+/g, ' ')
+      .trim() || slug
+  )
+}
+
 /** Case-insensitive membership, matching the backend's normalized comparison. */
 export function isProviderExcluded(excluded: readonly string[], slug: string): boolean {
   const target = slug.toLowerCase()
