@@ -602,6 +602,141 @@ describe('startFreshSessionDraft', () => {
     expect(requestGateway).toHaveBeenCalledTimes(1)
     expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-old' })
   })
+  it('closes an unselected tiled runtime before archiving', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionId={new Map([['stored-old', 'runtime-tile']])}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('stored-old')
+    })
+
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-tile' })
+    expect(setSessionArchived).toHaveBeenCalledWith('stored-old', true, undefined)
+  })
+
+  it('closes an unselected tiled runtime before deleting', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    vi.mocked(deleteSession).mockClear()
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionId={new Map([['stored-old', 'runtime-tile']])}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('stored-old')
+    })
+
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-tile' })
+    expect(deleteSession).toHaveBeenCalledWith('stored-old', undefined)
+    expect(requestGateway.mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(deleteSession).mock.invocationCallOrder[0]
+    )
+  })
+
+  it('deduplicates the selected and tiled runtime before archiving', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        activeSessionId="runtime-shared"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionId={new Map([['stored-old', 'runtime-shared']])}
+        selectedStoredSessionId="stored-old"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('stored-old')
+    })
+
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-shared' })
+  })
+
+  it('does not archive when a tiled runtime cannot be finalized', async () => {
+    const requestGateway = vi.fn(async () => Promise.reject(new Error('close failed')))
+    let handle: HarnessHandle | null = null
+
+    vi.mocked(setSessionArchived).mockClear()
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionId={new Map([['stored-old', 'runtime-tile']])}
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('stored-old')
+    })
+
+    expect(setSessionArchived).not.toHaveBeenCalled()
+    expect($sessions.get().some(session => session.id === 'stored-old')).toBe(true)
+  })
+
+  it('resumes the selected session when the archive write fails after close', async () => {
+    const requestGateway = vi.fn(async method => {
+      if (method === 'session.resume') {
+        return {
+          messages: [],
+          resumed: 'stored-old',
+          session_id: 'runtime-resumed'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    vi.mocked(setSessionArchived).mockRejectedValueOnce(new Error('archive failed'))
+    vi.mocked(getLatestSessionMessages).mockResolvedValueOnce({
+      messages: [],
+      session_id: 'stored-old'
+    })
+    setSessions([storedSession({ id: 'stored-old' })])
+    render(
+      <Harness
+        activeSessionId="runtime-old"
+        onReady={value => (handle = value)}
+        requestGateway={requestGateway}
+        selectedStoredSessionId="stored-old"
+      />
+    )
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('stored-old')
+    })
+
+    expect(requestGateway).toHaveBeenCalledWith('session.close', { session_id: 'runtime-old' })
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.objectContaining({ session_id: 'stored-old' }))
+    expect($selectedStoredSessionId.get()).toBe('stored-old')
+    expect($activeSessionId.get()).toBe('runtime-resumed')
+  })
 })
 
 describe('createBackendSessionForSend profile routing', () => {
