@@ -956,10 +956,15 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 ### Autonomous coding-run ownership
 
-For autonomous coding work, define a checkable exit predicate before moving the
-card into progress. Keep the implementation isolated on its own branch or
-worktree, make the smallest coherent change, run the repository's real
-verification commands, and record important decisions on the card.
+Kanban workers receive this policy automatically in their system prompt. Cron
+jobs and `delegate_task` children do not: for those run types, include this
+policy (or the `autonomous-ai-agents/hermes-agent` skill that contains it) in
+the job prompt or delegated goal when you want the same operating convention.
+
+For autonomous Kanban coding work, define a checkable exit predicate before
+moving the card into progress. Keep the implementation isolated on its own
+branch or worktree, make the smallest coherent change, run the repository's
+real verification commands, and record important decisions on the card.
 
 During the run, the agent owns fixable discoveries that block or materially
 improve the original task, such as broken skills, verifier drift, closely

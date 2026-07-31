@@ -102,8 +102,13 @@ User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban
 
 ### Autonomous coding-run ownership
 
-For unattended coding work driven by cron, Kanban, or delegation, define the
-run before dispatch:
+This section is an operating convention, not a globally injected prompt.
+Kanban workers receive the equivalent policy automatically through
+`KANBAN_GUIDANCE`. Cron jobs and `delegate_task` children receive it only when
+their job prompt or delegated goal explicitly includes this reference (or an
+equivalent policy).
+
+For unattended coding work, define the run before dispatch:
 
 - Write a checkable exit predicate (for example, a focused test passes and the
   issue reproduction no longer fails).
