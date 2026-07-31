@@ -32,10 +32,15 @@ def _make_runner(session_db=None):
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
     runner._voice_mode = {}
+    runner._schedule_telegram_topic_title_rename = MagicMock()
+    runner._schedule_adapter_session_title_propagation = MagicMock()
     # Gateway holds the async facade; the slash handlers await it.
     if session_db is not None:
-        from hermes_state import AsyncSessionDB
-        session_db = AsyncSessionDB(session_db)
+        session_db = SimpleNamespace(
+            get_session_title=AsyncMock(side_effect=session_db.get_session_title),
+            create_session=AsyncMock(side_effect=session_db.create_session),
+            set_session_title=AsyncMock(side_effect=session_db.set_session_title),
+        )
     runner._session_db = session_db
 
     # Mock session_store that returns a session entry with a known session_id
@@ -45,6 +50,10 @@ def _make_runner(session_db=None):
     mock_store = MagicMock()
     mock_store.get_or_create_session.return_value = mock_session_entry
     runner.session_store = mock_store
+    runner._async_session_store = SimpleNamespace(
+        _store=mock_store,
+        get_or_create_session=AsyncMock(return_value=mock_session_entry),
+    )
 
     return runner
 
@@ -118,7 +127,7 @@ class TestHandleTitleCommand:
         db.create_session("test_session_123", "matrix")
 
         runner = _make_runner(session_db=db)
-        runner._schedule_matrix_semantic_room_rename = MagicMock()
+        runner._schedule_adapter_session_title_propagation = MagicMock()
 
         event = _make_event(
             text="/title Matrix Task Name",
@@ -129,7 +138,7 @@ class TestHandleTitleCommand:
         result = await runner._handle_title_command(event)
 
         assert "Matrix Task Name" in result
-        runner._schedule_matrix_semantic_room_rename.assert_called_once_with(
+        runner._schedule_adapter_session_title_propagation.assert_called_once_with(
             event.source, "test_session_123", "Matrix Task Name"
         )
         db.close()

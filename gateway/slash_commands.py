@@ -4316,26 +4316,21 @@ class GatewaySlashCommandsMixin:
                     )
                     if callable(schedule_rename):
                         try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                            schedule_rename(source, session_id, sanitized)
                         except Exception:
                             logger.debug(
                                 "Failed to rename Telegram topic from /title",
                                 exc_info=True,
                             )
-                    schedule_matrix_rename = getattr(
-                        self, "_schedule_matrix_semantic_room_rename", None
+                    schedule_adapter_title = getattr(
+                        self, "_schedule_adapter_session_title_propagation", None
                     )
-                    if callable(schedule_matrix_rename):
+                    if callable(schedule_adapter_title):
                         try:
-                            await asyncio.to_thread(
-                                schedule_matrix_rename,
-                                source,
-                                session_id,
-                                sanitized,
-                            )
+                            schedule_adapter_title(source, session_id, sanitized)
                         except Exception:
                             logger.debug(
-                                "Failed to rename Matrix room from /title",
+                                "Failed to propagate /title through platform adapter",
                                 exc_info=True,
                             )
                     return t("gateway.title.set_to", title=sanitized)

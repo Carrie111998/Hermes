@@ -131,6 +131,7 @@ except ImportError:
     TrustState = _TrustStateStub  # type: ignore[misc,assignment]
 
 from gateway.config import Platform, PlatformConfig
+from gateway.session import SessionSource
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -3718,6 +3719,20 @@ class MatrixAdapter(BasePlatformAdapter):
             title
         )
         return await self._render_dynamic_room_name(str(room_id))
+
+    async def on_session_title_changed(
+        self,
+        source: SessionSource,
+        title: str,
+    ) -> bool:
+        """Propagate a session title to an opted-in Matrix DM room."""
+        if not (
+            self._dynamic_room_name_enabled
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        ):
+            return False
+        return await self.set_semantic_room_name(str(source.chat_id), title)
 
     async def _on_reaction(self, event: Any) -> None:
         """Handle incoming reaction events."""

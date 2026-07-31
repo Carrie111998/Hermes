@@ -5532,8 +5532,8 @@ class TurnRunner:
                         effective_session_id,
                         title,
                     )
-                elif self._runner._is_matrix_dynamic_room_name_lane(ctx.source):
-                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_matrix_semantic_room_rename(
+                elif self._runner._adapter_supports_session_title_propagation(ctx.source):
+                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_adapter_session_title_propagation(
                         ctx.source,
                         effective_session_id,
                         title,
@@ -19243,58 +19243,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         future.add_done_callback(_log_rename_failure)
 
-    @staticmethod
-    def _is_matrix_dynamic_room_name_lane(source: SessionSource) -> bool:
-        """Return True for Matrix DMs eligible for opt-in dynamic room names."""
-        return bool(
-            source.platform == Platform.MATRIX
-            and source.chat_type == "dm"
-            and source.chat_id
+    def _adapter_supports_session_title_propagation(
+        self,
+        source: SessionSource,
+    ) -> bool:
+        """Return whether the source adapter exposes the optional title hook."""
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return False
+        # Static lookup keeps permissive mocks from inventing the hook while
+        # still allowing adapters to install a concrete per-instance callback.
+        return callable(
+            inspect.getattr_static(adapter, "on_session_title_changed", None)
         )
 
-    async def _rename_matrix_room_for_session_title(
+    async def _propagate_session_title_to_adapter(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
     ) -> None:
-        """Best-effort Matrix room rename from a generated session title."""
-        if not self._is_matrix_dynamic_room_name_lane(source):
+        """Best-effort title propagation through an adapter's optional hook."""
+        if not title or not self._adapter_supports_session_title_propagation(source):
             return
         try:
             current_entry = await self.async_session_store.get_or_create_session(source)
         except Exception:
             logger.debug(
-                "Could not validate current Matrix session before room rename",
+                "Could not validate current session before adapter title propagation",
                 exc_info=True,
             )
             return
         if str(getattr(current_entry, "session_id", "")) != str(session_id):
             return
-        adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
+        adapter = self._adapter_for_source(source)
         if adapter is None:
             return
-        set_semantic_room_name = getattr(adapter, "set_semantic_room_name", None)
-        if not callable(set_semantic_room_name):
+        title_hook = getattr(adapter, "on_session_title_changed", None)
+        if not callable(title_hook):
             return
         try:
-            result = set_semantic_room_name(str(source.chat_id), title)
+            result = title_hook(source, title)
             if inspect.isawaitable(result):
                 await result
         except Exception:
             logger.debug(
-                "Failed to rename Matrix room for generated session title",
+                "Adapter session-title propagation failed",
                 exc_info=True,
             )
 
-    def _schedule_matrix_semantic_room_rename(
+    def _schedule_adapter_session_title_propagation(
         self,
         source: SessionSource,
         session_id: str,
         title: str,
     ) -> None:
-        """Schedule Matrix room rename from the auto-title background thread."""
-        if not title or not self._is_matrix_dynamic_room_name_lane(source):
+        """Schedule an optional adapter title hook from any caller thread."""
+        if not title or not self._adapter_supports_session_title_propagation(source):
             return
         try:
             loop = asyncio.get_running_loop()
@@ -19307,14 +19312,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
-            self._rename_matrix_room_for_session_title(
+            self._propagate_session_title_to_adapter(
                 copied_source,
                 session_id,
                 title,
             ),
             loop,
             logger=logger,
-            log_message="Matrix semantic room rename failed to schedule",
+            log_message="Adapter session-title propagation failed to schedule",
         )
         if future is None:
             return
@@ -19323,7 +19328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 fut.result()
             except Exception:
-                logger.debug("Matrix semantic room rename failed", exc_info=True)
+                logger.debug("Adapter session-title propagation failed", exc_info=True)
 
         future.add_done_callback(_log_rename_failure)
 

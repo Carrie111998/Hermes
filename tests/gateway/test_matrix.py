@@ -1789,8 +1789,8 @@ class TestMatrixDynamicRoomNames:
         event = self._event()
 
         await self.adapter.on_processing_start(event)
-        await self.adapter.set_semantic_room_name(
-            "!room:ex", "Add dynamic Matrix room names"
+        await self.adapter.on_session_title_changed(
+            event.source, "Add dynamic Matrix room names"
         )
         await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
 
@@ -1829,6 +1829,17 @@ class TestMatrixDynamicRoomNames:
         self.adapter._dynamic_room_name_enabled = False
         event.source.chat_type = "dm"
         await self.adapter.on_processing_start(event)
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_title_hook_is_limited_to_opted_in_dms(self):
+        event = self._event(chat_type="group")
+        assert not await self.adapter.on_session_title_changed(event.source, "Group")
+        self.adapter._client.send_state_event.assert_not_awaited()
+
+        self.adapter._dynamic_room_name_enabled = False
+        event.source.chat_type = "dm"
+        assert not await self.adapter.on_session_title_changed(event.source, "DM")
         self.adapter._client.send_state_event.assert_not_awaited()
 
     @pytest.mark.asyncio

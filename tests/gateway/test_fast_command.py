@@ -10,8 +10,8 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
-from gateway.config import Platform
-from gateway.platforms.base import MessageEvent
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent
 from gateway.session import SessionSource
 
 
@@ -109,17 +109,25 @@ def _make_matrix_source() -> SessionSource:
     )
 
 
-def _make_matrix_source() -> SessionSource:
-    return SessionSource(
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.org",
-        chat_type="dm",
-        user_id="@user:matrix.org",
-    )
-
-
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+class _TitleAwareAdapter(BasePlatformAdapter):
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return None
+
+    async def on_session_title_changed(self, source, title):
+        return None
 
 
 def test_turn_route_injects_priority_processing_without_changing_runtime():
@@ -189,10 +197,107 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_run_agent_passes_matrix_room_name_title_callback(monkeypatch, tmp_path):
+async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    # ``_load_service_tier`` was refactored to call ``_load_gateway_runtime_config``
+    # (which wraps ``_load_gateway_config`` plus env-expansion).  Since the test
+    # stubs ``_load_gateway_config`` to ``{}``, also stub the runtime wrapper
+    # directly so the priority routing assertions still exercise the live tier.
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"agent": {"service_tier": "fast"}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:main:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["service_tier"] == "priority"
+    assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_discord_auto_thread_title_callback(monkeypatch, tmp_path):
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
     runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_load_gateway_runtime_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    with patch("agent.title_generator.maybe_auto_title") as mock_title:
+        await runner._run_agent(
+            message="raw user prompt",
+            context_prompt="",
+            history=[],
+            source=_make_discord_auto_thread_source(),
+            session_id="session-1",
+            session_key="agent:main:discord:thread:999",
+        )
+
+    mock_title.assert_called_once()
+    callback = mock_title.call_args.kwargs["title_callback"]
+    with patch.object(runner, "_schedule_discord_semantic_thread_rename") as mock_schedule:
+        callback("Semantic Session Title")
+    mock_schedule.assert_called_once()
+    assert mock_schedule.call_args.args[1] == "session-1"
+    assert mock_schedule.call_args.args[2] == "Semantic Session Title"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_optional_adapter_title_callback(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+    runner._session_db = SimpleNamespace(_db=MagicMock())  # type: ignore[assignment]
+
+    adapter = _TitleAwareAdapter(PlatformConfig(), Platform.MATRIX)
+    runner.adapters = {Platform.MATRIX: adapter}  # type: ignore[dict-item]
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
@@ -230,7 +335,7 @@ async def test_run_agent_passes_matrix_room_name_title_callback(monkeypatch, tmp
 
     mock_title.assert_called_once()
     callback = mock_title.call_args.kwargs["title_callback"]
-    with patch.object(runner, "_schedule_matrix_semantic_room_rename") as mock_schedule:
+    with patch.object(runner, "_schedule_adapter_session_title_propagation") as mock_schedule:
         callback("Semantic Session Title")
     mock_schedule.assert_called_once_with(
         _make_matrix_source(),
@@ -240,19 +345,50 @@ async def test_run_agent_passes_matrix_room_name_title_callback(monkeypatch, tmp
 
 
 @pytest.mark.asyncio
-async def test_matrix_room_rename_ignores_stale_session_title():
+async def test_adapter_title_propagation_invokes_optional_hook():
     runner = _make_runner()
-    adapter = SimpleNamespace(set_semantic_room_name=AsyncMock())
-    runner.adapters = {Platform.MATRIX: adapter}  # type: ignore[dict-item]
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="session-1")
+        ),
+    )
+
+    adapter = SimpleNamespace(on_session_title_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
+
+    await runner._propagate_session_title_to_adapter(
+        _make_source(),
+        "session-1",
+        "Current Session Title",
+    )
+
+    adapter.on_session_title_changed.assert_awaited_once_with(
+        _make_source(),
+        "Current Session Title",
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_title_propagation_ignores_stale_session():
+    runner = _make_runner()
+
+    adapter = SimpleNamespace(on_session_title_changed=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}  # type: ignore[dict-item]
     runner.session_store = SimpleNamespace(  # type: ignore[assignment]
         get_or_create_session=lambda source: SimpleNamespace(session_id="new-session")
     )
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="new-session")
+        ),
+    )
 
-    await runner._rename_matrix_room_for_session_title(
-        _make_matrix_source(),
+    await runner._propagate_session_title_to_adapter(
+        _make_source(),
         "old-session",
         "Old Session Title",
     )
 
-    adapter.set_semantic_room_name.assert_not_awaited()
-
+    adapter.on_session_title_changed.assert_not_awaited()
