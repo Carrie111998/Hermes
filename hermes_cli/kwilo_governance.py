@@ -557,10 +557,17 @@ def _nonempty(value: Any) -> bool:
     return value is not None and (not isinstance(value, str) or bool(value.strip()))
 
 
-def _string_set(value: Any, field: str) -> set[str]:
+def _canonical_string_list(value: Any, field: str) -> list[str]:
     if not isinstance(value, (list, tuple, set)):
         raise ValueError(f"governance contract field {field} must be a list")
-    return {str(item).strip() for item in value if str(item).strip()}
+    normalized = [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, set):
+        normalized.sort()
+    return list(dict.fromkeys(normalized))
+
+
+def _string_set(value: Any, field: str) -> set[str]:
+    return set(_canonical_string_list(value, field))
 
 
 def _candidate(value: Any, *, required: bool) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -695,8 +702,13 @@ def validate_contract(
         ("required_parent_skills", "configured_parent_skills"),
         ("required_connectors", "configured_connectors"),
     )
+    canonical_capabilities: dict[str, list[str]] = {}
     for required_field, profile_field in comparisons:
-        required = _string_set(contract.get(required_field, []), required_field)
+        canonical_required = _canonical_string_list(
+            contract.get(required_field, []), required_field
+        )
+        canonical_capabilities[required_field] = canonical_required
+        required = set(canonical_required)
         available = _string_set(profile.get(profile_field, []), f"profile.{profile_field}")
         unavailable = sorted(required - available)
         if unavailable:
@@ -739,6 +751,7 @@ def validate_contract(
         raise ValueError(f"prohibited_actions may not omit profile prohibitions: {', '.join(omitted)}")
 
     canonical = dict(contract)
+    canonical.update(canonical_capabilities)
     canonical["phase"] = phase
     if not legacy:
         canonical["workflow_version"] = CURRENT_WORKFLOW_VERSION

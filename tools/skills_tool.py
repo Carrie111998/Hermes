@@ -74,7 +74,7 @@ from hermes_constants import get_hermes_home, display_hermes_home
 import os
 import re
 from enum import Enum
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from tools.registry import registry, tool_error
@@ -187,20 +187,9 @@ def _skill_lookup_path_error(name: str) -> Optional[str]:
     drive paths (e.g. ``C:\\skills``), whose ``:`` would otherwise be misread as
     a plugin namespace separator.
     """
-    from tools.path_security import has_traversal_component
+    from agent.skill_utils import skill_lookup_path_error
 
-    if not isinstance(name, str):
-        return "Skill name must be a string."
-    candidate = name.strip()
-    if (
-        PurePosixPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).is_absolute()
-        or PureWindowsPath(candidate).drive
-    ):
-        return "Skill name must be a relative path within the skills directory."
-    if has_traversal_component(candidate):
-        return "Skill name cannot contain '..' path traversal components."
-    return None
+    return skill_lookup_path_error(name)
 
 
 def load_env() -> Dict[str, str]:

@@ -143,6 +143,38 @@ def test_resolve_external_skills_dirs_ignores_blank_entries(tmp_path):
     ) == []
 
 
+def test_local_skill_resolver_rejects_paths_outside_search_root(tmp_path):
+    from agent.skill_utils import (
+        find_local_skill_candidates,
+        local_skill_is_loadable,
+    )
+
+    root = tmp_path / "skills"
+    root.mkdir()
+    escaped = tmp_path / "escaped"
+    escaped.mkdir()
+    (escaped / "SKILL.md").write_text(
+        "---\nname: escaped\n---\n", encoding="utf-8"
+    )
+
+    assert find_local_skill_candidates("../escaped", [root]) == []
+    assert local_skill_is_loadable("../escaped", [root]) is False
+    assert local_skill_is_loadable(str(escaped), [root]) is False
+
+
+def test_local_skill_resolver_uses_qualified_category_fallback(tmp_path):
+    from agent.skill_utils import local_skill_is_loadable
+
+    skill = tmp_path / "skills" / "namespace" / "qualified"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: qualified\nplatforms: [linux, macos, windows]\n---\n",
+        encoding="utf-8",
+    )
+
+    assert local_skill_is_loadable("namespace:qualified", [tmp_path / "skills"])
+
+
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
     """Repeated skill config helpers should parse config.yaml only once."""
     from agent import skill_utils

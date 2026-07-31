@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kwilo_governance as kwilo
 
 
 @pytest.fixture
@@ -850,6 +851,42 @@ def test_governed_creation_force_loads_contract_parent_skills(kwilo_home):
         assert kb.get_task(conn, task_id).skills == ["test-driven-development"]
 
 
+def test_governed_contract_skills_reach_spawned_worker_argv(
+    kwilo_home, monkeypatch
+):
+    home, _, _ = kwilo_home
+    captured = {}
+
+    class FakeProc:
+        pid = 42
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed spawn activation",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+        kb._default_spawn(
+            kb.get_task(conn, task_id),
+            str(home),
+            board="kwilo",
+        )
+
+    cmd = captured["cmd"]
+    assert [cmd[index + 1] for index, token in enumerate(cmd) if token == "--skills"] == [
+        "test-driven-development"
+    ]
+    assert captured["env"]["HERMES_PLATFORM"] == "cli"
+
+
 def test_governed_claim_fails_closed_if_contract_skill_activation_drifts(kwilo_home):
     with kb.connect(board="kwilo") as conn:
         task_id = kb.create_task(
@@ -873,6 +910,31 @@ def test_governed_claim_fails_closed_if_contract_skill_activation_drifts(kwilo_h
         )
 
 
+def test_legacy_semantic_contract_still_requires_worker_skill_activation(kwilo_home):
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="legacy contract activation drift",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=_contract(),
+        )
+        semantics = kwilo.get_task_semantics(conn, task_id)
+        legacy_contract = dict(semantics["contract"])
+        legacy_contract["workflow_version"] = "2.0.0"
+        conn.execute(
+            "UPDATE task_semantics SET contract_json = ? WHERE task_id = ?",
+            (json.dumps(legacy_contract), task_id),
+        )
+        conn.execute("UPDATE tasks SET skills = NULL WHERE id = ?", (task_id,))
+        conn.commit()
+
+        assert (
+            "contract-required worker skills are not activated"
+            in kwilo.admission_error(conn, task_id)
+        )
+
+
 def test_governed_creation_unions_explicit_and_contract_parent_skills(kwilo_home):
     with kb.connect(board="kwilo") as conn:
         task_id = kb.create_task(
@@ -888,6 +950,31 @@ def test_governed_creation_unions_explicit_and_contract_parent_skills(kwilo_home
             "optional-review",
             "test-driven-development",
         ]
+
+
+def test_governed_creation_canonicalizes_contract_parent_skills(kwilo_home):
+    contract = _contract()
+    contract["required_parent_skills"] = [
+        " test-driven-development ",
+        "test-driven-development",
+    ]
+
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="canonical contract skills",
+            assignee="kwilo-forge",
+            board="kwilo",
+            governance_contract=contract,
+        )
+
+        task = kb.get_task(conn, task_id)
+        semantics = kwilo.get_task_semantics(conn, task_id)
+        assert task.skills == ["test-driven-development"]
+        assert semantics["contract"]["required_parent_skills"] == [
+            "test-driven-development"
+        ]
+        assert kb.claim_task(conn, task_id) is not None
 
 
 def test_long_frontmatter_platform_gate_blocks_governed_creation(kwilo_home):

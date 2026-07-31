@@ -9,7 +9,7 @@ import logging
 import os
 import re
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_constants import get_config_path, get_skills_dir, is_termux
@@ -848,6 +848,23 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
         yield Path(path)
 
 
+def skill_lookup_path_error(name: str) -> Optional[str]:
+    """Return an error when a local skill identifier can escape its roots."""
+    if not isinstance(name, str):
+        return "Skill name must be a string."
+    candidate = name.strip()
+    if (
+        PurePosixPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).is_absolute()
+        or PureWindowsPath(candidate).drive
+    ):
+        return "Skill name must be a relative path within the skills directory."
+    normalized_parts = PurePosixPath(candidate.replace("\\", "/")).parts
+    if ".." in normalized_parts:
+        return "Skill name cannot contain '..' path traversal components."
+    return None
+
+
 def find_local_skill_candidates(
     name: str,
     search_dirs: Iterable[Path],
@@ -863,6 +880,11 @@ def find_local_skill_candidates(
     packages with the same identifier remain ambiguous and therefore fail
     closed at the caller.
     """
+    if skill_lookup_path_error(name):
+        return []
+    if categorized_name and skill_lookup_path_error(categorized_name):
+        return []
+
     candidates: List[Tuple[Optional[Path], Path]] = []
     seen_files: set[Path] = set()
 
@@ -927,7 +949,16 @@ def local_skill_is_loadable(
     disabled: Iterable[str] = (),
 ) -> bool:
     """Whether an explicit local skill identifier will preload successfully."""
-    candidates = find_local_skill_candidates(name, search_dirs)
+    categorized_name = None
+    if ":" in name:
+        namespace, bare = name.split(":", 1)
+        if is_valid_namespace(namespace) and bare:
+            categorized_name = f"{namespace}/{bare}"
+    candidates = find_local_skill_candidates(
+        name,
+        search_dirs,
+        categorized_name=categorized_name,
+    )
     if len(candidates) != 1:
         return False
     _, skill_file = candidates[0]
