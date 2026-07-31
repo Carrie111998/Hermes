@@ -371,19 +371,6 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
     // cronChangeTick: a fired run reloads the peek immediately.
   }, [changeEventsAvailable, cronChangeTick, jobId, visible])
 
-  // Separate effect to trigger immediate load when pane becomes visible
-  useEffect(() => {
-    if (visible) {
-      getCronJobRuns(jobId, PEEK_RUN_LIMIT)
-        .then(result => {
-          setRuns(result)
-        })
-        .catch(() => {
-          setRuns(prev => prev ?? [])
-        })
-    }
-  }, [visible, jobId])
-
   return (
     <div className="mb-1 ml-[1.375rem] flex flex-col gap-px">
       {runs === null ? (
