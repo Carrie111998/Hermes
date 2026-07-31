@@ -124,6 +124,14 @@ Because OAuth spends your subscription allowance, heavy Hermes use competes with
 The behavior above was confirmed on a Team plan. Max is expected to behave the same way, and Pro has not been verified — if you have a Pro or Max subscription, the `anthropic-ratelimit-unified-*` headers described above will tell you definitively, and a report either way is welcome.
 :::
 
+:::warning `ANTHROPIC_API_KEY` silently wins if OAuth resolution fails
+`resolve_anthropic_token()` tries the Claude Code credential *before* `ANTHROPIC_API_KEY`, so a working OAuth login always takes precedence. But if OAuth resolution comes up empty and `ANTHROPIC_API_KEY` is set, Hermes falls through to the API key and bills pay-per-token instead — and every diagnostic on that path is logged at `debug`, so **nothing surfaces at default verbosity**. Your plan allowance simply goes untouched, which looks indistinguishable from "OAuth doesn't use the plan."
+
+To tell which lane you're actually on, check the response headers: an OAuth request carries `anthropic-ratelimit-unified-*` plan attribution, an `x-api-key` request does not. `hermes doctor` also reports the resolved auth method.
+
+One known trigger on macOS: Claude Code stores its MCP-server OAuth state under the *same* `Claude Code-credentials` Keychain service as your login credential. `security find-generic-password` returns only the first matching item, so an unscoped lookup could return the MCP item, find no login token in it, and give up — while you were fully signed in. Fixed by scoping the lookup to your account ([#75146](https://github.com/NousResearch/Hermes-Agent/pull/75146)). If you're on an older version and want to be certain, unset `ANTHROPIC_API_KEY` while using OAuth so there is nothing to silently fall back to.
+:::
+
 ```bash
 # With an API key (pay-per-token)
 export ANTHROPIC_API_KEY=***
