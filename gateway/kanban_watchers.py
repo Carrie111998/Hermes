@@ -966,6 +966,25 @@ class GatewayKanbanWatchersMixin:
                     conn.close()
             return await asyncio.to_thread(_sync_has_structured_outcome)
 
+        async def _has_approval_challenge() -> bool:
+            def _sync_has_approval_challenge() -> bool:
+                conn = kb_module.connect(board=board)
+                try:
+                    return (
+                        kb_module
+                        .grace_loop_callback_has_approval_challenge(
+                            conn,
+                            review_task_id=review_id,
+                            event_id=event_id,
+                            lease_owner=lease_owner,
+                        )
+                    )
+                finally:
+                    conn.close()
+            return await asyncio.to_thread(
+                _sync_has_approval_challenge,
+            )
+
         async def _escalate(error: str) -> None:
             def _sync_escalate() -> None:
                 conn = kb_module.connect(board=board)
@@ -1398,7 +1417,10 @@ class GatewayKanbanWatchersMixin:
             "Respond to KJ in the originating language. For an execution-stage "
             "callback, inspect the exact blocker evidence and ask only for the "
             "specific missing decision, or report the exact capability/runtime fault; "
-            "do not claim that Grace reviewed or accepted the deliverables. For an "
+            "do not claim that Grace reviewed or accepted the deliverables. If that "
+            "execution blocker requires a newly authorized external-action contract, "
+            "you MUST use the external next-stage challenge flow below during this "
+            "callback; do not ask for generic yes/no approval in prose. For an "
             "accepted review, summarize deliverables and verified evidence, state what "
             "external actions were not taken, then explicitly determine whether the "
             "originating user outcome is satisfied. completion_mode=intermediate is a "
@@ -1431,7 +1453,8 @@ class GatewayKanbanWatchersMixin:
             "'separate approval is required'. When KJ's next message grants the requested "
             "checkpoint approval, immediately call clawops_delegate for the fresh "
             "continuation; do not merely acknowledge, finalize, or restate the completed "
-            "stage. Before ending an accepted-review callback, call "
+            "stage. Before ending an accepted-review callback, or any execution-blocker "
+            "callback that created an approval challenge, call "
             "grace_callback_outcome exactly once: use outcome_kind=closed with a truthful "
             "summary only when the complete originating outcome is satisfied; use "
             "outcome_kind=continued with the queued delegation_id, execution_task_id, and "
@@ -1446,6 +1469,7 @@ class GatewayKanbanWatchersMixin:
             "this callback turn; internal delegation of an already-authorized safe "
             "continuation is allowed."
         )
+        structured_outcome_required = outcome == "accepted"
         try:
             from gateway.platforms.base import MessageEvent, MessageType
             event = MessageEvent(
@@ -1465,9 +1489,17 @@ class GatewayKanbanWatchersMixin:
             )
             callback["attempts"] = await _record_attempt()
             await _handle_with_lease_heartbeat(event)
-            if outcome == "accepted" and not await _has_structured_outcome():
+            structured_outcome_required = (
+                structured_outcome_required
+                or await _has_approval_challenge()
+            )
+            if (
+                structured_outcome_required
+                and not await _has_structured_outcome()
+            ):
                 raise RuntimeError(
-                    "accepted callback returned without a valid structured outcome"
+                    "callback requiring a durable checkpoint returned without "
+                    "a valid structured outcome"
                 )
             await _finish()
             logger.info(
@@ -1477,6 +1509,18 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             error = f"Grace callback delivery failed: {type(exc).__name__}: {exc}"
             logger.warning("%s", error)
+            try:
+                structured_outcome_required = (
+                    structured_outcome_required
+                    or await _has_approval_challenge()
+                )
+            except Exception as checkpoint_exc:
+                structured_outcome_required = True
+                error += (
+                    "; durable approval checkpoint check failed: "
+                    f"{type(checkpoint_exc).__name__}: {checkpoint_exc}"
+                )
+                logger.warning("%s", error)
             if int(callback.get("attempts") or 1) >= 3:
                 send_meta = {}
                 if callback.get("thread_id"):
@@ -1496,7 +1540,7 @@ class GatewayKanbanWatchersMixin:
                             "callback fallback notice was not delivered: "
                             f"{getattr(send_result, 'error', 'unknown error')}"
                         )
-                    if outcome == "accepted":
+                    if structured_outcome_required:
                         await _escalate(error)
                     else:
                         await _finish(error)

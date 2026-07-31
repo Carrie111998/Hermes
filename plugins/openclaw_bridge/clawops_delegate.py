@@ -342,6 +342,24 @@ def _resolve_approval_challenge(token: str) -> tuple[str, dict[str, Any]]:
     return matches[0]
 
 
+def recover_clawops_approval_args(token: str) -> dict[str, Any] | None:
+    """Recover the exact delegate arguments persisted with a durable token."""
+    _board, challenge = _resolve_approval_challenge(token)
+    raw_args = str(challenge.get("delegation_args") or "").strip()
+    if not raw_args:
+        return None
+    try:
+        recovered = json.loads(raw_args)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(recovered, dict):
+        return None
+    recovered.pop("approval_token", None)
+    recovered.pop("_approval_refresh_token", None)
+    recovered["approved"] = False
+    return recovered
+
+
 def _queued_delegation_replay(
     delegation: dict[str, Any] | None,
     *,
@@ -468,11 +486,24 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "approval_token; it cannot be treated as a fresh request."
             )
         approval_challenge: dict[str, Any] | None = None
+        approval_board = ""
         challenge_lookup_token = approval_token or approval_refresh_token
         if challenge_lookup_token and not internal_turn:
             approval_board, approval_challenge = _resolve_approval_challenge(
                 challenge_lookup_token,
             )
+            if (
+                approval_challenge.get("platform") != platform
+                or approval_challenge.get("chat_id") != chat_id
+                or approval_challenge.get("thread_id") != thread_id
+                or approval_challenge.get("session_key") != session_key
+            ):
+                raise ValueError(
+                    "Approval token is bound to another conversation lane: "
+                    f"{approval_challenge.get('platform')}/"
+                    f"{approval_challenge.get('chat_id')}/thread/"
+                    f"{approval_challenge.get('thread_id')}."
+                )
             challenge_review_id = str(
                 approval_challenge.get("origin_review_task_id") or ""
             ).strip()
@@ -535,14 +566,16 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
             and origin_review_id
             and origin_event_id is not None
         ):
-            resolved_board = _resolve_completed_callback_board(
-                review_task_id=origin_review_id,
-                event_id=origin_event_id,
-                platform=platform,
-                chat_id=chat_id,
-                thread_id=thread_id,
-                session_id=session_id,
-            )
+            resolved_board = approval_board
+            if approval_challenge is None:
+                resolved_board = _resolve_completed_callback_board(
+                    review_task_id=origin_review_id,
+                    event_id=origin_event_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    session_id=session_id,
+                )
             if (
                 requested_callback_board
                 and requested_callback_board != resolved_board
@@ -720,7 +753,10 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
         contract["routing"]["resolved"] = resolved_route_binding(routing_preview)
         normalized_contract = validate_loop_contract(contract)
         exact_fingerprint = contract_fingerprint(normalized_contract)
-        approval_needed = route_requires_owner_approval(routing_preview)
+        approval_needed = (
+            bool(external_targets)
+            or route_requires_owner_approval(routing_preview)
+        )
         approval_scope = list(scope.get("allowed") or [])
         approval_platform = "、".join(external_targets)
         approval_scope_json = json.dumps(
@@ -841,7 +877,6 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 or approval_challenge.get("chat_id") != chat_id
                 or approval_challenge.get("thread_id") != thread_id
                 or approval_challenge.get("session_key") != session_key
-                or approval_challenge.get("session_id") != session_id
                 or approval_challenge.get("user_id_sha256")
                 != expected_user_hash
                 or approval_challenge.get("approval_platform")
@@ -881,16 +916,42 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     session_id=session_id,
                     lease_owner=callback_lease_owner,
                 )
-                kb.validate_accepted_grace_callback_origin(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                    lease_owner=callback_lease_owner,
+                execution_blocker_origin = (
+                    kb.is_grace_callback_execution_blocker_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
                 )
+                if execution_blocker_origin:
+                    approval_needed = True
+                if approval_needed:
+                    kb.validate_grace_callback_approval_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
+                else:
+                    kb.validate_accepted_grace_callback_origin(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                        lease_owner=callback_lease_owner,
+                    )
         elif (
             origin_review_id
             or origin_event_id is not None
@@ -904,16 +965,17 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 raise ValueError(
                     "Fresh callback approval requires review id, event id, and board."
                 )
-            with kb.connect_closing(board=board) as conn:
-                kb.validate_completed_approval_blocker(
-                    conn,
-                    review_task_id=origin_review_id,
-                    event_id=origin_event_id,
-                    platform=platform,
-                    chat_id=chat_id,
-                    thread_id=thread_id,
-                    session_id=session_id,
-                )
+            if approval_challenge is None:
+                with kb.connect_closing(board=board) as conn:
+                    kb.validate_completed_approval_blocker(
+                        conn,
+                        review_task_id=origin_review_id,
+                        event_id=origin_event_id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        thread_id=thread_id,
+                        session_id=session_id,
+                    )
         effective_approved = False
         approval_provenance: dict[str, Any] = {}
         if scheduled_turn and approval_needed:
@@ -926,7 +988,22 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                 "External-action delegation requires explicit external_targets."
             )
         if not scheduled_turn and approval_needed:
-            if not message_id or not session_key or not session_id:
+            approval_request_message_id = message_id
+            if (
+                internal_turn
+                and not approval_request_message_id
+                and origin_review_id
+                and origin_event_id is not None
+            ):
+                approval_request_message_id = (
+                    f"callback:{board or kb.DEFAULT_BOARD}:"
+                    f"{origin_review_id}:{origin_event_id}"
+                )
+            if (
+                not approval_request_message_id
+                or not session_key
+                or not session_id
+            ):
                 raise ValueError(
                     "External-action approval requires an authenticated user context "
                     "and durable session/message identifiers."
@@ -964,6 +1041,16 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                     if scheduled_turn:
                         record_cron_functional_error("")
                     return replay
+                approval_replay_args = dict(args)
+                approval_replay_args.pop("approval_token", None)
+                approval_replay_args.pop("_approval_refresh_token", None)
+                approval_replay_args["approved"] = False
+                approval_replay_args_json = json.dumps(
+                    approval_replay_args,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
                 with kb.connect_closing(board=board) as conn:
                     challenge = kb.create_grace_approval_challenge(
                         conn,
@@ -975,10 +1062,11 @@ def handle_clawops_delegate(args: dict[str, Any] | None = None, **_kwargs: Any) 
                         session_key=session_key,
                         session_id=session_id,
                         user_id_sha256=user_id_sha256,
-                        requested_message_id=message_id,
+                        requested_message_id=approval_request_message_id,
                         action_summary=str(goal.get("objective") or "").strip(),
                         approval_platform=approval_platform,
                         approval_scope=approval_scope_json,
+                        delegation_args=approval_replay_args_json,
                         origin_review_task_id=origin_review_id,
                         origin_event_id=origin_event_id,
                         callback_lease_owner=(
