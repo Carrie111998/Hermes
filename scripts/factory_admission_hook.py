@@ -64,6 +64,8 @@ _WORKTREE_MUTATION_TOOLS = frozenset({
     "edit_file", "create_file", "delete_file", "move_file",
 })
 _ALWAYS_UNBOUNDED_TOOLS = frozenset({
+    "bfl_flux3_get_result", "bfl_flux3_image_to_video", "bfl_flux3_keyframes_to_video",
+    "bfl_flux3_prompting_guide", "bfl_flux3_text_to_video", "bfl_flux3_video_continuation",
     "browser_back", "browser_cdp", "browser_click", "browser_console", "browser_dialog", "browser_navigate",
     "browser_press", "browser_scroll", "browser_type", "browser_vision", "close_terminal",
     "delegate_task", "discord", "discord_admin", "execute_code", "feishu_doc_read",
