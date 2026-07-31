@@ -44,7 +44,7 @@ hermes plugins list | grep approval-guard
 
 ```
 Tool call → pre_tool_call hook
-  ├─ SAFE_TOOLS (21 read/query tools) → ALLOW (0ms)
+  ├─ SAFE_TOOLS (20 read/query tools) → ALLOW (0ms)
   ├─ extract_context — reuses system detect_dangerous/hardline_command
   ├─ Terminal fast-path: no DANGEROUS match → ALLOW (0ms)
   │   • HARDLINE-only signals (rm -rf /) → skip LLM, let system layer block
@@ -58,8 +58,10 @@ Tool call → pre_tool_call hook
       • Stateless: no persistent session; all context injected in prompt
       • Context from SessionDB: conversation + full tool call chain
       • Hindsight-backed: session-level + cross-session pattern memory
-      • Restricted toolsets (file,memory,session_search — no terminal)
-      • Timeout → process group killed (SIGTERM → 3s → SIGKILL)
+      • Read-only boundary: session_search toolset only (no file/terminal),
+        HERMES_YOLO_MODE stripped from the child env
+      • Timeout → process group killed (SIGTERM → 3s → SIGKILL;
+        direct-child terminate/kill fallback on Windows)
       • Outputs: ALLOW / DENY / MODIFY with structured JSON feedback
 ```
 
@@ -143,8 +145,13 @@ Launches `hermes chat -q --profile approval`. Prompt has 5 sections:
 The prompt explicitly instructs the LLM: "You are an automated security check program, not a conversational assistant" to prevent
 non-JSON output. Falls back to text matching if JSON parsing fails.
 
-**Subprocess safety:** The ACP agent is launched with restricted toolsets (`file,memory,session_search` — no `terminal`).
-On timeout, the entire process group is killed (SIGTERM → 3s grace → SIGKILL) to prevent orphan processes.
+**Subprocess safety:** The ACP reviewer runs with a genuinely read-only boundary:
+only the `session_search` toolset is exposed (no `file`, no `terminal`), and
+`HERMES_YOLO_MODE` is stripped from the child environment so a `--yolo` parent
+gateway cannot turn the reviewer into an approval-bypassing writer.
+On timeout, the entire process group is killed (SIGTERM → 3s grace → SIGKILL;
+on Windows, where `killpg`/`SIGKILL` don't exist, the direct child is
+terminated/killed instead) to prevent orphan processes.
 
 Enable with `plugin_guard.stage2.enabled: true`.
 
@@ -162,6 +169,25 @@ System check_all_command_guards → terminal HARDLINE safety net (always active)
 | Memory | Session-level (`_session_approved`) | Hindsight cross-session pattern bank |
 | Context | None (command string only) | Conversation + tool chain + historical patterns |
 | Denial feedback | "BLOCKED: xxx" | Structured: reason + alternatives + approval_id |
+
+## Relationship with the Native `approve` Directive
+
+Upstream (`hermes_cli/plugins.py`) lets any plugin return
+`{"action": "approve"}` from `pre_tool_call`, which escalates the tool call to
+the built-in **human** approval gate (`[o]nce/[s]ession/[a]lways/[d]eny`) —
+for any tool, not just terminal. This plugin deliberately does **not**
+duplicate that:
+
+| Aspect | Native `approve` directive | This plugin |
+|--------|---------------------------|-------------|
+| Decider | Human at the terminal | Dual-agent LLM pipeline (Stage 1 + ACP) |
+| Latency | Blocks until user responds | ~0.5-8s, unattended |
+| Context | Plugin-supplied reason string | SessionDB conversation + tool chain + Hindsight memory |
+| Best for | Interactive sessions, final human veto | Headless/gateway runs where no human is watching |
+
+They compose: this plugin returns only `block`/`None` (autonomous semantic
+filtering), leaving the native `approve` path available to other plugins or a
+future `fail_open: false`-style escalation policy.
 
 ## Failure Modes
 
@@ -206,21 +232,28 @@ check is redundant; system HARDLINE remains active regardless.
 | `stage2_acp.py` | Stateless ACP: 5-section prompt with anti-chat hardening, Hindsight integration |
 | `feedback.py` | Structured denial messages with alternatives and override paths |
 | `hindsight_store.py` | Approval memory: explicit config only, session/pattern queries, Honcho fallback |
-| `test_integration.py` | 7 scenarios, 41 test cases |
+| `test_integration.py` | 8 scenarios, standalone runner (`python3 test_integration.py`) |
 | `recommended-config.yaml` | Annotated config template |
 
 ## Testing
 
 ```bash
+# Integration tests (8 scenarios)
 cd plugins/hermes-approval-guard
-
-# Integration tests (7 scenarios, 41 cases)
 python3 test_integration.py
+
+# pytest suite (discovery, hook dispatch, failure branches, Windows behavior)
+# — run from the repo root
+pytest tests/plugins/test_approval_guard_plugin.py
 ```
 
-Covers: SAFE_TOOLS bypass, context extraction (no hard DENY), terminal
-risk signals (HARDLINE/DANGEROUS separation), feedback messages, pattern
-key generation, LLM prompt structure.
+Covers: SAFE_TOOLS bypass boundary (browser_console reviewed, not bypassed),
+context extraction (no hard DENY), terminal risk signals (HARDLINE/DANGEROUS
+separation), feedback messages, pattern key generation, LLM prompt structure,
+fail-closed Stage 2 (`fail_open: false` → block), config-reload retry, Stage 2
+read-only boundary (toolset restriction + `HERMES_YOLO_MODE` stripping),
+Windows process-kill fallback, bundled-plugin discovery, and real
+`pre_tool_call` hook dispatch through `hermes_cli.plugins`.
 
 ## Compatibility
 
