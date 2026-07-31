@@ -1132,7 +1132,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             exc_info=True,
         )
         raise
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         copied = False
         try:

@@ -25,6 +25,17 @@ def test_load_auth_store_propagates_transient_read_errors(tmp_path):
     assert not auth_file.with_suffix(".json.corrupt").exists()
 
 
+def test_load_auth_store_preserves_invalid_utf8_before_empty_store(tmp_path):
+    auth_file = tmp_path / "auth.json"
+    raw = b'{"version": 1, "providers": {"nous": "\xff"}}'
+    auth_file.write_bytes(raw)
+
+    store = auth._load_auth_store(auth_file)
+
+    assert store == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    assert auth_file.with_suffix(".json.corrupt").read_bytes() == raw
+
+
 def test_load_auth_store_preserves_corrupt_json_before_empty_store(tmp_path):
     auth_file = tmp_path / "auth.json"
     raw = '{"version": 1, "providers": {'
