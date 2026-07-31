@@ -179,9 +179,10 @@ def drain_request_mutation_lock(
                 os.fchmod(descriptor, 0o600)
             opened = os.fstat(descriptor)
             reachable = path.stat(follow_symlinks=False)
+            effective_uid = getattr(os, "geteuid", None)
             expected_uid = (
-                os.geteuid()
-                if hasattr(os, "geteuid")
+                effective_uid()
+                if callable(effective_uid)
                 else opened.st_uid
             )
             if (
@@ -259,9 +260,10 @@ def _read_marker_for_mutation(path: Path) -> Optional[dict[str, Any]]:
         item.st_mtime_ns,
         item.st_ctime_ns,
     )
+    effective_uid = getattr(os, "geteuid", None)
     expected_uid = (
-        os.geteuid()
-        if hasattr(os, "geteuid")
+        effective_uid()
+        if callable(effective_uid)
         else opened.st_uid
     )
     if (

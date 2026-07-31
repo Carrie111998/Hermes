@@ -683,7 +683,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     preflight_parser = subparsers.add_parser("preflight")
     preflight_parser.add_argument("--revision", required=True)
     args = parser.parse_args(argv)
-    if os.geteuid() != 0 or os.getegid() != 0:
+    effective_uid = getattr(os, "geteuid", None)
+    effective_gid = getattr(os, "getegid", None)
+    if (
+        not callable(effective_uid)
+        or not callable(effective_gid)
+        or effective_uid() != 0
+        or effective_gid() != 0
+    ):
         parser.error("owner_gate_runtime_preflight_root_required")
     try:
         result = preflight_owner_gate_runtime(args.revision)
