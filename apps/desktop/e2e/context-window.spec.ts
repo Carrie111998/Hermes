@@ -22,16 +22,6 @@ import { type MockBackendFixture, setupMockBackend, waitForAppReady } from './fi
 
 let fixture: MockBackendFixture | null = null
 
-test.beforeAll(async () => {
-  fixture = await setupMockBackend()
-  await waitForAppReady(fixture!, 120_000)
-})
-
-test.afterAll(async () => {
-  await fixture?.cleanup()
-  fixture = null
-})
-
 /**
  * Read `model.context_length` straight out of the on-disk config.yaml.
  *
@@ -110,126 +100,132 @@ async function ensureDialogOpen(): Promise<void> {
   await expect(dialog()).toBeVisible({ timeout: 20_000 })
 }
 
-test.describe('/ctxwindow quick access', () => {
-  test('is discoverable in the slash popover when typing /ctxw', async ({}, testInfo) => {
-    const page = fixture!.page
-    const composer = page.locator('[contenteditable="true"]').first()
+test('/ctxwindow quick access persists and clears the backend override', async ({}, testInfo) => {
+  test.setTimeout(240_000)
+  fixture = await setupMockBackend()
 
-    await composer.click()
-    await page.keyboard.press('ControlOrMeta+a')
-    await page.keyboard.press('Backspace')
-    await composer.type('/ctxw', { delay: 60 })
+  try {
+    await waitForAppReady(fixture, 120_000)
 
-    const popover = page.locator('[data-slot="composer-completion-drawer"]')
-    await expect(popover).toBeVisible({ timeout: 15_000 })
+    await test.step('is discoverable in the slash popover when typing /ctxw', async () => {
+      const page = fixture!.page
+      const composer = page.locator('[contenteditable="true"]').first()
 
-    await page.screenshot({ path: testInfo.outputPath('slash-popover-ctxw.png') })
+      await composer.click()
+      await page.keyboard.press('ControlOrMeta+a')
+      await page.keyboard.press('Backspace')
+      await composer.type('/ctxw', { delay: 60 })
 
-    // "As convenient to switch as /model" means the command has to show up
-    // while the user is typing a prefix of it — that's the discoverability
-    // half of the acceptance criteria.
-    await expect(popover.locator('button', { hasText: '/ctxwindow' })).toBeVisible({ timeout: 15_000 })
+      const popover = page.locator('[data-slot="composer-completion-drawer"]')
+      await expect(popover).toBeVisible({ timeout: 15_000 })
 
-    await page.keyboard.press('Escape')
-    await page.keyboard.press('ControlOrMeta+a')
-    await page.keyboard.press('Backspace')
-  })
+      await page.screenshot({ path: testInfo.outputPath('slash-popover-ctxw.png') })
 
-  test('opens the dialog showing the auto-detected window and an empty override', async ({}, testInfo) => {
-    const page = fixture!.page
+      // "As convenient to switch as /model" means the command has to show up
+      // while the user is typing a prefix of it — that's the discoverability
+      // half of the acceptance criteria.
+      await expect(popover.locator('button', { hasText: '/ctxwindow' })).toBeVisible({ timeout: 15_000 })
 
-    expect(hasConfigContextLengthKey(fixture!.sandbox.hermesHome)).toBe(false)
+      await page.keyboard.press('Escape')
+      await page.keyboard.press('ControlOrMeta+a')
+      await page.keyboard.press('Backspace')
+    })
 
-    await runSlash('/ctxwindow')
+    await test.step('opens with the auto-detected window and an empty override', async () => {
+      const page = fixture!.page
 
-    await expect(dialog()).toBeVisible({ timeout: 20_000 })
-    await page.screenshot({ path: testInfo.outputPath('context-dialog-auto.png') })
+      expect(hasConfigContextLengthKey(fixture!.sandbox.hermesHome)).toBe(false)
 
-    const override = page.locator('#context-window-override')
-    await expect(override).toBeVisible()
-    // No pin on disk → the field is blank and the dialog says it's on auto.
-    await expect(override).toHaveValue('')
-    // Whatever `get_model_context_length()` resolves for the mock route, the
-    // dialog must show it as a concrete figure rather than "unknown", and must
-    // say it's the value in use. The exact number is the backend resolver's
-    // business (asserting a literal here would be a change-detector on the
-    // provider metadata), so capture it and reuse it after the clear.
-    await expect(dialog()).toContainText(/Auto-detected: \d/)
-    await expect(dialog()).toContainText('Auto-detect')
+      await runSlash('/ctxwindow')
 
-    // Capture just the compact figure. The dialog text runs together without
-    // separators, so anchor on the digits-plus-unit shape rather than \S+.
-    autoDetectedValue = (await dialog().textContent())?.match(/Auto-detected: (\d[\d.]*[kM]?)/)?.[1] ?? ''
-    expect(autoDetectedValue).toMatch(/^\d/)
-    // Nothing pinned, so the window in use is the auto figure.
-    await expect(dialog()).toContainText(`In use: ${autoDetectedValue} · Auto-detect`)
+      await expect(dialog()).toBeVisible({ timeout: 20_000 })
+      await page.screenshot({ path: testInfo.outputPath('context-dialog-auto.png') })
 
-    // "Use auto-detect" is inert while nothing is pinned.
-    await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeDisabled()
-  })
+      const override = page.locator('#context-window-override')
+      await expect(override).toBeVisible()
+      // No pin on disk → the field is blank and the dialog says it's on auto.
+      await expect(override).toHaveValue('')
+      // Whatever `get_model_context_length()` resolves for the mock route, the
+      // dialog must show it as a concrete figure rather than "unknown", and must
+      // say it's the value in use. The exact number is the backend resolver's
+      // business (asserting a literal here would be a change-detector on the
+      // provider metadata), so capture it and reuse it after the clear.
+      await expect(dialog()).toContainText(/Auto-detected: \d/)
+      await expect(dialog()).toContainText('Auto-detect')
 
-  test('saving an explicit value writes model.context_length to config.yaml', async ({}, testInfo) => {
-    const page = fixture!.page
+      // Capture just the compact figure. The dialog text runs together without
+      // separators, so anchor on the digits-plus-unit shape rather than \S+.
+      autoDetectedValue = (await dialog().textContent())?.match(/Auto-detected: (\d[\d.]*[kM]?)/)?.[1] ?? ''
+      expect(autoDetectedValue).toMatch(/^\d/)
+      // Nothing pinned, so the window in use is the auto figure.
+      await expect(dialog()).toContainText(`In use: ${autoDetectedValue} · Auto-detect`)
 
-    await ensureDialogOpen()
+      // "Use auto-detect" is inert while nothing is pinned.
+      await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeDisabled()
+    })
 
-    const override = page.locator('#context-window-override')
-    await override.fill('128000')
-    await page.screenshot({ path: testInfo.outputPath('context-dialog-filled.png') })
+    await test.step('saving an explicit value writes model.context_length to config.yaml', async () => {
+      const page = fixture!.page
 
-    await page.getByRole('button', { name: 'Save', exact: true }).click()
+      await ensureDialogOpen()
 
-    // The dialog closes on a successful commit.
-    await expect(dialog()).toBeHidden({ timeout: 20_000 })
+      const override = page.locator('#context-window-override')
+      await override.fill('128000')
+      await page.screenshot({ path: testInfo.outputPath('context-dialog-filled.png') })
 
-    // The real assertion: the value survived the backend's config merge and
-    // landed on disk under the test's HERMES_HOME.
-    await expect
-      .poll(() => readConfigContextLength(fixture!.sandbox.hermesHome), { timeout: 20_000 })
-      .toBe(128_000)
-  })
+      await page.getByRole('button', { name: 'Save', exact: true }).click()
 
-  test('reopening reflects the persisted pin with no stale draft', async ({}, testInfo) => {
-    const page = fixture!.page
+      // The dialog closes on a successful commit.
+      await expect(dialog()).toBeHidden({ timeout: 20_000 })
 
-    await runSlash('/ctxwindow')
+      // The real assertion: the value survived the backend's config merge and
+      // landed on disk under the test's HERMES_HOME.
+      await expect.poll(() => readConfigContextLength(fixture!.sandbox.hermesHome), { timeout: 20_000 }).toBe(128_000)
+    })
 
-    await expect(dialog()).toBeVisible({ timeout: 20_000 })
+    await test.step('reopening reflects the persisted pin with no stale draft', async () => {
+      const page = fixture!.page
 
-    const override = page.locator('#context-window-override')
-    await expect(override).toHaveValue('128000', { timeout: 20_000 })
-    await expect(dialog()).toContainText('128k')
-    await page.screenshot({ path: testInfo.outputPath('context-dialog-pinned.png') })
+      await runSlash('/ctxwindow')
 
-    // With a pin present, the escape hatch back to auto is now live.
-    await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeEnabled()
-  })
+      await expect(dialog()).toBeVisible({ timeout: 20_000 })
 
-  test('Use auto-detect removes the key from config.yaml and returns to auto', async ({}, testInfo) => {
-    const page = fixture!.page
+      const override = page.locator('#context-window-override')
+      await expect(override).toHaveValue('128000', { timeout: 20_000 })
+      await expect(dialog()).toContainText('128k')
+      await page.screenshot({ path: testInfo.outputPath('context-dialog-pinned.png') })
 
-    await ensureDialogOpen()
-    expect(readConfigContextLength(fixture!.sandbox.hermesHome)).toBe(128_000)
+      // With a pin present, the escape hatch back to auto is now live.
+      await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeEnabled()
+    })
 
-    await page.getByRole('button', { name: 'Use auto-detect' }).click()
-    await expect(dialog()).toBeHidden({ timeout: 20_000 })
+    await test.step('Use auto-detect removes the key from config.yaml and returns to auto', async () => {
+      const page = fixture!.page
 
-    // The previously broken path: `_deep_merge` cannot delete, so the pin used
-    // to be resurrected on every save and "back to auto" did nothing. The key
-    // must be GONE, not merely set to 0 — an explicit 0 is a different state.
-    await expect
-      .poll(() => hasConfigContextLengthKey(fixture!.sandbox.hermesHome), { timeout: 20_000 })
-      .toBe(false)
+      await ensureDialogOpen()
+      expect(readConfigContextLength(fixture!.sandbox.hermesHome)).toBe(128_000)
 
-    // And the UI agrees: reopening shows a blank field on the auto value.
-    await runSlash('/ctxwindow')
-    await expect(dialog()).toBeVisible({ timeout: 20_000 })
-    await expect(page.locator('#context-window-override')).toHaveValue('', { timeout: 20_000 })
-    await expect(dialog()).toContainText(`Auto-detected: ${autoDetectedValue}`)
-    await expect(dialog()).toContainText(`In use: ${autoDetectedValue} · Auto-detect`)
-    await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeDisabled()
-    await page.screenshot({ path: testInfo.outputPath('context-dialog-back-to-auto.png') })
+      await page.getByRole('button', { name: 'Use auto-detect' }).click()
+      await expect(dialog()).toBeHidden({ timeout: 20_000 })
 
-    await page.keyboard.press('Escape')
-  })
+      // The previously broken path: `_deep_merge` cannot delete, so the pin used
+      // to be resurrected on every save and "back to auto" did nothing. The key
+      // must be GONE, not merely set to 0 — an explicit 0 is a different state.
+      await expect.poll(() => hasConfigContextLengthKey(fixture!.sandbox.hermesHome), { timeout: 20_000 }).toBe(false)
+
+      // And the UI agrees: reopening shows a blank field on the auto value.
+      await runSlash('/ctxwindow')
+      await expect(dialog()).toBeVisible({ timeout: 20_000 })
+      await expect(page.locator('#context-window-override')).toHaveValue('', { timeout: 20_000 })
+      await expect(dialog()).toContainText(`Auto-detected: ${autoDetectedValue}`)
+      await expect(dialog()).toContainText(`In use: ${autoDetectedValue} · Auto-detect`)
+      await expect(page.getByRole('button', { name: 'Use auto-detect' })).toBeDisabled()
+      await page.screenshot({ path: testInfo.outputPath('context-dialog-back-to-auto.png') })
+
+      await page.keyboard.press('Escape')
+    })
+  } finally {
+    await fixture.cleanup()
+    fixture = null
+  }
 })
