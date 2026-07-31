@@ -165,5 +165,5 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
   }
 
   const detail = lastError instanceof Error ? lastError.message : 'timeout'
-  throw new Error(`Hermes backend did not become ready: ${detail}`)
+  throw new Error(`Douglas Agent backend did not become ready: ${detail}`)
 }
