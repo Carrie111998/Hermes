@@ -998,6 +998,11 @@ export interface Translations {
     modeAgent: string
     modeScript: string
     modeScriptOnly: string
+    repeatProgress: (completed: number, times: number | string) => string
+    metaLastStatus: (status: string) => string
+    metaToolsets: (toolsets: string) => string
+    metaSkills: (skills: string) => string
+    metaWorkdir: (workdir: string) => string
     jobViews: Record<
       'attention' | 'driver' | 'inbox' | 'revenue' | 'sentinel' | 'trading' | 'watchdog',
       { description: string; label: string }

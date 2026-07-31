@@ -1103,6 +1103,11 @@ export const ja = defineLocale({
     modeAgent: 'エージェント',
     modeScript: 'スクリプト',
     modeScriptOnly: 'スクリプトのみ',
+    repeatProgress: (completed, times) => `${completed}/${times} 回実行`,
+    metaLastStatus: status => `前回: ${status}`,
+    metaToolsets: toolsets => `ツール: ${toolsets}`,
+    metaSkills: skills => `スキル: ${skills}`,
+    metaWorkdir: workdir => `作業ディレクトリ: ${workdir}`,
     jobViews: {
       attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
       driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },

@@ -1136,6 +1136,11 @@ export const en: Translations = {
     modeAgent: 'agent',
     modeScript: 'script',
     modeScriptOnly: 'script-only',
+    repeatProgress: (completed, times) => `${completed}/${times} runs`,
+    metaLastStatus: status => `last: ${status}`,
+    metaToolsets: toolsets => `tools: ${toolsets}`,
+    metaSkills: skills => `skills: ${skills}`,
+    metaWorkdir: workdir => `cwd: ${workdir}`,
     jobViews: {
       attention: {
         description: 'Attention monitor: verify live notifications/review requests before taking action.',

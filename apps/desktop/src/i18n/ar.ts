@@ -951,6 +951,11 @@ export const ar = defineLocale({
     modeAgent: 'وكيل',
     modeScript: 'سكريبت',
     modeScriptOnly: 'سكريبت فقط',
+    repeatProgress: (completed, times) => `${completed}/${times} تشغيل`,
+    metaLastStatus: status => `آخر حالة: ${status}`,
+    metaToolsets: toolsets => `الأدوات: ${toolsets}`,
+    metaSkills: skills => `المهارات: ${skills}`,
+    metaWorkdir: workdir => `دليل العمل: ${workdir}`,
     jobViews: {
       attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
       driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },

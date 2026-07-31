@@ -193,7 +193,7 @@ function jobViewKind(job: CronJob): CronJobViewKind {
   return 'default'
 }
 
-function repeatText(job: CronJob): string {
+function repeatText(job: CronJob, a: Translations['agents']): string {
   const completed = job.repeat?.completed
   const times = job.repeat?.times
 
@@ -201,7 +201,7 @@ function repeatText(job: CronJob): string {
     return ''
   }
 
-  return `${completed ?? 0}/${times ?? '∞'} runs`
+  return a.repeatProgress(completed ?? 0, times ?? '∞')
 }
 
 function LocalAgentsBoard() {
@@ -411,11 +411,11 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
   const customAccent = custom === 'default' ? '' : CUSTOM_JOB_VIEW_ACCENT[custom]
 
   const meta = [
-    repeatText(job),
-    asText(job.last_status) ? `last: ${asText(job.last_status)}` : '',
-    job.enabled_toolsets?.length ? `tools: ${job.enabled_toolsets.join(', ')}` : '',
-    job.skills?.length ? `skills: ${job.skills.join(', ')}` : '',
-    asText(job.workdir) ? `cwd: ${asText(job.workdir)}` : ''
+    repeatText(job, a),
+    asText(job.last_status) ? a.metaLastStatus(asText(job.last_status)) : '',
+    job.enabled_toolsets?.length ? a.metaToolsets(job.enabled_toolsets.join(', ')) : '',
+    job.skills?.length ? a.metaSkills(job.skills.join(', ')) : '',
+    asText(job.workdir) ? a.metaWorkdir(asText(job.workdir)) : ''
   ].filter(Boolean)
 
   return (

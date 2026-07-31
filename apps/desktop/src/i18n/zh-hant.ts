@@ -1068,6 +1068,11 @@ export const zhHant = defineLocale({
     modeAgent: '代理',
     modeScript: '腳本',
     modeScriptOnly: '僅腳本',
+    repeatProgress: (completed, times) => `${completed}/${times} 次執行`,
+    metaLastStatus: status => `上次：${status}`,
+    metaToolsets: toolsets => `工具：${toolsets}`,
+    metaSkills: skills => `技能：${skills}`,
+    metaWorkdir: workdir => `工作目錄：${workdir}`,
     jobViews: {
       attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
       driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },

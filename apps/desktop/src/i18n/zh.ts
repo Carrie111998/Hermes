@@ -1333,6 +1333,11 @@ export const zh: Translations = {
     modeAgent: '代理',
     modeScript: '脚本',
     modeScriptOnly: '仅脚本',
+    repeatProgress: (completed, times) => `${completed}/${times} 次运行`,
+    metaLastStatus: status => `上次：${status}`,
+    metaToolsets: toolsets => `工具：${toolsets}`,
+    metaSkills: skills => `技能：${skills}`,
+    metaWorkdir: workdir => `工作目录：${workdir}`,
     jobViews: {
       attention: { description: 'Attention monitor: verify live notifications/review requests before taking action.', label: 'GitHub attention' },
       driver: { description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.', label: 'Driver loop' },
