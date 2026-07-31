@@ -466,8 +466,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if _effective_hint:
         post_workspace_parts.append(_effective_hint)
 
+    try:
+        from agent.system_prompt_part_providers import collect_system_prompt_parts
+
+        provider_parts = collect_system_prompt_parts(agent, system_message=system_message)
+    except Exception:
+        provider_parts = {"stable": [], "context": [], "volatile": []}
+    stable_parts.extend(provider_parts.get("stable", []))
+
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
+    context_parts.extend(provider_parts.get("context", []))
 
     if coding_workspace_parts:
         context_parts.extend(coding_workspace_parts)
@@ -499,6 +508,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
+    volatile_parts.extend(provider_parts.get("volatile", []))
 
     if agent._memory_store:
         if agent._memory_enabled:
