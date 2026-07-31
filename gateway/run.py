@@ -15257,9 +15257,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_reasoning_command(event)
 
         if canonical == "memory":
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_memory_command(event)
             return await self._handle_memory_command(event)
 
         if canonical == "skills":
+            if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    return await self._handle_skills_command(event)
             return await self._handle_skills_command(event)
 
         if canonical == "learn":
