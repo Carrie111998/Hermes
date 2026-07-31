@@ -22,6 +22,7 @@ from gateway.api_server_runtime import (
     _resume_runtime_history,
     _runtime_attachment_parts,
     _runtime_image_paths,
+    _runtime_allowed_skill_names,
     _runtime_video_paths,
     _runtime_tool_middleware,
 )
@@ -97,6 +98,7 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
             "platform rules\n\ntrusted turn context\n\n"
             "<available_skills>\n"
             "- media-qa: Inspect generated media.\n"
+            "- planning-only: Plan media without a delegated tool.\n"
             "</available_skills>"
         )
         assert agent._build_system_prompt() == agent._cached_system_prompt
@@ -558,6 +560,11 @@ async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_fi
 async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypatch):
     monkeypatch.setattr(runtime_module, "_discover_skill_metadata", lambda: [
         {"name": "media-qa", "description": "Inspect generated media.", "category": "creative"},
+        {
+            "name": "planning-only",
+            "description": "Plan media without a delegated tool.",
+            "category": "creative",
+        },
     ])
     adapter = _RuntimeAdapter()
     app = web.Application()
@@ -586,6 +593,14 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "digest": digest,
                 "stable": stable,
                 "turn": turn,
+            },
+            "skill_manifest": {
+                "resolution_id": "resolution-test",
+                "manifest_digest": "sha256:test",
+                "skills": [
+                    {"runtime_alias": "media-qa"},
+                    {"runtime_alias": "planning-only"},
+                ],
             },
             "tools": [{
                 "name": "ultra_media_job_create",
@@ -682,6 +697,38 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         assert completed["payload"]["text"] == "asset://image/01"
     finally:
         await client.close()
+
+
+def test_runtime_skill_manifest_is_visibility_source_of_truth():
+    definitions = [{
+        "name": "media.generate_image",
+        "allowed_skills": ["tool-guided"],
+    }]
+    manifest = {
+        "skills": [
+            {"runtime_alias": "tool-guided"},
+            {"runtime_alias": "planning-only"},
+        ],
+    }
+
+    assert _runtime_allowed_skill_names(definitions, manifest) == {
+        "tool-guided",
+        "planning-only",
+    }
+    with pytest.raises(
+        ValueError,
+        match="tool skill scope unavailable in skill_manifest: tool-guided",
+    ):
+        _runtime_allowed_skill_names(definitions, {
+            "skills": [{"runtime_alias": "planning-only"}],
+        })
+    with pytest.raises(ValueError, match="duplicate runtime_alias"):
+        _runtime_allowed_skill_names([], {
+            "skills": [
+                {"runtime_alias": "duplicate"},
+                {"runtime_alias": "duplicate"},
+            ],
+        })
 
 
 def test_resume_history_continues_from_tool_result_without_synthetic_user():

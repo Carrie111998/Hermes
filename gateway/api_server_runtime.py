@@ -72,6 +72,7 @@ _RUNTIME_GATE_LOCK = threading.Lock()
 _RUNTIME_EXECUTOR: ThreadPoolExecutor | None = None
 _ACTIVE_RUN_COUNT = 0
 _SWEEPERS: dict[int, tuple[asyncio.AbstractEventLoop, "asyncio.Task[None]"]] = {}
+_NO_SKILL_MANIFEST = object()
 
 
 def _runtime_max_concurrent() -> int:
@@ -325,6 +326,42 @@ def _allowed_skill_names(definitions: list[dict[str, Any]]) -> set[str]:
             values = definition.get(field_name)
             if isinstance(values, list):
                 names.update(str(value).strip() for value in values if str(value).strip())
+    return names
+
+
+def _runtime_allowed_skill_names(
+    definitions: list[dict[str, Any]],
+    skill_manifest: Any = _NO_SKILL_MANIFEST,
+) -> set[str]:
+    """Resolve the immutable Run Skill scope, with legacy Tool fallback."""
+    if skill_manifest is _NO_SKILL_MANIFEST:
+        return _allowed_skill_names(definitions)
+    if not isinstance(skill_manifest, dict):
+        raise ValueError("skill_manifest must be an object")
+    skills = skill_manifest.get("skills")
+    if not isinstance(skills, list):
+        raise ValueError("skill_manifest.skills must be an array")
+    names: set[str] = set()
+    for skill in skills:
+        if not isinstance(skill, dict):
+            raise ValueError("skill_manifest.skills must contain only objects")
+        name = skill.get("runtime_alias")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name.strip()) > 255
+        ):
+            raise ValueError("skill_manifest runtime_alias is invalid")
+        name = name.strip()
+        if name in names:
+            raise ValueError("skill_manifest contains duplicate runtime_alias")
+        names.add(name)
+    outside_manifest = _allowed_skill_names(definitions) - names
+    if outside_manifest:
+        raise ValueError(
+            "tool skill scope unavailable in skill_manifest: "
+            + ", ".join(sorted(outside_manifest))
+        )
     return names
 
 
@@ -736,6 +773,7 @@ class RuntimeBridgeSession:
         definitions: list[dict[str, Any]],
         deadline_ms: int,
         agent_session_id: str,
+        allowed_skill_names: set[str] | None = None,
         allowed_image_paths: set[str] | None = None,
         allowed_video_paths: set[str] | None = None,
     ) -> None:
@@ -745,7 +783,11 @@ class RuntimeBridgeSession:
         self.queue = queue
         self.definitions = {str(item["name"]): dict(item) for item in definitions}
         self.tool_names = set(self.definitions)
-        self.allowed_skill_names = _allowed_skill_names(definitions)
+        self.allowed_skill_names = (
+            set(allowed_skill_names)
+            if allowed_skill_names is not None
+            else _allowed_skill_names(definitions)
+        )
         self.allowed_image_paths = {
             str(Path(path).resolve())
             for path in (allowed_image_paths or set())
@@ -1120,7 +1162,15 @@ class APIServerRuntimeMixin:
             resuming = bool(tool_results or runtime_checkpoint)
             if resuming and (not tool_results or runtime_checkpoint is None):
                 raise ValueError("runtime_checkpoint and tool_results are both required for resume")
-            allowed_skill_names = _allowed_skill_names(definitions)
+            skill_manifest = (
+                body["skill_manifest"]
+                if "skill_manifest" in body
+                else _NO_SKILL_MANIFEST
+            )
+            allowed_skill_names = _runtime_allowed_skill_names(
+                definitions,
+                skill_manifest,
+            )
             instructions = (
                 _replacement_system_prompt(system_context)
                 + _allowed_skills_prompt(allowed_skill_names)
@@ -1193,6 +1243,7 @@ class APIServerRuntimeMixin:
             definitions,
             int(body.get("deadline_ms") or 0),
             agent_session_id,
+            allowed_skill_names=allowed_skill_names,
             allowed_image_paths={str(path) for path in runtime_image_paths},
             allowed_video_paths={str(path) for path in runtime_video_paths},
         )
