@@ -105,13 +105,13 @@ class TestCleanShutdownMarker:
         assert marker.exists(), ".clean_shutdown marker should exist after graceful stop"
 
 
-    def test_marker_consumption_is_one_shot_even_if_cleanup_fails(
+    def test_claimed_marker_remains_retryable_until_cleanup_commits(
         self, tmp_path, monkeypatch
     ):
-        """A consumed marker must never survive under the recognized name."""
+        """A claimed receipt survives only for the immediate cleanup transaction."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
-        marker.touch()
+        marker.write_bytes(b"clean\n")
 
         from gateway.run import _consume_clean_shutdown_marker
 
@@ -119,7 +119,16 @@ class TestCleanShutdownMarker:
             assert _consume_clean_shutdown_marker() is True
 
         assert not marker.exists()
-        assert (tmp_path / ".clean_shutdown.consumed").exists()
+        assert (tmp_path / ".clean_shutdown.cleanup_pending").exists()
+        assert _consume_clean_shutdown_marker() is True
+
+    def test_legacy_consumed_tombstone_is_never_trusted(self, tmp_path, monkeypatch):
+        """Old releases could leave this path after already starting adapters."""
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        (tmp_path / ".clean_shutdown.consumed").write_bytes(b"clean\n")
+
+        from gateway.run import _consume_clean_shutdown_marker
+
         assert _consume_clean_shutdown_marker() is False
 
     def test_post_rename_inspection_failure_is_still_one_shot(
@@ -128,15 +137,15 @@ class TestCleanShutdownMarker:
         """Inspection failure after consume cannot preserve predecessor proof."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
-        marker.touch()
+        marker.write_bytes(b"clean\n")
 
         from gateway.run import _consume_clean_shutdown_marker
 
-        with patch("pathlib.Path.stat", side_effect=OSError("stat blocked")):
+        with patch("pathlib.Path.read_bytes", side_effect=OSError("read blocked")):
             assert _consume_clean_shutdown_marker() is False
 
         assert not marker.exists()
-        assert not (tmp_path / ".clean_shutdown.consumed").exists()
+        assert not (tmp_path / ".clean_shutdown.cleanup_pending").exists()
         assert _consume_clean_shutdown_marker() is False
 
     def test_failed_atomic_consume_invalidates_marker_for_next_boot(
@@ -144,7 +153,7 @@ class TestCleanShutdownMarker:
     ):
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
-        marker.touch()
+        marker.write_bytes(b"clean\n")
 
         from gateway.run import _consume_clean_shutdown_marker
 
@@ -163,7 +172,7 @@ class TestCleanShutdownMarker:
         """Startup must fail closed if stale clean proof cannot be invalidated."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
-        marker.touch()
+        marker.write_bytes(b"clean\n")
 
         from gateway.run import _consume_clean_shutdown_marker
 
@@ -175,6 +184,30 @@ class TestCleanShutdownMarker:
 
         assert marker.exists(), "the fatal path must not pretend invalidation succeeded"
 
+    def test_failed_tombstone_write_cannot_become_clean_proof(
+        self, tmp_path, monkeypatch
+    ):
+        """A truncate-then-fail invalidation leaves an invalid payload."""
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+        marker.write_bytes(b"clean\n")
+
+        from gateway.run import _consume_clean_shutdown_marker
+
+        def truncate_then_fail(*_args, **_kwargs):
+            marker.write_bytes(b"")
+            raise OSError("write blocked after truncate")
+
+        with patch("gateway.run.os.replace", side_effect=OSError("rename blocked")), patch(
+            "pathlib.Path.unlink", side_effect=OSError("unlink blocked")
+        ), patch("pathlib.Path.write_text", side_effect=truncate_then_fail):
+            with pytest.raises(RuntimeError, match="Cannot safely invalidate"):
+                _consume_clean_shutdown_marker()
+
+        assert marker.read_bytes() == b""
+        assert _consume_clean_shutdown_marker() is False
+        assert not marker.exists()
+
     def test_later_clean_drain_replaces_invalid_tombstone(self, tmp_path, monkeypatch):
         """A stale consume tombstone must not suppress new clean-shutdown proof."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
@@ -185,7 +218,7 @@ class TestCleanShutdownMarker:
 
         _write_clean_shutdown_marker()
 
-        assert marker.read_bytes() == b""
+        assert marker.read_bytes() == b"clean\n"
         assert _consume_clean_shutdown_marker() is True
         assert not marker.exists()
 
@@ -196,8 +229,16 @@ class TestCleanShutdownMarker:
         """A startup crash cannot leave its predecessor's proof reusable."""
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
         marker = tmp_path / ".clean_shutdown"
-        marker.touch()
+        marker.write_bytes(b"clean\n")
         runner = MagicMock()
+
+        async def commit_clean_receipt(path):
+            path.unlink()
+            return 0
+
+        runner._consume_clean_shutdown_marker = AsyncMock(
+            side_effect=commit_clean_receipt
+        )
 
         with patch("gateway.code_skew.record_boot_fingerprint"), patch(
             "gateway.status.get_running_pid", return_value=None
@@ -230,6 +271,10 @@ class TestCleanShutdownMarker:
 
         assert runner._previous_shutdown_clean is True
         assert not marker.exists()
+        assert not (tmp_path / ".clean_shutdown.cleanup_pending").exists()
+        runner._consume_clean_shutdown_marker.assert_awaited_once_with(
+            tmp_path / ".clean_shutdown.cleanup_pending"
+        )
         from gateway.run import _consume_clean_shutdown_marker
 
         assert _consume_clean_shutdown_marker() is False
@@ -302,6 +347,49 @@ class TestCleanShutdownMarker:
         assert marker.exists(), (
             "a successful drain must be recorded before slower teardown begins"
         )
+
+    def test_blocked_clean_proof_survives_graceful_stop(self, tmp_path, monkeypatch):
+        """A failed persistent downgrade must taint the whole lifecycle."""
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._restart_requested = False
+        runner._restart_detached = False
+        runner._restart_via_service = False
+        runner._restart_task_started = False
+        runner._running = True
+        runner._draining = False
+        runner._stop_task = None
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._pending_approvals = {}
+        runner._background_tasks = set()
+        runner._shutdown_event = MagicMock()
+        runner._restart_drain_timeout = 5
+        runner._exit_code = None
+        runner._exit_reason = None
+        runner._clean_shutdown_marker_blocked = True
+        runner.adapters = {}
+        runner.config = GatewayConfig()
+
+        with patch(
+            "gateway.run.GatewayRunner._drain_active_agents",
+            new_callable=AsyncMock,
+            return_value=([], False),
+        ), patch(
+            "gateway.run.GatewayRunner._finalize_shutdown_agents",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("host teardown interrupted cleanup"),
+        ):
+            import asyncio
+
+            with pytest.raises(RuntimeError, match="host teardown interrupted cleanup"):
+                asyncio.get_event_loop().run_until_complete(runner.stop())
+
+        assert not marker.exists()
 
     def test_non_chat_timeout_does_not_trigger_broad_chat_recovery(
         self, tmp_path, monkeypatch
