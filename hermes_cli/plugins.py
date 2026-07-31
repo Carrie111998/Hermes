@@ -1862,7 +1862,9 @@ class PluginContext:
             handle = None
         logger.debug(
             "Plugin %s registered tool: %s%s",
-            self.manifest.name, name, " (override)" if override else "",
+            self.manifest.name,
+            name,
+            " (override)" if override else "",
         )
         return handle
 
