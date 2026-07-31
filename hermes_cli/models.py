@@ -340,6 +340,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "kimi-coding": [
         "kimi-k3",
+        "k3-256k",
         "kimi-k2.7-code",
         "kimi-k2.6",
         "kimi-k2.5",
@@ -2766,6 +2767,24 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
     return merged
 
 
+class _ProviderModelCatalog(list[str]):
+    """List-compatible catalog carrying whether it is safe to persist.
+
+    Public callers still receive a normal ``list`` interface. The disk-cache
+    wrapper uses ``cacheable`` to avoid pinning a static fallback returned
+    after transient live discovery failures.
+    """
+
+    def __init__(self, models: list[str], *, cacheable: bool = True):
+        super().__init__(models)
+        self.cacheable = cacheable
+
+
+def _fallback_provider_models(models: list[str]) -> list[str]:
+    """Return a renderable static fallback that must not overwrite live cache."""
+    return _ProviderModelCatalog(list(models), cacheable=False)
+
+
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Return the best known model catalog for a provider.
 
@@ -2956,6 +2975,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
     # Handles any provider registered in providers/ with auth_type="api_key".
     # Replaces per-provider copy-paste blocks (stepfun, gmi, zai, etc.).
+    profile_live_attempted = False
     try:
         from providers import get_provider_profile
         from hermes_cli.auth import resolve_api_key_provider_credentials
@@ -2971,6 +2991,7 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             if not base_url:
                 base_url = _p.base_url
             if api_key:
+                profile_live_attempted = True
                 live = _p.fetch_models(api_key=api_key, base_url=base_url or None)
                 if live:
                     # Merge static curated list with live API results so
@@ -3007,13 +3028,18 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
             # Use profile's fallback_models if defined
             if _p.fallback_models:
-                return list(_p.fallback_models)
+                fallback = list(_p.fallback_models)
+                if profile_live_attempted:
+                    return _fallback_provider_models(fallback)
+                return fallback
     except Exception:
         pass
 
     curated_static = list(_PROVIDER_MODELS.get(normalized, []))
     if normalized in _MODELS_DEV_PREFERRED:
         return _merge_with_models_dev(normalized, curated_static)
+    if profile_live_attempted:
+        return _fallback_provider_models(curated_static)
     return curated_static
 
 
@@ -3033,8 +3059,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 #     normally reads. Swap your OPENAI_API_KEY and the entry invalidates.
 #   - 1h TTL by default. `force_refresh=True` skips the cache entirely
 #     and overwrites it on success.
-#   - Only NON-EMPTY results are cached. An empty/None response from a
-#     transient network error never gets pinned.
+#   - Only NON-EMPTY, cacheable results are cached. A static fallback returned
+#     after a transient live discovery failure is renderable but never pinned.
 #   - Cache file is best-effort. Any read/write error degrades silently
 #     to a live fetch — the picker keeps working.
 
@@ -3149,8 +3175,10 @@ def cached_provider_model_ids(
 ) -> list[str]:
     """Disk-cached wrapper around :func:`provider_model_ids`.
 
-    Hits the cache when fresh; otherwise calls the live function and
-    persists a non-empty result. Always returns a list (never None).
+    Hits the cache when fresh; otherwise calls the discovery function and
+    persists a non-empty result only when it is safe to cache. Static
+    fallbacks remain renderable but cannot replace a last-known live catalog.
+    Always returns a list (never None).
     """
     normalized = normalize_provider(provider) or (provider or "")
     if not normalized:
@@ -3171,20 +3199,24 @@ def cached_provider_model_ids(
     ):
         return list(entry["models"])
 
-    # Cache miss / stale / forced refresh — call the live path.
-    live = provider_model_ids(normalized, force_refresh=force_refresh)
-    if live:
+    # Cache miss / stale / forced refresh — run provider discovery. Static
+    # fallbacks are useful for rendering but are explicitly non-cacheable, so
+    # a transient failure cannot replace a last-known live-only catalog.
+    discovered = provider_model_ids(normalized, force_refresh=force_refresh)
+    models = list(discovered or [])
+    cacheable = bool(getattr(discovered, "cacheable", True))
+    if models and cacheable:
         cache[normalized] = {
             "fp": fp,
             "at": now,
-            "models": list(live),
+            "models": models,
         }
         _save_provider_models_cache(cache)
-        return list(live)
+        return models
 
-    # Live fetch returned nothing. If we have a stale entry with the
-    # SAME fingerprint, prefer it over an empty result — stale data
-    # beats no data when the network is flaky.
+    # Discovery returned nothing or only a non-cacheable fallback. If we have
+    # a stale entry with the SAME fingerprint, prefer it — last-known live
+    # data beats a degraded fallback when the network is flaky.
     if (
         isinstance(entry, dict)
         and entry.get("fp") == fp
@@ -3192,7 +3224,7 @@ def cached_provider_model_ids(
         and entry["models"]
     ):
         return list(entry["models"])
-    return list(live or [])
+    return models
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:
