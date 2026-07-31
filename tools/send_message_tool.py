@@ -985,118 +985,14 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
-    # --- Slack: native media via files_upload_v2 in the plugin's
-    # standalone_sender_fn (plugins/platforms/slack/adapter.py::_standalone_send).
-    # Gateway in-channel MEDIA: delivery already worked; send_message previously
-    # omitted Slack attachments and told the model media was unsupported.
-    if platform == Platform.SLACK and media_files:
-        from gateway.platform_registry import platform_registry as _pr_slack
-        from hermes_cli.plugins import discover_plugins as _dp_slack
-        _dp_slack()
-        _slack_entry = _pr_slack.get("slack")
-        if _slack_entry is None or _slack_entry.standalone_sender_fn is None:
-            return {"error": "Slack plugin not registered or missing standalone_sender_fn"}
-        _sl_caption, _ = _media_caption_split(
-            message, media_files,
-            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
-        )
-        if _sl_caption is not None:
-            result = await _slack_entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                "",
-                thread_id=thread_id,
-                media_files=media_files,
-                caption=_sl_caption,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            return result
+    # --- QQBot: native media attachment support via running gateway adapter ---
+    if platform == Platform.QQBOT and media_files:
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)
-            result = await _slack_entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
-
-    # --- WhatsApp: native media attachment support via the registry's
-    # standalone_sender_fn (plugins/platforms/whatsapp/adapter.py::_standalone_send).
-    # The plugin uploads each file through the local Baileys bridge /send-media
-    # endpoint so images/videos/audio arrive as native bubbles, not documents. #41112
-    if platform == Platform.WHATSAPP and media_files:
-        from gateway.platform_registry import platform_registry as _pr_wa
-        from hermes_cli.plugins import discover_plugins as _dp_wa
-        _dp_wa()
-        _wa_entry = _pr_wa.get("whatsapp")
-        if _wa_entry is None or _wa_entry.standalone_sender_fn is None:
-            return {"error": "WhatsApp plugin not registered or missing standalone_sender_fn"}
-        # MEDIA:<path> caption: a single captionable file + short text rides
-        # as the media's native caption instead of a separate message before
-        # the bubble (single enforced decision in _media_caption_split). Cap on
-        # the platform's own message limit so the caption is always deliverable.
-        _wa_caption, _ = _media_caption_split(
-            message, media_files,
-            max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
-        )
-        last_result = None
-        if _wa_caption is not None:
-            # Single-file captioned send: no separate text chunk, caption on
-            # the media itself.
-            result = await _wa_entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                "",
-                media_files=media_files,
-                thread_id=thread_id,
-                force_document=force_document,
-                caption=_wa_caption,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            return result
-        for i, chunk in enumerate(chunks):
-            is_last = (i == len(chunks) - 1)
-            result = await _wa_entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                chunk,
+            result = await _send_qqbot(
+                pconfig, chat_id, chunk,
                 media_files=media_files if is_last else None,
-                thread_id=thread_id,
-                force_document=force_document,
-            )
-            if isinstance(result, dict) and result.get("error"):
-                return result
-            last_result = result
-        return last_result
-
-    # --- Slack: prefer the live gateway adapter, then the plugin's
-    # standalone sender.  The live adapter is multi-workspace aware (it maps
-    # channels to the workspace client that owns them) and honors adapter-side
-    # gates like ignored_channels; the standalone Web-API path may only have a
-    # comma-separated token list.  ``_send_via_adapter`` tries the in-process
-    # adapter first and falls back to the registry standalone sender for
-    # out-of-process cron runs, preserving MEDIA delivery on the fallback
-    # (media-bearing sends were already intercepted by the branch above).
-    if platform == Platform.SLACK:
-        last_result = None
-        for i, chunk in enumerate(chunks):
-            is_last = i == len(chunks) - 1
-            result = await _send_via_adapter(
-                platform,
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files if is_last else [],
-                force_document=force_document,
             )
             if isinstance(result, dict) and result.get("error"):
                 return result
@@ -1107,7 +1003,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and qqbot; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -1115,7 +1011,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and qqbot"
         )
 
     last_result = None
@@ -1994,74 +1890,49 @@ def _check_send_message():
         return False
 
 
-async def _send_qqbot(pconfig, chat_id, message):
-    """Send via QQBot using the REST API directly (no WebSocket needed).
+async def _send_qqbot(pconfig, chat_id, message, media_files=None):
+    """Send via QQBot using the running gateway adapter (supports media).
 
-    Uses the QQ Bot Open Platform REST endpoints to get an access token
-    and post a message. Supports guild channels, C2C (private) chats,
-    and group chats by trying the appropriate endpoints.
+    Obtains the live QQAdapter singleton, re-injects MEDIA: tags for any
+    media_files that were already extracted, and delegates to adapter.send().
     """
     try:
-        import httpx
+        from gateway.platforms.qqbot.adapter import get_active_adapter
     except ImportError:
-        return _error("QQBot direct send requires httpx. Run: pip install httpx")
+        return _error("QQBot adapter module not available.")
 
     extra = pconfig.extra or {}
-    appid = extra.get("app_id") or os.getenv("QQ_APP_ID", "")
-    secret = (pconfig.token or extra.get("client_secret")
-              or os.getenv("QQ_CLIENT_SECRET", ""))
-    if not appid or not secret:
-        return _error("QQBot: QQ_APP_ID / QQ_CLIENT_SECRET not configured.")
+    profile_name = str(extra.get("profile_name") or "default").strip()
+    adapter = get_active_adapter(profile_name)
+    if adapter is None:
+        return _error(
+            "QQBot adapter is not running. "
+            "Start the gateway with qqbot platform enabled first."
+        )
+
+    # Re-inject MEDIA: tags so adapter.send() → extract_media() picks them up.
+    # Use [[audio_as_voice]] + MEDIA:<path> (the established contract) instead
+    # of a VOICE:<path> tag that extract_media() does not parse.
+    content = message or ""
+    if media_files:
+        tags = []
+        voice_directive = ""
+        for item in media_files:
+            if isinstance(item, tuple):
+                path, is_voice = item
+                if is_voice:
+                    voice_directive = "[[audio_as_voice]]\n"
+                tags.append(f"MEDIA:{path}")
+            else:
+                tags.append(f"MEDIA:{item}")
+        content = voice_directive + "\n".join(tags) + ("\n" + content if content else "")
 
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            # Step 1: Get access token
-            token_resp = await client.post(
-                "https://bots.qq.com/app/getAppAccessToken",
-                json={"appId": str(appid), "clientSecret": str(secret)},
-            )
-            if token_resp.status_code != 200:
-                return _error(f"QQBot token request failed: {token_resp.status_code}")
-            token_data = token_resp.json()
-            access_token = token_data.get("access_token")
-            if not access_token:
-                return _error("QQBot: no access_token in response")
-
-            # Step 2: Send message via REST
-            # QQ Bot API has separate endpoints for channels, C2C, and groups.
-            # We try them in order: channel first, then fallback to C2C.
-            headers = {
-                "Authorization": f"QQBot {access_token}",
-                "Content-Type": "application/json",
-            }
-            payload = {"content": message[:4000], "msg_type": 0}
-
-            # Try channel endpoint first (works for guild channels)
-            url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code in {200, 201}:
-                data = resp.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
-            url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
-            resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
-            if resp_c2c.status_code in {200, 201}:
-                data = resp_c2c.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # If C2C also failed, try group endpoint
-            url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
-            resp_group = await client.post(url_group, json=payload, headers=headers)
-            if resp_group.status_code in {200, 201}:
-                data = resp_group.json()
-                return {"success": True, "platform": "qqbot", "chat_id": chat_id,
-                        "message_id": data.get("id")}
-
-            # All endpoints failed — return the most informative error
-            return _error(f"QQBot send failed: channel={resp.status_code} c2c={resp_c2c.status_code} group={resp_group.status_code}")
+        result = await adapter.send(chat_id, content)
+        if result and result.success:
+            return {"success": True, "platform": "qqbot", "chat_id": chat_id,
+                    "message_id": getattr(result, "message_id", None)}
+        return _error(f"QQBot send failed: {getattr(result, 'error', 'unknown')}")
     except Exception as e:
         return _error(f"QQBot send failed: {e}")
 
