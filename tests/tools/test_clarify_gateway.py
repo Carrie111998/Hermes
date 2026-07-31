@@ -395,6 +395,7 @@ class TestProseCancelsPendingClarify:
         cm.register("c4", "sk4", "Deploy where?", ["staging", "prod", "cancel"])
         assert cm.resolve_text_response_or_cancel("sk4", "7") is False
         assert cm.has_pending("sk4") is True
+        assert not cm._entries["c4"].event.is_set()
 
     def test_multi_select_label_typo_keeps_the_clarify_pending(self):
         """A comma-separated multi-select reply with a typo keeps retry semantics."""
@@ -406,6 +407,7 @@ class TestProseCancelsPendingClarify:
         )
         assert cm.resolve_text_response_or_cancel("sk5", "stagin, prod") is False
         assert cm.has_pending("sk5") is True
+        assert not cm._entries["c5"].event.is_set()
 
     def test_awaiting_text_accepts_prose_unchanged(self):
         """After the Other button, prose resolves — never cancels."""
@@ -432,3 +434,32 @@ class TestProseCancelsPendingClarify:
             "sk8", "let's go with staging please"
         ) is False
         assert cm.has_pending("sk8") is True
+
+    def test_multi_select_comma_prose_still_cancels(self):
+        """A comma inside free prose is not a selection: every comma-separated
+        part must be label-sized for the reply to keep retry semantics."""
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "c9", "sk9", "Which envs?", ["staging", "prod", "canary"],
+            multi_select=True,
+        )
+        assert cm.resolve_text_response_or_cancel(
+            "sk9", "please use staging, then tell me when it is ready"
+        ) is False
+        entry = cm._entries["c9"]
+        assert entry.event.is_set(), "comma prose must cancel, not stay pending"
+        assert entry.response == ""
+
+    def test_multi_select_multiword_labels_keep_typo_retry(self):
+        """Label-sized comma parts stay retryable even with multi-word labels."""
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "c10", "sk10", "Which regions?", ["north region", "south region"],
+            multi_select=True,
+        )
+        assert cm.resolve_text_response_or_cancel(
+            "sk10", "north regoin, south region"
+        ) is False
+        assert not cm._entries["c10"].event.is_set()

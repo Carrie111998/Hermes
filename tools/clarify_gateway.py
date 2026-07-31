@@ -339,12 +339,15 @@ def _looks_like_attempted_selection(entry: _ClarifyEntry, text: str) -> bool:
     """True when a *rejected* reply still reads as the user trying to pick.
 
     A short digit reply ("7" with 3 choices), digit lists ("1 5"), or a
-    comma-separated reply to a multi-select ("stagin, prod") are attempted
-    selections with a typo or out-of-range index — the user should get to
-    retry, so the clarify must stay pending (the deliberate reject-and-retry
-    semantics of #62042). Free prose ("let's go with staging please") can
+    comma-separated reply to a multi-select whose parts are label-sized
+    ("stagin, prod") are attempted selections with a typo or out-of-range
+    index — the user should get to retry, so the clarify must stay pending
+    (the deliberate reject-and-retry semantics of #62042). Free prose can
     never satisfy the native multi-choice guard no matter how often it is
-    retried, so it does not count.
+    retried, so it does not count — including comma-containing prose like
+    "please use staging, then tell me when it is ready": a comma alone is
+    not a selection; every comma-separated part must be no longer (in
+    words) than the longest choice label to read as a selection attempt.
     """
     stripped = str(text).strip()
     if not stripped:
@@ -352,8 +355,13 @@ def _looks_like_attempted_selection(entry: _ClarifyEntry, text: str) -> bool:
     tokens = [t for t in re.split(r"[,\s]+", stripped) if t]
     if tokens and all(t.isdigit() for t in tokens):
         return True
-    if entry.multi_select and "," in stripped:
-        return True
+    if entry.multi_select and "," in stripped and entry.choices:
+        max_label_words = max(len(str(c).split()) for c in entry.choices)
+        comma_tokens = [t.strip() for t in stripped.split(",") if t.strip()]
+        if comma_tokens and all(
+            len(t.split()) <= max_label_words for t in comma_tokens
+        ):
+            return True
     return False
 
 

@@ -123,9 +123,35 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
     with pytest.raises(_FellThroughIntercept):
         await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
 
-    # The clarify entry must still be pending and unresolved.
+    # The prose is not accepted as the answer (the #62042 guard holds), but
+    # since it can never satisfy the prompt, the clarify is cancelled with
+    # the empty sentinel so the blocked tool call unblocks now instead of
+    # spinning until agent.clarify_timeout (#74399).
     with cm._lock:
         entry = cm._entries.get("cl-native")
+    assert entry is not None
+    assert entry.event.is_set()
+    assert entry.response == ""
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
+async def test_selection_like_reply_keeps_clarify_pending_for_retry():
+    """An out-of-range number is an attempted selection, not prose: it falls
+    through as a normal turn AND the clarify stays pending so the user can
+    retry with a valid choice (#62042 retry semantics preserved)."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    cm.register("cl-retry", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
+
+    with pytest.raises(_FellThroughIntercept):
+        await _dispatch(runner, _event("7"))
+
+    with cm._lock:
+        entry = cm._entries.get("cl-retry")
     assert entry is not None
     assert not entry.event.is_set()
     _clear_clarify_state()
