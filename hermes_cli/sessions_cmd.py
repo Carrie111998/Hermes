@@ -239,20 +239,23 @@ def cmd_sessions(args, sessions_parser=None):
     if action == "list":
         from hermes_state import workspace_key as _ws_key
 
-        # Workspace filtering runs in Python (the workspace key is derived
-        # from git repo root / cwd, not a DB column), so when a filter is
-        # active, fetch a superset, filter, then slice — applying the SQL
-        # limit first would silently drop workspace matches that fall
-        # outside the most-recent N rows.
-        _ws_filter = (getattr(args, "workspace", None) or "").strip()
-        _fetch_limit = args.limit * 4 if _ws_filter else args.limit
-        sessions = db.list_sessions_rich(
-            source=args.source, exclude_sources=_exclude, limit=_fetch_limit
-        )
-
+        _page = max(1, getattr(args, "page", 1) or 1)
+        _offset = (_page - 1) * args.limit
         # Workspace filter: match a session by its workspace key (git repo
         # root, else cwd) — path substring or exact basename.
+        _ws_filter = (getattr(args, "workspace", None) or "").strip()
         if _ws_filter:
+            # The workspace key is derived (repo root / cwd), not a DB
+            # column, so filtering happens in Python. Fetch a superset
+            # WITHOUT the SQL offset, filter, then slice — applying the
+            # offset first would silently skip workspace matches on
+            # page > 1 (same filter-then-offset ordering as
+            # query_session_listing).
+            sessions = db.list_sessions_rich(
+                source=args.source,
+                exclude_sources=_exclude,
+                limit=max((args.limit + _offset) * 4, args.limit + _offset),
+            )
             _needle = _ws_filter.lower()
 
             def _in_workspace(s):
@@ -261,7 +264,15 @@ def cmd_sessions(args, sessions_parser=None):
                     _needle in key or _needle == os.path.basename(key.rstrip("/\\"))
                 )
 
-            sessions = [s for s in sessions if _in_workspace(s)][: args.limit]
+            sessions = [s for s in sessions if _in_workspace(s)]
+            sessions = sessions[_offset : _offset + args.limit]
+        else:
+            sessions = db.list_sessions_rich(
+                source=args.source,
+                exclude_sources=_exclude,
+                limit=args.limit,
+                offset=_offset,
+            )
 
         if not sessions:
             print("No sessions found.")
@@ -274,47 +285,45 @@ def cmd_sessions(args, sessions_parser=None):
             key = _ws_key(s)
             return (os.path.basename(key.rstrip("/\\")) or key) if key else "—"
 
-        has_ws = bool(_ws_filter) or any(_ws_key(s) for s in sessions)
-        has_titles = any(s.get("title") for s in sessions)
-
-        if has_ws:
+        # Workspace column only when the user explicitly filtered by it.
+        if _ws_filter:
+            has_titles = any(s.get("title") for s in sessions)
             if has_titles:
-                print(f"{'Title':<28} {'Workspace':<18} {'Last Active':<13} {'ID'}")
-                print("─" * 110)
+                print(f"{'Title':<24} {'Workspace':<18} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'ID'}")
+                print("─" * 100)
             else:
-                print(f"{'Preview':<38} {'Workspace':<18} {'Last Active':<13} {'Src':<6} {'ID'}")
+                print(f"{'Preview':<30} {'Workspace':<18} {'Model':<12} {'Msgs':>4}  {'Last Active':<13} {'Src':<6} {'ID'}")
                 print("─" * 100)
             for s in sessions:
                 last_active = _relative_time(s.get("last_active"))
                 ws = _ws_label(s)[:16]
+                model_raw = (s.get("model") or "—")
+                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                if len(model) > 12:
+                    model = model[:11] + "…"
+                msgs = s.get("message_count")
+                msgs_str = str(msgs) if msgs is not None else "—"
                 if has_titles:
-                    title = (s.get("title") or "—")[:26]
-                    print(f"{title:<28} {ws:<18} {last_active:<13} {s['id']}")
+                    title = (s.get("title") or "—")[:22]
+                    print(f"{title:<24} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['id']}")
                 else:
-                    preview = s.get("preview", "")[:36]
-                    print(f"{preview:<38} {ws:<18} {last_active:<13} {s['source']:<6} {s['id']}")
+                    preview = s.get("preview", "")[:28]
+                    print(f"{preview:<30} {ws:<18} {model:<12} {msgs_str:>4}  {last_active:<13} {s['source']:<6} {s['id']}")
+            from hermes_cli.session_listing import CLI_SESSIONS_LIST_FOOTER
+            print()
+            print(CLI_SESSIONS_LIST_FOOTER.rstrip())
             return
 
-        if has_titles:
-            print(f"{'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
-            print("─" * 110)
-        else:
-            print(f"{'Preview':<50} {'Last Active':<13} {'Src':<6} {'ID'}")
-            print("─" * 95)
-        for s in sessions:
-            last_active = _relative_time(s.get("last_active"))
-            preview = (
-                s.get("preview", "")[:38]
-                if has_titles
-                else s.get("preview", "")[:48]
-            )
-            if has_titles:
-                title = (s.get("title") or "—")[:30]
-                sid = s["id"]
-                print(f"{title:<32} {preview:<40} {last_active:<13} {sid}")
-            else:
-                sid = s["id"]
-                print(f"{preview:<50} {last_active:<13} {s['source']:<6} {sid}")
+        # Canonical table (same format as /sessions and /sessions search).
+        # The # column shows the global position in the canonical list, so
+        # page 2 renders rows limit+1..2*limit (not 1..limit) and the
+        # number on screen is the number /resume <N> accepts.
+        from hermes_cli.session_listing import CLI_SESSIONS_LIST_FOOTER, render_sessions_table
+        for _i, _s in enumerate(sessions, 1):
+            _s["rank"] = _offset + _i
+        render_sessions_table(sessions, out=print, db=db)
+        print()
+        print(CLI_SESSIONS_LIST_FOOTER.rstrip())
 
     elif action == "search":
         query = " ".join(args.query)

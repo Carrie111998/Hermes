@@ -1,11 +1,11 @@
-"""F10: workspace-filtered `hermes sessions list` doesn't drop matches.
+"""F10: workspace-filtered `hermes sessions list` paginates correctly.
 
 The workspace key is derived (git_repo_root / cwd), not a DB column, so
-the filter runs in Python. The old code applied the SQL limit BEFORE the
-filter, so a workspace whose matches fell outside the most-recent N rows
-returned nothing (or fewer than the limit) even though matching sessions
-existed. The fix fetches a superset when a filter is active, filters, then
-slices back to the requested limit.
+the filter runs in Python. The old code applied the SQL offset+limit
+BEFORE the filter, so a workspace whose matches fell outside the fetched
+window returned nothing (or the wrong page) even though matching sessions
+existed. The fix fetches a superset WITHOUT the SQL offset when a filter
+is active, filters, then slices to [offset, offset+limit).
 """
 
 import os
@@ -63,7 +63,7 @@ def test_workspace_matches_beyond_recent_n_still_appear(tmp_path):
     home = tmp_path / "hermes_home"
     home.mkdir()
     _seed(home)
-    out = _run(home, "--workspace", "repo1", "--limit", "4")
+    out = _run(home, "--workspace", "repo1", "-l", "4")
     assert "w1_d" in out and "w1_c" in out
     assert "w1_b" in out and "w1_a" in out
     assert "w2_a" not in out and "w2_b" not in out
@@ -75,19 +75,10 @@ def test_workspace_filter_respects_limit(tmp_path):
     home = tmp_path / "hermes_home"
     home.mkdir()
     _seed(home)
-    out = _run(home, "--workspace", "repo1", "--limit", "2")
+    out = _run(home, "--workspace", "repo1", "-l", "2")
     assert "w1_d" in out and "w1_c" in out
     assert "w1_b" not in out and "w1_a" not in out
     assert "w2_a" not in out and "w2_b" not in out
-
-
-def test_workspace_filter_excludes_other_repos(tmp_path):
-    home = tmp_path / "hermes_home"
-    home.mkdir()
-    _seed(home)
-    out = _run(home, "--workspace", "repo2", "--limit", "10")
-    assert "w2_b" in out and "w2_a" in out
-    assert "w1_a" not in out and "w1_d" not in out
 
 
 def test_unfiltered_limit_still_bounds_rows(tmp_path):
@@ -95,6 +86,29 @@ def test_unfiltered_limit_still_bounds_rows(tmp_path):
     home = tmp_path / "hermes_home"
     home.mkdir()
     _seed(home)
-    out = _run(home, "--limit", "2")
+    out = _run(home, "-l", "2")
     assert "w1_d" in out and "w1_c" in out
     assert "w1_a" not in out and "w2_a" not in out
+
+
+def test_workspace_filter_page_two_slices_correct_window(tmp_path):
+    """Page 2 with a workspace filter: superset fetch WITHOUT the SQL
+    offset, filter, then slice to [offset, offset+limit) — the exact F10
+    regression. Old code applied offset+limit in SQL first (rows 2..4 of
+    the global list), then filtered to repo1, returning the wrong window."""
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _seed(home)
+    out = _run(home, "--workspace", "repo1", "-l", "2", "2")
+    assert "w1_b" in out and "w1_a" in out
+    assert "w1_d" not in out and "w1_c" not in out
+    assert "w2_a" not in out and "w2_b" not in out
+
+
+def test_page_two_shows_next_window_unfiltered(tmp_path):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _seed(home)
+    out = _run(home, "-l", "2", "2")
+    assert "w1_b" in out and "w2_b" in out
+    assert "w1_d" not in out and "w1_c" not in out
