@@ -313,3 +313,32 @@ class TestBundledProfileProtocolGates:
         )
         assert top_disabled == {"reasoning_effort": "none"}
         assert extras_disabled == {"think": False}
+
+    def test_zai_profile_messages_wire_shape(self):
+        from providers import get_provider_profile
+
+        zai = get_provider_profile("zai")
+        extras, top = zai.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.2",
+            api_mode="anthropic_messages",
+        )
+        assert extras == {}
+        assert top == {}
+
+    def test_zai_messages_request_uses_adapter_reasoning_shape(self):
+        from providers import get_provider_profile
+
+        zai = get_provider_profile("zai")
+        kw = AnthropicTransport().build_kwargs(
+            model="glm-5.2",
+            messages=_simple_messages(),
+            tools=None,
+            max_tokens=1024,
+            reasoning_config={"enabled": True, "effort": "high"},
+            provider_profile=zai,
+            base_url="https://open.bigmodel.cn/api/anthropic",
+        )
+        assert "thinking" in kw
+        assert "reasoning_effort" not in kw.get("extra_body", {})
+        assert "thinking" not in kw.get("extra_body", {})
