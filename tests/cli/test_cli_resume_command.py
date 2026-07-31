@@ -2,6 +2,8 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli import HermesCLI
 
 
@@ -19,6 +21,84 @@ def _make_cli():
     # the test only exercises session-switch behavior.
     cli_obj.resume_display = "minimal"
     return cli_obj
+
+
+class TestResumeArmingRealDb:
+    """Real-DB resume arming: bare-number selection after `/resume list
+    <page>` must resolve against the real session store — no MagicMock
+    session-listing fakes (review F7).
+
+    Regression coverage: with offset > 0 the old bounds check compared a
+    global rank against the page length, so every valid selection on
+    page 2+ was rejected.
+    """
+
+    @pytest.fixture
+    def cli_db(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        base = 1_700_000_000.0
+        for i in range(15):
+            sid = f"sess_{i:03d}"
+            db.create_session(sid, "cli")
+            db.set_session_title(sid, f"Session {i:02d}")
+            db.append_message(sid, "user", f"opener {i}", timestamp=base + i * 60.0)
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (base + i * 60.0, sid),
+            )
+        db._conn.commit()
+        cli_obj = HermesCLI.__new__(HermesCLI)
+        cli_obj.session_id = "current_session"
+        cli_obj._resumed = False
+        cli_obj._pending_title = None
+        cli_obj.conversation_history = []
+        cli_obj.agent = None
+        cli_obj._session_db = db
+        cli_obj._pending_resume_sessions = None
+        cli_obj.resume_display = "minimal"
+        yield cli_obj, db
+        db.close()
+
+    def test_bare_number_after_list_page_two_resolves(self, cli_db):
+        cli_obj, db = cli_db
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume list 2")
+            assert cli_obj._pending_resume_offset == 10
+            # Page 2 of 15 sessions = ranks 11..15.
+            assert len(cli_obj._pending_resume_sessions) == 5
+            consumed = cli_obj._consume_pending_resume_selection("12")
+        assert consumed is True
+        # 12th most recent session in the canonical list (sess_014 is #1).
+        assert cli_obj.session_id == "sess_003"
+
+    def test_bare_number_below_page_two_window_out_of_range(self, cli_db):
+        cli_obj, db = cli_db
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            cli_obj._handle_resume_command("/resume list 2")
+            consumed = cli_obj._consume_pending_resume_selection("5")
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert consumed is True
+        assert "out of range" in printed.lower()
+        assert cli_obj.session_id == "current_session"
+
+    def test_bare_number_after_page_one_still_resolves(self, cli_db):
+        cli_obj, db = cli_db
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_resume_command("/resume")
+            consumed = cli_obj._consume_pending_resume_selection("2")
+        assert consumed is True
+        assert cli_obj.session_id == "sess_013"
 
 
 class TestCliResumeCommand:
