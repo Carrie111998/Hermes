@@ -1585,7 +1585,7 @@ def _resolve_explicit_runtime(
             api_mode = "codex_responses"
         else:
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode:
+            if configured_mode and model_cfg.get("provider") == provider:
                 api_mode = configured_mode
             else:
                 # Auto-detect from URL (Anthropic /anthropic suffix,
