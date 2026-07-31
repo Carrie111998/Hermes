@@ -246,6 +246,17 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     with (
         patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
         patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch(
+            "gateway.run._load_gateway_config",
+            return_value={
+                "memory": {"auto_inject_recall": True},
+                "gateway": {
+                    "platforms": {
+                        "telegram": {"memory": {"auto_inject_recall": False}}
+                    }
+                },
+            },
+        ),
         patch("run_agent.AIAgent", return_value=agent_instance) as mock_agent,
         patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
     ):
@@ -259,6 +270,7 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     # Stable gateway session key preserved, identical to a normal gateway turn.
     assert kwargs.get("gateway_session_key") == runner._session_key_for_source(_make_source())
     assert kwargs["gateway_session_key"]
+    assert kwargs.get("auto_inject_recall") is False
 
 
 @pytest.mark.asyncio
