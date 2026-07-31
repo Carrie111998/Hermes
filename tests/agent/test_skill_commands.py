@@ -248,6 +248,16 @@ class TestScanSkillCommands:
 
     # -- inter-skill slug collision dedup (#50304 / #63305) ------------------
 
+    def test_preserves_underscores_in_generated_command(self, tmp_path):
+        """Skill command names retain valid underscores from frontmatter."""
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "__demo")
+            result = scan_skill_commands()
+
+        assert "/__demo" in result
+        assert result["/__demo"]["name"] == "__demo"
+        assert result["/__demo"]["skill_dir"] == str(skill_dir)
+
     def test_slug_collision_keeps_first_skill(self, tmp_path):
         """Two skills whose names normalize to the same slug do not clobber.
 
