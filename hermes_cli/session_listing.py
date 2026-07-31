@@ -168,6 +168,53 @@ def session_rank(
     return None
 
 
+def _compression_root(session_db: Any, sid: str, max_hops: int = 50) -> str:
+    """Deepest compression ancestor of ``sid`` (itself when not in a chain).
+
+    Follows ``parent_session_id`` upward only across compression edges —
+    a child counts only if the parent ended with ``end_reason ==
+    "compression"`` and the child is not a branch (branches are their own
+    conversation). Does not rely on ``get_compression_lineage``, whose
+    forward walk assumes a linear chain and can fragment on divergent
+    children.
+    """
+    current = sid
+    for _ in range(max_hops):
+        meta = session_db.get_session(current) or {}
+        if session_db._is_branch_child_row(meta):
+            return current
+        parent_id = meta.get("parent_session_id")
+        if not parent_id:
+            return current
+        parent = session_db.get_session(parent_id)
+        if not parent or parent.get("end_reason") != "compression":
+            return current
+        current = parent_id
+    return current
+
+
+def dedup_compression_chains(
+    session_db: Any, sids: list[str]
+) -> set[str]:
+    """Keep only the latest descendant per compression chain.
+
+    FTS5 matches messages across compression generations, so several
+    children of one conversation (e.g. ``...#7`` and ``...#13`` with the
+    intermediate generations missing from the result set) can all appear.
+    Group every result by its deepest compression ancestor and keep the
+    newest descendant; branches are never collapsed into their source
+    chain.
+    """
+    best: dict[str, tuple[float, str]] = {}
+    for sid in sids:
+        root = _compression_root(session_db, sid)
+        meta = session_db.get_session(sid) or {}
+        ts = meta.get("started_at") or 0
+        if root not in best or ts > best[root][0]:
+            best[root] = (ts, sid)
+    return {sid for _, sid in best.values()}
+
+
 def render_sessions_table(
     sessions: list[dict[str, Any]],
     *,
@@ -259,8 +306,8 @@ def render_sessions_table(
             except Exception:
                 previews[sid] = s.get("preview") or ""
 
-    out(f"  {'#':>{num_w}}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
-    out(f"  {'─'*num_w}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
+    out(f"  {'#':>{num_w}}  {'Title':<{title_w}} {'Model':<10} {'Tok(In/Out)':>12}  {'Created':<10} {'Last':<8} {'Preview':<40} {'ID'}")
+    out(f"  {'─'*num_w}  {'─'*title_w} {'─'*10} {'─'*12}  {'─'*10} {'─'*8} {'─'*40} {'─'*24}")
     for idx, s in enumerate(sessions, 1):
         sid = s.get("id") or "—"
         num = s.get("rank") or idx
@@ -276,4 +323,4 @@ def render_sessions_table(
         pv = (previews.get(sid) or "")[:38]
         if len(previews.get(sid) or "") >= 38:
             pv = pv[:37] + "…"
-        out(f"  {num:>{num_w}}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<40} {sid}")
+        out(f"  {num:>{num_w}}  {title:<{title_w}} {model:<10} {tok_str:>12}  {created:<10} {when:<8} {pv:<40} {sid}")

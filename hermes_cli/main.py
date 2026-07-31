@@ -17985,18 +17985,13 @@ def main():
                 return
 
             # Deduplicate compression children: if A → A #2 → A #3,
-            # keep only the latest descendant in each lineage.
-            result_ids = set(seen.keys())
-            ancestors = set()
-            for sid in result_ids:
-                meta = db.get_session(sid) or {}
-                parent_id = meta.get("parent_session_id")
-                while parent_id and parent_id in result_ids:
-                    ancestors.add(parent_id)
-                    parent_meta = db.get_session(parent_id) or {}
-                    parent_id = parent_meta.get("parent_session_id")
-            for sid in ancestors:
-                seen.pop(sid, None)
+            # keep only the latest descendant in each lineage — even when
+            # intermediate generations are absent from the FTS5 hit set.
+            from hermes_cli.session_listing import dedup_compression_chains
+            kept = dedup_compression_chains(db, list(seen.keys()))
+            for sid in list(seen.keys()):
+                if sid not in kept:
+                    seen.pop(sid, None)
 
             # Sort by last_active descending (most recent first)
             sids_sorted = list(seen.keys())
