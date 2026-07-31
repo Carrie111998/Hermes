@@ -10161,8 +10161,9 @@ async def _start_device_code_flow(
     """
     if provider_id == "nous":
         from hermes_cli.auth import (
-            _request_device_code,
             PROVIDER_REGISTRY,
+            _request_device_code,
+            _resolve_nous_device_verification_url,
         )
         import httpx
         pconfig = PROVIDER_REGISTRY["nous"]
@@ -10192,6 +10193,9 @@ async def _start_device_code_flow(
         device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
             None, _do_nous_device_request
         )
+        verification_url, _rewritten = _resolve_nous_device_verification_url(
+            device_data, portal_base_url
+        )
         sid, sess = _new_oauth_session("nous", "device_code", profile=profile)
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
@@ -10206,7 +10210,7 @@ async def _start_device_code_flow(
             "session_id": sid,
             "flow": "device_code",
             "user_code": str(device_data["user_code"]),
-            "verification_url": str(device_data["verification_uri_complete"]),
+            "verification_url": verification_url,
             "expires_in": int(device_data["expires_in"]),
             "poll_interval": int(device_data["interval"]),
         }

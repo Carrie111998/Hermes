@@ -5010,6 +5010,91 @@ def _request_device_code(
     return data
 
 
+def _path_is_manage_subscription(url: str) -> bool:
+    """Return True when *url*'s path is the Portal plan/subscribe page."""
+    try:
+        path = (urlparse(url).path or "").rstrip("/").lower()
+    except Exception:
+        return "manage-subscription" in (url or "").lower()
+    return path.endswith("/manage-subscription")
+
+
+def _path_is_device_approval(url: str) -> bool:
+    """Return True when *url*'s path is the Portal device-approval page."""
+    try:
+        path = (urlparse(url).path or "").rstrip("/").lower()
+    except Exception:
+        return False
+    return path.endswith("/device")
+
+
+def _append_user_code_query(url: str, user_code: str) -> str:
+    """Ensure *url* carries ``user_code`` (leave existing code params alone)."""
+    if not user_code or not url:
+        return url
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query, keep_blank_values=True)
+    if "user_code" in qs or "code" in qs:
+        return url
+    sep = "&" if parsed.query else "?"
+    return f"{url}{sep}user_code={user_code}"
+
+
+def _resolve_nous_device_verification_url(
+    device_data: Dict[str, Any],
+    portal_base_url: str,
+) -> Tuple[str, bool]:
+    """Choose the browser URL for Nous device authorization.
+
+    Portal has been returning ``manage-subscription?user_code=…`` as
+    ``verification_uri_complete``. That page is a plan picker without a
+    device-approval UI, so users get stuck on CAPTCHA/login and the CLI
+    times out (#20605, #47950). Prefer the RFC-style ``/device`` page that
+    Hermes's own fixtures and docs expect.
+
+    Returns ``(url, rewritten)`` where *rewritten* is True when we replaced
+    a manage-subscription link with ``/device``.
+    """
+    user_code = str(device_data.get("user_code") or "").strip()
+    complete = str(device_data.get("verification_uri_complete") or "").strip()
+    base = str(device_data.get("verification_uri") or "").strip()
+    portal = (portal_base_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
+    fallback = (
+        f"{portal}/device?user_code={user_code}" if user_code else f"{portal}/device"
+    )
+
+    if base and _path_is_device_approval(base):
+        return _append_user_code_query(base, user_code), _path_is_manage_subscription(
+            complete
+        )
+
+    if complete and not _path_is_manage_subscription(complete):
+        return complete, False
+
+    if complete and _path_is_manage_subscription(complete) and user_code:
+        return fallback, True
+
+    if complete:
+        return complete, False
+    if base:
+        return _append_user_code_query(base, user_code), False
+    return fallback, bool(user_code)
+
+
+def _nous_device_auth_timeout_message(portal_base_url: str) -> str:
+    """Actionable timeout text for Nous device-code login failures."""
+    portal = (portal_base_url or DEFAULT_NOUS_PORTAL_URL).rstrip("/")
+    return (
+        "Timed out waiting for device authorization.\n"
+        "  Portal sign-in is required before the device code can be approved.\n"
+        "  If the browser showed a CAPTCHA / 'You did not pass CAPTCHA' error,\n"
+        "  finish signing in at the Portal in a normal browser tab, then retry:\n"
+        "    hermes portal\n"
+        f"  Device approval page: {portal}/device\n"
+        f"  Portal login: {portal}/login"
+    )
+
+
 def _poll_for_token(
     client: httpx.Client,
     portal_base_url: str,
@@ -8534,7 +8619,9 @@ def _nous_device_code_login(
             scope=scope,
         )
 
-        verification_url = str(device_data["verification_uri_complete"])
+        verification_url, rewritten = _resolve_nous_device_verification_url(
+            device_data, portal_base_url
+        )
         user_code = str(device_data["user_code"])
         expires_in = int(device_data["expires_in"])
         interval = int(device_data["interval"])
@@ -8543,6 +8630,11 @@ def _nous_device_code_login(
         print("To continue:")
         print(f"  1. Open: {verification_url}")
         print(f"  2. If prompted, enter code: {user_code}")
+        if rewritten:
+            print(
+                "  (Using /device approval URL — Portal's manage-subscription "
+                "link has no device-approval UI)"
+            )
 
         if open_browser:
             opened = webbrowser.open(verification_url)
@@ -8564,14 +8656,19 @@ def _nous_device_code_login(
         effective_interval = max(1, min(interval, DEVICE_AUTH_POLL_INTERVAL_CAP_SECONDS))
         print(f"Waiting for approval (polling every {effective_interval}s)...")
 
-        token_data = _poll_for_token(
-            client=client,
-            portal_base_url=portal_base_url,
-            client_id=client_id,
-            device_code=str(device_data["device_code"]),
-            expires_in=expires_in,
-            poll_interval=interval,
-        )
+        try:
+            token_data = _poll_for_token(
+                client=client,
+                portal_base_url=portal_base_url,
+                client_id=client_id,
+                device_code=str(device_data["device_code"]),
+                expires_in=expires_in,
+                poll_interval=interval,
+            )
+        except TimeoutError as exc:
+            raise TimeoutError(
+                _nous_device_auth_timeout_message(portal_base_url)
+            ) from exc
 
     now = datetime.now(timezone.utc)
     token_expires_in = _coerce_ttl_seconds(token_data.get("expires_in", 0))
