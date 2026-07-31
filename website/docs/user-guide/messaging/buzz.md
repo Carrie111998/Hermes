@@ -54,8 +54,24 @@ Path ③ keeps full Hermes (memory, skills, approvals, cron, multi-platform gate
 ## Prerequisites
 
 1. **A Buzz community relay** you can join — either [host one](https://github.com/block/buzz) or get invited to an existing community.
-2. **The [`buzz` CLI binary](https://github.com/block/buzz)** on `PATH` (or set `BUZZ_CLI_PATH`). Build with `cargo build --release -p buzz-cli`.
+2. **The [`buzz` CLI binary](https://github.com/block/buzz)** on `PATH` (or set `BUZZ_CLI_PATH`). On a machine with the Rust toolchain, build it with `cargo build --release -p buzz-cli`.
 3. **Agent identity that is a community member** — Desktop create is the practical mint path; then stop Desktop ACP and use Hermes gateway.
+
+### Hermes Cloud: install the CLI without Rust
+
+The Buzz Desktop Debian package includes the self-contained `buzz` CLI. On an x86-64 Hermes Cloud instance, extract only that binary to the persistent volume. The commands below pin the current verified Buzz release, [v0.5.2](https://github.com/block/buzz/releases/tag/v0.5.2):
+
+```bash
+cd /tmp
+curl -fsSL -o buzz.deb https://github.com/block/buzz/releases/download/v0.5.2/Buzz_0.5.2_amd64.deb
+mkdir -p /opt/data/.local/bin
+dpkg-deb --fsys-tarfile buzz.deb | tar -xO usr/bin/buzz > /opt/data/.local/bin/buzz
+chmod +x /opt/data/.local/bin/buzz
+rm buzz.deb
+buzz --version
+```
+
+`/opt/data/.local/bin` is already on the Hermes Cloud image `PATH`, and `/opt/data` persists across restarts and image updates.
 
 ## Quick setup
 
@@ -105,6 +121,15 @@ platforms:
 ```
 
 `BUZZ_PRIVATE_KEY` and `BUZZ_AUTH_TAG` stay in `.env` (secrets). Everything else can live in `config.yaml` under `platforms.buzz.extra`.
+
+Buzz defaults to final-answer-first delivery, so natural mid-turn assistant narration does not become extra permanent channel messages. To opt back in:
+
+```yaml
+display:
+  platforms:
+    buzz:
+      interim_assistant_messages: true
+```
 
 ## How it works
 

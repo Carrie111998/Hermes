@@ -632,6 +632,10 @@ def test_interactive_setup_resolves_cli_and_reprompts_invalid_auth_tag(monkeypat
     assert saved["BUZZ_AUTH_TAG"] == valid_auth_tag
     assert [value for key, value in writes if key == "BUZZ_AUTH_TAG"] == [valid_auth_tag]
     assert any("must be valid JSON" in warning for warning in warnings)
+    assert any(
+        "authentication is not channel membership" in warning.lower()
+        for warning in warnings
+    )
 
 
 def test_interactive_setup_live_probe_never_joins_dm_shaped_channels(monkeypatch):

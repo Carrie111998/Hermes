@@ -1463,7 +1463,7 @@ def buzz_recommended_setup_steps() -> list[str]:
         "1. In Buzz Desktop: Create the agent so the community mints identity + NIP-OA auth tag.",
         "2. Stop the Desktop worker immediately and turn off start-on-launch.",
         "3. Paste that nsec + auth tag into Hermes (this wizard). Do not leave Desktop ACP running on the same key.",
-        "4. Join the channels you care about and publish a profile so humans can DM / @mention the agent.",
+        "4. Join at least one community channel and publish a profile. Relay auth alone does not make the agent visible for DM / @mention.",
         "5. Reload the Hermes gateway process and smoke-test: untagged DM replies, channels need a mention.",
         "Desktop ACP (paths 1/2) is easier for a quick try. Path 3 keeps Hermes memory, skills, cron, and approvals.",
     ]
@@ -1527,7 +1527,8 @@ def interactive_setup() -> None:
     else:
         print_warning(
             "buzz CLI not found on PATH. Install from https://github.com/block/buzz "
-            "(cargo build --release -p buzz-cli) or set BUZZ_CLI_PATH."
+            "or set BUZZ_CLI_PATH. Hermes Cloud users can extract usr/bin/buzz "
+            "from the Buzz Desktop .deb into /opt/data/.local/bin; see the Buzz docs."
         )
         custom_cli = prompt("Path to buzz binary (or empty to continue anyway)", default="")
         if custom_cli.strip():
@@ -1606,6 +1607,12 @@ def interactive_setup() -> None:
             default=get_env_value("BUZZ_ALLOWED_USERS") or "",
         )
         save_env_value("BUZZ_ALLOWED_USERS", allowed.replace(" ", "") if allowed else "")
+
+    print()
+    print_warning(
+        "Relay authentication is not channel membership. Until this identity joins "
+        "at least one community channel, people cannot find or @mention the agent."
+    )
 
     # Live membership / join assist when CLI + key are present
     private_key = _resolve_private_key()
@@ -1710,9 +1717,10 @@ def interactive_setup() -> None:
     print_info("Smoke checklist after you reload the gateway process:")
     print_info("  1. Reload Hermes gateway (separate terminal / service supervisor)")
     print_info("  2. Confirm Desktop ACP is STOPPED for this agent key")
-    print_info("  3. Untagged DM → agent replies")
-    print_info("  4. Channel without mention → silence (if require_mention=true)")
-    print_info("  5. @Agent in channel → reply")
+    print_info("  3. Confirm the agent appears in at least one channel member list")
+    print_info("  4. Untagged DM → agent replies")
+    print_info("  5. Channel without mention → silence (if require_mention=true)")
+    print_info("  6. @Agent in channel → reply")
     print_info(
         "If DM search cannot find the agent, it is usually not a channel member yet."
     )
