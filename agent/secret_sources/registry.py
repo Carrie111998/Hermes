@@ -27,9 +27,9 @@ third-party backends ship as standalone plugin repos implementing
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -205,33 +205,57 @@ def _fetch_with_timeout(
     result is discarded.  The thread itself may linger until process
     exit — acceptable for a startup-only path, and strictly better than
     an unbounded hang on every ``hermes`` invocation.
+
+    The worker is an explicit ``threading.Thread(daemon=True)`` and NOT a
+    ``concurrent.futures.ThreadPoolExecutor`` on purpose: executor workers
+    are non-daemon threads that ``concurrent.futures.thread`` joins at
+    interpreter shutdown via its atexit hook, and ``shutdown(wait=False)``
+    does not detach them.  With an executor, a fetch stuck in a hung
+    download or subprocess kept the whole process alive at exit — the
+    TIMEOUT result was returned, the command printed its output, and then
+    the CLI hung forever anyway (#72071: ``hermes gateway status`` never
+    returning with a misconfigured Bitwarden source).  A daemon thread
+    cannot block interpreter shutdown, which is the entire point of this
+    budget.
     """
     timeout = source.fetch_timeout_seconds(cfg)
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
-    )
-    try:
-        future = executor.submit(source.fetch, cfg, home_path)
-        try:
-            result = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            future.cancel()
-            res = FetchResult()
-            res.error = (
-                f"fetch exceeded {timeout:.0f}s budget — startup continued "
-                "without this source (raise secrets."
-                f"{source.name}.timeout_seconds if the backend is just slow)"
-            )
-            res.error_kind = ErrorKind.TIMEOUT
-            return res
-        except Exception as exc:  # noqa: BLE001 — contract violation, contain it
-            res = FetchResult()
-            res.error = f"fetch raised {type(exc).__name__}: {exc}"
-            res.error_kind = ErrorKind.INTERNAL
-            return res
-    finally:
-        executor.shutdown(wait=False)
 
+    outcome: Dict[str, object] = {}
+    done = threading.Event()
+
+    def _worker() -> None:
+        try:
+            outcome["result"] = source.fetch(cfg, home_path)
+        except Exception as exc:  # noqa: BLE001 — contract violation, contain it
+            outcome["exception"] = exc
+        finally:
+            done.set()
+
+    worker = threading.Thread(
+        target=_worker,
+        name=f"secret-src-{source.name}",
+        daemon=True,
+    )
+    worker.start()
+
+    if not done.wait(timeout):
+        res = FetchResult()
+        res.error = (
+            f"fetch exceeded {timeout:.0f}s budget — startup continued "
+            "without this source (raise secrets."
+            f"{source.name}.timeout_seconds if the backend is just slow)"
+        )
+        res.error_kind = ErrorKind.TIMEOUT
+        return res
+
+    exc = outcome.get("exception")
+    if exc is not None:
+        res = FetchResult()
+        res.error = f"fetch raised {type(exc).__name__}: {exc}"
+        res.error_kind = ErrorKind.INTERNAL
+        return res
+
+    result = outcome.get("result")
     if not isinstance(result, FetchResult):
         res = FetchResult()
         res.error = (
