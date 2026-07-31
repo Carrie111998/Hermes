@@ -2327,6 +2327,105 @@ class TestAutoMaintenance:
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
 
+    def test_repair_orphan_references_cleans_all_three_classes(self, db):
+        """Repair nulls dangling parents and deletes orphan messages/usage rows."""
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+        db.append_message(session_id="child", role="user", content="hello")
+
+        # Simulate a legacy FK-off deletion of `parent`: rows that reference it
+        # are now orphaned. FK is enforced on this connection, so delete the
+        # parent via raw SQL with FK off to mimic the historical bug.
+        db._conn.execute("PRAGMA foreign_keys=OFF")
+        db._conn.execute("DELETE FROM sessions WHERE id = 'parent'")
+        db._conn.execute("PRAGMA foreign_keys=ON")
+        db._conn.commit()
+
+        # Orphan usage row pointing at a session that no longer exists
+        # (FK off here too — an FK-off connection could also have written this)
+        db._conn.execute("PRAGMA foreign_keys=OFF")
+        db._conn.execute(
+            "INSERT INTO session_model_usage "
+            "(session_id, model, billing_provider, api_call_count) "
+            "VALUES ('ghost_session', 'test-model', 'test', 1)"
+        )
+        db._conn.execute("PRAGMA foreign_keys=ON")
+        db._conn.commit()
+
+        repaired = db.repair_orphan_references()
+
+        assert repaired["parent_pointers_nulled"] == 1  # child.parent → NULL
+        assert repaired["orphan_usage_deleted"] == 1  # ghost usage row
+        # child has no orphan messages (parent had none), so 0 expected here
+        assert repaired["orphan_messages_deleted"] == 0
+
+        # FK check is now clean
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+        # child survived and its parent pointer was nulled, not deleted
+        child = db.get_session("child")
+        assert child is not None
+        assert child["parent_session_id"] is None
+
+    def test_repair_orphan_references_deletes_orphan_messages(self, db):
+        """Messages whose session row is gone are removed by repair."""
+        db.create_session(session_id="alive", source="cli")
+        db.append_message(session_id="alive", role="user", content="keep me")
+
+        # Orphan message rows (session deleted out-of-band)
+        db._conn.execute("PRAGMA foreign_keys=OFF")
+        db._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('gone1', 'user', 'orphan msg', ?)",
+            (time.time(),),
+        )
+        db._conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('gone2', 'user', 'orphan msg', ?)",
+            (time.time(),),
+        )
+        db._conn.execute("PRAGMA foreign_keys=ON")
+        db._conn.commit()
+
+        repaired = db.repair_orphan_references()
+
+        assert repaired["orphan_messages_deleted"] == 2
+        assert repaired["orphan_usage_deleted"] == 0
+        # Alive session's messages untouched
+        assert len(db.search_messages("keep me")) == 1
+
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+    def test_auto_prune_runs_orphan_repair(self, db):
+        """maybe_auto_prune_and_vacuum self-heals FK orphans in the same pass."""
+        # Prunable old session with an orphan child pointer
+        self._make_old_ended(db, "old", days_old=100)
+        db._conn.execute("PRAGMA foreign_keys=OFF")
+        db._conn.execute(
+            "INSERT INTO sessions (id, source, parent_session_id, started_at) "
+            "VALUES ('orphan_child', 'cli', 'no_such_parent', ?)",
+            (time.time(),),
+        )
+        db._conn.execute(
+            "INSERT INTO session_model_usage "
+            "(session_id, model, billing_provider, api_call_count) "
+            "VALUES ('ghost', 'm', 'p', 1)"
+        )
+        db._conn.execute("PRAGMA foreign_keys=ON")
+        db._conn.commit()
+
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+
+        assert result["pruned"] == 1  # old session pruned
+        assert "repaired" in result
+        assert result["repaired"]["parent_pointers_nulled"] == 1
+        assert result["repaired"]["orphan_usage_deleted"] == 1
+
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
 
 
 
