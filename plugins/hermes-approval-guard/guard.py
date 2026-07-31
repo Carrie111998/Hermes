@@ -197,8 +197,15 @@ def pre_tool_call_handler(
     task_id: str = "",
     session_id: str = "",
     tool_call_id: str = "",
+    **_extra: Any,
 ) -> Optional[Dict[str, str]]:
-    """pre_tool_call hook callback."""
+    """pre_tool_call hook callback.
+
+    Accepts (and ignores) extra dispatch kwargs — turn_id, api_request_id,
+    middleware_trace, telemetry_schema_version — the same way the bundled
+    langfuse / security-guidance hooks do, so future dispatch fields never
+    turn this hook into a silent no-op via TypeError.
+    """
     cfg = _load_config()
     if not cfg.get("enabled", False):
         return None
