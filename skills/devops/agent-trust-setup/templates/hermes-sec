@@ -1,0 +1,79 @@
+#!/bin/bash
+# hermes-sec — Launch Hermes with secrets injected from Infisical
+#
+# Usage:
+#   hermes-sec          # launches hermes desktop with dev secrets (no approval)
+#   hermes-sec --prod   # launches with prod secrets (requires approval gate)
+#   hermes-sec --cli    # launches hermes CLI instead of desktop
+#
+# Setup (one-time):
+#   1. infisical login              # Login to Infisical Cloud
+#   2. cd ~ && infisical init       # Creates ~/.infisical.json linking to your project
+#   3. infisical secrets set HERMES_CUSTOM_API_AIAND_COM_API_KEY="..." --env=dev
+#      infisical secrets set SUDO_PASSWORD="..." --env=dev
+#      infisical secrets set EXA_API_KEY="..." --env=dev
+#
+# Secret mapping (stored in Infisical, NOT in .env):
+#   HERMES_CUSTOM_API_AIAND_COM_API_KEY   → provider API key
+#   SUDO_PASSWORD                         → local sudo access
+#   EXA_API_KEY                           → Exa web search
+#
+# Non-secret config (terminal backend, browser settings, etc.) stays in .env
+
+set -euo pipefail
+
+# Parse args
+ENV="dev"
+SURFACE="desktop"
+for arg in "$@"; do
+  case "$arg" in
+    --prod) ENV="prod" ;;
+    --cli)  SURFACE="cli" ;;
+    --help|-h)
+      echo "Usage: hermes-sec [--prod] [--cli] [hermes-args...]"
+      echo "  --prod  Use prod environment (approval-gated secrets)"
+      echo "  --cli   Launch CLI instead of desktop app"
+      echo ""
+      echo "Setup: infisical login && infisical init"
+      exit 0
+      ;;
+  esac
+done
+
+# Check Infisical is installed
+if ! command -v infisical &>/dev/null; then
+  echo "ERROR: infisical CLI not found. Install with: npm install -g @infisical/cli"
+  exit 1
+fi
+
+# Check that infisical init has been run (looks for .infisical.json in home or cwd)
+CONFIG_FILE=""
+for candidate in "$HOME/.infisical.json" "./.infisical.json"; do
+  if [ -f "$candidate" ]; then
+    CONFIG_FILE="$candidate"
+    break
+  fi
+done
+
+if [ -z "$CONFIG_FILE" ]; then
+  echo "ERROR: No .infisical.json found."
+  echo "Run these commands first:"
+  echo "  infisical login      # Login to Infisical Cloud"
+  echo "  infisical init       # Connect this directory to your Infisical project"
+  echo ""
+  echo "Then add your secrets:"
+  echo "  infisical secrets set HERMES_CUSTOM_API_AIAND_COM_API_KEY=\"...\" --env=dev"
+  echo "  infisical secrets set SUDO_PASSWORD=\"...\" --env=dev"
+  echo "  infisical secrets set EXA_API_KEY=\"...\" --env=dev"
+  exit 1
+fi
+
+echo "Using Infisical config: $CONFIG_FILE (env: $ENV)"
+
+# Launch Hermes with secrets injected from Infisical
+# Non-secret env vars from .env are still loaded by Hermes normally
+if [ "$SURFACE" = "cli" ]; then
+  exec infisical run --env="$ENV" -- hermes "$@"
+else
+  exec infisical run --env="$ENV" -- hermes desktop
+fi
