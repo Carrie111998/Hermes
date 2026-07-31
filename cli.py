@@ -8077,11 +8077,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
 
         index = int(stripped)
-        if index < 1 or index > len(pending):
+        # The # column shows global positions (page 2 renders offset+1 ..
+        # offset+len(pending)), so a bare number is a global rank. Bound it
+        # against the displayed window — checking against len(pending) alone
+        # rejects every valid selection on a paginated page.
+        offset = getattr(self, "_pending_resume_offset", 0)
+        if index < offset + 1 or index > offset + len(pending):
             _cprint(f"  Resume index {index} is out of range.")
             _cprint("  Use /resume with no arguments to see available sessions.")
             return True
 
+        # Forward the global rank; _handle_resume_command converts it to the
+        # page-local index via the stored offset.
         self._handle_resume_command(f"/resume {index}")
         return True
 

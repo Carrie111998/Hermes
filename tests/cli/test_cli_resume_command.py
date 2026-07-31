@@ -308,6 +308,76 @@ class TestPendingResumeNumberedSelection:
         assert cli_obj.session_id == "current_session"
         assert cli_obj._pending_resume_sessions is None
 
+    def test_pending_number_on_paginated_page_resolves_global_rank(self):
+        """Page-2 arming: the # column shows global ranks 11..20, so a bare
+        number is a global rank, not a page-local position.
+
+        Regression coverage for the pagination feature: the bounds check
+        used len(pending) (page-relative) while _handle_resume_command
+        converts global -> local via the stored offset — every valid
+        selection on a page with offset > 0 failed one of the two checks.
+        """
+        cli_obj = _make_cli()
+        # Page 2 of a 10-per-page list: rows are global ranks 11..20.
+        sessions = [
+            {"id": f"sess_{11 + i}", "title": f"Session {11 + i}"} for i in range(10)
+        ]
+        cli_obj._pending_resume_sessions = sessions
+        cli_obj._pending_resume_limit = 10
+        cli_obj._pending_resume_offset = 10
+        # _handle_resume_command re-resolves the index against the same page.
+        cli_obj._list_recent_sessions = MagicMock(return_value=sessions)
+        target = {"id": "sess_12", "title": "Session 12"}
+        cli_obj._session_db.get_session.return_value = target
+        cli_obj._session_db.get_resume_conversations.return_value = [], []
+        cli_obj._session_db.resolve_resume_session_id.return_value = "sess_12"
+
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint"),
+        ):
+            consumed = cli_obj._consume_pending_resume_selection("12")
+
+        assert consumed is True
+        assert cli_obj.session_id == "sess_12"
+        assert cli_obj._pending_resume_sessions is None
+
+    def test_pending_number_below_paginated_window_is_out_of_range(self):
+        """A bare number not on the displayed page (e.g. `5` while page 2
+        shows ranks 11..20) is rejected instead of silently resolving to a
+        different page's row."""
+        cli_obj = _make_cli()
+        sessions = [
+            {"id": f"sess_{11 + i}", "title": f"Session {11 + i}"} for i in range(10)
+        ]
+        cli_obj._pending_resume_sessions = sessions
+        cli_obj._pending_resume_offset = 10
+
+        with patch("cli._cprint") as mock_cprint:
+            consumed = cli_obj._consume_pending_resume_selection("5")
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert consumed is True
+        assert "out of range" in printed.lower()
+        assert cli_obj.session_id == "current_session"
+
+    def test_pending_number_above_paginated_window_is_out_of_range(self):
+        """Page 2 shows ranks 11..20; `21` is not on screen and must fail."""
+        cli_obj = _make_cli()
+        sessions = [
+            {"id": f"sess_{11 + i}", "title": f"Session {11 + i}"} for i in range(10)
+        ]
+        cli_obj._pending_resume_sessions = sessions
+        cli_obj._pending_resume_offset = 10
+
+        with patch("cli._cprint") as mock_cprint:
+            consumed = cli_obj._consume_pending_resume_selection("21")
+
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert consumed is True
+        assert "out of range" in printed.lower()
+        assert cli_obj.session_id == "current_session"
+
     def test_pending_non_numeric_falls_through_and_disarms(self):
         cli_obj = _make_cli()
         cli_obj._pending_resume_sessions = [{"id": "sess_002", "title": "Coding"}]
