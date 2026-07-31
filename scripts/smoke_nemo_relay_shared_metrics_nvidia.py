@@ -63,6 +63,8 @@ def _new_output_directory(output_dir: Path | None) -> Path:
 
 
 def _counter_rows(database_path: Path) -> dict[tuple[str, str], int]:
+    if not database_path.exists():
+        return {}
     with sqlite3.connect(database_path) as connection:
         rows = connection.execute(
             """
@@ -161,7 +163,10 @@ def _assert_live_deltas(
         if after_totals.get(name, 0) != before_totals.get(name, 0)
     }
     expected = {
-        "hermes.model_call.count": 1,
+        "hermes.client.active": 1,
+        "hermes.client.first_successful_task": 1,
+        "hermes.client.first_usable": 1,
+        "hermes.model_route.count": 1,
         "hermes.task_run.finished": 1,
         "hermes.task_run.started": 1,
     }
@@ -171,9 +176,9 @@ def _assert_live_deltas(
         )
 
     deltas = _row_deltas(before, after)
-    [model] = [item for item in deltas if item[0] == "hermes.model_call.count"]
+    [model] = [item for item in deltas if item[0] == "hermes.model_route.count"]
     if model != (
-        "hermes.model_call.count",
+        "hermes.model_route.count",
         {"model": expected_model, "provider": "nvidia"},
         1,
     ):
@@ -212,7 +217,10 @@ def _validate_live_package(
     jsonschema.validate(package, schema)
     metric_names = sorted(metric["name"] for metric in package["metrics"])
     if metric_names != [
-        "hermes.model_call.count",
+        "hermes.client.active",
+        "hermes.client.first_successful_task",
+        "hermes.client.first_usable",
+        "hermes.model_route.count",
         "hermes.task_run.finished",
         "hermes.task_run.started",
     ]:
@@ -220,10 +228,10 @@ def _validate_live_package(
     [model_metric] = [
         metric
         for metric in package["metrics"]
-        if metric["name"] == "hermes.model_call.count"
+        if metric["name"] == "hermes.model_route.count"
     ]
     if model_metric != {
-        "name": "hermes.model_call.count",
+        "name": "hermes.model_route.count",
         "type": "counter",
         "dimensions": {"model": model, "provider": "nvidia"},
         "value": 1,
@@ -257,10 +265,12 @@ def main() -> int:
     _run_deterministic_smoke(
         hermes_repo=hermes_repo,
         relay_python=relay_python,
-        root=root,
+        root=root / "deterministic",
     )
-    home = root / "hermes-home"
+    home = root / "live-hermes-home"
     workdir = root / "workspace"
+    home.mkdir(parents=True)
+    workdir.mkdir(parents=True)
     telemetry = home / "telemetry" / "shared_metrics"
     database_path = telemetry / "metrics.sqlite3"
     before_rows = _counter_rows(database_path)
@@ -330,7 +340,7 @@ def main() -> int:
             / "hermes_cli"
             / "observability"
             / "schemas"
-            / "hermes.shared_metrics.v1.schema.json"
+            / "hermes.shared_metrics.v2.schema.json"
         ),
         model=args.nvidia_model,
         api_key=api_key,

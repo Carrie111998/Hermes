@@ -14,9 +14,9 @@ from .shared_metrics import SharedMetricsStore
 from .shared_metrics_contract import (
     CLIENT_ACTIVE_METRIC,
     CLIENT_FIRST_USABLE_METRIC,
-    MODEL_CALL_METRIC,
     TASK_FINISHED_METRIC,
     TASK_STARTED_METRIC,
+    MODEL_ROUTE_METRIC,
     TOOL_CALL_METRIC,
     client_active_counter,
     client_lifecycle_counter,
@@ -76,7 +76,7 @@ class SharedMetricsSubscriber:
                 metric_name, dimensions = metric
         if dimensions is None:
             dimensions = model_call_dimensions(event)
-            metric_name = MODEL_CALL_METRIC
+            metric_name = MODEL_ROUTE_METRIC
         if dimensions is None:
             dimensions = tool_call_dimensions(event)
             metric_name = TOOL_CALL_METRIC

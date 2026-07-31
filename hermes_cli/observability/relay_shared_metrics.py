@@ -115,6 +115,7 @@ class SetupMetricsAttempt:
 
     session_id: str
     mode: str
+    _runtime: _Runtime = field(repr=False, compare=False)
 
 
 @dataclass
@@ -1151,12 +1152,14 @@ def enabled() -> bool:
     """Return the shared-metrics policy for the active Hermes profile."""
     profile_key = relay_runtime.current_profile_key()
     try:
-        from hermes_cli.config import read_raw_config
+        from hermes_cli.config import read_raw_config_readonly
 
         # Collection consent is profile-owned. Managed config overlays may
         # control runtime policy, but cannot opt a profile into or out of
-        # shared metrics.
-        config = read_raw_config() or {}
+        # shared metrics. Read-only fast path: this gate runs 2-3x per agent
+        # turn, and the mutable read_raw_config() paid a full config deepcopy
+        # on every call.
+        config = read_raw_config_readonly() or {}
     except Exception:
         logger.debug("Unable to read Hermes shared-metrics policy", exc_info=True)
         value = False
@@ -1254,6 +1257,7 @@ def start_setup_lifecycle(mode: str) -> SetupMetricsAttempt | None:
     attempt = SetupMetricsAttempt(
         session_id=f"hermes-shared-metrics-setup-{uuid.uuid4()}",
         mode=normalized_mode,
+        _runtime=runtime,
     )
     if runtime._safe(runtime.record_setup_started, attempt) is not True:
         runtime._safe(runtime.close_owned_session, attempt.session_id)
@@ -1268,10 +1272,11 @@ def finish_setup_lifecycle(
     failure_stage: str = "none",
 ) -> None:
     """Finish and export one consented setup lifecycle without raw error data."""
-    if attempt is None or not enabled():
+    if attempt is None:
         return
-    runtime = _get_runtime()
-    if runtime is None:
+    runtime = attempt._runtime
+    if not enabled():
+        runtime._safe(runtime.close_owned_session, attempt.session_id)
         return
     normalized_outcome = outcome if outcome in SETUP_OUTCOMES else "failed"
     normalized_stage = (
