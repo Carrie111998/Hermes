@@ -31,11 +31,11 @@ async def test_teams_inbound_message_sends_placeholder_and_carries_metadata():
 
     activity = SimpleNamespace(
         id="incoming-1",
-        text="<at>本部AI エルメス</at> 今日の天気は？",
+        text="<at>Assistant</at> what is the weather today?",
         from_=SimpleNamespace(id="user-id", aad_object_id="aad-id", name="Yuta"),
         conversation=SimpleNamespace(
             id="conversation-1",
-            name="honbu hermes（TEST）",
+            name="general",
             conversation_type="channel",
             tenant_id="tenant-1",
         ),
@@ -47,11 +47,11 @@ async def test_teams_inbound_message_sends_placeholder_and_carries_metadata():
 
     adapter.send.assert_awaited_once_with(
         "conversation-1",
-        "🤔 考え中...",
+        "Working on it...",
         reply_to="incoming-1",
     )
     assert captured_events
-    assert captured_events[0].text == "今日の天気は？"
+    assert captured_events[0].text == "what is the weather today?"
     assert captured_events[0].metadata["_stream_message_id"] == "placeholder-1"
 
 
@@ -115,3 +115,49 @@ async def test_teams_typing_status_edits_placeholder_message():
         "🤔 Web で検索中...",
     )
     adapter._app.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_placeholder_survives_a_tool_boundary():
+    """A turn that calls a tool before writing text must reuse the message.
+
+    The tool-boundary reset clears the edit target so the next text chunk lands
+    below any tool-progress messages.  When the model calls a tool first, that
+    reset runs while the adapter's acknowledgement is still untouched, and
+    dropping it there leaves the acknowledgement stranded above a second
+    message carrying the answer.
+    """
+
+    from unittest.mock import MagicMock
+
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="conversation-1",
+        metadata={"_stream_message_id": "placeholder-1"},
+    )
+
+    consumer._reset_segment_state()
+
+    assert consumer._message_id == "placeholder-1"
+    assert consumer._segment_preview_message_ids == {"placeholder-1"}
+
+
+@pytest.mark.asyncio
+async def test_message_that_already_showed_text_is_still_released():
+    from unittest.mock import MagicMock
+
+    from gateway.stream_consumer import GatewayStreamConsumer
+
+    consumer = GatewayStreamConsumer(
+        adapter=MagicMock(),
+        chat_id="conversation-1",
+        metadata={"_stream_message_id": "placeholder-1"},
+    )
+    consumer._last_sent_text = "partial answer"
+
+    consumer._reset_segment_state()
+
+    assert consumer._message_id is None
+    assert consumer._segment_preview_message_ids == set()

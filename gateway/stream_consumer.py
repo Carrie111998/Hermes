@@ -245,6 +245,9 @@ class GatewayStreamConsumer:
             self._message_created_ts = time.monotonic()
             self._preview_message_ids.add(self._message_id)
             self._segment_preview_message_ids.add(self._message_id)
+            logger.debug(
+                "stream: editing the adapter's message %s", self._message_id,
+            )
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
@@ -475,6 +478,17 @@ class GatewayStreamConsumer:
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        # A message we have never written to is not a finalized segment. An
+        # adapter-supplied acknowledgement is the case that matters: a turn
+        # that calls a tool before emitting any text hits this reset first, and
+        # dropping the id there strands the acknowledgement on screen while the
+        # answer arrives as a second message. Nothing was committed to it, so
+        # there is nothing to leave above the next segment.
+        keep_untouched_target = bool(
+            self._message_id
+            and self._message_id != "__no_edit__"
+            and not self._last_sent_text
+        )
         # Retain the finalized visible text of the current segment before
         # clearing ``_last_sent_text``, so ``has_delivered_text`` can still
         # match it after a segment break. (#65919 review)
@@ -482,14 +496,17 @@ class GatewayStreamConsumer:
             finalized = self._clean_for_display(self._last_sent_text).strip()
             if finalized:
                 self._delivered_segment_texts.append(finalized)
-        self._message_id = None
-        self._message_created_ts = None
+        if not keep_untouched_target:
+            self._message_id = None
+            self._message_created_ts = None
         self._accumulated = ""
         self._last_sent_text = ""
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
-        self._segment_preview_message_ids = set()
+        self._segment_preview_message_ids = (
+            {self._message_id} if keep_untouched_target and self._message_id else set()
+        )
         # #29346: a tool/segment boundary means what we delivered was an interim
         # preamble, not the final answer — clear the flags so a premature setter
         # can't fool the gateway. Safe: got_done returns before any reset, and
