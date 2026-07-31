@@ -142,6 +142,39 @@ class TestEnsure:
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
 
+    def test_ensure_wake_sherpa_supplies_pypinyin_when_missing(self, monkeypatch):
+        """#75321 / #75241: when sherpa-onnx is present but pypinyin is not,
+        ensure('wake.sherpa') must install the pypinyin pin via the Hermes
+        venv installer (_venv_pip_install), not leave text2token to fail.
+        """
+        sherpa_specs = ld.LAZY_DEPS["wake.sherpa"]
+        pypinyin_specs = [s for s in sherpa_specs if s.startswith("pypinyin")]
+        assert pypinyin_specs == ["pypinyin==0.55.0"]
+
+        already_ok = {s for s in sherpa_specs if not s.startswith("pypinyin")}
+        supplied: set[str] = set()
+        pip_batches: list[tuple[str, ...]] = []
+
+        def _is_satisfied(spec: str) -> bool:
+            return spec in already_ok or spec in supplied
+
+        def _venv_pip_install(specs, **_kw):
+            batch = tuple(specs)
+            pip_batches.append(batch)
+            supplied.update(batch)
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_is_satisfied", _is_satisfied)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(ld, "_venv_pip_install", _venv_pip_install)
+
+        assert ld.feature_missing("wake.sherpa") == ("pypinyin==0.55.0",)
+        ld.ensure("wake.sherpa", prompt=False)
+
+        assert pip_batches == [("pypinyin==0.55.0",)]
+        assert ld.feature_missing("wake.sherpa") == ()
+        assert ld.is_available("wake.sherpa") is True
+
 
 # ---------------------------------------------------------------------------
 # is_available

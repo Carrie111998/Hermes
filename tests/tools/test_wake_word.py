@@ -665,3 +665,69 @@ def test_sherpa_text2token_missing_module_targets_hermes_executable(monkeypatch,
     assert "Do not use system/Homebrew pip" in msg
     # Must not recommend bare Homebrew/system pip as the primary command.
     assert "Please run `pip install pypinyin`" not in msg
+
+
+def test_sherpa_engine_ensure_supplies_pypinyin_before_text2token(monkeypatch, tmp_path):
+    """#75321 review: ensure('wake.sherpa') must supply pypinyin into the
+    Hermes install path before text2token() runs.
+    """
+    from tools import lazy_deps as ld
+
+    model_dir = tmp_path / "sherpa-model"
+    model_dir.mkdir()
+    (model_dir / "tokens.txt").write_text("a\n", encoding="utf-8")
+    (model_dir / "bpe.model").write_text("bpe", encoding="utf-8")
+    for name in ("encoder-x.onnx", "decoder-x.onnx", "joiner-x.onnx"):
+        (model_dir / name).write_bytes(b"onnx")
+
+    sherpa_specs = ld.LAZY_DEPS["wake.sherpa"]
+    already_ok = {s for s in sherpa_specs if not s.startswith("pypinyin")}
+    supplied: set[str] = set()
+    pip_batches: list[tuple[str, ...]] = []
+    text2token_calls: list[list[str]] = []
+
+    def _is_satisfied(spec: str) -> bool:
+        return spec in already_ok or spec in supplied
+
+    def _venv_pip_install(specs, **_kw):
+        batch = tuple(specs)
+        pip_batches.append(batch)
+        supplied.update(batch)
+        return ld._InstallResult(True, "ok", "")
+
+    monkeypatch.setattr(ld, "_is_satisfied", _is_satisfied)
+    monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+    monkeypatch.setattr(ld, "_venv_pip_install", _venv_pip_install)
+
+    def _text2token(phrases, **_kw):
+        assert any(s.startswith("pypinyin==") for s in supplied), (
+            "text2token ran before ensure supplied pypinyin"
+        )
+        text2token_calls.append(list(phrases))
+        return [["tok"] for _ in phrases]
+
+    class _FakeSpotter:
+        def __init__(self, **_kw):
+            pass
+
+        def create_stream(self):
+            return object()
+
+    fake_sherpa = types.ModuleType("sherpa_onnx")
+    fake_sherpa.text2token = _text2token
+    fake_sherpa.KeywordSpotter = _FakeSpotter
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake_sherpa)
+    monkeypatch.setattr(ww, "enrolled_profile_phrases", lambda: {})
+
+    eng = ww._SherpaKwsEngine(
+        {
+            "provider": "sherpa",
+            "phrase": "hey hermes",
+            "profile_routing": False,
+            "sherpa": {"model_dir": str(model_dir)},
+        }
+    )
+
+    assert pip_batches == [("pypinyin==0.55.0",)]
+    assert text2token_calls == [["HEY HERMES"]]
+    assert eng._spotter is not None
