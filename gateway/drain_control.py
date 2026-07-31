@@ -50,11 +50,23 @@ both degrade to the original presence-only behaviour — never fail-closed.
 from __future__ import annotations
 
 import functools
+import hashlib
+import hmac
 import json
 import logging
+import os
+import re
+import stat
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no production helper.
+    fcntl = None  # type: ignore[assignment]
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -62,6 +74,12 @@ from utils import atomic_json_write
 _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
+_DRAIN_REQUEST_LOCK_FILENAME = ".drain_request.lock"
+_PROCESS_DRAIN_MUTATION_LOCK = threading.RLock()
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_HELD_TRANSACTION_FIELD = "held_transaction_sha256"
+_HELD_CAPABILITY_FIELD = "held_mutation_capability_sha256"
+_MAX_MUTATION_MARKER_BYTES = 64 * 1024
 
 
 @functools.lru_cache(maxsize=1)
@@ -132,11 +150,206 @@ def drain_request_path(home: Optional[Path] = None) -> Path:
     return Path(base) / _DRAIN_REQUEST_FILENAME
 
 
+def drain_request_lock_path(home: Optional[Path] = None) -> Path:
+    """Shared lock used by every drain-marker mutator."""
+    base = home if home is not None else get_hermes_home()
+    return Path(base) / _DRAIN_REQUEST_LOCK_FILENAME
+
+
+@contextmanager
+def drain_request_mutation_lock(
+    *,
+    home: Optional[Path] = None,
+) -> Iterator[None]:
+    """Serialize marker replacement/removal across gateway processes.
+
+    The production release helper takes this same advisory lock before it
+    publishes or clears its receipt-bound marker.  A stable descriptor/path
+    identity check prevents a replaced lock pathname from splitting writers
+    across different lock inodes.
+    """
+    path = drain_request_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    with _PROCESS_DRAIN_MUTATION_LOCK:
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(descriptor, 0o600)
+            opened = os.fstat(descriptor)
+            reachable = path.stat(follow_symlinks=False)
+            expected_uid = (
+                os.geteuid()
+                if hasattr(os, "geteuid")
+                else opened.st_uid
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_ISLNK(reachable.st_mode)
+                or opened.st_dev != reachable.st_dev
+                or opened.st_ino != reachable.st_ino
+                or opened.st_uid != expected_uid
+                or (
+                    os.name != "nt"
+                    and stat.S_IMODE(opened.st_mode) != 0o600
+                )
+            ):
+                raise OSError("unsafe drain-request lock identity")
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                reachable = path.stat(follow_symlinks=False)
+                if (
+                    opened.st_dev != reachable.st_dev
+                    or opened.st_ino != reachable.st_ino
+                ):
+                    raise OSError("drain-request lock changed while acquiring")
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+def _capability_sha256(capability: str) -> str:
+    if (
+        not isinstance(capability, str)
+        or len(capability.encode("utf-8")) < 32
+        or len(capability.encode("utf-8")) > 1024
+    ):
+        raise ValueError("invalid drain-marker mutation capability")
+    return hashlib.sha256(capability.encode("utf-8")).hexdigest()
+
+
+def _read_marker_for_mutation(path: Path) -> Optional[dict[str, Any]]:
+    """Strict read used only by mutators; unlike the watcher it fails closed."""
+    if not os.path.lexists(path):
+        return None
+    descriptor: Optional[int] = None
+    try:
+        before = path.lstat()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        remaining = _MAX_MUTATION_MARKER_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        reachable = path.lstat()
+    except OSError as exc:
+        raise PermissionError("drain marker cannot be verified for mutation") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    identity = lambda item: (
+        item.st_dev,
+        item.st_ino,
+        item.st_mode,
+        item.st_nlink,
+        item.st_uid,
+        item.st_gid,
+        item.st_size,
+        item.st_mtime_ns,
+        item.st_ctime_ns,
+    )
+    expected_uid = (
+        os.geteuid()
+        if hasattr(os, "geteuid")
+        else opened.st_uid
+    )
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or stat.S_ISLNK(before.st_mode)
+        or opened.st_nlink != 1
+        or opened.st_uid != expected_uid
+        or (
+            os.name != "nt"
+            and stat.S_IMODE(opened.st_mode) != 0o600
+        )
+        or len(raw) != opened.st_size
+        or not 0 < len(raw) <= _MAX_MUTATION_MARKER_BYTES
+        or identity(before) != identity(opened)
+        or identity(before) != identity(after)
+        or identity(before) != identity(reachable)
+    ):
+        raise PermissionError("drain marker cannot be verified for mutation")
+    listxattr = getattr(os, "listxattr", None)
+    if listxattr is not None:
+        try:
+            attributes = listxattr(path, follow_symlinks=False)
+        except OSError as exc:
+            raise PermissionError(
+                "drain marker metadata cannot be verified for mutation"
+            ) from exc
+        if attributes:
+            raise PermissionError(
+                "drain marker metadata cannot be verified for mutation"
+            )
+    try:
+        value = json.loads(raw.decode("utf-8", errors="strict"))
+    except (UnicodeError, ValueError, TypeError) as exc:
+        raise PermissionError("malformed drain marker cannot be mutated") from exc
+    if not isinstance(value, dict) or not value:
+        raise PermissionError("malformed drain marker cannot be mutated")
+    return value
+
+
+def _held_marker_binding(body: Optional[dict[str, Any]]) -> Optional[tuple[str, str]]:
+    """Return the held transaction/capability digests, failing closed.
+
+    A transaction-held marker intentionally cannot be replaced or removed by
+    ordinary dashboard/gateway callers while a release is between activation
+    and final-health.  The marker contains only digests; the root-only release
+    manifest retains the capability preimage.
+    """
+    if body is None:
+        return None
+    if not body:
+        raise PermissionError("malformed drain marker cannot be mutated")
+    transaction = body.get(_HELD_TRANSACTION_FIELD)
+    capability = body.get(_HELD_CAPABILITY_FIELD)
+    if transaction is None and capability is None:
+        return None
+    if (
+        not isinstance(transaction, str)
+        or _SHA256.fullmatch(transaction) is None
+        or not isinstance(capability, str)
+        or _SHA256.fullmatch(capability) is None
+    ):
+        raise PermissionError("malformed held drain marker cannot be mutated")
+    return transaction, capability
+
+
+def _authorize_marker_mutation(
+    body: Optional[dict[str, Any]],
+    mutation_capability: Optional[str],
+) -> Optional[tuple[str, str]]:
+    binding = _held_marker_binding(body)
+    if binding is None:
+        return None
+    _transaction, expected = binding
+    if mutation_capability is None or not hmac.compare_digest(
+        _capability_sha256(mutation_capability),
+        expected,
+    ):
+        raise PermissionError("transaction-held drain marker")
+    return binding
+
+
 def write_drain_request(
     *,
     principal: str = "drain-control",
     suppress_notification: bool = False,
     home: Optional[Path] = None,
+    mutation_capability: Optional[str] = None,
+    hold_transaction_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
 
@@ -159,31 +372,59 @@ def write_drain_request(
     of which drain causes set the flag lives entirely in the caller (NAS). The
     field defaults False so legacy/operator drains behave exactly as before.
     """
-    payload = {
-        "action": "drain",
-        "requested_at": datetime.now(timezone.utc).isoformat(),
-        "principal": principal,
-        "epoch": current_instantiation_epoch(),
-        "suppress_notification": bool(suppress_notification),
-    }
-    atomic_json_write(drain_request_path(home), payload)
+    with drain_request_mutation_lock(home=home):
+        existing = _read_marker_for_mutation(drain_request_path(home))
+        held = _authorize_marker_mutation(existing, mutation_capability)
+        if hold_transaction_sha256 is not None:
+            if (
+                not isinstance(hold_transaction_sha256, str)
+                or _SHA256.fullmatch(hold_transaction_sha256) is None
+                or mutation_capability is None
+            ):
+                raise ValueError("held drain marker requires exact transaction binding")
+            if held is not None and held[0] != hold_transaction_sha256:
+                raise PermissionError("held drain marker belongs to another transaction")
+            held = (
+                hold_transaction_sha256,
+                _capability_sha256(mutation_capability),
+            )
+        payload = {
+            "action": "drain",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "principal": principal,
+            "epoch": current_instantiation_epoch(),
+            "suppress_notification": bool(suppress_notification),
+        }
+        if held is not None:
+            payload[_HELD_TRANSACTION_FIELD] = held[0]
+            payload[_HELD_CAPABILITY_FIELD] = held[1]
+        atomic_json_write(drain_request_path(home), payload)
     return payload
 
 
-def clear_drain_request(*, home: Optional[Path] = None) -> bool:
+def clear_drain_request(
+    *,
+    home: Optional[Path] = None,
+    mutation_capability: Optional[str] = None,
+) -> bool:
     """Remove the drain marker (cancel-drain). Returns True if one existed.
 
     Best-effort: a missing file is not an error (cancel is idempotent).
     """
     path = drain_request_path(home)
-    try:
-        path.unlink()
-        return True
-    except FileNotFoundError:
-        return False
-    except OSError as e:
-        _log.warning("drain-control: failed to remove %s: %s", path, e)
-        return False
+    with drain_request_mutation_lock(home=home):
+        _authorize_marker_mutation(
+            _read_marker_for_mutation(path),
+            mutation_capability,
+        )
+        try:
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            _log.warning("drain-control: failed to remove %s: %s", path, e)
+            return False
 
 
 def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
@@ -271,3 +512,63 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     except (ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def active_drain_observation(
+    *,
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a digest-bound observation of one stable active marker.
+
+    This is used only for the gateway's persisted drain acknowledgment.  It
+    does not change the legacy fail-safe presence semantics of
+    :func:`drain_requested`: malformed markers still engage drain, but cannot
+    produce an exact acknowledgment for an offline release transaction.
+    """
+
+    path = drain_request_path(home)
+    try:
+        first = path.read_bytes()
+        second = path.read_bytes()
+    except OSError:
+        return None
+    if (
+        not first
+        or first != second
+        or len(first) > _MAX_MUTATION_MARKER_BYTES
+    ):
+        return None
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate drain marker key")
+            result[key] = value
+        return result
+
+    try:
+        body = json.loads(first, object_pairs_hook=pairs)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(body, dict)
+        or _marker_epoch_is_stale(body)
+        or not isinstance(body.get("epoch"), str)
+        or not body["epoch"]
+    ):
+        return None
+    transaction = body.get(_HELD_TRANSACTION_FIELD)
+    capability = body.get(_HELD_CAPABILITY_FIELD)
+    if (
+        not isinstance(transaction, str)
+        or _SHA256.fullmatch(transaction) is None
+        or not isinstance(capability, str)
+        or _SHA256.fullmatch(capability) is None
+    ):
+        return None
+    return {
+        "marker_sha256": hashlib.sha256(first).hexdigest(),
+        "transaction_sha256": transaction,
+        "mutation_capability_sha256": capability,
+        "epoch": body["epoch"],
+    }

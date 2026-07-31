@@ -25,6 +25,7 @@ fails closed.
 from __future__ import annotations
 
 import argparse
+import copy
 import ctypes
 import errno
 import hashlib
@@ -71,6 +72,18 @@ RELEASE_ACTIVATION_BEGIN_SCHEMA = (
 RELEASE_ABORTED_RECEIPT_SCHEMA = (
     "muncho-production-release-unit-input-rotation-aborted.v1"
 )
+RELEASE_PHASE_REQUEST_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-command.v1"
+)
+RELEASE_PHASE_RESULT_SCHEMA = (
+    "muncho-production-release-unit-input-rotation-command-result.v1"
+)
+RELEASE_PHASE_ACTIONS = frozenset({
+    "prepare-release-unit-inputs",
+    "preauthorize-release-unit-inputs",
+    "finalize-release-unit-inputs",
+    "abort-release-unit-inputs",
+})
 AUDIT_DIRECTORY_NAME = "unit-input-authority-rotations"
 LEGACY_RELEASE_AUDIT_DIRECTORY_NAME = (
     "release-unit-input-authority-rotations-v4"
@@ -7144,16 +7157,444 @@ def finalize_prepared_release_unit_input_authority_rotation(
     )
 
 
+def validate_release_unit_input_phase_request(
+    action: str,
+    value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate one exact, replayable split-phase request without mutation."""
+
+    common = {
+        "schema",
+        "action",
+        "owner_release_revision",
+        "remote_stager_revision",
+        "unit_input_publication",
+        "release_update_publication",
+        "trusted_predecessor",
+        "expected_predecessor_trust_sha256",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "request_sha256",
+    }
+    phase_fields = {
+        "prepare-release-unit-inputs": common,
+        "preauthorize-release-unit-inputs": common
+        | {"prepared_receipt", "expected_transaction_sha256"},
+        "finalize-release-unit-inputs": common
+        | {
+            "prepared_receipt",
+            "preauthorization_receipt",
+            "expected_transaction_sha256",
+        },
+        "abort-release-unit-inputs": common
+        | {
+            "prepared_receipt",
+            "preauthorization_receipt",
+            "expected_transaction_sha256",
+        },
+    }
+    if (
+        action not in RELEASE_PHASE_ACTIONS
+        or not isinstance(value, Mapping)
+        or set(value) != phase_fields[action]
+        or value.get("schema") != RELEASE_PHASE_REQUEST_SCHEMA
+        or value.get("action") != action
+        or package.REVISION.fullmatch(
+            str(value.get("owner_release_revision", ""))
+        )
+        is None
+        or package.REVISION.fullmatch(
+            str(value.get("remote_stager_revision", ""))
+        )
+        is None
+        or not isinstance(value.get("unit_input_publication"), Mapping)
+        or not isinstance(value.get("release_update_publication"), Mapping)
+        or value["unit_input_publication"].get("release_revision")
+        != value["remote_stager_revision"]
+        or value["release_update_publication"].get("release_revision")
+        != value["remote_stager_revision"]
+        or not isinstance(value.get("trusted_predecessor"), Mapping)
+        or _SHA256.fullmatch(
+            str(value.get("expected_predecessor_trust_sha256", ""))
+        )
+        is None
+        or value.get("secret_material_recorded") is not False
+        or value.get("secret_digest_recorded") is not False
+        or value.get("request_sha256")
+        != _sha(_canonical({
+            name: item
+            for name, item in value.items()
+            if name != "request_sha256"
+        }))
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_phase_request_invalid"
+        )
+    publications = (
+        value["unit_input_publication"],
+        value["release_update_publication"],
+    )
+    kwargs = {
+        "trusted_predecessor": value["trusted_predecessor"],
+        "expected_predecessor_trust_sha256": value[
+            "expected_predecessor_trust_sha256"
+        ],
+    }
+    if action != "prepare-release-unit-inputs":
+        transaction_sha256 = value.get("expected_transaction_sha256")
+        if (
+            _SHA256.fullmatch(str(transaction_sha256 or "")) is None
+            or not isinstance(value.get("prepared_receipt"), Mapping)
+        ):
+            raise UnitInputRotationError(
+                "unit_input_rotation_phase_request_invalid"
+            )
+        prepared = validate_release_prepared_rotation_receipt(
+            value["prepared_receipt"],
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            **kwargs,
+        )
+        if prepared["transaction_sha256"] != transaction_sha256:
+            raise UnitInputRotationError(
+                "unit_input_rotation_phase_request_invalid"
+            )
+        if action in {
+            "finalize-release-unit-inputs",
+            "abort-release-unit-inputs",
+        }:
+            if not isinstance(
+                value.get("preauthorization_receipt"), Mapping
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_phase_request_invalid"
+                )
+            validate_release_preauthorization_receipt(
+                value["preauthorization_receipt"],
+                unit_input_publication=publications[0],
+                release_update_publication=publications[1],
+                prepared_receipt=prepared,
+                **kwargs,
+            )
+    return copy.deepcopy(dict(value))
+
+
+def validate_release_unit_input_phase_result(
+    action: str,
+    request: Mapping[str, Any],
+    result: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate one phase result against the exact immutable request."""
+
+    request = validate_release_unit_input_phase_request(action, request)
+    expected_fields = {
+        "schema",
+        "action",
+        "owner_release_revision",
+        "remote_stager_revision",
+        "request_sha256",
+        "transaction_sha256",
+        "audit_transaction_path",
+        "canonical_receipt",
+        "canonical_receipt_sha256",
+        "activation_begin",
+        "secret_material_recorded",
+        "secret_digest_recorded",
+        "result_sha256",
+    }
+    if not isinstance(result, Mapping) or set(result) != expected_fields:
+        raise UnitInputRotationError(
+            "unit_input_rotation_phase_result_invalid"
+        )
+    unsigned = {
+        name: item
+        for name, item in result.items()
+        if name != "result_sha256"
+    }
+    receipt = result.get("canonical_receipt")
+    activation_begin = result.get("activation_begin")
+    digest_field = (
+        "mutation_begin_sha256"
+        if action == "preauthorize-release-unit-inputs"
+        else "receipt_sha256"
+    )
+    if (
+        result.get("schema") != RELEASE_PHASE_RESULT_SCHEMA
+        or result.get("action") != action
+        or result.get("owner_release_revision")
+        != request["owner_release_revision"]
+        or result.get("remote_stager_revision")
+        != request["remote_stager_revision"]
+        or result.get("request_sha256") != request["request_sha256"]
+        or not isinstance(receipt, Mapping)
+        or result.get("canonical_receipt_sha256")
+        != receipt.get(digest_field)
+        or _SHA256.fullmatch(
+            str(result.get("canonical_receipt_sha256", ""))
+        )
+        is None
+        or result.get("secret_material_recorded") is not False
+        or result.get("secret_digest_recorded") is not False
+        or result.get("result_sha256") != _sha(_canonical(unsigned))
+        or (
+            action != "prepare-release-unit-inputs"
+            and result.get("transaction_sha256")
+            != request["expected_transaction_sha256"]
+        )
+        or (
+            action == "finalize-release-unit-inputs"
+            and not isinstance(activation_begin, Mapping)
+        )
+        or (
+            action != "finalize-release-unit-inputs"
+            and activation_begin is not None
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_phase_result_invalid"
+        )
+    publications = (
+        request["unit_input_publication"],
+        request["release_update_publication"],
+    )
+    kwargs = {
+        "trusted_predecessor": request["trusted_predecessor"],
+        "expected_predecessor_trust_sha256": request[
+            "expected_predecessor_trust_sha256"
+        ],
+    }
+    prepared = (
+        validate_release_prepared_rotation_receipt(
+            receipt,
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            **kwargs,
+        )
+        if action == "prepare-release-unit-inputs"
+        else validate_release_prepared_rotation_receipt(
+            request["prepared_receipt"],
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            **kwargs,
+        )
+    )
+    if action == "prepare-release-unit-inputs":
+        validated_receipt = prepared
+    elif action == "preauthorize-release-unit-inputs":
+        validated_receipt = validate_release_preauthorization_receipt(
+            receipt,
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            prepared_receipt=prepared,
+            **kwargs,
+        )
+    else:
+        preauthorization = validate_release_preauthorization_receipt(
+            request["preauthorization_receipt"],
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            prepared_receipt=prepared,
+            **kwargs,
+        )
+        if action == "abort-release-unit-inputs":
+            validated_receipt = validate_release_rotation_abort_receipt(
+                receipt,
+                unit_input_publication=publications[0],
+                release_update_publication=publications[1],
+                prepared_receipt=prepared,
+                preauthorization_receipt=preauthorization,
+                **kwargs,
+            )
+        else:
+            validated_receipt = validate_release_rotation_receipt(
+                receipt,
+                unit_input_publication=publications[0],
+                release_update_publication=publications[1],
+                prepared_receipt=prepared,
+                mutation_begin=preauthorization,
+                activation_begin=activation_begin,
+                **kwargs,
+            )
+    if (
+        validated_receipt != receipt
+        or result.get("transaction_sha256")
+        != prepared["transaction_sha256"]
+        or result.get("transaction_sha256")
+        != receipt.get("transaction_sha256")
+        or result.get("audit_transaction_path")
+        != prepared["audit_transaction_path"]
+        or (
+            receipt.get("audit_transaction_path") is not None
+            and result.get("audit_transaction_path")
+            != receipt["audit_transaction_path"]
+        )
+        or (
+            action == "finalize-release-unit-inputs"
+            and receipt.get("activation_begin_sha256")
+            != activation_begin.get("activation_begin_sha256")
+        )
+    ):
+        raise UnitInputRotationError(
+            "unit_input_rotation_phase_result_invalid"
+        )
+    return copy.deepcopy(dict(result))
+
+
+def execute_release_unit_input_phase(
+    action: str,
+    value: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Dispatch one exact root-only release rotation phase.
+
+    The outer transport supplies only canonical public documents.  This
+    function deliberately exposes no clock, lock, path, or identity override;
+    all mutation authority remains in the four production entrypoints above.
+    """
+
+    value = validate_release_unit_input_phase_request(action, value)
+    kwargs = {
+        "trusted_predecessor": value["trusted_predecessor"],
+        "expected_predecessor_trust_sha256": value[
+            "expected_predecessor_trust_sha256"
+        ],
+    }
+    publications = (
+        value["unit_input_publication"],
+        value["release_update_publication"],
+    )
+    if action == "prepare-release-unit-inputs":
+        receipt = prepare_release_unit_input_authority_rotation(
+            *publications,
+            **kwargs,
+        )
+        prepared = receipt
+    else:
+        transaction_sha256 = value.get("expected_transaction_sha256")
+        if _SHA256.fullmatch(str(transaction_sha256 or "")) is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_phase_request_invalid"
+            )
+        if not isinstance(value.get("prepared_receipt"), Mapping):
+            raise UnitInputRotationError(
+                "unit_input_rotation_phase_request_invalid"
+            )
+        prepared = validate_release_prepared_rotation_receipt(
+            value["prepared_receipt"],
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            **kwargs,
+        )
+        if action == "preauthorize-release-unit-inputs":
+            receipt = (
+                preauthorize_prepared_release_unit_input_authority_rotation(
+                    *publications,
+                    prepared,
+                    **kwargs,
+                    expected_transaction_sha256=transaction_sha256,
+                )
+            )
+        else:
+            if not isinstance(
+                value.get("preauthorization_receipt"), Mapping
+            ):
+                raise UnitInputRotationError(
+                    "unit_input_rotation_phase_request_invalid"
+                )
+            operation = (
+                finalize_preauthorized_release_unit_input_authority_rotation
+                if action == "finalize-release-unit-inputs"
+                else abort_preauthorized_release_unit_input_authority_rotation
+            )
+            receipt = operation(
+                *publications,
+                prepared,
+                value["preauthorization_receipt"],
+                **kwargs,
+                expected_transaction_sha256=transaction_sha256,
+            )
+
+    activation_begin = None
+    if action == "finalize-release-unit-inputs":
+        transaction = _release_receipt_transaction(prepared)
+        successor = _release_successor(
+            publications[0],
+            publications[1],
+            value["trusted_predecessor"],
+            expected_predecessor_trust_sha256=value[
+                "expected_predecessor_trust_sha256"
+            ],
+            now_unix=transaction["authorization_checked_at_unix"],
+        )
+        activation_begin = _load_release_activation_begin(
+            Path(prepared["audit_transaction_path"]),
+            transaction=transaction,
+            successor=successor,
+            preauthorization_receipt=value["preauthorization_receipt"],
+            uid=0,
+            gid=0,
+        )
+        if activation_begin is None:
+            raise UnitInputRotationError(
+                "unit_input_rotation_activation_begin_invalid"
+            )
+        validate_release_rotation_receipt(
+            receipt,
+            unit_input_publication=publications[0],
+            release_update_publication=publications[1],
+            trusted_predecessor=value["trusted_predecessor"],
+            expected_predecessor_trust_sha256=value[
+                "expected_predecessor_trust_sha256"
+            ],
+            prepared_receipt=prepared,
+            mutation_begin=value["preauthorization_receipt"],
+            activation_begin=activation_begin,
+        )
+    receipt_digest = (
+        receipt["mutation_begin_sha256"]
+        if action == "preauthorize-release-unit-inputs"
+        else receipt["receipt_sha256"]
+    )
+    unsigned = {
+        "schema": RELEASE_PHASE_RESULT_SCHEMA,
+        "action": action,
+        "owner_release_revision": value["owner_release_revision"],
+        "remote_stager_revision": value["remote_stager_revision"],
+        "request_sha256": value["request_sha256"],
+        "transaction_sha256": prepared["transaction_sha256"],
+        "audit_transaction_path": prepared["audit_transaction_path"],
+        "canonical_receipt": receipt,
+        "canonical_receipt_sha256": receipt_digest,
+        "activation_begin": activation_begin,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    result = {
+        **unsigned,
+        "result_sha256": _sha(_canonical(unsigned)),
+    }
+    return validate_release_unit_input_phase_result(action, value, result)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Rotate one fixed owner-signed unit-input authority",
     )
-    parser.parse_args(argv)
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=tuple(sorted(RELEASE_PHASE_ACTIONS)),
+    )
+    arguments = parser.parse_args(argv)
     raw = sys.stdin.buffer.read(public_stager.MAX_INPUT + 1)
     try:
         if not raw or len(raw) > public_stager.MAX_INPUT or raw.endswith(b"\n"):
             raise UnitInputRotationError("unit_input_rotation_input_invalid")
-        receipt = rotate_unit_input_authority(_decode(raw))
+        decoded = _decode(raw)
+        receipt = (
+            rotate_unit_input_authority(decoded)
+            if arguments.action is None
+            else execute_release_unit_input_phase(arguments.action, decoded)
+        )
     except (OSError, UnitInputRotationError):
         print(
             '{"error_code":"unit_input_rotation_failed","ok":false}',

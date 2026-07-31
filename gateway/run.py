@@ -7391,6 +7391,7 @@ class TurnRunner:
             ),
         }
 
+_EXTERNAL_DRAIN_ACK_UNSET = object()
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -7409,6 +7410,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_ack_marker_sha256: str = ""
+    _external_drain_ack_sequence: int = 0
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -8008,6 +8011,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_ack_marker_sha256 = ""
+        self._external_drain_ack_sequence = 0
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -10023,17 +10028,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
     def _update_runtime_status(
-        self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None
+        self,
+        gateway_state: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+        *,
+        external_drain_ack: Any = _EXTERNAL_DRAIN_ACK_UNSET,
     ) -> None:
         try:
             from gateway.status import write_runtime_status
 
+            values: Dict[str, Any] = {
+                "gateway_state": gateway_state,
+                "exit_reason": exit_reason,
+                "restart_requested": self._restart_requested,
+                "active_agents": self._active_work_count(),
+                "active_session_keys": self._active_session_keys_for_status(),
+            }
+            if external_drain_ack is not _EXTERNAL_DRAIN_ACK_UNSET:
+                values["external_drain_ack"] = external_drain_ack
             write_runtime_status(
-                gateway_state=gateway_state,
-                exit_reason=exit_reason,
-                restart_requested=self._restart_requested,
-                active_agents=self._active_work_count(),
-                active_session_keys=self._active_session_keys_for_status(),
+                **values,
             )
         except Exception:
             pass
@@ -10046,7 +10060,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 keys.append(session_key)
         return sorted(keys)
 
-    def _persist_active_agents(self) -> None:
+    def _persist_active_agents(
+        self,
+        *,
+        external_drain_ack: Any = _EXTERNAL_DRAIN_ACK_UNSET,
+    ) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
 
         Called at every turn boundary (a running-agent slot is claimed or
@@ -10066,10 +10084,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from gateway.status import write_runtime_status
 
-            write_runtime_status(
-                active_agents=self._active_work_count(),
-                active_session_keys=self._active_session_keys_for_status(),
-            )
+            values: Dict[str, Any] = {
+                "active_agents": self._active_work_count(),
+                "active_session_keys": self._active_session_keys_for_status(),
+            }
+            if external_drain_ack is not _EXTERNAL_DRAIN_ACK_UNSET:
+                values["external_drain_ack"] = external_drain_ack
+            write_runtime_status(**values)
         except Exception:
             pass
 
@@ -10139,6 +10160,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read-merge keeps the live count); only the state changes.
         self._update_runtime_status("draining")
 
+    def _build_external_drain_ack(
+        self,
+        observation: Mapping[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        marker_sha256 = observation.get("marker_sha256")
+        invocation_id = os.environ.get("INVOCATION_ID", "")
+        try:
+            process_stat = Path(
+                f"/proc/{os.getpid()}/stat"
+            ).read_text(encoding="utf-8")
+            process_start_ticks = (
+                process_stat.rsplit(")", 1)[1].split()[19]
+            )
+        except (OSError, IndexError):
+            return None
+        if (
+            not isinstance(marker_sha256, str)
+            or len(marker_sha256) != 64
+            or not process_start_ticks.isdigit()
+            or len(invocation_id) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in invocation_id
+            )
+        ):
+            return None
+        if marker_sha256 != self._external_drain_ack_marker_sha256:
+            self._external_drain_ack_marker_sha256 = marker_sha256
+            self._external_drain_ack_sequence = 0
+        self._external_drain_ack_sequence += 1
+        return {
+            **dict(observation),
+            "process_start_ticks": process_start_ticks,
+            "systemd_invocation_id": invocation_id,
+            "ack_sequence": self._external_drain_ack_sequence,
+        }
+
     def _exit_external_drain(self) -> None:
         """Cancel external drain: revert state, re-accept new turns.
 
@@ -10149,6 +10207,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        self._external_drain_ack_marker_sha256 = ""
+        self._external_drain_ack_sequence = 0
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -10161,7 +10221,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
         )
-        self._update_runtime_status("running")
+        self._update_runtime_status(
+            "running",
+            external_drain_ack=None,
+        )
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -10177,16 +10240,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the gateway into drain. Best-effort: any tick error is logged and the
         loop continues (a transient stat() failure must not wedge the gateway).
         """
-        from gateway.drain_control import drain_requested
+        from gateway.drain_control import (
+            active_drain_observation,
+            drain_requested,
+        )
 
         while self._running:
             try:
                 if drain_requested():
                     self._enter_external_drain()
+                    observation = active_drain_observation()
+                    acknowledgment = (
+                        self._build_external_drain_ack(observation)
+                        if observation is not None
+                        else None
+                    )
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
                     # external caller polls this reversible drain state.
-                    self._persist_active_agents()
+                    self._persist_active_agents(
+                        external_drain_ack=acknowledgment,
+                    )
                 else:
                     self._exit_external_drain()
             except asyncio.CancelledError:

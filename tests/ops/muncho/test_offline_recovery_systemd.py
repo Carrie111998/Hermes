@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -14,6 +16,7 @@ from ops.muncho.runtime.offline_recovery_systemd import (
     LoadedScaffoldObservation,
     OfflineRecoverySystemdError,
     OfflineRecoverySystemdSpec,
+    ReservedNamespaceObservation,
     UnitArtifact,
     cleanup_systemctl_commands,
     cleanup_readback_commands,
@@ -26,6 +29,7 @@ from ops.muncho.runtime.offline_recovery_systemd import (
     scaffold_sha256s,
     validate_cleaned_scaffold,
     validate_loaded_scaffold,
+    validate_reserved_namespace,
     validate_rendered_scaffold,
 )
 
@@ -400,7 +404,7 @@ def test_prearm_readback_commands_cover_every_loaded_relationship(
         "--property=DropInPaths",
         "--property=Wants",
         "--property=After",
-        "--property=ExecCondition",
+        "--property=ExecConditionEx",
         "--",
         spec.gateway_unit,
     )
@@ -410,7 +414,7 @@ def test_prearm_readback_commands_cover_every_loaded_relationship(
         "--property=FragmentPath",
         "--property=Before",
         "--property=DropInPaths",
-        "--property=ExecStart",
+        "--property=ExecStartEx",
         "--",
         spec.recovery_service,
     )
@@ -714,6 +718,47 @@ def _cleaned_observation(
     )
 
 
+def test_manifest_then_scaffold_construction_has_no_digest_fixed_point() -> None:
+    manifest_payload = {
+        "schema": "muncho-offline-deploy-manifest-envelope.v1",
+        "transaction_id": TX,
+        "reconciler_sha256": RECONCILER,
+        "scaffolding_contract": "muncho-offline-recovery-systemd.v1",
+    }
+    manifest_bytes = json.dumps(
+        manifest_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    built = OfflineRecoverySystemdSpec(
+        transaction_id=TX,
+        manifest_sha256=manifest_sha256,
+        reconciler_sha256=RECONCILER,
+    )
+    artifacts = render_scaffold(built)
+    validate_rendered_scaffold(built, artifacts)
+
+    artifacts_by_path = {artifact.path: artifact for artifact in artifacts}
+    assert (
+        manifest_sha256.encode("ascii")
+        in artifacts_by_path[built.recovery_service_path].content
+    )
+    assert (
+        manifest_sha256.encode("ascii")
+        in artifacts_by_path[built.gateway_drop_in_path].content
+    )
+    attestation = scaffold_sha256s(built)
+    assert attestation == {
+        str(artifact.path): hashlib.sha256(artifact.content).hexdigest()
+        for artifact in artifacts
+    }
+    assert "scaffold_sha256s" not in manifest_payload
+    assert hashlib.sha256(manifest_bytes).hexdigest() == manifest_sha256
+
+
 def test_cleanup_readback_commands_cover_enablement_activity_and_gateway(
     spec: OfflineRecoverySystemdSpec,
 ) -> None:
@@ -751,7 +796,7 @@ def test_cleanup_readback_commands_cover_enablement_activity_and_gateway(
         "--property=DropInPaths",
         "--property=Wants",
         "--property=After",
-        "--property=ExecCondition",
+        "--property=ExecConditionEx",
         "--",
         spec.gateway_unit,
     )
@@ -869,6 +914,108 @@ def test_cleanup_rejects_stale_transaction_namespace_not_only_current(
                 spec,
                 replace(_cleaned_observation(spec), **{field: value}),
             )
+
+
+def _reserved_namespace(
+    spec: OfflineRecoverySystemdSpec,
+    *,
+    cleaned: bool = False,
+) -> ReservedNamespaceObservation:
+    empty = frozenset()
+    return ReservedNamespaceObservation(
+        recovery_service_files=empty
+        if cleaned
+        else frozenset({str(spec.recovery_service_path)}),
+        recovery_timer_files=empty
+        if cleaned
+        else frozenset({str(spec.recovery_timer_path)}),
+        gateway_drop_in_files=empty
+        if cleaned
+        else frozenset({str(spec.gateway_drop_in_path)}),
+        reconciler_files=empty
+        if cleaned
+        else frozenset({str(spec.reconciler_path)}),
+        transaction_state_directories=empty
+        if cleaned
+        else frozenset({str(spec.state_directory)}),
+        enabled_recovery_services=empty
+        if cleaned
+        else frozenset({spec.recovery_service}),
+        enabled_recovery_timers=empty
+        if cleaned
+        else frozenset({spec.recovery_timer}),
+        active_recovery_services=empty,
+        active_recovery_timers=empty
+        if cleaned
+        else frozenset({spec.recovery_timer}),
+    )
+
+
+def test_reserved_namespace_accepts_only_current_transaction(
+    spec: OfflineRecoverySystemdSpec,
+) -> None:
+    validate_reserved_namespace(
+        spec,
+        _reserved_namespace(spec),
+        cleaned=False,
+    )
+    validate_reserved_namespace(
+        spec,
+        _reserved_namespace(spec, cleaned=True),
+        cleaned=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "field,stale",
+    (
+        (
+            "recovery_service_files",
+            "/etc/systemd/system/muncho-offline-release-recovery-"
+            + "8" * 64
+            + ".service",
+        ),
+        (
+            "recovery_timer_files",
+            "/etc/systemd/system/muncho-offline-release-recovery-"
+            + "8" * 64
+            + ".timer",
+        ),
+        (
+            "enabled_recovery_services",
+            "muncho-offline-release-recovery-" + "8" * 64 + ".service",
+        ),
+        (
+            "active_recovery_timers",
+            "muncho-offline-release-recovery-" + "8" * 64 + ".timer",
+        ),
+        (
+            "transaction_state_directories",
+            "/var/lib/muncho-offline-release-transactions/" + "8" * 64,
+        ),
+    ),
+)
+def test_reserved_namespace_rejects_orphans_not_linked_to_gateway(
+    spec: OfflineRecoverySystemdSpec,
+    field: str,
+    stale: str,
+) -> None:
+    observation = _reserved_namespace(spec)
+    with pytest.raises(
+        OfflineRecoverySystemdError,
+        match="reserved recovery namespace mismatch",
+    ):
+        validate_reserved_namespace(
+            spec,
+            replace(
+                observation,
+                **{
+                    field: getattr(observation, field)
+                    | frozenset({stale}),
+                },
+            ),
+            cleaned=False,
+        )
 
 
 def test_systemd_analyze_accepts_rendered_service_and_timer_when_available(

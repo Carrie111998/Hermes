@@ -189,6 +189,21 @@ class CleanedScaffoldObservation:
 
 
 @dataclass(frozen=True)
+class ReservedNamespaceObservation:
+    """Closed-world inventory of every offline-release recovery namespace."""
+
+    recovery_service_files: frozenset[str]
+    recovery_timer_files: frozenset[str]
+    gateway_drop_in_files: frozenset[str]
+    reconciler_files: frozenset[str]
+    transaction_state_directories: frozenset[str]
+    enabled_recovery_services: frozenset[str]
+    enabled_recovery_timers: frozenset[str]
+    active_recovery_services: frozenset[str]
+    active_recovery_timers: frozenset[str]
+
+
+@dataclass(frozen=True)
 class OfflineRecoverySystemdSpec:
     """Content-addressed names and paths for one offline transaction."""
 
@@ -449,7 +464,12 @@ def validate_rendered_scaffold(
 def scaffold_sha256s(
     spec: OfflineRecoverySystemdSpec,
 ) -> Mapping[str, str]:
-    """Return path-to-digest bindings suitable for the durable manifest."""
+    """Return path-to-digest bindings for the post-manifest arm attestation.
+
+    The rendered files embed ``manifest_sha256`` and therefore their hashes
+    must never be included in that manifest's own digest.  They are sealed in
+    the separate pre-arm scaffold-attestation receipt instead.
+    """
 
     return {str(artifact.path): artifact.sha256 for artifact in render_scaffold(spec)}
 
@@ -548,7 +568,7 @@ def prearm_readback_commands(
                 "--property=DropInPaths",
                 "--property=Wants",
                 "--property=After",
-                "--property=ExecCondition",
+                "--property=ExecConditionEx",
                 "--",
                 spec.gateway_unit,
             ),
@@ -561,7 +581,7 @@ def prearm_readback_commands(
                 "--property=FragmentPath",
                 "--property=Before",
                 "--property=DropInPaths",
-                "--property=ExecStart",
+                "--property=ExecStartEx",
                 "--",
                 spec.recovery_service,
             ),
@@ -765,7 +785,7 @@ def cleanup_readback_commands(
                 "--property=DropInPaths",
                 "--property=Wants",
                 "--property=After",
-                "--property=ExecCondition",
+                "--property=ExecConditionEx",
                 "--",
                 spec.gateway_unit,
             ),
@@ -830,6 +850,76 @@ def validate_cleaned_scaffold(
         )
 
 
+def validate_reserved_namespace(
+    spec: OfflineRecoverySystemdSpec,
+    observation: ReservedNamespaceObservation,
+    *,
+    cleaned: bool,
+) -> None:
+    """Reject every stale transaction, including enabled orphan units.
+
+    Gateway relationship checks alone are insufficient: an old enabled timer
+    or service can still run at boot without appearing in the current
+    gateway's Wants/After properties.  The caller inventories the fixed
+    filesystem and systemd namespaces; this validator applies only exact,
+    mechanical set equality.
+    """
+
+    expected = {
+        "recovery_service_files": frozenset()
+        if cleaned
+        else frozenset({str(spec.recovery_service_path)}),
+        "recovery_timer_files": frozenset()
+        if cleaned
+        else frozenset({str(spec.recovery_timer_path)}),
+        "gateway_drop_in_files": frozenset()
+        if cleaned
+        else frozenset({str(spec.gateway_drop_in_path)}),
+        "reconciler_files": frozenset()
+        if cleaned
+        else frozenset({str(spec.reconciler_path)}),
+        "transaction_state_directories": frozenset()
+        if cleaned
+        else frozenset({str(spec.state_directory)}),
+        "enabled_recovery_services": frozenset()
+        if cleaned
+        else frozenset({spec.recovery_service}),
+        "enabled_recovery_timers": frozenset()
+        if cleaned
+        else frozenset({spec.recovery_timer}),
+        # The oneshot may be inactive or be the caller currently validating
+        # itself.  No other transaction service is ever permitted.
+        "active_recovery_services": frozenset(),
+        "active_recovery_timers": frozenset()
+        if cleaned
+        else frozenset({spec.recovery_timer}),
+    }
+    observed = {
+        name: getattr(observation, name)
+        for name in expected
+    }
+    if observed["active_recovery_services"] not in {
+        frozenset(),
+        frozenset({spec.recovery_service}),
+    }:
+        raise OfflineRecoverySystemdError(
+            "stale active recovery service remains in reserved namespace"
+        )
+    observed["active_recovery_services"] = frozenset()
+    mismatches = {
+        name: {
+            "expected": sorted(wanted),
+            "observed": sorted(observed[name]),
+        }
+        for name, wanted in expected.items()
+        if observed[name] != wanted
+    }
+    if mismatches:
+        raise OfflineRecoverySystemdError(
+            f"reserved recovery namespace mismatch: {mismatches!r}"
+        )
+
+
 __all__ = [
     "DEFAULT_GATEWAY_UNIT",
     "CleanedScaffoldObservation",
@@ -839,6 +929,7 @@ __all__ = [
     "NamedCommand",
     "OfflineRecoverySystemdError",
     "OfflineRecoverySystemdSpec",
+    "ReservedNamespaceObservation",
     "UnitArtifact",
     "cleanup_systemctl_commands",
     "cleanup_readback_commands",
@@ -851,5 +942,6 @@ __all__ = [
     "scaffold_sha256s",
     "validate_cleaned_scaffold",
     "validate_loaded_scaffold",
+    "validate_reserved_namespace",
     "validate_rendered_scaffold",
 ]

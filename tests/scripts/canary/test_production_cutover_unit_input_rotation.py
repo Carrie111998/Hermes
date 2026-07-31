@@ -2158,6 +2158,171 @@ def test_release_public_root_api_has_no_clock_lock_or_identity_override() -> Non
         assert "require_root" not in parameters
 
 
+def test_release_phase_dispatcher_binds_exact_request_before_root_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    receipt = {
+        "transaction_sha256": "b" * 64,
+        "audit_transaction_path": "/var/lib/exact-audit",
+        "receipt_sha256": "c" * 64,
+    }
+
+    def prepare(
+        unit_publication: dict[str, Any],
+        update_publication: dict[str, Any],
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        observed.append(
+            (
+                {
+                    "unit": unit_publication,
+                    "update": update_publication,
+                },
+                kwargs,
+            )
+        )
+        return receipt
+
+    monkeypatch.setattr(
+        rotation,
+        "prepare_release_unit_input_authority_rotation",
+        prepare,
+    )
+    monkeypatch.setattr(
+        rotation,
+        "validate_release_prepared_rotation_receipt",
+        lambda value, **_kwargs: dict(value),
+    )
+    request: dict[str, Any] = {
+        "schema": rotation.RELEASE_PHASE_REQUEST_SCHEMA,
+        "action": "prepare-release-unit-inputs",
+        "owner_release_revision": "a" * 40,
+        "remote_stager_revision": "b" * 40,
+        "unit_input_publication": {"release_revision": "b" * 40},
+        "release_update_publication": {"release_revision": "b" * 40},
+        "trusted_predecessor": {"trust_sha256": "d" * 64},
+        "expected_predecessor_trust_sha256": "d" * 64,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    request["request_sha256"] = rotation._sha(rotation._canonical(request))
+
+    result = rotation.execute_release_unit_input_phase(
+        "prepare-release-unit-inputs",
+        request,
+    )
+
+    assert len(observed) == 1
+    assert result["request_sha256"] == request["request_sha256"]
+    assert result["owner_release_revision"] == "a" * 40
+    assert result["remote_stager_revision"] == "b" * 40
+    assert result["canonical_receipt"] == receipt
+    assert result["canonical_receipt_sha256"] == "c" * 64
+    assert result["activation_begin"] is None
+    unsigned = {
+        key: value
+        for key, value in result.items()
+        if key != "result_sha256"
+    }
+    assert result["result_sha256"] == rotation._sha(
+        rotation._canonical(unsigned)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("action", "abort-release-unit-inputs"),
+        ("owner_release_revision", "c" * 40),
+        ("remote_stager_revision", "d" * 40),
+    ),
+)
+def test_release_phase_dispatcher_rejects_request_tamper_before_root_call(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    replacement: str,
+) -> None:
+    called = False
+
+    def prepare(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(
+        rotation,
+        "prepare_release_unit_input_authority_rotation",
+        prepare,
+    )
+    request: dict[str, Any] = {
+        "schema": rotation.RELEASE_PHASE_REQUEST_SCHEMA,
+        "action": "prepare-release-unit-inputs",
+        "owner_release_revision": "a" * 40,
+        "remote_stager_revision": "b" * 40,
+        "unit_input_publication": {},
+        "release_update_publication": {},
+        "trusted_predecessor": {},
+        "expected_predecessor_trust_sha256": "d" * 64,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    request["request_sha256"] = rotation._sha(rotation._canonical(request))
+    request[field] = replacement
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_phase_request_invalid",
+    ):
+        rotation.execute_release_unit_input_phase(
+            "prepare-release-unit-inputs",
+            request,
+        )
+
+    assert called is False
+
+
+def test_release_phase_dispatcher_rejects_rehashed_publication_revision_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called = False
+
+    def prepare(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        called = True
+        return {}
+
+    monkeypatch.setattr(
+        rotation,
+        "prepare_release_unit_input_authority_rotation",
+        prepare,
+    )
+    request: dict[str, Any] = {
+        "schema": rotation.RELEASE_PHASE_REQUEST_SCHEMA,
+        "action": "prepare-release-unit-inputs",
+        "owner_release_revision": "a" * 40,
+        "remote_stager_revision": "b" * 40,
+        "unit_input_publication": {"release_revision": "c" * 40},
+        "release_update_publication": {"release_revision": "b" * 40},
+        "trusted_predecessor": {},
+        "expected_predecessor_trust_sha256": "d" * 64,
+        "secret_material_recorded": False,
+        "secret_digest_recorded": False,
+    }
+    request["request_sha256"] = rotation._sha(rotation._canonical(request))
+
+    with pytest.raises(
+        rotation.UnitInputRotationError,
+        match="unit_input_rotation_phase_request_invalid",
+    ):
+        rotation.execute_release_unit_input_phase(
+            "prepare-release-unit-inputs",
+            request,
+        )
+
+    assert called is False
+
+
 def test_release_public_root_api_fixes_clock_lock_and_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
