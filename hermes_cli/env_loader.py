@@ -489,7 +489,7 @@ def _apply_managed_env() -> None:
     _load_dotenv_with_fallback(managed_env, override=True)
 
 
-def _apply_external_secret_sources(home_path: Path) -> None:
+def _apply_external_secret_sources_locked(home_path: Path) -> None:
     """Pull secrets from every enabled external source into env.
 
     Runs AFTER dotenv loads so .env values are visible (sources use them
@@ -592,6 +592,21 @@ def _apply_external_secret_sources(home_path: Path) -> None:
             print(f"  {src.label}: {warn}", file=sys.stderr)
     for conflict in report.conflicts:
         print(f"  Secret sources: {conflict}", file=sys.stderr)
+
+
+def _apply_external_secret_sources(home_path: Path) -> None:
+    """Apply one home's process-global sources exactly once at a time.
+
+    Multiplex hydration uses the same per-home lock, so a direct startup apply
+    cannot race a cold turn for that home or duplicate an external fetch.
+    """
+    home_key = str(Path(home_path).resolve())
+    with _SECRET_SOURCE_CACHE_LOCK:
+        home_lock = _SECRET_SOURCE_HYDRATION_LOCKS.setdefault(
+            home_key, threading.Lock()
+        )
+    with home_lock:
+        _apply_external_secret_sources_locked(home_path)
 
 
 def _remediation_hint(source_name: str, error_kind, secrets_cfg: dict) -> str:

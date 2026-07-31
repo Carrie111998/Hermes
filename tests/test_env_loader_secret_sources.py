@@ -547,3 +547,48 @@ def test_reset_during_cold_profile_hydration_retries_for_a_complete_snapshot(
     assert calls["count"] == 2
     assert result == {"TEST_PROVIDER_API_KEY": "profile-only"}
     assert env_loader.get_secret_source_values(home) == result
+
+
+def test_startup_source_apply_shares_the_same_home_hydration_lock(
+    tmp_path, monkeypatch
+):
+    """Concurrent startup calls for one home produce exactly one source fetch."""
+    from types import SimpleNamespace
+
+    from agent.secret_sources import registry
+
+    home = tmp_path / "secondary"
+    home.mkdir()
+    monkeypatch.setattr(
+        env_loader, "_load_secrets_config", lambda _home: {"fake": {"enabled": True}}
+    )
+    first_fetch_started = threading.Event()
+    release_first_fetch = threading.Event()
+    calls = {"count": 0}
+
+    def _fake_apply_all(_cfg, _home):
+        calls["count"] += 1
+        first_fetch_started.set()
+        assert release_first_fetch.wait(timeout=5)
+        return SimpleNamespace(
+            sources=[
+                SimpleNamespace(applied=[], result=SimpleNamespace(error="", warnings=[]))
+            ],
+            applied_any=False,
+            conflicts=[],
+        )
+
+    monkeypatch.setattr(registry, "apply_all", _fake_apply_all)
+    workers = [
+        threading.Thread(target=env_loader._apply_external_secret_sources, args=(home,))
+        for _ in range(2)
+    ]
+    workers[0].start()
+    assert first_fetch_started.wait(timeout=5)
+    workers[1].start()
+    release_first_fetch.set()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert calls["count"] == 1
