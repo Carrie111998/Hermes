@@ -3105,6 +3105,14 @@ class MatrixAdapter(BasePlatformAdapter):
         # is treated as a command, matching how ``/command`` is recognized below.
         body = _normalize_matrix_bang_command(body)
 
+        # Fetch the quoted (m.in_reply_to) original message and inject it as
+        # context so the agent can see what the reply is referring to. Without
+        # this the agent only sees the new reply text, not the quoted message.
+        if reply_to:
+            quoted = await self._fetch_quoted_message(room_id, reply_to)
+            if quoted:
+                body = f"[引用回复 {quoted}]\n\n{body}"
+
         msg_type = MessageType.TEXT
         if body.startswith("/"):
             msg_type = MessageType.COMMAND
@@ -4055,6 +4063,53 @@ class MatrixAdapter(BasePlatformAdapter):
             "msgtype": str(content.get("msgtype", "")),
             "body": str(content.get("body", "")),
         }
+
+    async def _fetch_quoted_message(
+        self, room_id: str, event_id: str
+    ) -> Optional[str]:
+        """Fetch a quoted (m.in_reply_to) message's content from the homeserver.
+
+        Returns a short ``@sender: body`` context string, or None if the event
+        cannot be fetched or has no usable text. Failures are silent — quoting
+        context is best-effort and must never block message processing.
+        """
+        if not self._client:
+            return None
+        try:
+            event = await self._client.get_event(
+                RoomID(room_id), EventID(event_id)
+            )
+            sender = str(getattr(event, "sender", "") or "")
+            content = getattr(event, "content", None)
+            if content is None and isinstance(event, dict):
+                content = event.get("content", {})
+            if not isinstance(content, dict):
+                content = dict(content) if hasattr(content, "items") else {}
+            if not content:
+                return None
+            # Edits (m.replace) carry the latest text in m.new_content.
+            new_content = content.get("m.new_content")
+            if isinstance(new_content, dict):
+                content = new_content
+            body = str(content.get("body", "") or "")
+            if not body:
+                return None
+            # Strip the leading "* " edit marker.
+            if body.startswith("* "):
+                body = body[2:]
+            localpart = sender.split(":")[0].lstrip("@") if sender else sender
+            display = f"@{localpart}" if localpart else sender
+            if len(body) > 500:
+                body = body[:497] + "..."
+            return f"{display}: {body}"
+        except Exception as exc:
+            logger.debug(
+                "Matrix: fetch quoted message %s in %s failed: %s",
+                event_id,
+                room_id,
+                exc,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Presence
