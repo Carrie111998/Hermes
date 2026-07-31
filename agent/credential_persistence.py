@@ -46,6 +46,8 @@ _SAFE_SECRETISH_METADATA_KEYS = frozenset({
     "last_error_reason",
     "last_error_message",
     "last_error_reset_at",
+    "last_rate_limit_streak",
+    "last_rate_limit_streak_at",
 })
 
 _SECRET_VALUE_KEYS = frozenset({

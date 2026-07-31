@@ -132,7 +132,13 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
 
 
 
-def _format_exhausted_status(entry) -> str:
+def _format_exhausted_status(entry, *, pool_size: int = 0) -> str:
+    """Render an entry's cooldown for `hermes auth list`.
+
+    ``pool_size`` lets the displayed retry window match the one the pool will
+    actually enforce — a single-credential pool rides a much shorter
+    header-less-429 ladder (see ``_headerless_429_ttl``).
+    """
     if entry.last_status != STATUS_EXHAUSTED:
         return ""
     label, show_retry_window = _classify_exhausted_status(entry)
@@ -141,7 +147,7 @@ def _format_exhausted_status(entry) -> str:
     code = f" ({entry.last_error_code})" if entry.last_error_code else ""
     if not show_retry_window:
         return f" {label}{reason_text}{code} (re-auth may be required)"
-    exhausted_until = _exhausted_until(entry)
+    exhausted_until = _exhausted_until(entry, sole_credential=pool_size == 1)
     if exhausted_until is None:
         return f" {label}{reason_text}{code}"
     remaining = max(0, int(math.ceil(exhausted_until - time.time())))
@@ -455,7 +461,7 @@ def auth_list_command(args) -> None:
             marker = "  "
             if current is not None and entry.id == current.id:
                 marker = "← "
-            status = _format_exhausted_status(entry)
+            status = _format_exhausted_status(entry, pool_size=len(entries))
             source = _display_source(entry.source)
             print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
         print()
@@ -713,8 +719,9 @@ def _interactive_remove() -> None:
         return
 
     # Show entries with indices
-    for i, e in enumerate(pool.entries(), 1):
-        exhausted = _format_exhausted_status(e)
+    pool_entries = pool.entries()
+    for i, e in enumerate(pool_entries, 1):
+        exhausted = _format_exhausted_status(e, pool_size=len(pool_entries))
         print(f"  #{i}  {e.label:25s} {e.auth_type:10s} {e.source}{exhausted} [id:{e.id}]")
 
     try:

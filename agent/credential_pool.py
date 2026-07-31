@@ -118,12 +118,40 @@ SUPPORTED_POOL_STRATEGIES = {
 }
 
 # Cooldown before retrying an exhausted credential.
+# Provider-supplied reset_at / Retry-After timestamps always win; everything
+# below is only the fallback for a failure that carried no reset hint at all.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
-# 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# 402 (billing/quota) and other failures cool down after 1 hour.
+#
+# A 429 with no Retry-After is almost always a short transient throttle, not a
+# spent quota window, so it does NOT get a flat hour.  The old flat hour froze
+# a single-key pool for 57 more minutes while the provider was already serving
+# that same key again — rotation could not help, because there was nothing to
+# rotate to.  Header-less 429s now start at EXHAUSTED_TTL_429_BASE_SECONDS and
+# multiply by EXHAUSTED_TTL_429_BACKOFF_FACTOR per consecutive strike, so a
+# credential that is genuinely out of quota still parks at the 1-hour ceiling
+# after a few strikes while a one-off throttle clears in under a minute.
+#
+# A pool with a single rotation candidate is a special case: freezing its only
+# credential cannot move traffic anywhere, it can only guarantee total agent
+# failure.  There we back off in seconds and let the provider be the authority
+# — a still-limited key just returns 429 again, cheaply.  The floor exists only
+# to stop a tight hammer loop, and it escalates on its own much lower ceiling.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
-EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
+EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour (header-less 429 ceiling)
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+EXHAUSTED_TTL_429_BASE_SECONDS = 60          # first header-less 429
+EXHAUSTED_TTL_429_BACKOFF_FACTOR = 4         # 60s -> 4m -> 16m -> 1h
+SOLE_CREDENTIAL_TTL_429_BASE_SECONDS = 5     # first header-less 429, pool of one
+SOLE_CREDENTIAL_TTL_429_MAX_SECONDS = 60     # ceiling for a pool of one
+
+# A header-less 429 counts as "consecutive" only while it lands inside the
+# cooldown the credential just served plus this grace window.  The
+# cooldown-expiry clear in ``_available_entries`` wipes ``last_status_at``, so
+# the strike's own timestamp is the only thing left to measure against; past
+# that window the credential clearly had a healthy stretch and the ladder
+# restarts at the base.
+RATE_LIMIT_STREAK_GRACE_SECONDS = 60
 
 # Throttle window for the "no available entries" INFO line. Credential
 # selection runs on a hot path (every model call, plus auxiliary tasks like
@@ -180,6 +208,12 @@ class PooledCredential:
     last_error_reason: Optional[str] = None
     last_error_message: Optional[str] = None
     last_error_reset_at: Optional[float] = None
+    # Consecutive header-less 429 strikes, and when the last one landed.
+    # ``request_count`` only moves under the least-used strategy, so it cannot
+    # stand in for "did this credential work since the last throttle" — the
+    # escalating backoff needs its own bookkeeping.
+    last_rate_limit_streak: int = 0
+    last_rate_limit_streak_at: Optional[float] = None
     base_url: Optional[str] = None
     expires_at: Optional[str] = None
     expires_at_ms: Optional[int] = None
@@ -289,12 +323,41 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
-def _exhausted_ttl(error_code: Optional[int]) -> int:
-    """Return cooldown seconds based on the HTTP status that caused exhaustion."""
+def _headerless_429_ttl(streak: int, *, sole_credential: bool) -> int:
+    """Escalating cooldown for a 429 that carried no Retry-After / reset hint.
+
+    ``streak`` is 1 for the first strike.  A pool with a single rotation
+    candidate rides a much shorter ladder: there is no other key to move
+    traffic to, so refusing locally only guarantees failure, and a re-probe
+    that is still limited costs one cheap 429.
+    """
+    if sole_credential:
+        base = SOLE_CREDENTIAL_TTL_429_BASE_SECONDS
+        ceiling = SOLE_CREDENTIAL_TTL_429_MAX_SECONDS
+    else:
+        base = EXHAUSTED_TTL_429_BASE_SECONDS
+        ceiling = EXHAUSTED_TTL_429_SECONDS
+    # Clamp the exponent before the power so a runaway streak can't build a
+    # huge int only to be min()'d straight back down to the ceiling.
+    exponent = min(max(int(streak) - 1, 0), 16)
+    return int(min(ceiling, base * (EXHAUSTED_TTL_429_BACKOFF_FACTOR ** exponent)))
+
+
+def _exhausted_ttl(
+    error_code: Optional[int],
+    *,
+    streak: int = 1,
+    sole_credential: bool = False,
+) -> int:
+    """Return cooldown seconds based on the HTTP status that caused exhaustion.
+
+    Only reached when the provider supplied no reset timestamp — see
+    ``_exhausted_until``, which honours ``last_error_reset_at`` first.
+    """
     if error_code == 401:
         return EXHAUSTED_TTL_401_SECONDS
     if error_code == 429:
-        return EXHAUSTED_TTL_429_SECONDS
+        return _headerless_429_ttl(streak, sole_credential=sole_credential)
     return EXHAUSTED_TTL_DEFAULT_SECONDS
 
 
@@ -376,14 +439,30 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
-def _exhausted_until(entry: PooledCredential) -> Optional[float]:
+def _exhausted_until(
+    entry: PooledCredential,
+    *,
+    sole_credential: bool = False,
+) -> Optional[float]:
+    """When *entry* may be retried, or None if it is not in cooldown.
+
+    A provider-supplied reset timestamp is authoritative and is returned
+    verbatim.  ``sole_credential`` only affects the header-less fallback ladder
+    (see ``_headerless_429_ttl``); callers that cannot cheaply tell how many
+    rotation candidates the pool has leave it False, which is the conservative
+    (longer) answer.
+    """
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(getattr(entry, "last_error_reset_at", None))
     if reset_at is not None:
         return reset_at
     if entry.last_status_at:
-        return entry.last_status_at + _exhausted_ttl(entry.last_error_code)
+        return entry.last_status_at + _exhausted_ttl(
+            entry.last_error_code,
+            streak=int(getattr(entry, "last_rate_limit_streak", 0) or 0) or 1,
+            sole_credential=sole_credential,
+        )
     return None
 
 
@@ -692,6 +771,48 @@ class CredentialPool:
             return False
         return reason.strip().lower() in _TERMINAL_AUTH_REASONS
 
+    def _rotation_candidate_count(self) -> int:
+        """How many entries could serve traffic once their cooldown lifts.
+
+        DEAD entries never re-enter rotation on a TTL, and an unhydrated
+        borrowed reference has no key to send.  Neither is somewhere traffic
+        can move, so neither counts as a rotation target.
+        """
+        count = 0
+        for entry in self._entries:
+            if entry.last_status == STATUS_DEAD:
+                continue
+            if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                continue
+            count += 1
+        return count
+
+    def _next_rate_limit_streak(self, entry: PooledCredential, now: float) -> int:
+        """Consecutive header-less 429 count for *entry*, decayed by recovery.
+
+        The cooldown-expiry clear in ``_available_entries`` wipes
+        ``last_status_at``, so a strike is measured against its own timestamp:
+        one that lands inside the cooldown the credential just served (plus
+        ``RATE_LIMIT_STREAK_GRACE_SECONDS``) belongs to the same throttle
+        episode and climbs the ladder, while one that arrives after a healthy
+        stretch starts over at the base.
+        """
+        previous = int(getattr(entry, "last_rate_limit_streak", 0) or 0)
+        if previous <= 0:
+            return 1
+        struck_at = _parse_absolute_timestamp(
+            getattr(entry, "last_rate_limit_streak_at", None)
+        )
+        if struck_at is None:
+            return 1
+        served = _headerless_429_ttl(
+            previous,
+            sole_credential=self._rotation_candidate_count() <= 1,
+        )
+        if now - struck_at > served + RATE_LIMIT_STREAK_GRACE_SECONDS:
+            return 1
+        return previous + 1
+
     def _mark_exhausted(
         self,
         entry: PooledCredential,
@@ -712,14 +833,30 @@ class CredentialPool:
             terminal_status = STATUS_DEAD
         else:
             terminal_status = STATUS_EXHAUSTED
+        now = time.time()
+        # Only a header-less 429 walks the escalating ladder, so only that case
+        # touches the streak.  Every other failure leaves it untouched (rather
+        # than zeroing it), so a 401 landing between two throttles doesn't hand
+        # a genuinely rate-limited key a fresh short cooldown.
+        streak_fields: Dict[str, Any] = {}
+        if (
+            terminal_status == STATUS_EXHAUSTED
+            and status_code == 429
+            and normalized_error.get("reset_at") is None
+        ):
+            streak_fields = {
+                "last_rate_limit_streak": self._next_rate_limit_streak(entry, now),
+                "last_rate_limit_streak_at": now,
+            }
         updated = replace(
             entry,
             last_status=terminal_status,
-            last_status_at=time.time(),
+            last_status_at=now,
             last_error_code=status_code,
             last_error_reason=normalized_error.get("reason"),
             last_error_message=normalized_error.get("message"),
             last_error_reset_at=normalized_error.get("reset_at"),
+            **streak_fields,
         )
         self._replace_entry(entry, updated)
         if persist:
@@ -1642,6 +1779,10 @@ class CredentialPool:
         cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
+        # Computed once up front: a pool with nowhere to rotate to serves a much
+        # shorter header-less-429 cooldown, because refusing its only credential
+        # locally can't move traffic — it can only take the agent down.
+        sole_credential = self._rotation_candidate_count() <= 1
         for entry in self._entries:
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load.  A stale duplicate row
@@ -1722,7 +1863,9 @@ class CredentialPool:
                 # the re-auth case for OAuth singletons.
                 continue
             if entry.last_status == STATUS_EXHAUSTED:
-                exhausted_until = _exhausted_until(entry)
+                exhausted_until = _exhausted_until(
+                    entry, sole_credential=sole_credential
+                )
                 if exhausted_until is not None and now < exhausted_until:
                     # Codex quota windows can reopen EARLY: the user redeems a
                     # banked rate-limit reset (Codex CLI / ChatGPT UI), upgrades

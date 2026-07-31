@@ -1492,6 +1492,11 @@ _POOL_STATUS_FIELDS = (
     "last_error_reason",
     "last_error_message",
     "last_error_reset_at",
+    # The header-less-429 backoff ladder is part of the same status block: a
+    # process that adopts another's newer cooldown has to adopt the strike
+    # count with it, or the next mark restarts the ladder at the base.
+    "last_rate_limit_streak",
+    "last_rate_limit_streak_at",
 )
 
 
@@ -1499,6 +1504,8 @@ def _merge_disk_cooldown_state(
     entry: Dict[str, Any],
     disk_entry: Optional[Dict[str, Any]],
     provider_id: str,
+    *,
+    sole_credential: bool = False,
 ) -> Dict[str, Any]:
     """Keep a newer on-disk cooldown/quarantine over a stale in-memory one.
 
@@ -1540,7 +1547,8 @@ def _merge_disk_cooldown_state(
             return entry
         if disk_status == STATUS_EXHAUSTED:
             until = _exhausted_until(
-                PooledCredential.from_dict(provider_id, disk_entry)
+                PooledCredential.from_dict(provider_id, disk_entry),
+                sole_credential=sole_credential,
             )
             if until is None or until <= time.time():
                 return entry
@@ -1600,9 +1608,16 @@ def write_credential_pool(
             for entry in sanitized_entries
             if isinstance(entry, dict) and entry.get("id")
         }
+        # Match the pool's own view of whether there is anywhere to rotate to,
+        # so a header-less-429 cooldown is judged binding here on the same
+        # ladder the pool used to write it.
+        pool_size = max(len(sanitized_entries), len(existing_list))
         merged: List[Dict[str, Any]] = [
             _merge_disk_cooldown_state(
-                entry, existing_by_id.get(entry.get("id")), provider_id
+                entry,
+                existing_by_id.get(entry.get("id")),
+                provider_id,
+                sole_credential=pool_size <= 1,
             )
             if isinstance(entry, dict)
             else entry
