@@ -59,9 +59,15 @@ class TestManagerRecallSidecarRendering:
         signed = build_memory_context_block("operator recall")
         sidecar = user_tag + "\n\n" + signed + "\n\n" + plugin_context
 
-        assert render_api_content_without_manager_recall(sidecar) == (
-            user_tag + "\n\n\n\n" + plugin_context
+        assert render_api_content_without_manager_recall(sidecar, user_tag) == (
+            user_tag + "\n\n" + plugin_context
         )
+
+    def test_preserves_manager_shaped_user_content_before_sidecar_suffix(self):
+        user_content = build_memory_context_block("user-authored lookalike")
+        sidecar = user_content + "\n\n" + build_memory_context_block("operator recall")
+
+        assert render_api_content_without_manager_recall(sidecar, user_content) == user_content
 
     def test_removes_legacy_manager_signed_recall_frame(self):
         legacy = (
@@ -74,7 +80,7 @@ class TestManagerRecallSidecarRendering:
             "after"
         )
 
-        assert render_api_content_without_manager_recall(legacy) == "before\n\nafter"
+        assert render_api_content_without_manager_recall(legacy, "before") == "before\n\nafter"
 
 
 
@@ -619,7 +625,9 @@ class TestWireInvariant:
         agent.run_conversation("next question", conversation_history=history, task_id="t")
 
         sent_history = _user_messages(_chat_requests(handler)[0])[0]["content"]
-        assert sent_history == render_api_content_without_manager_recall(stored_sidecar)
+        assert sent_history == render_api_content_without_manager_recall(
+            stored_sidecar, history[0]["content"]
+        )
         assert "<memory-context>literal tag</memory-context>" in sent_history
         assert "UNSIGNED-PLUGIN-CONTEXT" in sent_history
         assert "operator recall" not in sent_history
@@ -1028,7 +1036,9 @@ class TestMaxIterationsSummaryReplay:
             assert handle_max_iterations(agent, messages, 5) == "SUMMARY"
 
         sent_user = next(m for m in captured["messages"] if m.get("role") == "user")
-        assert sent_user["content"] == render_api_content_without_manager_recall(stored_sidecar)
+        assert sent_user["content"] == render_api_content_without_manager_recall(
+            stored_sidecar, messages[0]["content"]
+        )
         assert "operator recall" not in sent_user["content"]
         assert messages[0]["api_content"] == stored_sidecar
 

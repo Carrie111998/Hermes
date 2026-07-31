@@ -81,7 +81,7 @@ except ImportError:
     AIOHTTP_AVAILABLE = False
     web = None  # type: ignore[assignment]
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, resolve_auto_inject_recall
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE,
     BasePlatformAdapter,
@@ -2650,6 +2650,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
+            "auto_inject_recall": resolve_auto_inject_recall(user_config, "api_server"),
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,

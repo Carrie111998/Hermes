@@ -1466,7 +1466,9 @@ def run_conversation(
                     # bytes (composed from msg["content"], never from a
                     # previously-injected copy).
                     api_msg["content"] = (
-                        render_api_content_without_manager_recall(_api_content)
+                        render_api_content_without_manager_recall(
+                            _api_content, api_msg.get("content")
+                        )
                         if not getattr(agent, "_auto_inject_recall", True)
                         else _api_content
                     )
@@ -1494,7 +1496,9 @@ def run_conversation(
                 # would rewrite on reload — see the capture in
                 # ``_flush_messages_to_session_db``).
                 api_msg["content"] = (
-                    render_api_content_without_manager_recall(_api_content)
+                    render_api_content_without_manager_recall(
+                        _api_content, api_msg.get("content")
+                    )
                     if not getattr(agent, "_auto_inject_recall", True)
                     else _api_content
                 )

@@ -109,7 +109,9 @@ def substitute_api_content(
         and api_msg.get("role") in ("user", "assistant")
     ):
         if not auto_inject_recall:
-            sidecar = render_api_content_without_manager_recall(sidecar)
+            sidecar = render_api_content_without_manager_recall(
+                sidecar, api_msg.get("content")
+            )
         api_msg["content"] = sidecar
     return sidecar
 

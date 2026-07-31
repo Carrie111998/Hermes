@@ -21522,37 +21522,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     @staticmethod
     def _resolve_auto_inject_recall(user_config: dict | None, platform_key: str) -> bool:
         """Resolve automatic external recall from global and platform config."""
-        config = user_config if isinstance(user_config, dict) else {}
-        memory_config = config.get("memory")
-        global_value = (
-            memory_config.get("auto_inject_recall", True)
-            if isinstance(memory_config, dict)
-            else True
-        )
-        resolved = global_value if isinstance(global_value, bool) else True
+        from gateway.config import resolve_auto_inject_recall
 
-        gateway_config = config.get("gateway")
-        platforms = (
-            gateway_config.get("platforms")
-            if isinstance(gateway_config, dict)
-            else None
-        )
-        platform_config = (
-            platforms.get(platform_key)
-            if isinstance(platforms, dict) and isinstance(platform_key, str)
-            else None
-        )
-        platform_memory = (
-            platform_config.get("memory")
-            if isinstance(platform_config, dict)
-            else None
-        )
-        override = (
-            platform_memory.get("auto_inject_recall")
-            if isinstance(platform_memory, dict)
-            else None
-        )
-        return override if isinstance(override, bool) else resolved
+        return resolve_auto_inject_recall(user_config, platform_key)
 
     @staticmethod
     def _agent_config_signature(

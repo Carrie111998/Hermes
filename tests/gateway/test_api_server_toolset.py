@@ -67,8 +67,10 @@ class TestApiServerAdapterToolset:
                                         "provider": None, "api_mode": None,
                                         "command": None, "args": []}
             mock_model.return_value = "test/model"
-            # No platform_toolsets override — should fall back to hermes-api-server default
-            mock_config.return_value = {}
+            mock_config.return_value = {
+                "memory": {"auto_inject_recall": True},
+                "gateway": {"platforms": {"api_server": {"memory": {"auto_inject_recall": False}}}},
+            }
             mock_agent_cls.return_value = MagicMock()
 
             adapter._create_agent()
@@ -79,4 +81,5 @@ class TestApiServerAdapterToolset:
             assert isinstance(toolsets, list)
             assert len(toolsets) > 0
             assert call_kwargs.kwargs.get("platform") == "api_server"
+            assert call_kwargs.kwargs.get("auto_inject_recall") is False
 

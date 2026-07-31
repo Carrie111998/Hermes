@@ -37,6 +37,21 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
     return is_truthy_value(value, default=default)
 
 
+def resolve_auto_inject_recall(config: dict | None, platform_key: str) -> bool:
+    """Resolve automatic external recall from global and platform config."""
+    source = config if isinstance(config, dict) else {}
+    memory = source.get("memory")
+    resolved = memory.get("auto_inject_recall", True) if isinstance(memory, dict) else True
+    if not isinstance(resolved, bool):
+        resolved = True
+    gateway = source.get("gateway")
+    platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    platform = platforms.get(platform_key) if isinstance(platforms, dict) else None
+    platform_memory = platform.get("memory") if isinstance(platform, dict) else None
+    override = platform_memory.get("auto_inject_recall") if isinstance(platform_memory, dict) else None
+    return override if isinstance(override, bool) else resolved
+
+
 # Recognized truthy / falsy tokens for the GATEWAY_MULTIPLEX_PROFILES operator
 # override. Anything not in either set — and a blank/whitespace value — is
 # treated as "unset" so it falls through to config.yaml rather than silently

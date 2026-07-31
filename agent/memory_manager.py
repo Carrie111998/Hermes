@@ -176,6 +176,13 @@ _MANAGER_RECALL_FRAME_RE = re.compile(
     r'[\s\S]*?</\s*memory-context\s*>',
     re.IGNORECASE,
 )
+_MANAGER_RECALL_SIDECAR_RE = re.compile(
+    r'\n\n<\s*memory-context\s*>\s*'
+    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*'
+    r'Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*'
+    r'[\s\S]*?</\s*memory-context\s*>',
+    re.IGNORECASE,
+)
 
 
 def sanitize_context(text: str) -> str:
@@ -186,9 +193,15 @@ def sanitize_context(text: str) -> str:
     return text
 
 
-def render_api_content_without_manager_recall(api_content: str) -> str:
-    """Remove manager-signed recall frames from a copied outbound sidecar."""
-    return _MANAGER_RECALL_FRAME_RE.sub('', api_content)
+def render_api_content_without_manager_recall(
+    api_content: str, canonical_content: Any
+) -> str:
+    """Remove manager recall only from the sidecar suffix added after canonical content."""
+    if not isinstance(canonical_content, str) or not api_content.startswith(canonical_content):
+        return api_content
+    suffix = api_content[len(canonical_content):]
+    suffix = _MANAGER_RECALL_SIDECAR_RE.sub('', suffix)
+    return canonical_content + _MANAGER_RECALL_FRAME_RE.sub('', suffix)
 
 
 class StreamingContextScrubber:
