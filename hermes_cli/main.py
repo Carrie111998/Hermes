@@ -2661,8 +2661,8 @@ def cmd_chat(args):
     try:
         cli_main(**kwargs)
     except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def cmd_gateway(args):

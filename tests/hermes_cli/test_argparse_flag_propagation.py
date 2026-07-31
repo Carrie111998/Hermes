@@ -451,6 +451,61 @@ class TestInvocationFallbackFlags:
             "gemini/gemini-3.1-pro-preview",
         ]
 
+    @pytest.mark.parametrize(
+        "fallback_argv,expected_message",
+        [
+            (["--fallback", "missing-slash"], "invalid fallback override"),
+            (
+                [
+                    "--fallback",
+                    "openai-codex/gpt-5.6-sol",
+                    "--fallback",
+                    "openai-codex/gpt-5.6-sol",
+                ],
+                "duplicate fallback override",
+            ),
+        ],
+    )
+    def test_cmd_chat_reports_invalid_fallbacks_as_cli_usage_errors(
+        self,
+        monkeypatch,
+        real_parser,
+        capsys,
+        fallback_argv,
+        expected_message,
+    ):
+        import types
+
+        import hermes_cli.main as main_mod
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        args = real_parser.parse_args(["chat", *fallback_argv])
+        fake_cli = types.ModuleType("cli")
+
+        def fake_main(**kwargs):
+            get_fallback_chain({}, kwargs["fallbacks"])
+
+        setattr(fake_cli, "main", fake_main)
+        fake_banner = types.ModuleType("hermes_cli.banner")
+        setattr(fake_banner, "prefetch_update_check", lambda: None)
+        fake_skills_sync = types.ModuleType("tools.skills_sync")
+        setattr(fake_skills_sync, "sync_skills", lambda quiet=True: None)
+
+        monkeypatch.setitem(sys.modules, "cli", fake_cli)
+        monkeypatch.setitem(sys.modules, "hermes_cli.banner", fake_banner)
+        monkeypatch.setitem(sys.modules, "tools.skills_sync", fake_skills_sync)
+        monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+        monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            main_mod.cmd_chat(args)
+
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert expected_message in captured.err
+        assert captured.err.startswith("Error: ")
+
 
 class TestInheritedAppendFlags:
     @pytest.fixture
