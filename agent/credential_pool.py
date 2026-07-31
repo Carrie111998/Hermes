@@ -659,12 +659,12 @@ class CredentialPool:
                 self._entries[idx] = new
                 return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None, skip_merge: bool = False) -> None:
+    def _persist(self, *, removed_ids: Optional[List[str]] = None, reset_statuses: bool = False) -> None:
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
-            skip_merge=skip_merge,
+            reset_statuses=reset_statuses,
         )
 
     def _is_terminal_auth_failure(
@@ -2042,7 +2042,11 @@ class CredentialPool:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist(skip_merge=True)
+                # Atomic read-clear-write: reset_statuses=True makes
+                # write_credential_pool re-read the latest disk state inside
+                # the same _auth_store_lock before clearing, so a concurrent
+                # gateway 429 is not silently dropped (issue #73748).
+                self._persist(reset_statuses=True)
             return count
 
     # -- reload_from_disk --------------------------------------------------

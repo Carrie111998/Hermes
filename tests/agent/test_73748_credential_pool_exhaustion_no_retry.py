@@ -586,3 +586,174 @@ class TestBug2FixReloadFromDisk:
             "Fix verified: single-credential pool recovers after "
             "reload_from_disk following auth reset."
         )
+
+
+# ── Concurrent 429 interleaving: reset_statuses must be atomic ────────
+
+class TestResetStatusesAtomicity:
+    """Verify that ``reset_statuses`` performs an atomic read-clear-write
+    so a concurrent 429 written by a gateway between ``load_pool`` and
+    ``reset_statuses`` is correctly cleared (not silently dropped nor
+    resurrected by a stale merge)."""
+
+    def test_reset_uses_latest_disk_state_not_stale_snapshot(self, tmp_path, monkeypatch):
+        """If a gateway writes a new 429 to disk AFTER ``load_pool`` but
+        BEFORE ``reset_statuses``, the reset must clear that 429 (since it
+        reads the latest disk state atomically) — it must NOT resurrect a
+        stale pre-reset 429 via the merge path."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        from agent.credential_pool import (
+            STATUS_EXHAUSTED,
+            load_pool,
+        )
+        from hermes_cli.auth import write_credential_pool
+
+        auth_store = tmp_path / "hermes"
+        auth_store.mkdir(parents=True, exist_ok=True)
+        ts_1 = time.time() - 10  # old timestamp
+
+        pool_data = {
+            "version": 1,
+            "credential_pool": {
+                "openai": [
+                    {
+                        "id": "cred-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-key-a",
+                        "last_status": STATUS_EXHAUSTED,
+                        "last_status_at": ts_1,
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit",
+                        "last_error_message": "Too many requests",
+                    },
+                ]
+            },
+        }
+        (auth_store / "auth.json").write_text(json.dumps(pool_data, indent=2))
+
+        # Step 1: load_pool reads disk state (entry has old 429)
+        pool = load_pool("openai")
+
+        # Step 2: a concurrent gateway writes a NEW 429 to disk
+        ts_2 = time.time()  # newer timestamp
+        write_credential_pool(
+            "openai",
+            [
+                {
+                    "id": "cred-a",
+                    "label": "primary",
+                    "auth_type": "api_key",
+                    "priority": 0,
+                    "source": "manual",
+                    "access_token": "sk-key-a",
+                    "last_status": STATUS_EXHAUSTED,
+                    "last_status_at": ts_2,
+                    "last_error_code": 429,
+                    "last_error_reason": "rate_limit",
+                    "last_error_message": "New concurrent 429",
+                },
+            ],
+        )
+
+        # Step 3: reset_statuses — must use latest disk state (ts_2), not
+        # the stale snapshot (ts_1), and clear ALL status fields atomically.
+        count = pool.reset_statuses()
+        assert count >= 1
+
+        # Verify disk: all status fields must be cleared
+        import json as _json
+        disk = _json.loads((auth_store / "auth.json").read_text())
+        disk_entry = disk["credential_pool"]["openai"][0]
+        assert disk_entry.get("last_status") is None, (
+            "reset_statuses must clear the LATEST disk state, not the stale snapshot"
+        )
+        assert disk_entry.get("last_status_at") is None
+        assert disk_entry.get("last_error_code") is None
+
+        # Verify in-memory: pool also has cleared state
+        entry = pool._entries[0]
+        assert entry.last_status is None
+        assert entry.last_status_at is None
+
+    def test_reset_does_not_drop_entries_added_concurrently(self, tmp_path, monkeypatch):
+        """If a new credential is added to disk between load_pool and
+        reset_statuses, the reset must not drop that new entry."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+
+        from agent.credential_pool import (
+            STATUS_EXHAUSTED,
+            load_pool,
+        )
+        from hermes_cli.auth import write_credential_pool
+
+        auth_store = tmp_path / "hermes"
+        auth_store.mkdir(parents=True, exist_ok=True)
+        ts = time.time() - 10
+
+        pool_data = {
+            "version": 1,
+            "credential_pool": {
+                "openai": [
+                    {
+                        "id": "cred-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-key-a",
+                        "last_status": STATUS_EXHAUSTED,
+                        "last_status_at": ts,
+                        "last_error_code": 429,
+                    },
+                ]
+            },
+        }
+        (auth_store / "auth.json").write_text(json.dumps(pool_data, indent=2))
+
+        # Step 1: load_pool reads disk state (1 entry)
+        pool = load_pool("openai")
+
+        # Step 2: a concurrent process adds a NEW credential to disk
+        write_credential_pool(
+            "openai",
+            [
+                {
+                    "id": "cred-a",
+                    "label": "primary",
+                    "auth_type": "api_key",
+                    "priority": 0,
+                    "source": "manual",
+                    "access_token": "sk-key-a",
+                    "last_status": STATUS_EXHAUSTED,
+                    "last_status_at": ts,
+                    "last_error_code": 429,
+                },
+                {
+                    "id": "cred-b",
+                    "label": "secondary",
+                    "auth_type": "api_key",
+                    "priority": 1,
+                    "source": "manual",
+                    "access_token": "sk-key-b",
+                },
+            ],
+        )
+
+        # Step 3: reset_statuses — must not drop cred-b
+        count = pool.reset_statuses()
+        assert count >= 1
+
+        # Verify disk: both entries must exist, both cleared
+        import json as _json
+        disk = _json.loads((auth_store / "auth.json").read_text())
+        disk_entries = disk["credential_pool"]["openai"]
+        disk_ids = {e["id"] for e in disk_entries}
+        assert "cred-a" in disk_ids, "Original entry must not be dropped"
+        assert "cred-b" in disk_ids, "Concurrently added entry must not be dropped"
+        for e in disk_entries:
+            assert e.get("last_status") is None
+            assert e.get("last_error_code") is None
