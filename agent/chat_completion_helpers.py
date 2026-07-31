@@ -1066,19 +1066,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _resolve_auto_reasoning_config(agent, messages: list) -> dict:
+    """Resolve the effective reasoning config for one API call.
+
+    If the configured effort is ``auto``, compute a concrete level from the
+    current task context (and the agent's model capability tier). Returns a
+    shallow copy — never mutates ``agent.reasoning_config`` in place.
+
+    Central chokepoint for dynamic resolution: every request-building path
+    (main ``build_api_kwargs``, iteration-limit summary, LM Studio summary)
+    routes through this so ``auto`` behaves identically everywhere.
+    """
+    rc = agent.reasoning_config
+    if isinstance(rc, dict) and rc.get("effort") == "auto":
+        from hermes_constants import compute_dynamic_reasoning_effort
+        resolved = compute_dynamic_reasoning_effort(messages, model=agent.model)
+        logger.debug("auto-reasoning resolved to %s", resolved)
+        rc = {**rc, "effort": resolved}
+    return rc
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
-    # ── Dynamic (auto) reasoning effort resolution ──────────────────────
-    # When the user has set reasoning_effort to "auto", compute a concrete
-    # level from the current task context before handing off to the transport.
-    _rc = agent.reasoning_config
-    if isinstance(_rc, dict) and _rc.get("effort") == "auto":
-        from hermes_constants import compute_dynamic_reasoning_effort
-        resolved = compute_dynamic_reasoning_effort(api_messages, model=agent.model)
-        logger.debug("build_api_kwargs: auto-reasoning resolved to %s", resolved)
-        # Shallow copy — never mutate the agent's config dict in place.
-        _rc = {**_rc, "effort": resolved}
-    # ────────────────────────────────────────────────────────────────────
+    # Dynamic (auto) reasoning effort — resolved per-API-call so reasoning
+    # adapts to each turn's task. See _resolve_auto_reasoning_config().
+    _rc = _resolve_auto_reasoning_config(agent, api_messages)
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -2128,12 +2140,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             and agent._supports_reasoning_extra_body()
         )
         _lm_reasoning_effort: str | None = (
-            agent._resolve_lmstudio_summary_reasoning_effort()
+            agent._resolve_lmstudio_summary_reasoning_effort(
+                _resolve_auto_reasoning_config(agent, api_messages)
+            )
             if _is_lmstudio_summary else None
         )
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
-            if agent.reasoning_config is not None:
-                summary_extra_body["reasoning"] = agent.reasoning_config
+            # Dynamic (auto) reasoning — same chokepoint as build_api_kwargs
+            # so the iteration-limit summary honors auto per-call too.
+            _summary_rc = _resolve_auto_reasoning_config(agent, api_messages)
+            if _summary_rc is not None:
+                summary_extra_body["reasoning"] = _summary_rc
             else:
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
