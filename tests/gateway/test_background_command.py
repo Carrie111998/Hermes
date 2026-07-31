@@ -221,16 +221,22 @@ class TestRunBackgroundTask:
     async def test_media_only_result_has_one_tracked_text_final(self):
         runner = _make_runner()
         mock_adapter = AsyncMock()
-        mock_adapter.send = AsyncMock(
-            return_value=SendResult(success=True, message_id="media-final-1")
-        )
+        delivery_order = []
+
+        async def send_terminal(**_kwargs):
+            delivery_order.append("terminal")
+            return SendResult(success=True, message_id="media-final-1")
+
+        async def send_document(**_kwargs):
+            delivery_order.append("attachment")
+            return SendResult(success=True, message_id="document-1")
+
+        mock_adapter.send = AsyncMock(side_effect=send_terminal)
         mock_adapter.extract_media = MagicMock(
             return_value=([("/tmp/result.pdf", False)], "")
         )
         mock_adapter.extract_images = MagicMock(return_value=([], ""))
-        mock_adapter.send_document = AsyncMock(
-            return_value=SendResult(success=True, message_id="document-1")
-        )
+        mock_adapter.send_document = AsyncMock(side_effect=send_document)
         runner.adapters[Platform.TELEGRAM] = mock_adapter
         source = _make_event().source
 
@@ -261,15 +267,174 @@ class TestRunBackgroundTask:
             )
 
         assert mock_adapter.send.call_count == 1
-        assert "(Media response attached.)" in (
+        assert "(All required attachments were delivered.)" in (
             mock_adapter.send.call_args.kwargs["content"]
         )
         mock_adapter.send_document.assert_awaited_once()
+        assert delivery_order == ["attachment", "terminal"]
         receipt = _only_run_receipt()
         assert receipt["run_terminal_state"] == "done"
         assert receipt["final_generated"] is True
         assert receipt["delivery_obligation_id"]
         assert receipt["final_delivery_status"] == "delivered"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        (
+            "attachment_outcome",
+            "expected_reason",
+            "expected_notice",
+        ),
+        [
+            (
+                SendResult(
+                    success=False,
+                    error="upload rejected",
+                    error_kind="forbidden",
+                ),
+                "background_media_delivery_rejected",
+                "required attachments were not delivered",
+            ),
+            (
+                SendResult(
+                    success=False,
+                    error="upload timed out",
+                    error_kind="unknown",
+                ),
+                "background_media_delivery_unknown",
+                "delivery could not be confirmed",
+            ),
+            (
+                RuntimeError("upload connection broke"),
+                "background_media_delivery_unknown:RuntimeError",
+                "delivery could not be confirmed",
+            ),
+        ],
+    )
+    async def test_media_failure_truth_precedes_tracked_terminal(
+        self,
+        attachment_outcome,
+        expected_reason,
+        expected_notice,
+    ):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        delivery_order = []
+
+        async def send_terminal(**_kwargs):
+            delivery_order.append("terminal")
+            return SendResult(success=True, message_id="terminal-1")
+
+        async def send_document(**_kwargs):
+            delivery_order.append("attachment")
+            if isinstance(attachment_outcome, BaseException):
+                raise attachment_outcome
+            return attachment_outcome
+
+        mock_adapter.send = AsyncMock(side_effect=send_terminal)
+        mock_adapter.extract_media = MagicMock(
+            return_value=([("/tmp/result.pdf", False)], "")
+        )
+        mock_adapter.extract_images = MagicMock(return_value=([], ""))
+        mock_adapter.send_document = AsyncMock(side_effect=send_document)
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = _make_event().source
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths",
+            return_value=[("/tmp/result.pdf", False)],
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "MEDIA:/tmp/result.pdf",
+                "completed": True,
+                "run_terminal_state": "done",
+                "run_end_reason": "completed",
+                "final_generated": True,
+            }
+            MockAgent.return_value = mock_agent
+
+            await runner._run_background_task(
+                "make a file",
+                source,
+                "bg_media_failure",
+            )
+
+        assert delivery_order == ["attachment", "terminal"]
+        terminal_content = mock_adapter.send.call_args.kwargs["content"]
+        assert expected_notice in terminal_content
+        assert "All required attachments were delivered" not in terminal_content
+        receipt = _only_run_receipt()
+        assert receipt["run_terminal_state"] == "failed"
+        assert receipt["run_end_reason"] == expected_reason
+        assert receipt["final_generated"] is True
+        assert receipt["delivery_obligation_id"]
+        assert receipt["final_delivery_status"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_media_cancellation_closes_cancelled_without_terminal_claim(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        delivery_order = []
+
+        async def send_terminal(**_kwargs):
+            delivery_order.append("terminal")
+            return SendResult(success=True, message_id="terminal-1")
+
+        async def cancel_document(**_kwargs):
+            delivery_order.append("attachment")
+            raise asyncio.CancelledError()
+
+        mock_adapter.send = AsyncMock(side_effect=send_terminal)
+        mock_adapter.extract_media = MagicMock(
+            return_value=([("/tmp/result.pdf", False)], "")
+        )
+        mock_adapter.extract_images = MagicMock(return_value=([], ""))
+        mock_adapter.send_document = AsyncMock(side_effect=cancel_document)
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = _make_event().source
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "gateway.platforms.base.BasePlatformAdapter.filter_media_delivery_paths",
+            return_value=[("/tmp/result.pdf", False)],
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": "MEDIA:/tmp/result.pdf",
+                "completed": True,
+                "run_terminal_state": "done",
+                "run_end_reason": "completed",
+                "final_generated": True,
+            }
+            MockAgent.return_value = mock_agent
+
+            with pytest.raises(asyncio.CancelledError):
+                await runner._run_background_task(
+                    "make a file",
+                    source,
+                    "bg_media_cancelled",
+                )
+
+        assert delivery_order == ["attachment"]
+        mock_adapter.send.assert_not_awaited()
+        receipt = _only_run_receipt()
+        assert receipt["run_terminal_state"] == "cancelled"
+        assert receipt["run_end_reason"] == "background_cancelled"
+        assert receipt["final_generated"] is False
+        assert receipt["delivery_obligation_id"] is None
+        assert receipt["final_delivery_status"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

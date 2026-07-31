@@ -19318,24 +19318,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             media_files = []
+            extracted_media_files = []
             images = []
             text_content = ""
             if response and response != "(empty)":
-                media_files, response = adapter.extract_media(response)
+                extracted_media_files, response = adapter.extract_media(response)
                 from gateway.platforms.base import BasePlatformAdapter
 
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                media_files = BasePlatformAdapter.filter_media_delivery_paths(
+                    extracted_media_files
+                )
                 images, text_content = adapter.extract_images(response)
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-            header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-            if text_content:
-                final_content = header + text_content
-            elif images or media_files:
-                final_content = header + "(Media response attached.)"
-            else:
-                final_content = header + "(No response generated)"
-
             terminal = result
             if not _agent_response_generated:
                 terminal.update(
@@ -19360,58 +19355,145 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                 )
 
-            await _deliver_terminal(final_content, terminal)
+            has_attachments = bool(images or extracted_media_files)
+            if not has_attachments:
+                header = (
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                )
+                final_content = (
+                    header + text_content
+                    if text_content
+                    else header + "(No response generated)"
+                )
+                await _deliver_terminal(final_content, terminal)
+            else:
+                attachment_rejected = (
+                    len(media_files) != len(extracted_media_files)
+                )
+                attachment_unknown = False
+                attachment_error_types: List[str] = []
 
-            # Media-only responses still have the tracked final above.
-            for image_url, alt_text in (images or []):
-                try:
-                    await adapter.send_image(
-                        chat_id=source.chat_id,
-                        image_url=image_url,
-                        caption=alt_text,
-                        metadata=_thread_metadata,
+                async def _capture_attachment(send_awaitable: Any) -> None:
+                    nonlocal attachment_rejected, attachment_unknown
+                    try:
+                        send_result = await send_awaitable
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as attachment_exc:
+                        attachment_unknown = True
+                        attachment_error_types.append(
+                            type(attachment_exc).__name__
+                        )
+                        logger.warning(
+                            "Background task %s attachment delivery raised %s",
+                            task_id,
+                            type(attachment_exc).__name__,
+                        )
+                        return
+                    if getattr(send_result, "success", False):
+                        return
+                    if _delivery_result_is_unknown(send_result):
+                        attachment_unknown = True
+                    else:
+                        attachment_rejected = True
+
+                for image_url, alt_text in (images or []):
+                    await _capture_attachment(
+                        adapter.send_image(
+                            chat_id=source.chat_id,
+                            image_url=image_url,
+                            caption=alt_text,
+                            metadata=_thread_metadata,
+                        )
                     )
-                except Exception:
-                    pass
 
-            from gateway.platforms.base import (
-                should_send_media_as_audio as _should_send_media_as_audio,
-            )
+                from gateway.platforms.base import (
+                    should_send_media_as_audio as _should_send_media_as_audio,
+                )
 
-            _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
-            _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
-            for media_path, _is_voice in (media_files or []):
-                _ext = os.path.splitext(media_path)[1].lower()
-                try:
-                    if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                        await adapter.send_voice(
+                _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+                _VIDEO_EXTS = {
+                    ".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"
+                }
+                for media_path, _is_voice in (media_files or []):
+                    _ext = os.path.splitext(media_path)[1].lower()
+                    if _should_send_media_as_audio(
+                        source.platform, _ext, _is_voice
+                    ):
+                        send_awaitable = adapter.send_voice(
                             chat_id=source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_metadata,
                         )
                     elif _ext in _VIDEO_EXTS:
-                        await adapter.send_video(
+                        send_awaitable = adapter.send_video(
                             chat_id=source.chat_id,
                             video_path=media_path,
                             metadata=_thread_metadata,
                         )
                     elif _ext in _IMAGE_EXTS:
-                        await adapter.send_image_file(
+                        send_awaitable = adapter.send_image_file(
                             chat_id=source.chat_id,
                             image_path=media_path,
                             metadata=_thread_metadata,
                         )
                     else:
-                        await adapter.send_document(
+                        send_awaitable = adapter.send_document(
                             chat_id=source.chat_id,
                             file_path=media_path,
                             metadata=_thread_metadata,
                         )
-                except Exception:
-                    pass
+                    await _capture_attachment(send_awaitable)
+
+                if attachment_unknown:
+                    reason = "background_media_delivery_unknown"
+                    if attachment_error_types:
+                        reason += f":{attachment_error_types[0]}"
+                    terminal.update(
+                        {
+                            "completed": False,
+                            "failed": True,
+                            "run_terminal_state": "failed",
+                            "run_end_reason": reason,
+                        }
+                    )
+                    status_line = (
+                        "⚠️ Background task finished, but attachment "
+                        "delivery could not be confirmed."
+                    )
+                elif attachment_rejected:
+                    terminal.update(
+                        {
+                            "completed": False,
+                            "failed": True,
+                            "run_terminal_state": "failed",
+                            "run_end_reason": (
+                                "background_media_delivery_rejected"
+                            ),
+                        }
+                    )
+                    status_line = (
+                        "❌ Background task finished, but one or more "
+                        "required attachments were not delivered."
+                    )
+                else:
+                    status_line = "✅ Background task complete"
+
+                final_content = f'{status_line}\nPrompt: "{preview}"'
+                if text_content:
+                    final_content += f"\n\n{text_content}"
+                if not attachment_unknown and not attachment_rejected:
+                    final_content += (
+                        "\n\n(All required attachments were delivered.)"
+                    )
+                await _deliver_terminal(final_content, terminal)
 
         except BaseException as e:
             logger.exception("Background task %s failed", task_id)
+            is_control_exit = isinstance(
+                e,
+                (asyncio.CancelledError, KeyboardInterrupt, InterruptedError),
+            ) or not isinstance(e, Exception)
             if not _terminal_closed:
                 terminal = _gateway_exception_terminal_fields(e)
                 terminal["run_end_reason"] = (
@@ -19419,7 +19501,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if terminal["run_terminal_state"] == "cancelled"
                     else f"background_exception:{type(e).__name__}"
                 )
-                if adapter is not None and not _final_delivery_started:
+                if is_control_exit:
+                    _close_terminal(terminal)
+                elif adapter is not None and not _final_delivery_started:
                     try:
                         await _deliver_terminal(
                             f"❌ Background task {task_id} failed: {e}",
@@ -19429,10 +19513,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                 else:
                     _close_terminal(terminal)
-            if isinstance(
-                e,
-                (asyncio.CancelledError, KeyboardInterrupt, InterruptedError),
-            ) or not isinstance(e, Exception):
+            if is_control_exit:
                 raise
 
 
