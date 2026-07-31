@@ -161,6 +161,22 @@ class TestTranscribeLocalWiring:
         assert captured["vad_filter"] is False
         assert "vad_parameters" not in captured
 
+    def test_vad_parameters_configurable(self, monkeypatch):
+        stt_cfg = {
+            "local": {
+                "vad_min_silence_ms": 300,
+                "vad_threshold": 0.35,
+                "vad_min_speech_duration_ms": 250,
+            }
+        }
+        captured, _ = self._run(monkeypatch, stt_cfg)
+        assert captured["vad_filter"] is True
+        assert captured["vad_parameters"] == {
+            "min_silence_duration_ms": 300,
+            "threshold": 0.35,
+            "min_speech_duration_ms": 250,
+        }
+
     def test_hallucinated_segments_filtered_from_transcript(self, monkeypatch):
         segments = [
             _seg(" real speech"),
