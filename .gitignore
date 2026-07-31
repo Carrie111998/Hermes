@@ -190,3 +190,7 @@ infographics/
 infograficos/
 infografico/
 native/fts5_cjk/*.so
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db

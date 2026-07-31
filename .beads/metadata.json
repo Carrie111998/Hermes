@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "hermes_agent",
+  "project_id": "50e1949f-d704-4b4e-b28a-23a799e9874c"
+}
