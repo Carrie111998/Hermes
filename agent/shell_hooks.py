@@ -855,6 +855,12 @@ def inline_shell_interpreter(command: str) -> Optional[str]:
     flag = parts[index + 1]
     if not flag.startswith("-") or flag == "--" or "c" not in flag[1:]:
         return None
+    # ``-c`` consumes the NEXT argument as the command body. Without one the
+    # shell has nothing to execute (``sh -c`` exits 2 at runtime), so the
+    # malformed form must fall through to the path heuristic and fail doctor
+    # rather than pass on interpreter availability alone.
+    if index + 2 >= len(parts):
+        return None
     return interpreter
 
 

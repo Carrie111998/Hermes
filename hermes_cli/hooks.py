@@ -348,8 +348,19 @@ def _cmd_doctor(_args) -> None:
 def _doctor_one(spec, shell_hooks) -> int:
     problems = 0
 
-    # 1. Script exists and is executable
-    if shell_hooks.script_is_executable(spec.command):
+    # 1. Script exists and is executable — or, for an inline ``sh -c '…'``
+    # hook, the interpreter is reachable (there is no script file to stat,
+    # so "script exists" would be misleading either way).
+    inline_interpreter = shell_hooks.inline_shell_interpreter(spec.command)
+    if inline_interpreter is not None:
+        if shell_hooks.script_is_executable(spec.command):
+            print(f"      ✓ inline shell command "
+                  f"({inline_interpreter} available; no script file to check)")
+        else:
+            problems += 1
+            print(f"      ✗ inline shell interpreter not found: "
+                  f"{inline_interpreter}")
+    elif shell_hooks.script_is_executable(spec.command):
         print("      ✓ script exists and is executable")
     else:
         problems += 1

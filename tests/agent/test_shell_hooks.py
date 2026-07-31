@@ -479,6 +479,22 @@ class TestInlineShellHooks:
             shell_hooks.INLINE_SHELL_SENTINEL
         )
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sh -c",
+            "bash -lc",
+            "sudo sh -c",
+            "env FOO=bar bash -c",
+        ],
+    )
+    def test_dash_c_without_a_body_is_not_inline(self, command):
+        """``-c`` consumes the next argument as the command body; without one
+        the shell executes nothing (``sh -c`` exits 2 at runtime). The
+        malformed form must not classify as a healthy inline hook."""
+        assert shell_hooks.inline_shell_interpreter(command) is None
+        assert shell_hooks.script_is_executable(command) is False
+
     def test_unavailable_interpreter_still_fails(self):
         """A typo must not pass doctor just because it looks inline."""
         assert shell_hooks.script_is_executable("bsh -c 'echo hi'") is False
