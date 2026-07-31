@@ -91,3 +91,28 @@ def test_unknown_selector_is_unknown():
     r = decoder.decode("0x12345678" + "0" * 64)
     assert r["action"] == "unknown"
     assert r["risk"] == "unknown"
+
+
+def test_trailing_calldata_does_not_bypass_setApprovalForAll():
+    # EVM ignores trailing calldata; decoder must use absolute word indexing
+    # (not negative indexing) so appended junk cannot flip a NO-GO to ok.
+    body = _word("0xOperator") + "0" * 63 + "1" + "00"  # approved=true + junk
+    r = decoder.decode("0xa22cb465" + body)
+    assert r["approved"] is True
+    assert r["risk"] == "NO-GO"
+
+
+def test_trailing_calldata_does_not_bypass_unlimited_approve():
+    body = _word("0xDeadBeef") + "f" * 64 + "00"  # unlimited + junk
+    r = decoder.decode("0x095ea7b3" + body)
+    assert r["unlimited"] is True
+    assert r["risk"] == "NO-GO"
+
+
+def test_truncated_approve_missing_amount_is_no_go():
+    # selector + spender word only (64 hex chars), no amount word
+    data = "0x095ea7b3" + _word("0xDeadBeef")
+    r = decoder.decode(data)
+    assert r["action"] == "approve"
+    assert r["risk"] == "NO-GO"
+    assert "malformed" in r["reason"]
