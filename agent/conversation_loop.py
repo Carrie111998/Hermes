@@ -193,6 +193,15 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
 
+    # A redirect appends a real user message to the live turn, so it is a task
+    # boundary too. Re-arm the checkpoint baseline here — the reset belongs
+    # with the event rather than at the one call site — or a scope="task" run
+    # would keep rolling back to the state before the *original* instruction,
+    # discarding exactly the work the correction asked for (#68877).
+    checkpoint_mgr = getattr(agent, "_checkpoint_mgr", None)
+    if checkpoint_mgr is not None:
+        checkpoint_mgr.new_task()
+
 
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
@@ -1273,13 +1282,6 @@ def run_conversation(
                     f"User correction during the turn: {_redirect_text}"
                 )
             agent._persist_session(messages, conversation_history)
-            # A redirect is a real user message appended to the live turn, so
-            # it is a task boundary too: re-arm the baseline here or a
-            # scope="task" run would keep rolling back to the state before the
-            # *original* instruction, discarding work the user just steered
-            # and asked to keep. Matches the documented "a new user message
-            # re-arms a fresh baseline" contract (#68877).
-            agent._checkpoint_mgr.new_task()
 
         # Reset per-turn checkpoint dedup so each iteration can take one snapshot
         # (no-op under scope="task"; see CheckpointManager.new_turn).

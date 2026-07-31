@@ -11,6 +11,23 @@ the next task boundary. These tests exercise the dedup bookkeeping directly
 from tools.checkpoint_manager import CheckpointManager
 
 
+def _redirect_agent():
+    """Minimal real AIAgent for driving ``_apply_active_turn_redirect``.
+
+    Mirrors the ``object.__new__`` stub pattern in tests/run_agent/test_steer.py,
+    which already exercises this same function.
+    """
+    from run_agent import AIAgent
+
+    agent = object.__new__(AIAgent)
+    agent._current_streamed_assistant_text = ""
+    agent._stream_needs_break = False
+    agent._strip_think_blocks = lambda content: content
+    agent.quiet_mode = True
+    agent.api_mode = "chat_completions"
+    return agent
+
+
 class TestScopeNormalization:
     def test_default_scope_is_turn(self):
         assert CheckpointManager().scope == "turn"
@@ -105,21 +122,35 @@ class TestRedirectReArmsTaskBaseline:
     correction just asked for.
     """
 
-    def test_redirect_branch_calls_new_task(self):
-        import inspect
+    def test_applying_a_redirect_rearms_the_task_baseline(self):
+        """Drives the real redirect path with a real CheckpointManager."""
+        from agent.conversation_loop import _apply_active_turn_redirect
 
-        from agent import conversation_loop
+        mgr = CheckpointManager(enabled=True, scope="task")
+        mgr._checkpointed_dirs.add("/work")  # the task already snapshotted
 
-        src = inspect.getsource(conversation_loop.run_conversation)
-        redirect_at = src.index("_apply_active_turn_redirect(agent, messages")
-        # The redirect branch ends where the per-iteration reset begins.
-        turn_reset_at = src.index("_checkpoint_mgr.new_turn()", redirect_at)
-        redirect_branch = src[redirect_at:turn_reset_at]
+        agent = _redirect_agent()
+        agent._checkpoint_mgr = mgr
+        agent._current_streamed_assistant_text = "partial answer"
+        messages = [{"role": "user", "content": "do the thing"}]
 
-        assert "_checkpoint_mgr.new_task()" in redirect_branch, (
-            "the redirect branch must re-arm the task baseline; otherwise a "
+        _apply_active_turn_redirect(agent, messages, "actually, do it this way")
+
+        assert messages[-1] == {
+            "role": "user", "content": "actually, do it this way",
+        }
+        assert "/work" not in mgr._checkpointed_dirs, (
+            "a correction is a task boundary; without re-arming, a "
             "scope='task' rollback discards the corrected work"
         )
+
+    def test_redirect_without_a_checkpoint_manager_is_harmless(self):
+        from agent.conversation_loop import _apply_active_turn_redirect
+
+        agent = _redirect_agent()  # no _checkpoint_mgr installed
+        messages = [{"role": "user", "content": "x"}]
+        _apply_active_turn_redirect(agent, messages, "y")
+        assert messages[-1]["content"] == "y"
 
     def test_new_task_after_simulated_redirect_allows_a_fresh_baseline(self):
         mgr = CheckpointManager(enabled=True, scope="task")
@@ -165,24 +196,59 @@ class TestScopeReachesConstructionPaths:
             monkeypatch.setattr(server, "_load_cfg", lambda cfg=cfg: cfg)
             assert server._load_checkpoint_scope() == "turn"
 
-    def test_tui_agent_construction_passes_the_scope(self):
-        """The helper must actually be wired into _make_agent's AIAgent call.
+    def test_tui_agent_construction_passes_the_scope(self, monkeypatch):
+        """Reading config is useless if the constructor never receives it.
 
-        Reading config is useless if the constructor never receives it — that
-        was the original gap: HERMES_TUI_CHECKPOINTS turned checkpoints on and
-        every other checkpoint setting was left at the constructor default.
+        Captures the kwargs `_make_agent` actually hands to AIAgent instead of
+        inspecting its source.
         """
-        import inspect
-
         from tui_gateway import server
 
-        src = inspect.getsource(server._make_agent)
-        assert "checkpoint_scope=_load_checkpoint_scope()" in src
+        captured = {}
 
-    def test_agent_constructor_threads_scope_to_manager(self):
-        import inspect
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
 
-        from agent.agent_init import init_agent
+            def __getattr__(self, name):
+                return lambda *a, **k: None
 
-        src = inspect.getsource(init_agent)
-        assert "scope=checkpoint_scope" in src
+        import run_agent
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(server, "_load_cfg", lambda: {"checkpoints": {"scope": "task"}})
+        # An isolated HERMES_HOME has no provider configured, so stub the
+        # resolution step; this test is about what reaches the constructor.
+        monkeypatch.setattr(
+            server, "_resolve_runtime_with_fallback",
+            lambda *a, **k: SimpleNamespace(
+                runtime={
+                    "provider": "openrouter", "base_url": "https://x/v1",
+                    "api_key": "sk-x", "api_mode": "chat_completions",
+                },
+                selected_model="some/model",
+                used_fallback=False,
+                notice=None,
+            ),
+        )
+        # _make_agent imports AIAgent from run_agent inside the function body.
+        monkeypatch.setattr(run_agent, "AIAgent", _FakeAgent)
+        monkeypatch.setenv("HERMES_TUI_CHECKPOINTS", "1")
+
+        error = None
+        try:
+            server._make_agent("sid", "key")
+        except Exception as exc:  # noqa: BLE001
+            # _make_agent does plenty besides constructing the agent (model
+            # resolution, provider routing). Those are not what this test is
+            # about — but if it blew up *before* the constructor, say so
+            # rather than silently asserting on an empty dict.
+            error = exc
+
+        assert captured, (
+            "AIAgent was never constructed, so this test proves nothing "
+            f"about checkpoint_scope: {type(error).__name__}: {error}"
+        )
+        assert captured.get("checkpoint_scope") == "task", (
+            f"checkpoint_scope never reached AIAgent; got {sorted(captured)}"
+        )
