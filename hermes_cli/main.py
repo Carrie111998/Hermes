@@ -73,6 +73,35 @@ suppress_platform_ver_console()
 import os
 import sys
 
+# `python -m hermes_cli.main` registers this module ONLY as `__main__`; a later
+# canonical `import hermes_cli.main` (setup.status / runtime_check handlers,
+# /api/pty argv builder, plugin aux-task registration, ...) would RE-EXECUTE
+# every top-level statement in this file inside the running process. That
+# second pass re-runs `_apply_profile_override()` after pass 1 already stripped
+# `-p <name>` from sys.argv, so it silently re-resolves the sticky
+# active_profile and rewrites os.environ["HERMES_HOME"] process-wide — a serve
+# launched `-p default` gets rehomed to the sticky profile mid-flight. Alias
+# the running module under its canonical name so imports reuse it instead.
+if __name__ == "__main__" and __spec__ is not None:
+    sys.modules.setdefault(__spec__.name, sys.modules[__name__])
+    # The sys.modules entry alone is only half of what a real import produces.
+    # CPython binds the child attribute on the parent package
+    # (`hermes_cli.main = <module>`) only when it actually LOADS the module
+    # (importlib._bootstrap._find_and_load_unlocked); a sys.modules cache hit
+    # returns straight out of _find_and_load without touching the parent. So
+    # with only the alias above, `import hermes_cli.main` succeeds but the
+    # dotted attribute `hermes_cli.main` raises AttributeError. Bind whatever
+    # module now owns the canonical name — the setdefault deliberately lets an
+    # embedding host's earlier registration win, so re-read it rather than
+    # assuming it is this module — and, mirroring that same philosophy, never
+    # clobber an attribute already bound on the parent package.
+    _canonical = sys.modules[__spec__.name]
+    _parent_name, _, _child = __spec__.name.rpartition(".")  # '' if undotted
+    _parent = sys.modules.get(_parent_name) if _parent_name else None
+    if _parent is not None and not hasattr(_parent, _child):
+        setattr(_parent, _child, _canonical)
+    del _canonical, _parent_name, _child, _parent
+
 # Early venv self-heal — MUST run before any third-party import below.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
