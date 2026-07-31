@@ -2149,6 +2149,16 @@ export default class Ink {
       }
     }
 
+    // Mark recent scroll-up to prevent sticky re-activation, mirroring
+    // ScrollBox's scrollBy()/scrollTo() handling. Selection auto-scroll
+    // (dragging a text selection past the viewport edge) also clears
+    // stickyScroll and moves scrollTop directly, without going through
+    // either of those methods, so it needs the same tracking (review of
+    // #74742).
+    if (next < current) {
+      box.recentScrollUpTime = Date.now()
+    }
+
     box.stickyScroll = false
     box.pendingScrollDelta = undefined
     box.scrollAnchor = undefined

@@ -134,13 +134,26 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
           return
         }
 
+        const targetTop = Math.max(0, Math.floor(y))
+
+        // Mark recent scroll-up to prevent sticky re-activation, mirroring
+        // scrollBy()'s dy < 0 check. scrollTo() is an absolute jump (no
+        // delta), so an "upward" movement here means the new position is
+        // above the position we're leaving -- this is what the transcript
+        // mouse scrollbar's drag path calls (review of #74742, matching
+        // #12884's originally reported interaction: manual scrollbar
+        // scrolling, not just keyboard/wheel scrollBy()).
+        if (targetTop < (el.scrollTop ?? 0)) {
+          el.recentScrollUpTime = Date.now()
+        }
+
         // Explicit false overrides the DOM attribute so manual scroll
         // breaks stickiness. Render code checks ?? precedence.
         el.stickyScroll = false
         manualScrollAtRef.current = Date.now()
         el.pendingScrollDelta = undefined
         el.scrollAnchor = undefined
-        el.scrollTop = Math.max(0, Math.floor(y))
+        el.scrollTop = targetTop
         scrollMutated(el)
       },
       scrollToElement(el: DOMElement, offset = 0) {
@@ -169,6 +182,12 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
         el.stickyScroll = false
         manualScrollAtRef.current = Date.now()
         el.scrollAnchor = undefined
+
+        // Mark recent scroll-up to prevent sticky re-activation.
+        if (dy < 0) {
+          el.recentScrollUpTime = Date.now()
+        }
+
         el.pendingScrollDelta = (el.pendingScrollDelta ?? 0) + Math.floor(dy)
         scrollMutated(el)
       },
@@ -181,6 +200,8 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
 
         el.pendingScrollDelta = undefined
         el.stickyScroll = true
+        // Clear recentScrollUpTime since we're explicitly going to bottom.
+        el.recentScrollUpTime = undefined
         markDirty(el)
         notify()
         forceRender(n => n + 1)

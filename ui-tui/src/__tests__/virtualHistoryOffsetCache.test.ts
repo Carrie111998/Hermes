@@ -281,4 +281,79 @@ describe('useVirtualHistory offset cache reuse', () => {
       instance.cleanup()
     }
   })
+
+  it(
+    'suppresses immediate sticky re-follow after a manual scrollTo() scroll-up, ' +
+      'then restores it once the grace window has passed (issue #12884, review of #74742)',
+    async () => {
+      const initial = Array.from({ length: 30 }, (_, index) => ({ height: 2, key: `a${index}` }))
+      const expose = { current: null as Exposed | null }
+      const streams = makeStreams()
+
+      const instance = renderSync(React.createElement(Harness, { expose, items: initial }), {
+        patchConsole: false,
+        stderr: streams.stderr as NodeJS.WriteStream,
+        stdin: streams.stdin as NodeJS.ReadStream,
+        stdout: streams.stdout as NodeJS.WriteStream
+      })
+
+      try {
+        await delay(20)
+        const scroll = expose.current!.scroll!
+        const bottomBeforeScrollUp = scroll.getScrollTop()
+
+        expect(bottomBeforeScrollUp).toBeGreaterThan(0)
+
+        // Manual scroll-up via scrollTo() -- the method the transcript
+        // mouse SCROLLBAR's drag path calls (ui-tui/src/components/
+        // appChrome.tsx), matching #12884's originally reported
+        // interaction. This is deliberately NOT scrollBy(), which the
+        // grace guard already covered before this review.
+        scroll.scrollTo(0)
+        await delay(20)
+        expect(scroll.getScrollTop()).toBe(0)
+
+        // Streaming content arrives immediately after (well within the
+        // 500ms grace window): must NOT snap back to the new bottom.
+        const grown = [
+          ...initial,
+          ...Array.from({ length: 5 }, (_, index) => ({ height: 2, key: `b${index}` }))
+        ]
+
+        instance.rerender(React.createElement(Harness, { expose, items: grown }))
+        await delay(20)
+        expect(scroll.getScrollTop()).toBe(0)
+
+        // Past the 500ms grace window, the user scrolls back to the
+        // (current) bottom themselves -- this still breaks stickyScroll
+        // (scrollTo() always does), but with recentScrollUpTime now
+        // expired, the NEXT follow-on-scroll check (render-node-to-
+        // output.ts) sees scrollTopBeforeFollow >= prevMaxScroll and
+        // correctly restores sticky mode for the content that follows.
+        await delay(520)
+        const currentBottom =
+          (expose.current!.virtualHistory.offsets[grown.length] ?? 0) - scroll.getViewportHeight()
+
+        scroll.scrollTo(Math.max(0, currentBottom))
+        await delay(20)
+
+        const grownMore = [
+          ...grown,
+          ...Array.from({ length: 5 }, (_, index) => ({ height: 2, key: `c${index}` }))
+        ]
+
+        instance.rerender(React.createElement(Harness, { expose, items: grownMore }))
+        await delay(20)
+
+        const finalTranscriptHeight = expose.current!.virtualHistory.offsets[grownMore.length] ?? 0
+        const expectedBottom = Math.max(0, finalTranscriptHeight - scroll.getViewportHeight())
+
+        expect(scroll.getScrollTop()).toBe(expectedBottom)
+        expect(scroll.getScrollTop()).toBeGreaterThan(0)
+      } finally {
+        instance.unmount()
+        instance.cleanup()
+      }
+    }
+  )
 })
