@@ -193,6 +193,19 @@ def _compression_root(session_db: Any, sid: str, max_hops: int = 50) -> str:
     return current
 
 
+def root_started_at(session_db: Any, sid: str) -> float | None:
+    """Original creation time of ``sid``'s compression chain (the root).
+
+    The Created column should show when the conversation first began, not
+    when its latest compression child was spawned. Plain listings already
+    carry the root's ``started_at`` on projected rows; search results are
+    keyed by the matched generation, so they resolve the root explicitly.
+    """
+    root_id = _compression_root(session_db, sid)
+    meta = session_db.get_session(root_id) or {}
+    return meta.get("started_at")
+
+
 def dedup_compression_chains(
     session_db: Any, sids: list[str]
 ) -> set[str]:

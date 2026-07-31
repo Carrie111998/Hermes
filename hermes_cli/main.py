@@ -18032,6 +18032,7 @@ def main():
             # `hermes sessions list`).
             from hermes_cli.session_listing import (
                 render_sessions_table,
+                root_started_at,
                 session_rank,
                 session_rank_lookup,
             )
@@ -18048,6 +18049,9 @@ def main():
                 # sessions resolve through their live tip), so the number on
                 # screen is the number /resume <N> accepts.
                 row["rank"] = session_rank(db, sid, rank_of)
+                # Created shows when the conversation first began (its
+                # compression root), not when the matched generation spawned.
+                row["started_at"] = root_started_at(db, sid) or meta.get("started_at")
                 table_rows.append(row)
 
             print(f"⚙️  sessions search {query}\n")
