@@ -1,0 +1,344 @@
+# Code Review Report — `sessions-resume-improvements`
+
+**Repository:** `/home/shiro/.hermes/hermes-agent`
+**Branch:** `sessions-resume-improvements`
+**Commits reviewed (5, HEAD~5..HEAD):**
+
+| Commit | Subject |
+|--------|---------|
+| `ae0ce271e` | fix(cli): chain-aware rank resolution in sessions search # column |
+| `1161e53c8` | fix(cli): collapse all compression generations in search dedup + Tok(In/Out) |
+| `a7f209232` | fix(cli): Created column shows original conversation start (root) |
+| `0df39438c` | feat(cli): paginated sessions list + /resume list \<page\>, default limit back to 10 |
+| `980588619` | feat(cli): concise parameter hints on listings, full reference in --help |
+
+**Diff:** 5 files, +246/−70 (`cli.py`, `hermes_cli/cli_commands_mixin.py`, `hermes_cli/main.py`, `hermes_cli/session_listing.py`, `tests/cli/test_cli_resume_command.py`).
+
+**Date:** 2026-07-31 · **Reviewer:** Sisyphus · **Type:** critical code review (findings only, no fixes applied)
+
+---
+
+## 1. Executive Summary
+
+The branch's core intent — make the CLI session listing/search compression-chain-aware — is **achieved and empirically verified**. Ranks are correct on real data, `dedup_compression_chains` collapses multi-generation chains correctly, `Created` shows root timestamps, and pagination numbering is continuous. The commit messages and the AGENTS.md contract ("collapse all compression generations", "chain-aware #", "Created = original start") are honestly descriptive of what works.
+
+However, the feature **cannot ship as-is**. Four Major functional defects sit on the exact code paths the branch advertises:
+
+1. **Bare-number resume is broken on any paginated page** — after `/sessions list 2`, *no* typed number can resolve, even ranks visibly on screen.
+2. **Three column-content contract violations** — search `Last` ≠ listing `Last` (uses `ended_at` instead of last message time); `Tok(In/Out)` shows the *root's* token counts, not the tip's; plain-list `Preview` leaks the compaction banner instead of the root's first user message.
+3. **Two latent chain-walk correctness gaps** — `session_rank`'s forward walk and `_compression_root`'s backward walk don't apply the branch/delegate/tool exclusions the canonical walkers (which the branch's own docstrings claim to mirror) already apply.
+4. **Zero test coverage for the new logic** — `session_rank`, `dedup_compression_chains`, `_compression_root`, `root_started_at`, pagination, and offset rendering have no tests; the sole test file touched by the branch changes 2 lines in a MagicMock-based test.
+
+**Verdict: Ship after fixes.** The fixes are bounded and concrete (see §7). If the maintainer applies the AGENTS.md Testing rubric strictly ("E2E validation, not just green unit mocks" — tests must exist for new core logic), treat finding #7 as blocking for a rework pass instead of a post-merge follow-up.
+
+**Test-environment blocker (reported, not a branch defect):** the pytest suite could not be executed in this environment — `scripts/run_tests.sh` skips ("no virtualenv with pytest found") and `./venv/bin/python -m pytest …` fails with `No module named pytest` (the venv symlinks to a cpython-3.11 `.hermes-runtime` with no pytest installed). Test review is by reading only; the affected test files are cited inline.
+
+---
+
+## 2. Scope & Method
+
+### 2.1 Review lens
+
+- **AGENTS.md Contribution Rubric** (§29), **File Dependency Chain** (§300) + **AIAgent class**, **Important Policies** (§1131 — prompt caching, gateway notifications, profiles), **Known Pitfalls** (§1217), **Testing** (§1282 — "E2E validation, not just green unit mocks", "Don't write change-detector tests").
+- **`website/docs/developer-guide/session-storage.md`** — authoritative session data model: `sessions`/`messages`/FTS5 tables, compression-split lineage (child holds live transcript, `parent_session_id` edge, `end_reason='compression'` on the parent), source tagging, `_branched_from`/`_delegate_from` markers.
+- **8-point contract** the branch's commit messages promise: canonical table, `#`-rank semantics, dedup, Created vs Last, Tok counts, pagination, numbered resume, footers.
+
+### 2.2 Verification method (no mocks)
+
+All empirical checks ran against the real `~/.hermes/state.db` (WAL mode) via `./venv/bin/python`:
+
+- Real commands: `hermes sessions list`, `sessions list 2`, `sessions list -l 5 3`, `sessions search tmux`.
+- Scripted verification (`/tmp/opencode/verify_ranks.py`, `verify_ranks2.py`): reproduced the full search pipeline (`search_messages(query="tmux", role_filter=["user","assistant"], exclude_sources=["tool","subagent","cron"])` → `dedup_compression_chains` → `session_rank` → `root_started_at` → `COALESCE(ended_at, started_at, 0)` sort) and compared ranks against the canonical `session_rank_lookup` map (569 rows).
+- SQL chain walks: for every displayed chain row, walked `parent_session_id` root→tip, recording each generation's `input_tokens`/`output_tokens`/`started_at`/`ended_at`/`end_reason`/`source`/`_delegate_from`.
+- Display-vs-DB cross-check for the `Tok(In/Out)` column: compared the CLI's rendered values to both the root's and the tip's token counts.
+- Gateway parity: `git log HEAD~5..HEAD -- gateway/slash_commands.py` (empty) + read of `gateway/slash_commands.py:4330-4609` and the shared `session_listing.py` functions the gateway imports.
+- AGENTS.md lens sections read in full (Rubric 25-57, File Dependency Chain 295-338, Policies 1125-1167).
+
+---
+
+## 3. Verified-Correct Behavior (empirical evidence)
+
+These are the parts of the branch that work and should not be regressed:
+
+| Claim | Evidence |
+|-------|----------|
+| `#` ranks in search match the canonical list | 6/6 kept rows match the 569-row canonical map; mid-chain FTS hits (e.g. `#303`, `#44`) resolve to their live tip's rank via `session_rank`'s forward walk. |
+| `dedup_compression_chains` collapses generations | 12 FTS hits → 6 kept rows; an 8-generation chain (`20260725_004744_2f5a80` → `20260728_125818_631f38`) and a 19-generation chain (`20260731_003207_606a44` → `20260731_125844_e1f9ab`) each collapse to a single latest descendant, including chains whose intermediate generations were absent from the hit set. |
+| `Created` = root `started_at` | Projection + `root_started_at()` match DB root values (e.g. root `1784933309` vs tip `1785236298` for the 8-gen chain). |
+| Pagination numbering is continuous | `sessions list 2` → rows 11-20; `sessions list -l 5 3` → rows 11-15. `list_sessions_rich(offset=…)` (hermes_state.py:6477) exists and works — no main-branch crash. |
+| Page-1 bare-number resume flow | `/resume` (offset=0) → type `3` resolves correctly through `_consume_pending_resume_selection` → `_handle_resume_command`. Internally consistent for offset 0. |
+| No duplicate conversation rows | 569-row rank map contains no duplicate projected tips. |
+| Branch additive to shared module | The three `session_listing.py` functions the gateway imports (`parse_session_listing_args`, `query_session_listing`, `format_gateway_session_listing`) are byte-unchanged; gateway behavior is unaffected (no regression). |
+
+---
+
+## 4. Findings
+
+### 4.1 Finding table (severity-ordered)
+
+| # | Sev | Area | Summary | Location |
+|---|-----|------|---------|----------|
+| 1 | **Major** | Numbered resume | Bare-number resume broken on any paginated page (offset > 0) | cli.py:8069, 8080; cli_commands_mixin.py:917-948 |
+| 2 | **Major** | Search Last | Search `Last` ≠ listing `Last` (`ended_at` vs `MAX(messages.timestamp)`) | main.py:18036; mixin:1193; hermes_state.py:6678 |
+| 3 | **Major** | Tok column | `Tok(In/Out)` shows root's token counts, not the tip's | hermes_state.py:6724-6756 (projection) |
+| 4 | **Major** | Preview column | Plain list leaks `[CONTEXT COMPACTION…]` banner as Preview | cli.py:7654; main.py:17170 (no `preview_lookup`) |
+| 5 | **Major** | Rank walk | `session_rank` forward walk unfiltered (branch/delegate/tool, `started_at` primary) | session_listing.py:160-163 |
+| 6 | **Major** | Root walk | `_compression_root` misses `_delegate_from`/source exclusion | session_listing.py:184 |
+| 7 | **Major** | Tests | Zero tests for all new chain-walk logic | tests/hermes_cli/test_session_listing.py (unchanged) |
+| 8 | Minor | Dead code | `/sessions list N` page-parse branch unreachable | cli_commands_mixin.py:1272-1277 |
+| 9 | Minor | Duplication | Search pipeline duplicated ~90 lines across two surfaces | main.py:18003-18094; mixin:1144-1263 |
+| 10 | Minor | Workspace | `--workspace` + page: offset applied before workspace filter | main.py:17103-17121 |
+| 11 | Minor | Scale | `session_rank_lookup` hardcoded limit=2000 → blank `#` beyond | session_listing.py:135 |
+| 12 | Minor | UX | `_parse_flags` silently swallows bad `--limit` | cli_commands_mixin.py:874-878 |
+| 13 | Nit | Consistency | Hop caps differ: 20 / 50 / 100 | session_listing.py:156, 171; hermes_state.py:6389 |
+| 14 | Nit | Semantics | Sort key `COALESCE(ended_at, started_at, 0)` labeled "last_active" | main.py:18036 |
+| 15 | Minor | Gateway parity | Chain-aware dedup/rank wired CLI-only; gateway search/`/resume` numbering still generation-unaware | gateway/slash_commands.py:4484-4548; session_listing.py:72-78 |
+
+---
+
+### Finding 1 — Major · Bare-number resume is broken on any paginated page
+
+**Contract item:** numbered resume resolves the `#` column shown on screen.
+
+**Location:** `cli.py:8069` (`_consume_pending_resume_selection` bounds check), `cli.py:8080` (`index > len(pending)`), `cli_commands_mixin.py:917-919` (arming stores `limit`+`offset`), `cli_commands_mixin.py:940-948` (digit re-resolution `local_index = index - digit_offset`).
+
+**Repro:**
+1. `/resume list 2` (or `/sessions list 2`) — arms `_pending_resume_sessions` = 10 rows, `_pending_resume_limit=10`, `_pending_resume_offset=10`; screen shows ranks **11–20**.
+2. Type a visible rank, e.g. `15`:
+   - `_consume_pending_resume_selection` checks `index > len(pending)` → `15 > 10` → prints "Resume index 15 is out of range." despite 15 being on screen.
+3. Type `5` (≤ 10, passes the consume guard): `_handle_resume_command("/resume 5")` computes `local_index = index - digit_offset` = `5 - 10` = `-5` → `local_index < 1` → "Resume index 5 is out of range."
+
+**Reasoning:** two independent bounds/arithmetic checks disagree about which coordinate space a bare number lives in. `_consume_pending_resume_selection` treats the number as a position within the *armed page* but bounds it with `len(pending)` (page-relative), while `_handle_resume_command` treats it as an *absolute rank* and subtracts the armed offset. With `offset=0` both coincide (the happy path that page-1-only testing would cover); any `offset>0` page makes every number fail one of the two checks. This is a functional regression of the headline interactive flow — the exact flow the pagination commit (`0df39438c`) exists to serve.
+
+**Fix direction:** in `_consume_pending_resume_selection`, bound against the displayed rank window `[offset+1, offset+len(pending)]` (or resolve rank→row directly), then pass the resolved row (not the raw number) to the resume path so `_handle_resume_command`'s digit branch isn't re-entered with inconsistent coordinates. Add a test for offset>0 arming + bare-number resolution — it fails today.
+
+---
+
+### Finding 2 — Major · Search `Last` column ≠ listing `Last` column
+
+**Contract item:** both surfaces show the tip's `last_active`.
+
+**Location:** search sort/display key `COALESCE(ended_at, started_at, 0)` — `hermes_cli/main.py:18036, 18039, 18081` and `cli_commands_mixin.py:1193, 1196, 1246` — vs listing's `MAX(messages.timestamp)` at `hermes_state.py:6678-6681`.
+
+**Repro (real data):** `sessions search tmux` renders `20260531_122030_aa469f` with Last = `1780270640.81` (its `ended_at`); `sessions list` renders Last = `1780254336.25` (its last message timestamp) — **2.4 hours apart**. The same row shows a different "Last" depending on which surface renders it.
+
+**Reasoning:** the two surfaces claim to share one canonical notion of "when was this session last active" (the branch's own `session_rank_lookup` docstring says search shows "the same numbers the user sees in the listing"). A session that idled for 2.4 h and then closed shows a search `Last` in the future relative to its last message — misleading and inconsistent with the listing, and the search *sort* inherits the same wrong key (see Finding 14).
+
+**Fix direction:** use one shared `last_active` expression on both surfaces — fetch `MAX(messages.timestamp)` in the search path too (fall back to `started_at`), and sort by the same value. Extract a single helper in `session_listing.py` so the key can't drift again.
+
+---
+
+### Finding 3 — Major · `Tok(In/Out)` shows the root's token counts, not the tip's
+
+**Contract item:** Tok counts describe the session being displayed.
+
+**Location:** `hermes_state.py:6724-6756` — the projection in `list_sessions_rich` swaps `id`/`title`/`last_active` to the live tip but **preserves the root row's `input_tokens`/`output_tokens`**; `render_sessions_table` then prints those projected values.
+
+**Repro (real data):** chain row `20260731_125844_e1f9ab` renders `121k/56k`. The DB shows the **root** `20260731_003207_606a44` = `121974/56668` (→ "121k/56k" exactly), while the live tip is `109727/6673` ("109k/6k"). A standalone session (no chain), `20260731_055644_5e1c37`, renders `99k/69k` = its own `99775/69733` — consistent only because root == tip.
+
+**Reasoning:** the header was renamed to `Tok(In/Out)` (session_listing.py header line, this branch) and the projection is deliberately tip-aware for three columns but not for tokens. The displayed number is neither the tip's current usage nor the chain's total — it is an arbitrary generation's (the root's) historical figure, which for a long conversation can differ from the live tip by 10× (root 121k/56k vs tip 109k/6k here). Users reading "Tok" against the live session see inflated stale numbers.
+
+**Fix direction:** project the tip's token columns in `list_sessions_rich`'s projection (matching how `id`/`title`/`last_active` are already tip-swapped). If the intent is instead "chain total", sum the generations and say so in the header — the current value is neither.
+
+---
+
+### Finding 4 — Major · Plain-list Preview leaks the compaction banner
+
+**Contract item:** Preview shows the root's first user message (the search path already does this).
+
+**Location:** plain-list render calls `render_sessions_table(…, db=db)` **without** `preview_lookup` — `cli.py:7654` and `main.py:17170` — while both search paths pass `preview_lookup=root_preview_cache` (`cli_commands_mixin.py:1256`, `main.py:18093`).
+
+**Repro (real data):** `hermes sessions list` row 10 (`20260731_125844_e1f9ab`, a projected compression tip) renders Preview = `[CONTEXT COMPACTION — REFERENCE ONLY]…` — the tip has no user messages of its own, so the renderer falls back to the marker text. A user scanning the listing sees a banner where a conversational preview belongs.
+
+**Reasoning:** the branch fixed the preview-walk for search (root cache) but not for the plain listing, which is the *primary* surface the pagination commit targets. Same contract, same projection, one surface fixed and the other not — exactly the drift pattern AGENTS.md warns about ("fix the whole bug class — sibling call paths included").
+
+**Fix direction:** reuse the search path's root-preview batch walk for the list path (pass the same `preview_lookup`), so projected tips show their root's first user message on both surfaces.
+
+---
+
+### Finding 5 — Major · `session_rank` forward walk is unfiltered
+
+**Contract item:** `#` = position in the canonical list, chain-aware.
+
+**Location:** `session_listing.py:160-163`:
+```python
+row = session_db._conn.execute(
+    "SELECT id FROM sessions WHERE parent_session_id = ? "
+    "ORDER BY started_at DESC LIMIT 1",
+    (current,),
+).fetchone()
+```
+
+**Reasoning:** the walk follows *any* child ordered by `started_at` — no exclusion for `_branched_from`/`_delegate_from`/`source='tool'`, no `end_reason` check, and `started_at` as the *primary* tiebreak. The canonical walkers this function's docstring claims to mirror deliberately avoid all three: `get_compression_tip` (hermes_state.py:6387-6410), `resolve_resume_session_id` (hermes_state.py:7781-7789), and `_COMPRESSION_CHILD_SQL` all filter branch/delegate/tool children and do not primary-order on `started_at`. The docstring at session_listing.py:141 ("latest started_at first") is an honest description of a **brittle** heuristic: a branched child of a mid-chain generation that happens to have the latest `started_at` would be followed instead of the true compression tip, yielding a wrong `#`. Not reproducible in current data (all 6 ranks correct — see §3), but the map is keyed by projected tip ids, so this walk is load-bearing for every mid-chain FTS hit.
+
+**Fix direction:** reuse `get_compression_tip`/`_is_compression_child_row` semantics in the walk: exclude branch + delegate + tool children, prefer compression edges, drop the `started_at DESC` primary ordering. Since the walk lives in the shared module, the canonical helper is directly importable.
+
+---
+
+### Finding 6 — Major · `_compression_root` misses the `_delegate_from` exclusion
+
+**Contract item:** dedup groups by "deepest compression ancestor"; branches are never collapsed into their source chain.
+
+**Location:** `session_listing.py:184` — the backward walk stops only on `_is_branch_child_row(meta)`; it does not check `_delegate_from` or `source='tool'`.
+
+**Reasoning:** delegate subagent sessions are created with `parent_session_id` **and** a `_delegate_from` marker (tools/delegate_tool.py:1565-1567; run_agent.py:622-632). A subagent child of a compression-ended parent would be treated as a compression descendant, so `dedup_compression_chains` could collapse a subagent session into its parent's chain or compute a root from it. The canonical `_is_compression_child_row` (hermes_state.py:9478-9483) excludes both branch **and** delegate children — the branch's new helper checks only branch. Latent (no delegate children in the current chains — the checked rows are `source='cli'`, `cfg_delegate=False`), but it is a direct divergence from the canonical semantics the docstrings cite.
+
+**Fix direction:** mirror `_is_compression_child_row`: reject `_branched_from`, `_delegate_from`, and `source='tool'` rows as chain edges. Also covers the same gap noted in Finding 15's gateway context.
+
+---
+
+### Finding 7 — Major · Zero tests for the module under review
+
+**Contract item:** AGENTS.md Testing rubric (§1282: "E2E validation, not just green unit mocks"; §1282: tests must exercise the real path with real imports).
+
+**Location:** `tests/hermes_cli/test_session_listing.py` is byte-identical to main across all 5 commits (git log: no commits touch it); it covers only `parse_session_listing_args` + `query_session_listing`. The branch's only test change is 2 lines in `tests/cli/test_cli_resume_command.py`, whose arming tests mock `_list_recent_sessions`/`_show_recent_sessions` with `MagicMock` (test_cli_resume_command.py:243-280).
+
+**Reasoning:** `session_rank`, `dedup_compression_chains`, `_compression_root`, `root_started_at`, pagination numbering, offset rendering, and the chain-walk logic have **no tests at all**. The two Major bugs found here (Findings 1 and 3) are both directly attributable to the absence of coverage: a paginated bare-number test would have caught Finding 1; a projection-tokens test would have caught Finding 3. The existing MagicMock-based tests cannot catch either because they never exercise the real query path. This is precisely the "green unit mocks" failure mode AGENTS.md bans. (Cannot be run here — see §2 blocker.)
+
+**Fix direction:** add real-DB tests (temp `HERMES_HOME`, real imports — no mocking of the listing functions) covering: rank resolution for root/mid-chain/tip hits, dedup across multi-generation chains with missing intermediates, `_compression_root` on branch/delegate/tool children, `root_started_at`, pagination offsets (page 2), and the bare-number resume flow with offset > 0. The first two fail on the current branch.
+
+---
+
+### Finding 8 — Minor · Dead `/sessions list N` page-parse branch
+
+**Location:** `cli_commands_mixin.py:1267-1287` — `_handle_sessions_command` contains a `_toks[1]` page-parse branch at 1272-1277, but the outer guard (`sub in {"list", "ls", "browse"}`) only matches the bare word. `/sessions list 2` therefore falls through to `_handle_resume_command("/resume list 2")`, which does real pagination. **It works, but by delegation, not by the code that appears to handle it.**
+
+**Reasoning:** dead code that misleads the next reader into believing the handler implements pagination; the live path is a delegation to a different handler whose behavior is subtly different (e.g. footer text).
+
+**Fix direction:** delete the `_toks[1]` branch and the now-unused parsing, or extend the guard to actually parse a page — keep the delegation, since it is the tested behavior.
+
+---
+
+### Finding 9 — Minor · Search pipeline duplicated ~90 lines across two surfaces
+
+**Location:** `main.py:18003-18094` (CLI `sessions search`) and `cli_commands_mixin.py:1144-1263` (interactive `/sessions search`) contain near-identical sequences: FTS call → `dedup_compression_chains` → `session_rank` → `root_started_at` → root-preview walk → `COALESCE(ended_at, started_at, 0)` sort → `render_sessions_table`. The same hardcoded `exclude_sources=["tool","subagent","cron"]` appears at mixin:1152 and main.py:18009.
+
+**Reasoning:** AGENTS.md: "Extend, don't duplicate… design one shared interface." Drift has already materialized between these two copies (Findings 2/14 live in both; any fix must be applied twice). The duplication is exactly the kind the rubric calls out.
+
+**Fix direction:** extract the shared search pipeline into `session_listing.py` (which already hosts the helpers); both call sites become thin wrappers.
+
+---
+
+### Finding 10 — Minor · `--workspace` + page interaction
+
+**Location:** `main.py:17103-17121` — `offset = (page-1) * limit` is applied in SQL (`list_sessions_rich(offset=…)`), then the workspace substring filter runs in Python at 17112-17121 **after** the offset slice.
+
+**Reasoning:** a filtered page 2+ can be empty or skip rows because offset is computed against the unfiltered store while the filter is applied post-offset. `query_session_listing` (session_listing.py:66-91) does the inverse (filter then offset) — the CLI surface is the inconsistent one.
+
+**Fix direction:** apply the workspace filter before offset (either filter in the SQL fetch window, or replicate `query_session_listing`'s filter-then-offset order).
+
+---
+
+### Finding 11 — Minor · `session_rank_lookup` hardcoded `limit=2000`
+
+**Location:** `session_listing.py:124-138`, `session_rank` at :156.
+
+**Reasoning:** `session_rank_lookup(limit=2000)` maps at most 2000 listable sessions; in a store with more, older tips are absent from the map and `session_rank` returns `None` → blank `#` with no indication why. The branch *raised* the cap 500→2000 (an improvement) but the failure mode remains silent.
+
+**Fix direction:** page the lookup over the whole store, or surface "rank unknown" explicitly in the renderer.
+
+---
+
+### Finding 12 — Minor · `_parse_flags` silently swallows bad `--limit`
+
+**Location:** `cli_commands_mixin.py:866-883`, try/except at 874-878.
+
+**Reasoning:** an unparseable `--limit` value is caught, ignored, and the default kept — the user gets no feedback and no visible error.
+
+**Fix direction:** emit a warning (or error) on unparseable `--limit` instead of `pass`-ing the exception.
+
+---
+
+### Finding 13 — Nit · Inconsistent hop caps
+
+**Location:** `session_listing.py:156` (`session_rank` 20), `session_listing.py:171` (`_compression_root` 50), `hermes_state.py:6389` (`get_compression_tip` 100).
+
+**Reasoning:** three different chain-depth limits for the same concept; a chain deeper than 20 (a very long-lived conversation) silently yields `None` rank from `session_rank` while the canonical walker would handle it.
+
+**Fix direction:** one shared constant, sized to the deepest possible chain (use the canonical 100).
+
+---
+
+### Finding 14 — Nit · Sort key labeled "last_active" is `COALESCE(ended_at, started_at, 0)`
+
+**Location:** `main.py:18031-18040`, `cli_commands_mixin.py:1188-1197`.
+
+**Reasoning:** the sort uses `ended_at` as a proxy for "last activity"; a session closed 2 h ago with a late `ended_at` sorts above a live session with more recent messages (same root cause as Finding 2). The comment/label claims one thing; the expression computes another.
+
+**Fix direction:** fold into Finding 2 — one `last_active` definition for sort and display.
+
+---
+
+### Finding 15 — Minor · Chain-aware fixes are CLI-only; gateway sibling surface untouched
+
+**Location:** `gateway/slash_commands.py:4484-4548` (`/sessions` handler) and `:4350-4399` (`/resume` numbered list) — both consume the shared module; the branch's new helpers are never called from it.
+
+**Verified no-regression first:** `git log HEAD~5..HEAD -- gateway/slash_commands.py` is empty; the three functions the gateway imports (`parse_session_listing_args`, `query_session_listing`, `format_gateway_session_listing`, slash_commands.py:4490-4494) are byte-unchanged by the branch; the 4-tuple unpacking at :4499-4501 still matches. **No signature break, no gateway behavior change.**
+
+**Gap:** the gateway's `/sessions search <query>` goes through `query_session_listing(search_query=…)` → `list_sessions_rich(search_query=…)` (session_listing.py:72-78) — per-generation rows, **no `dedup_compression_chains`, no canonical rank**; gateway `/resume <number>` numbering is positional (`enumerate(rows, start=1)`, format_gateway_session_listing:110), not the canonical `#` map. The compression-generation listing bug class the branch fixes on the CLI remains latent on the gateway surface.
+
+**Fix direction:** apply `dedup_compression_chains`/`session_rank` inside `query_session_listing` (the shared selection policy) so both surfaces inherit the fix; the helpers already live in the same module.
+
+---
+
+## 5. Reasoning Summary — why these matter against the AGENTS.md lens
+
+- **"Fix real bugs, well … fix the whole bug class — sibling call paths included"** — Findings 2/3/4/15 are all the same bug class (chain-aware projection applied to one surface, not its siblings). The branch fixed search but not list, list but not gateway, display columns but not the projection that feeds them.
+- **"Extend, don't duplicate"** — Finding 9 duplicates ~90 lines that have already drifted; Finding 15 leaves a third surface out of the shared fix.
+- **"E2E validation, not just green unit mocks"** — Finding 7 is the direct violation, and Findings 1 & 3 exist because of it.
+- **"Keep the core narrow … extend existing code first"** — the new logic is correctly placed in the existing shared module (`session_listing.py`) rather than a new tool or core surface; the placement itself is good and should be preserved.
+- **"Behavior contracts over snapshots"** — the `#`/Created/Tok contract is *asserted* in commit messages and docstrings but never *tested* as an invariant (Finding 7); the two wrong-column findings (2, 3) would each fail such a test today.
+
+## 6. What is genuinely good about this branch
+
+- The chain-walk design (walk-then-lookup against a tip-keyed rank map) is the right shape — it sidesteps the canonical walkers' linear-chain assumption without duplicating the map.
+- `dedup_compression_chains` handles missing intermediates correctly (verified on real 8- and 19-gen chains).
+- The projection is already tip-aware for `id`/`title`/`last_active`/`Created` — Finding 3 is a one-column completion of that design, not a redesign.
+- Placement in the shared module + gateway-safe signature changes = no cross-surface regression (Finding 15's no-regression check).
+- The `limit=500→2000` bump and pagination offset plumbing are correct where tested.
+
+## 7. Verdict & Prioritized Fix Plan
+
+**Verdict: Ship after fixes.**
+
+The feature works on the happy path — ranks, dedup, Created, and pagination are all empirically correct on real data, and the commit intent is achieved. But three displayed columns violate their own contract on chain rows, the paginated resume flow is broken, two chain-walk gaps are latent, and none of it is tested. That is not a "ship as-is".
+
+| Priority | Findings | Action |
+|----------|----------|--------|
+| **Must fix, same PR** | 1, 2, 3, 4, 5, 6, 7 | Fix the bare-number pagination bug (1); align Last (2), Tok (3), Preview (4) on one tip-aware contract; harden both walks with the canonical exclusions (5, 6); add real-DB tests incl. offset>0 bare-number + token-projection cases (7) — these tests fail today. |
+| **Should fix, same PR** | 8, 9, 10, 15 | Delete the dead page-parse branch (8); extract the shared search pipeline (9); reorder workspace-filter/offset (10); route the gateway through the shared dedup/rank (15). |
+| **Nice-to-have** | 11, 12, 13, 14 | Cap the rank map to the store (11); warn on bad `--limit` (12); unify hop caps (13); fold sort key into (2) (14). |
+
+**Rework trigger:** if the maintainer applies the Testing rubric strictly (no new core logic without E2E tests), Findings 7 + 1 + 3 are blocking and the correct call is a **rework** pass rather than merge-then-follow-up. That is a policy decision, not a technical one — the code is fixable in-place with the bounded changes above.
+
+---
+
+## 8. Appendix — verification artifacts
+
+### 8.1 Real chain maps (root → tip, from `~/.hermes/state.db`)
+
+| Chain | Generations | Root (in/out) | Tip (in/out) | Tip end_reason |
+|-------|-------------|---------------|--------------|----------------|
+| `20260731_003207_606a44` → `20260731_125844_e1f9ab` | 19 | 121,974 / 56,668 | 109,727 / 6,673 | `None` (active) |
+| `20260725_004744_2f5a80` → `20260728_125818_631f38` | 8 | 131,814 / 48,745 | 1,010,259 / 20,440 | `new_session` |
+| `20260728_092814_3e2429` → `20260728_142559_6d0268` | 4 | 129,341 / 47,129 | 112,547 / 17,305 | `None` |
+| `20260531_122030_aa469f` → `20260601_013720_c24352` | 2 | 100,493 / 13,972 | — | `cli_close` |
+| `20260623_194534_b88c78` → `20260625_221907_9c3f28` | 2 | — | — | `cli_close` |
+
+All intermediate generations: `end_reason='compression'`. Last-divergence evidence: `aa469f` `ended_at=1780270640.814` vs last message ts `1780254336.255` (2.4 h). Rows checked for lineage markers: `source='cli'`, `cfg_delegate=False`.
+
+### 8.2 Tok evidence (Finding 3)
+
+- Displayed `20260731_125844_e1f9ab`: `121k/56k` = root `20260731_003207_606a44` (121,974/56,668). Tip is 109,727/6,673. **Root wins — mismatch.**
+- Displayed `20260731_055644_5e1c37` (no chain): `99k/69k` = own 99,775/69,733. Consistent only because root==tip.
+
+### 8.3 Files reviewed
+
+`cli.py` (init 4538-4545, `_list_recent_sessions` 7591-7617, `_show_recent_sessions` 7619+, `_consume_pending_resume_selection` 8050-8086, `process_command` reset 9494-9502) · `hermes_cli/cli_commands_mixin.py` (`_handle_resume_command` 854+, `_handle_sessions_command` 1081+, search path 1174-1230+, arming 917-919/1284-1286) · `hermes_cli/main.py` (sessions subparser ~16491, list action 17100-17134, search action 18003-18056, optimize 17975+) · `hermes_cli/session_listing.py` (parser :8, `query_session_listing` :45, `format_gateway_session_listing` :95, `session_rank_lookup` :124, `session_rank` :141, `_compression_root` :171, `root_started_at` ~:185, `dedup_compression_chains` ~:197, `render_sessions_table` :242+) · `hermes_state.py` (`_LISTABLE_CHILD_SQL` 222, `get_compression_tip` 6360, `list_sessions_rich` 6471, projection 6724-6756, `_is_branch_child_row` 9468, `_is_compression_child_row` ~9477) · `tools/delegate_tool.py:1565-1567` · `gateway/slash_commands.py:4330-4609` · `tests/cli/test_cli_resume_command.py` · `tests/hermes_cli/test_session_listing.py` · `website/docs/developer-guide/session-storage.md`.
+
+### 8.4 Environment notes
+
+- Python: `./venv/bin/python` (symlinks to `.hermes-runtime` cpython-3.11). Real DB: `~/.hermes/state.db` (WAL). `TZ=UTC`; provider API keys unset.
+- Helper scripts retained: `/tmp/opencode/verify_ranks.py`, `/tmp/opencode/verify_ranks2.py` (re-run any rank claim with: `TZ=UTC ./venv/bin/python /tmp/opencode/verify_ranks.py`).
+- Explore-agent transcript retained: `/tmp/opencode/tool-output/tool_fb7eb73180015AY6R4NLDM0EE0`.
+- pytest blocker: `scripts/run_tests.sh` → "no virtualenv with pytest found (skipped)"; `./venv/bin/python -m pytest …` → `No module named pytest`. Not a branch defect; reported for completeness.

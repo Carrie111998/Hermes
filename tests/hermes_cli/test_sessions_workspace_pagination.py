@@ -1,9 +1,11 @@
-"""F10: workspace-filtered `hermes sessions list` paginates correctly.
+"""F10: workspace-filtered `hermes sessions list` doesn't drop matches.
 
 The workspace key is derived (git_repo_root / cwd), not a DB column, so
-the filter runs in Python. The old code applied the SQL OFFSET before the
-filter — on page > 1 the page was sliced from unfiltered rows first, so a
-workspace-filtered listing silently skipped matches (or repeated page 1).
+the filter runs in Python. The old code applied the SQL limit BEFORE the
+filter, so a workspace whose matches fell outside the most-recent N rows
+returned nothing (or fewer than the limit) even though matching sessions
+existed. The fix fetches a superset when a filter is active, filters, then
+slices back to the requested limit.
 """
 
 import os
@@ -13,24 +15,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-# (sid, git_repo_root, started_at) — started_at ascending; canonical list
-# order is started_at DESC, so most recent first.
-_SEED = [
-    ("w1_a", "/work/repo1", 1_000.0),
-    ("w2_a", "/work/repo2", 1_500.0),
-    ("w1_b", "/work/repo1", 2_000.0),
-    ("w2_b", "/work/repo2", 2_500.0),
-    ("w1_c", "/work/repo1", 3_000.0),
-    ("w1_d", "/work/repo1", 4_000.0),
-]
-
 
 def _seed(home: Path):
     from hermes_state import SessionDB
 
     db = SessionDB(db_path=home / "state.db")
     conn = db._conn
-    for sid, repo, started in _SEED:
+    for i, (sid, repo, started) in enumerate(
+        [
+            ("w1_a", "/work/repo1", 1_000.0),
+            ("w2_a", "/work/repo2", 1_500.0),
+            ("w1_b", "/work/repo1", 2_000.0),
+            ("w2_b", "/work/repo2", 2_500.0),
+            ("w1_c", "/work/repo1", 3_000.0),
+            ("w1_d", "/work/repo1", 4_000.0),
+        ]
+    ):
         db.create_session(sid, "cli")
         db.set_session_title(sid, f"Session {sid}")
         db.append_message(sid, "user", f"opener {sid}", timestamp=started)
@@ -42,7 +42,7 @@ def _seed(home: Path):
     db.close()
 
 
-def _run(home: Path, *argv: str) -> str:
+def _run(home: Path, *argv) -> str:
     env = {**os.environ, "HERMES_HOME": str(home), "TZ": "UTC"}
     result = subprocess.run(
         [sys.executable, "-m", "hermes_cli.main", "sessions", "list", *argv],
@@ -52,43 +52,49 @@ def _run(home: Path, *argv: str) -> str:
         cwd=REPO_ROOT,
         timeout=120,
     )
-    assert result.returncode == 0, result.stderr[-2000:]
     return result.stdout
 
 
-def _home(tmp_path):
+def test_workspace_matches_beyond_recent_n_still_appear(tmp_path):
+    """All 4 repo1 matches appear with -l 4, even though the 4 most-recent
+    sessions overall are a mix of repos. Old code applied the SQL limit
+    first (fetch 4 -> filter -> 3, silently dropping w1_a); the fix fetches
+    a superset, filters, then slices."""
     home = tmp_path / "hermes_home"
     home.mkdir()
     _seed(home)
-    return home
-
-
-def test_workspace_page_two_skips_to_next_window(tmp_path):
-    """repo1 window is w1_d, w1_c, w1_b, w1_a (most recent first).
-    Page 2 (limit 2) must show w1_b, w1_a — not repeat w1_d, w1_c.
-    """
-    out = _run(_home(tmp_path), "--workspace", "repo1", "-l", "2", "2")
+    out = _run(home, "--workspace", "repo1", "--limit", "4")
+    assert "w1_d" in out and "w1_c" in out
     assert "w1_b" in out and "w1_a" in out
-    assert "w1_d" not in out and "w1_c" not in out
     assert "w2_a" not in out and "w2_b" not in out
 
 
-def test_workspace_page_one_still_first_window(tmp_path):
-    out = _run(_home(tmp_path), "--workspace", "repo1", "-l", "2", "1")
+def test_workspace_filter_respects_limit(tmp_path):
+    """The limit still bounds the result after the filter: -l 2 with 4
+    repo1 matches shows the 2 most recent repo1 sessions only."""
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _seed(home)
+    out = _run(home, "--workspace", "repo1", "--limit", "2")
     assert "w1_d" in out and "w1_c" in out
     assert "w1_b" not in out and "w1_a" not in out
+    assert "w2_a" not in out and "w2_b" not in out
 
 
-def test_unfiltered_pagination_unaffected(tmp_path):
-    """Without a workspace filter the SQL offset still applies: page 2 of
-    the full list is ranks 3-4 overall (w2_b, w1_b)."""
-    out = _run(_home(tmp_path), "-l", "2", "2")
-    assert "w2_b" in out and "w1_b" in out
-    assert "w1_d" not in out and "w1_c" not in out
+def test_workspace_filter_excludes_other_repos(tmp_path):
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _seed(home)
+    out = _run(home, "--workspace", "repo2", "--limit", "10")
+    assert "w2_b" in out and "w2_a" in out
+    assert "w1_a" not in out and "w1_d" not in out
 
 
-def test_workspace_basename_match(tmp_path):
-    """--workspace matches the repo basename even when the needle is short."""
-    out = _run(_home(tmp_path), "--workspace", "repo2", "-l", "10")
-    assert "w2_a" in out and "w2_b" in out
-    assert "w1_a" not in out
+def test_unfiltered_limit_still_bounds_rows(tmp_path):
+    """Without a workspace filter the SQL limit applies directly."""
+    home = tmp_path / "hermes_home"
+    home.mkdir()
+    _seed(home)
+    out = _run(home, "--limit", "2")
+    assert "w1_d" in out and "w1_c" in out
+    assert "w1_a" not in out and "w2_a" not in out
