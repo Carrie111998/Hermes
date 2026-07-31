@@ -7,6 +7,7 @@ requiring a session restart (/new) to recover.
 """
 
 import json
+import threading
 
 import pytest
 
@@ -183,6 +184,106 @@ class TestSyncTurn:
         assert added[0][0]["role"] == "user"
         assert added[0][1]["role"] == "assistant"
         assert p._backend is healthy
+
+
+class _GateBackend(FakeBackend):
+    """Backend whose add() blocks until released — for event-synced tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.added = []
+        self.in_add = threading.Event()
+        self.release_add = threading.Event()
+
+    def add(self, messages, **kwargs):
+        self.added.append(messages)
+        self.in_add.set()
+        self.release_add.wait(timeout=5)
+        return {"results": []}
+
+
+class TestSyncBacklog:
+    def _wait_for(self, predicate, timeout=3.0):
+        import time as _time
+
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if predicate():
+                return True
+            _time.sleep(0.02)
+        return predicate()
+
+    def test_turns_are_buffered_not_dropped_while_worker_busy(self, monkeypatch):
+        # Worker is stuck in a slow extraction; two more turns arrive. The
+        # newest must be coalesced into the backlog and drained after the
+        # first completes — never silently dropped (the old 5s-join skip).
+        import time as _time
+
+        p = _make_provider()
+        p._backend = None
+        p._reinit_backend_at = 0.0
+        gate = _GateBackend()
+        monkeypatch.setattr(p, "_create_backend", lambda: gate)
+
+        p.sync_turn("t1 user", "t1 asst")
+        assert gate.in_add.wait(2), "worker never started first add"
+
+        p.sync_turn("t2 user", "t2 asst")  # buffered
+        p.sync_turn("t3 user", "t3 asst")  # coalesces over t2
+        gate.release_add.set()
+
+        assert self._wait_for(lambda: len(gate.added) >= 2), "backlog never drained"
+
+        contents = [[m["content"] for m in msgs] for msgs in gate.added]
+        assert contents[0] == ["t1 user", "t1 asst"]
+        # t2 was coalesced away; t3 (the newest) survived — nothing dropped.
+        assert contents[1] == ["t3 user", "t3 asst"]
+        assert len(contents) == 2
+
+    def test_sync_retries_after_transport_failure(self, monkeypatch):
+        # First add hits a dead store (backend invalidated, worker exits).
+        # The next sync_turn spawns a fresh worker that re-initializes the
+        # backend and delivers the turn.
+        import time as _time
+
+        p = _make_provider()
+        p._backend = None
+        p._reinit_backend_at = 0.0
+        calls = []
+
+        def flaky_add(self_, messages, **kwargs):
+            calls.append(messages)
+            if len(calls) == 1:
+                raise ConnectionError("Connection refused")
+            return {"results": []}
+
+        healthy = FakeBackend()
+        monkeypatch.setattr(FakeBackend, "add", flaky_add)
+        monkeypatch.setattr(p, "_create_backend", lambda: healthy)
+
+        p.sync_turn("u1", "a1")
+        assert self._wait_for(lambda: len(calls) >= 1), "first add never ran"
+        assert self._wait_for(lambda: not (p._sync_thread and p._sync_thread.is_alive())), "worker did not exit"
+        assert p._backend is None  # invalidated for lazy rebuild
+
+        # Cooldown elapses; the next turn triggers a fresh worker + rebuild.
+        p._reinit_backend_at = 0.0
+        p.sync_turn("u2", "a2")
+        assert self._wait_for(lambda: len(calls) >= 2), "retry add never ran"
+        assert p._backend is healthy  # re-initialized
+        assert [[m["content"] for m in calls[1]]] == [["u2", "a2"]]
+
+    def test_worker_exits_when_queue_empty(self, monkeypatch):
+        p = _make_provider()
+        p._backend = None
+        p._reinit_backend_at = 0.0
+        healthy = FakeBackend()
+        monkeypatch.setattr(p, "_create_backend", lambda: healthy)
+
+        p.sync_turn("u", "a")
+        assert self._wait_for(
+            lambda: not (p._sync_thread and p._sync_thread.is_alive())
+        ), "worker leaked after draining the queue"
 
 
 class TestEOFDependencyError:

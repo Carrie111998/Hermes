@@ -215,6 +215,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._rerank_default = False
         self._channel = "cli"  # gateway channel name (cli/telegram/discord/...)
         self._sync_thread = None
+        self._sync_backlog = None
         self._prefetch_thread = None
         self._prefetch_query = ""
         self._prefetch_result = ""
@@ -568,11 +569,41 @@ class Mem0MemoryProvider(MemoryProvider):
         return ""
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """Send the turn to Mem0 for server-side fact extraction (non-blocking).
+
+        Turns are processed by a single serialized worker. If the worker is
+        still busy with a previous turn, the new turn is buffered (coalescing
+        to the newest pending turn) instead of being dropped — a slow
+        extraction must never silently lose conversational memory.
+        """
         if self._is_breaker_open():
             return
 
-        def _sync():
+        with self._sync_lock:
+            self._sync_backlog = (user_content, assistant_content)
+            if self._sync_thread and self._sync_thread.is_alive():
+                # Worker is draining; it will pick up the newest backlog entry.
+                return
+            self._sync_thread = threading.Thread(
+                target=self._sync_worker, daemon=True, name="mem0-sync",
+            )
+            self._sync_thread.start()
+
+    def _sync_worker(self) -> None:
+        """Drain the sync backlog, one turn at a time, then exit.
+
+        Serialization is guaranteed by sync_turn (a new worker is only
+        spawned when no worker is alive), so concurrent adds never race.
+        A transport failure invalidates the backend for lazy re-init and
+        stops the drain; the next sync_turn spawns a fresh worker that
+        rebuilds the backend.
+        """
+        while True:
+            with self._sync_lock:
+                if self._sync_backlog is None:
+                    return  # queue empty — worker exits
+                user_content, assistant_content = self._sync_backlog
+                self._sync_backlog = None
             backend = self._ensure_backend()
             if backend is None or self._is_breaker_open():
                 return
@@ -594,15 +625,7 @@ class Mem0MemoryProvider(MemoryProvider):
                     self._invalidate_backend()
                 self._record_failure()
                 logger.warning("Mem0 sync failed: %s", e)
-
-        with self._sync_lock:
-            if self._sync_thread and self._sync_thread.is_alive():
-                self._sync_thread.join(timeout=5.0)
-            # If still alive after timeout, skip to avoid duplicate ingestion.
-            if self._sync_thread and self._sync_thread.is_alive():
                 return
-            self._sync_thread = threading.Thread(target=_sync, daemon=True, name="mem0-sync")
-            self._sync_thread.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [SEARCH_SCHEMA, ADD_SCHEMA, UPDATE_SCHEMA, DELETE_SCHEMA]
