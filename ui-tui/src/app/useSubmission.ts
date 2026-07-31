@@ -317,7 +317,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         patchUiState({ busy: true })
 
         return interpolate(full, text =>
-          send(prepareSubmission(text, submissionTokens).text, true, submission.display, value => value)
+          send(prepareSubmission(text, submissionTokens).text, true, text, value => value)
         )
       }
 
