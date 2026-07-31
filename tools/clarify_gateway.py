@@ -32,6 +32,7 @@ Two delivery paths from the adapter:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -332,6 +333,69 @@ def resolve_text_response_for_session(session_key: str, response: str) -> bool:
         entry.clarify_id,
         coerced,
     )
+
+
+def _looks_like_attempted_selection(entry: _ClarifyEntry, text: str) -> bool:
+    """True when a *rejected* reply still reads as the user trying to pick.
+
+    A short digit reply ("7" with 3 choices), digit lists ("1 5"), or a
+    comma-separated reply to a multi-select ("stagin, prod") are attempted
+    selections with a typo or out-of-range index — the user should get to
+    retry, so the clarify must stay pending (the deliberate reject-and-retry
+    semantics of #62042). Free prose ("let's go with staging please") can
+    never satisfy the native multi-choice guard no matter how often it is
+    retried, so it does not count.
+    """
+    stripped = str(text).strip()
+    if not stripped:
+        return True
+    tokens = [t for t in re.split(r"[,\s]+", stripped) if t]
+    if tokens and all(t.isdigit() for t in tokens):
+        return True
+    if entry.multi_select and "," in stripped:
+        return True
+    return False
+
+
+def resolve_text_response_or_cancel(session_key: str, response: str) -> bool:
+    """Resolve the oldest pending clarify from typed text, or cancel it.
+
+    Same acceptance rules as :func:`resolve_text_response_for_session`, with
+    one addition for the rejected case: when the reply is free prose that the
+    native multi-choice guard can never accept, the pending clarify is
+    cancelled with the empty-string sentinel (the same contract as
+    :func:`clear_session`) so the blocked ``wait_for_response`` unblocks
+    immediately instead of spinning until ``agent.clarify_timeout`` — up to
+    an hour of "Working…" while the reply dispatches as a new turn that the
+    still-pending tool call would ignore (#74399).
+
+    Rejected replies that look like *attempted* selections (out-of-range
+    number, label typo in a comma-separated multi-select reply) keep the
+    clarify pending so the user can retry.
+
+    Returns True when the reply resolved the clarify; False when the reply
+    should continue as a normal turn (whether or not the clarify was
+    cancelled alongside it).
+    """
+    entry = get_pending_for_session(session_key, include_choice_prompts=True)
+    if entry is None:
+        return False
+
+    coerced = _coerce_text_response(entry, response)
+    if coerced is not None:
+        return resolve_gateway_clarify(entry.clarify_id, coerced)
+
+    if _looks_like_attempted_selection(entry, response):
+        return False
+
+    if resolve_gateway_clarify(entry.clarify_id, ""):
+        logger.info(
+            "Cancelled pending clarify %s after unmatched prose reply; "
+            "message continues as a new turn (session=%s)",
+            entry.clarify_id,
+            session_key,
+        )
+    return False
 
 
 def mark_awaiting_text(clarify_id: str) -> bool:

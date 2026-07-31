@@ -13843,7 +13843,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
             if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _resolved = _clarify_mod.resolve_text_response_for_session(
+                # resolve_text_response_or_cancel additionally cancels the
+                # pending clarify (empty-string sentinel) when the reply is
+                # free prose the native multi-choice guard can never accept —
+                # otherwise the blocked tool call spins until
+                # agent.clarify_timeout (up to an hour) while this message
+                # dispatches as a new turn (#74399). Attempted-but-invalid
+                # selections still leave the clarify pending for a retry.
+                _resolved = _clarify_mod.resolve_text_response_or_cancel(
                     _quick_key, _raw_clarify_reply,
                 )
                 if _resolved:

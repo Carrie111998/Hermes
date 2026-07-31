@@ -341,3 +341,94 @@ class TestMultiSelectTextFallback:
         from tools import clarify_gateway as cm
         entry = cm.register("s4", "sk", "Q?", ["A", "B"])
         assert cm._coerce_text_response(entry, "b") == "B"
+
+
+class TestProseCancelsPendingClarify:
+    """#74399: free prose that the native multi-choice guard can never accept
+    must cancel the pending clarify (empty-string sentinel, the clear_session
+    contract) so the blocked wait_for_response unblocks immediately instead
+    of spinning until agent.clarify_timeout while the prose dispatches as a
+    new turn. Attempted-but-invalid selections keep the retry semantics of
+    the deliberate rejection guard (#62042)."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_prose_cancels_and_unblocks_the_waiting_agent(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("c1", "sk1", "Deploy where?", ["staging", "prod", "cancel"])
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(cm.wait_for_response, "c1", 30.0)
+            time.sleep(0.05)
+
+            resolved = cm.resolve_text_response_or_cancel(
+                "sk1", "let's go with staging please"
+            )
+
+            assert resolved is False, "prose must still dispatch as a new turn"
+            # The agent thread must unblock with the cancel sentinel long
+            # before the 30s timeout.
+            result = fut.result(timeout=5.0)
+        assert result == ""
+        assert cm.has_pending("sk1") is False
+
+    def test_exact_label_still_resolves(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("c2", "sk2", "Deploy where?", ["staging", "prod"])
+        assert cm.resolve_text_response_or_cancel("sk2", "staging") is True
+        assert cm.wait_for_response("c2", 1.0) == "staging"
+
+    def test_numeric_selection_still_resolves(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("c3", "sk3", "Deploy where?", ["staging", "prod"])
+        assert cm.resolve_text_response_or_cancel("sk3", "2") is True
+        assert cm.wait_for_response("c3", 1.0) == "prod"
+
+    def test_out_of_range_number_keeps_the_clarify_pending(self):
+        """"7" with three choices is an attempted selection — retry, not cancel."""
+        from tools import clarify_gateway as cm
+
+        cm.register("c4", "sk4", "Deploy where?", ["staging", "prod", "cancel"])
+        assert cm.resolve_text_response_or_cancel("sk4", "7") is False
+        assert cm.has_pending("sk4") is True
+
+    def test_multi_select_label_typo_keeps_the_clarify_pending(self):
+        """A comma-separated multi-select reply with a typo keeps retry semantics."""
+        from tools import clarify_gateway as cm
+
+        cm.register(
+            "c5", "sk5", "Which envs?", ["staging", "prod", "canary"],
+            multi_select=True,
+        )
+        assert cm.resolve_text_response_or_cancel("sk5", "stagin, prod") is False
+        assert cm.has_pending("sk5") is True
+
+    def test_awaiting_text_accepts_prose_unchanged(self):
+        """After the Other button, prose resolves — never cancels."""
+        from tools import clarify_gateway as cm
+
+        cm.register("c6", "sk6", "Deploy where?", ["staging", "prod"])
+        cm.mark_awaiting_text("c6")
+        assert cm.resolve_text_response_or_cancel(
+            "sk6", "let's go with staging please"
+        ) is True
+        assert cm.wait_for_response("c6", 1.0) == "let's go with staging please"
+
+    def test_no_pending_clarify_returns_false(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.resolve_text_response_or_cancel("sk7", "anything") is False
+
+    def test_legacy_resolver_still_leaves_prose_pending(self):
+        """The original resolve_text_response_for_session contract is unchanged."""
+        from tools import clarify_gateway as cm
+
+        cm.register("c8", "sk8", "Deploy where?", ["staging", "prod"])
+        assert cm.resolve_text_response_for_session(
+            "sk8", "let's go with staging please"
+        ) is False
+        assert cm.has_pending("sk8") is True
