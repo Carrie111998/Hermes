@@ -67,6 +67,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
+        "expected_base_sha": t.expected_base_sha,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
         "created_by": t.created_by,
@@ -338,6 +339,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument("--base-sha", dest="expected_base_sha", default=None,
+                          help="Full 40-character commit SHA used as the immutable "
+                               "base for worktree materialization")
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -1504,6 +1508,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
+            expected_base_sha=getattr(args, "expected_base_sha", None),
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
             tenant=args.tenant,

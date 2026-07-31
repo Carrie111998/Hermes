@@ -17,6 +17,7 @@ Two-part fix under test:
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -71,8 +72,8 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
         root = kb.create_task(conn, title="build the feature", triage=True)
         conn.execute(
             "UPDATE tasks SET workspace_kind='worktree', "
-            "workspace_path='/repo/.worktrees/root' WHERE id = ?",
-            (root,),
+            "workspace_path='/repo/.worktrees/root', expected_base_sha=? WHERE id = ?",
+            ("b" * 40, root),
         )
         conn.commit()
 
@@ -90,13 +91,15 @@ def test_decompose_worktree_children_get_own_workspace(kanban_home):
 
         for cid in child_ids:
             row = conn.execute(
-                "SELECT workspace_kind, workspace_path FROM tasks WHERE id = ?",
+                "SELECT workspace_kind, workspace_path, expected_base_sha "
+                "FROM tasks WHERE id = ?",
                 (cid,),
             ).fetchone()
             assert row["workspace_kind"] == "worktree"
             # Each child resolves its own <repo>/.worktrees/<child-id> at
             # dispatch; the root's literal path must never be shared.
             assert row["workspace_path"] is None
+            assert row["expected_base_sha"] == "b" * 40
 
 
 
@@ -124,6 +127,100 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
+
+
+def test_pinned_worktree_rejects_occupied_canonical_path_with_wrong_branch(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    expected_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="pinned",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="wt/pinned",
+            expected_base_sha=expected_base,
+        )
+        persisted = kb.get_task(conn, tid)
+    assert persisted is not None
+
+    target = repo / ".worktrees" / tid
+    _add_worktree(repo, target, "occupied-branch")
+    pinned = replace(persisted, workspace_path=str(target))
+    assert pinned.expected_base_sha == expected_base
+    with pytest.raises(RuntimeError, match="cannot safely reuse"):
+        kb.resolve_workspace(pinned)
+
+    # Preserve the legacy fallback only for tasks that did not request an
+    # immutable base contract.
+    legacy = replace(pinned, expected_base_sha=None)
+    assert kb.resolve_workspace(legacy).resolve() == target.resolve()
+
+
+def test_missing_expected_base_fails_without_fallback(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "missing-base"
+    missing = "f" * 40
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing base",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/missing-base",
+            expected_base_sha=missing,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(RuntimeError, match="git worktree add failed"):
+        kb._resolve_worktree_workspace(task)
+    assert not target.exists()
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", "wt/missing-base"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch == ""
+
+
+def test_existing_dirty_worktree_is_reused_without_reset(kanban_home, tmp_path):
+    repo = _make_repo(tmp_path)
+    expected = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    target = _add_worktree(repo, repo / ".worktrees" / "resume", "wt/resume")
+    dirty = target / "resume.txt"
+    dirty.write_text("preserve me\n")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="resume pinned task",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/resume",
+            expected_base_sha=expected,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task)
+    assert workspace == target.resolve()
+    assert branch == "wt/resume"
+    assert dirty.read_text() == "preserve me\n"
 
 
 

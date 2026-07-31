@@ -115,6 +115,23 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_worktree_task_round_trips_expected_base_sha(client):
+    base = "d" * 40
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "Pinned worktree",
+            "workspace_kind": "worktree",
+            "expected_base_sha": base,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["workspace_kind"] == "worktree"
+    assert task["expected_base_sha"] == base
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

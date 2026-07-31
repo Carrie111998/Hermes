@@ -883,6 +883,8 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    # Optional immutable lineage anchor for worktree materialization.
+    expected_base_sha: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -976,6 +978,11 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            expected_base_sha=(
+                row["expected_base_sha"]
+                if "expected_base_sha" in keys and row["expected_base_sha"]
+                else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1146,6 +1153,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed_at         INTEGER,
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
+    expected_base_sha    TEXT,
     branch_name          TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
@@ -2281,6 +2289,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "expected_base_sha" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "expected_base_sha", "expected_base_sha TEXT"
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -2826,6 +2838,7 @@ def create_task(
     created_by: Optional[str] = None,
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
+    expected_base_sha: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
@@ -2895,6 +2908,9 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    expected_base_sha = str(expected_base_sha or "").strip().lower() or None
+    if expected_base_sha and not re.fullmatch(r"[0-9a-f]{40}", expected_base_sha):
+        raise ValueError("expected_base_sha must be a full 40-character commit SHA")
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -2988,6 +3004,9 @@ def create_task(
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
+
+    if expected_base_sha and workspace_kind != "worktree":
+        raise ValueError("expected_base_sha is only valid for worktree workspaces")
 
     parents = tuple(p for p in parents if p)
 
@@ -3133,11 +3152,11 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        expected_base_sha, branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3150,6 +3169,7 @@ def create_task(
                         now,
                         workspace_kind,
                         workspace_path,
+                        expected_base_sha,
                         branch_name,
                         project_id,
                         tenant,
@@ -3180,6 +3200,7 @@ def create_task(
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
+                        "expected_base_sha": expected_base_sha,
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
@@ -6001,7 +6022,8 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "expected_base_sha "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6016,6 +6038,7 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_expected_base_sha = root_row["expected_base_sha"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -6047,11 +6070,14 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            child_expected_base_sha = (
+                root_expected_base_sha if child_ws_kind == "worktree" else None
+            )
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, expected_base_sha, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6059,6 +6085,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_expected_base_sha,
                     tenant,
                     now,
                     (author or "decomposer"),
@@ -6338,21 +6365,68 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    base_ref: str = "HEAD",
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            actual_branch = _git_current_branch(target)
+            if actual_branch != branch_name:
+                raise RuntimeError(
+                    f"existing worktree branch mismatch: expected {branch_name!r}, "
+                    f"found {actual_branch!r}"
+                )
+            if base_ref != "HEAD":
+                lineage = subprocess.run(
+                    [
+                        "git", "-C", str(target), "merge-base", "--is-ancestor",
+                        base_ref, "HEAD",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+                if lineage.returncode != 0:
+                    raise RuntimeError(
+                        f"existing worktree HEAD is not descended from expected base "
+                        f"{base_ref}"
+                    )
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
+        if base_ref != "HEAD":
+            lineage = subprocess.run(
+                [
+                    "git", "-C", str(repo_root), "merge-base", "--is-ancestor",
+                    base_ref, branch_name,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+                check=False,
+            )
+            if lineage.returncode != 0:
+                raise RuntimeError(
+                    f"existing branch {branch_name} is not descended from expected base "
+                    f"{base_ref}; refusing to materialize it"
+                )
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_ref,
         ]
     result = subprocess.run(
         cmd,
@@ -6382,6 +6456,13 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    materialization_base = (task.expected_base_sha or "").strip().lower() or "HEAD"
+    if materialization_base != "HEAD" and not re.fullmatch(
+        r"[0-9a-f]{40}", materialization_base
+    ):
+        raise RuntimeError(
+            "expected_base_sha must be a full 40-character commit SHA for worktree materialization"
+        )
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -6408,7 +6489,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, materialization_base)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6422,6 +6503,12 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            existing_root = _git_toplevel(requested)
+            if existing_root is None:
+                raise RuntimeError(f"cannot resolve git repository for {requested}")
+            _ensure_git_worktree(
+                existing_root, requested, branch_name, materialization_base
+            )
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -6434,17 +6521,27 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name, materialization_base
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
+        # task's own canonical worktree). Pinned tasks must fail closed:
+        # reusing the wrong branch would silently violate their immutable
+        # lineage contract. Preserve the historical reuse only for legacy
+        # tasks that did not request an exact base.
+        if materialization_base != "HEAD":
+            raise RuntimeError(
+                f"cannot safely reuse pinned worktree {requested}: expected branch "
+                f"{branch_name!r}, found {actual_branch or '(detached)'!r}, and no "
+                f"distinct fallback target is available for base {materialization_base}"
+            )
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, materialization_base)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6453,7 +6550,7 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, materialization_base)
     return requested, branch_name
 
 

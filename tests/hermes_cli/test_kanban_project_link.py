@@ -40,6 +40,24 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert not task.branch_name.startswith("wt/")
 
 
+def test_project_linked_task_accepts_expected_base_before_workspace_promotion(kanban_conn):
+    proj = _make_project()
+    assert proj is not None
+    base = "a" * 40
+
+    tid = kb.create_task(
+        kanban_conn,
+        title="Pinned project work",
+        project_id=proj.slug,
+        expected_base_sha=base,
+    )
+    task = kb.get_task(kanban_conn, tid)
+
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.expected_base_sha == base
+
+
 def test_explicit_branch_overrides_project_default(kanban_conn):
     proj = _make_project()
     tid = kb.create_task(

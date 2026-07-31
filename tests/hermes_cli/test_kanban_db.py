@@ -145,11 +145,18 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        legacy = migrated.execute(
+            "SELECT id, title, expected_base_sha FROM tasks WHERE id = 'legacy'"
+        ).fetchone()
 
     # Additive columns added by migration:
     assert "session_id" in task_columns
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
+    assert "expected_base_sha" in task_columns
+    assert legacy is not None
+    assert legacy["title"] == "old board task"
+    assert legacy["expected_base_sha"] is None
     assert "run_id" in event_columns
     # And their indexes — the regression scope of this test:
     assert "idx_tasks_session_id" in indexes
@@ -560,6 +567,95 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     ).stdout
     assert f"worktree {target}" in listed
     assert f"branch refs/heads/{branch}" in listed
+
+
+def test_dispatch_materializes_new_worktree_at_expected_base_not_anchor_head(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    expected_base = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "later.txt").write_text("later\n")
+    subprocess.run(["git", "-C", str(repo), "add", "later.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "later anchor head"],
+        check=True,
+        capture_output=True,
+    )
+    anchor_head = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert anchor_head != expected_base
+    (repo / "dirty-anchor.txt").write_text("must not leak\n")
+
+    kb.create_board("worktree-exact-base-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+
+    with kb.connect(board="worktree-exact-base-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="review pinned snapshot",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            expected_base_sha=expected_base,
+            board="worktree-exact-base-board",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: None,
+            board="worktree-exact-base-board",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert task.expected_base_sha == expected_base
+    assert task.workspace_path is not None
+    assert result.spawned == [(tid, "sentinel", task.workspace_path)]
+    materialized_head = subprocess.run(
+        ["git", "-C", task.workspace_path, "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert materialized_head == expected_base
+    assert not (Path(task.workspace_path) / "dirty-anchor.txt").exists()
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["abc123", "g" * 40, "a" * 39, "a" * 41],
+)
+def test_create_task_rejects_non_full_expected_base_sha(kanban_home, value):
+    with kb.connect() as conn, pytest.raises(
+        ValueError, match="full 40-character commit SHA"
+    ):
+        kb.create_task(
+            conn,
+            title="bad base",
+            workspace_kind="worktree",
+            expected_base_sha=value,
+        )
+
+
+def test_create_task_rejects_expected_base_for_non_worktree(kanban_home):
+    with kb.connect() as conn, pytest.raises(
+        ValueError, match="only valid for worktree"
+    ):
+        kb.create_task(
+            conn,
+            title="bad workspace",
+            workspace_kind="scratch",
+            expected_base_sha="a" * 40,
+        )
 
 
 # ---------------------------------------------------------------------------

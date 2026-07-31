@@ -29,9 +29,19 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_create_worktree_base_sha_is_persisted_and_returned(kanban_home):
+    base = "b" * 40
+    raw = kc.run_slash(
+        f"create 'pinned worktree' --workspace worktree --base-sha {base} --json"
+    )
+    payload = json.loads(raw)
 
-
-
+    assert payload["workspace_kind"] == "worktree"
+    assert payload["expected_base_sha"] == base
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, payload["id"])
+    assert task is not None
+    assert task.expected_base_sha == base
 
 
 # ---------------------------------------------------------------------------

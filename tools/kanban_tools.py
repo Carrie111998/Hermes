@@ -379,6 +379,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "expected_base_sha": task.expected_base_sha,
         "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
@@ -426,6 +427,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "tenant": t.tenant, "priority": t.priority,
                     "workspace_kind": t.workspace_kind,
                     "workspace_path": t.workspace_path,
+                    "expected_base_sha": t.expected_base_sha,
                     "created_by": t.created_by, "created_at": t.created_at,
                     "started_at": t.started_at,
                     "completed_at": t.completed_at,
@@ -1161,6 +1163,7 @@ def _handle_create(args: dict, **kw) -> str:
     # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    expected_base_sha = args.get("expected_base_sha")
     project_id = args.get("project") or args.get("project_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
@@ -1218,6 +1221,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                expected_base_sha=expected_base_sha,
                 project_id=project_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
@@ -1244,6 +1248,9 @@ def _handle_create(args: dict, **kw) -> str:
                 status=new_task.status if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
+                expected_base_sha=(
+                    new_task.expected_base_sha if new_task else None
+                ),
                 project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
             )
@@ -1896,6 +1903,14 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "expected_base_sha": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{40}$",
+                "description": (
+                    "Optional full commit SHA used as the immutable base for "
+                    "worktree materialization. Valid only with workspace_kind='worktree'."
                 ),
             },
             "project": {

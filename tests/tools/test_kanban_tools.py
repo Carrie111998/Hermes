@@ -416,6 +416,27 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_worktree_expected_base_sha_round_trips(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    base = "c" * 40
+    out = kt._handle_create({
+        "title": "pinned child",
+        "assignee": "peer",
+        "workspace_kind": "worktree",
+        "expected_base_sha": base,
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is True
+    assert payload["expected_base_sha"] == base
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, payload["task_id"])
+    assert task is not None
+    assert task.expected_base_sha == base
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
