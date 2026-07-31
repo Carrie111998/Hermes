@@ -62,6 +62,7 @@ class FakeMediaClient:
         self.downloads: list[str] = []
         self.upload_result: Optional[str] = "https://conn.example/relay/media/aa11"
         self.download_result: Optional[str] = "/tmp/relay_media_fake.png"
+        self._classifier = RelayMediaClient("https://conn.example", "gw1", "sec")
 
     async def upload(self, file_path, *, mime=None, filename=None):
         self.uploads.append((str(file_path), filename))
@@ -72,7 +73,7 @@ class FakeMediaClient:
         return self.download_result
 
     def is_relay_media_url(self, url: str) -> bool:
-        return "/relay/media/" in (url or "")
+        return self._classifier.is_relay_media_url(url)
 
 
 def _adapter(**desc_kw) -> tuple[RelayAdapter, StubConnector, FakeMediaClient]:
@@ -152,7 +153,50 @@ def _make_event(media_urls):
 
 
 @pytest.mark.asyncio
-async def test_inbound_without_client_keeps_public_drops_rehost():
+async def test_inbound_rehost_urls_are_localized():
+    adapter, _stub, fake = _adapter()
+    event = _make_event(["https://conn.example/relay/media/deadbeef"])
+    await adapter._localize_inbound_media(event)
+    assert fake.downloads == ["https://conn.example/relay/media/deadbeef"]
+    assert event.media_urls == ["/tmp/relay_media_fake.png"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_dead_rehost_ref_is_dropped_public_url_kept():
+    adapter, _stub, fake = _adapter()
+    fake.download_result = None  # every download fails
+    event = _make_event(
+        [
+            "https://conn.example/relay/media/deadbeef",  # dead re-host → dropped
+            "https://cdn.discordapp.com/attachments/a/b.png",  # public → kept as URL
+        ]
+    )
+    await adapter._localize_inbound_media(event)
+    assert event.media_urls == ["https://cdn.discordapp.com/attachments/a/b.png"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_download_failure_keeps_public_marker_url():
+    adapter, _stub, fake = _adapter()
+    fake.download_result = None
+    public_marker = "https://cdn.example/files/relay/media/photo.png"
+    event = _make_event(
+        [
+            "https://conn.example/relay/media/deadbeef",
+            public_marker,
+        ]
+    )
+    await adapter._localize_inbound_media(event)
+    assert fake.downloads == [
+        "https://conn.example/relay/media/deadbeef",
+        public_marker,
+    ]
+    assert event.media_urls == [public_marker]
+
+
+@pytest.mark.asyncio
+async def test_inbound_without_client_keeps_public_drops_rehost(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_URL", "wss://conn.example/relay")
     adapter, _stub, _fake = _adapter()
     adapter._media_client = None
     adapter._get_media_client = lambda: None  # type: ignore[method-assign]
@@ -164,6 +208,23 @@ async def test_inbound_without_client_keeps_public_drops_rehost():
     )
     await adapter._localize_inbound_media(event)
     assert event.media_urls == ["https://cdn.discordapp.com/attachments/a/b.png"]
+
+
+@pytest.mark.asyncio
+async def test_inbound_without_client_keeps_public_marker_url(monkeypatch):
+    monkeypatch.setenv("GATEWAY_RELAY_URL", "wss://conn.example/relay")
+    adapter, _stub, _fake = _adapter()
+    adapter._media_client = None
+    adapter._get_media_client = lambda: None  # type: ignore[method-assign]
+    public_marker = "https://cdn.example/files/relay/media/photo.png"
+    event = _make_event(
+        [
+            "https://conn.example/relay/media/deadbeef",
+            public_marker,
+        ]
+    )
+    await adapter._localize_inbound_media(event)
+    assert event.media_urls == [public_marker]
 
 
 # ── RelayMediaClient unit surface ────────────────────────────────────────
@@ -194,6 +255,28 @@ def test_client_recognizes_rehost_urls_under_connector_base_path():
     c = RelayMediaClient("https://c.example/team-a", "gw1", "sec")
     assert c.is_relay_media_url("https://c.example/team-a/relay/media/abc") is True
     assert c.is_relay_media_url("https://c.example/relay/media/abc") is False
+
+
+def test_client_recognizes_equivalent_default_port_origins():
+    implicit_https = RelayMediaClient("https://c.example", "gw1", "sec")
+    explicit_https = RelayMediaClient("https://c.example:443", "gw1", "sec")
+    implicit_http = RelayMediaClient("http://c.example", "gw1", "sec")
+
+    assert implicit_https.is_relay_media_url(
+        "https://c.example:443/relay/media/abc"
+    ) is True
+    assert explicit_https.is_relay_media_url(
+        "https://c.example/relay/media/abc"
+    ) is True
+    assert implicit_http.is_relay_media_url(
+        "http://c.example:80/relay/media/abc"
+    ) is True
+    assert implicit_https.is_relay_media_url(
+        "https://c.example:444/relay/media/abc"
+    ) is False
+    assert implicit_https.is_relay_media_url(
+        "http://c.example:443/relay/media/abc"
+    ) is False
 
 
 class _CaptureHandler(BaseHTTPRequestHandler):

@@ -60,6 +60,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
+def _effective_port(parsed: urllib.parse.ParseResult) -> Optional[int]:
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None:
+        return port
+    scheme = (parsed.scheme or "").lower()
+    if scheme == "http":
+        return 80
+    if scheme == "https":
+        return 443
+    return None
+
+
+def _origin_key(parsed: urllib.parse.ParseResult) -> Optional[tuple[str, str, int]]:
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = _effective_port(parsed)
+    if scheme not in {"http", "https"} or not host or port is None:
+        return None
+    return scheme, host, port
+
+
 def media_base_url(relay_dial_url: str) -> str:
     """Map the ``ws(s)://…/relay`` dial URL to the ``http(s)://…`` base.
 
@@ -106,7 +130,13 @@ class RelayMediaClient:
             return False
         if not candidate.scheme or not candidate.netloc:
             return False
-        if candidate.scheme != base.scheme or candidate.netloc != base.netloc:
+        candidate_origin = _origin_key(candidate)
+        base_origin = _origin_key(base)
+        if (
+            candidate_origin is None
+            or base_origin is None
+            or candidate_origin != base_origin
+        ):
             return False
         base_path = (base.path or "").rstrip("/")
         media_path = f"{base_path}/relay/media/"
