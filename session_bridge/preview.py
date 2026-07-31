@@ -290,6 +290,16 @@ def _render_preview(
                 "",
             )
         )
+    parts.extend(
+        (
+            "## Source and Filesystem Safety",
+            "",
+            f"Source working directory: {cwd}",
+            "The .hermes Session Inbox is for discussion and non-mutating inspection only.",
+            "Do not make source-project file changes until an explicit source-project handoff authorizes them.",
+            "",
+        )
+    )
     return "\n".join(parts).rstrip() + "\n"
 
 

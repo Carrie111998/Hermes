@@ -599,18 +599,16 @@ def build_hydration_message(
         ):
             raise ValueError("hydration preview is malformed")
         readable = preview_rendered.rstrip("\n")
-    source = json.dumps(source_id, ensure_ascii=False, separators=(",", ":"))
     return "\n".join((
         readable,
         "",
         "## In-place Session Bridge Hydration",
         "",
         "This is an authenticated in-place Session Bridge hydration.",
-        "Call "
-        f"session_continue(session_id={source}, target_provider=\"codex\") "
-        "before project work.",
+        "Do not perform project work during this maintenance turn.",
+        "Do not call session_continue during this maintenance turn.",
         f"Hydration marker: {marker}",
-        "After the continuation call, reply only: HYDRATED",
+        "After the marker is recorded, reply only: HYDRATED",
     ))
 
 

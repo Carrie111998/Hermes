@@ -70,6 +70,54 @@ def test_preview_selects_last_five_conversational_messages_in_order() -> None:
     assert len(preview.rendered) <= 24_000
 
 
+def test_preview_orders_readable_sections_and_filesystem_safety() -> None:
+    preview = _preview(
+        [
+            {
+                "role": "user" if index % 2 else "assistant",
+                "content": f"message-{index}",
+                "timestamp": float(index),
+            }
+            for index in range(1, 7)
+        ]
+    )
+
+    rendered = preview.rendered
+    assert rendered.index("## Continuation Brief") < rendered.index("## Last 5 Messages")
+    assert rendered.index("## Last 5 Messages") < rendered.index(
+        "## Source and Filesystem Safety"
+    )
+    assert "Source working directory: C:\\repo" in rendered
+    assert ".hermes Session Inbox" in rendered
+    assert "source-project handoff" in rendered
+
+
+def test_preview_exact_latest_five_messages_are_chronological() -> None:
+    preview = _preview(
+        [
+            {
+                "role": "user" if index % 2 else "assistant",
+                "content": f"message-{index}",
+                "timestamp": float(index),
+            }
+            for index in range(1, 7)
+        ]
+    )
+
+    assert [message.content for message in preview.recent_messages] == [
+        "message-2",
+        "message-3",
+        "message-4",
+        "message-5",
+        "message-6",
+    ]
+    last_five = preview.rendered.split("## Last 5 Messages", 1)[1]
+    assert "message-1" not in last_five
+    assert [last_five.index(f"message-{index}") for index in range(2, 7)] == sorted(
+        last_five.index(f"message-{index}") for index in range(2, 7)
+    )
+
+
 def test_preview_excludes_control_noise_inactive_and_redaction_only_messages() -> None:
     messages = [
         {

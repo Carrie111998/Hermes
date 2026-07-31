@@ -505,7 +505,6 @@ def create_app(
                         store,
                         claim,
                         secret,
-                        config.sidebar.readable_preview_enabled,
                         config.sidebar.preview_budget_chars,
                     )
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -1838,7 +1837,6 @@ def _build_sidebar_broker_job(
     store: SessionBridgeStore,
     claim: object,
     marker_key: bytes,
-    readable_preview_enabled: bool = False,
     preview_budget_chars: int = 24_000,
 ) -> dict[str, Any]:
     lease_token = _exact_sidebar_text(
@@ -1891,35 +1889,33 @@ def _build_sidebar_broker_job(
         ):
             raise ValueError("recovered sidebar thread identity is malformed")
         recovered_thread_id = verified_thread_id
-    preview = None
-    if readable_preview_enabled:
-        snapshot = store.get_sidebar_preview_source(source_session_id)
-        if (
-            snapshot.get("source_session_id") != source_session_id
-            or snapshot.get("provider") != candidate.provider.value
-        ):
-            raise ValueError("sidebar source preview identity is malformed")
-        preview = build_session_preview(
-            source_session_id=source_session_id,
-            source_cursor=_exact_sidebar_text(
-                snapshot.get("source_cursor"),
-                "preview source cursor",
-            ),
-            source_hash=_exact_sidebar_text(
-                snapshot.get("source_hash"),
-                "preview source hash",
-            ),
-            title=cast(str | None, snapshot.get("title")),
-            provider=candidate.provider.value,
-            cwd=candidate.cwd,
-            captured_at=snapshot.get("captured_at"),
-            messages=cast(list[Mapping[str, Any]], snapshot.get("messages")),
-            git_root=candidate.git_root,
-            git_branch=candidate.git_branch,
-            git_head=candidate.git_head,
-            worktree_id=candidate.worktree_id,
-            budget_chars=preview_budget_chars,
-        )
+    snapshot = store.get_sidebar_preview_source(source_session_id)
+    if (
+        snapshot.get("source_session_id") != source_session_id
+        or snapshot.get("provider") != candidate.provider.value
+    ):
+        raise ValueError("sidebar source preview identity is malformed")
+    preview = build_session_preview(
+        source_session_id=source_session_id,
+        source_cursor=_exact_sidebar_text(
+            snapshot.get("source_cursor"),
+            "preview source cursor",
+        ),
+        source_hash=_exact_sidebar_text(
+            snapshot.get("source_hash"),
+            "preview source hash",
+        ),
+        title=candidate.title,
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=snapshot.get("captured_at"),
+        messages=cast(list[Mapping[str, Any]], snapshot.get("messages")),
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+        budget_chars=preview_budget_chars,
+    )
     return {
         "lease_token": lease_token,
         "registration_prompt": build_registration_prompt(

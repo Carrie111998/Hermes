@@ -20,6 +20,7 @@ from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     ACK_OR_CONTROL_ONLY,
     SidebarCandidate,
+    build_hydration_message,
     build_registration_prompt,
     decode_hydration_marker,
     encode_hydration_marker,
@@ -674,9 +675,8 @@ def test_readable_registration_prompt_puts_preview_before_bridge_metadata() -> N
         preview=preview,
     )
 
-    assert prompt.index("# Imported Claude Code Session") < prompt.index(
-        "## Bridge Registration"
-    )
+    assert prompt.startswith("# Imported Claude Code Session")
+    assert prompt.index("## Last 5 Messages") < prompt.index("## Bridge Registration")
     assert "## Continuation Brief" in prompt
     assert "## Last 5 Messages" in prompt
     assert f"Signed marker: {_marker_for(candidate)}" in prompt
@@ -688,6 +688,39 @@ def test_readable_registration_prompt_puts_preview_before_bridge_metadata() -> N
         "Until that later user message, reply with only: REGISTERED"
     )
     assert is_registration_prompt(prompt)
+
+
+def test_hydration_message_is_a_maintenance_only_turn() -> None:
+    candidate = _candidate()
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        title="Readable source",
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=NOW,
+        messages=[],
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+    )
+
+    message = build_hydration_message(
+        preview_rendered=preview.rendered,
+        source_session_id=candidate.source_session_id,
+        hydration_marker="HERMES_SESSION_HYDRATION_V1:marker.signature",
+        send_reserved=False,
+    )
+
+    assert "## In-place Session Bridge Hydration" in message
+    assert "This is an authenticated in-place Session Bridge hydration." in message
+    assert "Do not perform project work during this maintenance turn." in message
+    assert "Do not call session_continue during this maintenance turn." in message
+    assert "Hydration marker: HERMES_SESSION_HYDRATION_V1:marker.signature" in message
+    assert message.endswith("After the marker is recorded, reply only: HYDRATED")
+    assert "Call session_continue(session_id=" not in message
 
 
 def test_readable_registration_prompt_digest_mismatch_fails_classification() -> None:

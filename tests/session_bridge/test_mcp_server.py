@@ -902,7 +902,9 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
     assert job["recovered_thread_id"] is None
     assert job["create_reserved"] is False
     prompt = job["registration_prompt"]
-    assert "Fix the sidebar registration broker" not in prompt
+    assert prompt.startswith("# Imported Claude Code Session")
+    assert prompt.index("## Last 5 Messages") < prompt.index("## Bridge Registration")
+    assert "Fix the sidebar registration broker" in prompt
     assert "C:/claude/sidebar-source.jsonl" not in prompt
     assert "sk-secret-value" not in prompt
     marker = next(
@@ -1046,10 +1048,10 @@ def test_session_sidebar_hydration_tools_have_exact_schemas_and_commit_exact_tas
             hydration_message=(
                 "# Imported Claude Code Session\n\n"
                 "This is an authenticated in-place Session Bridge hydration.\n"
-                f'Call session_continue(session_id="{candidate.source_session_id}", '
-                'target_provider="codex") before project work.\n'
+                "Do not perform project work during this maintenance turn.\n"
+                "Do not call session_continue during this maintenance turn.\n"
                 f"Hydration marker: {marker}\n"
-                "After the continuation call, reply only: HYDRATED"
+                "After the marker is recorded, reply only: HYDRATED"
             ),
             cwd=candidate.cwd,
             git_root=candidate.git_root,
@@ -1110,6 +1112,12 @@ def test_session_sidebar_hydration_tools_have_exact_schemas_and_commit_exact_tas
     assert job["codex_thread_id"] == thread_id
     assert job["hydration_marker"] == marker
     assert job["hydration_message"].startswith("# Imported Claude Code Session")
+    assert "Do not perform project work during this maintenance turn." in job["hydration_message"]
+    assert "Do not call session_continue during this maintenance turn." in job["hydration_message"]
+    assert "Call session_continue(session_id=" not in job["hydration_message"]
+    assert job["hydration_message"].endswith(
+        "After the marker is recorded, reply only: HYDRATED"
+    )
     assert "native_path" not in json.dumps(job)
     assert reserved == {"state": "hydration_leased", "send_reserved": True}
     assert committed == {
