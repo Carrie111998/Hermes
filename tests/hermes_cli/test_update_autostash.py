@@ -115,7 +115,6 @@ def _make_update_side_effect(
     current_branch="main",
     commit_count="3",
     ff_only_fails=False,
-    reset_fails=False,
     fetch_fails=False,
     fetch_stderr="",
 ):
@@ -125,6 +124,14 @@ def _make_update_side_effect(
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
         joined = " ".join(str(c) for c in cmd)
+        # HER-110 ancestry-guard probes (read-only): resolvable refs and an
+        # is-ancestor answer of "yes" model a clean fast-forward-safe clone.
+        if "merge-base" in joined and "--is-ancestor" in joined:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "show-ref" in joined:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if "rev-parse" in joined and "^{commit}" in joined:
+            return SimpleNamespace(stdout="a" * 40 + "\n", stderr="", returncode=0)
         if "fetch" in joined and "origin" in joined:
             if fetch_fails:
                 return SimpleNamespace(stdout="", stderr=fetch_stderr, returncode=128)
@@ -143,10 +150,6 @@ def _make_update_side_effect(
                     returncode=128,
                 )
             return SimpleNamespace(stdout="Updating abc..def\n", stderr="", returncode=0)
-        if "reset" in joined and "--hard" in joined:
-            if reset_fails:
-                return SimpleNamespace(stdout="", stderr="error: unable to write\n", returncode=1)
-            return SimpleNamespace(stdout="HEAD is now at abc123\n", stderr="", returncode=0)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     return side_effect, recorded
@@ -163,11 +166,13 @@ def _make_update_side_effect(
 
 
 # ---------------------------------------------------------------------------
-# reset --hard failure — don't attempt stash restore
+# ff-only failure — refuse fail-closed (HER-110), keep the stash, no reset
 # ---------------------------------------------------------------------------
 
-def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, capsys):
-    """When reset --hard fails, stash restore is skipped with a helpful message."""
+def test_cmd_update_ff_failure_refuses_and_keeps_stash(monkeypatch, tmp_path, capsys):
+    """A failed ff-only merge refuses the update instead of resetting to
+    origin (HER-110): exit non-zero, skip the stash restore, point at the
+    preserved stash, and never run any ``git reset``."""
     _setup_update_mocks(monkeypatch, tmp_path)
     # Re-enable stash so it actually returns a ref
     monkeypatch.setattr(
@@ -180,7 +185,7 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
         lambda *a, **kw: restore_calls.append(1) or True,
     )
 
-    side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
+    side_effect, recorded = _make_update_side_effect(ff_only_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
     with pytest.raises(SystemExit, match="1"):
@@ -190,7 +195,12 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
     assert len(restore_calls) == 0
 
     out = capsys.readouterr().out
+    assert "Update refused" in out
     assert "preserved in stash" in out
+    # The old destructive fallback must be gone: no reset of any kind ran.
+    assert not any(
+        "reset" in " ".join(str(c) for c in cmd) for cmd in recorded
+    ), recorded
 
 
 # ---------------------------------------------------------------------------

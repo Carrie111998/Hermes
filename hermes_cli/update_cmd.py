@@ -116,6 +116,134 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+UPDATE_ANCESTRY_FAST_FORWARD_SAFE = "FAST_FORWARD_SAFE"
+UPDATE_ANCESTRY_LOCAL_ONLY_OR_DIVERGED = "LOCAL_ONLY_OR_DIVERGED"
+UPDATE_ANCESTRY_UNKNOWN = "UNKNOWN"
+
+def _classify_update_ancestry(
+    git_cmd: list[str], cwd, branch: str, local_ref: str = "HEAD"
+) -> tuple[str, str | None]:
+    """Classify *local_ref* against ``origin/<branch>`` for update safety.
+
+    ``hermes update`` may only ever move the checkout forward along the
+    remote history. Returns ``(classification, detail)``:
+
+    - ``FAST_FORWARD_SAFE`` — the local tip is an ancestor of (or equal to)
+      ``origin/<branch>``; a ff-only merge cannot lose anything.
+    - ``LOCAL_ONLY_OR_DIVERGED`` — the local tip carries commits that are
+      not on ``origin/<branch>`` (committed local overlay, or diverged /
+      force-pushed history). Updating would have to discard them.
+    - ``UNKNOWN`` — either ref is unresolvable or git itself failed; the
+      caller must fail closed.
+    """
+    remote_ref = f"origin/{branch}"
+
+    def _resolve(ref: str):
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    try:
+        local_sha = _resolve(local_ref)
+        if not local_sha:
+            return (
+                UPDATE_ANCESTRY_UNKNOWN,
+                f"could not resolve local ref {local_ref!r}",
+            )
+        remote_sha = _resolve(remote_ref)
+        if not remote_sha:
+            return (
+                UPDATE_ANCESTRY_UNKNOWN,
+                f"could not resolve {remote_ref!r} after fetch",
+            )
+        probe = subprocess.run(
+            git_cmd + ["merge-base", "--is-ancestor", local_sha, remote_sha],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return UPDATE_ANCESTRY_UNKNOWN, f"git ancestry probe failed: {exc}"
+    if probe.returncode == 0:
+        return UPDATE_ANCESTRY_FAST_FORWARD_SAFE, None
+    if probe.returncode == 1:
+        return UPDATE_ANCESTRY_LOCAL_ONLY_OR_DIVERGED, None
+    stderr_lines = (probe.stderr or "").strip().splitlines()
+    detail = f"git merge-base exited {probe.returncode}"
+    if stderr_lines:
+        detail += f": {stderr_lines[0]}"
+    return UPDATE_ANCESTRY_UNKNOWN, detail
+
+def _local_branch_ref_state(git_cmd: list[str], cwd, branch: str) -> str:
+    """Return ``"present"``, ``"absent"``, or ``"unknown"`` for ``refs/heads/<branch>``.
+
+    ``show-ref --verify --quiet`` exits 0 when the ref exists and 1 when it
+    does not; anything else (or an OS-level failure) is indistinguishable
+    from a broken repo and reports ``unknown`` so the caller can fail closed.
+    """
+    try:
+        probe = subprocess.run(
+            git_cmd + ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if probe.returncode == 0:
+        return "present"
+    if probe.returncode == 1:
+        return "absent"
+    return "unknown"
+
+def _print_update_refused_preserving_local_history(
+    branch: str, classification: str, detail: str | None
+) -> None:
+    """Explain an update refusal that preserved the local checkout.
+
+    Deliberately never suggests any destructive command: local commits were
+    detected (or safety could not be proven) and everything was left exactly
+    as it was. Inspection guidance is read-only.
+    """
+    remote_ref = f"origin/{branch}"
+    print()
+    if classification == UPDATE_ANCESTRY_LOCAL_ONLY_OR_DIVERGED:
+        print(
+            f"✗ Update refused: this checkout has local commits that are "
+            f"not on {remote_ref}."
+        )
+        print(
+            "  Updating would have discarded them, so nothing was changed — "
+            "your branch,"
+        )
+        print("  local commits, and working tree are preserved exactly as they were.")
+    else:
+        print(
+            f"✗ Update refused (fail-closed): could not verify that "
+            f"fast-forwarding to {remote_ref} is safe."
+        )
+        if detail:
+            print(f"  ({detail})")
+        print(
+            "  Nothing was changed — your branch, local commits, and working "
+            "tree are preserved."
+        )
+    print()
+    print("  Inspect the situation (read-only):")
+    print(f"    git log --oneline {remote_ref}..HEAD    # local-only commits")
+    print(f"    git log --oneline HEAD..{remote_ref}    # upstream commits not yet local")
+    print("    git status")
+    print()
+    print("  When ready, integrate the histories deliberately (for example merge or")
+    print(f"  rebase onto {remote_ref} in a separate, reviewed step), then re-run")
+    print("  `hermes update`. Hermes never discards local commits on its own.")
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -3325,6 +3453,54 @@ def _cmd_update_impl(args, gateway_mode: bool):
         )
         current_branch = result.stdout.strip()
 
+        # ── Anti-destructive-update guard (HER-110) ──────────────────────
+        # Classify the local committed history against the freshly fetched
+        # origin/<branch> BEFORE any stash/checkout/merge can touch the
+        # checkout. An update may only ever fast-forward along the remote
+        # history: a tip that is not an ancestor of origin/<branch> means
+        # committed local work exists that any reset/merge fallback would
+        # erase (dirty-file autostash cannot protect committed overlays).
+        # Refuse and preserve everything in that case, and refuse
+        # fail-closed on any classification doubt (detached HEAD, missing
+        # refs, git errors). There is deliberately no config or CLI
+        # override for this refusal.
+        if current_branch == "HEAD":
+            ancestry, ancestry_detail = (
+                UPDATE_ANCESTRY_UNKNOWN,
+                "HEAD is detached — cannot tell which local branch the "
+                "update would rewrite",
+            )
+        elif current_branch != branch:
+            target_ref_state = _local_branch_ref_state(
+                git_cmd, _m().PROJECT_ROOT, branch
+            )
+            if target_ref_state == "absent":
+                # The update target does not exist locally yet; the
+                # checkout below creates it at origin/<branch>. No local
+                # commits are at risk.
+                ancestry, ancestry_detail = UPDATE_ANCESTRY_FAST_FORWARD_SAFE, None
+            elif target_ref_state == "present":
+                ancestry, ancestry_detail = _classify_update_ancestry(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    branch,
+                    local_ref=f"refs/heads/{branch}",
+                )
+            else:
+                ancestry, ancestry_detail = (
+                    UPDATE_ANCESTRY_UNKNOWN,
+                    f"could not determine whether local branch {branch!r} exists",
+                )
+        else:
+            ancestry, ancestry_detail = _classify_update_ancestry(
+                git_cmd, _m().PROJECT_ROOT, branch
+            )
+        if ancestry != UPDATE_ANCESTRY_FAST_FORWARD_SAFE:
+            _print_update_refused_preserving_local_history(
+                branch, ancestry, ancestry_detail
+            )
+            sys.exit(1)
+
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
         # "always update against main" behavior; for any other target it's
@@ -3516,26 +3692,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                # The ancestry guard above proved the local tip was an
+                # ancestor of origin/<branch>, so a failed fast-forward here
+                # means the situation changed underneath us or git failed.
+                # HER-110: never fall back to resetting the checkout onto
+                # the remote — that fallback destroyed committed local
+                # overlays. Fail closed and leave HEAD untouched instead.
+                stderr_lines = (pull_result.stderr or "").strip().splitlines()
+                _print_update_refused_preserving_local_history(
+                    branch,
+                    UPDATE_ANCESTRY_UNKNOWN,
+                    "fast-forward merge failed after the ancestry check passed"
+                    + (f": {stderr_lines[0]}" if stderr_lines else ""),
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
-                    sys.exit(1)
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

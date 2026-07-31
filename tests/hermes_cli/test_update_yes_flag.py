@@ -25,6 +25,16 @@ def _make_run_side_effect(
 
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
+        # HER-110 ancestry-guard probes (read-only): resolvable refs and an
+        # is-ancestor "yes" model a clean fast-forward-safe checkout.
+        if "merge-base" in joined and "--is-ancestor" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "show-ref" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "rev-parse" in joined and "^{commit}" in joined:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="a" * 40 + "\n", stderr=""
+            )
         if "rev-parse" in joined and "--verify" in joined:
             return subprocess.CompletedProcess(
                 cmd, 0 if verify_ok else 128, stdout="", stderr=""

@@ -20,6 +20,17 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
 
+        # HER-110 ancestry-guard probes (read-only). Resolvable refs plus an
+        # is-ancestor "yes" model a clean fast-forward-safe checkout.
+        if "merge-base" in joined and "--is-ancestor" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "show-ref" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        if "rev-parse" in joined and "^{commit}" in joined:
+            rc = 0 if verify_ok else 1
+            sha = ("a" * 40 + "\n") if verify_ok else ""
+            return subprocess.CompletedProcess(cmd, rc, stdout=sha, stderr="")
+
         # git rev-parse --verify origin/{branch}  (check remote branch exists)
         if "rev-parse" in joined and "--verify" in joined:
             rc = 0 if verify_ok else 128
@@ -441,6 +452,18 @@ class TestCmdUpdateBranchFlag:
 
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
+
+            # HER-110 ancestry-guard probes. ``checkout_fails`` models "the
+            # target branch does not exist locally", so show-ref answers
+            # absent (rc 1) in that case — the guard then allows the
+            # create-from-origin path the checkout clauses below simulate.
+            if "merge-base" in joined and "--is-ancestor" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if "show-ref" in joined:
+                rc = 1 if checkout_fails else 0
+                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+            if "rev-parse" in joined and "^{commit}" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="a" * 40 + "\n", stderr="")
 
             if "checkout" in joined and "-B" in joined:
                 rc = 128 if track_fails else 0
