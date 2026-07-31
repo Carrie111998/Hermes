@@ -313,6 +313,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "(launchctl submit -l com.example.cleanup -p /usr/bin/true)",
         "sh -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
         "bash -o posix -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
+        "bash -O extglob -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
         "bash --init-file /tmp/empty -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
     ])
     def test_blocks_local_launchctl_submit_inside_gateway(self, monkeypatch, cmd):
