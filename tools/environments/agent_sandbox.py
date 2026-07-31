@@ -20,9 +20,7 @@ from tools.environments.base import (
 from tools.environments.file_sync import (
     FileSyncManager,
     iter_sync_files,
-    quoted_mkdir_command,
     quoted_rm_command,
-    unique_parent_dirs,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,6 +101,7 @@ class AgentSandboxBackend(BaseEnvironment):
         else:
             raise ValueError(f"Not allowed connection config name: \"{config_name}\"")
 
+        self._timeout = timeout
         self._remote_home = ""
         self._task_id = task_id
         self._lock = threading.Lock()
@@ -153,18 +152,25 @@ class AgentSandboxBackend(BaseEnvironment):
         rel_base = f"{self._remote_home}/.hermes".lstrip("/")
         rel_remote_tar = f"{rel_base}_sync.{os.getpid()}.tar"
         self._sandbox.commands.run(
-            f"tar cf {shlex.quote(rel_remote_tar)} -C /app {shlex.quote(rel_base)}"
+            command=f"tar cf {shlex.quote(rel_remote_tar)} -C /app {shlex.quote(rel_base)}",
+            timeout=self._timeout
         )
         content = self._sandbox.files.read(rel_remote_tar)
         with open(dest, "wb") as fo:
             fo.write(content)
         try:
-            self._sandbox.commands.run(f"bash -c \"rm -f {shlex.quote(rel_remote_tar)}\"")
+            self._sandbox.commands.run(
+                command=f"bash -c \"rm -f {shlex.quote(rel_remote_tar)}\"",
+                timeout=self._timeout
+            )
         except Exception:
             pass
 
     def _agent_sandbox_delete(self, remote_paths: list[str]):
-        self._sandbox.commands.run(quoted_rm_command(remote_paths))
+        self._sandbox.commands.run(
+            command=quoted_rm_command(remote_paths),
+            timeout=self._timeout
+        )
 
     def _before_execute(self):
         """Syncs files via FileSyncManager."""
@@ -185,7 +191,7 @@ class AgentSandboxBackend(BaseEnvironment):
             shell_cmd = f"bash -c {shlex.quote(cmd_string)}"
 
         def exec_fn() -> tuple[str, int]:
-            response = sandbox.commands.run(shell_cmd, timeout=timeout)
+            response = sandbox.commands.run(command=shell_cmd, timeout=timeout)
             return (response.stdout or response.stderr, response.exit_code)
         return _ThreadedProcessHandle(exec_fn=exec_fn)
 
