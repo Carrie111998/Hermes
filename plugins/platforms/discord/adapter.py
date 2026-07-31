@@ -3048,10 +3048,22 @@ class DiscordAdapter(BasePlatformAdapter):
                 chat_id,
                 "".join(traceback.format_stack(limit=12)[:-1]),
             )
-            return SendResult(
+            result = SendResult(
                 success=False,
                 error="Refusing to send empty message",
             )
+            # Mirror the exception path's recovery bookkeeping. Missed-message
+            # backfill decides what to replay from this table, so a dropped
+            # final reply must be recorded as failed — otherwise the reply is
+            # both never sent and never retried.
+            await asyncio.to_thread(
+                self._record_discord_response,
+                reply_to=reply_to,
+                result=result,
+                content=content,
+                final=bool(metadata and metadata.get("notify")),
+            )
+            return result
 
         try:
             # Determine target channel: thread_id in metadata takes precedence.
