@@ -2,8 +2,10 @@ import { normalize } from '@/lib/text'
 
 /** Hermes' reasoning levels, in ascending order — mirrors the backend's
  *  VALID_REASONING_EFFORTS (hermes_constants.py). `none` is not a level: it's
- *  thinking disabled, owned by the Thinking toggle rather than the scale. */
-export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
+ *  thinking disabled, owned by the Thinking toggle rather than the scale.
+ *  `auto` is the dynamic mode: effort is computed per-API-call from the task
+ *  context and the model's capability tier. */
+export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'auto'] as const
 
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number]
 
@@ -24,7 +26,8 @@ const SHORT_LABELS: Record<string, string> = {
   high: 'High',
   xhigh: 'XHigh',
   max: 'Max',
-  ultra: 'Ultra'
+  ultra: 'Ultra',
+  auto: 'Auto'
 }
 
 export function reasoningEffortLabel(effort: string): string {

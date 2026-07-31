@@ -6554,16 +6554,20 @@ class AIAgent:
         cache[key] = (supported, _time.monotonic())
         return bool(supported)
 
-    def _resolve_lmstudio_summary_reasoning_effort(self) -> Optional[str]:
+    def _resolve_lmstudio_summary_reasoning_effort(self, rc: Optional[dict] = None) -> Optional[str]:
         """Resolve a safe top-level ``reasoning_effort`` for LM Studio.
 
         The iteration-limit summary path calls ``chat.completions.create()``
         directly, bypassing the transport. Share the helper so the two paths
         can't drift on effort resolution and clamping.
+
+        ``rc`` may be an already auto-resolved config (the summary path passes
+        ``_resolve_auto_reasoning_config`` output so ``auto`` is honored here
+        too); defaults to ``self.reasoning_config``.
         """
         from agent.lmstudio_reasoning import resolve_lmstudio_effort
         return resolve_lmstudio_effort(
-            self.reasoning_config,
+            rc if rc is not None else self.reasoning_config,
             self._lmstudio_reasoning_options_cached(),
         )
 

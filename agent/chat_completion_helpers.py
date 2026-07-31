@@ -1120,8 +1120,31 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def _resolve_auto_reasoning_config(agent, messages: list) -> dict:
+    """Resolve the effective reasoning config for one API call.
+
+    If the configured effort is ``auto``, compute a concrete level from the
+    current task context (and the agent's model capability tier). Returns a
+    shallow copy — never mutates ``agent.reasoning_config`` in place.
+
+    Central chokepoint for dynamic resolution: every request-building path
+    (main ``build_api_kwargs``, iteration-limit summary, LM Studio summary)
+    routes through this so ``auto`` behaves identically everywhere.
+    """
+    rc = agent.reasoning_config
+    if isinstance(rc, dict) and rc.get("effort") == "auto":
+        from hermes_constants import compute_dynamic_reasoning_effort
+        resolved = compute_dynamic_reasoning_effort(messages, model=agent.model)
+        logger.debug("auto-reasoning resolved to %s", resolved)
+        rc = {**rc, "effort": resolved}
+    return rc
+
+
 def build_api_kwargs(agent, api_messages: list) -> dict:
     """Build the keyword arguments dict for the active API mode."""
+    # Dynamic (auto) reasoning effort — resolved per-API-call so reasoning
+    # adapts to each turn's task. See _resolve_auto_reasoning_config().
+    _rc = _resolve_auto_reasoning_config(agent, api_messages)
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
@@ -1137,7 +1160,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             messages=anthropic_messages,
             tools=tools_for_api,
             max_tokens=ephemeral_out if ephemeral_out is not None else agent.max_tokens,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_rc,
             is_oauth=agent._is_anthropic_oauth,
             preserve_dots=agent._anthropic_preserve_dots(),
             context_length=ctx_len,
@@ -1219,7 +1242,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             model=agent.model,
             messages=_msgs_for_codex,
             tools=tools_for_api,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_rc,
             session_id=getattr(agent, "session_id", None),
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
@@ -1325,7 +1348,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             max_tokens=agent.max_tokens,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
-            reasoning_config=agent.reasoning_config,
+            reasoning_config=_rc,
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             provider_profile=_profile,
@@ -1357,7 +1380,7 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
         max_tokens=agent.max_tokens,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
-        reasoning_config=agent.reasoning_config,
+        reasoning_config=_rc,
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         model_lower=(agent.model or "").lower(),
@@ -2193,12 +2216,17 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             and agent._supports_reasoning_extra_body()
         )
         _lm_reasoning_effort: str | None = (
-            agent._resolve_lmstudio_summary_reasoning_effort()
+            agent._resolve_lmstudio_summary_reasoning_effort(
+                _resolve_auto_reasoning_config(agent, api_messages)
+            )
             if _is_lmstudio_summary else None
         )
         if not _is_lmstudio_summary and agent._supports_reasoning_extra_body():
-            if agent.reasoning_config is not None:
-                summary_extra_body["reasoning"] = agent.reasoning_config
+            # Dynamic (auto) reasoning — same chokepoint as build_api_kwargs
+            # so the iteration-limit summary honors auto per-call too.
+            _summary_rc = _resolve_auto_reasoning_config(agent, api_messages)
+            if _summary_rc is not None:
+                summary_extra_body["reasoning"] = _summary_rc
             else:
                 summary_extra_body["reasoning"] = {
                     "enabled": True,
