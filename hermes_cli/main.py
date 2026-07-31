@@ -3149,13 +3149,11 @@ def select_provider_and_model(args=None):
             base_url = (entry.get("base_url") or "").strip()
             if not name or not base_url:
                 continue
-            key = "custom:" + name.lower().replace(" ", "-")
             provider_key = (entry.get("provider_key") or "").strip()
             if provider_key:
-                try:
-                    resolve_provider(provider_key)
-                except AuthError:
-                    key = provider_key
+                key = provider_key
+            else:
+                key = "custom:" + name.lower().replace(" ", "-")
             custom_provider_map[key] = {
                 "name": name,
                 "base_url": base_url,
