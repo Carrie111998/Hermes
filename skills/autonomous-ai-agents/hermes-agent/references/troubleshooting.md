@@ -21,6 +21,12 @@
 - **Config changes:** In gateway: `/restart`. In CLI: exit and relaunch.
 - **Code changes:** Restart the CLI or gateway process
 
+When operating from a gateway-backed conversation, never bypass the in-process
+restart guard with a delayed shell, cron job, `launchctl submit`, `systemd-run`,
+or another supervisor. That can create a repeated SIGTERM/respawn loop under
+launchd or systemd. Ask the user to send `/restart`, or have them run
+`hermes gateway restart` from an independent shell outside the gateway.
+
 ### Skills not showing
 1. `hermes skills list` — verify installed
 2. `hermes skills config` — check platform enablement
