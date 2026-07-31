@@ -1150,35 +1150,44 @@ class CLICommandsMixin:
             for sid in ancestors:
                 seen.pop(sid, None)
 
-            # Render as cards matching the AI's session_search output style
+            if not seen:
+                _cprint("")
+                _cprint(f"  No sessions matching \"{search_query}\".")
+                return
+
+            _cprint("")
+            _cprint(f"  ⚙️  /sessions search {search_query}")
+            _cprint("  Sessions matching \"{search_query}\":")
+            _cprint("")
+            _cprint(f"  {'#':>2}  {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<30} {'Last Active':<12} {'ID'}")
+            _cprint(f"  {'─'*2}  {'─'*28} {'─'*12} {'─'*4}  {'─'*30} {'─'*12} {'─'*24}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = self._session_db.get_session(sid) or {}
-                title = meta.get("title") or "(no title)"
+                title = (meta.get("title") or "—")[:26]
+                if len(title) >= 26:
+                    title = title[:25] + "…"
                 started = meta.get("started_at")
                 if started:
                     when = _dt.fromtimestamp(started).strftime("%b %d")
                 else:
                     when = "?"
-                source = r.get("source", "?")
-                model_raw = (r.get("model") or "?")
+                model_raw = (r.get("model") or "—")
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 18:
-                    model = model[:17] + "…"
-                mc = meta.get("message_count", 0)
+                if len(model) > 12:
+                    model = model[:11] + "…"
+                mc = meta.get("message_count")
+                msgs_str = str(mc) if mc is not None else "—"
 
-                # Clean FTS5 snippet: strip >>>...<<< markers, collapse whitespace
+                # Clean FTS5 snippet for preview
                 snippet = r.get("snippet", "") or ""
                 snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snippet))
-                snip_short = snip_clean.replace("\n", " ").strip()
-                if len(snip_short) > 80:
-                    snip_short = snip_short[:77] + "..."
+                preview = snip_clean.replace("\n", " ").strip()
+                if len(preview) > 30:
+                    preview = preview[:27] + "..."
 
-                _cprint(f"  {idx}. @session:default/{sid} — \"{title}\"")
-                _cprint(f"     {when} ({source}, {model}, {mc} msgs)")
-                if snip_short:
-                    _cprint(f"     {snip_short}")
-                _cprint("")
+                _cprint(f"  {idx:>2}  {title:<28} {model:<12} {msgs_str:>4}  {preview:<30} {when:<12} {sid}")
 
+            _cprint("")
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
             _cprint("  Example: /resume 2")
             _cprint("")

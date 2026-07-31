@@ -18010,32 +18010,35 @@ def main():
             for sid in ancestors:
                 seen.pop(sid, None)
 
+            if not seen:
+                print(f"No sessions matching \"{query}\".")
+                db.close()
+                return
+
             print(f"⚙️  sessions search {query}\n")
+            from datetime import datetime as _dt
+            print(f"  {'#':>2}  {'Title':<28} {'Model':<12} {'Msgs':>4}  {'Preview':<30} {'Last Active':<12} {'ID'}")
+            print(f"  {'─'*2}  {'─'*28} {'─'*12} {'─'*4}  {'─'*30} {'─'*12} {'─'*24}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
-                title = meta.get("title") or "(no title)"
+                title = (meta.get("title") or "—")[:26]
+                if len(title) >= 26:
+                    title = title[:25] + "…"
                 started = meta.get("started_at")
-                if started:
-                    from datetime import datetime as _dt
-                    when = _dt.fromtimestamp(started).strftime("%b %d")
-                else:
-                    when = "?"
-                source = r.get("source", "?")
-                model_raw = (r.get("model") or "?")
+                when = _dt.fromtimestamp(started).strftime("%b %d") if started else "?"
+                model_raw = (r.get("model") or "—")
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
-                if len(model) > 18:
-                    model = model[:17] + "…"
-                mc = meta.get("message_count", 0)
+                if len(model) > 12:
+                    model = model[:11] + "…"
+                mc = meta.get("message_count")
+                msgs_str = str(mc) if mc is not None else "—"
                 snip_raw = r.get("snippet", "") or ""
                 snip_clean = _re.sub(r'>{3,4}(.*?)<{3,4}', r'\1', str(snip_raw))
-                snip_short = snip_clean.replace("\n", " ").strip()
-                if len(snip_short) > 80:
-                    snip_short = snip_short[:77] + "..."
-                print(f"  {idx}. @session:default/{sid} — \"{title}\"")
-                print(f"     {when} ({source}, {model}, {mc} msgs)")
-                if snip_short:
-                    print(f"     {snip_short}")
-                print()
+                preview = snip_clean.replace("\n", " ").strip()
+                if len(preview) > 30:
+                    preview = preview[:27] + "..."
+                print(f"  {idx:>2}  {title:<28} {model:<12} {msgs_str:>4}  {preview:<30} {when:<12} {sid}")
+            print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 
         elif action == "stats":
