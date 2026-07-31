@@ -164,6 +164,26 @@ describe('⌘W over a focused tool panel', () => {
     expect(allPaneIds($layoutTree.get()!)).toContain('logs')
   })
 
+  it('returns to workspace when terminal shares a zone with files', async () => {
+    const { allPaneIds, findGroupOfPane } = await import('../model')
+    const { setPaneCollapsed } = await import('../store')
+
+    declareDefaultTree(
+      split('column', [
+        group(['workspace', 'files', 'terminal'], { active: 'files', id: 'grp-shared' })
+      ])
+    )
+
+    setPaneCollapsed('terminal', true)
+
+    const tree = $layoutTree.get()!
+    const main = findGroupOfPane(tree, 'workspace')
+
+    expect(allPaneIds(tree)).toContain('workspace')
+    expect(main?.active).toBe('workspace')
+    expect(main?.active).not.toBe('files')
+  })
+
   it('leaves the uncloseable workspace zone to the chat rung', async () => {
     const { allPaneIds } = await import('../model')
     const { closeFocusedToolTab } = await import('../store')

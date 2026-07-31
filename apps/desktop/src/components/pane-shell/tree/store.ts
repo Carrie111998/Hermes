@@ -1288,16 +1288,19 @@ export function setPaneCollapsed(paneId: string, collapsed: boolean) {
   // inactive toggle folding its visible sibling is what re-collapsed the zone
   // on every boot (broke collapse persistence).
   if (group.panes.length > 1) {
-    if (collapsed && group.active === paneId) {
-      if (group.panes.some(isUncloseablePane)) {
-        // Workspace can't minimize (strands the app) → tab-switch to a sibling
-        // (guaranteed to exist by length > 1).
-        const at = group.panes.indexOf(paneId)
+    if (collapsed && group.panes.some(isUncloseablePane)) {
+      // Workspace can't minimize (strands the app). A tool toggle can fire
+      // after another tab (typically files) became active, so do not require
+      // the tool to still be the active tab here. Any shared group containing
+      // workspace must return to chat when the tool closes; otherwise the
+      // sibling pane expands into the main surface and chat appears to vanish.
+      const workspace = group.panes.find(isUncloseablePane)
 
-        activateTreePane(group.id, group.panes[at - 1] ?? group.panes[at + 1])
-      } else {
-        setTreeGroupMinimized(group.id, true) // pure tool zone folds as a unit
+      if (workspace && group.active !== workspace) {
+        activateTreePane(group.id, workspace)
       }
+    } else if (collapsed && group.active === paneId) {
+      setTreeGroupMinimized(group.id, true) // pure tool zone folds as a unit
     } else if (!collapsed) {
       revealTreePane(paneId)
     }
