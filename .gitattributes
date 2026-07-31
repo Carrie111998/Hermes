@@ -8,3 +8,12 @@ web/package-lock.json linguist-generated=true
 Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
+
+# Douglas Agent: pin source line endings to LF regardless of the checkout
+# platform, so files edited on Windows don't show as modified with no real
+# diff (CRLF vs LF noise) when committed from this environment.
+*.py  text eol=lf
+*.ts  text eol=lf
+*.tsx text eol=lf
+*.md  text eol=lf
+*.json text eol=lf

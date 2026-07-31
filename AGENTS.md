@@ -1433,3 +1433,38 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+---
+
+## DOUGLAS AGENT — REGLAS DEL PROYECTO
+
+Este fork está siendo convertido en un producto llamado Douglas Agent.
+Antes de proponer construir cualquier funcionalidad, **consulta
+`CAPABILITIES.md`** en la raíz del repo. Si ya existe, úsala o extiéndela.
+Si crees que lo existente no sirve, pregunta primero — no la reconstruyas.
+
+**El contrato de compatibilidad**: Douglas Agent es Hermes Agent con otra
+cara. Por fuera, todo dice Douglas. Por dentro, todo sigue siendo Hermes y
+sigue funcionando — debe seguir siendo posible ejecutar
+`git merge upstream/main` indefinidamente. Módulos, rutas de import,
+directorios del núcleo y nombres de clases/funciones no se tocan ni se
+renombran. CLI, variables de entorno, directorio de datos y config ganan un
+alias `douglas`/`DOUGLAS_*`/`~/.douglas` que cae hacia atrás a
+`hermes`/`HERMES_*`/`~/.hermes` si ya existen. Solo lo visible en la UI
+(textos, identidad de la app, iconos, README) cambia por completo a
+Douglas.
+
+**Las 8 reglas** (detalle completo en [`douglas/README.md`](./douglas/README.md)):
+
+1. Consulta `CAPABILITIES.md` antes de construir cualquier cosa.
+2. No renombres módulos, directorios ni rutas de import del núcleo.
+3. Todo código nuevo vive en `douglas/`; cada toque al núcleo se anota en
+   `douglas/CORE_PATCHES.md`.
+4. Commits atómicos, agrupados por intención.
+5. Compatibilidad hacia atrás obligatoria con instalaciones existentes de
+   Hermes (`~/.hermes`, `HERMES_*`, comando `hermes`).
+6. Los tests existentes deben seguir pasando.
+7. Licencia MIT intacta, atribución a Nous Research visible; nunca usar la
+   marca "Hermes" ni el logo de Nous en superficies de producto.
+8. Ante una decisión con más de una opción razonable, presenta las
+   opciones con sus trade-offs — no elijas unilateralmente.
