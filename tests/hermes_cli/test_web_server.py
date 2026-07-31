@@ -1693,8 +1693,8 @@ class TestNewEndpoints:
             "mode": "allowlist",
             "servers": ["beta"],
         }
-        assert "beta" in _get_platform_tools(config, "qqbot")
-        assert "alpha" not in _get_platform_tools(config, "qqbot")
+        assert "mcp-beta" in _get_platform_tools(config, "qqbot")
+        assert "mcp-alpha" not in _get_platform_tools(config, "qqbot")
 
     def test_channel_capabilities_keeps_toolset_when_mcp_uses_same_name(self):
         """MCP allowlists cannot delete a same-named built-in toolset."""
@@ -1726,7 +1726,7 @@ class TestNewEndpoints:
         }
         resolved = _get_platform_tools(config, "email")
         assert "web" in resolved
-        assert "other" in resolved
+        assert "mcp-other" in resolved
 
     def test_channel_capabilities_rejects_empty_toolset_submission(self):
         resp = self.client.put(
@@ -1736,6 +1736,22 @@ class TestNewEndpoints:
 
         assert resp.status_code == 400
         assert "Select at least one toolset" in resp.json()["detail"]
+
+    def test_channel_capabilities_replaces_legacy_empty_selection(self):
+        """The Channels boundary repairs a legacy empty selection on save."""
+        from hermes_cli.config import load_config, save_config
+
+        config = load_config()
+        config["platform_toolsets"] = {"email": []}
+        save_config(config)
+
+        resp = self.client.put(
+            "/api/tools/channels/email",
+            json={"toolsets": ["web"], "mcp_mode": "none", "mcp_servers": []},
+        )
+
+        assert resp.status_code == 200
+        assert load_config()["platform_toolsets"]["email"] == ["web"]
 
     def test_channel_capabilities_rejects_malformed_mcp_policy_without_saving(self):
         """A manual scalar config must not become a partial channel update."""

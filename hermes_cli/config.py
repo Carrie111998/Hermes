@@ -1852,6 +1852,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
     "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
+    "platform_mcp_policy",   # per-platform MCP policy written by channel settings
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
     "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
     "session_reset",         # top-level form read by gateway/config.py + setup
@@ -4617,6 +4618,7 @@ _OPEN_DICT_TOP_LEVEL_KEYS = frozenset({
     "providers",
     "credential_pool_strategies",
     "mcp_servers",
+    "platform_mcp_policy",
     "hooks",
     "quick_commands",
     "personalities",

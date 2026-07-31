@@ -61,6 +61,7 @@ def _channel_capability_rows(config: dict, only_platform: Optional[str] = None):
         _CONFIG_ONLY_TOOLSETS,
         _get_effective_configurable_toolsets,
         _get_platform_tools,
+        _mcp_toolset_name,
         _toolset_allowed_for_platform,
         enabled_mcp_server_names,
         gui_toolset_label,
@@ -142,7 +143,11 @@ def _channel_capability_rows(config: dict, only_platform: Optional[str] = None):
                 "mode": mcp_mode,
                 "available": sorted(enabled_mcp),
                 "selected": sorted(selected_mcp & enabled_mcp),
-                "effective": sorted(effective & enabled_mcp),
+                "effective": sorted(
+                    server
+                    for server in enabled_mcp
+                    if _mcp_toolset_name(server) in effective
+                ),
             },
             "plugins_locked": isinstance(known_plugins.get(platform), list),
         })
@@ -225,6 +230,7 @@ async def update_channel_capabilities(
     from hermes_cli.tools_config import (
         _CONFIG_ONLY_TOOLSETS,
         _get_effective_configurable_toolsets,
+        _get_platform_tools,
         _save_platform_tools,
         _toolset_allowed_for_platform,
         enabled_mcp_server_names,
