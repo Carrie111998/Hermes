@@ -363,7 +363,7 @@ async fn run_update(app: AppHandle) -> Result<()> {
         LogStream::Stdout,
         &format!("[update] updating against branch {update_branch}"),
     );
-    let child_env = update_child_env(&install_root);
+    let child_env = update_child_env(&install_root, &hermes);
     let mut update_args: Vec<String> =
         vec!["update".into(), "--yes".into(), "--gateway".into()];
     // --force skips `hermes update`'s Windows running-exe guard (which would
@@ -972,7 +972,7 @@ fn resolve_hermes(install_root: &Path) -> Option<HermesInvocation> {
     None
 }
 
-fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
+fn update_child_env(install_root: &Path, hermes: &HermesInvocation) -> Vec<(String, OsString)> {
     let hermes_home = crate::paths::hermes_home();
     let mut envs = vec![(
         "HERMES_HOME".to_string(),
@@ -985,6 +985,18 @@ fn update_child_env(install_root: &Path) -> Vec<(String, OsString)> {
     // a frozen stage, and users cancel a healthy update. Force line-by-line
     // output instead.
     envs.push(("PYTHONUNBUFFERED".to_string(), OsString::from("1")));
+    // When resolve_hermes() fell back to `python -m hermes_cli.main` (shim
+    // missing, issue #75584), pin PYTHONPATH to install_root so module
+    // resolution matches exactly what venv_python_can_import_hermes_cli()
+    // already probed — belt-and-suspenders alongside `-m`'s own cwd-first
+    // sys.path insertion, in case a stale editable-install .pth or an
+    // inherited PYTHONPATH shadows it in some environment we didn't probe.
+    if !hermes.prefix_args.is_empty() {
+        envs.push((
+            "PYTHONPATH".to_string(),
+            install_root.as_os_str().to_os_string(),
+        ));
+    }
     // We hold the update-in-progress marker for this whole run, and the
     // `hermes update` child claims that SAME lock (hermes_cli/update_lock.py).
     // Name our pid so the child recognizes the live holder as its own
@@ -1368,7 +1380,10 @@ mod tests {
 
     #[test]
     fn update_child_env_forces_unbuffered_python() {
-        let envs = update_child_env(Path::new("/x/hermes-agent"));
+        let envs = update_child_env(
+            Path::new("/x/hermes-agent"),
+            &HermesInvocation::direct(PathBuf::from("/x/hermes-agent/venv/bin/hermes")),
+        );
         assert!(
             envs.iter()
                 .any(|(k, v)| k == "PYTHONUNBUFFERED" && v.to_str() == Some("1")),
@@ -1378,12 +1393,38 @@ mod tests {
 
     #[test]
     fn update_child_env_names_our_pid_for_the_lock_handoff() {
-        let envs = update_child_env(Path::new("/x/hermes-agent"));
+        let envs = update_child_env(
+            Path::new("/x/hermes-agent"),
+            &HermesInvocation::direct(PathBuf::from("/x/hermes-agent/venv/bin/hermes")),
+        );
         assert!(
             envs.iter().any(|(k, v)| k == "HERMES_UPDATE_HANDOFF_PID"
                 && v.to_str() == Some(std::process::id().to_string().as_str())),
             "the hermes update child claims the same marker we hold; without our pid \
              it refuses its own parent's lock and every GUI update dead-ends on exit 2"
+        );
+    }
+
+    #[test]
+    fn update_child_env_sets_pythonpath_only_for_module_fallback() {
+        let direct = HermesInvocation::direct(PathBuf::from("/x/hermes-agent/venv/bin/hermes"));
+        let direct_envs = update_child_env(Path::new("/x/hermes-agent"), &direct);
+        assert!(
+            !direct_envs.iter().any(|(k, _)| k == "PYTHONPATH"),
+            "the direct shim invocation must not need a PYTHONPATH override"
+        );
+
+        let module_fallback = HermesInvocation {
+            program: PathBuf::from("/x/hermes-agent/venv/bin/python"),
+            prefix_args: vec!["-m".to_string(), "hermes_cli.main".to_string()],
+        };
+        let module_envs = update_child_env(Path::new("/x/hermes-agent"), &module_fallback);
+        assert!(
+            module_envs.iter().any(|(k, v)| k == "PYTHONPATH"
+                && v.to_str() == Some("/x/hermes-agent")),
+            "the python -m hermes_cli.main fallback (#75584) must pin PYTHONPATH to \
+             install_root so module resolution matches what the import probe already \
+             verified, even if a stale editable-install .pth would otherwise shadow it"
         );
     }
 
