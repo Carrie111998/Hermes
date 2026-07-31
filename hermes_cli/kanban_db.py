@@ -7038,7 +7038,15 @@ def _terminate_reclaimed_worker(
             return info
         return _terminate_worker_without_identity(int(pid), info, kill=signal_fn)
 
-    if not _worker_identity_is_alive(int(pid), process_start_time):
+    state = _worker_identity_state(int(pid), process_start_time)
+    if state == IDENTITY_UNKNOWN:
+        # We could not observe the process at all. Signalling would be blind
+        # and reporting termination would let a duplicate be spawned beside a
+        # worker that may well be alive. Quarantine instead: no signal, not
+        # terminated, and ``_worker_survived_termination`` holds the claim.
+        info["identity_unknown"] = True
+        return info
+    if state == IDENTITY_DEAD:
         # Either the worker exited (nothing to signal) or this PID now belongs
         # to a different process (must never be signalled). Both are "gone".
         info["identity_mismatch"] = True
@@ -7064,16 +7072,25 @@ def _terminate_reclaimed_worker(
         return info
 
     for _ in range(10):
-        if not _worker_identity_is_alive(int(pid), process_start_time):
+        state = _worker_identity_state(int(pid), process_start_time)
+        if state == IDENTITY_DEAD:
             info["terminated"] = True
+            return info
+        if state == IDENTITY_UNKNOWN:
+            # Do not escalate blindly and do not claim success.
+            info["identity_unknown"] = True
             return info
         time.sleep(0.5)
 
     # Re-prove the exact identity immediately before escalating: the worker may
     # have exited during the grace window and the OS may have already handed
     # its PID to an unrelated process.
-    if not _worker_identity_is_alive(int(pid), process_start_time):
+    state = _worker_identity_state(int(pid), process_start_time)
+    if state == IDENTITY_DEAD:
         info["terminated"] = True
+        return info
+    if state == IDENTITY_UNKNOWN:
+        info["identity_unknown"] = True
         return info
     try:
         # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
@@ -7084,7 +7101,11 @@ def _terminate_reclaimed_worker(
     except (ProcessLookupError, OSError):
         return info
 
-    info["terminated"] = not _worker_identity_is_alive(int(pid), process_start_time)
+    final_state = _worker_identity_state(int(pid), process_start_time)
+    if final_state == IDENTITY_UNKNOWN:
+        info["identity_unknown"] = True
+        return info
+    info["terminated"] = final_state == IDENTITY_DEAD
     return info
 
 
@@ -7097,6 +7118,11 @@ def _worker_survived_termination(termination: dict) -> bool:
     claim lock or a no-op attempt (no ``os.kill`` available) must fall through
     to the normal release path, since we cannot manage that worker anyway.
     """
+    if termination.get("identity_unknown") and termination.get("host_local"):
+        # We could not prove the worker is gone. Holding the claim is the safe
+        # reading: releasing it would spawn a duplicate beside a possibly-live
+        # worker, which is the failure this guard exists to prevent.
+        return True
     return bool(
         termination.get("termination_attempted")
         and termination.get("host_local")
@@ -9148,6 +9174,53 @@ def _trusted_worker_launcher(
     return str(launcher)
 
 
+def _reprove_worker_owner_claim(
+    task: Task, workspace: str, profile_home: Path, pid: int,
+    process_start_time: str, session_id: str,
+) -> None:
+    """Re-read the owner record and prove it is still exactly ours.
+
+    Attestation runs a real subprocess and is allowed up to two minutes. A
+    reaper, an operator or a competing lane can take the owner away in that
+    window, so the claim that authorized this spawn must be re-proven against
+    the live record immediately before the gate opens. Every identity field is
+    compared — a record that merely still says ``active`` is not proof it is
+    still ours.
+    """
+    hook = _code_owner_hook_spec(profile_home)
+    if hook is None:
+        raise RuntimeError("worker profile no longer declares the AI Factory hook")
+    owner_path = (
+        Path(hook["registry"]) / "locks" / _worker_issue_key(task) / "owner.json"
+    )
+    try:
+        record = json.loads(owner_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "exact worker owner record vanished or became unreadable during "
+            f"attestation; refusing to open the owner gate ({exc})"
+        ) from exc
+    expected = {
+        "session_id": str(session_id),
+        "agent": hook["agent"],
+        "profile": hook["profile"],
+        "worktree": str(Path(workspace).resolve()),
+        "pid": int(pid),
+        "process_start_time": process_start_time,
+    }
+    for field, value in expected.items():
+        if record.get(field) != value:
+            raise RuntimeError(
+                "exact worker owner claim changed during attestation "
+                f"({field}: {record.get(field)!r} != {value!r}); refusing to "
+                "open the owner gate"
+            )
+    if record.get("state", "active") != "active":
+        raise RuntimeError(
+            "exact worker owner is no longer active; refusing to open the gate"
+        )
+
+
 def _attest_worker_admission_hook_armed(
     *, profile_home: Path, env: dict, worker_argv: "list[str] | None" = None,
     cwd: "str | None" = None, workspace: "str | None" = None,
@@ -9344,28 +9417,64 @@ def _worker_owner_release_argv(
     ]
 
 
-def _worker_identity_is_alive(pid: int, process_start_time: str) -> bool:
+#: Tri-state process identity. ``UNKNOWN`` means the probe itself failed —
+#: it must never be read as "dead", which would authorize both a blind signal
+#: and spawning a duplicate beside a worker that is very possibly still alive.
+IDENTITY_ALIVE = "alive"
+IDENTITY_DEAD = "dead"
+IDENTITY_UNKNOWN = "unknown"
+
+
+def _worker_identity_state(pid: int, process_start_time: str) -> str:
+    """Return ALIVE / DEAD / UNKNOWN for an exact (pid, start-time) identity.
+
+    DEAD is only returned on positive evidence: the process is gone, is a
+    zombie, or its start fingerprint proves it is a different process that
+    inherited the PID. Every probe failure (``ps`` missing, timing out,
+    permission denied) is UNKNOWN.
+    """
     try:
         os.kill(int(pid), 0)
-    except (ProcessLookupError, OSError):
-        return False
+    except ProcessLookupError:
+        return IDENTITY_DEAD
+    except PermissionError:
+        # Alive, owned by somebody else — that alone is not our worker's death.
+        return IDENTITY_UNKNOWN
+    except OSError:
+        return IDENTITY_UNKNOWN
     try:
         state = subprocess.run(
             ["ps", "-o", "state=", "-p", str(int(pid))],
             capture_output=True, text=True, timeout=5,
         )
-        if state.returncode != 0 or state.stdout.strip().startswith("Z"):
-            return False
+    except Exception:
+        return IDENTITY_UNKNOWN
+    if state.returncode != 0:
+        # ``ps`` exits non-zero when the pid is gone.
+        return IDENTITY_DEAD
+    if state.stdout.strip().startswith("Z"):
+        return IDENTITY_DEAD
+    try:
         current_start = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(int(pid))],
             capture_output=True, text=True, timeout=5,
         )
     except Exception:
-        return False
-    return (
-        current_start.returncode == 0
-        and current_start.stdout.strip() == process_start_time
-    )
+        return IDENTITY_UNKNOWN
+    if current_start.returncode != 0:
+        return IDENTITY_DEAD
+    observed = current_start.stdout.strip()
+    if not observed:
+        return IDENTITY_UNKNOWN
+    return IDENTITY_ALIVE if observed == process_start_time else IDENTITY_DEAD
+
+
+def _worker_identity_is_alive(pid: int, process_start_time: str) -> bool:
+    """Back-compat boolean wrapper; UNKNOWN is deliberately not "alive".
+
+    Callers that must distinguish UNKNOWN use :func:`_worker_identity_state`.
+    """
+    return _worker_identity_state(pid, process_start_time) == IDENTITY_ALIVE
 
 
 def _wait_for_pid_exit_and_run_release(
@@ -9831,6 +9940,12 @@ def _default_spawn(
                 _attest_worker_admission_hook_armed(
                     profile_home=profile_home, env=env, worker_argv=cmd,
                     cwd=workspace, workspace=workspace,
+                )
+                # Last thing before the gate: the claim that authorized this
+                # spawn must still be exactly ours (R3-M5).
+                _reprove_worker_owner_claim(
+                    task, workspace, profile_home, proc.pid,
+                    process_start_time, str(worker_session_id),
                 )
         gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(gate_fd)

@@ -11,6 +11,7 @@ must never touch the worktree contents (WIP stays intact).
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -282,12 +283,12 @@ def test_recycled_pid_during_grace_is_never_sigkilled(kanban_home, monkeypatch):
     state = {"alive_calls": 0}
 
     def flaky_identity(pid, start_time):
-        # Alive for the pre-SIGTERM check, recycled by the time the grace
-        # window expires and SIGKILL is considered.
+        # Alive for the pre-SIGTERM check, recycled (a *different* process now
+        # owns the PID) by the time the grace window expires.
         state["alive_calls"] += 1
-        return state["alive_calls"] == 1
+        return kb.IDENTITY_ALIVE if state["alive_calls"] == 1 else kb.IDENTITY_DEAD
 
-    monkeypatch.setattr(kb, "_worker_identity_is_alive", flaky_identity)
+    monkeypatch.setattr(kb, "_worker_identity_state", flaky_identity)
     monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
 
@@ -375,6 +376,92 @@ def test_legacy_null_identity_is_refused_on_the_controller_block_path(kanban_hom
         assert legacy, "reclaim keeps its historical PID-only contract"
         assert info["termination_attempted"] is True
         assert info["identity_unproven"] is True
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# R3-M4 — liveness is tri-state: UNKNOWN is never DEAD
+# ---------------------------------------------------------------------------
+
+def test_identity_state_distinguishes_alive_dead_and_unknown(kanban_home, monkeypatch):
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        identity = kb._worker_process_start_time(proc.pid)
+        assert kb._worker_identity_state(proc.pid, identity) == kb.IDENTITY_ALIVE
+        # A start-time that cannot belong to this process: proven different.
+        assert kb._worker_identity_state(
+            proc.pid, "Mon Jan  1 00:00:00 1990",
+        ) == kb.IDENTITY_DEAD
+
+        # ``ps`` unavailable: we know nothing, and nothing is not death.
+        def broken_ps(*args, **kwargs):
+            raise OSError("ps unavailable")
+
+        monkeypatch.setattr(kb.subprocess, "run", broken_ps)
+        assert kb._worker_identity_state(proc.pid, identity) == kb.IDENTITY_UNKNOWN
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_unknown_identity_never_signals_and_never_claims_termination(
+    kanban_home, monkeypatch,
+):
+    """UNKNOWN must not authorize a signal nor let a duplicate be spawned."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    try:
+        identity = kb._worker_process_start_time(proc.pid)
+        monkeypatch.setattr(
+            kb, "_worker_identity_state", lambda pid, start: kb.IDENTITY_UNKNOWN,
+        )
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, f"{kb._claimer_id().split(':', 1)[0]}:x",
+            signal_fn=lambda p, s: sent.append(s),
+            process_start_time=identity,
+        )
+        assert sent == [], f"UNKNOWN identity must not be signalled: {sent}"
+        assert info["terminated"] is False, "UNKNOWN is never a proven termination"
+        assert info.get("identity_unknown") is True
+        # And the reclaim guard must treat it as "worker may still live", so no
+        # duplicate is spawned beside it.
+        assert kb._worker_survived_termination(info) is True
+        assert proc.poll() is None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_transient_ps_failure_before_sigkill_does_not_claim_termination(
+    kanban_home, monkeypatch,
+):
+    """A ``ps`` blip during grace must not suppress escalation AND report success."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    sent: list = []
+    states = [kb.IDENTITY_ALIVE] + [kb.IDENTITY_UNKNOWN] * 40
+    try:
+        identity = kb._worker_process_start_time(proc.pid)
+        monkeypatch.setattr(
+            kb, "_worker_identity_state",
+            lambda pid, start: states.pop(0) if states else kb.IDENTITY_UNKNOWN,
+        )
+        monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+        info = kb._terminate_reclaimed_worker(
+            proc.pid, f"{kb._claimer_id().split(':', 1)[0]}:x",
+            signal_fn=lambda p, s: sent.append(s),
+            process_start_time=identity,
+        )
+        # SIGTERM went out while identity was proven ALIVE...
+        assert sent and sent[0] == signal.SIGTERM
+        # ...but an UNKNOWN outcome must never be reported as terminated.
+        assert info["terminated"] is False
+        assert info.get("identity_unknown") is True
+        assert kb._worker_survived_termination(info) is True
     finally:
         if proc.poll() is None:
             proc.kill()

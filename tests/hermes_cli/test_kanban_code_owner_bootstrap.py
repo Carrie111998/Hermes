@@ -1699,3 +1699,64 @@ def test_default_spawn_keeps_the_gate_shut_when_the_launcher_is_opaque(
     assert captured.get("terminated") is True
     gates = list(kb.worker_logs_dir().glob("*.owner-ready-*"))
     assert gates == [], gates
+
+
+# ---------------------------------------------------------------------------
+# R3-M5 — the owner claim must still be ours immediately before the gate opens
+# ---------------------------------------------------------------------------
+
+def test_owner_lost_during_attestation_keeps_the_gate_shut(monkeypatch, tmp_path):
+    """Attestation can take up to 120s; the claim must be re-proven after it.
+
+    A reaper, an operator or a competing lane can take the owner away in that
+    window. Opening the gate on a stale claim would run a worker whose owner
+    now belongs to somebody else.
+    """
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    owner_path = registry / "locks" / "HER-118" / "owner.json"
+
+    def steal_owner_during_attestation(**kwargs):
+        # Simulate the owner being replaced while we were attesting.
+        record = json.loads(owner_path.read_text())
+        record["session_id"] = "kanban-someone-else-run-1"
+        owner_path.write_text(json.dumps(record), encoding="utf-8")
+
+    _spawn_with_fakes(
+        monkeypatch, kb, captured, attest=steal_owner_during_attestation,
+    )
+
+    with pytest.raises(RuntimeError, match="owner"):
+        kb._default_spawn(_task(kb), str(workspace))
+
+    assert captured.get("terminated") is True
+    gates = list(kb.worker_logs_dir().glob("*.owner-ready-*"))
+    assert gates == [], f"gate must stay shut when the claim moved: {gates}"
+
+
+def test_owner_reproof_accepts_the_unchanged_claim(monkeypatch, tmp_path):
+    """The happy path must not be disturbed by the re-proof."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    _spawn_with_fakes(monkeypatch, kb, captured, attest=lambda **kw: None)
+
+    pid = kb._default_spawn(_task(kb), str(workspace))
+
+    assert pid == os.getpid()
+    assert not captured.get("terminated")
