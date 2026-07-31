@@ -584,15 +584,54 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _configured_copilot_token_env_vars() -> Optional[tuple[str, ...]]:
+    """Return the credential env policy for an explicitly configured Copilot route.
+
+    A profile with ``model.provider: copilot`` is an explicit routing choice, not
+    provider auto-discovery.  Keep that route fail-closed by defaulting to the
+    provider-owned ``COPILOT_GITHUB_TOKEN`` instead of borrowing generic GitHub
+    tool credentials (``GH_TOKEN`` / ``GITHUB_TOKEN`` / ``gh auth token``).  A
+    profile may override the env var with ``model.key_env`` / ``api_key_env``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        model = (load_config() or {}).get("model")
+    except Exception:
+        return None
+    if not isinstance(model, dict):
+        return None
+    provider = str(model.get("provider") or "").strip().lower()
+    if provider not in {"copilot", "github", "github-copilot", "github-model", "github-models"}:
+        return None
+    for key in ("key_env", "api_key_env"):
+        env_name = str(model.get(key) or "").strip()
+        if env_name:
+            return (env_name,)
+    return ("COPILOT_GITHUB_TOKEN",)
+
+
+def _resolve_copilot_token_for_runtime() -> tuple[str, str]:
+    from hermes_cli.copilot_auth import resolve_copilot_token
+
+    env_vars = _configured_copilot_token_env_vars()
+    if env_vars:
+        return resolve_copilot_token(env_vars=env_vars, allow_gh_cli=False)
+    return resolve_copilot_token()
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
-        # Use the dedicated copilot auth module for proper token validation
+        # Use the dedicated copilot auth module for proper token validation.
+        # When config.yaml explicitly selects Copilot, keep credential routing
+        # fail-closed to the profile-owned Copilot token instead of falling
+        # through to generic GitHub tool credentials.
         try:
-            from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
-            token, source = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+            token, source = _resolve_copilot_token_for_runtime()
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
@@ -6972,11 +7011,8 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
         # resolves an empty base URL (#50252).
         base_url = env_url.rstrip("/") if env_url else pconfig.inference_base_url
         try:
-            from hermes_cli.copilot_auth import (
-                resolve_copilot_token,
-                get_copilot_api_token,
-            )
-            raw_token, _ = resolve_copilot_token()
+            from hermes_cli.copilot_auth import get_copilot_api_token
+            raw_token, _ = _resolve_copilot_token_for_runtime()
             if raw_token:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()

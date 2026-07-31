@@ -301,6 +301,72 @@ def _get_model_config() -> Dict[str, Any]:
     return {}
 
 
+_COPILOT_PROVIDER_ALIASES = frozenset({
+    "copilot",
+    "github",
+    "github-copilot",
+    "github-model",
+    "github-models",
+})
+
+
+def _canonical_provider_for_match(provider: Optional[str]) -> str:
+    normalized = (provider or "").strip().lower()
+    if normalized in _COPILOT_PROVIDER_ALIASES:
+        return "copilot"
+    return normalized
+
+
+def _configured_provider_matches(provider: str, configured_provider: Optional[str]) -> bool:
+    configured = (configured_provider or "").strip().lower()
+    if not configured:
+        return False
+    if provider == "custom":
+        return configured == "custom" or configured.startswith("custom:")
+    return _canonical_provider_for_match(configured) == _canonical_provider_for_match(provider)
+
+
+def _configured_copilot_pool_sources(model_cfg: Dict[str, Any]) -> Optional[set[str]]:
+    """Allowed pool sources for an explicitly configured Copilot route.
+
+    A profile that deliberately pins Copilot should not borrow generic GitHub
+    credentials from the pool.  Pool entries are still usable for the configured
+    Copilot env var itself, so already-exchanged COPILOT_GITHUB_TOKEN rows keep
+    working without allowing env:GITHUB_TOKEN / gh_cli fallthrough.
+    """
+    if not _configured_provider_matches("copilot", model_cfg.get("provider")):
+        return None
+    for key in ("key_env", "api_key_env"):
+        env_name = str(model_cfg.get(key) or "").strip()
+        if env_name:
+            return {f"env:{env_name}"}
+    return {"env:COPILOT_GITHUB_TOKEN"}
+
+
+def _select_pool_entry_for_runtime(
+    *,
+    provider: str,
+    pool: CredentialPool,
+    model_cfg: Dict[str, Any],
+) -> Optional[PooledCredential]:
+    entry = pool.select()
+    if provider != "copilot":
+        return entry
+
+    allowed_sources = _configured_copilot_pool_sources(model_cfg)
+    if allowed_sources is None:
+        return entry
+    if entry is not None and getattr(entry, "source", "") in allowed_sources:
+        return entry
+
+    for candidate in pool.entries():
+        if getattr(candidate, "source", "") not in allowed_sources:
+            continue
+        if getattr(candidate, "runtime_api_key", None) or getattr(candidate, "access_token", ""):
+            return candidate
+    return None
+
+
 def _provider_supports_explicit_api_mode(provider: Optional[str], configured_provider: Optional[str] = None) -> bool:
     """Check whether a persisted api_mode should be honored for a given provider.
 
@@ -313,9 +379,7 @@ def _provider_supports_explicit_api_mode(provider: Optional[str], configured_pro
     normalized_configured = (configured_provider or "").strip().lower()
     if not normalized_configured:
         return True
-    if normalized_provider == "custom":
-        return normalized_configured == "custom" or normalized_configured.startswith("custom:")
-    return normalized_configured == normalized_provider
+    return _configured_provider_matches(normalized_provider, normalized_configured)
 
 
 def _copilot_runtime_api_mode(
@@ -468,7 +532,11 @@ def _resolve_runtime_from_pool_entry(
             getattr(entry, "runtime_api_key", ""),
             target_model=effective_model,
         )
-        base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = ""
+        if _configured_provider_matches("copilot", cfg_provider):
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+        base_url = cfg_base_url or base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
     elif provider == "azure-foundry":
         # Azure Foundry: read api_mode and base_url from config
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
@@ -503,7 +571,7 @@ def _resolve_runtime_from_pool_entry(
         # fell back to the hardcoded default).  Env var overrides win (#6039).
         pconfig = PROVIDER_REGISTRY.get(provider)
         pool_url_is_default = pconfig and base_url.rstrip("/") == pconfig.inference_base_url.rstrip("/")
-        if configured_provider == provider and pool_url_is_default:
+        if _configured_provider_matches(provider, configured_provider) and pool_url_is_default:
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
             if cfg_base_url:
                 base_url = cfg_base_url
@@ -1559,20 +1627,36 @@ def _resolve_explicit_runtime(
         if pconfig.base_url_env_var:
             env_url = _getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
 
+        cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
+        cfg_base_url = ""
+        if _configured_provider_matches(provider, cfg_provider):
+            cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+
         base_url = explicit_base_url
         if not base_url:
-            if provider in {"kimi-coding", "kimi-coding-cn"}:
+            if cfg_base_url:
+                base_url = cfg_base_url
+            elif provider in {"kimi-coding", "kimi-coding-cn"}:
                 creds = resolve_api_key_provider_credentials(provider)
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
                 base_url = env_url or pconfig.inference_base_url
 
         api_key = explicit_api_key
+        creds = None
         if not api_key:
             creds = resolve_api_key_provider_credentials(provider)
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
+        if not has_usable_secret(api_key):
+            env_names = ", ".join(pconfig.api_key_env_vars)
+            hint = f" Set {env_names}." if env_names else ""
+            raise AuthError(
+                f"No usable credentials found for provider '{provider}'.{hint}",
+                provider=provider,
+                code="missing_api_key",
+            )
 
         api_mode = "chat_completions"
         if provider == "copilot":
@@ -1599,7 +1683,7 @@ def _resolve_explicit_runtime(
             "api_mode": api_mode,
             "base_url": base_url.rstrip("/"),
             "api_key": api_key,
-            "source": "explicit",
+            "source": (creds.get("source", "explicit") if isinstance(creds, dict) else "explicit"),
             "requested_provider": requested_provider,
         }
 
@@ -1812,7 +1896,11 @@ def resolve_runtime_provider(
     except Exception:
         pool = None
     if pool and pool.has_credentials():
-        entry = pool.select()
+        entry = _select_pool_entry_for_runtime(
+            provider=provider,
+            pool=pool,
+            model_cfg=model_cfg,
+        )
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (
@@ -2152,7 +2240,7 @@ def resolve_runtime_provider(
         # (China endpoint) still get the hardcoded api.minimax.io default (#6039).
         cfg_provider = str(model_cfg.get("provider") or "").strip().lower()
         cfg_base_url = ""
-        if cfg_provider == provider:
+        if _configured_provider_matches(provider, cfg_provider):
             cfg_base_url = (model_cfg.get("base_url") or "").strip().rstrip("/")
         base_url = cfg_base_url or creds.get("base_url", "").rstrip("/")
         api_mode = "chat_completions"

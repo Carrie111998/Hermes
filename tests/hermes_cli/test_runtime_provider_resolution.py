@@ -1,11 +1,36 @@
 import base64
 import json
+import os
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_cli import runtime_provider as rp
+
+
+def _write_model_config(model_cfg: dict) -> Path:
+    home = Path(os.environ["HERMES_HOME"])
+    config_path = home / "config.yaml"
+    lines = ["model:"]
+    for key, value in model_cfg.items():
+        lines.append(f"  {key}: {value}")
+    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # This file intentionally carries several provider-resolution tests.  Clear
+    # config caches so each test sees its own per-test HERMES_HOME/config.yaml.
+    from hermes_cli import config as config_mod
+
+    for cache_name in (
+        "_LOAD_CONFIG_CACHE",
+        "_RAW_CONFIG_CACHE",
+        "_LAST_EXPANDED_CONFIG_BY_PATH",
+    ):
+        cache = getattr(config_mod, cache_name, None)
+        if cache is not None and hasattr(cache, "clear"):
+            cache.clear()
+    return config_path
 
 
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
@@ -47,6 +72,257 @@ def test_noauth_lmstudio_still_resolves(monkeypatch):
 
     assert resolved["provider"] == "lmstudio"
     assert resolved["api_key"]
+
+
+def test_configured_copilot_uses_only_copilot_github_token(monkeypatch):
+    """A profile pinned to Copilot must not borrow generic GitHub credentials."""
+    from hermes_cli import copilot_auth
+
+    model_cfg = {
+        "provider": "copilot",
+        "default": "gpt-5.5",
+        "api_mode": "codex_responses",
+        "base_url": "https://api.business.githubcopilot.com",
+    }
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(model_cfg))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": dict(model_cfg)})
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_generic_repo_token")
+    monkeypatch.setattr(copilot_auth, "_try_gh_cli_token", lambda: "gho_from_gh_cli")
+    exchanged = []
+
+    def _unexpected_exchange(raw_token):
+        exchanged.append(raw_token)
+        return "borrowed-api-token", "https://api.githubcopilot.com"
+
+    monkeypatch.setattr(copilot_auth, "get_copilot_api_token", _unexpected_exchange)
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*copilot"):
+        rp.resolve_runtime_provider(requested="copilot")
+    assert exchanged == []
+
+
+def test_configured_copilot_honors_pinned_endpoint_and_api_mode(monkeypatch):
+    """Provider/model/api_mode/base_url pinning produces a strict Copilot route."""
+    from hermes_cli import copilot_auth
+
+    model_cfg = {
+        "provider": "copilot",
+        "default": "gpt-5.5",
+        "api_mode": "codex_responses",
+        "base_url": "https://api.business.githubcopilot.com",
+    }
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(model_cfg))
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"model": dict(model_cfg)})
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: SimpleNamespace(has_credentials=lambda: False))
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_work_token")
+    monkeypatch.setenv("GITHUB_TOKEN", "github_pat_generic_repo_token")
+    exchanged = []
+
+    def _exchange(raw_token):
+        exchanged.append(raw_token)
+        return "copilot-api-token", "https://api.githubcopilot.com"
+
+    monkeypatch.setattr(copilot_auth, "get_copilot_api_token", _exchange)
+
+    resolved = rp.resolve_runtime_provider(requested="copilot")
+
+    assert exchanged == ["gho_work_token", "gho_work_token"]
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_key"] == "copilot-api-token"
+    assert resolved["source"] == "COPILOT_GITHUB_TOKEN"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.business.githubcopilot.com"
+
+
+def test_configured_copilot_pool_keeps_pinned_endpoint(monkeypatch):
+    """A Copilot credential pool entry must not override model.base_url."""
+    model_cfg = {
+        "provider": "copilot",
+        "default": "gpt-5.5",
+        "api_mode": "codex_responses",
+        "base_url": "https://api.business.githubcopilot.com",
+    }
+    entry = SimpleNamespace(
+        access_token="pool-token",
+        runtime_api_key="pool-api-token",
+        source="env:COPILOT_GITHUB_TOKEN",
+        base_url="https://api.githubcopilot.com",
+    )
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return entry
+
+    monkeypatch.setattr(rp, "_get_model_config", lambda: dict(model_cfg))
+    monkeypatch.setattr(rp, "load_pool", lambda _provider: _Pool())
+    monkeypatch.setattr(rp, "credential_pool_matches_provider", lambda *a, **k: True)
+
+    resolved = rp.resolve_runtime_provider(requested="copilot")
+
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_key"] == "pool-api-token"
+    assert resolved["source"] == "env:COPILOT_GITHUB_TOKEN"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.business.githubcopilot.com"
+
+
+def test_configured_copilot_real_pool_rejects_github_token(monkeypatch):
+    """Strict Copilot config must not be satisfied by real pool GITHUB_TOKEN seeding."""
+    from hermes_cli import copilot_auth
+
+    _write_model_config(
+        {
+            "provider": "copilot",
+            "default": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.business.githubcopilot.com",
+        }
+    )
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_generic_github_token")
+    monkeypatch.setattr(copilot_auth, "_try_gh_cli_token", lambda: "")
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda raw_token: (f"api-for-{raw_token}", "https://api.githubcopilot.com"),
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*copilot"):
+        rp.resolve_runtime_provider()
+
+
+def test_configured_copilot_real_pool_rejects_gh_cli(monkeypatch):
+    """Strict Copilot config must not be satisfied by gh auth token seeding."""
+    from hermes_cli import copilot_auth
+
+    _write_model_config(
+        {
+            "provider": "copilot",
+            "default": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.business.githubcopilot.com",
+        }
+    )
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.setattr(copilot_auth, "_try_gh_cli_token", lambda: "gho_from_gh_cli")
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda raw_token: (f"api-for-{raw_token}", "https://api.githubcopilot.com"),
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*copilot"):
+        rp.resolve_runtime_provider()
+
+
+def test_configured_copilot_real_pool_ignores_persisted_generic_sources(monkeypatch):
+    """Stale generic Copilot pool rows must not satisfy a strict Copilot profile."""
+    home = Path(os.environ["HERMES_HOME"])
+    _write_model_config(
+        {
+            "provider": "copilot",
+            "default": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.business.githubcopilot.com",
+        }
+    )
+    (home / "auth.json").write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "copilot": [
+                        {
+                            "id": "ghenv1",
+                            "source": "env:GITHUB_TOKEN",
+                            "auth_type": "api_key",
+                            "access_token": "api-from-github-token",
+                            "base_url": "https://api.githubcopilot.com",
+                        },
+                        {
+                            "id": "ghcli1",
+                            "source": "gh_cli",
+                            "auth_type": "api_key",
+                            "access_token": "api-from-gh-cli",
+                            "base_url": "https://api.githubcopilot.com",
+                        },
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+    with pytest.raises(rp.AuthError, match="No usable credentials.*copilot"):
+        rp.resolve_runtime_provider()
+
+
+def test_configured_copilot_real_pool_uses_exchanged_copilot_token(monkeypatch):
+    """Allowed Copilot env pool rows keep exchanged API tokens, not raw GitHub tokens."""
+    from hermes_cli import copilot_auth
+
+    _write_model_config(
+        {
+            "provider": "copilot",
+            "default": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.business.githubcopilot.com",
+        }
+    )
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_work_token")
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_generic_github_token")
+    monkeypatch.setattr(copilot_auth, "_try_gh_cli_token", lambda: "")
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda raw_token: (f"api-for-{raw_token}", "https://api.githubcopilot.com"),
+    )
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_key"] == "api-for-gho_work_token"
+    assert resolved["source"] == "env:COPILOT_GITHUB_TOKEN"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.business.githubcopilot.com"
+
+
+def test_configured_copilot_alias_real_pool_keeps_pinned_endpoint(monkeypatch):
+    """Copilot aliases must honor the same pinned endpoint/mode as provider: copilot."""
+    from hermes_cli import copilot_auth
+
+    _write_model_config(
+        {
+            "provider": "github-copilot",
+            "default": "gpt-5.5",
+            "api_mode": "codex_responses",
+            "base_url": "https://api.business.githubcopilot.com",
+        }
+    )
+    monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "gho_work_token")
+    monkeypatch.setattr(copilot_auth, "_try_gh_cli_token", lambda: "")
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda raw_token: ("api-for-work-token", "https://api.githubcopilot.com"),
+    )
+
+    resolved = rp.resolve_runtime_provider()
+
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_key"] == "api-for-work-token"
+    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["base_url"] == "https://api.business.githubcopilot.com"
 
 
 def _fake_invoke_jwt(ttl_seconds=3600):

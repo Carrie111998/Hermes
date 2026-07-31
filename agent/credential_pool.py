@@ -2614,7 +2614,29 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             continue
         active_sources.add(source)
         base_url = env_url or pconfig.inference_base_url
-        if provider == "kimi-coding":
+        if provider == "copilot":
+            try:
+                from hermes_cli.copilot_auth import (
+                    get_copilot_api_token,
+                    validate_copilot_token,
+                )
+
+                valid, message = validate_copilot_token(token)
+                if not valid:
+                    logger.warning(
+                        "Token from %s is not supported for Copilot: %s",
+                        env_var,
+                        message,
+                    )
+                    continue
+                api_token, enterprise_base_url = get_copilot_api_token(token)
+                token = api_token
+                if enterprise_base_url:
+                    base_url = enterprise_base_url
+            except Exception as exc:
+                logger.debug("Copilot env token exchange failed for %s: %s", env_var, exc)
+                continue
+        elif provider == "kimi-coding":
             base_url = _resolve_kimi_base_url(token, pconfig.inference_base_url, env_url)
         elif provider == "zai":
             base_url = _resolve_zai_base_url(token, pconfig.inference_base_url, env_url)
