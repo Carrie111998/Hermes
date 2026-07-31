@@ -3508,13 +3508,37 @@ def test_production_transport_exposes_fixed_unit_input_rotation_edge() -> None:
         "rotate-unit-input-authority",
     )
 
-    assert remote[-4:] == (
-        "-B",
-        "-I",
-        "-m",
-        "scripts.canary.production_cutover_unit_input_rotation",
+    assert remote[-3:] == (
+        owner.ProductionCutoverTransport._ROTATION_STAGER_WRAPPER,
+        REVISION,
+        "rotate-unit-input-authority",
     )
     assert "muncho-canary-v2-01" not in " ".join(remote)
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        "prepare-release-unit-inputs",
+        "preauthorize-release-unit-inputs",
+    ),
+)
+def test_production_transport_release_rotation_phases_use_fixed_stager(
+    action: str,
+) -> None:
+    remote = owner.ProductionCutoverTransport._remote_command(
+        REVISION,
+        action,
+    )
+
+    assert remote[-3:] == (
+        owner.ProductionCutoverTransport._ROTATION_STAGER_WRAPPER,
+        REVISION,
+        action,
+    )
+    assert not any(
+        item.endswith("/.venv/bin/python") for item in remote
+    )
 
 
 def test_production_transport_full_argv_is_sealed_away_from_canary() -> None:

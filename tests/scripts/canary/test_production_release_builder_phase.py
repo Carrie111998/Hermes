@@ -156,6 +156,9 @@ def _fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Fixture:
 
     source_files = {
         phase.ENTRYPOINT_RELATIVE_PATH: b"#!/usr/bin/env python3\nVALUE = 1\n",
+        phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH: (
+            b"#!/usr/bin/env python3\nROTATION = 1\n"
+        ),
         "README.md": b"pinned source\n",
     }
     entry_records: list[tuple[str, str, bytes]] = []
@@ -412,6 +415,72 @@ def test_offline_build_is_exact_receipt_last_and_secret_free(
     assert len(venv[3]) == 1
 
 
+def test_unit_input_rotation_stager_is_exactly_purpose_and_entrypoint_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    _rewrite_request(
+        fixture,
+        schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+        purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+        entrypoint_relative_path=(
+            phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+        ),
+    )
+
+    receipt = _run(fixture)
+    candidate_entrypoint = (
+        fixture.output_root
+        / phase.CANDIDATE_NAME
+        / phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    )
+
+    assert (
+        receipt["schema"]
+        == phase.UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+    )
+    assert receipt["purpose"] == phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    assert (
+        receipt["entrypoint_relative_path"]
+        == phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    )
+    assert receipt["entrypoint_sha256"] == hashlib.sha256(
+        candidate_entrypoint.read_bytes()
+    ).hexdigest()
+    assert phase.validate_terminal_receipt(receipt) == receipt
+
+
+@pytest.mark.parametrize(
+    ("purpose", "entrypoint"),
+    [
+        ("release-updater", phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH),
+        (phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE, phase.ENTRYPOINT_RELATIVE_PATH),
+    ],
+)
+def test_unit_input_rotation_stager_rejects_mixed_exact_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    purpose: str,
+    entrypoint: str,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    _rewrite_request(
+        fixture,
+        schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+        purpose=purpose,
+        entrypoint_relative_path=entrypoint,
+    )
+
+    with pytest.raises(
+        phase.ProductionReleaseBuilderPhaseError,
+        match="release_builder_phase_request_invalid",
+    ):
+        _run(fixture)
+    assert fixture.runner.calls == []
+    assert list(fixture.output_root.iterdir()) == []
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -662,6 +731,33 @@ def test_terminal_receipt_validator_rejects_rehashed_semantic_tamper(
     receipt = dict(_run(fixture))
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_sha256"}
     unsigned["terminal"] = False
+    tampered = _self_hash(unsigned, "receipt_sha256")
+
+    with pytest.raises(
+        phase.ProductionReleaseBuilderPhaseError,
+        match="release_builder_phase_terminal_receipt_invalid",
+    ):
+        phase.validate_terminal_receipt(tampered)
+
+
+def test_rotation_stager_terminal_receipt_rejects_rehashed_purpose_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+    _rewrite_request(
+        fixture,
+        schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+        purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+        entrypoint_relative_path=(
+            phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+        ),
+    )
+    receipt = dict(_run(fixture))
+    unsigned = {
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    }
+    unsigned["purpose"] = "release-updater"
     tampered = _self_hash(unsigned, "receipt_sha256")
 
     with pytest.raises(

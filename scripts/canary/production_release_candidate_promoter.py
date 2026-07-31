@@ -184,6 +184,35 @@ class PromoterRoots:
     proc_root: Path = Path("/proc")
 
 
+@dataclass(frozen=True)
+class _PromotionBinding:
+    request_schema: str
+    request_purpose: str | None
+    terminal_receipt_schema: str
+    terminal_receipt_purpose: str | None
+    entrypoint_relative_path: str
+
+
+_RELEASE_UPDATER_PROMOTION_BINDING = _PromotionBinding(
+    request_schema=phase.REQUEST_SCHEMA,
+    request_purpose=None,
+    terminal_receipt_schema=phase.TERMINAL_RECEIPT_SCHEMA,
+    terminal_receipt_purpose=None,
+    entrypoint_relative_path=phase.ENTRYPOINT_RELATIVE_PATH,
+)
+_UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING = _PromotionBinding(
+    request_schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+    request_purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+    terminal_receipt_schema=(
+        phase.UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+    ),
+    terminal_receipt_purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+    entrypoint_relative_path=(
+        phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    ),
+)
+
+
 def production_roots() -> PromoterRoots:
     return PromoterRoots(
         job_root=phase.PRODUCTION_JOB_ROOT,
@@ -645,6 +674,7 @@ def _load_inputs(
     *,
     revision: str,
     roots: PromoterRoots,
+    binding: _PromotionBinding,
     authority_uid: int,
     authority_gid: int,
     xattr_reader: Callable[[int], Sequence[str | bytes]],
@@ -675,6 +705,20 @@ def _load_inputs(
         _decode_document(_read_held(request_file)),
         expected_job_id=revision,
     )
+    if (
+        request.get("schema") != binding.request_schema
+        or request.get("entrypoint_relative_path")
+        != binding.entrypoint_relative_path
+        or (
+            binding.request_purpose is None
+            and "purpose" in request
+        )
+        or (
+            binding.request_purpose is not None
+            and request.get("purpose") != binding.request_purpose
+        )
+    ):
+        _fail("candidate_promoter_request_purpose_invalid")
     source_file = _open_root_file(
         stack,
         input_root / phase.SOURCE_MANIFEST_NAME,
@@ -1066,9 +1110,20 @@ def _validate_candidate_documents(
     terminal: Mapping[str, Any],
     expected_terminal_receipt_sha256: str,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
 ) -> None:
     if (
-        terminal["receipt_sha256"] != expected_terminal_receipt_sha256
+        terminal.get("schema") != binding.terminal_receipt_schema
+        or (
+            binding.terminal_receipt_purpose is None
+            and "purpose" in terminal
+        )
+        or (
+            binding.terminal_receipt_purpose is not None
+            and terminal.get("purpose")
+            != binding.terminal_receipt_purpose
+        )
+        or terminal["receipt_sha256"] != expected_terminal_receipt_sha256
         or terminal["release_revision"]
         != inputs.request["release_revision"]
         or terminal["source_tree_oid"] != inputs.request["source_tree_oid"]
@@ -1087,6 +1142,8 @@ def _validate_candidate_documents(
         or terminal["payload_manifest_sha256"] != payload["manifest_sha256"]
         or terminal["payload_manifest_file_sha256"] != payload_file_sha256
         or terminal["payload_tree_sha256"] != payload["payload_tree_sha256"]
+        or terminal["entrypoint_relative_path"]
+        != inputs.request["entrypoint_relative_path"]
         or payload["release_revision"] != inputs.request["release_revision"]
         or payload["source_tree_oid"] != inputs.request["source_tree_oid"]
         or terminal["command_environment_sha256"]
@@ -1097,7 +1154,7 @@ def _validate_candidate_documents(
         str(item["path"]): item for item in payload["payload_entries"]
     }
     interpreter = entries.get(phase.INTERPRETER_RELATIVE_PATH)
-    entrypoint = entries.get(phase.ENTRYPOINT_RELATIVE_PATH)
+    entrypoint = entries.get(binding.entrypoint_relative_path)
     retained_names = {
         f"{phase.RETAINED_WHEEL_DIRECTORY_NAME}/{item['filename']}"
         for item in inputs.runtime_manifest["wheels"]
@@ -1136,6 +1193,7 @@ def _load_and_validate_candidate(
     *,
     root: Path,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
     expected_terminal_receipt_sha256: str,
     expected_uid: int,
     expected_gid: int,
@@ -1182,6 +1240,7 @@ def _load_and_validate_candidate(
                 expected_terminal_receipt_sha256
             ),
             inputs=inputs,
+            binding=binding,
         )
         records = _scan_candidate_tree(
             root,
@@ -1218,7 +1277,7 @@ def _load_and_validate_candidate(
         ):
             _fail("candidate_promoter_candidate_tree_invalid")
         interpreter = actual.get(phase.INTERPRETER_RELATIVE_PATH)
-        entrypoint = actual.get(phase.ENTRYPOINT_RELATIVE_PATH)
+        entrypoint = actual.get(binding.entrypoint_relative_path)
         if (
             not isinstance(interpreter, Mapping)
             or not isinstance(entrypoint, Mapping)
@@ -1906,6 +1965,7 @@ def _published_result(
     revision: str,
     expected_terminal_receipt_sha256: str,
     inputs: _InputBundle,
+    binding: _PromotionBinding,
     identities: builder.ReleaseIdentities,
     expected_uid: int,
     expected_gid: int,
@@ -1962,6 +2022,7 @@ def _published_result(
                 expected_terminal_receipt_sha256
             ),
             inputs=inputs,
+            binding=binding,
         )
     except phase.ProductionReleaseBuilderPhaseError as exc:
         _fail("candidate_promoter_published_binding_invalid", exc)
@@ -2038,6 +2099,7 @@ def _promote_candidate_for_test(
     revision: str,
     expected_builder_terminal_receipt_sha256: str,
     roots: PromoterRoots,
+    binding: _PromotionBinding,
     production: bool = True,
     checkpoint: Callable[[str], None] | None = None,
     rename_no_replace: Callable[[Path, Path], None] | None = None,
@@ -2202,6 +2264,7 @@ def _promote_candidate_for_test(
             stack,
             revision=revision,
             roots=normalized_roots,
+            binding=binding,
             authority_uid=authority_uid,
             authority_gid=authority_gid,
             xattr_reader=xattr_reader,
@@ -2238,6 +2301,7 @@ def _promote_candidate_for_test(
                         expected_builder_terminal_receipt_sha256
                     ),
                     inputs=inputs,
+                    binding=binding,
                     identities=validated_identities,
                     expected_uid=publication_uid,
                     expected_gid=publication_gid,
@@ -2267,6 +2331,7 @@ def _promote_candidate_for_test(
             stack,
             root=inputs.candidate_root,
             inputs=inputs,
+            binding=binding,
             expected_terminal_receipt_sha256=(
                 expected_builder_terminal_receipt_sha256
             ),
@@ -2281,6 +2346,7 @@ def _promote_candidate_for_test(
                     stack,
                     root=final,
                     inputs=inputs,
+                    binding=binding,
                     expected_terminal_receipt_sha256=(
                         expected_builder_terminal_receipt_sha256
                     ),
@@ -2298,6 +2364,7 @@ def _promote_candidate_for_test(
                         stack,
                         root=hidden,
                         inputs=inputs,
+                        binding=binding,
                         expected_terminal_receipt_sha256=(
                             expected_builder_terminal_receipt_sha256
                         ),
@@ -2325,6 +2392,7 @@ def _promote_candidate_for_test(
                     stack,
                     root=hidden,
                     inputs=inputs,
+                    binding=binding,
                     expected_terminal_receipt_sha256=(
                         expected_builder_terminal_receipt_sha256
                     ),
@@ -2342,6 +2410,7 @@ def _promote_candidate_for_test(
             stack,
             root=final,
             inputs=inputs,
+            binding=binding,
             expected_terminal_receipt_sha256=(
                 expected_builder_terminal_receipt_sha256
             ),
@@ -2427,6 +2496,7 @@ def _promote_candidate_for_test(
                     source_candidate.terminal_receipt["receipt_sha256"]
                 ),
                 inputs=inputs,
+                binding=binding,
                 identities=validated_identities,
                 expected_uid=publication_uid,
                 expected_gid=publication_gid,
@@ -2467,6 +2537,25 @@ def promote_candidate(
             expected_builder_terminal_receipt_sha256
         ),
         roots=production_roots(),
+        binding=_RELEASE_UPDATER_PROMOTION_BINDING,
+        production=True,
+    )
+
+
+def promote_rotation_stager_candidate(
+    *,
+    revision: str,
+    expected_builder_terminal_receipt_sha256: str,
+) -> Mapping[str, Any]:
+    """Publish one exact unit-input rotation stager without activating it."""
+
+    return _promote_candidate_for_test(
+        revision=revision,
+        expected_builder_terminal_receipt_sha256=(
+            expected_builder_terminal_receipt_sha256
+        ),
+        roots=production_roots(),
+        binding=_UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
         production=True,
     )
 
@@ -2478,6 +2567,7 @@ __all__ = [
     "ProductionReleaseCandidatePromoterError",
     "canonical_bytes",
     "promote_candidate",
+    "promote_rotation_stager_candidate",
     "sha256_bytes",
     "validate_promotion_result",
 ]

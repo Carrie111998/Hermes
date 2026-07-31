@@ -34,12 +34,18 @@ from scripts.canary import production_release_builder_runtime as builder
 
 
 REQUEST_SCHEMA = "muncho-production-release-builder-request.v1"
+UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA = (
+    "muncho-production-unit-input-rotation-stager-builder-request.v1"
+)
 SOURCE_V3_MANIFEST_SCHEMA = "muncho-production-release-source-v3-manifest.v1"
 RUNTIME_DEPENDENCY_MANIFEST_SCHEMA = (
     "muncho-production-release-runtime-wheel-manifest.v1"
 )
 PAYLOAD_MANIFEST_SCHEMA = "muncho-production-release-builder-payload-manifest.v1"
 TERMINAL_RECEIPT_SCHEMA = "muncho-production-release-builder-terminal-receipt.v1"
+UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA = (
+    "muncho-production-unit-input-rotation-stager-builder-terminal-receipt.v1"
+)
 
 PRODUCTION_JOB_ROOT = Path("/var/lib/muncho-release-updates")
 REQUEST_NAME = "request.json"
@@ -55,6 +61,10 @@ PAYLOAD_MANIFEST_NAME = "production-release-builder-payload-manifest.json"
 TERMINAL_RECEIPT_NAME = "production-release-builder-terminal-receipt.json"
 INTERPRETER_RELATIVE_PATH = ".venv/bin/python"
 ENTRYPOINT_RELATIVE_PATH = "scripts/canary/production_release_update_entrypoint.py"
+UNIT_INPUT_ROTATION_STAGER_PURPOSE = "unit-input-rotation-stager"
+UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH = (
+    "scripts/canary/production_cutover_unit_input_rotation.py"
+)
 BUILDER_USER = "muncho-release-builder"
 BUILDER_GROUP = "muncho-release-builder"
 BUILDER_UID = builder.BUILDER_UID
@@ -98,6 +108,7 @@ _REQUEST_FIELDS = frozenset({
     "secret_digest_recorded",
     "request_sha256",
 })
+_PURPOSE_BOUND_REQUEST_FIELDS = _REQUEST_FIELDS | {"purpose"}
 _SOURCE_MANIFEST_FIELDS = frozenset({
     "schema",
     "release_revision",
@@ -182,6 +193,7 @@ _TERMINAL_RECEIPT_FIELDS = frozenset({
     "secret_digest_recorded",
     "receipt_sha256",
 })
+_PURPOSE_BOUND_TERMINAL_RECEIPT_FIELDS = _TERMINAL_RECEIPT_FIELDS | {"purpose"}
 _BUILDER_IDENTITY = {
     "user": BUILDER_USER,
     "group": BUILDER_GROUP,
@@ -330,15 +342,29 @@ def validate_request(
     *,
     expected_job_id: str,
 ) -> Mapping[str, Any]:
+    request_schema = value.get("schema") if isinstance(value, Mapping) else None
+    if request_schema == UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA:
+        request_fields = _PURPOSE_BOUND_REQUEST_FIELDS
+        expected_entrypoint = UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+        expected_purpose: str | None = UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    else:
+        request_fields = _REQUEST_FIELDS
+        expected_entrypoint = ENTRYPOINT_RELATIVE_PATH
+        expected_purpose = None
     raw = _self_hashed(
         value,
-        fields=_REQUEST_FIELDS,
+        fields=request_fields,
         digest_field="request_sha256",
         code="release_builder_phase_request_invalid",
     )
     identity = raw.get("builder_identity")
     if (
-        raw.get("schema") != REQUEST_SCHEMA
+        raw.get("schema")
+        not in {REQUEST_SCHEMA, UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA}
+        or (
+            expected_purpose is not None
+            and raw.get("purpose") != expected_purpose
+        )
         or _JOB_ID.fullmatch(str(expected_job_id)) is None
         or raw.get("job_id") != expected_job_id
         or raw.get("release_revision") != expected_job_id
@@ -375,7 +401,7 @@ def validate_request(
     )
     _relative_path(
         raw.get("entrypoint_relative_path"),
-        ENTRYPOINT_RELATIVE_PATH,
+        expected_entrypoint,
         "release_builder_phase_request_invalid",
     )
     return raw
@@ -576,14 +602,24 @@ def validate_payload_manifest(value: Any) -> Mapping[str, Any]:
 def validate_terminal_receipt(value: Any) -> Mapping[str, Any]:
     """Validate the final builder receipt without trusting its producer."""
 
+    receipt_schema = value.get("schema") if isinstance(value, Mapping) else None
+    if receipt_schema == UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA:
+        receipt_fields = _PURPOSE_BOUND_TERMINAL_RECEIPT_FIELDS
+        expected_entrypoint = UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+        expected_purpose: str | None = UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    else:
+        receipt_fields = _TERMINAL_RECEIPT_FIELDS
+        expected_entrypoint = ENTRYPOINT_RELATIVE_PATH
+        expected_purpose = None
     raw = _self_hashed(
         value,
-        fields=_TERMINAL_RECEIPT_FIELDS,
+        fields=receipt_fields,
         digest_field="receipt_sha256",
         code="release_builder_phase_terminal_receipt_invalid",
     )
-    digest_fields = _TERMINAL_RECEIPT_FIELDS - {
+    digest_fields = receipt_fields - {
         "schema",
+        "purpose",
         "release_revision",
         "candidate_name",
         "source_tree_oid",
@@ -598,13 +634,21 @@ def validate_terminal_receipt(value: Any) -> Mapping[str, Any]:
         "receipt_sha256",
     }
     if (
-        raw.get("schema") != TERMINAL_RECEIPT_SCHEMA
+        raw.get("schema")
+        not in {
+            TERMINAL_RECEIPT_SCHEMA,
+            UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA,
+        }
+        or (
+            expected_purpose is not None
+            and raw.get("purpose") != expected_purpose
+        )
         or _REVISION.fullmatch(str(raw.get("release_revision", ""))) is None
         or _TREE_OID.fullmatch(str(raw.get("source_tree_oid", ""))) is None
         or raw.get("candidate_name") != CANDIDATE_NAME
         or raw.get("payload_manifest_name") != PAYLOAD_MANIFEST_NAME
         or raw.get("interpreter_relative_path") != INTERPRETER_RELATIVE_PATH
-        or raw.get("entrypoint_relative_path") != ENTRYPOINT_RELATIVE_PATH
+        or raw.get("entrypoint_relative_path") != expected_entrypoint
         or raw.get("builder_identity") != _BUILDER_IDENTITY
         or raw.get("resume_policy") != "reject-nonempty-output-requires-root-cleanup"
         or raw.get("terminal") is not True
@@ -1361,6 +1405,15 @@ def _run_builder_phase_for_test(
             _decode_canonical_document(_read_held(request_file)),
             expected_job_id=job_id,
         )
+        entrypoint_relative_path = str(request["entrypoint_relative_path"])
+        if request["schema"] == UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA:
+            terminal_receipt_schema = (
+                UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+            )
+            request_purpose: str | None = str(request["purpose"])
+        else:
+            terminal_receipt_schema = TERMINAL_RECEIPT_SCHEMA
+            request_purpose = None
         source_file = stack.enter_context(
             builder.open_held_regular(
                 input_root / SOURCE_MANIFEST_NAME,
@@ -1412,14 +1465,10 @@ def _run_builder_phase_for_test(
             for entry in entries
         ):
             _fail("release_builder_phase_source_path_reserved")
-        if not any(
-            entry.path == ENTRYPOINT_RELATIVE_PATH
-            for entry in entries
-        ):
-            # The real Stage C entrypoint is an intentional deployment
-            # interlock until the complete updater lands.  Reject a source
-            # revision that lacks it before materializing any output so the
-            # failed attempt remains exactly retryable.
+        if not any(entry.path == entrypoint_relative_path for entry in entries):
+            # The request schema selects one exact, purpose-bound entrypoint.
+            # Reject a source revision that lacks it before materializing any
+            # output so the failed attempt remains exactly retryable.
             _fail("release_builder_phase_entrypoint_missing")
         manifest_blobs = {
             str(item["object_id"]): dict(item) for item in source_manifest["blobs"]
@@ -1692,7 +1741,7 @@ def _run_builder_phase_for_test(
             ) as interpreter:
                 interpreter_sha256 = interpreter.sha256
             with builder.open_held_regular(
-                candidate / ENTRYPOINT_RELATIVE_PATH,
+                candidate / entrypoint_relative_path,
                 expected_uid=physical_builder_uid,
                 expected_gid=physical_builder_gid,
                 allowed_modes=frozenset({0o444, 0o555}),
@@ -1700,7 +1749,7 @@ def _run_builder_phase_for_test(
             ) as entrypoint:
                 entrypoint_sha256 = entrypoint.sha256
             receipt_unsigned = {
-                "schema": TERMINAL_RECEIPT_SCHEMA,
+                "schema": terminal_receipt_schema,
                 "release_revision": request["release_revision"],
                 "candidate_name": CANDIDATE_NAME,
                 "source_tree_oid": request["source_tree_oid"],
@@ -1728,7 +1777,7 @@ def _run_builder_phase_for_test(
                 "payload_tree_sha256": payload_manifest["payload_tree_sha256"],
                 "interpreter_relative_path": INTERPRETER_RELATIVE_PATH,
                 "interpreter_sha256": interpreter_sha256,
-                "entrypoint_relative_path": ENTRYPOINT_RELATIVE_PATH,
+                "entrypoint_relative_path": entrypoint_relative_path,
                 "entrypoint_sha256": entrypoint_sha256,
                 "venv_argv_sha256": sha256_bytes(canonical_bytes(list(venv_argv))),
                 "install_argv_sha256": sha256_bytes(
@@ -1743,6 +1792,8 @@ def _run_builder_phase_for_test(
                 "secret_material_recorded": False,
                 "secret_digest_recorded": False,
             }
+            if request_purpose is not None:
+                receipt_unsigned["purpose"] = request_purpose
             receipt = {
                 **receipt_unsigned,
                 "receipt_sha256": sha256_bytes(canonical_bytes(receipt_unsigned)),
@@ -1834,6 +1885,10 @@ __all__ = [
     "SOURCE_V3_MANIFEST_SCHEMA",
     "TERMINAL_RECEIPT_NAME",
     "TERMINAL_RECEIPT_SCHEMA",
+    "UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH",
+    "UNIT_INPUT_ROTATION_STAGER_PURPOSE",
+    "UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA",
+    "UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA",
     "canonical_bytes",
     "main",
     "run_builder_phase",

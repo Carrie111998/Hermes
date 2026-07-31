@@ -99,6 +99,7 @@ exec /usr/bin/flock --exclusive --no-fork \\
   muncho-release-builder-phase "$@"
 """
 EXPECTED_BUILDER_TMPFILES = (
+    b"d /var/lib/muncho-release-updates 0755 root root -\n"
     b"f /run/lock/muncho-release-builder-promotion.lock "
     b"0440 root muncho-release-builder -\n"
 )
@@ -140,8 +141,19 @@ def _sha256(path: Path) -> str:
 def _fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    rotation_stager: bool = False,
 ) -> Fixture:
     build = build_test._fixture(tmp_path, monkeypatch)
+    if rotation_stager:
+        build_test._rewrite_request(
+            build,
+            schema=phase.UNIT_INPUT_ROTATION_STAGER_REQUEST_SCHEMA,
+            purpose=phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE,
+            entrypoint_relative_path=(
+                phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+            ),
+        )
     terminal = phase._run_builder_phase_for_test(
         build.request_path,
         production=False,
@@ -233,6 +245,9 @@ def _fixture(
 def _promote(
     fixture: Fixture,
     *,
+    binding: promoter._PromotionBinding = (
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING
+    ),
     checkpoint: Callable[[str], None] | None = None,
     rename_no_replace: Callable[[Path, Path], None] | None = None,
     xattr_reader=None,
@@ -245,6 +260,7 @@ def _promote(
             fixture.terminal["receipt_sha256"]
         ),
         roots=fixture.roots,
+        binding=binding,
         production=False,
         checkpoint=checkpoint,
         rename_no_replace=rename_no_replace,
@@ -355,6 +371,111 @@ def test_public_promoter_has_no_authority_or_test_seams() -> None:
         "revision",
         "expected_builder_terminal_receipt_sha256",
     )
+    assert tuple(
+        inspect.signature(
+            promoter.promote_rotation_stager_candidate
+        ).parameters
+    ) == (
+        "revision",
+        "expected_builder_terminal_receipt_sha256",
+    )
+
+
+def test_public_promoters_are_bound_to_disjoint_exact_receipt_purposes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[promoter._PromotionBinding] = []
+
+    def capture(**kwargs: Any) -> Mapping[str, Any]:
+        observed.append(kwargs["binding"])
+        return {"binding": kwargs["binding"]}
+
+    monkeypatch.setattr(promoter, "_promote_candidate_for_test", capture)
+
+    updater = promoter.promote_candidate(
+        revision=REVISION,
+        expected_builder_terminal_receipt_sha256="1" * 64,
+    )
+    stager = promoter.promote_rotation_stager_candidate(
+        revision=REVISION,
+        expected_builder_terminal_receipt_sha256="2" * 64,
+    )
+
+    assert updater["binding"] is (
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING
+    )
+    assert stager["binding"] is (
+        promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING
+    )
+    assert observed == [
+        promoter._RELEASE_UPDATER_PROMOTION_BINDING,
+        promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
+    ]
+    assert observed[0].request_purpose is None
+    assert observed[0].terminal_receipt_purpose is None
+    assert observed[1].request_purpose == (
+        phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    )
+    assert observed[1].terminal_receipt_purpose == (
+        phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    )
+
+
+def test_rotation_stager_is_published_only_through_stager_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch, rotation_stager=True)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="candidate_promoter_request_purpose_invalid",
+    ):
+        _promote(fixture)
+    assert not fixture.hidden.exists()
+    assert not fixture.final.exists()
+
+    result = _promote(
+        fixture,
+        binding=promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING,
+    )
+
+    assert result["completed"] is True
+    terminal = json.loads(
+        (fixture.final / phase.TERMINAL_RECEIPT_NAME).read_text(
+            encoding="ascii"
+        )
+    )
+    assert terminal["schema"] == (
+        phase.UNIT_INPUT_ROTATION_STAGER_TERMINAL_RECEIPT_SCHEMA
+    )
+    assert terminal["purpose"] == phase.UNIT_INPUT_ROTATION_STAGER_PURPOSE
+    assert terminal["entrypoint_relative_path"] == (
+        phase.UNIT_INPUT_ROTATION_STAGER_ENTRYPOINT_RELATIVE_PATH
+    )
+    assert fixture.final.is_dir()
+    assert not fixture.final.is_symlink()
+
+
+def test_updater_candidate_is_rejected_by_rotation_stager_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(
+        promoter.ProductionReleaseCandidatePromoterError,
+        match="candidate_promoter_request_purpose_invalid",
+    ):
+        _promote(
+            fixture,
+            binding=(
+                promoter._UNIT_INPUT_ROTATION_STAGER_PROMOTION_BINDING
+            ),
+        )
+
+    assert not fixture.hidden.exists()
+    assert not fixture.final.exists()
 
 
 def test_production_builder_assets_and_embedded_digests_are_exact() -> None:

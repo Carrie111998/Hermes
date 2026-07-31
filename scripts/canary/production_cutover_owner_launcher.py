@@ -332,6 +332,14 @@ class PinnedProductionGoogleComputeKnownHosts(
 class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
     """Pinned IAP transport for the fixed production cutover entry points."""
 
+    _ROTATION_STAGER_WRAPPER = (
+        "/usr/libexec/muncho-release-unit-input-rotation-stager"
+    )
+    _ROTATION_STAGER_ACTIONS = frozenset({
+        "rotate-unit-input-authority",
+        "prepare-release-unit-inputs",
+        "preauthorize-release-unit-inputs",
+    })
     _ACTIONS = frozenset({
         "stage-host-artifacts",
         "collect-initial",
@@ -714,26 +722,11 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 "-m",
                 "scripts.canary.production_cutover_public_stager",
             )
-        if action == "rotate-unit-input-authority":
+        if action in cls._ROTATION_STAGER_ACTIONS:
             return (
                 *prefix,
-                interpreter,
-                "-B",
-                "-I",
-                "-m",
-                "scripts.canary.production_cutover_unit_input_rotation",
-            )
-        if action in {
-            "prepare-release-unit-inputs",
-            "preauthorize-release-unit-inputs",
-        }:
-            return (
-                *prefix,
-                interpreter,
-                "-B",
-                "-I",
-                "-m",
-                "scripts.canary.production_cutover_unit_input_rotation",
+                cls._ROTATION_STAGER_WRAPPER,
+                revision,
                 action,
             )
         if action in {"prepare-bridge", "activate-bridge"}:
