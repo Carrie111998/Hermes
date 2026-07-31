@@ -192,6 +192,14 @@ class TestExtractCacheBustingConfig:
 
 
 class TestAutoInjectRecallResolution:
+    def test_false_global_default_applies_without_platform_override(self):
+        from gateway.run import GatewayRunner
+
+        config = {"memory": {"auto_inject_recall": False}}
+
+        assert GatewayRunner._resolve_auto_inject_recall(config, "whatsapp") is False
+        assert GatewayRunner._resolve_auto_inject_recall(config, "telegram") is False
+
     def test_platform_boolean_override_wins_over_global_default(self):
         from gateway.run import GatewayRunner
 

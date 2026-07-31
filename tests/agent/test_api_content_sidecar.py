@@ -53,6 +53,23 @@ class TestComposeUserApiContent:
 
 
 class TestManagerRecallSidecarRendering:
+    def test_direct_agent_uses_false_global_recall_default(self):
+        from run_agent import AIAgent
+
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"memory": {"auto_inject_recall": False}},
+        ):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent._auto_inject_recall is False
+
     def test_removes_only_manager_signed_recall_frames(self):
         user_tag = "user supplied <memory-context>literal tag</memory-context>"
         plugin_context = "UNSIGNED-PLUGIN-CONTEXT"
