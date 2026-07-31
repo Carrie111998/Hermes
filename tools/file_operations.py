@@ -488,8 +488,15 @@ class FileOperations(ABC):
     @abstractmethod
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
-        """Search for content or files."""
+               output_mode: str = "content", context: int = 0,
+               type: str = "files") -> SearchResult:
+        """Search for content or files.
+
+        Args:
+            type: For target="files", filter entry type. One of:
+                "files" (default, files only), "dirs" (directories only,
+                surfaces empty dirs), "all" (both files and directories).
+        """
         ...
 
 
@@ -2055,10 +2062,11 @@ class ShellFileOperations(FileOperations):
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               type: str = "files") -> SearchResult:
         """
         Search for content or files.
-        
+
         Args:
             pattern: Regex (for content) or glob pattern (for files)
             path: Directory/file to search (default: cwd)
@@ -2068,9 +2076,16 @@ class ShellFileOperations(FileOperations):
             offset: Skip first N results
             output_mode: "content", "files_only", or "count"
             context: Lines of context around matches
-        
+            type: For target="files", filter entry type. One of:
+                "files" (default, files only), "dirs" (directories only,
+                surfaces empty dirs), "all" (both files and directories).
+
         Returns:
-            SearchResult with matches or file list
+            SearchResult with matches or file list. Directory entries
+            are returned with a trailing '/' so callers can distinguish
+            them from files.
+
+        See #54347.
         """
         offset, limit = normalize_search_pagination(offset, limit)
 
@@ -2111,13 +2126,34 @@ class ShellFileOperations(FileOperations):
             )
         
         if target == "files":
-            return self._search_files(pattern, path, limit, offset)
+            return self._search_files(pattern, path, limit, offset, type=type)
         else:
             return self._search_content(pattern, path, file_glob, limit, offset, 
                                         output_mode, context)
     
-    def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
-        """Search for files by name pattern (glob-like)."""
+    def _search_files(self, pattern: str, path: str, limit: int, offset: int,
+                     type: str = "files") -> SearchResult:
+        """Search for files by name pattern (glob-like).
+
+        Args:
+            pattern: Glob pattern (e.g., "*config*")
+            path: Root directory to search
+            limit: Max results
+            offset: Pagination offset
+            type: One of "files" (default), "dirs", or "all". For "dirs"
+                and "all", directory entries are returned with a trailing
+                '/'. See #54347.
+
+        Returns:
+            SearchResult with files or directories.
+        """
+        if type not in ("files", "dirs", "all"):
+            return SearchResult(
+                error=f"Invalid type: {type!r}. "
+                      "Must be 'files', 'dirs', or 'all'.",
+                total_count=0,
+            )
+
         # Auto-prepend **/ for recursive search if not already present
         if not pattern.startswith('**/') and '/' not in pattern:
             search_pattern = pattern
@@ -2132,9 +2168,18 @@ class ShellFileOperations(FileOperations):
 
         # Prefer ripgrep: respects .gitignore, excludes hidden dirs by
         # default, and has parallel directory traversal (~200x faster than
-        # find on wide trees).  Mirrors _search_content which already uses rg.
-        if self._has_command('rg'):
-            return self._search_files_rg(search_pattern, path, limit, offset)
+        # find on wide trees).  Mirrors _search_content which already uses
+        # rg.
+        #
+        # rg --files can only emit *files*, not directories. So when the
+        # caller asks for directories only (type=dirs), rg is not useful
+        # and we fall through to find, which has -type d. For type=all,
+        # rg would emit files but miss directories, so we also fall
+        # through to find and merge. See #54347.
+        if self._has_command('rg') and type == "files":
+            return self._search_files_rg(
+                search_pattern, path, limit, offset, type=type
+            )
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
@@ -2155,7 +2200,15 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        # Map type to find -type filter. See #54347.
+        if type == "files":
+            find_type = "-type f"
+        elif type == "dirs":
+            find_type = "-type d"
+        else:  # type == "all"; rg already handles files
+            find_type = "-type d"
+
+        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} {find_type} -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2163,7 +2216,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} {find_type} -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2177,6 +2230,37 @@ class ShellFileOperations(FileOperations):
                 files.append(parts[1])
             else:
                 files.append(line)
+
+        # Mark directories with trailing '/'. For type=dirs, every find
+        # entry is a directory. For type=all, the find is also limited to
+        # -type d (the rg half handles files), so we add '/' to each find
+        # entry before merging. See #54347.
+        if type == "dirs":
+            files = [f + "/" for f in files]
+        elif type == "all":
+            # Append '/' to find entries (all dirs).
+            files = [f + "/" for f in files]
+            if self._has_command('rg') and not has_hidden_path_ancestor:
+                # Standard root: rg and find can be combined. For hidden
+                # roots, the post-filter logic is more complex; we keep
+                # directories-only from find (the user can use type=dirs
+                # for comprehensive dir listing).
+                rg_cmd = (
+                    f"rg --files --sortr=modified -g {self._escape_shell_arg(search_pattern)} "
+                    f"{self._escape_shell_arg(path)} 2>/dev/null "
+                    f"| head -n {limit + offset}"
+                )
+                rg_result = self._exec(rg_cmd, timeout=60)
+                rg_stdout, _ = _search_stdout_and_limit(rg_result)
+                rg_files = [f for f in rg_stdout.strip().split('\n') if f]
+                # Merge: dirs from find (with '/') + files from rg.
+                # Dedup by stripping '/' for comparison.
+                existing = {f.rstrip('/'): f for f in files}
+                for f in rg_files:
+                    key = f.rstrip('/')
+                    if key not in existing:
+                        existing[key] = f
+                files = list(existing.values())
 
         # For explicit hidden roots, find's path-based filtering excludes every
         # file under the hidden path. Apply descendant filtering after command
@@ -2202,14 +2286,31 @@ class ShellFileOperations(FileOperations):
             limit_reason=limit_reason,
         )
 
-    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int,
+                        type: str = "files") -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
         default, and uses parallel directory traversal for ~200x speedup
         over find on wide trees.  Results are sorted by modification time
         (most recently edited first) when rg >= 13.0 supports --sortr.
+
+        Args:
+            type: One of "files" (default), "dirs", or "all". For
+                "dirs" and "all", directory entries are returned with
+                a trailing '/'. See #54347.
+
+        Note: rg --files only emits files. The caller (search_files)
+        skips rg for type=dirs. For type=all, the caller uses rg for
+        files and merges with find -type d. We keep the type parameter
+        for type-completeness.
         """
+        if type not in ("files", "dirs", "all"):
+            return SearchResult(
+                error=f"Invalid type: {type!r}. "
+                      "Must be 'files', 'dirs', or 'all'.",
+                total_count=0,
+            )
         # rg --files -g uses glob patterns; wrap bare names so they match
         # at any depth (equivalent to find -name).
         if '/' not in pattern and not pattern.startswith('*'):
