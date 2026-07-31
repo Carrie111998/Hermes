@@ -3456,6 +3456,32 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     assert captured["platform"] == "tui"
 
 
+def test_background_agent_kwargs_exempts_provider_request_budget(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._background_agent_kwargs(
+        types.SimpleNamespace(model="gpt-5.5", provider="openai-codex"),
+        "task-id",
+    )
+
+    assert kwargs["provider_request_budget_exempt"] is True
+
+
+def test_ephemeral_preview_agent_kwargs_exempts_provider_request_budget(monkeypatch):
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    kwargs = server._ephemeral_preview_agent_kwargs(
+        types.SimpleNamespace(model="gpt-5.5", provider="openai-codex"),
+        "task-id",
+    )
+
+    assert kwargs["provider_request_budget_exempt"] is True
+
+
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     chain = [
         {"provider": "openrouter", "model": "openai/gpt-5.5"},
