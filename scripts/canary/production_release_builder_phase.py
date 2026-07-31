@@ -1649,7 +1649,6 @@ def _run_builder_phase_for_test(
             "--no-config",
             "--no-python-downloads",
             "--no-deps",
-            "--no-build",
             "--only-binary",
             ":all:",
             "--no-sources",

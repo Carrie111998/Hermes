@@ -393,7 +393,6 @@ def test_offline_build_is_exact_receipt_last_and_secret_free(
     for flag in (
         "--offline",
         "--no-index",
-        "--no-build",
         "--no-deps",
         "--only-binary",
         "--no-sources",
@@ -401,6 +400,10 @@ def test_offline_build_is_exact_receipt_last_and_secret_free(
         "--strict",
     ):
         assert flag in install[0]
+    # Current production uv rejects --no-build together with --only-binary.
+    # Explicit, verified wheel paths plus --only-binary=:all: and --no-sources
+    # preserve the no-source-build contract without the incompatible flag.
+    assert "--no-build" not in install[0]
     assert install[0][-1].endswith(WHEEL_NAME)
     assert set(venv[2]) == set(phase._command_environment())
     assert not {
