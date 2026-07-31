@@ -231,3 +231,50 @@ class TestProviderConfigValuesEditDoesNotClobberActivation:
         # Configuring a new provider appends it (activate-on-configure UX),
         # preserving the existing one's priority.
         assert get_active_memory_providers(load_config()) == ["honcho", "mem0"]
+
+    def test_non_declared_arm_preserves_multiprovider_list(self, client, monkeypatch):
+        """FINDING 3 (#5688): the surface!=declared arm of the SAME PUT handler
+        (the _load_memory_provider path) also raw-wrote memory.provider=name,
+        bypassing the setter. A multi-provider user hitting this arm got
+        singular=name while the plural list still governed — identical split to
+        finding 2, in the other arm of the same handler.
+
+        Exercises the REAL endpoint with surface omitted (=> non-declared arm);
+        only the disk/plugin-dependent bits are stubbed.
+        """
+        from hermes_cli import web_server
+
+        cfg = load_config()
+        web_server.set_active_memory_providers(cfg, ["honcho", "mem0"])
+        save_config(cfg)
+
+        monkeypatch.setattr(web_server, "_load_memory_provider", lambda name: object())
+        monkeypatch.setattr(
+            web_server, "_write_memory_provider_config_values", lambda name, provider, values: None
+        )
+        monkeypatch.setattr(web_server, "_require_memory_provider_ready", lambda name: None)
+
+        # Hit mem0's config with NO surface param => non-declared arm.
+        resp = client.put("/api/memory/providers/mem0/config", json={"values": {"api_key": "x"}})
+        assert resp.status_code == 200
+
+        # honcho still first, mem0 still present, order intact, no clobber.
+        assert get_active_memory_providers(load_config()) == ["honcho", "mem0"]
+
+    def test_non_declared_arm_activates_new_provider(self, client, monkeypatch):
+        """New provider via the non-declared arm appends, preserving priority."""
+        from hermes_cli import web_server
+
+        cfg = load_config()
+        web_server.set_active_memory_providers(cfg, ["honcho"])
+        save_config(cfg)
+
+        monkeypatch.setattr(web_server, "_load_memory_provider", lambda name: object())
+        monkeypatch.setattr(
+            web_server, "_write_memory_provider_config_values", lambda name, provider, values: None
+        )
+        monkeypatch.setattr(web_server, "_require_memory_provider_ready", lambda name: None)
+
+        resp = client.put("/api/memory/providers/mem0/config", json={"values": {"api_key": "x"}})
+        assert resp.status_code == 200
+        assert get_active_memory_providers(load_config()) == ["honcho", "mem0"]

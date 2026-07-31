@@ -5959,13 +5959,19 @@ async def update_memory_provider_config(
                 raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
             _write_memory_provider_config_values(name, provider, values)
             _require_memory_provider_ready(name)
+            # Route activation through the canonical setter — never write the
+            # singular ``memory.provider`` field directly. A raw write leaves
+            # singular=name while the plural ``memory.providers`` list still
+            # governs (resolver is plural-first), the exact writer≠reader split
+            # #5688 exists to kill. This is the surface!=declared arm; the
+            # declared arm (via _update_memory_provider_config) fixes the same
+            # bug 900 lines up. Append-if-absent so this never reorders or
+            # drops another active provider.
             config = load_config()
-            memory_config = config.get("memory")
-            if not isinstance(memory_config, dict):
-                memory_config = {}
-                config["memory"] = memory_config
-            memory_config["provider"] = name
-            save_config(config)
+            active = get_active_memory_providers(config)
+            if name not in active:
+                set_active_memory_providers(config, [*active, name])
+                save_config(config)
             return {"ok": True, "active": name}
 
     try:
