@@ -163,9 +163,35 @@ class CLIAgentSetupMixin:
                     and _provider != "auto"
                     and _state_db is not None
                 ):
-                    _generation = _state_db.get_or_create_provider_credential_generation(
+                    _bound_scope = getattr(
+                        self,
+                        "_provider_credential_generation_binding",
+                        None,
+                    )
+                    if (
+                        credentials_changed
+                        and isinstance(_bound_scope, tuple)
+                        and len(_bound_scope) == 3
+                        and _bound_scope[:2] == (_profile, _provider)
+                    ):
+                        _generation = (
+                            _state_db.rotate_provider_credential_generation(
+                                _profile,
+                                _provider,
+                                expected_generation=_bound_scope[2],
+                            )
+                        )
+                    else:
+                        _generation = (
+                            _state_db.get_or_create_provider_credential_generation(
+                                _profile,
+                                _provider,
+                            )
+                        )
+                    self._provider_credential_generation_binding = (
                         _profile,
                         _provider,
+                        _generation,
                     )
                     os.environ["HERMES_PROVIDER"] = _provider
                     os.environ["HERMES_PROVIDER_CREDENTIAL_GENERATION"] = str(

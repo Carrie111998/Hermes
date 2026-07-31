@@ -7908,6 +7908,61 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return int(self._execute_write(_do))
 
+    def rotate_provider_credential_generation(
+        self,
+        profile: str,
+        provider: str,
+        *,
+        expected_generation: int,
+    ) -> int:
+        """Rotate an auth scope generation if its current value is expected.
+
+        A stale observer receives the already-current generation instead of
+        rotating it again. Tokens remain random profile/provider metadata and
+        are never derived from credential bytes.
+        """
+        scope_part = re.compile(r"[a-z0-9][a-z0-9._:-]{0,127}\Z")
+        if not isinstance(profile, str) or scope_part.fullmatch(profile) is None:
+            raise ValueError("provider credential profile must be normalized")
+        if not isinstance(provider, str) or scope_part.fullmatch(provider) is None:
+            raise ValueError("provider credential provider must be normalized")
+        if (
+            not isinstance(expected_generation, int)
+            or isinstance(expected_generation, bool)
+            or expected_generation <= 0
+        ):
+            raise ValueError("expected provider credential generation is malformed")
+        key = f"provider_credential_generation:{profile}:{provider}"
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("provider credential generation does not exist")
+            raw = row["value"] if isinstance(row, sqlite3.Row) else row[0]
+            try:
+                generation = int(raw)
+            except (TypeError, ValueError):
+                raise ValueError("provider credential generation is malformed")
+            if generation <= 0:
+                raise ValueError("provider credential generation is malformed")
+            if generation != expected_generation:
+                return generation
+
+            rotated_generation = generation
+            while rotated_generation == generation:
+                rotated_generation = secrets.randbits(63) or 1
+            cursor = conn.execute(
+                "UPDATE state_meta SET value = ? WHERE key = ? AND value = ?",
+                (str(rotated_generation), key, raw),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("provider credential generation rotation lost CAS")
+            return rotated_generation
+
+        return int(self._execute_write(_do))
+
     def apply_telegram_topic_migration(self) -> None:
         """Create Telegram DM topic-mode tables on explicit /topic opt-in.
 
