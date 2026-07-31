@@ -83,8 +83,10 @@ at Git revision `91d5ebe8a081620c0eb854998e071eb1bb65c2cb`; the audited file SHA
 An alternate local copy exists at
 `C:\Users\diego\.hermes\docs\superpowers\plans\2026-07-13-cross-harness-session-bridge.md`,
 but it has a different SHA-256 and is not the audited source. A fresh checkout
-therefore needs the stated external worktree (or an independently archived file
-with the recorded hash) to validate the CH rows.
+can validate the CH ledger claims and run the snapshot hash verifier from the
+repo-local frozen subset. The stated external worktree (or an independently
+archived file with the recorded hash) is needed only to independently
+re-extract the snapshot or verify its provenance and full-source hash.
 
 ## Canary registry
 
