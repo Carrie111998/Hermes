@@ -104,7 +104,12 @@ from tools.xai_http import hermes_xai_user_agent
 # ---------------------------------------------------------------------------
 
 def _import_edge_tts():
-    """Lazy import edge_tts. Returns the module or raises ImportError."""
+    """Lazy import edge_tts. Returns the module or raises ImportError.
+
+    On Windows, inject the native certificate store before importing edge_tts.
+    This allows corporate TLS-inspection CAs trusted by Windows to work with
+    edge_tts, which otherwise relies on certifi's Mozilla-only CA bundle.
+    """
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("tts.edge", prompt=False)
@@ -112,6 +117,19 @@ def _import_edge_tts():
         pass
     except Exception:
         pass
+
+    if os.name == "nt":
+        try:
+            import truststore
+            truststore.inject_into_ssl()
+        except ImportError:
+            logger.debug("truststore is unavailable; Edge TTS will use certifi")
+        except Exception as exc:
+            logger.warning(
+                "Could not inject Windows certificate store for Edge TTS: %s",
+                exc,
+            )
+
     import edge_tts
     return edge_tts
 
