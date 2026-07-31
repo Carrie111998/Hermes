@@ -289,6 +289,13 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    if task.block_kind is not None:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            f"task escalated to triage after repeated {task.block_kind!r} blocks; "
+            "waiting on human input — refusing to re-specify",
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
@@ -457,12 +464,13 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return decomposable task ids currently in the triage column."""
+    query = "SELECT id FROM tasks WHERE status = 'triage' AND block_kind IS NULL"
+    params: list[str] = []
+    if tenant is not None:
+        query += " AND tenant = ?"
+        params.append(tenant)
+    query += " ORDER BY priority DESC, created_at ASC LIMIT 1000"
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
-            conn,
-            status="triage",
-            tenant=tenant,
-            limit=1000,
-        )
-    return [row.id for row in rows]
+        rows = conn.execute(query, params).fetchall()
+    return [row["id"] for row in rows]

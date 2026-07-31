@@ -653,6 +653,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons.",
     )
+    p_unblock.add_argument(
+        "--recover-escalated", action="store_true",
+        help="Clear a human-reviewed triage escalation so the decomposer can retry it",
+    )
     p_unblock.add_argument("task_ids", nargs="+")
 
     p_promote = sub.add_parser(
@@ -2328,9 +2332,14 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"UNBLOCK: {reason}")
-            if not kb.unblock_task(conn, tid):
+            ok = (
+                kb.recover_escalated_triage_task(conn, tid)
+                if getattr(args, "recover_escalated", False)
+                else kb.unblock_task(conn, tid)
+            )
+            if not ok:
                 failed.append(tid)
-                print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
+                print(f"cannot unblock {tid} (not blocked/scheduled or escalated triage?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1

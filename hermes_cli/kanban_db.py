@@ -5751,6 +5751,19 @@ def promote_task(
     return True, None
 
 
+def recover_escalated_triage_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Acknowledge a human decision and make an escalated triage task decomposable."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET block_kind = NULL WHERE id = ? AND status = 'triage' AND block_kind IS NOT NULL",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "triage_escalation_recovered", None)
+        return True
+
+
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Transition ``blocked``/``scheduled`` -> ready or todo.
 

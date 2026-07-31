@@ -161,3 +161,40 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_blocked_triage_tasks_are_not_decomposed_until_a_human_clears_the_block(kanban_home):
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="awaiting capability", triage=True)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = ?, block_recurrences = ? WHERE id = ?",
+                ("capability", kb.BLOCK_RECURRENCE_LIMIT, task_id),
+            )
+
+    assert task_id not in decomp.list_triage_ids()
+    with patch("agent.auxiliary_client.call_llm") as call_llm:
+        outcome = decomp.decompose_task(task_id, author="me")
+    assert outcome.ok is False
+    assert "waiting on human input" in outcome.reason
+    call_llm.assert_not_called()
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status == "triage"
+        assert task.block_kind == "capability"
+        assert kb.recover_escalated_triage_task(conn, task_id) is True
+
+    assert task_id in decomp.list_triage_ids()
+
+    patches = _patch_list_profiles(["orchestrator"])
+    for profile_patch in patches:
+        profile_patch.start()
+    try:
+        with _patch_aux_client(
+            jsonlib.dumps({"fanout": False, "title": "respecified", "body": "ready to retry"})
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(task_id, author="me")
+    finally:
+        for profile_patch in patches:
+            profile_patch.stop()
+
+    assert outcome.ok is True
