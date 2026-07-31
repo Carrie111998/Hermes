@@ -1777,7 +1777,10 @@ def _manual_credential_entry(prompt, save_env_value, print_success) -> None:
     print_success("DingTalk credentials saved")
 
 
-def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
+def _apply_yaml_config(
+    yaml_cfg: dict,
+    dingtalk_cfg: dict,
+) -> dict | None:
     """Translate config.yaml dingtalk: keys into DINGTALK_* env vars.
 
     Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
@@ -1786,20 +1789,35 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
     Returns None — everything flows through env.
     """
     import json as _json
-    if "require_mention" in dingtalk_cfg and not os.getenv("DINGTALK_REQUIRE_MENTION"):
-        os.environ["DINGTALK_REQUIRE_MENTION"] = str(dingtalk_cfg["require_mention"]).lower()
-    if "mention_patterns" in dingtalk_cfg and not os.getenv("DINGTALK_MENTION_PATTERNS"):
-        os.environ["DINGTALK_MENTION_PATTERNS"] = _json.dumps(dingtalk_cfg["mention_patterns"])
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "dingtalk"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    if "require_mention" in dingtalk_cfg:
+        _write("DINGTALK_REQUIRE_MENTION", str(dingtalk_cfg["require_mention"]).lower(), "require_mention", lambda: not os.getenv("DINGTALK_REQUIRE_MENTION"))
+    if "mention_patterns" in dingtalk_cfg:
+        _write("DINGTALK_MENTION_PATTERNS", _json.dumps(dingtalk_cfg["mention_patterns"]), "mention_patterns", lambda: not os.getenv("DINGTALK_MENTION_PATTERNS"))
     frc = dingtalk_cfg.get("free_response_chats")
-    if frc is not None and not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["DINGTALK_FREE_RESPONSE_CHATS"] = str(frc)
+        _write("DINGTALK_FREE_RESPONSE_CHATS", str(frc), "free_response_chats", lambda: not os.getenv("DINGTALK_FREE_RESPONSE_CHATS"))
     ac = dingtalk_cfg.get("allowed_chats")
-    if ac is not None and not os.getenv("DINGTALK_ALLOWED_CHATS"):
+    if ac is not None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
-        os.environ["DINGTALK_ALLOWED_CHATS"] = str(ac)
+        _write("DINGTALK_ALLOWED_CHATS", str(ac), "allowed_chats", lambda: not os.getenv("DINGTALK_ALLOWED_CHATS"))
     allowed = dingtalk_cfg.get("allowed_users")
     if allowed is None:
         # Fall back to the documented nested paths (#44928). The docs
@@ -1826,10 +1844,11 @@ def _apply_yaml_config(yaml_cfg: dict, dingtalk_cfg: dict) -> dict | None:
                 if isinstance(_dt_extra, dict) and _dt_extra.get("allowed_users") is not None:
                     allowed = _dt_extra.get("allowed_users")
                     break
-    if allowed is not None and not os.getenv("DINGTALK_ALLOWED_USERS"):
+    if allowed is not None:
         if isinstance(allowed, list):
             allowed = ",".join(str(v) for v in allowed)
-        os.environ["DINGTALK_ALLOWED_USERS"] = str(allowed)
+        leaf = "allowed_users" if "allowed_users" in dingtalk_cfg else "extra.allowed_users"
+        _write("DINGTALK_ALLOWED_USERS", str(allowed), leaf, lambda: not os.getenv("DINGTALK_ALLOWED_USERS"))
     return None
 
 

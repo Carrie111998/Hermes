@@ -1215,19 +1215,34 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     update.  Returns ``None`` because no extras are seeded into
     ``PlatformConfig.extra`` directly (everything flows through env).
     """
-    if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
-        os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "mattermost"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    if "require_mention" in mattermost_cfg:
+        _write("MATTERMOST_REQUIRE_MENTION", str(mattermost_cfg["require_mention"]).lower(), "require_mention", lambda: not os.getenv("MATTERMOST_REQUIRE_MENTION"))
     frc = mattermost_cfg.get("free_response_channels")
-    if frc is not None and not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["MATTERMOST_FREE_RESPONSE_CHANNELS"] = str(frc)
+        _write("MATTERMOST_FREE_RESPONSE_CHANNELS", str(frc), "free_response_channels", lambda: not os.getenv("MATTERMOST_FREE_RESPONSE_CHANNELS"))
     # allowed_channels: if set, bot ONLY responds in these channels (whitelist)
     ac = mattermost_cfg.get("allowed_channels")
-    if ac is not None and not os.getenv("MATTERMOST_ALLOWED_CHANNELS"):
+    if ac is not None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
-        os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
+        _write("MATTERMOST_ALLOWED_CHANNELS", str(ac), "allowed_channels", lambda: not os.getenv("MATTERMOST_ALLOWED_CHANNELS"))
     return None  # all settings flow through env; nothing to merge into extras
 
 

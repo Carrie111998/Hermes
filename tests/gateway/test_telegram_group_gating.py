@@ -882,3 +882,99 @@ def test_identity_freshness_does_not_depend_on_host_uptime(monkeypatch):
 
     adapter._note_bot_username("new_helper_bot")
     assert adapter._bot_identity_is_fresh() is True
+def test_external_allowlist_override_still_controls_message_gating(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_FREE_RESPONSE_CHATS", "-1001")
+    adapter = _make_adapter(require_mention=True)
+    assert adapter._should_process_message(_group_message("hello", chat_id=-1001)) is True
+    assert adapter._should_process_message(_group_message("hello", chat_id=-1002)) is False
+
+
+def test_reporter_telegram_self_restart_refreshes_new_free_response_chat(tmp_path, monkeypatch):
+    import asyncio
+    import os
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures" / "issue-13582-telegram-self-restart.json").read_text(encoding="utf-8")
+    )
+    assert fixture["issue"] == 13582
+    assert fixture["host_os"] == "Windows 10"
+    assert fixture["platform"] == "telegram"
+    assert fixture["transport"] == "polling"
+    assert fixture["multiplex_profiles"] is True
+    assert fixture["restart_command"] == "/restart"
+    assert fixture["require_mention"] is True
+    assert fixture["updated_free_response_chats"] == ["-1001", "-1002"]
+    assert fixture["ordinary_message_chat"] in fixture["updated_free_response_chats"]
+    assert "mention-gated" in fixture["observed_stale_gating_log"]
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        "telegram:\n"
+        f"  require_mention: {str(fixture['require_mention']).lower()}\n"
+        "  free_response_chats:\n"
+        + "".join(f"    - {chat}\n" for chat in fixture["initial_free_response_chats"]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for env_name in (
+        "TELEGRAM_FREE_RESPONSE_CHATS",
+        "TELEGRAM_ALLOWED_CHATS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_ALLOWED_TOPICS",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    from gateway.config import Platform, load_gateway_config
+    try:
+        from gateway.yaml_env import clear_records
+        has_provenance = True
+    except ImportError:
+        clear_records = lambda: None
+        has_provenance = False
+    import gateway.run as gateway_run
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+
+    clear_records()
+    first = load_gateway_config()
+    assert os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] == ",".join(fixture["initial_free_response_chats"])
+    config_path.write_text(
+        "telegram:\n"
+        f"  require_mention: {str(fixture['require_mention']).lower()}\n"
+        "  free_response_chats:\n"
+        + "".join(f"    - {chat}\n" for chat in fixture["updated_free_response_chats"]),
+        encoding="utf-8",
+    )
+    calls = []
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner._detached_restart_helper_started = False
+    runner._restart_drain_timeout = 0.0
+    monkeypatch.setattr(gateway_run.sys, "platform", "win32")
+    monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
+    monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    import hermes_cli._subprocess_compat as subprocess_compat
+    monkeypatch.setattr(subprocess_compat, "windows_detach_popen_kwargs", lambda: {})
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kwargs: calls.append(kwargs) or MagicMock())
+    asyncio.run(runner._launch_detached_restart_command())
+    child_env = calls[0]["env"]
+    if has_provenance:
+        assert child_env.get("TELEGRAM_FREE_RESPONSE_CHATS") is None
+    else:
+        assert child_env.get("TELEGRAM_FREE_RESPONSE_CHATS") == "-1001"
+    with patch.dict(os.environ, child_env, clear=True):
+        child = load_gateway_config()
+        assert os.environ["TELEGRAM_FREE_RESPONSE_CHATS"] == ",".join(
+            fixture["updated_free_response_chats"]
+        )
+        adapter = TelegramAdapter(child.platforms[Platform.TELEGRAM])
+        adapter._bot = SimpleNamespace(id=999, username="hermes_bot")
+        assert adapter._telegram_free_response_chats() == set(
+            fixture["updated_free_response_chats"]
+        )
+        assert adapter._should_process_message(
+            _group_message("hello", chat_id=int(fixture["ordinary_message_chat"]))
+        ) is has_provenance
+    clear_records()

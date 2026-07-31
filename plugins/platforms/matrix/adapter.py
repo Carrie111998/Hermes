@@ -4916,38 +4916,47 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
     matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
     take precedence over YAML. Returns None — everything flows through env.
     """
-    if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
-        os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "matrix"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    def _write(name, value, leaf, predicate):
+        if yaml_env is not None:
+            return yaml_env.set_env_from_yaml(name, value, source_for(leaf), predicate=predicate)
+        if predicate():
+            os.environ[name] = value
+            return True
+        return False
+
+    if "require_mention" in matrix_cfg:
+        _write("MATRIX_REQUIRE_MENTION", str(matrix_cfg["require_mention"]).lower(), "require_mention", lambda: not os.getenv("MATRIX_REQUIRE_MENTION"))
     au = matrix_cfg.get("allowed_users")
-    if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
+    if au is not None:
         if isinstance(au, list):
             au = ",".join(str(v) for v in au)
-        os.environ["MATRIX_ALLOWED_USERS"] = str(au)
+        _write("MATRIX_ALLOWED_USERS", str(au), "allowed_users", lambda: not os.getenv("MATRIX_ALLOWED_USERS"))
     frc = matrix_cfg.get("free_response_rooms")
-    if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
+    if frc is not None:
         if isinstance(frc, list):
             frc = ",".join(str(v) for v in frc)
-        os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
+        _write("MATRIX_FREE_RESPONSE_ROOMS", str(frc), "free_response_rooms", lambda: not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"))
     ar = matrix_cfg.get("allowed_rooms")
-    if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
+    if ar is not None:
         if isinstance(ar, list):
             ar = ",".join(str(v) for v in ar)
-        os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
+        _write("MATRIX_ALLOWED_ROOMS", str(ar), "allowed_rooms", lambda: not os.getenv("MATRIX_ALLOWED_ROOMS"))
     ignore_patterns = matrix_cfg.get("ignore_user_patterns")
-    if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
+    if ignore_patterns is not None:
         if isinstance(ignore_patterns, list):
             ignore_patterns = ",".join(str(v) for v in ignore_patterns)
-        os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
-    if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
-        os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
-    if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
-        os.environ["MATRIX_SESSION_SCOPE"] = str(matrix_cfg["session_scope"]).lower()
-    if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
-        os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-    if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
-        os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
-    if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
-        os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
+        _write("MATRIX_IGNORE_USER_PATTERNS", str(ignore_patterns), "ignore_user_patterns", lambda: not os.getenv("MATRIX_IGNORE_USER_PATTERNS"))
+    for key, env in (("process_notices", "MATRIX_PROCESS_NOTICES"), ("session_scope", "MATRIX_SESSION_SCOPE"), ("auto_thread", "MATRIX_AUTO_THREAD"), ("dm_mention_threads", "MATRIX_DM_MENTION_THREADS"), ("max_message_length", "MATRIX_MAX_MESSAGE_LENGTH")):
+        if key in matrix_cfg:
+            value = str(matrix_cfg[key]).lower() if key != "max_message_length" else str(matrix_cfg[key])
+            _write(env, value, key, lambda env=env: not os.getenv(env))
     return None
 
 

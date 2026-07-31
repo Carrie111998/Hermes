@@ -5803,8 +5803,19 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     feishu_cfg block from gateway/config.py::load_gateway_config() (allow_bots).
     Env vars take precedence over YAML. Returns None — flows through env.
     """
-    if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
-        os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+    from gateway.yaml_env import get_yaml_env_context
+
+    _context = get_yaml_env_context()
+    yaml_env = _context.load if _context else None
+    source_prefix = _context.source_prefix if _context else "feishu"
+    source_for = _context.source_for if _context else lambda leaf: f"{source_prefix}.{leaf}"
+
+    if "allow_bots" in feishu_cfg:
+        value = str(feishu_cfg["allow_bots"]).lower()
+        if yaml_env is not None:
+            yaml_env.set_env_from_yaml("FEISHU_ALLOW_BOTS", value, source_for("allow_bots"), predicate=lambda: not os.getenv("FEISHU_ALLOW_BOTS"))
+        elif not os.getenv("FEISHU_ALLOW_BOTS"):
+            os.environ["FEISHU_ALLOW_BOTS"] = value
     return None
 
 

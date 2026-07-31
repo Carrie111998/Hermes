@@ -46,6 +46,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_AGENT_TIMEOUT_WARNING",
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_GATEWAY_BUSY_TEXT_MODE",
+            "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED",
             "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
             "HERMES_TIMEZONE",
         ):
@@ -57,7 +58,11 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
     env = dict(initial_env)
     env["HERMES_HOME"] = str(hermes_home)
     # Keep PATH / PYTHONPATH so venv imports resolve.
-    for k in ("PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME"):
+    for k in (
+        "PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME", "SystemRoot", "WINDIR",
+        "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "USERPROFILE",
+        "APPDATA", "LOCALAPPDATA", "PATHEXT",
+    ):
         if k in os.environ and k not in env:
             env[k] = os.environ[k]
 
@@ -149,3 +154,25 @@ def test_env_platform_connect_timeout_wins_over_config(hermes_home: Path) -> Non
     )
 
     assert env.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT") == "120"
+
+
+def test_guarded_runner_bridges_route_through_yaml_env_load(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _write_config(home, gateway_cfg={"platform_connect_timeout": 90}, display_cfg={"busy_steer_ack_enabled": True})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
+    env = _run_gateway_import(home, {})
+    assert env["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == "90"
+    assert env["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] == "True"
+
+
+def test_guarded_runner_bridges_preserve_empty_and_blank_semantics(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _write_config(home, gateway_cfg={"platform_connect_timeout": 90})
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "   ")
+    env = _run_gateway_import(home, {"HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT": "   "})
+    assert env["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] == "90"

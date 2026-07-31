@@ -127,7 +127,10 @@ class PlatformEntry:
     #
     # Signature: (yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]
     # Called from ``load_gateway_config()`` after the generic shared-key loop
-    # and before ``_apply_env_overrides``.  Mutating ``os.environ`` is allowed
+    # and before ``_apply_env_overrides``.  The active YAML provenance context
+    # is available through ``gateway.yaml_env.get_yaml_env_context()`` while
+    # the hook runs; ``context.source_for(leaf)`` resolves each effective leaf.
+    # Mutating ``os.environ`` is allowed
     # (use ``not os.getenv(...)`` guards to preserve env > YAML precedence);
     # any returned dict is merged into ``PlatformConfig.extra``.  Exceptions
     # are caught and logged at debug level.
@@ -181,6 +184,7 @@ class PlatformRegistry:
         # actually asks for that platform (gateway start, cron delivery,
         # `hermes setup`/`gateway status`, send_message).
         self._deferred: dict[str, Callable[[], None]] = {}
+        self._deferred_load_errors: set[str] = set()
 
     # -- deferred loading ----------------------------------------------------
 
@@ -207,6 +211,7 @@ class PlatformRegistry:
         try:
             loader()
         except Exception as e:
+            self._deferred_load_errors.add(name)
             logger.warning(
                 "Deferred load of platform '%s' failed: %s",
                 name,
@@ -228,6 +233,11 @@ class PlatformRegistry:
         for name in list(self._deferred):
             self._resolve(name)
 
+    @property
+    def deferred_load_errors(self) -> frozenset[str]:
+        """Return deferred platform loaders that failed during discovery."""
+        return frozenset(self._deferred_load_errors)
+
     def register(self, entry: PlatformEntry) -> None:
         """Register a platform adapter entry.
 
@@ -236,6 +246,7 @@ class PlatformRegistry:
         """
         # A concrete registration supersedes any pending deferred loader.
         self._deferred.pop(entry.name, None)
+        self._deferred_load_errors.discard(entry.name)
         if entry.name in self._entries:
             prev = self._entries[entry.name]
             logger.info(
@@ -250,6 +261,7 @@ class PlatformRegistry:
     def unregister(self, name: str) -> bool:
         """Remove a platform entry.  Returns True if it existed."""
         self._deferred.pop(name, None)
+        self._deferred_load_errors.discard(name)
         return self._entries.pop(name, None) is not None
 
     def get(self, name: str) -> Optional[PlatformEntry]:

@@ -1871,6 +1871,26 @@ _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 # Bridge config.yaml values into the environment so os.getenv() picks them up.
 # config.yaml is authoritative for terminal settings — overrides .env.
 _config_path = _hermes_home / 'config.yaml'
+from gateway.yaml_env import YamlEnvLoad as _YamlEnvLoad
+
+
+def _bootstrap_yaml_source(path: str) -> str:
+    try:
+        from hermes_cli import managed_scope
+
+        managed_keys = managed_scope.managed_config_keys()
+        if path in managed_keys:
+            return "managed-config"
+    except Exception:
+        pass
+    return "user-config"
+
+
+_bootstrap_yaml_env = _YamlEnvLoad(
+    f"gateway-bootstrap:{Path(_hermes_home).resolve()}",
+    source_resolver=_bootstrap_yaml_source,
+)
+_bootstrap_yaml_complete = True
 if _config_path.exists():
     try:
         # Presence-sensitive env bridge: raw read is deliberate — only keys the
@@ -1895,8 +1915,13 @@ if _config_path.exists():
             pass
         # Top-level simple values (fallback only — don't override .env)
         for _key, _val in _cfg.items():
-            if isinstance(_val, (str, int, float, bool)) and _key not in os.environ:
-                os.environ[_key] = str(_val)
+            if isinstance(_val, (str, int, float, bool)):
+                _bootstrap_yaml_env.set_env_from_yaml(
+                    _key,
+                    str(_val),
+                    _key,
+                    predicate=lambda _key=_key: _key not in os.environ,
+                )
         # Terminal config is nested — bridge to TERMINAL_* env vars.
         # config.yaml overrides .env for these since it's the documented config path.
         _terminal_cfg = _cfg.get("terminal", {})
@@ -2048,10 +2073,12 @@ if _config_path.exists():
             # bridges stay config-authoritative for backwards compatibility.
             if (
                 "busy_steer_ack_enabled" in _display_cfg
-                and "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ
             ):
-                os.environ["HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED"] = str(
-                    _display_cfg["busy_steer_ack_enabled"]
+                _bootstrap_yaml_env.set_env_from_yaml(
+                    "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED",
+                    str(_display_cfg["busy_steer_ack_enabled"]),
+                    "display.busy_steer_ack_enabled",
+                    predicate=lambda: "HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED" not in os.environ,
                 )
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
@@ -2094,14 +2121,16 @@ if _config_path.exists():
             # Unlike the agent.*/display.* bridges above (config-authoritative),
             # this env var is the manual-override escape hatch, so it WINS if
             # already set explicitly; otherwise config.yaml supplies the value.
-            if (
-                "platform_connect_timeout" in _gateway_cfg
-                and not os.environ.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip()
-            ):
-                os.environ["HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT"] = str(
-                    _gateway_cfg["platform_connect_timeout"]
+            if "platform_connect_timeout" in _gateway_cfg:
+                _bootstrap_yaml_env.set_env_from_yaml(
+                    "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
+                    str(_gateway_cfg["platform_connect_timeout"]),
+                    "gateway.platform_connect_timeout",
+                    predicate=lambda: not os.environ.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT", "").strip(),
                 )
     except Exception as _bridge_err:
+        _bootstrap_yaml_complete = False
+        _bootstrap_yaml_env.abort()
         # Previously this was silent (`except Exception: pass`), which
         # hid partial bridge failures and let .env defaults shadow
         # config.yaml values — users observed max_turns=500 in config
@@ -2119,6 +2148,10 @@ if _config_path.exists():
             "your current config.yaml. Run `hermes doctor` to investigate.",
             file=sys.stderr,
         )
+if _bootstrap_yaml_complete:
+    _bootstrap_yaml_env.finish()
+else:
+    _bootstrap_yaml_env.abort()
 
 # Apply IPv4 preference if configured (before any HTTP clients are created).
 try:
@@ -9486,12 +9519,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 """
             ).strip()
-            from tools.environments.local import build_subprocess_env
-            watcher_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
-            # This watcher is intentionally outside the running gateway. If it
-            # inherits the gateway marker, `hermes gateway restart` refuses to
-            # run as a self-restart loop guard and the gateway stays stopped.
-            watcher_env.pop("_HERMES_GATEWAY", None)
+            from hermes_cli.gateway import build_gateway_restart_environment
+            watcher_env = build_gateway_restart_environment()
             project_root = Path(__file__).resolve().parent.parent
             # The watcher runs sys.executable (console python) under the
             # CREATE_NO_WINDOW detach kwargs below: it owns one hidden
@@ -9576,9 +9605,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # _HERMES_GATEWAY=1 from us, and the CLI's self-restart loop guard
         # refuses to run when that marker is set — silently (DEVNULL), so the
         # gateway stops and never comes back.
-        from tools.environments.local import build_subprocess_env
-        watcher_env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
-        watcher_env.pop("_HERMES_GATEWAY", None)
+        from hermes_cli.gateway import build_gateway_restart_environment
+        watcher_env = build_gateway_restart_environment()
         setsid_bin = shutil.which("setsid")
         if setsid_bin:
             subprocess.Popen(

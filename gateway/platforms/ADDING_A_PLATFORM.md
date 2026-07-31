@@ -28,7 +28,9 @@ status display, gateway setup, and more.
   Mutating `os.environ` is allowed (use `not os.getenv(...)` guards to
   preserve env > YAML precedence); the returned dict is merged into
   `PlatformConfig.extra`.  Called during `load_gateway_config()` after
-  the generic shared-key loop and before `_apply_env_overrides()`.
+  the generic shared-key loop and before `_apply_env_overrides()`.  During
+  the hook, `get_yaml_env_context()` exposes `context.source_for(leaf)` so
+  provenance records the source of each effective leaf in a merged block.
 - `cron_deliver_env_var: str` — name of the `*_HOME_CHANNEL` env var.  When
   set, `deliver=<name>` cron jobs route to this var without editing
   `cron/scheduler.py`'s hardcoded sets.

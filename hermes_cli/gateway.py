@@ -738,6 +738,25 @@ def launch_detached_profile_gateway_restart(profile: str, old_pid: int) -> bool:
     return _spawn_gateway_restart_watcher(old_pid, _gateway_run_args_for_profile(profile))
 
 
+def build_gateway_restart_environment(
+    base: dict[str, str] | None = None,
+    *,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the environment for a direct replacement gateway process."""
+    if base is None:
+        from tools.environments.local import build_subprocess_env
+
+        base = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    from gateway.yaml_env import without_yaml_generated_env
+
+    env = without_yaml_generated_env(base)
+    env.pop("_HERMES_GATEWAY", None)
+    if extra:
+        env.update(extra)
+    return env
+
+
 def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
     """Spawn the detached watcher that respawns ``run_argv`` once ``old_pid`` exits."""
     if old_pid <= 0 or not run_argv:
@@ -868,6 +887,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         str(old_pid),
         *run_argv,
     ]
+    watcher_env = build_gateway_restart_environment()
 
     # Same platform-aware detach for the watcher process itself — so
     # closing the user's terminal doesn't kill the watcher.
@@ -876,6 +896,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
             watcher_argv,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            env=watcher_env,
             **windows_detach_popen_kwargs(),
         )
     except OSError:
@@ -894,6 +915,7 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
                 watcher_argv,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=watcher_env,
                 **fallback_kwargs,
             )
         except OSError:
@@ -3907,6 +3929,7 @@ def _spawn_detached_gateway() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
+                env=build_gateway_restart_environment(),
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
