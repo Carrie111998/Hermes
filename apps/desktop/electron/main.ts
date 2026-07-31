@@ -6010,44 +6010,23 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
         return
       }
 
-      if (await hasOauthSessionCookie(baseUrl)) {
-        finish(null)
+      try {
+        if (await hasOauthSessionCookie(baseUrl)) {
+          finish(null)
+        }
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error('Unknown authentication error'))
       }
     }
 
-    try {
-      win = new BrowserWindow({
-        width: 520,
-        height: 720,
-        title: silent ? 'Connecting to Hermes Cloud agent…' : 'Sign in to Hermes gateway',
-        autoHideMenuBar: true,
-        // Silent cascade: start HIDDEN. The auto-SSO 302 chain completes in
-        // well under a second, so the window normally never needs to show. We
-        // only reveal it as a fallback if the cascade DOESN'T complete quickly
-        // (e.g. the portal session lapsed and the gate fell through to the
-        // interactive chooser) — see the reveal timer below.
-        show: !silent,
-        webPreferences: {
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          session: sess,
-          webSecurity: true
-        }
-      })
-    } catch (error) {
-      finish(error instanceof Error ? error : new Error(String(error)))
+    const checkCookieHandler = () => void checkCookie()
 
-      return
+    win.webContents.on('did-navigate', checkCookieHandler)
+    win.webContents.on('did-redirect-navigation', checkCookieHandler)
+    win.webContents.on('did-frame-navigate', checkCookieHandler)
+    if (!settled) {
+      pollTimer = setInterval(() => void checkCookie(), 750)
     }
-
-    // Re-check the cookie jar on every successful navigation (the callback
-    // redirect is the moment cookies get set) plus a low-frequency poll as a
-    // belt-and-braces fallback for IDPs that finish via in-page JS.
-    win.webContents.on('did-navigate', () => void checkCookie())
-    win.webContents.on('did-redirect-navigation', () => void checkCookie())
-    win.webContents.on('did-frame-navigate', () => void checkCookie())
-    pollTimer = setInterval(() => void checkCookie(), 750)
 
     // Silent-mode reveal fallback: if the cascade hasn't settled shortly, the
     // auto-SSO didn't go through silently (no portal session, multi-provider,
@@ -6067,15 +6046,18 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
     }
 
     win.on('closed', () => {
+      clearTimeout(revealTimer)
+      win.webContents.removeListener('did-navigate', checkCookieHandler)
+      win.webContents.removeListener('did-redirect-navigation', checkCookieHandler)
+      win.webContents.removeListener('did-frame-navigate', checkCookieHandler)
       if (!settled) {
         finish(new Error('Login window closed before authentication completed.'))
       }
+      if (pollTimer) {
+        clearInterval(pollTimer)
+      }
     })
 
-    // ``next`` is intentionally omitted: the gateway lands on ``/`` after
-    // login, which is a valid authenticated page that sets the cookies. We
-    // only care that the cookie jar is populated.
-    //
     // silent=true loads the protected root so the gate auto-SSOs (no chooser);
     // silent=false loads the public ``/login`` chooser for interactive sign-in.
     const normalizedBase = normalizeRemoteBaseUrl(baseUrl)
@@ -6536,11 +6518,17 @@ function openPortalLoginWindow() {
         return
       }
 
-      // A live portal (Privy) session cookie means sign-in completed.
-      if (await hasLivePortalSession()) {
-        finish(null)
+      try {
+        // A live portal (Privy) session cookie means sign-in completed.
+        if (await hasLivePortalSession()) {
+          finish(null)
+        }
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error('Unknown authentication error'))
       }
     }
+
+    const checkCookieHandler = () => void checkCookie()
 
     try {
       win = new BrowserWindow({
@@ -6562,14 +6550,22 @@ function openPortalLoginWindow() {
       return
     }
 
-    win.webContents.on('did-navigate', () => void checkCookie())
-    win.webContents.on('did-redirect-navigation', () => void checkCookie())
-    win.webContents.on('did-frame-navigate', () => void checkCookie())
-    pollTimer = setInterval(() => void checkCookie(), 750)
+    win.webContents.on('did-navigate', checkCookieHandler)
+    win.webContents.on('did-redirect-navigation', checkCookieHandler)
+    win.webContents.on('did-frame-navigate', checkCookieHandler)
+    if (!settled) {
+      pollTimer = setInterval(() => void checkCookie(), 750)
+    }
 
     win.on('closed', () => {
+      win.webContents.removeListener('did-navigate', checkCookieHandler)
+      win.webContents.removeListener('did-redirect-navigation', checkCookieHandler)
+      win.webContents.removeListener('did-frame-navigate', checkCookieHandler)
       if (!settled) {
         finish(new Error('Sign-in window closed before authentication completed.'))
+      }
+      if (pollTimer) {
+        clearInterval(pollTimer)
       }
     })
 

@@ -1,5 +1,6 @@
-import type { TestProjectConfiguration } from 'vitest/config';
+import type { TestProjectConfiguration } from 'vitest/config'
 import { defineConfig } from 'vitest/config'
+import path from 'path'
 
 const reactUi: TestProjectConfiguration = {
   extends: './vite.config.ts',
@@ -9,9 +10,6 @@ const reactUi: TestProjectConfiguration = {
     setupFiles: ['./vitest.setup.ts'],
     include: ['src/**/*.test.{ts,tsx}'],
     globals: true,
-    // The first test in each file pays jsdom env init + full module transform,
-    // which can exceed vitest's 5000ms default under CI/load. 15s gives the
-    // cold start headroom without masking genuinely hung tests.
     testTimeout: 15_000
   }
 }
@@ -27,5 +25,10 @@ const electronNative: TestProjectConfiguration = {
 export default defineConfig({
   test: {
     projects: [reactUi, electronNative]
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src')
+    }
   }
 })
