@@ -2045,8 +2045,10 @@ def test_model_scoped_429_keeps_key_level_status_and_rotates_for_that_model(
         api_key_hint="***",
         model="gemini-3.5-flash-lite",
     )
-    assert next_entry is not None
-    assert next_entry.id == "cred-2"
+    # Both entries share the same runtime key ("***"), so the per-model
+    # bench propagates to the sibling: nothing is left to rotate to for the
+    # rate-limited model.
+    assert next_entry is None
 
     cred_1 = pool.entries()[0]
     assert cred_1.id == "cred-1"
@@ -2055,13 +2057,18 @@ def test_model_scoped_429_keeps_key_level_status_and_rotates_for_that_model(
     assert bench is not None
     assert bench["status_code"] == 429
     assert bench["until"] > time.time()
+    # Sibling sharing the failed key is benched for the model too, so
+    # model-aware rotation cannot reselect the same depleted key.
+    cred_2 = pool.entries()[1]
+    assert cred_2.last_status == "ok"
+    assert "gemini-3.5-flash-lite" in cred_2.model_exhaustions
 
     sel_x = pool.select(model="gemini-3.5-flash-lite")
-    assert sel_x is not None and sel_x.id == "cred-2"
+    assert sel_x is None  # every same-key entry benched for that model
     sel_y = pool.select(model="gemini-3.5-pro")
-    assert sel_y is not None and sel_y.id == "cred-1"
+    assert sel_y is not None and sel_y.id in {"cred-1", "cred-2"}
     sel_none = pool.select()
-    assert sel_none is not None and sel_none.id == "cred-1"  # no-model callers ignore benches
+    assert sel_none is not None and sel_none.id in {"cred-1", "cred-2"}  # no-model callers ignore benches
 
 
 def test_peek_and_has_available_ignore_model_benches(tmp_path, monkeypatch):

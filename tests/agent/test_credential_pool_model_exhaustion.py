@@ -318,3 +318,36 @@ def test_resolve_provider_client_threads_model_into_openrouter_select(monkeypatc
     assert client is not None
     assert captured["model"] == "google/gemini-3-flash-preview"
     assert final_model is not None
+
+
+def test_per_model_bench_propagates_to_same_key_siblings(tmp_path, monkeypatch):
+    """A per-model bench must cover every entry sharing the failed key.
+
+    Duplicate entries (an explicit pool entry plus a model_config entry
+    auto-seeded from the same model.api_key) carry the identical runtime
+    key. Benching only the matched entry would let model-aware rotation
+    reselect the same depleted key through its sibling.
+    """
+    payload = _two_key_pool_payload()
+    # cred-b shares cred-a's runtime key.
+    payload["credential_pool"]["custom"][1]["access_token"] = "tok-a"
+    pool = _load_pool(tmp_path, monkeypatch, payload)
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        api_key_hint="tok-a",
+        model="gemini-x",
+    )
+    # Both entries benched for gemini-x: nothing left to rotate to.
+    assert next_entry is None
+
+    key_a = _entry(pool, "cred-a")
+    key_b = _entry(pool, "cred-b")
+    assert key_a.last_status == "ok"
+    assert key_b.last_status == "ok"
+    assert "gemini-x" in key_a.model_exhaustions
+    assert "gemini-x" in key_b.model_exhaustions
+    # No entry selectable for the benched model...
+    assert pool.select(model="gemini-x") is None
+    # ...but both remain selectable for other models.
+    assert _selected_id(pool, "gemini-y") in {"cred-a", "cred-b"}
