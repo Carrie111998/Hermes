@@ -221,3 +221,48 @@ class TestMemoryManagerDedup:
         m.add_provider(_P("honcho"))
         m.add_provider(_P("hindsight"))
         assert m.provider_names == ["honcho", "hindsight"]
+
+
+class TestDisplayConsumersReportAllActive:
+    """#5688 broken-window sweep: STATUS/DIAGNOSTIC/DUMP surfaces must not
+    under-report active providers in multi-provider mode. A trusted surface
+    that shows only the singular provider (blanked at 2+ by the setter) LIES
+    about system state. Behavior contract: every active provider is reported.
+    """
+
+    def test_dump_reports_all_active_providers(self):
+        from hermes_cli.dump import _memory_provider
+
+        # Multi: ordered list governs, singular blank (canonical setter shape).
+        assert _memory_provider(
+            {"memory": {"providers": ["honcho", "mem0"], "provider": ""}}
+        ) == "honcho, mem0"
+        # Single legacy fallback still works.
+        assert _memory_provider({"memory": {"provider": "mem0"}}) == "mem0"
+        # Empty => built-in.
+        assert _memory_provider({"memory": {"providers": [], "provider": ""}}) == "built-in"
+        assert _memory_provider({}) == "built-in"
+
+    def test_discover_flags_every_missing_active_provider(self, temp_hermes_home, monkeypatch):
+        """web_server.discover_memory_providers must flag a missing 2nd/3rd
+        active provider, not just the singular one."""
+        import hermes_cli.web_server as ws
+
+        _write_config(
+            temp_hermes_home,
+            "memory:\n  providers:\n    - ghost_a\n    - ghost_b\n",
+        )
+        # No plugins discovered on disk => both actives are "configured but
+        # missing". The old singular read would flag at most one.
+        import plugins.memory as _plugins_memory
+        monkeypatch.setattr(_plugins_memory, "discover_memory_providers", lambda: [])
+        # Stub the per-row enrichment so we only assess the missing-map logic.
+        monkeypatch.setattr(ws, "_load_memory_provider", lambda name: None)
+        monkeypatch.setattr(ws, "_memory_provider_setup_info", lambda name: {})
+        monkeypatch.setattr(ws, "_memory_provider_is_configured", lambda name, provider: False)
+        monkeypatch.setattr(ws, "_normalize_memory_provider_schema", lambda name, provider: [])
+
+        rows = ws._discover_memory_provider_statuses()
+        by_name = {r["name"]: r for r in rows}
+        assert by_name["ghost_a"]["status"] == "missing"
+        assert by_name["ghost_b"]["status"] == "missing"

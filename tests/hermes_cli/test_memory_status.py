@@ -54,4 +54,31 @@ class TestMemoryStatusLabels:
         assert "disabled ✗" in out
 
 
+class TestMemoryStatusReportsAllActiveProviders:
+    """FR-7/#5688: `hermes memory status` must report EVERY active provider,
+    not just the legacy singular field (blanked by the canonical setter at 2+).
+    Behavior contract: each configured provider name appears in the output.
+    """
+
+    def test_single_provider_shown(self, capfd):
+        out = _run_cmd_status(capfd, mem_config={"provider": "mem0"})
+        assert "Provider:" in out
+        assert "mem0" in out
+
+    def test_multiple_active_providers_all_shown(self, capfd):
+        # Canonical multi-provider shape: ordered list governs, singular blank.
+        out = _run_cmd_status(
+            capfd, mem_config={"providers": ["honcho", "mem0"], "provider": ""}
+        )
+        assert "Provider:" in out
+        # BOTH must appear — the old singular read would have shown neither.
+        assert "honcho" in out
+        assert "mem0" in out
+
+    def test_no_provider_shows_builtin_only(self, capfd):
+        out = _run_cmd_status(capfd, mem_config={"providers": [], "provider": ""})
+        assert "Provider:" in out
+        assert "none" in out or "built-in" in out
+
+
 

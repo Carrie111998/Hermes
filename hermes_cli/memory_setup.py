@@ -477,11 +477,14 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 
 def cmd_status(args) -> None:
     """Show current memory provider config."""
-    from hermes_cli.config import load_config
+    from hermes_cli.config import get_active_memory_providers, load_config
 
     config = load_config()
     mem_config = config.get("memory", {})
-    provider_name = mem_config.get("provider", "")
+    # Report the full active list via the FR-1 resolver (#5688), not just the
+    # legacy singular field — which the canonical setter blanks at 2+ providers.
+    active_providers = get_active_memory_providers(config)
+    provider_name = ", ".join(active_providers)
 
     memory_enabled = mem_config.get("memory_enabled", True)
     user_profile_enabled = mem_config.get("user_profile_enabled", True)

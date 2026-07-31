@@ -5783,17 +5783,18 @@ def _discover_memory_provider_statuses() -> List[Dict[str, Any]]:
         _log.exception("discover_memory_providers failed")
 
     cfg = load_config()
-    active = ""
-    mem = cfg.get("memory")
-    if isinstance(mem, dict):
-        active = _normalize_memory_provider_name(mem.get("provider"))
-    if active and active not in discovered:
-        discovered[active] = {
-            "name": active,
-            "description": "Configured provider was not found.",
-            "available": False,
-            "missing": True,
-        }
+    # Flag EVERY configured-but-missing active provider, not just the singular
+    # one — route through the FR-1 resolver (#5688) so a missing 2nd/3rd
+    # provider is surfaced too. Normalize to drop built-in sentinels.
+    for raw_name in get_active_memory_providers(cfg):
+        active = _normalize_memory_provider_name(raw_name)
+        if active and active not in discovered:
+            discovered[active] = {
+                "name": active,
+                "description": "Configured provider was not found.",
+                "available": False,
+                "missing": True,
+            }
 
     providers: List[Dict[str, Any]] = []
     for name in sorted(discovered):
