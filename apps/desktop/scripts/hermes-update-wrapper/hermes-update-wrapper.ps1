@@ -240,11 +240,18 @@ if (Test-Path -LiteralPath $LOCK_FILE) {
 Write-Log ("launching real installer: {0} {1}" -f $REAL_INSTALLER, $argSummary)
 
 $installStart = Get-Date
-$proc = Start-Process -FilePath $REAL_INSTALLER `
-                     -ArgumentList $args `
-                     -PassThru `
-                     -NoNewWindow `
-                     -WorkingDirectory $HERMES_HOME
+# PowerShell 5.1's Start-Process rejects -ArgumentList when it's an empty array,
+# so build the start args conditionally. Splatting skips absent keys cleanly.
+$startArgs = @{
+    FilePath         = $REAL_INSTALLER
+    PassThru         = $true
+    NoNewWindow      = $true
+    WorkingDirectory = $HERMES_HOME
+}
+if ($null -ne $args -and $args.Count -gt 0) {
+    $startArgs.ArgumentList = @($args)
+}
+$proc = Start-Process @startArgs
 $proc.WaitForExit()
 $installSeconds = [math]::Round(((Get-Date) - $installStart).TotalSeconds, 1)
 $exitCode = $proc.ExitCode
