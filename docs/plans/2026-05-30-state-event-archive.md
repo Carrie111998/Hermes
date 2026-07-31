@@ -269,15 +269,18 @@ scripts/run_tests.sh tests/hermes_cli/test_session_archive.py -q
 **Objective:** Import a verified archive into a local `SessionDB` without duplicating existing messages.
 
 **Files:**
+- Modify: `hermes_state.py`
 - Modify: `hermes_cli/session_archive.py`
 - Test: `tests/hermes_cli/test_session_archive.py`
+- Test: `tests/test_hermes_state.py`
 
 **Approach:**
 - Use `session_id` from the archive unless an explicit `--prefix-session-id` / `--remap-session-id` is requested later.
 - Create missing sessions with existing SessionDB APIs.
 - For each message, deduplicate on `(session_id, message_index, payload_sha256)` using a small archive import ledger.
-- Insert each restored message through `append_message`, then apply one explicit `UPDATE messages SET active=?, compacted=? WHERE id=?` using the returned row ID. `append_message()` currently has no `active` or `compacted` parameter (`hermes_state.py:5450-5473`), so preserving soft-deleted/compacted state requires this small but real write-path addition; the existing API must not be described as already supporting it.
-- If adding a table is too much for the first code PR, start with a sidecar import receipt file under a Hermes-controlled cache directory and leave DB ledger as the next PR.
+- Add one transaction-capable `SessionDB` archive-import primitive in `hermes_state.py`. For each archive message, one `_execute_write` callback must perform the ledger lookup, message insertion, restoration of `active` / `compacted`, all corresponding session-counter updates, and ledger insertion on the same connection. The unique ledger key remains the concurrency backstop; a duplicate key means the message is already imported rather than authorizing a second insert.
+- Reuse append's transaction-local SQL by extracting an internal helper that accepts the callback's `sqlite3.Connection`, or implement the dedicated archive insert inside that callback. Do **not** call public `append_message()` from inside the import transaction: it currently owns a separate `_execute_write` and commits when that callback returns (`hermes_state.py:5612-5614`, `_execute_write` at `hermes_state.py:2317-2368`), so it is neither a transaction-sharing nor safely nestable API. `append_message()` also has no `active` or `compacted` parameter (`hermes_state.py:5450-5473`), so preserving lifecycle state remains a real write-path addition.
+- The DB ledger and the atomic import primitive are required in the first idempotent-import code PR. A sidecar receipt cannot atomically commit with SQLite message state and must not be used as the idempotence boundary.
 
 Preferred DB table for stable idempotency:
 
@@ -296,6 +299,7 @@ CREATE TABLE IF NOT EXISTS session_archive_imports (
 **Tests:**
 - import archive into empty DB creates session/messages,
 - importing same archive twice does not duplicate messages,
+- parameterized fault injection after message insertion and after lifecycle restoration (before the ledger write) raises from inside the import transaction; each failure rolls back the message row, ledger row, and session counters, and retrying the same archive then restores exactly one message and one ledger row (with a further retry remaining a no-op),
 - import preserves roles/content/tool metadata,
 - FTS assertions distinguish lifecycle state: restored `compacted=1` rows are included by `search_messages()` by default, while rewind rows (`active=0, compacted=0`) remain hidden (`hermes_state.py:6039-6045`). Do not promise blanket FTS visibility for every restored inactive row.
 
