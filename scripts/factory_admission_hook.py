@@ -646,6 +646,83 @@ def _command_substitution_bodies(command):
     return scan["bodies"]
 
 
+def _token_has_path_expansion(token):
+    r"""True when a shell token carries an expansion that rewrites its path.
+
+    ``shlex`` hands back tokens with quotes still attached (``posix=False``),
+    so quoting state is recoverable here: only *unquoted* metacharacters
+    expand. Covered classes, each of which Bash resolves to a path the hook
+    never sees:
+
+    * tilde — ``~``, ``~/x``, ``~user`` expand to ``$HOME``/another account's
+      home, while a literal reading anchors them under the workspace;
+    * globbing — ``*``, ``?``, ``[...]``;
+    * brace expansion — ``{a,b}``;
+    * process substitution — ``<(...)`` / ``>(...)``.
+
+    ``expanduser`` is deliberately NOT used: ``~user`` and environment-driven
+    expansion are host state, not a target this hook can prove ownership of.
+    """
+    if not isinstance(token, str) or not token:
+        return False
+    quote = None
+    brace_depth = 0
+    for index, char in enumerate(token):
+        if quote == "'":
+            if char == "'":
+                quote = None
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            continue
+        if char == "\\":
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        # Tilde only expands at the start of an unquoted word or right after
+        # an unquoted ``=`` or ``:`` (PATH-like assignments).
+        if char == "~" and (index == 0 or token[index - 1] in "=:"):
+            return True
+        if char in {"*", "?", "["}:
+            return True
+        if char == "{":
+            brace_depth += 1
+            continue
+        if char == "}" and brace_depth:
+            return True
+        if char in {"<", ">"} and token[index + 1:index + 2] == "(":
+            return True
+    return False
+
+
+def _command_has_path_expansion(command):
+    """True when any word of the command carries an unresolved path expansion.
+
+    Runs on the masked form so an already-rejected substitution body does not
+    double-report, and fails closed when the command cannot be scanned.
+    """
+    masked = _mask_active_command_substitutions(command)
+    if masked is None:
+        return True
+    if "<(" in masked or ">(" in masked:
+        # Process substitution survives masking; catch it before tokenizing.
+        return True
+    try:
+        lexer = shlex.shlex(masked, posix=False, punctuation_chars=";&|()<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return True
+    return any(
+        not _is_shell_control_token(token) and _token_has_path_expansion(token)
+        for token in tokens
+    )
+
+
 def _substitution_bodies_are_readonly(command):
     """True only when every ``$(...)``/backtick body is a literal readonly call.
 
@@ -809,6 +886,10 @@ def _terminal_has_unresolved_dynamic_target(command, depth=0):
     command. Literal single-quoted dollars remain safe data.
     """
     if depth >= _MAX_REPARSED_SHELL_DEPTH:
+        return True
+    if _command_has_path_expansion(command):
+        # Tilde/glob/brace/process-substitution rewrite the effective path
+        # before the hook could resolve ownership of it.
         return True
     marker = _DYNAMIC_SUBSTITUTION_MARKER
     masked_command = _mask_active_command_substitutions(command)

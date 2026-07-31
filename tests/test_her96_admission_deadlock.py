@@ -1390,3 +1390,73 @@ def test_real_shell_oracle_confirms_blocked_payloads_would_have_executed(tmp_pat
         assert sentinel.exists(), (
             f"oracle did not execute the payload, test is not proving anything: {command}"
         )
+
+
+# ---------------------------------------------------------------------------
+# R3-B3 — shell path expansions must not escape ownership resolution
+# ---------------------------------------------------------------------------
+
+# Bash expands these to paths the hook never resolves: the hook treats a
+# literal ``~/x`` as relative to the workspace while the shell rewrites it to
+# ``$HOME/x``. Same class for globs, braces and process substitution.
+PATH_EXPANSION_PAYLOADS = [
+    "touch ~/pwned",
+    "git -C ~/other commit -am x",
+    "cd ~/other && git commit -am x",
+    "touch ~user/pwned",
+    "git -C ~ status --short",
+    "cp file ~/pwned",
+    "touch pwned*",
+    "rm -f build/*.o",
+    "touch {a,b}",
+    "cat <(touch pwned)",
+    "tee >(touch pwned)",
+    "touch a?b",
+    "touch [ab]c",
+]
+
+
+@pytest.mark.parametrize("command", PATH_EXPANSION_PAYLOADS)
+def test_path_expansion_is_unresolved_at_helper_level(command):
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import factory_admission_hook as hook
+
+    assert hook._terminal_has_unresolved_dynamic_target(command) is True, command
+
+
+@pytest.mark.parametrize("command", PATH_EXPANSION_PAYLOADS)
+def test_path_expansion_blocked_with_valid_owner(tmp_path, command):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(registry, payload("terminal", {"command": command}, repo))
+    assert decision(result)["decision"] == "block", command
+
+
+@pytest.mark.parametrize("command", PATH_EXPANSION_PAYLOADS)
+def test_path_expansion_blocked_preclaim(tmp_path, command):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    result = run_hook(tmp_path / "missing", payload("terminal", {"command": command}, outside))
+    assert decision(result)["decision"] == "block", command
+
+
+@pytest.mark.parametrize("command", [
+    # Literal, ownership-resolvable targets keep working.
+    "touch pwned",
+    "touch sub/file.txt",
+    "git commit -am x",
+    "git -C . status --short",
+    "cd sub && git commit -am x",
+    # A literal tilde that cannot expand: quoted, so it is ordinary data.
+    "touch './~literal'",
+    # Home-anchored discovery reads stay readonly through the normal grammar.
+    "pwd",
+])
+def test_literal_targets_are_not_treated_as_expansion(tmp_path, command):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    (repo / "sub").mkdir()
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(registry, payload("terminal", {"command": command}, repo))
+    assert decision(result)["decision"] == "allow", command
