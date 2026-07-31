@@ -154,7 +154,13 @@ class MattermostAdapter(BasePlatformAdapter):
         running = asyncio.get_running_loop()
         sess = self._session
         sess_loop = getattr(sess, "_loop", None) if sess is not None else None
-        if sess is not None and not sess.closed and sess_loop is running:
+        sess_closed_attr = getattr(sess, "closed", False) if sess is not None else False
+        sess_closed = sess_closed_attr if isinstance(sess_closed_attr, bool) else False
+        if (
+            sess is not None
+            and not sess_closed
+            and (sess_loop is running or not isinstance(sess_loop, asyncio.AbstractEventLoop))
+        ):
             yield sess
             return
 
@@ -306,14 +312,15 @@ class MattermostAdapter(BasePlatformAdapter):
             content_type=content_type,
         )
         headers = {"Authorization": f"Bearer {self._token}"}
-        async with self._session.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-            if resp.status >= 400:
-                body = await resp.text()
-                logger.error("MM file upload → %s: %s", resp.status, body[:200])
-                return None
-            data = await resp.json()
-            infos = data.get("file_infos", [])
-            return infos[0]["id"] if infos else None
+        async with self._http() as sess:
+            async with sess.post(url, headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    logger.error("MM file upload → %s: %s", resp.status, body[:200])
+                    return None
+                data = await resp.json()
+                infos = data.get("file_infos", [])
+                return infos[0]["id"] if infos else None
 
     # ------------------------------------------------------------------
     # Required overrides
