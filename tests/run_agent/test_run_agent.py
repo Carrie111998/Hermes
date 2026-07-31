@@ -1238,7 +1238,7 @@ class TestBuildApiKwargs:
         """The core GitHub Responses path must preserve a supported xhigh."""
         monkeypatch.setattr(
             "hermes_cli.models.github_model_reasoning_efforts",
-            lambda _model: ["none", "low", "medium", "high", "xhigh"],
+            lambda _model, **_kw: ["none", "low", "medium", "high", "xhigh"],
         )
         agent.model = "gpt-5.5"
         agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
@@ -1254,7 +1254,7 @@ class TestBuildApiKwargs:
         """
         monkeypatch.setattr(
             "hermes_cli.models.github_model_reasoning_efforts",
-            lambda _model: ["low", "medium", "high", "xhigh", "max"],
+            lambda _model, **_kw: ["low", "medium", "high", "xhigh", "max"],
         )
         agent.model = "claude-opus-5"
         agent.reasoning_config = {"enabled": True, "effort": "ultra"}
@@ -1268,7 +1268,7 @@ class TestBuildApiKwargs:
         supported = ["low", "medium", "high", "max"]
         monkeypatch.setattr(
             "hermes_cli.models.github_model_reasoning_efforts",
-            lambda _model: supported,
+            lambda _model, **_kw: supported,
         )
         agent.model = "claude-opus-4.6"
 

@@ -31,9 +31,16 @@ class CopilotProfile(ProviderProfile):
         extra_body: dict[str, Any] = {}
         if supports_reasoning and model:
             try:
-                from hermes_cli.models import github_model_reasoning_efforts
+                # The agent resolves the catalog's effort list once per
+                # (model, base_url) with the route's key in hand and forwards
+                # it here. Re-resolving locally would repeat that work without
+                # the key, and a keyless lookup only recognizes o-series and
+                # GPT-5 IDs — every Claude slot would come back empty (#74295).
+                supported_efforts = ctx.get("copilot_reasoning_efforts")
+                if supported_efforts is None:
+                    from hermes_cli.models import github_model_reasoning_efforts
 
-                supported_efforts = github_model_reasoning_efforts(model)
+                    supported_efforts = github_model_reasoning_efforts(model)
                 if supported_efforts and reasoning_config:
                     effort = reasoning_config.get("effort", "medium")
                     # Honor the requested level when the live Copilot catalog
