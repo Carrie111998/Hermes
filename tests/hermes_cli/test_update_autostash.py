@@ -417,7 +417,7 @@ def test_rename_reserved_untracked_noop_on_non_windows(tmp_path, monkeypatch):
 
 
 def test_restore_reserved_renames_restores_original_names(tmp_path, monkeypatch):
-    """Renamed files are restored to their original names."""
+    """Renamed files are restored to their original names when passed explicitly."""
     from hermes_cli.update_cmd import _restore_reserved_renames
     from hermes_cli import main as hermes_main
 
@@ -427,7 +427,11 @@ def test_restore_reserved_renames_restores_original_names(tmp_path, monkeypatch)
     (tmp_path / ".hermes_reserved_name_CON.txt").write_text("con content")
     (tmp_path / ".hermes_reserved_name_AUX.md").write_text("aux content")
 
-    _restore_reserved_renames(tmp_path)
+    renames = [
+        (tmp_path / "CON.txt", tmp_path / ".hermes_reserved_name_CON.txt"),
+        (tmp_path / "AUX.md", tmp_path / ".hermes_reserved_name_AUX.md"),
+    ]
+    _restore_reserved_renames(tmp_path, renames)
 
     assert (tmp_path / "CON.txt").exists()
     assert (tmp_path / "AUX.md").exists()
@@ -539,3 +543,149 @@ def test_restore_stashed_changes_restores_reserved_names_after_apply(
 
     out = capsys.readouterr().out
     assert "Restored reserved file name: CON.txt" in out
+
+
+def test_restore_reserved_renames_via_sidecar_file(tmp_path, monkeypatch):
+    """Renamed files are restored from the sidecar map when no explicit list is given."""
+    import json
+    from hermes_cli.update_cmd import (
+        _restore_reserved_renames,
+        _RESERVED_RENAME_MAP_FILE,
+    )
+    from hermes_cli import main as hermes_main
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    (tmp_path / ".hermes_reserved_name_CON.txt").write_text("con content")
+    (tmp_path / ".hermes_reserved_name_PRN.md").write_text("prn content")
+
+    map_data = {
+        "CON.txt": ".hermes_reserved_name_CON.txt",
+        "PRN.md": ".hermes_reserved_name_PRN.md",
+    }
+    (tmp_path / _RESERVED_RENAME_MAP_FILE).write_text(
+        json.dumps(map_data), encoding="utf-8"
+    )
+
+    _restore_reserved_renames(tmp_path)
+
+    assert (tmp_path / "CON.txt").exists()
+    assert (tmp_path / "PRN.md").exists()
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert not (tmp_path / ".hermes_reserved_name_PRN.md").exists()
+    assert not (tmp_path / _RESERVED_RENAME_MAP_FILE).exists()
+
+
+def test_stash_push_failure_restores_reserved_names(
+    tmp_path, monkeypatch
+):
+    """If stash push fails, temporarily-renamed files are restored immediately."""
+    import shutil
+    import subprocess
+    from unittest.mock import MagicMock
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    from hermes_cli import main as hermes_main
+    from hermes_cli.update_cmd import _stash_local_changes_if_needed
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    # Create a reserved-name untracked file
+    (tmp_path / "CON.txt").write_text("con content")
+
+    orig_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        # Intercept only the stash push call to make it fail.
+        if (
+            isinstance(cmd, list)
+            and len(cmd) >= 5
+            and cmd[1:5] == ["stash", "push", "--include-untracked", "-m"]
+        ):
+            mock = MagicMock()
+            mock.returncode = 1
+            mock.stdout = ""
+            mock.stderr = "stash push failed"
+            mock.args = cmd
+            return mock
+        return orig_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _stash_local_changes_if_needed(["git"], tmp_path)
+
+    # The original file should have been restored
+    assert (tmp_path / "CON.txt").exists()
+    assert (tmp_path / "CON.txt").read_text() == "con content"
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+
+
+def test_manual_stash_apply_recovery_via_sidecar(
+    tmp_path, monkeypatch
+):
+    """Simulate manual `git stash apply` then recover via sidecar map."""
+    import shutil
+    import subprocess
+    import json
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    from hermes_cli import main as hermes_main
+    from hermes_cli.update_cmd import (
+        _stash_local_changes_if_needed,
+        _restore_stashed_changes,
+        _restore_reserved_renames,
+        _RESERVED_RENAME_MAP_FILE,
+    )
+
+    monkeypatch.setattr(hermes_main, "_is_windows", lambda: True)
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "tracked.txt").write_text("v1\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    # Create a reserved-name untracked file
+    (tmp_path / "CON.txt").write_text("con content")
+
+    stash_ref = _stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref is not None
+    assert not (tmp_path / "CON.txt").exists()
+    # Sidecar was stashed along with the renamed file; not in working tree.
+    assert not (tmp_path / _RESERVED_RENAME_MAP_FILE).exists()
+
+    # Simulate user manually applying the stash (the renamed file and sidecar come back)
+    git("stash", "apply", "stash@{0}")
+    # After manual apply, the prefixed file and sidecar exist again.
+    assert (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert (tmp_path / _RESERVED_RENAME_MAP_FILE).exists()
+
+    # Recovery via sidecar (no explicit list → reads sidecar)
+    _restore_reserved_renames(tmp_path)
+
+    assert (tmp_path / "CON.txt").exists()
+    assert not (tmp_path / ".hermes_reserved_name_CON.txt").exists()
+    assert not (tmp_path / _RESERVED_RENAME_MAP_FILE).exists()
