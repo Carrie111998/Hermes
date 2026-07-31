@@ -276,7 +276,12 @@ def _resolve_mcp_server_config(config: dict) -> dict:
 
 
 def _probe_single_server(
-    name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
+    name: str,
+    config: dict,
+    connect_timeout: Optional[float] = None,
+    *,
+    details: Optional[dict] = None,
+    truncate_descriptions: bool = True,
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
@@ -286,6 +291,10 @@ def _probe_single_server(
     ``details``: optional dict the probe fills with extra capability counts
     (``prompts``, ``resources``) — an out-param so the return shape stays
     stable for existing CLI callers.
+
+    ``truncate_descriptions``: mặc định True để giữ nguyên hành vi cũ cho các
+    caller hiện có (in gọn ra CLI). Truyền False khi caller là 1 API/dashboard
+    cần mô tả đầy đủ (vd. route dashboard test) — không cắt còn 80 ký tự.
     """
     issues = validate_mcp_server_entry(name, config)
     if issues:
@@ -317,8 +326,10 @@ def _probe_single_server(
         try:
             for t in server._tools:
                 desc = getattr(t, "description", "") or ""
-                # Truncate long descriptions for display
-                if len(desc) > 80:
+                # Truncate long descriptions for display — chỉ áp dụng khi
+                # caller không yêu cầu mô tả đầy đủ (mặc định True, giữ hành
+                # vi CLI cũ nguyên vẹn).
+                if truncate_descriptions and len(desc) > 80:
                     desc = desc[:77] + "..."
                 tools_found.append((t.name, desc))
             if details is not None:
