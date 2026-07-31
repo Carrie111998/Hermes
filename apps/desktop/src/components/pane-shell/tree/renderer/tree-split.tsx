@@ -258,10 +258,13 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
       //    so it keeps absorbing the remainder and no leftover gap can open.
       //  - a flex-vs-flex seam pins both sides to `0 1 <px>`. Their combined
       //    px is constant, so sibling flex tracks see the same leftover.
-      //  - cleanup: a real drag commits the store once, and React's re-render
-      //    rewrites the `flex` shorthand, which clears the overrides (writing
-      //    the shorthand resets the longhands). A no-movement click restores
-      //    the captured style attribute instead, since nothing re-renders.
+      //  - cleanup: restore the captured style attribute FIRST, then commit
+      //    the store once. The commit can be a store no-op (drag released at
+      //    the px an override already holds -> setPaneWidthOverride returns
+      //    early, nothing notifies, nothing re-renders), so relying on the
+      //    re-render to rewrite `flex` would leave the preview stuck on the
+      //    DOM. When the store does notify, React's re-render rewrites the
+      //    same styles anyway, so restoring first is never wrong.
       const applyShift = (shiftPx: number) => {
         if (a.fixed) {
           a.paneIds.forEach(id => setOverride(id, Math.round(a0px + shiftPx)))
@@ -307,15 +310,13 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
       }
 
       const cleanup = () => {
-        resize.finish()
+        try {
+          resize.finish()
 
-        if (lastShift !== null) {
-          // One store commit; the re-render rewrites `flex` and clears the
-          // preview overrides.
-          applyShift(lastShift)
-        } else {
-          // Click without movement: nothing will re-render, so put the
-          // wrappers' inline styles back exactly as React last wrote them.
+          // Restore the captured styles BEFORE the store commit: if the
+          // commit is a no-op (released at the px an override already
+          // holds), nothing re-renders and a preview left in place would
+          // stick (frozen grow / stale basis) until some unrelated render.
           if (styleA === null) {
             kidA.removeAttribute('style')
           } else {
@@ -327,24 +328,34 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
           } else {
             kidB.setAttribute('style', styleB)
           }
+
+          if (lastShift !== null) {
+            // One store commit at the released position.
+            applyShift(lastShift)
+          }
+        } finally {
+          // Teardown must survive a throwing store commit: a stuck sash
+          // depth freezes every :root geometry-var write for the rest of
+          // the session (see geometry.ts), and a kept pointer listener
+          // would keep previewing a dead drag.
+          //
+          // Geometry vars re-enable AFTER the final store commit above, so
+          // the release publishes exactly one fresh measurement.
+          endSashDrag()
+          document.body.style.cursor = restoreCursor
+          document.body.style.userSelect = restoreSelect
+
+          try {
+            handle.releasePointerCapture?.(pointerId)
+          } catch {
+            // Mirror.
+          }
+
+          window.removeEventListener('pointermove', onMove, true)
+          window.removeEventListener('pointerup', cleanup, true)
+          window.removeEventListener('pointercancel', cleanup, true)
+          persistTree()
         }
-
-        // Geometry vars re-enable AFTER the final store commit above, so the
-        // release publishes exactly one fresh measurement.
-        endSashDrag()
-        document.body.style.cursor = restoreCursor
-        document.body.style.userSelect = restoreSelect
-
-        try {
-          handle.releasePointerCapture?.(pointerId)
-        } catch {
-          // Mirror.
-        }
-
-        window.removeEventListener('pointermove', onMove, true)
-        window.removeEventListener('pointerup', cleanup, true)
-        window.removeEventListener('pointercancel', cleanup, true)
-        persistTree()
       }
 
       window.addEventListener('pointermove', onMove, true)
