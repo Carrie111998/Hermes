@@ -9473,6 +9473,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return False
 
+    def _should_handle_background_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /background should be dispatched immediately while the agent is running.
+
+        /background (and aliases /bg, /btw) MUST bypass _pending_input when the
+        agent is active for the same reason as /steer: process_loop is blocked
+        inside self.chat(), so a queued command only runs after the foreground
+        turn finishes — defeating the point of starting independent background
+        work.  The handler itself is mid-run safe (spawns a separate session
+        thread and does not interrupt or steer the foreground agent).
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            base = text.split(None, 1)[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "background")
+        except Exception:
+            return False
+
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -15015,6 +15037,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # app, so without this the submitted "/steer <text>" can
                     # linger in the input area (looking unsent) and invite an
                     # accidental re-submit. See issue #34569.
+                    event.app.invalidate()
+                    return
+
+                # Handle /background (/bg, /btw) while the agent is running
+                # immediately on the UI thread.  Queuing through _pending_input
+                # would defer the command until after the foreground chat()
+                # returns — same deadlock as /steer before #13354.  The
+                # background handler spawns an independent session and leaves
+                # the foreground agent alone. See issue #75221.
+                if self._should_handle_background_command_inline(text, has_images=has_images):
+                    self.process_command(text)
+                    event.app.current_buffer.reset(append_to_history=True)
                     event.app.invalidate()
                     return
 
