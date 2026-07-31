@@ -2809,31 +2809,6 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 
-def _project_async_delegation(record: dict) -> dict:
-    """One registry record trimmed to what the docked panel / overlay render.
-
-    Mirrors ``AsyncDelegationRecord`` in ui-tui/src/gatewayTypes.ts. Anything
-    added here must be added there too, and nothing large (context, goals,
-    results) belongs in a 1.5s poll.
-    """
-    projected = {
-        "completed_at": record.get("completed_at"),
-        "delegation_id": record.get("delegation_id"),
-        "dispatched_at": record.get("dispatched_at"),
-        "goal": record.get("goal"),
-        "model": record.get("model"),
-        "role": record.get("role"),
-        "status": record.get("status"),
-    }
-    if record.get("is_batch"):
-        projected["is_batch"] = True
-        # Join key for the panel's live-subagent dedupe; short id strings only.
-        projected["subagent_ids"] = [
-            s for s in (record.get("subagent_ids") or []) if isinstance(s, str)
-        ]
-    return projected
-
-
 @method("delegation.async_list")
 def _(rid, params: dict) -> dict:
     """Read projection of the async-delegation registry for the docked panel.

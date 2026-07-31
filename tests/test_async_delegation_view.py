@@ -5,6 +5,8 @@ of the async registry) and ``subagent.send`` (live steering) — plus the
 ``send_to_subagent`` helper they lean on.
 """
 
+from unittest.mock import MagicMock
+
 import tools.async_delegation as async_delegation
 import tools.delegate_tool as delegate_tool
 from tui_gateway import server
@@ -287,6 +289,151 @@ def test_steer_injection_preserves_role_alternation():
         assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1))
     finally:
         delegate_tool._unregister_subagent("b7c2")
+
+
+# ── Regression: steer races the child's final response (review #70899) ────
+#
+# send_to_subagent()/steer() only queues onto _pending_steer; the queue
+# drains at the next tool batch (apply_pending_steer_to_tool_results). If
+# the child's current LLM call turns out to be its LAST (no further
+# tool_calls), that drain point never arrives. turn_finalizer hands the
+# unconsumed text back as result["pending_steer"] instead of dropping it
+# (mirrors the main turn's leftover-steer handling) — but a delegated child
+# has no "next turn" to inject it into. Before this fix, _run_single_child
+# built its entry from final_response only and silently discarded
+# pending_steer, so a caller who got delivered=True from subagent.send had
+# no way to learn the child never actually saw the text.
+
+
+def test_run_single_child_surfaces_a_steer_the_child_never_saw():
+    """The race: steer() queues successfully, but the child's last iteration
+    produces no tool_calls, so turn_finalizer drains it as leftover
+    (pending_steer) instead of splicing it into a tool result. The entry
+    _run_single_child returns must surface that, not silently drop it."""
+    from tests.tools.test_delegate import _make_mock_parent
+    from tools.delegate_tool import _run_single_child
+
+    child = MagicMock()
+    child.run_conversation.return_value = {
+        "final_response": "done before the steer could land",
+        "completed": True,
+        "interrupted": False,
+        "api_calls": 3,
+        "messages": [],
+        # What turn_finalizer hands back when _drain_pending_steer() finds
+        # text after the last tool batch already drained (agent/turn_finalizer.py).
+        "pending_steer": "switch to the sliding-window approach",
+    }
+
+    result = _run_single_child(
+        task_index=0,
+        goal="Investigate rate limits",
+        child=child,
+        parent_agent=_make_mock_parent(),
+    )
+
+    assert result["status"] == "completed"
+    assert result["missed_steer"] == "switch to the sliding-window approach"
+
+
+def test_run_single_child_omits_missed_steer_when_none_pending():
+    """No leftover steer → no missed_steer key (the common case stays clean)."""
+    from tests.tools.test_delegate import _make_mock_parent
+    from tools.delegate_tool import _run_single_child
+
+    child = MagicMock()
+    child.run_conversation.return_value = {
+        "final_response": "done",
+        "completed": True,
+        "interrupted": False,
+        "api_calls": 1,
+        "messages": [],
+    }
+
+    result = _run_single_child(
+        task_index=0,
+        goal="Investigate rate limits",
+        child=child,
+        parent_agent=_make_mock_parent(),
+    )
+
+    assert "missed_steer" not in result
+
+
+def test_completion_event_carries_missed_steer(monkeypatch):
+    """The completion event a _run_single_child-shaped result produces must
+    surface missed_steer — the only place left to correct an earlier
+    delivered=True once the child's real outcome (not seeing the text) is
+    known."""
+    captured = []
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(process_registry.completion_queue, "put", captured.append)
+
+    async_delegation._push_completion_event(
+        {"delegation_id": "deleg_b7c2", "session_key": "", "dispatched_at": 1.0,
+         "completed_at": 2.0, "goal": "patch token-bucket refill race"},
+        {
+            "status": "completed",
+            "summary": "done before the steer could land",
+            "api_calls": 3,
+            "missed_steer": "switch to the sliding-window approach",
+        },
+        "completed",
+    )
+
+    assert captured, "completion event never pushed"
+    assert captured[0]["missed_steer"] == "switch to the sliding-window approach"
+
+
+def test_completion_event_omits_missed_steer_when_absent(monkeypatch):
+    """The common case (no race) stays clean — no missed_steer key at all."""
+    captured = []
+    from tools.process_registry import process_registry
+
+    monkeypatch.setattr(process_registry.completion_queue, "put", captured.append)
+
+    async_delegation._push_completion_event(
+        {"delegation_id": "deleg_b7c2", "session_key": "", "dispatched_at": 1.0,
+         "completed_at": 2.0, "goal": "patch token-bucket refill race"},
+        {"status": "completed", "summary": "done", "api_calls": 1},
+        "completed",
+    )
+
+    assert captured, "completion event never pushed"
+    assert "missed_steer" not in captured[0]
+
+
+def test_formatted_completion_surfaces_missed_steer_to_the_model():
+    """The re-injection block the model actually reads must call out a missed
+    steer explicitly — a backend field nobody renders is as good as lost."""
+    from tools.process_registry import format_process_notification
+
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "deleg_b7c2",
+        "goal": "patch token-bucket refill race",
+        "status": "completed",
+        "summary": "done before the steer could land",
+        "missed_steer": "switch to the sliding-window approach",
+    })
+
+    assert "switch to the sliding-window approach" in text
+    assert "never saw" in text
+
+
+def test_formatted_completion_omits_the_note_when_nothing_was_missed():
+    from tools.process_registry import format_process_notification
+
+    text = format_process_notification({
+        "type": "async_delegation",
+        "delegation_id": "deleg_b7c2",
+        "goal": "patch token-bucket refill race",
+        "status": "completed",
+        "summary": "done",
+    })
+
+    assert "never saw" not in text
 
 
 def test_async_list_reflects_status_transition():

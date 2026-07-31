@@ -14,7 +14,7 @@ import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js
 import type { Msg } from '../types.js'
 
 import { getAsyncDelegations } from './delegationStore.js'
-import type { ComposerActions, ComposerRefs, ComposerState, PasteSnippet } from './interfaces.js'
+import type { ComposerActions, ComposerRefs, ComposerState } from './interfaces.js'
 import { dispatchSteer, submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
@@ -320,7 +320,6 @@ export function useSubmission(opts: UseSubmissionOptions) {
       appendMessage,
       composerActions,
       composerRefs,
-      composerState.pasteSnips,
       gw,
       handleBusyInput,
       interpolate,

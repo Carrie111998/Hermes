@@ -8216,6 +8216,37 @@ def _serialize_subscription_preview(p) -> dict:
     }
 
 
+def _project_async_delegation(record: dict) -> dict:
+    """One registry record trimmed to what the docked panel / overlay render.
+
+    Mirrors ``AsyncDelegationRecord`` in ui-tui/src/gatewayTypes.ts. Anything
+    added here must be added there too, and nothing large (context, goals,
+    results) belongs in a 1.5s poll.
+
+    Lives here (not in methods_session.py, alongside the RPC handler that
+    uses it) because HandlerRegistry.install() only rebinds @method-decorated
+    functions onto server.py's globals — a plain helper defined in the split
+    module is invisible to a handler running with server.py's globals as its
+    __globals__ (see method_ctx.py).
+    """
+    projected = {
+        "completed_at": record.get("completed_at"),
+        "delegation_id": record.get("delegation_id"),
+        "dispatched_at": record.get("dispatched_at"),
+        "goal": record.get("goal"),
+        "model": record.get("model"),
+        "role": record.get("role"),
+        "status": record.get("status"),
+    }
+    if record.get("is_batch"):
+        projected["is_batch"] = True
+        # Join key for the panel's live-subagent dedupe; short id strings only.
+        projected["subagent_ids"] = [
+            s for s in (record.get("subagent_ids") or []) if isinstance(s, str)
+        ]
+    return projected
+
+
 # ── Spawn-tree snapshots: TUI-written, disk-persisted ────────────────
 # The TUI is the source of truth for subagent state (it assembles payloads
 # from the event stream).  On turn-complete it posts the final tree here;

@@ -2188,6 +2188,12 @@ def _format_async_delegation(evt: dict) -> str:
                     + (f": {r_error}" if r_error else "")
                     + ")"
                 )
+            r_missed_steer = r.get("missed_steer")
+            if r_missed_steer:
+                lines.append(
+                    "NOTE: a steer was queued for this subagent but arrived "
+                    f"after its last tool call — it never saw: {r_missed_steer!r}"
+                )
             r_live = r.get("live_transcript")
             if r_live:
                 lines.append(
@@ -2236,6 +2242,12 @@ def _format_async_delegation(evt: dict) -> str:
         if summary:
             lines.append("Partial output:")
             lines.append(summary)
+    missed_steer = evt.get("missed_steer")
+    if missed_steer:
+        lines.append(
+            "NOTE: a steer was queued for this subagent but arrived after "
+            f"its last tool call — it never saw: {missed_steer!r}"
+        )
     return "\n".join(lines)
 
 
