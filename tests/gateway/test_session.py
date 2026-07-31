@@ -35,6 +35,7 @@ class TestSessionSourceRoundtrip:
             user_id="99",
             user_name="alice",
             thread_id="t1",
+            conversation_id="root-1",
         )
         d = source.to_dict()
         restored = SessionSource.from_dict(d)
@@ -46,6 +47,7 @@ class TestSessionSourceRoundtrip:
         assert restored.user_id == "99"
         assert restored.user_name == "alice"
         assert restored.thread_id == "t1"
+        assert restored.conversation_id == "root-1"
 
 
     def test_minimal_roundtrip(self):
@@ -730,6 +732,49 @@ class TestWhatsAppSessionKeyConsistency:
         assert "bob" not in build_session_key(bob)
 
 
+class TestConversationIdentitySessionKeys:
+    def test_feishu_top_level_messages_are_distinct_conversations(self):
+        first = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_dm",
+            chat_type="dm",
+            conversation_id="om_first",
+        )
+        second = replace(first, conversation_id="om_second")
+
+        assert build_session_key(first) == "agent:main:feishu:dm:oc_dm:om_first"
+        assert build_session_key(first) != build_session_key(second)
+
+    def test_feishu_root_and_thread_followup_share_session(self):
+        root = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_dm",
+            chat_type="dm",
+            conversation_id="om_root",
+        )
+        followup = replace(
+            root,
+            thread_id="omt_native",
+            conversation_id="om_root",
+        )
+
+        assert build_session_key(root) == build_session_key(followup)
+        assert "omt_native" not in build_session_key(followup)
+
+    def test_group_conversation_is_shared_across_participants(self):
+        alice = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            user_id="alice",
+            conversation_id="om_root",
+        )
+        bob = replace(alice, user_id="bob", thread_id="omt_native")
+
+        assert build_session_key(alice) == build_session_key(bob)
+        assert build_session_key(alice) == "agent:main:feishu:group:oc_group:om_root"
+
+
 class TestSlackWorkspaceSessionKeys:
 
 
@@ -1369,5 +1414,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

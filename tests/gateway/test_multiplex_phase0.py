@@ -15,7 +15,12 @@ import yaml
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from gateway.config import GatewayConfig, Platform
-from gateway.session import SessionSource, SessionStore, build_session_key
+from gateway.session import (
+    SessionSource,
+    SessionStore,
+    build_session_key,
+    build_session_key_for_config,
+)
 
 
 def _src(**kw) -> SessionSource:
@@ -62,6 +67,19 @@ class TestSessionKeyNamespacedWhenOn:
         b = build_session_key(s, profile="coder")
         c = build_session_key(s, profile="writer")
         assert a != b != c and a != c
+
+    def test_config_aware_key_keeps_profile_and_conversation_identity(self):
+        source = _src(
+            platform=Platform.FEISHU,
+            chat_id="oc1",
+            conversation_id="om_root",
+            profile="coder",
+        )
+        config = GatewayConfig(multiplex_profiles=True)
+
+        assert build_session_key_for_config(source, config) == (
+            "agent:coder:feishu:dm:oc1:om_root"
+        )
 
 
 class TestMultiplexConfigFlag:

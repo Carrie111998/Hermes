@@ -3298,7 +3298,13 @@ class FeishuAdapter(BasePlatformAdapter):
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        # Feishu exposes two distinct identities for an in-topic message:
+        # ``root_id`` is the stable top-level message (``om_*``), while
+        # ``thread_id`` is the native delivery topic (``omt_*``).  Keep them
+        # separate so UI routing never changes which Hermes session is loaded.
+        root_id = getattr(message, "root_id", None) or None
+        thread_id = getattr(message, "thread_id", None) or None
+        conversation_id = root_id or message_id
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -3335,6 +3341,8 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
             thread_id=thread_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
         )
@@ -3374,13 +3382,11 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     def _media_batch_key(self, event: MessageEvent) -> str:
-        from gateway.session import build_session_key
+        from gateway.session import build_session_key_for_config
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        runner = getattr(self, "gateway_runner", None)
+        key_config = getattr(runner, "config", None) or self.config
+        session_key = build_session_key_for_config(event.source, key_config)
         return f"{session_key}:media:{event.message_type.value}"
 
     @staticmethod
@@ -3682,14 +3688,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Return the session-scoped key used for Feishu text aggregation."""
-        from gateway.session import build_session_key
+        from gateway.session import build_session_key_for_config
 
-        return build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
-        )
+        runner = getattr(self, "gateway_runner", None)
+        key_config = getattr(runner, "config", None) or self.config
+        return build_session_key_for_config(event.source, key_config)
 
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:

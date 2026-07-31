@@ -2514,6 +2514,63 @@ def test_find_session_by_origin_matching_rules(db):
     ) is None
 
 
+def test_gateway_peer_preserves_conversation_and_delivery_thread(db):
+    db.create_session(
+        "gw-conversation",
+        "feishu",
+        user_id="u1",
+        session_key="agent:main:feishu:dm:oc1:om_root",
+        chat_id="oc1",
+        chat_type="dm",
+        thread_id="omt_native",
+        conversation_id="om_root",
+    )
+    db.append_message("gw-conversation", "user", "hello")
+
+    row = db.find_latest_gateway_session_for_peer(
+        source="feishu",
+        user_id="u1",
+        session_key="missing-key-to-exercise-peer-fallback",
+        chat_id="oc1",
+        chat_type="dm",
+        thread_id="omt_native",
+        conversation_id="om_root",
+    )
+
+    assert row["id"] == "gw-conversation"
+    assert row["thread_id"] == "omt_native"
+    assert row["conversation_id"] == "om_root"
+    assert db.find_latest_gateway_session_for_peer(
+        source="feishu",
+        user_id="u1",
+        session_key="missing-other",
+        chat_id="oc1",
+        chat_type="dm",
+        thread_id="omt_native",
+        conversation_id="om_other",
+    ) is None
+
+
+def test_existing_database_adds_conversation_id_column(tmp_path):
+    db_path = tmp_path / "legacy-no-conversation-id.db"
+    initial = SessionDB(db_path=db_path)
+    initial.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute("ALTER TABLE sessions DROP COLUMN conversation_id")
+    conn.commit()
+    conn.close()
+
+    upgraded = SessionDB(db_path=db_path)
+    try:
+        columns = {
+            row["name"]
+            for row in upgraded._conn.execute("PRAGMA table_info(sessions)")
+        }
+        assert "conversation_id" in columns
+    finally:
+        upgraded.close()
+
+
 
 
 

@@ -2191,8 +2191,10 @@ from gateway.session import (
     build_session_context_prompt,
     build_channel_continuity_note,
     build_session_key,
+    build_session_key_for_config,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    session_conversation_id,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -3043,14 +3045,19 @@ def _parse_session_key(session_key: str) -> "dict | None":
     thread_id, so we leave ``thread_id`` out to avoid mis-routing.
     """
     parts = session_key.split(":")
-    if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+    if len(parts) >= 5 and parts[0] == "agent":
         result = {
             "platform": parts[2],
             "chat_type": parts[3],
             "chat_id": parts[4],
         }
+        if parts[1] != "main":
+            result["profile"] = parts[1]
         if len(parts) > 5 and parts[3] in {"dm", "thread"}:
-            result["thread_id"] = parts[5]
+            if parts[2] == "feishu":
+                result["conversation_id"] = parts[5]
+            else:
+                result["thread_id"] = parts[5]
         return result
     return None
 
@@ -6317,26 +6324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return session_key
             except Exception:
                 pass
-        config = getattr(self, "config", None)
-        # Mirror SessionStore._resolve_profile_for_key so this fallback path
-        # produces the same namespace as the primary path: None (legacy
-        # agent:main) unless multiplexing is on, then the active profile.
-        _profile = None
-        if getattr(config, "multiplex_profiles", False):
-            if source.profile:
-                _profile = source.profile
-            else:
-                try:
-                    from hermes_cli.profiles import get_active_profile_name
-                    _profile = get_active_profile_name() or "default"
-                except Exception:
-                    _profile = None
-        return build_session_key(
-            source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
-            profile=_profile,
-        )
+        return build_session_key_for_config(source, getattr(self, "config", None))
 
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
@@ -11235,7 +11223,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _process_handoff(self, row: Dict[str, Any]) -> None:
         """Execute one handoff row. Raises on failure (caller marks failed)."""
         from gateway.config import Platform
-        from gateway.session import SessionSource, build_session_key
+        from gateway.session import SessionSource
         from gateway.platforms.base import MessageEvent
 
         cli_session_id = row["id"]
@@ -11337,13 +11325,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # entry. For thread destinations build_session_key keys without
         # user_id (thread_sessions_per_user defaults to False) — so the
         # next real user message in the thread shares this same session.
-        platform_cfg = self.config.platforms.get(platform)
-        extra = platform_cfg.extra if platform_cfg else {}
-        session_key = build_session_key(
-            dest_source,
-            group_sessions_per_user=extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._session_key_for_source(dest_source)
 
         # Make sure there's an entry in the session_store for this key. If
         # the home channel has never been used, get_or_create_session
@@ -12649,6 +12631,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        adapter._owned_profile = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -17605,7 +17588,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns an empty list when the source is not in a thread, or when no
         sibling runs exist — callers must still gate on authorization.
         """
-        thread_id = getattr(source, "thread_id", None)
+        thread_id = session_conversation_id(source)
         chat_id = getattr(source, "chat_id", None)
         if not thread_id or not chat_id:
             return []
@@ -17616,8 +17599,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # shared-thread key or any key with a further (user_id) segment
         # (prefix + ":") avoids cross-matching an unrelated thread whose id
         # merely starts with this one.
+        namespace = ":".join(str(own_key).split(":")[:2])
         prefix = ":".join(
-            ["agent:main", platform, chat_type, str(chat_id), str(thread_id)]
+            [namespace, platform, chat_type, str(chat_id), str(thread_id)]
         )
         matches = []
         for key, agent in self._running_agent_items():
@@ -20804,6 +20788,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_id=chat_id,
             chat_type=chat_type,
             thread_id=str(evt.get("thread_id") or "").strip() or None,
+            conversation_id=(
+                str(evt.get("conversation_id") or "").strip() or None
+            ),
+            profile=str(evt.get("profile") or "").strip() or None,
             user_id=str(evt.get("user_id") or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
@@ -21143,8 +21131,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt["platform"] = parsed.get("platform", "")
         evt["chat_type"] = parsed.get("chat_type", "")
         evt["chat_id"] = parsed.get("chat_id", "")
+        if parsed.get("profile"):
+            evt["profile"] = parsed["profile"]
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
+        if parsed.get("conversation_id"):
+            evt["conversation_id"] = parsed["conversation_id"]
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.

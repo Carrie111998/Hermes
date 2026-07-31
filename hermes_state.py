@@ -2628,6 +2628,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        conversation_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
         profile_name: str = None,
@@ -2672,10 +2673,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """INSERT INTO sessions (
                    id, source, user_id, session_key, chat_id, chat_type, thread_id,
+                   conversation_id,
                    model, model_config, system_prompt, parent_session_id, cwd,
                    profile_name, git_repo_root, started_at
                 )
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        model = COALESCE(sessions.model, excluded.model),
                        model_config = COALESCE(sessions.model_config, excluded.model_config),
@@ -2684,6 +2686,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
                        chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                        thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                       conversation_id = COALESCE(sessions.conversation_id, excluded.conversation_id),
                        parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
                        cwd = COALESCE(sessions.cwd, excluded.cwd),
                        profile_name = COALESCE(sessions.profile_name, excluded.profile_name),
@@ -2696,6 +2699,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_id,
                     chat_type,
                     thread_id,
+                    conversation_id,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt,
@@ -2752,6 +2756,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                            thread_id = COALESCE(sessions.thread_id,
                                        (SELECT p.thread_id FROM sessions p
                                          WHERE p.id = sessions.parent_session_id)),
+                           conversation_id = COALESCE(sessions.conversation_id,
+                                              (SELECT p.conversation_id FROM sessions p
+                                                WHERE p.id = sessions.parent_session_id)),
                            display_name = COALESCE(sessions.display_name,
                                           (SELECT p.display_name FROM sessions p
                                             WHERE p.id = sessions.parent_session_id)),
@@ -2786,6 +2793,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        conversation_id: str = None,
         display_name: str = None,
         origin_json: str = None,
     ) -> None:
@@ -2804,7 +2812,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             conn.execute(
                 """UPDATE sessions
                    SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
-                       chat_type = ?, thread_id = ?,
+                       chat_type = ?, thread_id = ?, conversation_id = ?,
                        display_name = COALESCE(?, display_name),
                        origin_json = COALESCE(?, origin_json)
                    WHERE id = ?""",
@@ -2815,6 +2823,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_id,
                     chat_type,
                     thread_id,
+                    conversation_id,
                     display_name,
                     origin_json,
                     session_id,
@@ -3017,6 +3026,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: Optional[str] = None,
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
+        conversation_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Find the latest recoverable gateway session for a routing peer.
 
@@ -3062,6 +3072,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                   AND COALESCE(chat_id, '') = COALESCE(?, '')
                   AND COALESCE(chat_type, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
+                  AND COALESCE(conversation_id, '') = COALESCE(?, '')
                   AND (ended_at IS NULL OR end_reason IN ('agent_close', 'ws_orphan_reap'))
                   AND (COALESCE(message_count, 0) > 0 OR EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id LIMIT 1
@@ -3069,7 +3080,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ORDER BY started_at DESC
                 LIMIT 1
                 """,
-                (source, user_id, chat_id, chat_type, thread_id),
+                (source, user_id, chat_id, chat_type, thread_id, conversation_id),
             ).fetchone()
         return dict(row) if row else None
 
@@ -3150,7 +3161,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
-                          thread_id, display_name, origin_json, profile_name
+                          thread_id, conversation_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
                 (parent_session_id,),
             ).fetchone()
@@ -3166,8 +3177,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    id, source, model, model_config, system_prompt,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, conversation_id, display_name, origin_json, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
@@ -3189,6 +3200,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     parent["chat_id"],
                     parent["chat_type"],
                     parent["thread_id"],
+                    parent["conversation_id"],
                     parent["display_name"],
                     parent["origin_json"],
                     time.time(),

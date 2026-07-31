@@ -39,6 +39,7 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    session_conversation_id,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -968,8 +969,8 @@ class GatewaySlashCommandsMixin:
         # WITHIN a thread, never across threads — require thread equality before
         # any sharing logic so a live origin in thread A cannot match a caller in
         # thread B of the same parent chat.
-        if str(getattr(current, "thread_id", "") or "") != str(
-            getattr(origin, "thread_id", "") or ""
+        if str(session_conversation_id(current) or "") != str(
+            session_conversation_id(origin) or ""
         ):
             return False
         chat_type = (getattr(current, "chat_type", "") or "").lower()
@@ -1071,8 +1072,8 @@ class GatewaySlashCommandsMixin:
         # or an admin override.
         caller_chat = str(getattr(source, "chat_id", "") or "")
         row_chat = str(row.get("chat_id") or "")
-        caller_thread = str(getattr(source, "thread_id", "") or "")
-        row_thread = str(row.get("thread_id") or "")
+        caller_thread = str(session_conversation_id(source) or "")
+        row_thread = str(row.get("conversation_id") or row.get("thread_id") or "")
         chat_type = (getattr(source, "chat_type", "") or "").lower()
         caller_is_dm = chat_type in {"dm", "direct", "private", ""}
         # build_session_key keys the participant on ``user_id_alt or user_id``
