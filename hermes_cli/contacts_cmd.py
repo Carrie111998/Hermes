@@ -42,8 +42,7 @@ def directory_path() -> Path:
 
 
 def _norm(value: Any) -> str:
-    normalized = unicodedata.normalize("NFKC", str(value).casefold())
-    return "".join(character for character in normalized if character.isalnum())
+    return unicodedata.normalize("NFKC", str(value)).casefold().strip()
 
 
 def _string_list(value: Any, field: str) -> list[str]:

@@ -57,7 +57,7 @@ contacts:
       - key: discord-dm
         platform: discord
         destination_type: dm
-        destination: "123456789012345678"
+        destination: "discord-user-id"
         preferred_for: [internal]
         status: verified
         sendable: true

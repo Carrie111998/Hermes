@@ -127,6 +127,13 @@ def test_find_contact_matches_id_display_name_or_alias_exactly():
     assert find_contact(data["contacts"], "ali")[0] == "unknown_contact"
 
 
+@pytest.mark.parametrize("query", ["Alice?", "a-l-i-c-e", "AliceExample"])
+def test_find_contact_preserves_punctuation_and_word_boundaries(query):
+    data = _registry(_contact())
+
+    assert find_contact(data["contacts"], query)[0] == "unknown_contact"
+
+
 def test_find_contact_supports_unicode_names():
     contact = _contact()
     contact.update({"id": "zoe", "display_name": "Zoë", "aliases": ["佐伊"]})
