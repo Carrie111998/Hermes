@@ -3,7 +3,7 @@
 ## Result
 
 **SOURCE GATE: PASS. HELD INSTALL: PASS. TRUSTED READ PROOF: PASS.
-ACTIVATION: PROHIBITED.**
+ACTIVATION AND TELEGRAM TRANSPORT: PASS.**
 
 This is the minimal global repair requested after the July 30 incidents. It
 preserves Hermes' native agency and existing specialist skills while enforcing
@@ -483,12 +483,57 @@ redacted session record shows only `skill_view`, `tool_describe`, and
 scope-checked deferred `tool_call` bridges, which resolved to the two trusted
 reads above.
 
-Activation remains a separate coordinated release decision. No business canary
-may be manufactured. The only valid later canary is a genuine low-risk
-owner-requested operation with its normal specialist skill and source readback.
-The required preactivation existing-skill lookup is now complete. Activation
-still requires explicit coordination because the gateway owner hold remains in
-force and Telegram delivery has intentionally not been exercised.
+### Live activation and transport proof
+
+Ed explicitly instructed Codex to turn on the gateway on July 31. Before
+releasing containment, the three exact runtime `RefuseManualStart` drop-ins
+were copied to:
+
+`/home/ed/.hermes/quarantine/direct-ops-runtime-hold-release-20260731`
+
+All three preserved files have SHA-256:
+`f96206d15765eab0354ff01bcd36cefab8591451ce4474e368814d6d3f6eb9e9`.
+The durable owner-hold file remained active while those systemd-only drop-ins
+were removed and the user manager was reloaded, so an implicit gateway start
+still failed closed during the transition.
+
+The supported explicit activation command was then invoked with the reviewed
+absolute interpreter and source:
+
+```text
+/home/ed/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway start
+```
+
+Activation receipt:
+
+- service definition refreshed from the installed Hermes source;
+- gateway active/running since `2026-07-31T06:09:29-04:00`;
+- systemd MainPID: `724515`;
+- process command:
+  `/home/ed/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run --replace`;
+- installed production source commit:
+  `a9fa619d1a808d339eff5bc702ae99d291bf7fd2`;
+- installed production source tree:
+  `250d887c91fb82a4da476e2ebe3e485d0080cf45`;
+- systemd result: `success`;
+- restarts after activation: `0`;
+- owner hold: absent after explicit activation;
+- runtime state: `running` with the exact MainPID;
+- Telegram state: `connected`, no platform error, current startup timestamp;
+- network proof: established TLS connections from the gateway PID to Telegram;
+- no manufactured test message or business mutation; and
+- multiple already-scheduled Telegram deliveries received provider success,
+  proving the real outbound transport while preserving the no-canary rule.
+
+The hygiene timer became active/waiting without any `Wants`, `BindsTo`, or
+`Upholds` gateway dependency. Its first post-activation cycle ran from
+`06:14:30` to `06:14:31`, returned `success`, and left the gateway on the same
+MainPID with `NRestarts=0`. Independent read-only review returned PASS for the
+process, Telegram transport, and hygiene-cycle proof.
+
+This release is activated and transport-verified. A genuine owner-requested
+business mutation remains the only valid mutation canary; none was
+manufactured during activation.
 
 ## Residual boundary
 
@@ -504,7 +549,7 @@ but eliminating the last window requires OS/container isolation or universal
 cooperative locking. This release does not represent that residual race as
 solved.
 
-Two cleanup items were discovered and deliberately deferred rather than
+Additional cleanup items were discovered and deliberately deferred rather than
 expanding this release:
 
 - `terrain-operations` renders 41,214 characters, above the 32,000-character
@@ -514,6 +559,20 @@ expanding this release:
 - Runtime logs warn that linked SQLite `3.50.4` lacks later WAL-reset
   corruption fixes. Upgrade to the supported fixed SQLite/Python build in a
   separate dependency-maintenance change with session-store regressions.
+- Existing cron deliveries reference missing Telegram thread `24049` and fall
+  back successfully to the chat root. Repair those job destinations so routine
+  messages land in the intended thread without warning noise.
+- Some cron runs request arbitrary `execute_code`, which is correctly blocked
+  without an attended approval. Replace those requests with the smallest
+  purpose-built read or operation tool instead of weakening the boundary.
+- Canonical skill loads still expose trust-path, supporting-file-order, and
+  oversized legacy-doctrine warnings in cron sessions. Consolidate those jobs
+  on the installed canonical front door and bounded references.
+- Optional `nemo_relay` is unavailable. Either install and verify it for jobs
+  that actually use Relay or disable that optional initialization path.
+- `gateway status` can report the unit stale immediately after a successful
+  refresh. Normalize launcher-dependent PATH entries in the comparison so the
+  status is truthful without prompting an unnecessary restart.
 
 ## Release state vocabulary
 
@@ -523,10 +582,13 @@ expanding this release:
 - **trusted-read-verified**: an ordinary owner lookup completed through the
   pinned read path with source readback while all runtime holds stayed active;
 - **activated**: gateway explicitly started after separate coordination; and
+- **transport-verified**: the live Telegram adapter is connected and a real
+  existing scheduled delivery received provider success;
 - **business-verified**: a genuine later owner request completed with source
   readback.
 
-The first three states are claimed. Hermes is installed, protected, and
-read-verified, but not activated, Telegram-delivery-verified, or
-business-mutation-verified. Health checks or source installation alone must
-never be described as live business proof.
+`source-ready`, `trusted-read-verified`, `activated`, and
+`transport-verified` are current. `installed-and-held` is the verified
+preactivation state that was explicitly released by Ed's activation command.
+Hermes is not yet business-mutation-verified. Health checks or source
+installation alone must never be described as live business proof.
