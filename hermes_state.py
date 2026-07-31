@@ -233,6 +233,13 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
+#: Upper bound for any parent/child lineage walk (compression chains,
+#: delegate trees, preview roots). Compression chains this deep are
+#: pathological — 100 hops is plenty and keeps every walker O(1)-bounded
+#: against malformed/cyclic data.
+COMPRESSION_CHAIN_MAX_HOPS = 100
+
+
 def _chain_token_totals(conn, root_ids) -> Dict[str, Tuple[Optional[int], Optional[int]]]:
     """Sum input/output tokens across each compression chain rooted at *root_ids*.
 
@@ -6416,8 +6423,8 @@ class SessionDB:
         current = session_id
         seen = {current} if current else set()
         # Bound the walk defensively — compression chains this deep are
-        # pathological and shouldn't happen in practice. 100 = plenty.
-        for _ in range(100):
+        # pathological and shouldn't happen in practice.
+        for _ in range(COMPRESSION_CHAIN_MAX_HOPS):
             with self._lock:
                 cursor = self._conn.execute(
                     """
@@ -8146,7 +8153,7 @@ class SessionDB:
         current = session_id
         seen = set()
         with self._lock:
-            for _ in range(100):
+            for _ in range(COMPRESSION_CHAIN_MAX_HOPS):
                 if not current or current in seen:
                     break
                 seen.add(current)
@@ -9567,7 +9574,7 @@ class SessionDB:
         roots: Dict[str, str] = {}
         for sid in session_ids:
             current = sid
-            for _ in range(100):
+            for _ in range(COMPRESSION_CHAIN_MAX_HOPS):
                 meta = self.get_session(current) or {}
                 if not self._is_compression_edge_child_row(meta):
                     break

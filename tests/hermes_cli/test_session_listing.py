@@ -1,5 +1,7 @@
 """Tests for the shared session-listing helpers (hermes_cli/session_listing.py)."""
 
+import inspect
+
 import pytest
 
 from hermes_cli.session_listing import (
@@ -102,6 +104,15 @@ class TestQuerySessionListingSearch:
 
     def test_plain_listing_still_hides_unnamed(self, db):
         assert self._ids(db, source="telegram") == ["sess_an94"]
+
+
+def test_hop_caps_unified():
+    """Every lineage walker shares one hop cap (F13)."""
+    from hermes_state import COMPRESSION_CHAIN_MAX_HOPS
+
+    assert COMPRESSION_CHAIN_MAX_HOPS == 100
+    sig = inspect.signature(_compression_root)
+    assert sig.parameters["max_hops"].default == COMPRESSION_CHAIN_MAX_HOPS
 
 
 class TestLastActiveOf:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from hermes_state import COMPRESSION_CHAIN_MAX_HOPS
+
 
 def parse_session_listing_args(raw_args: str) -> tuple[bool, bool, str, str | None]:
     """Parse `/sessions`-style args into listing flags, a resume target, and a search query.
@@ -189,7 +191,7 @@ def session_rank(
     return rank_of.get(tip)
 
 
-def _compression_root(session_db: Any, sid: str, max_hops: int = 50) -> str:
+def _compression_root(session_db: Any, sid: str, max_hops: int = COMPRESSION_CHAIN_MAX_HOPS) -> str:
     """Deepest compression ancestor of ``sid`` (itself when not in a chain).
 
     Follows ``parent_session_id`` upward only across compression edges —
@@ -334,7 +336,7 @@ def render_sessions_table(
             if not s.get("_lineage_root_id"):
                 current = sid
                 hops = 0
-                while current and hops < 20:
+                while current and hops < COMPRESSION_CHAIN_MAX_HOPS:
                     m = db.get_session(current) or {}
                     parent = m.get("parent_session_id")
                     if not parent:
