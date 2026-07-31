@@ -31,7 +31,7 @@ gateway:
     switched:               "ປ່ຽນໂມເດວເປັນ `{model}` ແລ້ວ"
     provider_label:         "ຜູ້ໃຫ້ບໍລິການ: {provider}"
     context_label:          "ບໍລິບົດ (Context): {tokens} ໂທເຄັນ"
-    max_output_label:       "ເອົາພຸດສູງສຸດ: {tokens} ໂທເຄັນ"
+    max_output_label:       "ຜົນຜະລິດສູງສຸດ (%{tokens} ໂທເຄັນ)"
     cost_label:             "ຄ່າໃຊ້ຈ່າຍ: {cost}"
     capabilities_label:     "ຄວາມສາມາດ: {capabilities}"
     prompt_caching_enabled: "ການແຄຊຄຳສັ່ງ (Prompt caching): ເປີດໃຊ້ແລ້ວ"
