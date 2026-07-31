@@ -19,6 +19,19 @@ from gateway.run import GatewayRunner
 class TestVoiceKeyHelper:
     """Test the _voice_key helper method."""
 
+    def test_voice_key_named_profile_isolated_without_changing_default_format(self):
+        runner = _make_runner()
+
+        assert runner._voice_key(
+            Platform.TELEGRAM,
+            "123",
+            profile="default",
+        ) == "telegram:123"
+        assert runner._voice_key(
+            Platform.TELEGRAM,
+            "123",
+            profile="catgirl",
+        ) == "catgirl:telegram:123"
 
     def test_voice_key_different_platforms_same_chat_id(self):
         """Same chat_id on different platforms yields different keys."""
@@ -113,6 +126,28 @@ class TestSyncVoiceModeStateToAdapter:
 
         # Only telegram:123 should be in disabled_chats (mode="off" for telegram)
         assert mock_adapter._auto_tts_disabled_chats == {"123"}
+
+    def test_sync_named_profile_only_includes_its_own_voice_state(self):
+        runner = _make_runner()
+        runner._voice_mode = {
+            "telegram:123": "off",
+            "catgirl:telegram:123": "all",
+            "catgirl:telegram:456": "off",
+            "writer:telegram:789": "all",
+        }
+
+        mock_adapter = MagicMock()
+        mock_adapter.platform = Platform.TELEGRAM
+        mock_adapter._auto_tts_disabled_chats = set()
+        mock_adapter._auto_tts_enabled_chats = set()
+
+        runner._sync_voice_mode_state_to_adapter(
+            mock_adapter,
+            profile="catgirl",
+        )
+
+        assert mock_adapter._auto_tts_disabled_chats == {"456"}
+        assert mock_adapter._auto_tts_enabled_chats == {"123"}
 
 
 # ---------------------------------------------------------------------------
