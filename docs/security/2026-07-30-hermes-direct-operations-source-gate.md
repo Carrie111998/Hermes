@@ -535,6 +535,25 @@ This release is activated and transport-verified. A genuine owner-requested
 business mutation remains the only valid mutation canary; none was
 manufactured during activation.
 
+### Deleted Telegram destination cleanup
+
+The live Telegram directory contained two targets named `Leadership`.
+Provider readback proved `-5417189586` was deleted, while Telegram Desktop and
+provider member-count readback proved `-5064720167` was the four-member live
+chat used on July 30. Hermes' existing alias overlay now treats a null alias as
+a durable hide: it removes the retired target on every directory load and
+rebuild without deleting historical sessions.
+
+The reviewed change is integration commit
+`986cbce0477680b0fd09e1989b0fa59c552e7f62` and installed-source commit
+`f0f36136eafac6f1000885a728777f59b20f4b82`. The exact pre-change directory is
+preserved at
+`/home/ed/.hermes/quarantine/deleted-telegram-leadership-5417189586-20260731`.
+After the one supported gateway restart, Telegram reconnected on PID `731892`.
+The immediate build and the scheduled rebuild at `2026-07-31T07:04:45-04:00`
+both contained zero entries for the deleted ID, one entry for the live ID, and
+resolved `Leadership` only to `-5064720167`.
+
 ## Residual boundary
 
 Hermes captures repository state at turn intake, re-probes immediately before
