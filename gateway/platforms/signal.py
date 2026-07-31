@@ -259,6 +259,11 @@ class SignalAdapter(BasePlatformAdapter):
     # square behind in chat clients when edit attempts fail.
     SUPPORTS_MESSAGE_EDITING = False
 
+    # send_multiple_images drops per-image alt texts — Signal's send RPC only
+    # carries one shared message body — so a caption can never deliver the
+    # runtime footer; it keeps its own trailing message instead (#74547).
+    supports_batch_image_captions = False
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.SIGNAL)
 

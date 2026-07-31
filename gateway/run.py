@@ -18436,21 +18436,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     non_image_media.append((media_path, is_voice))
 
             footer_attached = False
+            # send_multiple_images returns None across adapters, so caption
+            # delivery can't be confirmed from its result. Gate on the
+            # adapter's declared caption support instead: Signal's batch RPC
+            # drops per-image alt text, so the footer must keep its trailing
+            # message there.
+            _adapter_captions = bool(
+                getattr(adapter, "supports_batch_image_captions", False)
+            )
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    if footer_line:
+                    if footer_line and _adapter_captions:
                         # Ride the runtime footer on the last photo's caption
                         # instead of a separate trailing message (#74547).
                         # Platform senders already clamp captions to their
                         # limits (Telegram: 1024 chars).
                         images[-1] = (images[-1][0], footer_line)
-                    result = await adapter.send_multiple_images(
+                    await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
                         metadata=_thread_meta,
                     )
-                    if footer_line and getattr(result, "success", True):
+                    if footer_line and _adapter_captions:
                         footer_attached = True
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)

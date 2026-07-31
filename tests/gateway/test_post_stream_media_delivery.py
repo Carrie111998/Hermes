@@ -45,9 +45,10 @@ def _fake_runner(thread_meta):
     )
 
 
-def _adapter():
+def _adapter(supports_batch_image_captions=True):
     return SimpleNamespace(
         name="test",
+        supports_batch_image_captions=supports_batch_image_captions,
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
@@ -183,6 +184,34 @@ class TestPostStreamFooterCaption:
         )
 
         assert attached is False
+
+    @pytest.mark.asyncio
+    async def test_caption_dropping_adapter_keeps_the_trailing_footer(
+        self, tmp_path, monkeypatch
+    ):
+        """Signal's batch RPC drops per-image alt text — the footer must NOT
+        be claimed by a caption that can never render it."""
+        media_file = _allowed_media_path(tmp_path, monkeypatch, "signal.png")
+        adapter = _adapter(supports_batch_image_captions=False)
+
+        attached = await GatewayRunner._deliver_media_from_response(
+            _fake_runner({}),
+            f"MEDIA:{media_file}",
+            _event(),
+            adapter,
+            footer_line="model-x │ 306K/1M │ 29%",
+        )
+
+        assert attached is False
+        images = adapter.send_multiple_images.await_args.kwargs["images"]
+        assert all(alt == "" for _, alt in images)
+
+    def test_base_adapter_declares_caption_support_and_signal_opts_out(self):
+        from gateway.platforms.base import BasePlatformAdapter as _base
+        from gateway.platforms.signal import SignalAdapter as _signal
+
+        assert _base.supports_batch_image_captions is True
+        assert _signal.supports_batch_image_captions is False
 
     @pytest.mark.asyncio
     async def test_without_footer_captions_stay_empty(self, tmp_path, monkeypatch):

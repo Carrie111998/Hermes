@@ -2652,6 +2652,15 @@ class BasePlatformAdapter(ABC):
     # never see these calls.
     supports_status_text: bool = False
 
+    # Whether send_multiple_images renders each item's alt text as a real
+    # per-image caption. The default per-image loop does (send_image /
+    # send_image_file take a caption), as does Telegram's media-group
+    # batching. Signal's batch RPC carries one shared body and drops
+    # per-image alt texts, so it overrides this to False. Used by the
+    # post-stream footer routing (#74547) to decide whether the runtime
+    # footer can ride a photo caption or needs its own trailing message.
+    supports_batch_image_captions: bool = True
+
     def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
         """Set or clear (``None``) the live working-state phrase for a chat.
 
