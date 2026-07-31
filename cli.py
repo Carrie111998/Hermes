@@ -6746,6 +6746,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_ansi=_tc,
                     pygments_theme=self._pygments_theme,
                     inline_code_ansi=_ic,
+                    max_width=_terminal_width_for_streaming(),
                 )
             rendered = self._md_stream_processor.feed_line(line)
             if rendered is not None:
@@ -6877,6 +6878,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         base_ansi=_tc,
                         pygments_theme=self._pygments_theme,
                         inline_code_ansi=getattr(self, "_stream_inline_code_ansi", ""),
+                        max_width=_terminal_width_for_streaming(),
                     )
                 rendered = self._md_stream_processor.feed_line(self._stream_buf)
                 if rendered is not None:

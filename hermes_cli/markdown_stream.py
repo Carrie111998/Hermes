@@ -102,6 +102,7 @@ class MarkdownStreamProcessor:
         base_ansi: str = "",
         pygments_theme: str = "monokai",
         inline_code_ansi: str = "",
+        max_width: Optional[int] = None,
     ):
         """
         Args:
@@ -112,11 +113,15 @@ class MarkdownStreamProcessor:
                        spans (e.g. bold + optional fg + optional bg resolved
                        from the skin). When empty, inline code falls back to
                        plain bold.
+            max_width: Maximum visible cells available to rendered output.
+                       The caller should subtract any indentation it prepends.
+                       When omitted, use the terminal width for compatibility.
         """
         self._base = base_ansi
         self._rst = _RST
         self._theme = pygments_theme
         self._inline_code_ansi = inline_code_ansi
+        self._max_width = max_width
 
         # State
         self._in_code_block = False
@@ -253,13 +258,22 @@ class MarkdownStreamProcessor:
         return f"  {result}{self._rst}"
 
     def _render_fence_header(self, lang: str) -> str:
-        w = shutil.get_terminal_size((80, 24)).columns
+        w = self._max_width
+        if w is None:
+            w = shutil.get_terminal_size((80, 24)).columns
+        w = max(int(w), 10)
         label = f" {lang} " if lang else ""
+        # Keep at least three border cells after the label. Fence languages are
+        # ASCII-only by parser contract, so len() is also their display width.
+        label = label[:max(w - 9, 0)]
         fill = max(w - 6 - len(label), 3)
         return f"{_DIM}  ┌───{self._rst}{_DIM}{_BOLD}{label}{self._rst}{_DIM}{'─' * fill}{self._rst}"
 
     def _render_fence_footer(self) -> str:
-        w = shutil.get_terminal_size((80, 24)).columns
+        w = self._max_width
+        if w is None:
+            w = shutil.get_terminal_size((80, 24)).columns
+        w = max(int(w), 10)
         fill = max(w - 4, 3)
         return f"{_DIM}  └{'─' * fill}{self._rst}"
 

@@ -347,6 +347,25 @@ class TestCodeBlockBasic:
         assert _strip_ansi(code).startswith("  ")
         p.feed_line("```")
 
+    def test_labelled_fence_respects_caller_width(self):
+        p = MarkdownStreamProcessor(max_width=32)
+
+        header = _strip_ansi(p.feed_line("```python"))
+        footer = _strip_ansi(p.feed_line("```"))
+
+        assert len(header) <= 32
+        assert len(footer) <= 32
+        assert " python " in header
+
+    def test_bare_fence_respects_caller_width(self):
+        p = MarkdownStreamProcessor(max_width=20)
+
+        header = _strip_ansi(p.feed_line("```"))
+        footer = _strip_ansi(p.feed_line("```"))
+
+        assert len(header) <= 20
+        assert len(footer) <= 20
+
 
 class TestMultipleCodeBlocks:
     def test_two_blocks_with_normal_text(self):
