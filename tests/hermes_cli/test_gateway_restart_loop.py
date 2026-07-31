@@ -308,10 +308,17 @@ class TestTerminalToolGatewayLifecycleGuard:
         "sudo --user root launchctl submit -l com.example.cleanup -p /usr/bin/true",
         "sudo FOO=bar launchctl submit -l com.example.cleanup -p /usr/bin/true",
         "time launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "caffeinate -t 60 launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "arch -arm64 launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "nice -n 5 launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "stdbuf -o L launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "timeout --signal TERM 10 launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "doas -u root launchctl submit -l com.example.cleanup -p /usr/bin/true",
         "launchctl \\\nsubmit -l com.example.cleanup -p /usr/bin/true",
         "launchctl submit -l com.example.cleanup -p /usr/bin/true # " + "x" * 17_000,
         "(launchctl submit -l com.example.cleanup -p /usr/bin/true)",
         "sh -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
+        "bash -c -- 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
         "bash -o posix -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
         "bash -O extglob -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
         "bash --init-file /tmp/empty -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
@@ -331,6 +338,36 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "submitted launchd jobs can outlive or relaunch the gateway" in result["error"]
         assert "external shell" in result["error"]
+        assert calls == []
+
+    @pytest.mark.parametrize("command", [
+        "nohup launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "setsid --wait launchctl submit -l com.example.cleanup -p /usr/bin/true",
+    ])
+    def test_blocks_background_wrapped_launchctl_submit_inside_gateway(
+        self, monkeypatch, command
+    ):
+        import tools.terminal_tool as tt
+        from tools.process_registry import process_registry
+
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        def fail_if_spawned(**kwargs):
+            calls.append(kwargs)
+            raise AssertionError("background process must not spawn")
+
+        monkeypatch.setattr(process_registry, "spawn_local", fail_if_spawned)
+
+        result = json.loads(tt.terminal_tool(command=command, background=True))
+
+        assert result["exit_code"] == 1
+        assert "submitted launchd jobs can outlive or relaunch the gateway" in result["error"]
         assert calls == []
 
     def test_allows_launchctl_submit_outside_gateway(self, monkeypatch):

@@ -90,7 +90,21 @@ _ENV_OPTIONS_WITH_VALUES = frozenset({
     "--split-string",
     "--unset",
 })
-_COMMAND_WRAPPERS = frozenset({"command", "env", "exec", "sudo", "time"})
+_COMMAND_WRAPPERS = frozenset({
+    "arch",
+    "caffeinate",
+    "command",
+    "doas",
+    "env",
+    "exec",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "sudo",
+    "time",
+    "timeout",
+})
 _SUDO_OPTIONS_WITH_VALUES = frozenset({
     "-C",
     "-D",
@@ -112,6 +126,23 @@ _SUDO_OPTIONS_WITH_VALUES = frozenset({
     "--user",
 })
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "-o", "--init-file", "--rcfile"})
+_OPTION_WRAPPERS = frozenset({
+    "arch",
+    "caffeinate",
+    "doas",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "timeout",
+})
+_WRAPPER_OPTIONS_WITH_VALUES = {
+    "caffeinate": frozenset({"-t", "-w"}),
+    "doas": frozenset({"-C", "-u"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "stdbuf": frozenset({"-e", "-i", "-o"}),
+    "timeout": frozenset({"-k", "-s", "--kill-after", "--signal"}),
+}
 
 
 def contains_gateway_lifecycle_command(text: str) -> bool:
@@ -188,6 +219,8 @@ def _shell_tokens(command: str) -> Optional[list[str]]:
             tokens.append(token)
         return tokens
     except ValueError:
+        # Fail open on malformed shell text. Known cases are unbalanced quotes,
+        # which the target shell also rejects rather than executing.
         return None
 
 
@@ -238,6 +271,20 @@ def _contains_launchctl_submit_tokens(tokens: list[str], depth: int) -> bool:
                 index = _skip_assignments(tokens, index)
             if wrapper == "time" and index < len(tokens) and tokens[index] == "-p":
                 index += 1
+            if wrapper in _OPTION_WRAPPERS:
+                options_with_values = _WRAPPER_OPTIONS_WITH_VALUES.get(
+                    wrapper, frozenset()
+                )
+                while (
+                    index < len(tokens)
+                    and tokens[index].startswith("-")
+                    and tokens[index] != "--"
+                ):
+                    index += 2 if tokens[index] in options_with_values else 1
+                if wrapper == "timeout":
+                    if index < len(tokens) and tokens[index] == "--":
+                        index += 1
+                    index += index < len(tokens)
             if index < len(tokens) and tokens[index] == "--":
                 index += 1
         if index >= len(tokens) or _is_command_separator(tokens[index]):
@@ -263,7 +310,15 @@ def _contains_launchctl_submit_tokens(tokens: list[str], depth: int) -> bool:
                 and not option.startswith("--")
                 and "c" in option[1:]
             ):
-                payload = _shell_tokens(_unquote(tokens[option_index + 1]))
+                payload_index = option_index + 1
+                if (
+                    payload_index < len(tokens)
+                    and _unquote(tokens[payload_index]) == "--"
+                ):
+                    payload_index += 1
+                if payload_index >= len(tokens):
+                    break
+                payload = _shell_tokens(_unquote(tokens[payload_index]))
                 if payload and _contains_launchctl_submit_tokens(payload, depth + 1):
                     return True
                 break
