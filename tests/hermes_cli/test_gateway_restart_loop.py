@@ -213,16 +213,34 @@ class TestTerminalToolGatewayLifecycleGuard:
                 raise AssertionError("execute must not be reached")
         return _FakeEnv()
 
-    def _minimal_config(self):
-        return {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600}
+    def _make_recording_env(self, calls):
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "ok", "returncode": 0}
+        return _FakeEnv()
 
-    def _patch_env(self, monkeypatch, fake_env, *, inside_gateway: bool):
+    def _minimal_config(self, env_type="local"):
+        return {
+            "env_type": env_type,
+            "cwd": "/tmp",
+            "timeout": 60,
+            "lifetime_seconds": 3600,
+            "docker_image": "test-image",
+        }
+
+    def _patch_env(
+        self, monkeypatch, fake_env, *, inside_gateway: bool, env_type="local"
+    ):
         import tools.terminal_tool as tt
         eid = "default"
         monkeypatch.setattr(tt, "_active_environments", {eid: fake_env})
         monkeypatch.setattr(tt, "_last_activity", {eid: 0.0})
         monkeypatch.setattr(tt, "_task_env_overrides", {})
-        monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
+        monkeypatch.setattr(
+            tt, "_get_env_config", lambda: self._minimal_config(env_type)
+        )
         if inside_gateway:
             monkeypatch.setenv("_HERMES_GATEWAY", "1")
         else:
@@ -234,6 +252,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl stop hermes-gateway.service",
         "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
+        "launchctl load /Library/LaunchDaemons/ai.hermes.gateway.plist",
         "pkill -f hermes.*gateway",
     ])
     def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
@@ -244,6 +263,7 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+        assert "gateway would kill this command" in result["error"]
 
     def test_force_true_cannot_bypass_block(self, monkeypatch):
         import tools.terminal_tool as tt
@@ -255,6 +275,143 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize("cmd", [
+        "launchctl submit -l ai.hermes.gateway-restart-once.test -p /bin/zsh "
+        "-- /bin/zsh /tmp/gateway-restart-once.sh",
+        "launchctl submit -l com.example.cleanup -p /does/not/exist",
+        "/bin/launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "command launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "exec /bin/launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "env MODE=test launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "env -i launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "echo ready; launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "true && /bin/launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "printf x | launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "echo ready\nlaunchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "echo ready\n\nlaunchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "echo ready;\nlaunchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "true &&\nlaunchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "echo ready # harmless comment\nlaunchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "if true; then launchctl submit -l com.example.cleanup -p /usr/bin/true; fi",
+        "{ launchctl submit -l com.example.cleanup -p /usr/bin/true; }",
+        "NOTE='one shot' launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "VAR=\"v\" launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "VAR='v' launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "env VAR=\"v\" launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "FOO=\"bar\" echo hi; launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        ">/tmp/launchctl-submit.log launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "2>&1 launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "command -p launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "sudo launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "sudo -n launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "sudo --user root launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "sudo FOO=bar launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "time launchctl submit -l com.example.cleanup -p /usr/bin/true",
+        "launchctl \\\nsubmit -l com.example.cleanup -p /usr/bin/true",
+        "launchctl submit -l com.example.cleanup -p /usr/bin/true # " + "x" * 17_000,
+        "(launchctl submit -l com.example.cleanup -p /usr/bin/true)",
+        "sh -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
+        "bash -o posix -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
+        "bash --init-file /tmp/empty -c 'launchctl submit -l com.example.cleanup -p /usr/bin/true'",
+    ])
+    def test_blocks_local_launchctl_submit_inside_gateway(self, monkeypatch, cmd):
+        import tools.terminal_tool as tt
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=cmd))
+
+        assert result["exit_code"] == 1
+        assert "submitted launchd jobs can outlive or relaunch the gateway" in result["error"]
+        assert "external shell" in result["error"]
+        assert calls == []
+
+    def test_allows_launchctl_submit_outside_gateway(self, monkeypatch):
+        import tools.terminal_tool as tt
+        calls = []
+        command = "launchctl submit -l com.example.cleanup -p /usr/bin/true"
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=False
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    @pytest.mark.parametrize("env_type", ["docker", "ssh"])
+    def test_allows_launchctl_submit_on_nonlocal_backend(
+        self, monkeypatch, env_type
+    ):
+        import tools.terminal_tool as tt
+        calls = []
+        command = "launchctl submit -l com.example.cleanup -p /usr/bin/true"
+        self._patch_env(
+            monkeypatch,
+            self._make_recording_env(calls),
+            inside_gateway=True,
+            env_type=env_type,
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    @pytest.mark.parametrize("cmd", [
+        "echo 'launchctl submit -l com.example.cleanup'",
+        "echo ';' launchctl submit",
+        "echo ready # launchctl submit -l com.example.cleanup",
+        "python -c 'import sys' launchctl submit",
+        "bash --norc 'launchctl submit -l com.example.cleanup'",
+    ])
+    def test_allows_launchctl_submit_words_outside_command_position(
+        self, monkeypatch, cmd
+    ):
+        import tools.terminal_tool as tt
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=cmd))
+
+        assert result["exit_code"] == 0
+        assert calls == [cmd]
+
+    @pytest.mark.parametrize("cmd", [
+        "launchctl bootstrap gui/501 /does/not/exist",
+        "launchctl load /does/not/exist",
+    ])
+    def test_allows_neutral_launchctl_bootstrap_and_load(self, monkeypatch, cmd):
+        import tools.terminal_tool as tt
+        calls = []
+        self._patch_env(
+            monkeypatch, self._make_recording_env(calls), inside_gateway=True
+        )
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=cmd))
+
+        assert result["exit_code"] == 0
+        assert calls == [cmd]
 
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
