@@ -4317,6 +4317,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # summary line out of non-interactive surfaces.
         self._interactive_turn = False
 
+        # show_cost: show estimated $ cost and token counts in the status bar
+        self._show_cost = bool(CLI_CONFIG["display"].get("show_cost", False))
+
         # Submitted multiline user-message preview (display.user_message_preview in config.yaml)
         _ump = CLI_CONFIG["display"].get("user_message_preview", {})
         if not isinstance(_ump, dict):
@@ -4498,6 +4501,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
+        self._provider_allow_fallbacks = pr.get("allow_fallbacks", True)
 
         # OpenRouter Pareto Code router knob — coding-score floor (0.0-1.0).
         # Only applied when model.model == "openrouter/pareto-code".
@@ -5234,6 +5238,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session_completion_tokens": 0,
             "session_total_tokens": 0,
             "session_api_calls": 0,
+            "session_cost_label": "",
+            "session_cost_status": "unknown",
+            "session_provider": "",
+            "session_cache_rate": None,
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
@@ -5329,6 +5337,53 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
 
+        # Provider name for the status bar
+        snapshot["session_provider"] = getattr(agent, "provider", None) or ""
+
+        # Cache rate: cache_read / (input + cache_read) * 100
+        try:
+            inp = snapshot["session_input_tokens"]
+            cache_read = snapshot["session_cache_read_tokens"]
+            cache_denom = inp + cache_read
+            if cache_denom > 0:
+                snapshot["session_cache_rate"] = round(cache_read / cache_denom * 100, 1)
+            else:
+                snapshot["session_cache_rate"] = None
+        except Exception:
+            snapshot["session_cache_rate"] = None
+
+        # Cost estimation for the status bar (only when show_cost is enabled)
+        if self._show_cost:
+            try:
+                total_tok = snapshot["session_total_tokens"]
+                if total_tok > 0:
+                    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+                    usage = CanonicalUsage(
+                        input_tokens=snapshot["session_input_tokens"],
+                        output_tokens=snapshot["session_output_tokens"],
+                        cache_read_tokens=snapshot["session_cache_read_tokens"],
+                        cache_write_tokens=snapshot["session_cache_write_tokens"],
+                        request_count=snapshot["session_api_calls"],
+                    )
+                    cost_result = estimate_usage_cost(
+                        model_name,
+                        usage,
+                        provider=getattr(agent, "provider", None),
+                        base_url=getattr(agent, "base_url", None),
+                        api_key=getattr(agent, "api_key", None),
+                    )
+                    snapshot["session_cost_label"] = cost_result.label
+                    snapshot["session_cost_status"] = cost_result.status
+                else:
+                    snapshot["session_cost_label"] = ""
+                    snapshot["session_cost_status"] = "unknown"
+            except Exception:
+                snapshot["session_cost_label"] = ""
+                snapshot["session_cost_status"] = "unknown"
+        else:
+            snapshot["session_cost_label"] = ""
+            snapshot["session_cost_status"] = "unknown"
+
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
             # last_prompt_tokens is parked at the -1 sentinel right after a
@@ -5349,6 +5404,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 snapshot["context_percent"] = max(0, min(100, round((context_tokens / context_length) * 100)))
 
         return snapshot
+
+    def _format_cost_token_string(self, snapshot: Dict[str, Any]) -> str:
+        """Build a compact cost/token/cache string for the status bar.
+        
+        Returns e.g. \"$0.02 · ↓105K ↑7.5K · 95.6% cache\" or empty string.
+        """
+        if not self._show_cost:
+            return ""
+        parts = []
+        cost_label = snapshot.get("session_cost_label", "")
+        if cost_label:
+            parts.append(cost_label)
+        inp = snapshot.get("session_input_tokens", 0) or 0
+        out = snapshot.get("session_output_tokens", 0) or 0
+        if inp > 0 and out > 0:
+            parts.append(f"↓{format_token_count_compact(inp)} ↑{format_token_count_compact(out)}")
+        elif inp > 0:
+            parts.append(f"↓{format_token_count_compact(inp)}")
+        elif out > 0:
+            parts.append(f"↑{format_token_count_compact(out)}")
+        cache_rate = snapshot.get("session_cache_rate")
+        if cache_rate is not None:
+            parts.append(f"{cache_rate}% cache")
+        return " · ".join(parts)
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -5890,9 +5969,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     text += " · ⚠ YOLO"
                 return self._trim_status_bar_text(text, width)
             if width < 76:
-                parts = [f"⚕ {snapshot['model_short']}", percent_label]
+                # Show provider alongside model name when show_cost is on
+                provider = snapshot.get("session_provider", "")
+                if provider and self._show_cost:
+                    model_label = f"⚕ {provider} · {snapshot['model_short']}"
+                else:
+                    model_label = f"⚕ {snapshot['model_short']}"
+                parts = [model_label, percent_label]
                 if battery_label:
                     parts.insert(0, battery_label)
+                # Cost/token/rate segment (medium tier)
+                cost_token_str = self._format_cost_token_string(snapshot)
+                if cost_token_str:
+                    parts.append(cost_token_str)
                 compressions = snapshot.get("compressions", 0)
                 if compressions:
                     parts.append(f"🗜️ {compressions}")
@@ -5922,9 +6011,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 context_label = "ctx --"
 
             compressions = snapshot.get("compressions", 0)
-            parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
+            # Show provider alongside model name when show_cost is on
+            provider = snapshot.get("session_provider", "")
+            if provider and self._show_cost:
+                model_label = f"⚕ {provider} · {snapshot['model_short']}"
+            else:
+                model_label = f"⚕ {snapshot['model_short']}"
+            parts = [model_label, context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
+            # Cost/token/rate segment (wide tier)
+            cost_token_str = self._format_cost_token_string(snapshot)
+            if cost_token_str:
+                parts.append(cost_token_str)
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -5996,12 +6095,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
+                    # Show provider alongside model name
+                    provider = snapshot.get("session_provider", "")
+                    if provider and self._show_cost:
+                        model_short = f"{provider} · {snapshot['model_short']}"
+                    else:
+                        model_short = snapshot["model_short"]
                     frags = [
                         ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
+                        ("class:status-bar-strong", model_short),
                         ("class:status-bar-dim", " · "),
                         (self._status_bar_context_style(percent), percent_label),
                     ]
+                    # Cost/token/rate segment (medium tier TUI)
+                    cost_token_str = self._format_cost_token_string(snapshot)
+                    if cost_token_str:
+                        frags.append(("class:status-bar-dim", " · "))
+                        frags.append(("class:status-bar-cost", cost_token_str))
                     if compressions:
                         frags.append(("class:status-bar-dim", " · "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -6041,9 +6151,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     bg_count = snapshot.get("active_background_tasks", 0)
                     bg_proc_count = snapshot.get("active_background_processes", 0)
                     bg_subagent_count = snapshot.get("active_background_subagents", 0)
+                    # Show provider alongside model name
+                    provider = snapshot.get("session_provider", "")
+                    if provider and self._show_cost:
+                        model_short = f"{provider} · {snapshot['model_short']}"
+                    else:
+                        model_short = snapshot["model_short"]
                     frags = [
                         ("class:status-bar", " ⚕ "),
-                        ("class:status-bar-strong", snapshot["model_short"]),
+                        ("class:status-bar-strong", model_short),
                         ("class:status-bar-dim", " │ "),
                         ("class:status-bar-dim", context_label),
                         ("class:status-bar-dim", " │ "),
@@ -6051,6 +6167,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
                     ]
+                    # Cost/token/rate segment (wide tier TUI)
+                    cost_token_str = self._format_cost_token_string(snapshot)
+                    if cost_token_str:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-cost", cost_token_str))
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
@@ -16644,6 +16765,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'status-bar-bad': 'bg:#1a1a2e #FF8C00 bold',
             'status-bar-critical': 'bg:#1a1a2e #FF6B6B bold',
             'status-bar-yolo': 'bg:#1a1a2e #FF4444 bold',
+            'status-bar-cost': 'bg:#1a1a2e #00BFA5 bold',
             # Bronze horizontal rules around the input area
             'input-rule': '#CD7F32',
             # Clipboard image attachment badges
