@@ -1460,3 +1460,138 @@ def test_literal_targets_are_not_treated_as_expansion(tmp_path, command):
     assert admit(registry, repo).returncode == 0
     result = run_hook(registry, payload("terminal", {"command": command}, repo))
     assert decision(result)["decision"] == "allow", command
+
+
+# ---------------------------------------------------------------------------
+# R4-B3 / R4-B4 / R4-B8a — path expansion in EVERY payload field, not just
+# terminal `command`
+# ---------------------------------------------------------------------------
+
+EXPANDING_PATHS = ["~/pwned", "~", "~user/pwned", "build/*.o", "{a,b}", "a?b", "[ab]c"]
+
+
+@pytest.mark.parametrize("bad", EXPANDING_PATHS)
+def test_file_tool_path_payloads_reject_expansion(tmp_path, bad):
+    """File tools call ``expanduser``; the hook must not see a workspace-local
+    literal where the tool will write under ``$HOME``."""
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    for tool, args in [
+        ("write_file", {"path": bad, "content": "x"}),
+        ("patch", {"path": bad, "mode": "replace", "old_string": "a", "new_string": "b"}),
+        ("edit_file", {"path": bad, "old": "a", "new": "b"}),
+        ("create_file", {"path": bad, "content": "x"}),
+        ("delete_file", {"path": bad}),
+        ("str_replace_editor", {"path": bad, "old_str": "a", "new_str": "b"}),
+    ]:
+        result = run_hook(registry, payload(tool, args, repo))
+        assert decision(result)["decision"] == "block", (tool, bad)
+
+
+@pytest.mark.parametrize("bad", EXPANDING_PATHS)
+def test_nested_apply_patch_change_paths_reject_expansion(tmp_path, bad):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    for args in [
+        {"changes": [{"path": bad}]},
+        {"changes": [{"path": "inside.txt"}, {"path": bad}]},
+        {"changes": [{"file_path": bad}]},
+        {"changes": [{"target_path": bad}]},
+    ]:
+        result = run_hook(registry, payload("apply_patch", args, repo))
+        assert decision(result)["decision"] == "block", (args, bad)
+
+
+@pytest.mark.parametrize("bad", EXPANDING_PATHS)
+def test_move_file_source_and_destination_reject_expansion(tmp_path, bad):
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    for args in [
+        {"path": bad, "target_path": "inside.txt"},
+        {"path": "inside.txt", "target_path": bad},
+        {"source_path": bad, "destination_path": "inside.txt"},
+        {"file_path": "inside.txt", "destination": bad},
+    ]:
+        result = run_hook(registry, payload("move_file", args, repo))
+        assert decision(result)["decision"] == "block", (args, bad)
+
+
+@pytest.mark.parametrize("bad", EXPANDING_PATHS)
+def test_terminal_workdir_rejects_expansion(tmp_path, bad):
+    """R4-B4: the local backend expands ``workdir`` before running the command."""
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    assert admit(registry, repo).returncode == 0
+    result = run_hook(
+        registry, payload("terminal", {"command": "touch pwned", "workdir": bad}, repo),
+    )
+    assert decision(result)["decision"] == "block", bad
+
+
+@pytest.mark.parametrize("command", [
+    "git -C ~/x rev-parse HEAD",
+    "git -C ~ rev-parse HEAD",
+    "git -C build/* rev-parse HEAD",
+])
+def test_preclaim_readonly_rejects_tilde_and_glob_reads(tmp_path, command):
+    """R4-B8a: no tilde read bypass on the pre-claim discovery grammar."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    result = run_hook(tmp_path / "missing", payload("terminal", {"command": command}, outside))
+    assert decision(result)["decision"] == "block", command
+
+
+def test_literal_owned_payload_paths_stay_admitted(tmp_path):
+    """Controls: ordinary literal targets inside the owned worktree still pass."""
+    repo, registry = tmp_path / "repo", tmp_path / "registry"
+    init_repo(repo)
+    (repo / "sub").mkdir()
+    assert admit(registry, repo).returncode == 0
+    for tool, args in [
+        ("write_file", {"path": "inside.txt", "content": "x"}),
+        ("write_file", {"path": str(repo / "sub" / "deep.txt"), "content": "x"}),
+        ("apply_patch", {"changes": [{"path": "a.txt"}, {"path": "sub/b.txt"}]}),
+        ("move_file", {"path": "a.txt", "target_path": "sub/b.txt"}),
+        ("terminal", {"command": "touch pwned", "workdir": str(repo)}),
+        ("terminal", {"command": "touch pwned", "workdir": "sub"}),
+    ]:
+        result = run_hook(registry, payload(tool, args, repo))
+        assert decision(result)["decision"] == "allow", (tool, args)
+
+
+def test_hook_path_key_table_covers_every_admitted_mutating_tool_schema():
+    """R4-B3: the hook's proven target must be the path the tool resolves.
+
+    Contract, not snapshot: every path-shaped parameter of every mutating tool
+    the strict gate admits must appear in the hook's path-key table. A key the
+    hook does not inspect is a key a worker can steer the tool through.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import factory_admission_hook as hook
+    import model_tools
+
+    schemas = {}
+    for schema in model_tools.get_tool_definitions():
+        function = schema.get("function", schema)
+        name = function.get("name")
+        if name:
+            schemas[name] = function.get("parameters", {}).get("properties", {}) or {}
+
+    covered = set(hook._PAYLOAD_PATH_KEYS)
+    uncovered = {}
+    for tool in sorted(hook._WORKTREE_MUTATION_TOOLS):
+        for param in schemas.get(tool, {}):
+            lowered = param.lower()
+            looks_like_path = (
+                lowered.endswith("path") or lowered.endswith("paths")
+                or lowered in {"source", "destination", "src", "dst", "file", "files"}
+            )
+            if looks_like_path and param not in covered and param != "workdir":
+                uncovered.setdefault(tool, []).append(param)
+    assert not uncovered, (
+        "these mutating-tool path parameters are invisible to the hook's "
+        f"target validation: {uncovered}"
+    )

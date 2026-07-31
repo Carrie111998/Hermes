@@ -347,6 +347,75 @@ def _strict_observation_payload_is_valid(tool_name, tool_input):
     return False
 
 
+#: Every payload key that names a filesystem target across Hermes file tools.
+#: The hook must prove ownership of the same path the tool will resolve, so a
+#: field the hook ignores is a field the tool can be steered through.
+_PAYLOAD_PATH_KEYS = (
+    "path", "file_path", "target_path", "source_path", "destination_path",
+    "source", "destination", "src", "dst", "new_path", "old_path",
+)
+
+
+def _payload_path_rewrites_target(value):
+    """True when a payload path string is not a plain literal.
+
+    File tools call ``expanduser`` (and the shell-free ones still glob) on the
+    value, so ``~/x`` is written under ``$HOME`` while the hook, reading it as
+    workspace-relative, would prove ownership of an entirely different path.
+    Payload values carry no shell quoting, so any occurrence counts.
+    """
+    if not isinstance(value, str):
+        return False
+    if not value.strip():
+        return False
+    if value.startswith("~"):
+        return True
+    return any(character in value for character in "*?[]{}")
+
+
+def _iter_payload_path_values(tool_input, _depth=0):
+    """Yield every path-shaped value in a payload, nested containers included."""
+    if _depth > 6:
+        return
+    if isinstance(tool_input, dict):
+        for key, value in tool_input.items():
+            if key in _PAYLOAD_PATH_KEYS and isinstance(value, str):
+                yield value
+            elif isinstance(value, (dict, list, tuple)):
+                yield from _iter_payload_path_values(value, _depth + 1)
+    elif isinstance(tool_input, (list, tuple)):
+        for item in tool_input:
+            yield from _iter_payload_path_values(item, _depth + 1)
+
+
+def _payload_has_path_expansion(tool_input):
+    """True when any declared target would be rewritten before the tool writes."""
+    if not isinstance(tool_input, dict):
+        return False
+    if any(
+        _payload_path_rewrites_target(value)
+        for value in _iter_payload_path_values(tool_input)
+    ):
+        return True
+    # ``workdir`` is not a mutation target but it *anchors* every relative one,
+    # and the local backend expands it exactly like a shell would.
+    workdir = tool_input.get("workdir")
+    if isinstance(workdir, str) and _payload_path_rewrites_target(workdir):
+        return True
+    # V4A patch bodies transport their own paths. A malformed body cannot be
+    # parsed into provable targets, which is itself a reason to refuse — the
+    # extractor is fail-closed by design and raises rather than guessing.
+    if isinstance(tool_input.get("patch"), str):
+        try:
+            patch_paths = extract_v4a_patch_paths(tool_input.get("patch"))
+        except Exception:
+            return True
+        for patch_path in patch_paths:
+            if _payload_path_rewrites_target(patch_path):
+                return True
+    return False
+
+
 def _worktree_mutation_payload_has_target_contract(tool_name, tool_input):
     if tool_name == "terminal":
         return isinstance(tool_input.get("command"), str) and bool(
@@ -441,6 +510,10 @@ def _terminal_is_readonly(command):
     if not isinstance(command, str) or not command.strip() or "\n" in command or "\r" in command:
         return False
     if _has_active_shell_expansion(command) or re.search(r"[*?\[]", command):
+        return False
+    if _command_has_path_expansion(command):
+        # A tilde read (``git -C ~/x rev-parse``) reaches outside the workspace
+        # exactly like a tilde write; discovery is not an exemption.
         return False
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|()<>\n")
@@ -1092,6 +1165,15 @@ def main(argv=None):
         if strict_code_gate:
             if not isinstance(tool_name, str) or not tool_name or not tool_input_is_valid:
                 _emit_block("unknown tool or invalid payload is mutation-capable by default")
+                return 0
+            if _payload_has_path_expansion(tool_input):
+                # Consumer-side rewriting (tilde, glob, brace) would make the
+                # ownership we prove here describe a different path than the
+                # one the tool resolves. Refuse before _path_anchor.
+                _emit_block(
+                    "tool payload target uses shell path expansion; the proven "
+                    "worktree would not be the path actually written"
+                )
                 return 0
             if tool_name == "terminal":
                 # Substitution bodies execute BEFORE the outer command, so this
