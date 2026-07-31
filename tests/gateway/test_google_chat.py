@@ -1054,6 +1054,41 @@ class TestSetupFilesSlashCommand:
         adapter._handle_setup_files_command.assert_awaited_once()
         adapter.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_setup_files_keys_oauth_by_email_not_resource_name(self, adapter):
+        """The per-user OAuth key must be the sender's email (``user_id``),
+        NOT the ``users/{id}`` resource name (``user_id_alt``).
+
+        Regression for #75492: ``/setup-files`` stored the token under
+        ``user_id_alt`` (always the resource name), while ``_send_file`` reads
+        it back by email, so the two keys never matched and native attachment
+        delivery failed permanently after a successful authorization.
+        """
+        adapter._handle_setup_files_command = AsyncMock(return_value=True)
+        adapter._build_message_event = AsyncMock(
+            return_value=MessageEvent(
+                text="/setup-files start",
+                message_type=MessageType.TEXT,
+                source=adapter.build_source(
+                    chat_id="spaces/S",
+                    chat_name="DM",
+                    chat_type="dm",
+                    # Email is the canonical id; resource name is the alt.
+                    user_id="ramon@example.com",
+                    user_name="Ramón",
+                    thread_id="spaces/S/threads/T",
+                    user_id_alt="users/12345",
+                ),
+                raw_message={},
+                message_id="spaces/S/messages/M",
+            )
+        )
+        await adapter._dispatch_message({}, {})
+        adapter._handle_setup_files_command.assert_awaited_once()
+        kwargs = adapter._handle_setup_files_command.await_args.kwargs
+        assert kwargs["sender_email"] == "ramon@example.com"
+        assert kwargs["sender_email"] != "users/12345"
+
 
 class TestUserOAuthHelper:
     @staticmethod

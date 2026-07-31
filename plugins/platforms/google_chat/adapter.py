@@ -1563,14 +1563,21 @@ class GoogleChatAdapter(BasePlatformAdapter):
             # Short-circuit /setup-files before the agent dispatch.
             text = (event.text or "").strip()
             if text.startswith("/setup-files") and event.source is not None:
-                # The sender's email (user_id_alt) is the per-user OAuth
-                # key — the bot stores this user's token at
-                # ${HERMES_HOME}/google_chat_user_tokens/<sanitized>.json
-                # so when User B asks for a file later in B's DM, B's
-                # token gets used (not the first person who set up files).
+                # The per-user OAuth key is the sender's EMAIL, stored at
+                # ${HERMES_HOME}/google_chat_user_tokens/<sanitized>.json so
+                # when User B asks for a file later in B's DM, B's token gets
+                # used (not the first person who set up files).
+                #
+                # ``_build_message_event`` assigns the email to ``user_id``
+                # and the ``users/{id}`` resource name to ``user_id_alt``, and
+                # ``_send_file`` reads the token back by that same email. The
+                # key MUST therefore come from ``user_id`` — reading
+                # ``user_id_alt`` here stored the token under the resource
+                # name, which the send path can never find, so native
+                # delivery failed permanently after a successful setup (#75492).
                 sender_email = (
-                    event.source.user_id_alt
-                    if event.source and event.source.user_id_alt
+                    event.source.user_id
+                    if event.source and event.source.user_id
                     else None
                 )
                 handled = await self._handle_setup_files_command(
