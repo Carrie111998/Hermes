@@ -1804,6 +1804,21 @@ registry.register(
     effect=ToolEffect.READ_ONLY,
     emoji="📚",
 )
+
+
+def _may_record_skill_usage() -> bool:
+    """Return whether recording skill telemetry is safe for this turn."""
+    try:
+        from agent.request_phase import RequestPhase, current_turn_policy
+
+        policy = current_turn_policy()
+    except Exception:
+        # Never let observability turn a read-only investigation into a write
+        # when the governing request-phase state is unavailable.
+        return False
+    return policy is None or policy.phase is not RequestPhase.INVESTIGATION
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
@@ -1842,7 +1857,11 @@ def _skill_view_with_bump(args, **kw):
         )
     try:
         parsed = json.loads(result)
-        if isinstance(parsed, dict) and parsed.get("success"):
+        if (
+            isinstance(parsed, dict)
+            and parsed.get("success")
+            and _may_record_skill_usage()
+        ):
             # Use the resolved skill name from the payload when present —
             # qualified forms ("plugin:skill") return with the canonical name.
             resolved = parsed.get("name") or name

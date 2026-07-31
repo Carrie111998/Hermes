@@ -441,6 +441,52 @@ def test_real_registry_without_router_allows_available_domain_skill(
     assert policy.loaded_root_skills == ["terrain-quote-workflows"]
 
 
+def test_investigation_skill_view_does_not_write_usage_sidecar(
+    clean_repo,
+    monkeypatch,
+):
+    """A registered read-only skill view must leave durable curator state alone."""
+    from hermes_constants import get_hermes_home
+    from tools import skills_tool
+    from tools.registry import registry
+    from tools.skill_usage import load_usage
+
+    skill_name = "investigation-proof"
+    skill_dir = get_hermes_home() / "skills" / skill_name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {skill_name}\n"
+        "description: A test skill for read-only investigation coverage.\n"
+        "---\n\n"
+        "# Investigation proof\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent.skill_utils.get_external_skills_dirs",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        skills_tool,
+        "_get_disabled_skill_names",
+        lambda: set(),
+    )
+    monkeypatch.setattr(
+        skills_tool,
+        "_is_skill_disabled",
+        lambda _name: False,
+    )
+    skills_tool._SKILLS_CACHE.clear()
+
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+    result = json.loads(registry.dispatch("skill_view", {"name": skill_name}))
+
+    assert result["success"] is True
+    assert load_usage() == {}
+    assert not (get_hermes_home() / "skills" / ".usage.json").exists()
+    assert not (get_hermes_home() / "skills" / ".usage.json.lock").exists()
+
+
 def test_skill_payload_budget_accounts_actual_returned_content(
     monkeypatch,
     clean_repo,
