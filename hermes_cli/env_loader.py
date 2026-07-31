@@ -30,13 +30,10 @@ _WARNED_KEYS: set[str] = set()
 # is enough.
 _WARNED_UTF32_PATHS: set[str] = set()
 
-# Map of env-var name → source label ("bitwarden", etc.) for credentials
-# that were injected by an external secret source during load_hermes_dotenv().
-# Used by setup / `hermes model` flows to label detected credentials so
-# users understand WHERE a key came from when their .env doesn't contain it
-# directly (otherwise the "credentials detected ✓" line looks identical to
-# the .env case and they don't know Bitwarden is wired up).
-_SECRET_SOURCES: dict[str, str] = {}
+# Provenance follows the same resolved-home boundary as secret values.  A
+# process-global ``var -> source`` map can mislabel the same variable when two
+# profiles hydrate it through different backends.
+_SECRET_SOURCES_BY_HOME: dict[str, dict[str, str]] = {}
 # Applied values are immutable per-home snapshots.  ``os.environ`` is shared
 # across profiles and may be overwritten by a later home's source apply.
 _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
@@ -57,18 +54,26 @@ _SECRET_SOURCE_HYDRATION_LOCKS: dict[str, threading.Lock] = {}
 _SECRET_SOURCE_CACHE_GENERATION = 0
 
 
-def get_secret_source(env_var: str) -> str | None:
-    """Return the label of the secret source that supplied ``env_var``, if any.
+def get_secret_source(
+    env_var: str, hermes_home: str | os.PathLike | None = None
+) -> str | None:
+    """Return the source label for ``env_var`` at one resolved Hermes home.
 
-    Returns ``"bitwarden"`` for keys pulled from Bitwarden Secrets Manager
-    during the current process's ``load_hermes_dotenv()`` call.  Returns
-    ``None`` for keys that came from ``.env``, the shell environment, or
-    aren't tracked.  The returned label is metadata only: credential-pool
-    persistence may store it to explain the origin of a borrowed secret, but
-    must never treat it as authorization to persist the raw value.
+    Pass ``hermes_home`` whenever a caller already knows which profile it is
+    serving.  The no-home compatibility path returns a label only when every
+    loaded home that supplied the variable agrees, avoiding a cross-profile
+    provenance lie.
     """
     with _SECRET_SOURCE_CACHE_LOCK:
-        return _SECRET_SOURCES.get(env_var)
+        if hermes_home is not None:
+            home_key = str(Path(hermes_home).resolve())
+            return _SECRET_SOURCES_BY_HOME.get(home_key, {}).get(env_var)
+        labels = {
+            sources[env_var]
+            for sources in _SECRET_SOURCES_BY_HOME.values()
+            if env_var in sources
+        }
+        return labels.pop() if len(labels) == 1 else None
 
 
 def get_secret_source_values(
@@ -154,7 +159,12 @@ def _hydrate_profile_secret_sources(
         for name, value in load_env_file(home / ".op.env").items():
             local_env.setdefault(name, value)
         local_env["HERMES_HOME"] = str(home)
-        report = apply_all(cfg, home, environ=local_env)
+        report = apply_all(
+            cfg,
+            home,
+            environ=local_env,
+            isolated_environment=True,
+        )
     except Exception:  # noqa: BLE001 — preserve fail-open startup behavior
         return {}, False
 
@@ -168,14 +178,16 @@ def _hydrate_profile_secret_sources(
             return get_secret_source_values(home), False
 
         values: dict[str, str] = {}
+        provenance: dict[str, str] = {}
         for name, applied in report.provenance.items():
             value = local_env.get(name)
             if value is None:
                 continue
-            _SECRET_SOURCES[name] = applied.source
+            provenance[name] = applied.source
             values[name] = value
         if values:
             _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+            _SECRET_SOURCES_BY_HOME[home_key] = provenance
         _APPLIED_HOMES.add(home_key)
         return dict(values), False
 
@@ -185,8 +197,8 @@ def reset_secret_source_cache() -> None:
 
     The first call to ``_apply_external_secret_sources(home_path)`` in a
     process pulls from Bitwarden (or other configured backend), records the
-    applied keys in ``_SECRET_SOURCES``, and remembers ``home_path`` so
-    subsequent calls in the same process are no-ops.  Call this to force the
+    applied keys in its resolved-home provenance map, and remembers
+    ``home_path`` so subsequent calls in the same process are no-ops. Call this
     next call to re-pull — useful for tests, and for long-running processes
     that want to refresh after a config change.
     """
@@ -194,11 +206,13 @@ def reset_secret_source_cache() -> None:
     with _SECRET_SOURCE_CACHE_LOCK:
         _SECRET_SOURCE_CACHE_GENERATION += 1
         _APPLIED_HOMES.clear()
-        _SECRET_SOURCES.clear()
+        _SECRET_SOURCES_BY_HOME.clear()
         _SECRET_SOURCE_VALUES_BY_HOME.clear()
 
 
-def format_secret_source_suffix(env_var: str) -> str:
+def format_secret_source_suffix(
+    env_var: str, hermes_home: str | os.PathLike | None = None
+) -> str:
     """Return a human-readable suffix like ``" (from Bitwarden)"`` or ``""``.
 
     Use this when printing a detected credential so the user can see where
@@ -206,7 +220,7 @@ def format_secret_source_suffix(env_var: str) -> str:
     the shell — those are the implicit / "default" cases users already
     understand.
     """
-    source = get_secret_source(env_var)
+    source = get_secret_source(env_var, hermes_home)
     if not source:
         return ""
     if source == "bitwarden":
@@ -501,8 +515,8 @@ def _apply_external_secret_sources_locked(home_path: Path) -> None:
     first-claim-wins conflict handling, override semantics, provenance)
     lives in ``agent.secret_sources.registry.apply_all``; this wrapper
     owns the once-per-HERMES_HOME guard, the post-apply ASCII
-    sanitization sweep, the ``_SECRET_SOURCES`` provenance map that
-    UI surfaces read, and the startup status lines.
+    sanitization sweep, the resolved-home provenance map that UI surfaces
+    read, and the startup status lines.
 
     Idempotent within a process: subsequent calls for the same
     ``home_path`` are no-ops.  ``load_hermes_dotenv()`` runs at import
@@ -570,10 +584,12 @@ def _apply_external_secret_sources_locked(home_path: Path) -> None:
             # Remember where each var came from so setup / `hermes model`
             # flows can label detected credentials with their source.
             values: dict[str, str] = {}
+            provenance: dict[str, str] = {}
             for name, applied in report.provenance.items():
-                _SECRET_SOURCES[name] = applied.source
+                provenance[name] = applied.source
                 if name in os.environ:
                     values[name] = os.environ[name]
+            _SECRET_SOURCES_BY_HOME[home_key] = provenance
             _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
 
     for src in report.sources:

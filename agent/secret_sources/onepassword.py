@@ -511,6 +511,7 @@ class OnePasswordSource(SecretSource):
     name = "onepassword"
     label = "1Password"
     shape = "mapped"
+    supports_isolated_environment = True
     scheme = "op"
 
     def override_existing(self, cfg: dict) -> bool:

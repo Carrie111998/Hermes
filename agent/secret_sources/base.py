@@ -149,9 +149,17 @@ class SecretSource(ABC):
             ``api_key`` fields), so scheme collisions are rejected at
             registration time to keep that future possible.
         api_version: Contract version this source was built against.
+        supports_isolated_environment: Whether this source is safe to run
+            during cold multiplex hydration.  Sources that opt in must read
+            bootstrap values through :func:`get_source_environment` (and pass
+            only that mapping to child processes), never directly from
+            ``os.environ``.  Legacy plugin sources default to ``False`` and
+            are skipped rather than allowed to observe another profile's
+            process-global credentials.
     """
 
     api_version: int = SECRET_SOURCE_API_VERSION
+    supports_isolated_environment: bool = False
     name: str = ""
     label: str = ""
     shape: str = "mapped"  # "mapped" | "bulk"

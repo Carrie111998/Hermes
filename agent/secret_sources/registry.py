@@ -198,17 +198,30 @@ def _reset_registry_for_tests() -> None:
 
 
 def _fetch_with_timeout(
-    source: SecretSource, cfg: dict, home_path: Path,
+    source: SecretSource,
+    cfg: dict,
+    home_path: Path,
     environ: MutableMapping[str, str],
+    *,
+    isolated_environment: bool = False,
 ) -> FetchResult:
     """Run source.fetch() under a wall-clock budget; never raises.
 
-    The budget is enforced with a daemon worker thread: a source that
-    blows its budget is reported as ``TIMEOUT`` and its (eventual)
-    result is discarded.  The thread itself may linger until process
-    exit — acceptable for a startup-only path, and strictly better than
-    an unbounded hang on every ``hermes`` invocation.
+    Cold multiplex hydration is an isolation boundary, not merely a different
+    mapping passed to test helpers.  Legacy plugin sources may read
+    ``os.environ`` directly, so they are fail-closed there unless they
+    explicitly implement the documented isolated-environment contract.
     """
+    if isolated_environment and not source.supports_isolated_environment:
+        return FetchResult(
+            error=(
+                "source does not declare supports_isolated_environment; "
+                "skipped during cold multiplex hydration to protect "
+                "profile credentials"
+            ),
+            error_kind=ErrorKind.INTERNAL,
+        )
+
     timeout = source.fetch_timeout_seconds(cfg)
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
@@ -330,11 +343,19 @@ def _profile_alias_target(var: str, profile: str) -> Optional[str]:
     return alias
 
 
-def apply_all(secrets_cfg: dict, home_path: Path,
-              environ: Optional[MutableMapping[str, str]] = None) -> ApplyReport:
+def apply_all(
+    secrets_cfg: dict,
+    home_path: Path,
+    environ: Optional[MutableMapping[str, str]] = None,
+    *,
+    isolated_environment: bool = False,
+) -> ApplyReport:
     """Fetch from every enabled source and apply the merged result to env.
 
-    ``environ`` defaults to ``os.environ``; injectable for tests.
+    ``environ`` defaults to ``os.environ``; injectable for tests.  Set
+    ``isolated_environment`` only for a cold multiplex profile: it prevents
+    legacy plugin sources from running unless they explicitly declare that
+    they use the per-fetch environment contract.
 
     Precedence per env var (most-specific intent wins):
 
@@ -386,7 +407,13 @@ def apply_all(secrets_cfg: dict, home_path: Path,
     for source in ordered:
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
-        result = _fetch_with_timeout(source, cfg, home_path, env)
+        result = _fetch_with_timeout(
+            source,
+            cfg,
+            home_path,
+            env,
+            isolated_environment=isolated_environment,
+        )
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):

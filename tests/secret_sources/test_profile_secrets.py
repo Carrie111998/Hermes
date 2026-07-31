@@ -154,6 +154,39 @@ def test_source_fetch_reads_injected_environment_without_global_mutation(
     assert "BOOTSTRAP_TOKEN" not in __import__("os").environ
 
 
+def test_legacy_plugin_source_is_skipped_during_isolated_hydration(monkeypatch, tmp_path):
+    """A legacy plugin that reads os.environ cannot observe another profile."""
+    import os
+
+    calls = 0
+
+    class _LegacyPluginSource(SecretSource):
+        name = "legacy_plugin"
+        label = "Legacy plugin"
+        shape = "mapped"
+
+        def fetch(self, cfg, home_path):
+            nonlocal calls
+            calls += 1
+            # This is intentionally unsafe legacy-plugin behavior.  The
+            # orchestrator must refuse to invoke it at the isolated boundary.
+            return FetchResult(secrets={"RESOLVED_API_KEY": os.environ["CANARY"]})
+
+    registry.register_source(_LegacyPluginSource())
+    monkeypatch.setenv("CANARY", "default-profile-secret")
+
+    report = registry.apply_all(
+        {"legacy_plugin": {"enabled": True}},
+        tmp_path,
+        environ={"CANARY": "secondary-profile-secret"},
+        isolated_environment=True,
+    )
+
+    assert calls == 0
+    assert report.sources[0].result.error_kind is ErrorKind.INTERNAL
+    assert "supports_isolated_environment" in (report.sources[0].result.error or "")
+
+
 def test_empty_injected_environment_does_not_fall_back_to_process(monkeypatch, tmp_path):
     from agent.secret_sources.base import get_source_environment
 

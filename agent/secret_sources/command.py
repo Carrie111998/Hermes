@@ -420,6 +420,7 @@ class CommandSource(SecretSource):
     name = "command"
     label = "Command helper"
     shape = "bulk"
+    supports_isolated_environment = True
 
     def config_schema(self) -> dict:
         return {

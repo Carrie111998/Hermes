@@ -122,7 +122,8 @@ def test_cold_profile_hydrates_external_source_without_global_env(
 
     calls = {"count": 0}
 
-    def _fake_apply_all(_cfg, _home, *, environ=None):
+    def _fake_apply_all(_cfg, _home, *, environ=None, isolated_environment=False):
+        assert isolated_environment is True
         calls["count"] += 1
         assert environ is not os.environ
         assert environ is not None

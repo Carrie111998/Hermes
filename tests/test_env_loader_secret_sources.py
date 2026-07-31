@@ -22,14 +22,21 @@ if str(ROOT) not in sys.path:
 from hermes_cli import env_loader  # noqa: E402
 
 
+_TEST_HOME = Path("/tmp/hermes-secret-source-test-home")
+
+
+def _record_source(name: str, source: str, home: Path = _TEST_HOME) -> None:
+    env_loader._SECRET_SOURCES_BY_HOME.setdefault(str(home.resolve()), {})[name] = source
+
+
 @pytest.fixture(autouse=True)
 def _reset_sources():
     """Each test starts with a clean source map and applied-home guard."""
-    env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_SOURCES_BY_HOME.clear()
     env_loader._SECRET_SOURCE_VALUES_BY_HOME.clear()
     env_loader.reset_secret_source_cache()
     yield
-    env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_SOURCES_BY_HOME.clear()
     env_loader._SECRET_SOURCE_VALUES_BY_HOME.clear()
     env_loader.reset_secret_source_cache()
 
@@ -39,8 +46,22 @@ def test_get_secret_source_returns_none_for_untracked_var():
 
 
 def test_get_secret_source_returns_label_for_tracked_var():
-    env_loader._SECRET_SOURCES["ANTHROPIC_API_KEY"] = "bitwarden"
+    _record_source("ANTHROPIC_API_KEY", "bitwarden")
     assert env_loader.get_secret_source("ANTHROPIC_API_KEY") == "bitwarden"
+
+
+def test_get_secret_source_is_scoped_by_resolved_home(tmp_path):
+    """Two profiles may attribute the same key to different source backends."""
+    home_a = tmp_path / "alpha"
+    home_b = tmp_path / "beta"
+    _record_source("SHARED_API_KEY", "bitwarden", home_a)
+    _record_source("SHARED_API_KEY", "onepassword", home_b)
+
+    assert env_loader.get_secret_source("SHARED_API_KEY", home_a) == "bitwarden"
+    assert env_loader.get_secret_source("SHARED_API_KEY", home_b) == "onepassword"
+    assert env_loader.format_secret_source_suffix("SHARED_API_KEY", home_a) == " (from Bitwarden)"
+    assert env_loader.format_secret_source_suffix("SHARED_API_KEY", home_b) == " (from 1Password)"
+    assert env_loader.get_secret_source("SHARED_API_KEY") is None
 
 
 def test_get_secret_source_values_returns_home_snapshot_copy(tmp_path):
@@ -71,7 +92,7 @@ def test_format_secret_source_suffix_empty_for_untracked():
 
 
 def test_format_secret_source_suffix_bitwarden_uses_proper_name():
-    env_loader._SECRET_SOURCES["ANTHROPIC_API_KEY"] = "bitwarden"
+    _record_source("ANTHROPIC_API_KEY", "bitwarden")
     assert (
         env_loader.format_secret_source_suffix("ANTHROPIC_API_KEY")
         == " (from Bitwarden)"
@@ -81,7 +102,7 @@ def test_format_secret_source_suffix_bitwarden_uses_proper_name():
 def test_format_secret_source_suffix_generic_label_for_future_sources():
     # Future-proofing: a new secret source (e.g. "vault") should still
     # produce a sensible label without needing to edit every call site.
-    env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "vault"
+    _record_source("OPENAI_API_KEY", "vault")
     assert (
         env_loader.format_secret_source_suffix("OPENAI_API_KEY")
         == " (from vault)"
@@ -89,7 +110,7 @@ def test_format_secret_source_suffix_generic_label_for_future_sources():
 
 
 def test_format_secret_source_suffix_onepassword_uses_proper_name():
-    env_loader._SECRET_SOURCES["OPENAI_API_KEY"] = "onepassword"
+    _record_source("OPENAI_API_KEY", "onepassword")
     assert (
         env_loader.format_secret_source_suffix("OPENAI_API_KEY")
         == " (from 1Password)"
@@ -468,7 +489,8 @@ def test_cold_profile_hydration_allows_distinct_homes_to_fetch_concurrently(
     )
     fetch_barrier = threading.Barrier(2, timeout=2)
 
-    def _fake_apply_all(_cfg, home, *, environ):
+    def _fake_apply_all(_cfg, home, *, environ, isolated_environment=False):
+        assert isolated_environment is True
         fetch_barrier.wait()
         key = f"{home.name.upper()}_API_KEY"
         environ[key] = f"{home.name}-only"
@@ -518,7 +540,8 @@ def test_reset_during_cold_profile_hydration_retries_for_a_complete_snapshot(
     release_first_fetch = threading.Event()
     calls = {"count": 0}
 
-    def _fake_apply_all(_cfg, _home, *, environ):
+    def _fake_apply_all(_cfg, _home, *, environ, isolated_environment=False):
+        assert isolated_environment is True
         calls["count"] += 1
         if calls["count"] == 1:
             first_fetch_started.set()

@@ -1104,8 +1104,11 @@ class TestBuildSafeEnv:
         from hermes_cli import env_loader
         from tools.mcp_tool import _build_safe_env
 
-        monkeypatch.setitem(env_loader._SECRET_SOURCES, "ALPACA_API_KEY", "bitwarden")
-        monkeypatch.setitem(env_loader._SECRET_SOURCES, "NOTION_TOKEN", "onepassword")
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCES_BY_HOME,
+            "test-home",
+            {"ALPACA_API_KEY": "bitwarden", "NOTION_TOKEN": "onepassword"},
+        )
         fake_env = {
             "PATH": "/usr/bin",
             "ALPACA_API_KEY": "from-bws-key",

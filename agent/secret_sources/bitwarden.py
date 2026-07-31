@@ -861,6 +861,7 @@ class BitwardenSource(SecretSource):
     name = "bitwarden"
     label = "Bitwarden Secrets Manager"
     shape = "bulk"
+    supports_isolated_environment = True
     scheme = "bws"
 
     def override_existing(self, cfg: dict) -> bool:

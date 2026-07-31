@@ -82,12 +82,12 @@ def test_profile_helper_does_not_inherit_process_secret(monkeypatch):
 def _clean_env(monkeypatch):
     """Each test starts with a clean source map, applied-home guard, and no
     leftover test keys in os.environ."""
-    env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_SOURCES_BY_HOME.clear()
     env_loader.reset_secret_source_cache()
     for key in ("CMDTEST_API_KEY", "CMDTEST_TOKEN", "CMDTEST_OTHER_KEY"):
         monkeypatch.delenv(key, raising=False)
     yield
-    env_loader._SECRET_SOURCES.clear()
+    env_loader._SECRET_SOURCES_BY_HOME.clear()
     env_loader.reset_secret_source_cache()
     for key in ("CMDTEST_API_KEY", "CMDTEST_TOKEN", "CMDTEST_OTHER_KEY"):
         os.environ.pop(key, None)
