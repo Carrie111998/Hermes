@@ -1216,6 +1216,24 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
                     getattr(agent, "log_prefix", ""), exc,
                 )
 
+        # Resolve provider profile so ResponsesApiTransport can merge
+        # build_api_kwargs_extras / build_extra_body (e.g. openai-responses
+        # retained_reasoning + compaction). Without this, codex_responses
+        # never consulted the profile hooks.
+        _codex_profile = None
+        try:
+            from providers import get_provider_profile
+
+            _codex_profile = get_provider_profile(agent.provider)
+        except Exception:
+            _codex_profile = None
+
+        _supports_reasoning = False
+        try:
+            _supports_reasoning = bool(agent._supports_reasoning_extra_body())
+        except Exception:
+            _supports_reasoning = agent.reasoning_config is not None
+
         return _ct.build_kwargs(
             model=agent.model,
             messages=_msgs_for_codex,
@@ -1233,6 +1251,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             replay_encrypted_reasoning=bool(
                 getattr(agent, "_codex_reasoning_replay_enabled", True)
             ),
+            provider_profile=_codex_profile,
+            supports_reasoning=_supports_reasoning,
         )
 
     # ── chat_completions (default) ─────────────────────────────────────

@@ -179,6 +179,11 @@ class ResponsesApiTransport(ProviderTransport):
             is_codex_backend: bool — chatgpt.com/backend-api/codex
             is_xai_responses: bool — xAI/Grok backend
             github_reasoning_extra: dict | None — Copilot reasoning params
+            provider_profile: ProviderProfile | None — when set, merges
+                ``build_extra_body`` / ``build_api_kwargs_extras`` into the
+                request (parity with ChatCompletionsTransport). Required for
+                profiles such as openai-responses (retained_reasoning /
+                compaction) to reach the wire body.
         """
         from agent.codex_responses_adapter import (
             _chat_messages_to_responses_input,
@@ -365,6 +370,63 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
+        # Provider-profile hooks (parity with ChatCompletionsTransport).
+        # chat_completion_helpers previously called build_kwargs without a
+        # profile, so profile extras such as openai-responses
+        # retained_reasoning / compaction never reached the request body.
+        profile = params.get("provider_profile")
+        if profile is not None:
+            try:
+                profile_body = (
+                    profile.build_extra_body(
+                        session_id=session_id,
+                        model=model,
+                        base_url=params.get("base_url"),
+                        reasoning_config=reasoning_config,
+                    )
+                    or {}
+                )
+            except Exception:
+                profile_body = {}
+            try:
+                supports_reasoning = params.get("supports_reasoning")
+                if supports_reasoning is None:
+                    supports_reasoning = bool(
+                        reasoning_enabled and reasoning_config is not None
+                    )
+                extra_from_profile, top_level_from_profile = (
+                    profile.build_api_kwargs_extras(
+                        reasoning_config=reasoning_config,
+                        supports_reasoning=bool(supports_reasoning),
+                        model=model,
+                        base_url=params.get("base_url"),
+                        session_id=session_id,
+                    )
+                )
+                extra_from_profile = extra_from_profile or {}
+                top_level_from_profile = top_level_from_profile or {}
+            except Exception:
+                extra_from_profile, top_level_from_profile = {}, {}
+
+            if top_level_from_profile:
+                kwargs.update(top_level_from_profile)
+
+            merged_profile_extra: Dict[str, Any] = {}
+            if isinstance(profile_body, dict) and profile_body:
+                merged_profile_extra.update(profile_body)
+            if isinstance(extra_from_profile, dict) and extra_from_profile:
+                merged_profile_extra.update(extra_from_profile)
+            if merged_profile_extra:
+                existing_extra_body = kwargs.get("extra_body")
+                if isinstance(existing_extra_body, dict):
+                    merged_extra = dict(existing_extra_body)
+                    merged_extra.update(merged_profile_extra)
+                    kwargs["extra_body"] = merged_extra
+                else:
+                    kwargs["extra_body"] = dict(merged_profile_extra)
+
+        # request_overrides win over profile extras (same order as chat
+        # completions transport).
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
