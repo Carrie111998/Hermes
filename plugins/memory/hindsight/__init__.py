@@ -559,13 +559,81 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
+def _embedded_config_changed(config: dict[str, Any], *, llm_api_key: str | None = None) -> bool:
+    """Report whether the Hermes-managed keys in the profile env differ from config.
+
+    Only the keys that ``_build_embedded_profile_env`` actually emits are
+    compared. User-added keys (embedding provider, ONNX params, reranker, port,
+    ...) are ignored so their mere presence never triggers a spurious daemon
+    restart (RC3).
+
+    Also detects present→absent transitions: if a Hermes-owned key exists in
+    the saved env but is no longer emitted, config is considered changed (RC4).
+    """
+    profile_env = _embedded_profile_env_path(config)
+    expected = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    saved = _load_simple_env(profile_env)
+
+    # Check if any emitted key differs from saved
+    if any(saved.get(key) != value for key, value in expected.items()):
+        return True
+
+    # Check if any Hermes-owned key was removed (present→absent)
+    hermes_owned_keys = {
+        "HINDSIGHT_API_LLM_PROVIDER",
+        "HINDSIGHT_API_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_MODEL",
+        "HINDSIGHT_API_LOG_LEVEL",
+        "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+    }
+
+    for key in hermes_owned_keys:
+        if key in saved and key not in expected:
+            return True
+
+    return False
+
+
 def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
-    """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    """Write the profile-scoped env file that standalone hindsight-embed uses.
+
+    Merges the Hermes-managed keys into any existing file rather than
+    overwriting it, so user-configured Hindsight settings (embedding provider,
+    ONNX params, reranker provider, API port, ...) survive daemon restarts and
+    ``hermes update`` (RC1). Existing keys keep their position; freshly added
+    Hermes keys are appended.
+
+    Hermes-owned keys that are no longer emitted (e.g., llm_base_url removed
+    from config) are deleted from the env file so the daemon stops seeing stale
+    values (per review feedback on #70606).
+    """
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+
+    # Full set of keys Hermes can emit (RC1+RC4: remove owned keys absent from env_values)
+    hermes_owned_keys = {
+        "HINDSIGHT_API_LLM_PROVIDER",
+        "HINDSIGHT_API_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_MODEL",
+        "HINDSIGHT_API_LOG_LEVEL",
+        "HINDSIGHT_API_LLM_BASE_URL",
+        "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT",
+    }
+
+    # Preserve every existing key (including user keys) and its order, then
+    # overlay only the Hermes-managed keys with fresh values.
+    merged = _load_simple_env(profile_env)
+
+    # Remove Hermes-owned keys that are no longer emitted (present→absent transition)
+    for key in hermes_owned_keys:
+        if key not in env_values and key in merged:
+            del merged[key]
+
+    merged.update(env_values)
     profile_env.write_text(
-        "".join(f"{key}={value}\n" for key, value in env_values.items()),
+        "".join(f"{key}={value}\n" for key, value in merged.items()),
         encoding="utf-8",
     )
     return profile_env
@@ -1424,10 +1492,9 @@ class HindsightMemoryProvider(MemoryProvider):
                     # Update the profile .env to match our current config so
                     # the daemon always starts with the right settings.
                     # If the config changed and the daemon is running, stop it.
-                    profile_env = _embedded_profile_env_path(self._config)
-                    expected_env = _build_embedded_profile_env(self._config)
-                    saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    # Only Hermes-managed keys count as a change; user-added
+                    # keys must not trigger a spurious restart (RC3).
+                    config_changed = _embedded_config_changed(self._config)
 
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)
