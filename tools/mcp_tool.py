@@ -108,7 +108,7 @@ import time
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
-from typing import Any, Coroutine, Dict, List, Optional
+from typing import Any, Coroutine, Dict, Iterable, List, Optional
 from urllib.parse import urlparse
 
 from tools.registry import tool_error
@@ -4256,6 +4256,36 @@ def _try_acquire_mcp_discovery_lock() -> Any:
         return None
 
 
+def _wait_for_mcp_discovery_lock(*, deadline: Optional[float] = None) -> Any:
+    """Acquire the discovery lock, bounded by retries and an optional deadline."""
+    if deadline is not None and time.monotonic() >= deadline:
+        return None
+
+    cookie = _try_acquire_mcp_discovery_lock()
+    if cookie is not None:
+        return cookie
+
+    logger.debug(
+        "Another process holds MCP discovery lock -- retrying with backoff"
+    )
+    for _ in range(_MCP_DISCOVERY_LOCK_MAX_RETRIES):
+        delay = _MCP_DISCOVERY_LOCK_RETRY_DELAY_S
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            delay = min(delay, remaining)
+
+        time.sleep(delay)
+        cookie = _try_acquire_mcp_discovery_lock()
+        if cookie is not None:
+            if cookie is not _LOCK_UNAVAILABLE:
+                logger.debug("Retry succeeded -- acquired MCP discovery lock")
+            return cookie
+
+    return None
+
+
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
 # them on shutdown if the graceful cleanup (SDK context-manager teardown)
 # fails or times out.  PIDs are added after connection and removed on
@@ -5896,7 +5926,18 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def get_configured_mcp_servers() -> Dict[str, dict]:
+    """Return the effective, security-filtered MCP server configuration.
+
+    This is the same managed-scope-aware configuration view used by discovery,
+    but does not start any MCP server.
+    """
+    return _load_mcp_config()
+
+
+def register_mcp_servers(
+    servers: Dict[str, dict], *, discovery_timeout: float = 120.0
+) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -5904,6 +5945,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     Args:
         servers: Mapping of ``{server_name: server_config}``.
+        discovery_timeout: Total wall-clock bound for this discovery batch.
 
     Returns:
         List of all currently registered MCP tool names.
@@ -5998,7 +6040,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     _clear_connect_failure(name)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
-    # The outer timeout is generous: 120s total for parallel discovery.
+    # The outer timeout bounds the total parallel discovery batch.
     #
     # Temporarily clear the interrupt flag on the current thread so that MCP
     # discovery is never cancelled by a stale interrupt from a prior agent
@@ -6008,7 +6050,19 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if _was_interrupted:
         _set_interrupt(False)
     try:
-        _run_on_mcp_loop(_discover_all, timeout=120)
+        _run_on_mcp_loop(_discover_all, timeout=discovery_timeout)
+    except TimeoutError:
+        message = f"Discovery timed out after {discovery_timeout:.1f}s"
+        with _lock:
+            for name in new_servers:
+                _server_connecting.discard(name)
+                if name in _servers:
+                    _server_connect_errors.pop(name, None)
+                    _clear_connect_failure(name)
+                    continue
+                _server_connect_errors[name] = message
+                _record_connect_failure(name)
+        raise
     finally:
         if _was_interrupted:
             _set_interrupt(True)
@@ -6032,6 +6086,81 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.info(summary)
 
     return _existing_tool_names()
+
+
+def discover_mcp_tools_for_servers(
+    server_names: Iterable[str], *, timeout: float = 1.5
+) -> List[str]:
+    """Discover tools only for explicitly named configured MCP servers.
+
+    Names that are not configured are ignored. Requested servers are connected
+    in parallel, one server's failure does not prevent healthy peers from
+    registering, and the whole batch is capped by ``timeout``.
+
+    Args:
+        server_names: Exact keys from the ``mcp_servers`` config mapping.
+        timeout: Positive finite total discovery timeout in seconds.
+
+    Returns:
+        List of currently registered MCP tool names. Raises ``TimeoutError``
+        when the batch reaches its timeout; tools from servers that completed
+        within the bound remain registered.
+    """
+    if not _MCP_AVAILABLE:
+        logger.debug("MCP SDK not available -- skipping targeted MCP discovery")
+        return []
+
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("MCP discovery timeout must be a positive finite number") from exc
+    if not math.isfinite(timeout_value) or timeout_value <= 0:
+        raise ValueError("MCP discovery timeout must be a positive finite number")
+    deadline = time.monotonic() + timeout_value
+
+    if isinstance(server_names, str):
+        requested_names = [server_names]
+    else:
+        requested_names = list(server_names)
+    requested = set(requested_names)
+    if not requested:
+        return _existing_tool_names()
+
+    configured = _load_mcp_config()
+    targeted = {
+        name: config
+        for name, config in configured.items()
+        if name in requested
+    }
+    if not targeted:
+        return _existing_tool_names()
+
+    cookie = _wait_for_mcp_discovery_lock(deadline=deadline)
+    try:
+        if cookie is None:
+            raise TimeoutError(
+                f"Targeted MCP discovery timed out after {timeout_value:.1f}s "
+                "waiting for the cross-process discovery lock"
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Targeted MCP discovery timed out after {timeout_value:.1f}s"
+            )
+        return register_mcp_servers(
+            targeted,
+            discovery_timeout=remaining,
+        )
+    except TimeoutError:
+        logger.warning(
+            "Targeted MCP discovery timed out after %.1fs for: %s",
+            timeout_value,
+            ", ".join(targeted),
+        )
+        raise
+    finally:
+        if cookie not in (None, _LOCK_UNAVAILABLE):
+            cookie.release()
 
 
 def discover_mcp_tools() -> List[str]:
@@ -6059,25 +6188,13 @@ def discover_mcp_tools() -> List[str]:
     # the holder, then performs its own process-local discovery. If locking is
     # unavailable or the bounded wait expires, preserve the previous
     # fail-soft behavior by running discovery unguarded.
-    cookie = _try_acquire_mcp_discovery_lock()
+    cookie = _wait_for_mcp_discovery_lock()
     if cookie is None:
-        logger.debug(
-            "Another process holds MCP discovery lock -- retrying with backoff"
+        logger.warning(
+            "MCP discovery lock still held after %d retries -- "
+            "running discovery unguarded",
+            _MCP_DISCOVERY_LOCK_MAX_RETRIES,
         )
-        for _ in range(_MCP_DISCOVERY_LOCK_MAX_RETRIES):
-            time.sleep(_MCP_DISCOVERY_LOCK_RETRY_DELAY_S)
-            cookie = _try_acquire_mcp_discovery_lock()
-            if cookie is not None:
-                break
-
-        if cookie is None:
-            logger.warning(
-                "MCP discovery lock still held after %d retries -- "
-                "running discovery unguarded",
-                _MCP_DISCOVERY_LOCK_MAX_RETRIES,
-            )
-        elif cookie is not _LOCK_UNAVAILABLE:
-            logger.debug("Retry succeeded -- acquired MCP discovery lock")
 
     try:
         with _lock:

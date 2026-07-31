@@ -2454,6 +2454,158 @@ class TestRegisterMcpServers:
         assert "mcp__my_server__tool1" in result
         _servers.pop("my_server", None)
 
+class TestDiscoverMcpToolsForServers:
+    """Verify targeted, bounded discovery for explicitly named servers."""
+
+    def test_only_requested_servers_are_attempted_and_failures_are_isolated(self):
+        from tools import mcp_tool
+
+        fresh_servers = {}
+        attempted = []
+
+        async def fake_register(name, cfg):
+            attempted.append(name)
+            if name == "broken":
+                raise ConnectionError("cannot connect")
+            server = _make_mock_server(name)
+            server._registered_tool_names = [f"mcp__{name}__ping"]
+            fresh_servers[name] = server
+            return list(server._registered_tool_names)
+
+        configured = {
+            "requested": {"command": "requested"},
+            "broken": {"command": "broken"},
+            "unrequested": {"command": "unrequested"},
+        }
+
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), \
+             patch.object(mcp_tool, "_servers", fresh_servers), \
+             patch.object(mcp_tool, "_server_connecting", set()), \
+             patch.object(mcp_tool, "_server_connect_errors", {}), \
+             patch.object(mcp_tool, "_server_connect_retry_after", {}), \
+             patch.object(mcp_tool, "_load_mcp_config", return_value=configured), \
+             patch.object(mcp_tool, "_discover_and_register_server", side_effect=fake_register):
+            result = mcp_tool.discover_mcp_tools_for_servers(
+                ["requested", "broken"], timeout=1.0
+            )
+
+        assert set(attempted) == {"requested", "broken"}
+        assert "unrequested" not in attempted
+        assert "mcp__requested__ping" in result
+        assert "mcp__broken__ping" not in result
+
+    def test_total_discovery_wait_is_bounded(self):
+        from tools import mcp_tool
+
+        async def never_finishes(_name, _cfg):
+            await asyncio.sleep(30)
+
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), \
+             patch.object(mcp_tool, "_servers", {}), \
+             patch.object(mcp_tool, "_server_connecting", set()), \
+             patch.object(mcp_tool, "_server_connect_errors", {}), \
+             patch.object(mcp_tool, "_server_connect_retry_after", {}), \
+             patch.object(
+                 mcp_tool,
+                 "_load_mcp_config",
+                 return_value={"slow": {"command": "slow"}},
+             ), \
+             patch.object(
+                 mcp_tool,
+                 "_discover_and_register_server",
+                 side_effect=never_finishes,
+             ):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError, match="timed out"):
+                mcp_tool.discover_mcp_tools_for_servers(["slow"], timeout=0.05)
+            elapsed = time.monotonic() - started
+
+        assert elapsed < 2.0
+
+    def test_lock_wait_consumes_total_discovery_timeout(self):
+        from tools import mcp_tool
+
+        clock = [100.0]
+        observed = {}
+
+        class LockCookie:
+            released = False
+
+            def release(self):
+                self.released = True
+
+        cookie = LockCookie()
+        lock_attempts = iter([None, cookie])
+
+        def fake_sleep(delay):
+            clock[0] += delay
+
+        def fake_register(servers, *, discovery_timeout):
+            observed["servers"] = servers
+            observed["timeout"] = discovery_timeout
+            return ["mcp__requested__ping"]
+
+        configured = {
+            "requested": {"command": "requested"},
+            "unrequested": {"command": "unrequested"},
+        }
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), \
+             patch.object(mcp_tool, "_load_mcp_config", return_value=configured), \
+             patch.object(
+                 mcp_tool,
+                 "_try_acquire_mcp_discovery_lock",
+                 side_effect=lambda: next(lock_attempts),
+             ), \
+             patch.object(mcp_tool, "_MCP_DISCOVERY_LOCK_RETRY_DELAY_S", 0.25), \
+             patch.object(mcp_tool.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(mcp_tool.time, "sleep", side_effect=fake_sleep), \
+             patch.object(mcp_tool, "register_mcp_servers", side_effect=fake_register):
+            result = mcp_tool.discover_mcp_tools_for_servers(
+                ["requested"], timeout=1.0
+            )
+
+        assert result == ["mcp__requested__ping"]
+        assert observed["servers"] == {"requested": configured["requested"]}
+        assert observed["timeout"] == pytest.approx(0.75)
+        assert cookie.released is True
+
+    def test_lock_wait_timeout_does_not_start_requested_servers(self):
+        from tools import mcp_tool
+
+        clock = [200.0]
+        registration_attempted = []
+
+        def fake_sleep(delay):
+            clock[0] += delay
+
+        def fake_register(_servers, *, discovery_timeout):
+            registration_attempted.append(discovery_timeout)
+            return []
+
+        with patch.object(mcp_tool, "_MCP_AVAILABLE", True), \
+             patch.object(
+                 mcp_tool,
+                 "_load_mcp_config",
+                 return_value={"requested": {"command": "requested"}},
+             ), \
+             patch.object(
+                 mcp_tool,
+                 "_try_acquire_mcp_discovery_lock",
+                 return_value=None,
+             ), \
+             patch.object(mcp_tool, "_MCP_DISCOVERY_LOCK_RETRY_DELAY_S", 0.2), \
+             patch.object(mcp_tool.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(mcp_tool.time, "sleep", side_effect=fake_sleep), \
+             patch.object(mcp_tool, "register_mcp_servers", side_effect=fake_register):
+            with pytest.raises(TimeoutError, match="timed out"):
+                mcp_tool.discover_mcp_tools_for_servers(
+                    ["requested"], timeout=0.35
+                )
+
+        assert registration_attempted == []
+        assert clock[0] == pytest.approx(200.35)
+
+
 # ---------------------------------------------------------------------------
 # Tests for parallel tool call support (port from openai/codex#17667)
 # ---------------------------------------------------------------------------
