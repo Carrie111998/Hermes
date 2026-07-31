@@ -4842,14 +4842,27 @@ def validate_requested_model(
         except Exception:
             catalog_models = []
         if catalog_models:
-            if requested_for_lookup in set(catalog_models):
+            # Copilot catalogs may contain vendor-prefixed IDs
+            # (e.g. ``anthropic/claude-opus-4.8``) while users commonly type
+            # the bare model slug (``claude-opus-4.8``). Normalize catalog
+            # entries to canonical forms before exact/close-match checks.
+            normalized_catalog: list[str] = []
+            seen_catalog: set[str] = set()
+            for model_id in catalog_models:
+                canonical = normalize_copilot_model_id(model_id) or str(model_id or "").strip()
+                if not canonical or canonical in seen_catalog:
+                    continue
+                seen_catalog.add(canonical)
+                normalized_catalog.append(canonical)
+
+            if requested_for_lookup in set(normalized_catalog):
                 return {
                     "accepted": True,
                     "persist": True,
                     "recognized": True,
                     "message": None,
                 }
-            auto = get_close_matches(requested_for_lookup, catalog_models, n=1, cutoff=0.9)
+            auto = get_close_matches(requested_for_lookup, normalized_catalog, n=1, cutoff=0.9)
             if auto:
                 return {
                     "accepted": True,
@@ -4858,7 +4871,7 @@ def validate_requested_model(
                     "corrected_model": auto[0],
                     "message": f"Auto-corrected `{requested}` → `{auto[0]}`",
                 }
-            suggestions = get_close_matches(requested_for_lookup, catalog_models, n=3, cutoff=0.5)
+            suggestions = get_close_matches(requested_for_lookup, normalized_catalog, n=3, cutoff=0.5)
             suggestion_text = ""
             if suggestions:
                 suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
