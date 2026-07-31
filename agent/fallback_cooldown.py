@@ -9,12 +9,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
 
 def _state_path() -> Path:
-    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
-    return home / "fallback_cooldowns.json"
+    return get_hermes_home() / "fallback_cooldowns.json"
 
 
 def _entry_key(entry: dict[str, Any]) -> str:
@@ -109,5 +109,7 @@ def record_cooldown(entry: dict[str, Any], *, now: float | None = None) -> float
         entries = {key: expiry for key, expiry in entries.items() if expiry > timestamp}
         key = _entry_key(entry)
         entries[key] = max(entries.get(key, 0), expires_at)
-        atomic_json_write(path, {"version": 1, "entries": entries}, indent=2, mode=0o600)
+        atomic_json_write(
+            path, {"version": 1, "entries": entries}, indent=2, mode=0o600
+        )
     return expires_at

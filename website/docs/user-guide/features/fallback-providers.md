@@ -35,9 +35,11 @@ If you'd rather edit the YAML directly, add a top-level `fallback_providers` lis
 fallback_providers:
   - provider: openrouter
     model: anthropic/claude-sonnet-4
+    cooldown_seconds: 300  # optional: persist a rate-limit cooldown for this entry
 ```
 
 Each entry requires both `provider` and `model`. Entries missing either field are ignored.
+Set optional `cooldown_seconds` to keep a fallback that returned a rate limit out of the chain for that many seconds, including across Hermes processes and restarts. It defaults to disabled when omitted.
 
 :::note `fallback_model` vs `fallback_providers`
 `fallback_providers` (plural, list) is the current config shape and supports multiple fallbacks tried in order. `fallback_model` (singular) is the legacy single-fallback key — Hermes still honors it for back-compat, but `hermes fallback` writes the current `fallback_providers` key and migrates legacy config on write. When both are set, `fallback_providers` takes priority.
