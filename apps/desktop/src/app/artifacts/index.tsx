@@ -19,6 +19,8 @@ import { RowButton } from '@/components/ui/row-button'
 import { Tip } from '@/components/ui/tooltip'
 import { getSessionMessages, listAllProfileSessions } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
+import { ExternalLink, ExternalLinkIcon, hostPathLabel, urlSlugTitleLabel, useLinkTitle } from '@/lib/external-link'
+import { FileImage, FileText, FolderOpen, Link2, Loader2, Pencil, Box, RefreshCw } from '@/lib/icons'
 import { resolveBrandIcon } from '@/lib/brand-icon'
 import {
   ExternalLink,
@@ -28,7 +30,6 @@ import {
   urlSlugTitleLabel,
   useLinkTitle
 } from '@/lib/external-link'
-import { FileImage, FileText, FolderOpen, Link2, Loader2, RefreshCw } from '@/lib/icons'
 import { downloadGatewayMediaFile, isRemoteGateway } from '@/lib/media'
 import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
@@ -575,6 +576,20 @@ const PrimaryCell = memo(function PrimaryCell({ artifact, ctx }: { artifact: Art
   )
 })
 
+// Distinct glyph per diagram-source type so .excalidraw / .drawio / .mermaid
+// attachments read as diagrams in the artifacts list (not a generic file).
+function fileTypeIcon(path: string): typeof FileText {
+  const ext = path.split('.').pop()?.toLowerCase() ?? ''
+  if (ext === 'excalidraw') {
+    return Pencil
+  }
+  if (ext === 'drawio') {
+    return Box
+  }
+  return FileText
+}
+
+function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) {
 const LocationCell = memo(function LocationCell({ artifact }: { artifact: ArtifactRecord; ctx: CellCtx }) {
   const { t } = useI18n()
   const isLink = artifact.kind === 'link'

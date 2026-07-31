@@ -3,11 +3,24 @@ import { useEffect, useRef, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { useI18n } from '@/i18n'
-import { MonitorPlay } from '@/lib/icons'
+import { Box, MonitorPlay, Pencil } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { previewName } from '@/lib/preview-targets'
 import { notifyError } from '@/store/notifications'
 import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRecordSource } from '@/store/preview'
+
+// Diagram-source attachments get a type-specific glyph instead of the generic
+// preview icon, matching the artifacts-panel treatment.
+function attachmentIcon(target: string) {
+  const ext = target.split('.').pop()?.toLowerCase() ?? ''
+  if (ext === 'excalidraw') {
+    return Pencil
+  }
+  if (ext === 'drawio') {
+    return Box
+  }
+  return MonitorPlay
+}
 
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
   const { t } = useI18n()
@@ -97,7 +110,10 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
   return (
     <div className="flex w-full max-w-160 items-center gap-2 rounded-lg border border-(--ui-stroke-tertiary) bg-card/55 px-2.5 py-1.5 text-sm">
       <span className="grid size-6 shrink-0 place-items-center rounded-md bg-muted/55 text-muted-foreground/85">
-        <MonitorPlay className="size-3.5" />
+        {(() => {
+          const Icon = attachmentIcon(target)
+          return <Icon className="size-3.5" />
+        })()}
       </span>
       <span className="min-w-0 flex-1 truncate text-[0.78rem] font-medium text-foreground/90" title={target}>
         {name}
