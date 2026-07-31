@@ -1502,9 +1502,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
-        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
-        self._approval_state: Dict[int, Dict[str, str]] = {}
-        self._approval_counter = itertools.count(1)
+        # Exec approval button state (opaque token → approval metadata)
+        self._approval_state: Dict[str, Dict[str, str]] = {}
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
@@ -2026,7 +2025,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            button_id = next(self._approval_counter)
+            button_id = uuid.uuid4().hex
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {

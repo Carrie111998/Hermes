@@ -208,6 +208,70 @@ class TestResolveApproval:
     """Test _resolve_approval pops state and calls resolve_gateway_approval."""
 
     @pytest.mark.asyncio
+    async def test_stale_card_from_prior_lifecycle_cannot_resolve_new_approval(self):
+        """A card issued before restart must not match a new approval."""
+        response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_old"),
+        )
+        old_adapter = _make_adapter()
+        with patch.object(
+            old_adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as old_send:
+            await old_adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="old command",
+                session_key="old-session",
+                approval_id="approval-old",
+            )
+        old_token = json.loads(old_send.call_args.kwargs["payload"])["elements"][1][
+            "actions"
+        ][0]["value"]["approval_id"]
+
+        response.data.message_id = "msg_new"
+        new_adapter = _make_adapter()
+        with patch.object(
+            new_adapter,
+            "_feishu_send_with_retry",
+            new_callable=AsyncMock,
+            return_value=response,
+        ) as new_send:
+            await new_adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="new command",
+                session_key="new-session",
+                approval_id="approval-new",
+            )
+        new_token = json.loads(new_send.call_args.kwargs["payload"])["elements"][1][
+            "actions"
+        ][0]["value"]["approval_id"]
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            await new_adapter._resolve_approval(
+                old_token,
+                "once",
+                "Norbert",
+                open_id="ou_user1",
+                chat_id="oc_12345",
+            )
+            resolve.assert_not_called()
+
+            await new_adapter._resolve_approval(
+                new_token,
+                "once",
+                "Norbert",
+                open_id="ou_user1",
+                chat_id="oc_12345",
+            )
+
+        resolve.assert_called_once_with(
+            "new-session", "once", approval_id="approval-new"
+        )
+
+    @pytest.mark.asyncio
     async def test_resolves_once(self):
         adapter = _make_adapter()
         adapter._approval_state[1] = {

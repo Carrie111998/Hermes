@@ -703,6 +703,45 @@ class TestRunEvents:
 
                 interrupted.set()
 
+    @pytest.mark.asyncio
+    async def test_approval_response_rejects_choice_not_offered_for_request(
+        self, adapter
+    ):
+        """A response cannot grant broader scope than the queued request offers."""
+        app = _create_runs_app(adapter)
+        run_id = "run-limited-approval"
+        pending = approval_mod._ApprovalEntry(
+            {
+                "command": "dangerous",
+                "allow_session": False,
+                "allow_permanent": False,
+            }
+        )
+        adapter._run_approval_sessions[run_id] = run_id
+        adapter._set_run_status(run_id, "waiting_for_approval")
+        with approval_mod._lock:
+            approval_mod._gateway_queues[run_id] = [pending]
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                approval_resp = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    json={"approval_id": pending.approval_id, "choice": "always"},
+                )
+                approval_data = await approval_resp.json()
+
+            assert approval_resp.status == 400
+            assert approval_data["error"]["code"] == "invalid_approval_choice"
+            assert pending.result is None
+            assert not pending.event.is_set()
+            with approval_mod._lock:
+                assert approval_mod._gateway_queues[run_id] == [pending]
+        finally:
+            with approval_mod._lock:
+                approval_mod._gateway_queues.pop(run_id, None)
+            adapter._run_approval_sessions.pop(run_id, None)
+            adapter._run_statuses.pop(run_id, None)
+
 
 # ---------------------------------------------------------------------------
 # Run lifecycle TTL sweeping

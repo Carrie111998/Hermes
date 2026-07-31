@@ -6662,6 +6662,39 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
+        from tools.approval import list_gateway_approvals
+
+        pending = next(
+            (
+                approval
+                for approval in list_gateway_approvals(approval_session_key)
+                if approval.get("approval_id") == approval_id
+            ),
+            None,
+        )
+        if pending is None:
+            return web.json_response(
+                _openai_error(
+                    f"Run has no pending approval: {run_id}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+        offered_choices = _approval_event_choices(
+            smart_denied=bool(pending.get("smart_denied")),
+            allow_permanent=pending.get("allow_permanent") is not False,
+            allow_session=pending.get("allow_session") is not False,
+        )
+        if choice not in offered_choices:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: "
+                    + ", ".join(offered_choices),
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -6682,8 +6715,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=409,
             )
-
-        from tools.approval import list_gateway_approvals
 
         remaining = list_gateway_approvals(approval_session_key)
         if remaining:

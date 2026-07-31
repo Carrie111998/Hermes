@@ -18,6 +18,7 @@ import html as _html
 import re
 import threading
 import time
+import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -835,7 +836,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → (session key, backend approval id)
-        self._approval_state: Dict[int, tuple[str, str]] = {}
+        self._approval_state: Dict[str, tuple[str, str]] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -5370,13 +5371,7 @@ class TelegramAdapter(BasePlatformAdapter):
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
 
-            # We'll use the message_id as part of callback_data to look up session_key
-            # Send a placeholder first, then update — or use a counter.
-            # Simpler: use a monotonic counter to generate short IDs.
-            import itertools
-            if not hasattr(self, "_approval_counter"):
-                self._approval_counter = itertools.count(1)
-            button_id = next(self._approval_counter)
+            button_id = uuid.uuid4().hex
 
             buttons = [
                 InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{button_id}")
@@ -6261,9 +6256,8 @@ class TelegramAdapter(BasePlatformAdapter):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
-                try:
-                    approval_id = int(parts[2])
-                except (ValueError, IndexError):
+                approval_id = parts[2]
+                if not approval_id:
                     await query.answer(text="Invalid approval data.")
                     return
 
