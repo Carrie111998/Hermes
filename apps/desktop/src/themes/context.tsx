@@ -351,6 +351,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
+  // A contributed theme (plugin / registry-backed) registers AFTER boot, so the
+  // persisted pick that the boot paint and the initial state fell back from may
+  // only resolve now. Re-read the persisted skin whenever the registry grows; if
+  // it now resolves to something we're not already showing, adopt it. This is
+  // what lets a late-registered contributed theme the user already chose survive
+  // a restart instead of snapping back to the default. The functional update
+  // preserves reference identity on the common no-op path so unrelated registry
+  // churn never re-renders the (expensive) themed tree.
+  useEffect(() => {
+    const persisted = skinPref.resolve(profileKey)
+    setThemeNameState(prev => (persisted === prev ? prev : persisted))
+  }, [registryVersion, profileKey])
+
   const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
   const resolvedMode = resolveMode(mode, systemDark)
 
