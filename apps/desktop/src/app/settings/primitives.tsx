@@ -42,7 +42,7 @@ export function SectionHeading({
   title: string
 }) {
   return (
-    <div className="mb-2.5 flex items-center gap-2 pt-2 text-[length:var(--conversation-text-font-size)] font-medium">
+    <div className="font-display mb-2.5 flex items-center gap-2 pt-2 text-[length:var(--conversation-text-font-size)] font-medium">
       <Icon className="size-4 shrink-0 text-muted-foreground" />
       <span>{title}</span>
       {meta && <Pill>{meta}</Pill>}

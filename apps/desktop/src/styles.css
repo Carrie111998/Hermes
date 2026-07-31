@@ -33,6 +33,18 @@
   src: url('../../../node_modules/@nous-research/ui/dist/fonts/Collapse-Bold.woff2') format('woff2');
 }
 
+/* Space Grotesk — Douglas Agent's display font for headings and the brand
+   header (SIL OFL 1.1, see ./fonts/SpaceGrotesk-OFL.txt). Variable font: one
+   file covers the whole 300-700 weight range via font-weight, no separate
+   files per weight needed. */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 300 700;
+  font-display: swap;
+  src: url('./fonts/SpaceGrotesk-Variable.ttf') format('truetype-variations');
+}
+
 /* JetBrains Mono — bundled terminal font (Apache-2.0) so bold/italic share the
    regular face's metrics instead of squeezing against a system fallback. */
 @font-face {
@@ -83,6 +95,7 @@
 
   --font-sans: var(--dt-font-sans);
   --font-mono: var(--dt-font-mono);
+  --font-display: var(--dt-font-display);
 
   --spacing-mul: var(--dt-spacing-mul, 1);
 
@@ -384,6 +397,9 @@
     --dt-font-sans:
       'Segoe WPC', 'Segoe UI', -apple-system, BlinkMacSystemFont, 'SF Pro Text', system-ui, sans-serif,
       'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji', emoji;
+    /* Douglas Agent brand display font — headings and the "DOUGLAS AGENT"
+       header only, never body text. Falls back to the body sans stack. */
+    --dt-font-display: 'Space Grotesk', var(--dt-font-sans);
     /* Key caps always use the native UI face — never theme typography overrides. */
     --dt-font-kbd: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
     /* Menlo/Monaco first — Apple's native monospace faces — so code/diff read

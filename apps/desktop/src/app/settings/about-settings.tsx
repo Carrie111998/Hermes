@@ -99,7 +99,7 @@ export function AboutSettings() {
       <div className="flex flex-col items-center gap-3 pt-6 pb-2 text-center">
         <BrandMark className="size-16" />
         <div>
-          <h2 className="text-lg font-semibold tracking-tight">{a.heading}</h2>
+          <h2 className="font-display text-lg font-semibold tracking-tight">{a.heading}</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             {version?.appVersion ? a.version(version.appVersion) : a.versionUnavailable}
           </p>
