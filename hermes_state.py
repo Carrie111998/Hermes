@@ -1807,6 +1807,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # lock so a reader that finishes opening after the drain finds the
         # shutdown in progress and closes its own connection immediately.
         self._read_conns_closed = False
+        # Generation counter for the bounded read-connection cache. When the
+        # strong _read_conns set exceeds _MAX_READ_CONNS we evict+close the
+        # whole current generation and bump this counter; threads holding a
+        # stale per-thread connection detect the mismatch on their next read
+        # and lazily reopen. Without the bound, every distinct worker thread
+        # that ever ran a read on a process-lifetime SessionDB handle (the
+        # dashboard's global _get_db(), the gateway runner's SessionDB)
+        # leaves a permanent main+wal+shm connection behind — the process
+        # eventually pins against RLIMIT_NOFILE and unrelated opens fail
+        # with EMFILE/Errno 24 (observed: ~80 leaked state.db connections
+        # on the dashboard backend after ~10h uptime).
+        self._read_gen = 0
         self._wal_active = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write
@@ -2006,6 +2018,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Read-path split ──
 
+    # Bound on the per-thread read-only connection cache. Long-lived
+    # SessionDB handles (dashboard global _get_db(), gateway runner) are
+    # never closed for the process lifetime; without a bound, every unique
+    # worker thread that ever reads leaves a permanent main+wal+shm
+    # connection in _read_conns, eventually exhausting RLIMIT_NOFILE and
+    # breaking unrelated opens (EMFILE / Errno 24). Evicting the whole
+    # generation on overflow is safe: threads reopen their own connection
+    # lazily on the next read (see _get_read_conn), and the churn cost is
+    # one connect per thread per eviction, which is negligible compared to
+    # the cost of pinning the process against its fd limit.
+    _MAX_READ_CONNS = 32
+
     def _get_read_conn(self) -> Optional[sqlite3.Connection]:
         """Per-thread read-only connection, or None when unavailable.
 
@@ -2023,7 +2047,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         conn = getattr(self._read_local, "conn", None)
         if conn is not None:
-            return conn
+            # A cached connection from a previous generation was evicted by
+            # the cache bound; close it and fall through to reopen (the
+            # thread-local may outlive the eviction for threads that read
+            # rarely).
+            if getattr(self._read_local, "gen", 0) != self._read_gen:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                self._read_local.conn = None
+                self._read_local.gen = 0
+                conn = None
+            else:
+                return conn
         if getattr(self._read_local, "failed", False):
             return None
         try:
@@ -2048,6 +2085,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.close()
                     self._read_local.failed = True
                     return None
+                if len(self._read_conns) >= self._MAX_READ_CONNS:
+                    # Cache overflow on a long-lived handle: evict the whole
+                    # generation. Each evicted connection is closed so its
+                    # main+wal+shm fds are released; the next read on any
+                    # thread reopens lazily under a fresh generation.
+                    self._read_gen += 1
+                    evicted = list(self._read_conns)
+                    self._read_conns.clear()
+                    for old_conn in evicted:
+                        try:
+                            old_conn.close()
+                        except Exception:
+                            pass
                 self._read_conns.add(conn)
         except sqlite3.Error:
             # Mark this thread failed so we don't retry the open on every
@@ -2056,6 +2106,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
             return None
         self._read_local.conn = conn
+        self._read_local.gen = self._read_gen
         return conn
 
     @contextmanager
