@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from hermes_cli import config as config_mod
 from hermes_cli import runtime_provider as rp
 
 
@@ -466,6 +467,29 @@ def test_openrouter_base_url_override_skips_populated_pool(tmp_path, monkeypatch
 
     assert resolved["api_key"] == "fallback-key"
     assert resolved["base_url"] == "https://openrouter-proxy.example/v1"
+    assert resolved.get("credential_pool") is None
+
+
+def test_auto_custom_config_skips_populated_openrouter_pool(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: auto\n"
+        "  base_url: https://custom.example/v1\n",
+        encoding="utf-8",
+    )
+    _write_openrouter_pool(hermes_home)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    getattr(config_mod, "_LOAD_CONFIG_CACHE").clear()
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fallback-key")
+
+    resolved = rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["api_key"] == ""
+    assert resolved["base_url"] == "https://custom.example/v1"
     assert resolved.get("credential_pool") is None
 
 

@@ -1153,7 +1153,7 @@ def _resolve_openrouter_runtime(
     # GitHub #27132: provider aliases follow the same base_url trust + routing
     # rules as their canonical custom/OpenRouter provider. Normalising here
     # keeps every check below alias-aware without duplicating the alias map.
-    if requested_norm and requested_norm != "custom":
+    if requested_norm and requested_norm not in {"auto", "custom"}:
         try:
             from hermes_cli.auth import resolve_provider as _resolve_provider
 
