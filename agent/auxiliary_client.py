@@ -6126,6 +6126,22 @@ def resolve_provider_client(
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
                 custom_key = _scoped_key_env(custom_key_env)
+            # Live runtime beats the persisted entry.  The main conversation may
+            # already be serving this named provider from a different endpoint or
+            # credential (rotated key, failover host, session-scoped token); the
+            # auxiliary safety net has to follow the route that actually works.
+            # Only the endpoint/credential are overridden — the entry keeps
+            # owning api_mode, model default, and header handling below.
+            if explicit_base_url:
+                _explicit_base = str(explicit_base_url).strip().rstrip("/")
+                if _explicit_base:
+                    custom_base = _explicit_base
+            if explicit_api_key:
+                if callable(explicit_api_key):
+                    # Azure Entra-style bearer provider — pass the callable through.
+                    custom_key = explicit_api_key
+                else:
+                    custom_key = str(explicit_api_key).strip() or custom_key
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
