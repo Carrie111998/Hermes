@@ -1474,6 +1474,54 @@ def _pip_install_probe_package(python: Path, source: Path) -> subprocess.Complet
     )
 
 
+def _make_local_build_backend_visible(python: Path) -> None:
+    """Expose the test runner's setuptools to a nested offline venv.
+
+    ``venv --system-site-packages`` inherits packages from the base interpreter,
+    not from the currently active virtualenv.  Managed Python installations can
+    therefore create a perfectly valid nested venv whose offline pip cannot see
+    the setuptools already available to this test process.  A test-only ``.pth``
+    keeps the package build offline while preserving the real pip reinstall and
+    generated-console-script path exercised below.
+    """
+    probe = subprocess.run(
+        [str(python), "-c", "import setuptools.build_meta"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if probe.returncode == 0:
+        return
+
+    setuptools_spec = importlib.util.find_spec("setuptools")
+    assert setuptools_spec is not None and setuptools_spec.origin is not None
+    parent_site_packages = Path(setuptools_spec.origin).resolve().parents[1]
+    nested_purelib = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import sysconfig; print(sysconfig.get_path('purelib'))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    Path(nested_purelib.stdout.strip(), "_hermes_test_build_backend.pth").write_text(
+        f"{parent_site_packages}\n",
+        encoding="utf-8",
+    )
+    verification = subprocess.run(
+        [str(python), "-c", "import setuptools.build_meta"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert verification.returncode == 0, verification.stderr
+
+
 def test_real_pip_reinstall_rebinds_all_entrypoints_after_staging_rename():
     if importlib.util.find_spec("setuptools") is None:
         pytest.skip("setuptools is required for the local no-network package build")
@@ -1527,6 +1575,7 @@ py-modules = ["entrypoint_probe"]
             timeout=30,
         )
         staging_python = staging / ".venv" / "bin" / "python"
+        _make_local_build_backend_visible(staging_python)
         first_install = _pip_install_probe_package(staging_python, staging)
         assert first_install.returncode == 0, first_install.stderr
         os.chown(staging / ".venv" / "bin", os.getuid(), os.getgid())

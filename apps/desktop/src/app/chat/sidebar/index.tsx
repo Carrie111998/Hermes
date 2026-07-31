@@ -3,7 +3,7 @@ import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation } from 'react-router'
 
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
 import { Button } from '@/components/ui/button'
@@ -611,19 +611,18 @@ export function ChatSidebar({
     }
 
     const sorted = sortProjectsForOverview(
-      filterVisibleProjects(projectTree, dismissedAutoProjects)
-        .map(project =>
-          excludeProjectSessions(
-            {
-              ...project,
-              // Home is synthetic, so its name is ours to translate — every other
-              // label is a repo basename or a name the user typed.
-              label: project.isNoProject ? s.projects.home : project.label,
-              repos: orderRepos(project.repos)
-            },
-            isPinnedSession
-          )
-        ),
+      filterVisibleProjects(projectTree, dismissedAutoProjects).map(project =>
+        excludeProjectSessions(
+          {
+            ...project,
+            // Home is synthetic, so its name is ours to translate — every other
+            // label is a repo basename or a name the user typed.
+            label: project.isNoProject ? s.projects.home : project.label,
+            repos: orderRepos(project.repos)
+          },
+          isPinnedSession
+        )
+      ),
       activeProjectId
     )
 

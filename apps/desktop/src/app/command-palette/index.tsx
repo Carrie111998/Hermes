@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { Dialog as DialogPrimitive } from 'radix-ui'
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import {
   HUD_HEADING,
@@ -67,7 +67,7 @@ import {
   closeCommandPalette,
   setCommandPaletteOpen
 } from '@/store/command-palette'
-import { $bindings } from '@/store/keybinds'
+import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
@@ -328,7 +328,9 @@ const PaletteRow = memo(function PaletteRow({
   const Icon = item.icon
   // The row's live keybind, else a static modifier-variant hint (⌘↵). One slot,
   // so every downstream `ml-auto` fallback below keeps working unchanged.
-  const combo = (item.action ? bindings[item.action]?.[0] : undefined) ?? item.comboHint
+  // `bindingsFor`, not a raw lookup: a plugin's action is contributed after
+  // $bindings was seeded, so its combo only resolves through the fallback chain.
+  const combo = (item.action ? bindingsFor(item.action, bindings)[0] : undefined) ?? item.comboHint
   // While ⌘/⌃ is held, a row with a modifier variant previews it: the label
   // swaps to the variant's copy so Enter reads as what it will actually do.
   const modPreview = modHeld && Boolean(item.modLabel)
@@ -942,7 +944,16 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     // live state through `detail()`, so the groups must rebuild after a select
     // that kept the palette open — eslint only sees an unused dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contributedItems, dismissedAutoProjects, go, projectTree, selectTick, settingsSectionLabel, t, updateVersionLabel])
+  }, [
+    contributedItems,
+    dismissedAutoProjects,
+    go,
+    projectTree,
+    selectTick,
+    settingsSectionLabel,
+    t,
+    updateVersionLabel
+  ])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
   // chats) only surface once the user types — otherwise they'd bury the

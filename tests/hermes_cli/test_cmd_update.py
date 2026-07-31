@@ -468,13 +468,17 @@ class TestCmdUpdateBranchFallback:
         build_ok = _subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with patch.object(hm, "_is_termux_env", return_value=False), \
              patch.object(hm, "_web_ui_build_needed", return_value=True), \
+             patch.object(
+                 hm,
+                 "_run_npm_watching_for_engine_failure",
+                 return_value=build_ok,
+             ) as mock_npm, \
              patch.object(hm, "_run_with_idle_timeout", return_value=build_ok) as mock_idle:
             cmd_update(mock_args)
 
         npm_calls = [
             (call.args[0], call.kwargs.get("cwd"))
-            for call in mock_run.call_args_list
-            if call.args and call.args[0][0] == "/usr/bin/npm"
+            for call in mock_npm.call_args_list
         ]
 
         # cmd_update runs npm commands in these locations:
@@ -537,7 +541,7 @@ class TestCmdUpdateBranchFallback:
         # capture_output=True, so exclude it.
         root_install_calls = [
             call
-            for call in mock_run.call_args_list
+            for call in mock_npm.call_args_list
             if call.args
             and call.args[0][0] == "/usr/bin/npm"
             and call.args[0][1] == "ci"
