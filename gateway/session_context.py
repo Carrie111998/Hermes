@@ -37,6 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
+from copy import deepcopy
 from typing import Any, Dict, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
@@ -398,7 +399,32 @@ def get_session_source_snapshot() -> Optional[Dict[str, Any]]:
     value = _SESSION_SOURCE_SNAPSHOT.get()
     if value is _UNSET or not isinstance(value, dict) or not value:
         return None
-    return dict(value)
+    return deepcopy(value)
+
+
+def capture_session_origin() -> Dict[str, Any]:
+    """Capture immutable routing identity for a detached producer."""
+    source_payload = get_session_source_snapshot()
+    message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+    profile = get_session_env("HERMES_SESSION_PROFILE", "") or ""
+    if source_payload:
+        message_id = message_id or str(source_payload.get("message_id") or "")
+        profile = profile or str(source_payload.get("profile") or "")
+    if source_payload and not profile:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name() or "default"
+        except Exception:
+            profile = "default"
+    return {
+        "origin_message_id": str(message_id),
+        "origin_source": deepcopy(source_payload) if source_payload else None,
+        "origin_profile": str(profile),
+        "parent_session_id": str(
+            get_session_env("HERMES_SESSION_ID", "") or ""
+        ),
+    }
 
 
 def declare_stateless_channel() -> None:

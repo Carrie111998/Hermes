@@ -3115,6 +3115,9 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     return watch_events
 
 
+_BACKGROUND_PROCESS_STATUS_MIN_INTERVAL_SECONDS = 30.0
+
+
 # Module-level weak reference to the active GatewayRunner instance.
 # Used by tools (e.g. send_message) that need to route through a live
 # adapter for plugin platforms.  Set in GatewayRunner.__init__().
@@ -20301,6 +20304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             source_snapshot=context.source.to_dict(),
@@ -21115,52 +21119,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         durable_delegation_id, exc,
                     )
                     return False
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                # Pre-flight (#65838-class): adapter acceptance is NOT proof of
-                # delivery — the inner #55578 resolver can still fail closed
-                # inside the message pipeline AFTER the adapter accepted, which
-                # would falsely acknowledge the durable row as delivered.
-                # Verify the target here, before acceptance, and give drops an
-                # honest durable disposition.
-                verdict = await self._classify_completion_target(
-                    parent_session_id,
-                    str(evt.get("origin_profile") or ""),
+        parent_session_id = str(evt.get("parent_session_id") or "").strip()
+        if parent_session_id:
+            # Adapter acceptance is not proof that the pinned physical session
+            # will accept the synthetic turn. Pre-flight every durable producer
+            # (delegation and terminal) before crossing that boundary.
+            verdict = await self._classify_completion_target(
+                parent_session_id,
+                str(evt.get("origin_profile") or ""),
+            )
+            if verdict == "terminal":
+                logger.warning(
+                    "%s completion targets permanently-gone session %s; "
+                    "terminally dropping delivery.",
+                    evt.get("type", "background"), parent_session_id,
                 )
-                if verdict == "terminal":
-                    logger.warning(
-                        "Async delegation %s targets permanently-gone session %s; "
-                        "terminally dropping delivery (result remains in the "
-                        "delegation records).",
-                        durable_delegation_id or "<legacy>", parent_session_id,
-                    )
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import drop_completion_delivery
+                if durable_claim_id:
+                    try:
+                        from tools.async_delegation import drop_completion_delivery
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not drop durable completion claim",
-                                exc_info=True,
-                            )
-                    return None
-                if verdict == "retry":
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import release_completion_delivery
+                        drop_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not drop durable completion claim",
+                            exc_info=True,
+                        )
+                return None
+            if verdict == "retry":
+                if durable_claim_id:
+                    try:
+                        from tools.async_delegation import release_completion_delivery
 
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not release durable completion claim",
-                                exc_info=True,
-                            )
-                    return False
+                        release_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not release durable completion claim",
+                            exc_info=True,
+                        )
+                return False
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
@@ -21329,7 +21329,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Process watcher ended (silent): %s", session_id)
             return
 
-        last_output_len = 0
+        last_output_snapshot = ""
+        pending_status = False
+        next_status_at = 0.0
         while True:
             await asyncio.sleep(interval)
 
@@ -21337,9 +21339,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if session is None:
                 break
 
-            current_output_len = len(session.output_buffer)
-            has_new_output = current_output_len > last_output_len
-            last_output_len = current_output_len
+            current_output = session.output_buffer or ""
+            if current_output != last_output_snapshot:
+                last_output_snapshot = current_output
+                pending_status = True
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
@@ -21377,6 +21380,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
+                        "origin_message_id": str(
+                            watcher.get("origin_message_id") or message_id or ""
+                        ),
+                        "origin_source": watcher.get("origin_source"),
+                        "origin_profile": watcher.get("origin_profile", ""),
+                        "parent_session_id": watcher.get("parent_session_id", ""),
                         "started_at": getattr(session, "started_at", None),
                         "command": _command,
                         "exit_code": session.exit_code,
@@ -21394,6 +21403,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
+                    _pr_check.mark_notification_delivered(session_id)
                     break
 
                 # --- Normal text-only notification ---
@@ -21430,26 +21440,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"[Background process {session_id} finished with exit code {session.exit_code}~ "
                         f"Here's the final output:\n{new_output}]"
                     )
-                    adapter = None
-                    for p, a in self.adapters.items():
-                        if p.value == platform_name:
-                            adapter = a
-                            break
-                    if adapter and chat_id:
-                        try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(
-                                chat_id,
-                                message_text,
-                                metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                            )
-                        except Exception as e:
-                            logger.error("Watcher delivery error: %s", e)
+                    delivered = await self._deliver_process_status_direct(
+                        message_text, watcher, status_key=f"process:{session_id}:final"
+                    )
+                    if delivered is False:
+                        continue
+                _pr_check.mark_notification_delivered(session_id)
                 break
 
-            elif has_new_output and notify_mode == "all" and not agent_notify:
-                # New output available -- deliver status update (only in "all" mode)
-                # Skip periodic updates for agent_notify watchers (they only care about completion)
+            elif pending_status and notify_mode == "all":
+                # Periodic output sync is direct status delivery, never a
+                # synthetic agent turn. Bursts coalesce behind a per-process
+                # throttle and adapters may edit the same status bubble.
+                now = time.monotonic()
+                if now < next_status_at:
+                    continue
                 new_output = session.output_buffer[-500:] if session.output_buffer else ""
                 if new_output:
                     from agent.redact import redact_terminal_output
@@ -21460,23 +21465,62 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[Background process {session_id} is still running~ "
                     f"New output:\n{new_output}]"
                 )
-                adapter = None
-                for p, a in self.adapters.items():
-                    if p.value == platform_name:
-                        adapter = a
-                        break
-                if adapter and chat_id:
-                    try:
-                        send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(
-                            chat_id,
-                            message_text,
-                            metadata=_non_conversational_metadata(send_meta, platform=platform_name),
-                        )
-                    except Exception as e:
-                        logger.error("Watcher delivery error: %s", e)
+                delivered = await self._deliver_process_status_direct(
+                    message_text, watcher, status_key=f"process:{session_id}:running"
+                )
+                if delivered is True:
+                    pending_status = False
+                    next_status_at = (
+                        now + _BACKGROUND_PROCESS_STATUS_MIN_INTERVAL_SECONDS
+                    )
 
         logger.debug("Process watcher ended: %s", session_id)
+
+    async def _deliver_process_status_direct(
+        self,
+        message_text: str,
+        watcher: dict,
+        *,
+        status_key: str,
+    ) -> Optional[bool]:
+        """Send terminal progress/final text without starting an agent turn."""
+        evt = dict(watcher)
+        if watcher.get("origin_message_id") and not evt.get("message_id"):
+            evt["message_id"] = watcher["origin_message_id"]
+        source = self._build_process_event_source(evt)
+        if source is None:
+            return None
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return None
+        anchor = str(
+            watcher.get("origin_message_id")
+            or watcher.get("message_id")
+            or getattr(source, "message_id", "")
+            or ""
+        ) or None
+        metadata = self._thread_metadata_for_source(source, anchor)
+        if metadata and metadata.get("reply_in_thread") and anchor:
+            metadata = dict(metadata)
+            metadata["reply_to_message_id"] = anchor
+        metadata = _non_conversational_metadata(
+            metadata,
+            platform=getattr(source.platform, "value", source.platform),
+        )
+        try:
+            result = await _send_or_update_status_coro(
+                adapter,
+                source.chat_id,
+                status_key,
+                message_text,
+                metadata,
+            )
+            if result is not None and getattr(result, "success", True) is False:
+                return False
+            return True
+        except Exception as exc:
+            logger.error("Watcher delivery error: %s", exc)
+            return False
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
 

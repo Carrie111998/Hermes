@@ -651,33 +651,22 @@ def capture_current_origin() -> Dict[str, Any]:
     session-key routing path.
     """
     try:
-        from gateway.session import SessionSource
         from gateway.session_context import (
-            get_session_env,
-            get_session_source_snapshot,
+            capture_session_origin,
         )
 
-        source_payload = get_session_source_snapshot()
+        captured = capture_session_origin()
+        source_payload = captured.get("origin_source")
         if source_payload:
             # Validate and normalize the snapshot through the public wire
             # contract, then copy it again for ownership by the producer.
-            source_payload = SessionSource.from_dict(source_payload).to_dict()
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
-        profile = get_session_env("HERMES_SESSION_PROFILE", "") or ""
-        if source_payload:
-            message_id = message_id or str(source_payload.get("message_id") or "")
-            profile = profile or str(source_payload.get("profile") or "")
-        if source_payload and not profile:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
+            from gateway.session import SessionSource
 
-                profile = get_active_profile_name() or "default"
-            except Exception:
-                profile = "default"
+            source_payload = SessionSource.from_dict(source_payload).to_dict()
         return {
-            "origin_message_id": str(message_id),
+            "origin_message_id": captured["origin_message_id"],
             "origin_source": dict(source_payload) if source_payload else None,
-            "origin_profile": str(profile),
+            "origin_profile": captured["origin_profile"],
         }
     except Exception:
         logger.debug("Could not capture async delegation origin", exc_info=True)

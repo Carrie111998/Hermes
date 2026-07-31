@@ -84,6 +84,65 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+@pytest.mark.parametrize(
+    ("parent", "tip_id", "tip", "expected"),
+    [
+        (
+            {"id": "parent", "ended_at": "now", "end_reason": "new", "profile_name": "coder"},
+            None,
+            None,
+            None,
+        ),
+        (
+            {"id": "parent", "ended_at": "now", "end_reason": "compression", "profile_name": "coder"},
+            None,
+            None,
+            False,
+        ),
+        (
+            {"id": "parent", "ended_at": "now", "end_reason": "compression", "profile_name": "coder"},
+            "tip",
+            {"id": "tip", "ended_at": None, "profile_name": "default"},
+            None,
+        ),
+        (
+            {"id": "parent", "ended_at": "now", "end_reason": "compression", "profile_name": "coder"},
+            "tip",
+            {"id": "tip", "ended_at": None, "profile_name": "coder"},
+            True,
+        ),
+    ],
+    ids=["new-boundary", "compression-tip-pending", "cross-profile-tip", "same-profile-tip"],
+)
+def test_terminal_completion_preflights_compression_lineage(
+    parent, tip_id, tip, expected,
+):
+    """Terminal completions retry/drop safely until a same-profile tip is live."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    rows = {"parent": parent}
+    if tip is not None:
+        rows["tip"] = tip
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=lambda session_id: rows.get(session_id)),
+        get_compression_tip=AsyncMock(return_value=tip_id),
+    )
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    event = _completion_event(started_at=123.0, session_id="proc-lineage")
+    event.update({
+        "parent_session_id": "parent",
+        "origin_profile": "coder",
+    })
+
+    result = asyncio.run(runner._deliver_completion_notification("done", event))
+
+    assert result is expected
+    if expected is True:
+        runner._inject_watch_notification.assert_awaited_once_with("done", event)
+    else:
+        runner._inject_watch_notification.assert_not_awaited()
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
