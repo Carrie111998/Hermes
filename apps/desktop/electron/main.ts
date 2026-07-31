@@ -508,6 +508,18 @@ if (INSTALL_STAMP) {
   )
 }
 
+// Douglas Agent: normalize DOUGLAS_DESKTOP_<X> into HERMES_DESKTOP_<X> for
+// every desktop-side env var (HERMES_DESKTOP_REMOTE_URL, _REMOTE_TOKEN, and
+// any future one), mirroring hermes_bootstrap.py::normalize_douglas_env() on
+// the Python side. Must run before anything below reads process.env.HERMES_
+// DESKTOP_* (first read is ~6900 lines down, well after this top-level block
+// executes on module load) so every existing read site works unmodified.
+for (const key of Object.keys(process.env)) {
+  if (key.startsWith('DOUGLAS_DESKTOP_') && process.env[key]) {
+    process.env['HERMES_DESKTOP_' + key.slice('DOUGLAS_DESKTOP_'.length)] = process.env[key]
+  }
+}
+
 // HERMES_HOME — the user-facing root for everything Hermes-related. Mirrors
 // scripts/install.ps1's $HermesHome and scripts/install.sh's $HERMES_HOME.
 //
@@ -698,7 +710,7 @@ const BOOT_FAKE_STEP_MS = (() => {
   return Math.max(120, raw)
 })()
 
-const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Hermes'
+const APP_NAME = process.env.HERMES_DESKTOP_APP_NAME || 'Douglas Agent'
 const TITLEBAR_HEIGHT = 34
 const MACOS_TRAFFIC_LIGHTS_HEIGHT = 14
 
@@ -3489,8 +3501,8 @@ async function applyUpdatesPosixInApp(opts: any) {
   }
 
   const rebuiltApp = [
-    path.join(updateRoot, 'apps', 'desktop', 'release', 'mac-arm64', 'Hermes.app'),
-    path.join(updateRoot, 'apps', 'desktop', 'release', 'mac', 'Hermes.app')
+    path.join(updateRoot, 'apps', 'desktop', 'release', 'mac-arm64', 'Douglas Agent.app'),
+    path.join(updateRoot, 'apps', 'desktop', 'release', 'mac', 'Douglas Agent.app')
   ].find(directoryExists)
 
   const targetApp = runningAppBundle()

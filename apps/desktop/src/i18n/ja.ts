@@ -704,7 +704,7 @@ export const ja = defineLocale({
         `"${profile}" がアクティブプロファイルのときのみ使用される接続。「デフォルトゲートウェイを使用」を選ぶとオーバーライドが削除されます。`,
       envOverrideTitle: '環境変数がこのデスクトップセッションを制御しています。',
       envOverrideDesc:
-        '保存された設定を使用するには HERMES_DESKTOP_REMOTE_URL と HERMES_DESKTOP_REMOTE_TOKEN の設定を解除してください。',
+        '保存された設定を使用するには DOUGLAS_DESKTOP_REMOTE_URL（または HERMES_DESKTOP_REMOTE_URL）と対応する _TOKEN 変数の設定を解除してください。',
       localTitle: 'ローカルゲートウェイ',
       localDesc:
         'ローカルホストでプライベートな Douglas Agent バックエンドを起動します。これがデフォルトで、オフラインでも動作します。',

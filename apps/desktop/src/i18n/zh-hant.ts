@@ -687,7 +687,7 @@ export const zhHant = defineLocale({
       defaultConnection: '預設連線適用於所有沒有自訂覆寫的設定檔。',
       profileConnection: profile => `僅當「${profile}」為作用中設定檔時使用此連線。選擇「使用預設閘道」可移除其覆寫。`,
       envOverrideTitle: '環境變數正在控制此桌面工作階段。',
-      envOverrideDesc: '取消設定 HERMES_DESKTOP_REMOTE_URL 和 HERMES_DESKTOP_REMOTE_TOKEN 後才會使用下方儲存的設定。',
+      envOverrideDesc: '取消設定 DOUGLAS_DESKTOP_REMOTE_URL（或 HERMES_DESKTOP_REMOTE_URL）及對應的 _TOKEN 變數後才會使用下方儲存的設定。',
       localTitle: '本機閘道',
       localDesc: '在 localhost 啟動私有 Douglas Agent 後端。這是預設方式，可離線使用。',
       inheritTitle: '使用預設閘道',
