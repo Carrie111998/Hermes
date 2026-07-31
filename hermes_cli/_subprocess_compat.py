@@ -360,6 +360,11 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
     ``taskkill /T /F`` takes the whole tree down so the bounded drain that
     follows can actually reach EOF.
 
+    On Windows the tree kill must run *before* ``proc.kill()``: once the
+    launcher exits, Windows can no longer reliably discover its descendants, so
+    kill-then-taskkill leaves orphans. ``proc.kill()`` remains as a fallback if
+    taskkill fails or is unavailable.
+
     All failures are swallowed — this is cleanup on an already-failing path, and
     the caller's contract is to fail open. ``kill()`` can raise (access denied,
     already reaped); an unhandled raise here would escape the caller's ``except``
@@ -367,10 +372,6 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
     re-enter the deadlock class it fixes: it captures no pipes (DEVNULL), so its
     own timeout cleanup has no reader threads to join.
     """
-    try:
-        proc.kill()
-    except OSError:
-        pass
     if IS_WINDOWS:
         try:
             subprocess.run(
@@ -384,6 +385,10 @@ def _kill_process_tree(proc: "subprocess.Popen") -> None:
             )
         except Exception:
             pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 # Back-compat alias for the original git-probe name.

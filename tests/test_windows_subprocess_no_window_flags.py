@@ -201,11 +201,10 @@ def test_bounded_captured_run_fast_path_spawn_contract_windows(monkeypatch):
 
 
 def test_bounded_captured_run_timeout_tree_kills_on_windows(monkeypatch):
-    """Timeout path must tree-kill + bounded drain, returning returncode=-1."""
+    """Timeout path: taskkill tree first, then kill fallback, then bounded drain."""
     from hermes_cli import _subprocess_compat
 
     events = []
-    taskkills = []
 
     class _HangingPopen:
         def __init__(self, cmd, **kwargs):
@@ -222,7 +221,8 @@ def test_bounded_captured_run_timeout_tree_kills_on_windows(monkeypatch):
             events.append("kill")
 
     def fake_run(cmd, **kwargs):
-        taskkills.append((cmd, kwargs))
+        if cmd and cmd[0] == "taskkill":
+            events.append(("taskkill", list(cmd)))
         return _Completed()
 
     monkeypatch.setattr(_subprocess_compat, "IS_WINDOWS", True)
@@ -234,9 +234,13 @@ def test_bounded_captured_run_timeout_tree_kills_on_windows(monkeypatch):
     assert result.returncode == -1
     assert result.stdout == ""
     assert result.stderr == "timed out after 15s"
-    assert events == ["comm:15", "kill", "comm:1"]
-    kills = [c for c, _ in taskkills if c and c[0] == "taskkill"]
-    assert kills == [["taskkill", "/T", "/F", "/PID", "5150"]], taskkills
+    # Windows: walk the live tree before killing the launcher, then drain.
+    assert events == [
+        "comm:15",
+        ("taskkill", ["taskkill", "/T", "/F", "/PID", "5150"]),
+        "kill",
+        "comm:1",
+    ]
 
 
 def test_bounded_git_probe_timeout_returns_empty(monkeypatch):
