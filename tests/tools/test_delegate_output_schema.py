@@ -215,6 +215,36 @@ class TestRunSingleChildSchemaValidation:
         # final summary is the retried (valid) answer
         assert json.loads(entry["summary"])["city"] == "Oslo"
 
+    def test_retry_suppresses_foreground_skill_grant(self, monkeypatch, tmp_path):
+        from agent import skill_utils
+
+        observed = []
+
+        class ObservingChild(_StubChild):
+            def run_conversation(self, *args, **kwargs):
+                observed.append(skill_utils.is_skill_read_granted("alpha"))
+                return super().run_conversation(*args, **kwargs)
+
+        child = ObservingChild(["not json at all", '{"city": "Oslo"}'])
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        monkeypatch.setattr(
+            skill_utils, "get_disabled_skill_names", lambda: {"alpha"}
+        )
+
+        with skill_utils.skill_read_grant_scope(
+            ["alpha"],
+            session_id="foreground",
+            profile="build",
+            requester="local-cli",
+            source="cli",
+            audit_path=tmp_path / "skill-grants.jsonl",
+        ):
+            entry = _run(child)
+            assert skill_utils.is_skill_read_granted("alpha") is True
+
+        assert entry["schema_valid"] is True
+        assert observed == [False, False]
+
     def test_invalid_twice_surfaces_errors_and_stops(self):
         child = _StubChild(["nope", "still nope"])
         child._delegate_output_schema = ADDRESS_SCHEMA
