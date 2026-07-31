@@ -110,6 +110,43 @@ def test_tab_title_uses_windows_console_title_api(monkeypatch):
     assert cli._tab_title_last == "done bad next"
 
 
+def test_tab_title_dual_writes_on_windows_tty(monkeypatch):
+    stream = _TtyStringIO()
+    cli = _make_cli(stream=stream)
+    set_console_title = Mock(return_value=1)
+    windll = SimpleNamespace(
+        kernel32=SimpleNamespace(SetConsoleTitleW=set_console_title),
+    )
+    monkeypatch.setattr(cli_module.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", windll, raising=False)
+    monkeypatch.setenv("TERM_PROGRAM", "vscode")
+
+    cli._set_tab_title_state("done", force=True)
+
+    set_console_title.assert_called_once_with("Project")
+    assert stream.getvalue() == "\033]0;Project\a"
+    assert cli._tab_title_last == "Project"
+
+
+def test_tab_title_avoids_osc_on_legacy_windows_console(monkeypatch):
+    stream = _TtyStringIO()
+    cli = _make_cli(stream=stream)
+    set_console_title = Mock(return_value=1)
+    windll = SimpleNamespace(
+        kernel32=SimpleNamespace(SetConsoleTitleW=set_console_title),
+    )
+    monkeypatch.setattr(cli_module.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", windll, raising=False)
+    for name in ("MSYSTEM", "TERM_PROGRAM", "WT_SESSION", "TERM"):
+        monkeypatch.delenv(name, raising=False)
+
+    cli._set_tab_title_state("done", force=True)
+
+    set_console_title.assert_called_once_with("Project")
+    assert stream.getvalue() == ""
+    assert cli._tab_title_last == "Project"
+
+
 def test_tab_title_sanitizes_control_characters():
     cli = _make_cli()
     cli._tab_title_done = "done \033bad\a\nnext\tmore\x7fhidden\x9f"
