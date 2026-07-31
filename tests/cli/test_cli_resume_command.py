@@ -100,6 +100,23 @@ class TestResumeArmingRealDb:
         assert consumed is True
         assert cli_obj.session_id == "sess_013"
 
+    def test_sessions_list_page_two_delegates_and_pages(self, cli_db):
+        """`/sessions list 2` (with a page) falls through to `/resume
+        list 2` — the dead page-parse block never ran — and still pages
+        to ranks 11..15 with a working bare-number selection (F8).
+        """
+        cli_obj, db = cli_db
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint"),
+        ):
+            cli_obj._handle_sessions_command("/sessions list 2")
+            assert cli_obj._pending_resume_offset == 10
+            assert len(cli_obj._pending_resume_sessions) == 5
+            consumed = cli_obj._consume_pending_resume_selection("14")
+        assert consumed is True
+        assert cli_obj.session_id == "sess_001"
+
 
 class TestCliResumeCommand:
     def test_show_recent_sessions_includes_indexes_and_resume_hint(self, capsys):

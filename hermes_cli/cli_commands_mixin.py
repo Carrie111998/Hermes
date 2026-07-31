@@ -1268,17 +1268,16 @@ class CLICommandsMixin:
 
         sub = arg.lower()
         # Bare /sessions or /sessions list [page] — show recent sessions inline.
+        # Note: /sessions list 2 (with a page) never reaches this branch —
+        # `sub in {"list", "ls", "browse"}` matches only the bare word, so the
+        # page-parsing below is unreachable and `list 2` falls through to
+        # _handle_resume_command("/resume list 2"), which owns pagination.
         if not arg or sub in {"list", "ls", "browse"}:
             if not self._session_db:
                 from hermes_state import format_session_db_unavailable
                 _cprint(f"  {format_session_db_unavailable()}")
                 return
-            # /sessions list 2 — paginated listing (page size = -l N).
-            page = 1
-            _toks = arg.split()
-            if len(_toks) >= 2 and _toks[1].isdigit():
-                page = max(1, int(_toks[1]))
-            offset = (page - 1) * limit
+            offset = 0
             if not self._show_recent_sessions(reason="sessions", limit=limit, offset=offset):
                 _cprint("  (._.) No previous sessions yet.")
                 return
