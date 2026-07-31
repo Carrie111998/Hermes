@@ -106,6 +106,7 @@ export function useComposerState({
   const [input, setInput] = useState('')
   const [inputBuf, setInputBuf] = useState<string[]>([])
   const [pasteSnips, setPasteSnips] = useState<PasteSnippet[]>([])
+  const [pendingSteer, setPendingSteer] = useState<string[]>([])
   const isBlocked = useStore($isBlocked)
   const { querier } = useStdin() as { querier: Parameters<typeof readOsc52Clipboard>[0] }
 
@@ -134,6 +135,11 @@ export function useComposerState({
     historyDraftRef.current = ''
   }, [historyDraftRef, setQueueEdit, setHistoryIdx])
 
+  const pushPendingSteer = useCallback(
+    (text: string) => setPendingSteer(prev => [...prev, text]),
+    []
+  )
+  const clearPendingSteer = useCallback(() => setPendingSteer([]), [])
   const handleResolvedPaste = useCallback(
     async ({
       bracketed,
@@ -314,6 +320,8 @@ export function useComposerState({
       setInput,
       setInputBuf,
       setPasteSnips,
+      pushPendingSteer,
+      clearPendingSteer,
       setQueueEdit,
       syncQueue
     }),
@@ -328,6 +336,8 @@ export function useComposerState({
       replaceQ,
       setCompIdx,
       setHistoryIdx,
+      pushPendingSteer,
+      clearPendingSteer,
       setQueueEdit,
       syncQueue
     ]
@@ -353,10 +363,11 @@ export function useComposerState({
       input,
       inputBuf,
       pasteSnips,
+      pendingSteer,
       queueEditIdx,
       queuedDisplay
     }),
-    [compIdx, compReplace, completions, historyIdx, input, inputBuf, pasteSnips, queueEditIdx, queuedDisplay]
+    [compIdx, compReplace, completions, historyIdx, input, inputBuf, pasteSnips, pendingSteer, queueEditIdx, queuedDisplay]
   )
 
   return {

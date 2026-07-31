@@ -763,6 +763,15 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued])
 
+  // A finished turn has no further tool-call boundary for a pending steer to
+  // ride on, so the composer hint must not outlive the busy state (otherwise
+  // it would linger after the steer was injected or dropped).
+  useEffect(() => {
+    if (!ui.busy) {
+      composerActions.clearPendingSteer()
+    }
+  }, [ui.busy, composerActions])
+
   const { pagerPageSize } = useInputHandlers({
     actions: {
       answerClarify,
@@ -791,7 +800,7 @@ export function useMainApp(gw: GatewayClient) {
   const onEvent = useMemo(
     () =>
       createGatewayEventHandler({
-        composer: { setInput: composerActions.setInput },
+        composer: { clearPendingSteer: () => composerActions.clearPendingSteer(), setInput: composerActions.setInput },
         gateway,
         session: {
           STARTUP_RESUME_ID,
@@ -1142,6 +1151,7 @@ export function useMainApp(gw: GatewayClient) {
       input: composerState.input,
       inputBuf: composerState.inputBuf,
       pagerPageSize,
+      pendingSteer: composerState.pendingSteer,
       queueEditIdx: composerState.queueEditIdx,
       queuedDisplay: composerState.queuedDisplay,
       submit,

@@ -14,8 +14,8 @@ export function getQueueWindow(queueLen: number, queueEditIdx: number | null) {
   return { end, showLead: start > 0, showTail: end < queueLen, start }
 }
 
-export function QueuedMessages({ cols, queueEditIdx, queued, t }: QueuedMessagesProps) {
-  if (!queued.length) {
+export function QueuedMessages({ cols, pendingSteer, queueEditIdx, queued, t }: QueuedMessagesProps) {
+  if (!queued.length && !pendingSteer.length) {
     return null
   }
 
@@ -23,11 +23,18 @@ export function QueuedMessages({ cols, queueEditIdx, queued, t }: QueuedMessages
 
   return (
     <Box flexDirection="column" marginTop={1}>
-      <Text color={t.color.muted} dimColor>
-        {`queued (${queued.length})${
-          queueEditIdx !== null ? ` · editing ${queueEditIdx + 1} · Ctrl+X delete · Esc cancel` : ''
-        }`}
-      </Text>
+      {pendingSteer.map((text, index) => (
+        <Text color={t.color.accent} key={`${index}-${text.slice(0, 16)}`}>
+          {`⏩ steer: ${compactPreview(text, Math.max(16, cols - 10))} · arrives after next tool call`}
+        </Text>
+      ))}
+      {queued.length > 0 && (
+        <Text color={t.color.muted} dimColor>
+          {`queued (${queued.length})${
+            queueEditIdx !== null ? ` · editing ${queueEditIdx + 1} · Ctrl+X delete · Esc cancel` : ''
+          }`}
+        </Text>
+      )}
 
       {q.showLead && (
         <Text color={t.color.muted} dimColor>
@@ -58,6 +65,7 @@ export function QueuedMessages({ cols, queueEditIdx, queued, t }: QueuedMessages
 
 interface QueuedMessagesProps {
   cols: number
+  pendingSteer: string[]
   queueEditIdx: number | null
   queued: string[]
   t: Theme

@@ -377,6 +377,8 @@ export interface ComposerActions {
   setInput: StateSetter<string>
   setInputBuf: StateSetter<string[]>
   setPasteSnips: StateSetter<PasteSnippet[]>
+  pushPendingSteer: (text: string) => void
+  clearPendingSteer: () => void
   setQueueEdit: (index: null | number) => void
   syncQueue: () => void
 }
@@ -397,6 +399,7 @@ export interface ComposerState {
   input: string
   inputBuf: string[]
   pasteSnips: PasteSnippet[]
+  pendingSteer: string[]
   queueEditIdx: null | number
   queuedDisplay: string[]
 }
@@ -457,6 +460,7 @@ export interface InputHandlerResult {
 
 export interface GatewayEventHandlerContext {
   composer: {
+    clearPendingSteer: () => void
     setInput: StateSetter<string>
   }
   gateway: GatewayServices
@@ -562,6 +566,7 @@ export interface AppLayoutComposerProps {
   input: string
   inputBuf: string[]
   pagerPageSize: number
+  pendingSteer: string[]
   queueEditIdx: null | number
   queuedDisplay: string[]
   submit: (value: string) => void

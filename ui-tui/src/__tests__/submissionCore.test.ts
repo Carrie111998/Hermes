@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { isSessionBusyError, markSubmitting, submitPrompt, type SubmitPromptDeps } from '../app/submissionCore.js'
+import { isSessionBusyError, markSubmitting, submitPrompt, submitSteer, type SubmitPromptDeps } from '../app/submissionCore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
 
@@ -126,5 +126,62 @@ describe('submissionCore.isSessionBusyError', () => {
     expect(isSessionBusyError(new Error('waiting for model response'))).toBe(true)
     expect(isSessionBusyError(new Error('some other failure'))).toBe(false)
     expect(isSessionBusyError('not an error')).toBe(false)
+  })
+})
+
+describe('submissionCore.submitSteer — busy-input steer feedback paths', () => {
+  // A gateway double whose `session.steer` resolution we control per test.
+  const makeSteerGateway = (resolver: () => Promise<unknown>) => {
+    const gw = {
+      request: vi.fn((method: string) => {
+        if (method === 'session.steer') {
+          return resolver()
+        }
+        return Promise.resolve({})
+      })
+    } as unknown as GatewayClient
+    return gw
+  }
+
+  const makeSteerDeps = (gw: GatewayClient, over: Partial<Parameters<typeof submitSteer>[2]> = {}) => ({
+    gw,
+    onQueued: vi.fn(),
+    onRejected: vi.fn(),
+    ...over
+  })
+
+  it('accepted steer (status queued) fires onQueued exactly once with the right RPC payload', async () => {
+    const gw = makeSteerGateway(() => Promise.resolve({ status: 'queued', text: 'keep going' }))
+    const deps = makeSteerDeps(gw)
+
+    submitSteer('sess-1', 'keep going', deps)
+    await Promise.resolve()
+
+    expect(gw.request).toHaveBeenCalledWith('session.steer', { session_id: 'sess-1', text: 'keep going' })
+    expect(deps.onQueued).toHaveBeenCalledTimes(1)
+    expect(deps.onRejected).not.toHaveBeenCalled()
+  })
+
+  it('rejected steer fires onRejected and never onQueued (fallback path, no optimistic bubble)', async () => {
+    const gw = makeSteerGateway(() => Promise.resolve({ status: 'rejected' }))
+    const deps = makeSteerDeps(gw)
+
+    submitSteer('sess-1', 'rejected note', deps)
+    await Promise.resolve()
+
+    expect(deps.onRejected).toHaveBeenCalledWith('steer rejected — message queued for next turn')
+    expect(deps.onQueued).not.toHaveBeenCalled()
+  })
+
+  it('RPC error fires onRejected with the failure note and never onQueued', async () => {
+    const gw = makeSteerGateway(() => Promise.reject(new Error('boom')))
+    const deps = makeSteerDeps(gw)
+
+    submitSteer('sess-1', 'will fail', deps)
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(deps.onRejected).toHaveBeenCalledWith('steer failed — message queued for next turn')
+    expect(deps.onQueued).not.toHaveBeenCalled()
   })
 })
