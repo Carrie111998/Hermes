@@ -1639,8 +1639,15 @@ def switch_model(
             _da = None
             resolved_alias = ""
         if _da is not None and _da.base_url:
+            _runtime_url = str(base_url or "").strip().rstrip("/").lower()
+            _alias_url = str(_da.base_url).strip().rstrip("/").lower()
             base_url = _da.base_url
-            api_mode = ""  # clear so determine_api_mode re-detects from URL
+            # The runtime resolver may have selected an explicit transport for
+            # this provider. Keep it when the alias only changes superficial URL
+            # spelling (for example a trailing slash); clear it only when the
+            # alias actually redirects to a different endpoint.
+            if _alias_url != _runtime_url:
+                api_mode = ""
             if not api_key:
                 api_key = "no-key-required"
 

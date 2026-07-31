@@ -11,6 +11,8 @@ Covers:
 
 import os
 
+import yaml
+
 
 # ---------------------------------------------------------------------------
 # OLLAMA_API_KEY credential resolution
@@ -470,6 +472,116 @@ class TestSwitchModelDirectAliasOverride:
         # The invariant: the endpoint must belong to the provider we switched to.
         assert result.base_url == "https://api-b.example.com"
         assert result.resolved_via_alias == "my-b"
+
+    def test_matching_alias_base_url_preserves_runtime_api_mode(self, monkeypatch):
+        """An accepted alias for the same endpoint keeps its configured wire mode.
+
+        Trailing-slash differences do not change the endpoint. Clearing the
+        runtime mode in that case makes a generic URL fall back to
+        ``chat_completions`` even when the provider explicitly selected native
+        Anthropic Messages.
+        """
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "my-b": DirectAlias(
+                "claude-opus-4-6",
+                "custom:provider-b",
+                "https://api-b.example.com/",
+            ),
+        })
+        self._stub_explicit_provider_b(monkeypatch, ms)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **_kwargs: {
+                "api_key": "sk-bbb",
+                "base_url": "https://api-b.example.com",
+                "api_mode": "anthropic_messages",
+                "provider": "custom:provider-b",
+            },
+        )
+
+        result = ms.switch_model(
+            "claude-opus-4-6",
+            "custom:provider-a",
+            "old-model",
+            current_base_url="https://api-a.example.com",
+            explicit_provider="custom:provider-b",
+        )
+
+        assert result.success
+        assert result.base_url == "https://api-b.example.com/"
+        assert result.api_mode == "anthropic_messages"
+        assert result.resolved_via_alias == "my-b"
+
+    def test_real_config_matching_alias_preserves_provider_transport(
+        self, monkeypatch, tmp_path
+    ):
+        """Real config loading and both provider resolvers retain transport."""
+        import hermes_cli.model_switch as ms
+        from hermes_cli.config import load_config
+
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / ".env").write_text("", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(
+            yaml.safe_dump({
+                "model": {
+                    "default": "old-model",
+                    "provider": "provider-a",
+                    "base_url": "https://api-a.example.com/v1",
+                },
+                "providers": {
+                    "provider-a": {
+                        "base_url": "https://api-a.example.com/v1",
+                        "models": ["old-model"],
+                    },
+                    "provider-b": {
+                        "base_url": "https://api-b.example.com/v1",
+                        "transport": "anthropic_messages",
+                        "models": ["shared-model"],
+                    },
+                },
+                "model_aliases": {
+                    "shared-b": {
+                        "model": "shared-model",
+                        "provider": "provider-b",
+                        "base_url": "https://api-b.example.com/v1/",
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            },
+        )
+        monkeypatch.setattr(ms, "get_model_capabilities", lambda *a, **kw: None)
+        monkeypatch.setattr(ms, "get_model_info", lambda *a, **kw: None)
+
+        config = load_config()
+        result = ms.switch_model(
+            "shared-model",
+            "provider-a",
+            "old-model",
+            current_base_url="https://api-a.example.com/v1",
+            explicit_provider="provider-b",
+            user_providers=config["providers"],
+        )
+
+        assert result.success
+        assert result.target_provider == "provider-b"
+        assert result.base_url == "https://api-b.example.com/v1/"
+        assert result.api_mode == "anthropic_messages"
+        assert result.resolved_via_alias == "shared-b"
 
     def test_explicit_provider_discards_alias_for_other_provider(self, monkeypatch):
         """An alias owned by a *different* provider is never adopted.
