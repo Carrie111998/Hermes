@@ -980,6 +980,83 @@ class TestSessionRetirement:
         # Confirm we issued turn/interrupt to free codex compute
         assert any(method == "turn/interrupt" for (method, _) in client.requests)
 
+    def test_default_post_tool_watchdog_allows_long_codex_reasoning(self):
+        """A healthy Codex turn may reason for more than 90 seconds after a
+        tool result before emitting its final response.
+
+        Keep the watchdog bounded, but do not interrupt a live turn at the
+        old 90-second threshold tuned for shorter requests.
+        """
+        clock = [0.0]
+
+        class DelayedFinalClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tool_delivered = False
+                self.final_delivered = False
+
+            def take_notification(self, timeout: float = 0.0):
+                if not self.tool_delivered:
+                    self.tool_delivered = True
+                    return {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "commandExecution",
+                                "id": "ex1",
+                                "command": "echo hi",
+                                "cwd": "/tmp",
+                                "status": "completed",
+                                "aggregatedOutput": "hi",
+                                "exitCode": 0,
+                                "commandActions": [],
+                            },
+                            "threadId": "t",
+                            "turnId": "tu1",
+                        },
+                    }
+                if clock[0] < 120.0:
+                    clock[0] += 30.0
+                    return None
+                if not self.final_delivered:
+                    self.final_delivered = True
+                    return {
+                        "method": "item/completed",
+                        "params": {
+                            "item": {
+                                "type": "agentMessage",
+                                "id": "m1",
+                                "text": "finished after reasoning",
+                            },
+                            "threadId": "t",
+                            "turnId": "tu1",
+                        },
+                    }
+                return {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "t",
+                        "turn": {
+                            "id": "tu1",
+                            "status": "completed",
+                            "error": None,
+                        },
+                    },
+                }
+
+        client = DelayedFinalClient()
+        session = make_session(client)
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = session.run_turn("tool then long reasoning")
+
+        assert result.final_text == "finished after reasoning"
+        assert result.error is None
+        assert result.interrupted is False
+        assert result.should_retire is False
+        assert not any(
+            method == "turn/interrupt" for method, _ in client.requests
+        )
+
     def test_post_tool_watchdog_uses_monotonic_clock(self):
         client = FakeClient()
         client.queue_notification(

@@ -48,6 +48,11 @@ logger = logging.getLogger(__name__)
 # enough to surface a config/provider/auth diagnostic.
 _STDERR_TAIL_LINES = 12
 
+# Reasoning-heavy Codex models can legitimately stay quiet for several minutes
+# after a tool result. Keep this below the 10-minute outer turn deadline so a
+# truly wedged app-server still retires early without interrupting healthy work.
+_POST_TOOL_QUIET_TIMEOUT_SECONDS = 300.0
+
 
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
@@ -373,7 +378,7 @@ class CodexAppServerSession:
         *,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
-        post_tool_quiet_timeout: float = 90.0,
+        post_tool_quiet_timeout: float = _POST_TOOL_QUIET_TIMEOUT_SECONDS,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -382,8 +387,9 @@ class CodexAppServerSession:
         post_tool_quiet_timeout: if codex emits a tool completion and then
         goes quiet for this many seconds without emitting another item or
         `turn/completed`, fast-fail and mark the session for retirement.
-        Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
-        so a wedged codex doesn't burn the full turn deadline.
+        Keeps a wedged codex from burning the full turn deadline while leaving
+        enough room for reasoning-heavy models to legitimately spend several
+        minutes processing a tool result before their next event.
         """
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
