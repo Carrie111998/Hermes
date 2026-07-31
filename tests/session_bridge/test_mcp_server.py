@@ -2097,8 +2097,13 @@ def test_session_status_exposes_only_sanitized_sidebar_observability(
         "terminal_resolution_ledger_valid",
         "terminal_resolutions",
         "execution_blockers",
+        "oldest_eligible_age_seconds",
         "oldest_pending_age_seconds",
         "last_heartbeat_at",
+        "heartbeat_stale",
+        "oldest_job_overdue",
+        "degraded_reasons",
+        "broker",
         "last_visible_task_id",
         "recent_error_codes",
         "delivery_latency_seconds",
@@ -2415,6 +2420,24 @@ def test_sidebar_status_preserves_only_broker_thresholds_and_identity() -> None:
     rendered = repr(status)
     assert "messages" not in rendered
     assert "private" not in rendered
+
+
+@pytest.mark.parametrize("field", ("thread_id", "project_id", "cwd"))
+@pytest.mark.parametrize("unsafe", ("bad\x00value", "bad\x85value", "bad\u2028value", "bad\u2029value"))
+def test_sidebar_status_drops_unsafe_broker_identity_text(
+    field: str,
+    unsafe: str,
+) -> None:
+    broker = {
+        "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+    }
+    broker[field] = unsafe
+
+    status = _sidebar_status({"counts": {}, "broker": broker})
+
+    assert field not in status["broker"]
 
 
 def test_sidebar_status_sanitizes_negative_canary_verified_at() -> None:

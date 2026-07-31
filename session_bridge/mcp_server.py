@@ -26,7 +26,7 @@ from .claude_visibility_codes import (
     CLAUDE_VISIBILITY_RETRY_CODES,
 )
 from .codex_adapter import SidebarVerificationError
-from .config import BridgeConfig
+from .config import BridgeConfig, is_canonical_sidebar_string
 from .coordinator import ContinueRequest, ContinueResult
 from .mirror import MirrorPolicy, enqueue_mirror_job
 from .models import (
@@ -1580,11 +1580,7 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             ("project_id", broker_source.get("project_id")),
             ("cwd", broker_source.get("cwd")),
         )
-        if type(value) is str
-        and value
-        and value == value.strip()
-        and "\n" not in value
-        and "\r" not in value
+        if is_canonical_sidebar_string(value)
     }
     raw_degraded_reasons = source.get("degraded_reasons")
     degraded_reasons = (

@@ -7792,6 +7792,25 @@ def test_sidebar_delivery_status_reports_exclusions_without_degradation(db) -> N
     }
 
 
+def test_sidebar_delivery_status_distinguishes_eligible_and_actionable_ages(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("distinct-sidebar-age"),
+    )
+    candidate = _sidebar_candidate(
+        db,
+        native_id="distinct-sidebar-age",
+        eligible_at=600.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    assert len(store.claim_sidebar_jobs(now=900.0, limit=1)) == 1
+
+    status = store.sidebar_delivery_status(now=1_001.0)
+
+    assert status["oldest_eligible_age_seconds"] == 401.0
+    assert status["oldest_pending_age_seconds"] == 101.0
+
+
 def test_sidebar_delivery_status_reports_scheduler_and_recovery_progress(db) -> None:
     store = SessionBridgeStore(
         db,

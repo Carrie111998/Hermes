@@ -63,6 +63,7 @@ from session_bridge.models import (
     SessionLink,
     SessionProjection,
     SidebarJobState,
+    canonical_session_id,
     encode_bridge_marker,
 )
 from session_bridge.preview import build_session_preview
@@ -771,6 +772,24 @@ def test_production_sidebar_broker_configuration_fails_closed_on_reload_mismatch
 
     with pytest.raises(ConfigurationFailure, match="sidebar_broker_reload_mismatch"):
         ProductionBackend(BridgeConfig()).configure_sidebar_broker(**expected)
+
+
+@pytest.mark.parametrize("field", ("thread_id", "project_id", "cwd", "inbox_cwd"))
+@pytest.mark.parametrize("unsafe", ("bad\x00value", "bad\x85value", "bad\u2028value", "bad\u2029value"))
+def test_production_sidebar_broker_configuration_rejects_unsafe_identity_text(
+    field: str,
+    unsafe: str,
+) -> None:
+    values = {
+        "thread_id": "019f9b71-7109-7ed0-943a-d7291190245c",
+        "project_id": "local-453ac85f86839c6d001817cb8480b8ca",
+        "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
+        "inbox_cwd": "C:\\Users\\diego\\.hermes",
+    }
+    values[field] = unsafe
+
+    with pytest.raises(ConfigurationFailure, match="invalid_sidebar_broker_identity"):
+        ProductionBackend(BridgeConfig()).configure_sidebar_broker(**values)
 
 
 def test_sidebar_readable_hydration_commands_are_explicit_and_never_schedule(
@@ -3710,6 +3729,40 @@ def test_sidebar_status_uses_broker_thresholds_and_preserves_identity(
         "cwd": "C:\\Users\\diego\\Developer\\session-sidebar-broker",
     }
     assert "messages" not in repr(status)
+
+
+def test_production_sidebar_status_uses_real_eligible_age_for_overdue_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = SessionDB(tmp_path / "state.db")
+    source_session_id = canonical_session_id(Provider.HERMES, "eligible-age")
+    db.create_session(source_session_id, "cli", cwd="C:/workspace/project")
+    store = SessionBridgeStore(db, sidebar_token_factory=lambda: "eligible-age-lease")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[hermes] eligible age",
+        cwd="C:/workspace/project",
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=600.0,
+    )
+    store.enqueue_sidebar_job(candidate)
+    assert len(store.claim_sidebar_jobs(now=900.0, limit=1)) == 1
+    backend = ProductionBackend(BridgeConfig())
+    backend._store = store
+    backend._catalog = object()  # type: ignore[assignment]
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_001.0)
+
+    status = backend.sidebar_status()
+
+    assert status["oldest_eligible_age_seconds"] == 401.0
+    assert status["oldest_pending_age_seconds"] == 101.0
+    assert status["oldest_job_overdue"] is True
 
 
 @pytest.mark.parametrize(

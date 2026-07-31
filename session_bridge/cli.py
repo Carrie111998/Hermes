@@ -54,7 +54,7 @@ from .claude_visibility_codes import (
 )
 from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter, SidebarThreadVerifier
 from .codex_client import RecoveringCodexAppServerClient
-from .config import BridgeConfig
+from .config import BridgeConfig, is_canonical_sidebar_string
 from .context_pack import ContextPackBuilder
 from .coordinator import (
     ClaudeVisibilityCoordinator,
@@ -4884,15 +4884,9 @@ def _status_count(value: object) -> int:
 
 
 def _canonical_sidebar_broker_value(value: object) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or "\n" in value
-        or "\r" in value
-    ):
+    if not is_canonical_sidebar_string(value):
         raise ConfigurationFailure("invalid_sidebar_broker_identity")
-    return value
+    return cast(str, value)
 
 
 def _persisted_sidebar_values(document: object) -> Mapping[str, Any]:

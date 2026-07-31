@@ -707,17 +707,22 @@ def _canonical_sidebar_string(
 ) -> str | None:
     if value is None and allow_none:
         return None
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or "\n" in value
-        or "\r" in value
-    ):
+    if not is_canonical_sidebar_string(value):
         if name == "session_bridge.sidebar.inbox_cwd":
             raise ValueError(f"{name} must be a non-empty string")
         raise ValueError(f"{name} must be a canonical non-empty single-line string")
     return value
+
+
+def is_canonical_sidebar_string(value: object) -> bool:
+    if not isinstance(value, str) or not value or value != value.strip():
+        return False
+    return not any(
+        ord(character) < 32
+        or 127 <= ord(character) <= 159
+        or character in {"\u2028", "\u2029"}
+        for character in value
+    )
 
 
 def _is_loopback_host(host: str) -> bool:

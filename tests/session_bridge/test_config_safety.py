@@ -37,7 +37,7 @@ def _installed_default_bridge_config() -> BridgeConfig:
     return BridgeConfig(
         sidebar=SidebarConfig(
             inbox_cwd=str(_DEFAULT_CONFIG_HOME),
-            readable_preview_enabled=False,
+            readable_preview_enabled=True,
         )
     )
 
@@ -209,7 +209,7 @@ _SIDEBAR_DEFAULTS = {
     "lease_seconds": 300,
     "max_attempts": 5,
     "heartbeat_grace_seconds": 120,
-    "readable_preview_enabled": False,
+    "readable_preview_enabled": True,
     "legacy_hydration_enabled": False,
     "preview_budget_chars": 24_000,
 }
@@ -252,7 +252,6 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
         "broker_cwd": None,
         "heartbeat_interval_seconds": 60,
         "oldest_job_alert_seconds": 300,
-        "readable_preview_enabled": True,
     }
     assert not any("SIDEBAR" in name for name in _ENV_NAMES)
 
@@ -485,6 +484,17 @@ def test_sidebar_config_loads_only_from_config_yaml(
 
     assert asdict(config.sidebar) == configured
     assert config.sidebar.heartbeat_stale_seconds == 180
+
+
+@pytest.mark.parametrize("field", ("inbox_cwd", "broker_thread_id", "broker_project_id", "broker_cwd"))
+@pytest.mark.parametrize("unsafe", ("bad\x00value", "bad\x85value", "bad\u2028value", "bad\u2029value"))
+def test_sidebar_broker_configuration_rejects_control_and_unicode_line_separators(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    unsafe: str,
+) -> None:
+    with pytest.raises(ValueError):
+        _load_with_sidebar(monkeypatch, {field: unsafe})
 
 
 def test_desktop_broker_continuous_delivery_requires_exact_identity_and_thresholds(

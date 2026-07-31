@@ -8115,9 +8115,9 @@ class SessionBridgeStore:
                 ),
             ).fetchall()
             oldest = conn.execute(
-                """SELECT MIN(
-                              CASE WHEN state = ? THEN updated_at ELSE eligible_at END
-                          ) AS actionable_at
+                """SELECT MIN(eligible_at) AS eligible_at,
+                          MIN(CASE WHEN state = ? THEN updated_at ELSE eligible_at END)
+                              AS actionable_at
                      FROM session_sidebar_jobs
                     WHERE state IN (?, ?, ?)""",
                 (
@@ -8202,9 +8202,17 @@ class SessionBridgeStore:
         for row in provider_rows:
             if row["provider"] in eligible_by_provider:
                 eligible_by_provider[row["provider"]] = int(row["job_count"])
-        oldest_at = oldest["actionable_at"] if oldest is not None else None
+        oldest_eligible_at = oldest["eligible_at"] if oldest is not None else None
+        oldest_actionable_at = oldest["actionable_at"] if oldest is not None else None
+        oldest_eligible_age = (
+            max(0.0, status_time - float(oldest_eligible_at))
+            if oldest_eligible_at is not None
+            else None
+        )
         oldest_age = (
-            max(0.0, status_time - float(oldest_at)) if oldest_at is not None else None
+            max(0.0, status_time - float(oldest_actionable_at))
+            if oldest_actionable_at is not None
+            else None
         )
         heartbeat = self.get_state("session-bridge:sidebar:broker-heartbeat")
         heartbeat_at = heartbeat.get("at") if isinstance(heartbeat, Mapping) else None
@@ -8298,6 +8306,7 @@ class SessionBridgeStore:
                 "by_resolution_code": resolution_stats["by_resolution_code"],
             },
             "execution_blockers": list(execution_blockers),
+            "oldest_eligible_age_seconds": oldest_eligible_age,
             "oldest_pending_age_seconds": oldest_age,
             "last_heartbeat_at": float(heartbeat_at)
             if heartbeat_at is not None
