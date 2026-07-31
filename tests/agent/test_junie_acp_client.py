@@ -20,6 +20,7 @@ from unittest.mock import patch
 
 import agent.junie_acp_client as junie_mod
 from agent.junie_acp_client import (
+    _DEFAULT_FORWARDED_TOOLS,
     JunieACPClient,
     _HermesClient,
     _build_subprocess_env,
@@ -495,6 +496,31 @@ class ToolBridgeTests(unittest.TestCase):
             self.assertEqual(_resolve_command(), "/opt/junie/bin/junie")
             self.assertEqual(_resolve_args(), ["--acp=true", "--quiet"])
 
+    def test_registered_defaults_do_not_disable_the_bridge(self) -> None:
+        """The schema block in config_defaults.py must not change behavior.
+
+        Registering ``junie_acp.*`` so ``hermes config set`` recognizes the path
+        means an unconfigured user gets every key back as an empty placeholder.
+        Read literally, ``forwarded_tools: []`` would disable the tool bridge —
+        the exact defect this provider was reviewed for — and ``args: []`` would
+        launch Junie without ``--acp=true``. Empty means unset.
+        """
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        defaults = DEFAULT_CONFIG.get("junie_acp")
+        self.assertIsInstance(defaults, dict, "junie_acp must stay registered")
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"junie_acp": dict(defaults)},
+        ):
+            self.assertEqual(
+                _resolve_forwarded_tools(), frozenset(_DEFAULT_FORWARDED_TOOLS)
+            )
+            self.assertEqual(_resolve_args()[:2], ["--acp=true", "--skip-update-check"])
+            self.assertEqual(_resolve_command(), "junie")
+            self.assertEqual(_resolve_permission_policy(), "deny")
+            self.assertIsNone(_resolve_brave_override())
+
     def test_env_bridge_wins_over_config(self) -> None:
         # The env names stay as an internal bridge for a one-off run: narrower
         # scope wins, but config.yaml is the documented surface.
@@ -560,6 +586,17 @@ class ToolBridgeTests(unittest.TestCase):
              "tool_calls": [{"id": "j1", "type": "function",
                              "function": {"name": "junie_edit", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "j1", "name": "junie_edit", "content": "1 file changed"},
+        ]
+        self.assertEqual(_trailing_tool_results(msgs), [])
+
+    def test_reloaded_session_keeps_the_projection_marker(self) -> None:
+        # A session restored from the DB carries the tool name under
+        # ``tool_name`` rather than ``name`` (hermes_state), so the filter must
+        # recognise both spellings.
+        msgs = [
+            {"role": "user", "content": "q"},
+            {"role": "tool", "tool_call_id": "j1", "tool_name": "junie_execute",
+             "content": "tests passed"},
         ]
         self.assertEqual(_trailing_tool_results(msgs), [])
 

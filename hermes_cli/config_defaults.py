@@ -746,6 +746,27 @@ DEFAULT_CONFIG = {
     #
     # Each aux task is independent — main-agent provider_routing and
     # openrouter.min_coding_score do NOT propagate to aux calls by design.
+    # JetBrains Junie ACP provider (model.provider: "junie-acp"). Behavioral
+    # settings only — the Junie token stays in .env as JUNIE_API_KEY because it
+    # is a credential. Values are intentionally left empty: agent/junie_acp_client.py
+    # owns the defaults so they cannot drift, and these entries exist so
+    # `hermes config set junie_acp.<key>` recognizes the path.
+    "junie_acp": {
+        # Path to the Junie CLI when it is not on PATH.
+        "command": "",
+        # Launch args; empty => ["--acp=true", "--skip-update-check"].
+        "args": [],
+        # How Hermes answers Junie's permission prompts: "deny" (safe) | "allow".
+        # Empty => "deny".
+        "permission": "",
+        # Force Junie's Brave Mode; null => leave Junie's own setting alone.
+        "brave_mode": None,
+        # Hermes tools described to Junie: "all" | "none" | list of names.
+        # Empty => the agent-level set (memory/todo/skills), which is what keeps
+        # the self-improvement loop working without re-offering Junie's own
+        # read/edit/execute capabilities.
+        "forwarded_tools": [],
+    },
     "auxiliary": {
         # Same-provider retries for a transient transport blip (connection
         # reset / timeout / 5xx / 408) on ANY auxiliary call before falling

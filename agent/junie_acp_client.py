@@ -248,7 +248,16 @@ def _junie_config() -> dict[str, Any]:
         block = load_config_readonly().get("junie_acp")
     except Exception:
         return {}
-    return block if isinstance(block, dict) else {}
+    if not isinstance(block, dict):
+        return {}
+    # The block is registered in hermes_cli/config_defaults.py so
+    # `hermes config set junie_acp.<key>` recognizes the path, which means an
+    # unconfigured user still gets every key back as an empty placeholder. Drop
+    # those: empty means "not set", and the defaults stay in this module. Read
+    # literally, an empty `forwarded_tools` would disable the tool bridge and an
+    # empty `args` would launch Junie without --acp=true. Use the explicit
+    # "none" keyword to forward nothing.
+    return {k: v for k, v in block.items() if v not in (None, "", [], (), {})}
 
 
 def _resolve_permission_policy() -> str:
@@ -478,7 +487,14 @@ def _trailing_tool_results(messages: list[dict[str, Any]]) -> list[dict[str, Any
         # "here are your tool results" about work it already did itself. They are
         # identified by the namespaced tool name rather than a private message
         # key, so nothing non-standard ends up on the wire for strict providers.
-        if str(message.get("name") or "").startswith(_PROJECTED_TOOL_PREFIX):
+        # A session reloaded from the DB carries the name under ``tool_name``
+        # (hermes_state.get_messages_as_conversation), so check both spellings.
+        # Even if neither survives, _answers_last_request still blocks reuse: a
+        # fresh client is owed no call ids.
+        if any(
+            str(message.get(key) or "").startswith(_PROJECTED_TOOL_PREFIX)
+            for key in ("name", "tool_name")
+        ):
             continue
         trailing.append(message)
     trailing.reverse()
