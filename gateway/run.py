@@ -18324,6 +18324,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and hasattr(adapter, "is_in_voice_channel")
                     and adapter.is_in_voice_channel(guild_id)):
                 await adapter.play_in_voice_channel(guild_id, actual_path)
+            elif (
+                event.source.platform == Platform.DISCORD
+                and adapter
+                and callable(discord_play_tts := getattr(adapter, "play_tts", None))
+            ):
+                # Internal completion/watch events are synthetic and have no
+                # raw Discord message, so _get_guild_id(event) returns None even
+                # while the adapter still has a live text-channel -> VC binding.
+                # Let DiscordAdapter.play_tts() resolve that binding by chat_id
+                # before it falls back to a native audio attachment.
+                reply_anchor = self._reply_anchor_for_event(event)
+                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+                if thread_meta is not None:
+                    thread_meta = dict(thread_meta)
+                    thread_meta["notify"] = True
+                else:
+                    thread_meta = {"notify": True}
+                await cast(Any, discord_play_tts)(
+                    chat_id=event.source.chat_id,
+                    audio_path=actual_path,
+                    reply_to=reply_anchor,
+                    metadata=thread_meta,
+                )
             elif adapter and hasattr(adapter, "send_voice"):
                 reply_anchor = self._reply_anchor_for_event(event)
                 thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)

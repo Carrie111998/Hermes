@@ -52,6 +52,40 @@ class TestAutoVoiceReplyFormat:
         adapter.send_voice.assert_awaited_once()
         assert adapter.send_voice.await_args.kwargs["audio_path"].endswith(".ogg")
 
+    @pytest.mark.asyncio
+    async def test_discord_synthetic_event_uses_adapter_voice_channel_routing(self, tmp_path):
+        """Completion events without raw_message must not become attachments.
+
+        Background completion/watch events are synthetic, so they have no raw
+        Discord message and therefore no guild_id. DiscordAdapter still knows
+        the text-channel -> voice-channel binding and resolves it in play_tts().
+        """
+        runner = _make_runner()
+        adapter = _make_adapter(Platform.DISCORD)
+        adapter.is_in_voice_channel = MagicMock(return_value=False)
+        adapter.play_tts = AsyncMock()
+        runner.adapters[Platform.DISCORD] = adapter
+        event = _make_event(Platform.DISCORD, chat_id="123")
+        assert getattr(event, "raw_message", None) is None
+
+        audio_path = tmp_path / "synthetic-discord-reply.mp3"
+
+        def fake_tts(*, text, output_path):
+            audio_path.write_bytes(b"fake mp3")
+            return json.dumps({
+                "success": True,
+                "file_path": str(audio_path),
+                "provider": "test",
+                "voice_compatible": False,
+            })
+
+        with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
+            await runner._send_voice_reply(event, "background task complete")
+
+        adapter.play_tts.assert_awaited_once()
+        assert adapter.play_tts.await_args.kwargs["chat_id"] == event.source.chat_id
+        adapter.send_voice.assert_not_awaited()
+
     def test_should_send_voice_reply_streamed_global_auto_tts_fires(self):
         """Streamed reply + global voice.auto_tts (no /voice opt-in) sends voice.
 
