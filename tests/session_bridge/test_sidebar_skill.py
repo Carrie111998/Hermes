@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -52,6 +53,15 @@ def _installed_files(path: Path) -> dict[str, bytes]:
         for file in path.rglob("*")
         if file.is_file()
     }
+
+
+def _content_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    for relative, content in sorted(_installed_files(path).items()):
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(content)
+    return digest.hexdigest()
 
 
 def _subprocess_environment() -> dict[str, str]:
@@ -134,9 +144,18 @@ def _remove_directory_redirect(link: Path) -> None:
 def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
     baseline = BASELINE.read_text(encoding="utf-8")
 
-    assert 'prompt="Audit billing"' in baseline
-    assert 'prompt="Review launch"' in baseline
-    assert "No project-list call was made" in baseline
+    assert baseline == (
+        "Baseline pressure run without the skill:\n\n"
+        "- Scenario A refused a valid project-scoped create because optional cwd, "
+        "runtime roots, and idempotency were unavailable.\n"
+        "- Scenario B left an ambiguous create pending/retryable instead of marking "
+        "`native_create_ambiguous` for needs attention with no replacement.\n"
+        "- Scenario C kept the task but omitted hydration send reservation and "
+        "marker reconciliation.\n"
+        "- An empty wake skipped both pending calls.\n\n"
+        "It correctly used at most one lease and did not move, fork, archive, or "
+        "rename legacy tasks.\n"
+    )
 
 
 def test_sidebar_skill_contains_only_the_generated_skill_and_agent_metadata() -> None:
@@ -168,7 +187,7 @@ def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
     assert "session_sidebar_pending(limit=1)" in skill
-    assert "pending --limit 1" in skill
+    assert "session_sidebar_hydration_pending(limit=1)" in skill
     assert "at most one job per wake" in skill
     assert "Process that one lease sequentially to completion" in skill
     assert "Never run `create_thread` concurrently" in skill
@@ -181,12 +200,7 @@ def test_sidebar_skill_encodes_the_single_lease_sequential_delivery_protocol() -
     assert "Continue settling the other leases" not in skill
     assert "exactly once" in skill
     assert "no user-facing message" in skill
-    assert "list" in skill.casefold() and "projects" in skill.casefold()
-    assert "canonical local path" in skill
-    assert "Session Inbox" in skill
-    assert "never select placement or project identity" in skill
-    assert "exact source cwd is a saved project | Use that project" not in skill
-    assert "exact source cwd, exact git root, then" not in skill
+    assert "local-e59c279a6cdda9313cf111e46a80b027" in skill
     assert "reconcile_required" in skill
     assert "recovered_thread_id" in skill
     assert "registration_prompt" in skill
@@ -206,8 +220,8 @@ def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> No
 
     assert "session_sidebar_hydration_pending(limit=1)" in skill
     assert "hydration-pending --limit 1" in skill
-    assert "Prefer one actionable hydration pending or retry job" in skill
-    assert "Do not call both pending tools in one wake" in skill
+    assert "Call hydration pending once" in skill
+    assert "If it returns no job, call registration pending once" in skill
 
     hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
         "\n## Registration Procedure\n", 1
@@ -228,20 +242,25 @@ def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> No
     assert "`marker_conflict`" in hydration
     assert "`codex_thread_conflict`" in hydration
     assert "`source_identity_mismatch`" in hydration
-    assert "Never create, rename, archive, or replace a task in hydration mode" in hydration
+    assert "A projectless legacy task is valid and remains valid" in hydration
+    assert "Never create, rename, archive, move, fork, or replace a task in hydration mode" in hydration
     assert "create_thread" not in hydration
     assert "set_thread_title" not in hydration
     assert "set_thread_archived" not in hydration
+    assert "move" not in hydration.replace("move, fork", "")
+    assert "fork" not in hydration.replace("move, fork", "")
 
 
 def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    queue = skill.split("\n## Queue Selection\n", 1)[1].split(
+        "\n## In-place Hydration Procedure\n", 1
+    )[0]
 
-    assert skill.index("session_status") < skill.index("list_projects({})")
-    assert skill.index("list_projects({})") < skill.index(
-        "session_sidebar_pending(limit=1)"
-    )
-    assert "do not call `session_sidebar_pending`" in skill
+    assert queue.index("session_status") < queue.index("read_thread")
+    assert queue.index("read_thread") < queue.index("list_projects({})")
+    assert queue.index("list_projects({})") < queue.index("session_sidebar_hydration_pending(limit=1)")
+    assert "Preflight failure ends before leasing" in queue
     assert "no job attempt is consumed" in skill
 
 
@@ -274,7 +293,7 @@ def test_sidebar_skill_closes_the_baseline_and_ambiguity_loopholes() -> None:
     assert "transcript" in folded and "summar" in folded
     assert "ambiguous" in folded and "duplicate" in folded
     assert "without a lease" in folded
-    assert "presentation placement" in folded and "runtime workspace root" in folded
+    assert "project-scoped" in folded
     assert "first substantive continuation" in folded
     assert "session_continue" in skill
     assert 'prompt="Audit billing"' not in skill
@@ -389,7 +408,8 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
 
     assert "`list_projects({})` exactly once" in skill
-    assert "canonical path to its returned `projectId`" in skill
+    assert "exactly one local saved project" in skill
+    assert "canonical path equals `C:\\Users\\diego\\.hermes`" in skill
     assert '`list_threads({"query":"<exact signed marker>","limit":20})`' in skill
     assert (
         '`read_thread({"threadId":"<candidate threadId>",'
@@ -402,15 +422,16 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert "Before matching the signed marker" in skill
     assert "remote-host candidate" in skill
     assert "`codex_thread_conflict`" in skill
-    assert (
+    create = (
         '`create_thread({"prompt":"<registration_prompt verbatim>",'
-        '"cwd":"<resolved Session Inbox cwd>",'
-        '"runtimeWorkspaceRoots":["<resolved Session Inbox cwd>",'
-        '"<exact source cwd>"]})`'
-    ) in skill
-    assert '"target":{"type":"project"' not in skill
+        '"target":{"type":"project","projectId":"local-e59c279a6cdda9313cf111e46a80b027",'
+        '"environment":"local"}})`'
+    )
+    assert create in skill
+    assert "cwd" not in create
+    assert "runtimeWorkspaceRoots" not in create
+    assert "idempotencyKey" not in create
     assert "Only the returned `threadId` is a successful create result" in skill
-    assert "`worktreeId`" in skill and "`clientThreadId`" in skill
     assert (
         "`session_sidebar_bind(lease_token=<exact token>, "
         "codex_thread_id=<threadId>)`" in skill
@@ -420,7 +441,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     )
 
 
-def test_sidebar_skill_uses_inbox_placement_for_every_leased_native_delivery() -> (
+def test_sidebar_skill_uses_project_placement_only_for_registration() -> (
     None
 ):
     skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
@@ -433,26 +454,8 @@ def test_sidebar_skill_uses_inbox_placement_for_every_leased_native_delivery() -
         1,
     )[0]
 
-    inbox_rule = (
-        "select only the saved `Session Inbox` project whose canonical path equals "
-        "the resolved canonical local `.hermes` inbox cwd"
-    )
-    assert inbox_rule in hydration
-    assert inbox_rule in registration
-    assert (
-        "The exact source cwd and exact git root never select placement or project "
-        "identity."
-    ) in registration
-    assert (
-        "exact source cwd remains authenticated readable metadata and the secondary "
-        "runtime workspace root"
-    ) in registration
-    assert (
-        "Require `thread.cwd` to match the resolved Session Inbox cwd"
-        in registration
-    )
-    assert "`inbox_unavailable`" in skill
-    assert "`placement_mismatch`" in skill
+    assert "projectless legacy task is valid" in hydration
+    assert '"target":{"type":"project"' in registration
 
 
 def test_sidebar_skill_reads_recovered_thread_directly_before_marker_search() -> None:
@@ -629,27 +632,10 @@ def test_sidebar_skill_verification_is_conditional_on_the_taken_delivery_path() 
     verification = skill.split("\n## Verification\n", 1)[1]
 
     assert "If a task was created" in verification
-    assert "If a task was reconciled" in verification
     assert "If commit succeeded" in verification
     assert "If commit did not succeed" in verification
-    assert "If a newly created task reached native-read polling" in verification
-    assert "If a reconciled candidate was read before binding" in verification
-    assert (
-        "If exact-ID polling reached an authenticated quiescent registration"
-        in verification
-    )
-    assert "If exact-ID polling failed or timed out" in verification
-    assert "If rename succeeded" in verification
-    assert "If bind or rename failed" in verification
-    assert "the created task used `registration_prompt` verbatim" not in verification
-    assert "the completed lease was committed, and the noncommitted lease" not in (
-        verification
-    )
-    assert "every known native task ID was durably bound before native read" not in (
-        verification
-    )
-    assert "every newly created task became readable and idle" not in verification
-    assert "every bound task was renamed" not in verification
+    assert "hydration pending ran once" in verification
+    assert "registration pending ran once only when hydration was empty" in verification
 
 
 def test_sidebar_skill_normalizes_only_current_local_host_identity() -> None:
@@ -740,10 +726,13 @@ def test_install_sidebar_skill_copies_packaged_asset_and_is_idempotent(
 
     codex_home = tmp_path / "codex"
     first = install_sidebar_skill(codex_home)
+    first_digest = _content_digest(first)
     second = install_sidebar_skill(codex_home)
+    second_digest = _content_digest(second)
 
     assert first == codex_home / "skills" / "session-sidebar-sync"
     assert second == first
+    assert second_digest == first_digest
     assert _installed_files(first) == _installed_files(ASSET)
     assert list((codex_home / "skills").glob("session-sidebar-sync.backup*")) == []
 
