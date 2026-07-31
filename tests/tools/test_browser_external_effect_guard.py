@@ -1,14 +1,71 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import secrets
 
 from hermes_cli import kanban_db as kb
+from proactive.loop_contract import contract_fingerprint
 from tools import browser_camofox
 from tools import browser_supervisor
 from tools import browser_tool
 
 
-def _execution_task(conn, body="GRACE_LOOP_CONTRACT_STAGE: execution"):
+def _execution_task(
+    conn,
+    body="GRACE_LOOP_CONTRACT_STAGE: execution",
+    *,
+    bind_approval=True,
+):
+    approval_record = None
+    contract = kb._grace_compiled_contract(body)
+    if (
+        bind_approval
+        and isinstance(contract, dict)
+        and contract.get("external_targets")
+    ):
+        contract = json.loads(json.dumps(contract))
+        contract.pop("authorization", None)
+        token = secrets.token_hex(8)
+        request_id = "request-" + secrets.token_hex(8)
+        user_hash = "a" * 64
+        original_request = "test approved Facebook group action"
+        fingerprint = contract_fingerprint({
+            **contract,
+            "original_request": original_request,
+        })
+        contract["approval_provenance"] = {
+            "source": "one_time_authenticated_owner_challenge",
+            "scope_binding": "exact_loop_contract_fingerprint",
+            "internal": False,
+            "platform": "telegram",
+            "requested_message_id": "request-message",
+            "approved_message_id": "approval-message",
+            "user_id_sha256": user_hash,
+            "challenge_token_sha256": hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest(),
+            "contract_fingerprint": fingerprint,
+        }
+        contract["audit"] = {
+            "original_request_location": (
+                "Grace session history only; not disclosed to ClawOps"
+            ),
+            "original_request_sha256": hashlib.sha256(
+                original_request.encode("utf-8")
+            ).hexdigest(),
+        }
+        body = (
+            "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+            f"```json\n{json.dumps(contract, ensure_ascii=False)}\n```"
+        )
+        approval_record = {
+            "token": token,
+            "request_id": request_id,
+            "user_hash": user_hash,
+            "fingerprint": fingerprint,
+            "original_request": original_request,
+        }
     task_id = kb.create_task(
         conn,
         title="protected external draft",
@@ -17,6 +74,54 @@ def _execution_task(conn, body="GRACE_LOOP_CONTRACT_STAGE: execution"):
     )
     run = kb.claim_task(conn, task_id)
     assert run is not None
+    if approval_record is not None:
+        conn.execute(
+            """
+            INSERT INTO grace_approval_challenges (
+                token, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                user_id_sha256, requested_message_id, action_summary,
+                approval_platform, approval_scope, delegation_args,
+                state, created_at, expires_at, consumed_at,
+                approved_message_id
+            ) VALUES (?, ?, ?, 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, 'request-message',
+                      'test action', 'Facebook', '[]', ?, 'consumed',
+                      1, 2, 2, 'approval-message')
+            """,
+            (
+                approval_record["token"],
+                approval_record["fingerprint"],
+                approval_record["request_id"],
+                approval_record["user_hash"],
+                json.dumps({
+                    "original_request": approval_record["original_request"],
+                }),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                challenge_token, platform, chat_id, thread_id, session_key,
+                session_id, user_id_sha256, approved_message_id,
+                resolved_route, approval_required, state, execution_task_id,
+                review_task_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, 'approval-message',
+                      '{"task_type":"browser_publish"}', 1, 'queued', ?,
+                      'review-1', 1, 1)
+            """,
+            (
+                "gd-" + approval_record["token"],
+                approval_record["fingerprint"],
+                approval_record["request_id"],
+                approval_record["token"],
+                approval_record["user_hash"],
+                task_id,
+            ),
+        )
+        conn.commit()
     return task_id, run
 
 
@@ -769,6 +874,136 @@ def test_lowercase_group_targets_and_browser_publish_authority_are_accepted():
         "1703088130054399",
     })
     assert kb.grace_allows_facebook_group_posting(body) is True
+
+
+def test_compiler_display_targets_require_consumed_challenge(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    token = "challenge-token"
+    user_hash = "a" * 64
+    original_request = "publish to the two approved groups"
+    contract = {
+        "approval_provenance": {
+            "source": "one_time_authenticated_owner_challenge",
+            "scope_binding": "exact_loop_contract_fingerprint",
+            "internal": False,
+            "platform": "telegram",
+            "requested_message_id": "2391",
+            "approved_message_id": "2395",
+            "user_id_sha256": user_hash,
+            "challenge_token_sha256": hashlib.sha256(
+                token.encode("utf-8")
+            ).hexdigest(),
+        },
+        "external_targets": [
+            "Facebook Group 897927458651235「大台灣二手家具家電交流*"
+            "免費贈送＆民眾/店家買賣」"
+            "https://www.facebook.com/groups/897927458651235/",
+            "Facebook Group 1466446866915040「二手｜液晶電視 中古 家電"
+            " 買賣交流 社團」"
+            "https://www.facebook.com/groups/1466446866915040/",
+        ],
+        "routing": {"task_type": "browser_publish"},
+    }
+    fingerprint = contract_fingerprint({
+        **contract,
+        "original_request": original_request,
+    })
+    contract["approval_provenance"]["contract_fingerprint"] = fingerprint
+    contract["audit"] = {
+        "original_request_location": (
+            "Grace session history only; not disclosed to ClawOps"
+        ),
+        "original_request_sha256": hashlib.sha256(
+            original_request.encode("utf-8")
+        ).hexdigest(),
+    }
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        f"```json\n{json.dumps(contract, ensure_ascii=False)}\n```"
+    )
+    with kb.connect_closing(db_path) as conn:
+        task_id, _ = _execution_task(
+            conn,
+            body=body,
+            bind_approval=False,
+        )
+        conn.execute(
+            """
+            INSERT INTO grace_approval_challenges (
+                token, contract_fingerprint, request_instance_id,
+                platform, chat_id, thread_id, session_key, session_id,
+                user_id_sha256, requested_message_id, action_summary,
+                approval_platform, approval_scope, delegation_args,
+                state, created_at, expires_at, consumed_at,
+                approved_message_id
+            ) VALUES (?, ?, 'request-1', 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, '2391', 'publish',
+                      'Facebook', '[]', ?, 'consumed', 1, 2, 2, '2395')
+            """,
+            (
+                token,
+                fingerprint,
+                user_hash,
+                json.dumps({"original_request": original_request}),
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO grace_delegations (
+                delegation_id, contract_fingerprint, request_instance_id,
+                challenge_token, platform, chat_id, thread_id, session_key,
+                session_id, user_id_sha256, approved_message_id,
+                resolved_route, approval_required, state, execution_task_id,
+                review_task_id, created_at, updated_at
+            ) VALUES ('gd-1', ?, 'request-1', ?, 'telegram', 'chat-1', '2',
+                      'session-key', 'session-id', ?, '2395',
+                      '{"task_type":"browser_publish"}', 1, 'queued', ?,
+                      'review-1', 1, 1)
+            """,
+            (fingerprint, token, user_hash, task_id),
+        )
+        conn.commit()
+        assert kb.grace_external_group_ids(body) == frozenset({
+            "897927458651235",
+            "1466446866915040",
+        })
+        assert kb.grace_allows_facebook_group_posting(body) is False
+        assert kb.grace_task_allows_facebook_group_posting(
+            conn,
+            task_id,
+        ) is True
+
+
+def test_compiler_display_group_target_rejects_mismatched_url_id():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"external_targets":['
+        '"Facebook Group 897927458651235「大台灣二手家具家電交流」'
+        'https://www.facebook.com/groups/1466446866915040/"]}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset()
+
+
+def test_group_posting_rejects_incomplete_challenge_proof():
+    body = (
+        "GRACE_LOOP_CONTRACT_STAGE: execution\n"
+        '```json\n{"approval_provenance":{'
+        '"source":"one_time_authenticated_owner_challenge",'
+        '"scope_binding":"exact_loop_contract_fingerprint",'
+        '"internal":false,"platform":"telegram",'
+        '"requested_message_id":"2391","approved_message_id":"2395",'
+        f'"user_id_sha256":"{"a" * 64}",'
+        f'"challenge_token_sha256":"{"b" * 64}"'
+        '},"external_targets":["Facebook Group 897927458651235"],'
+        '"routing":{"task_type":"browser_publish"}}\n```'
+    )
+
+    assert kb.grace_external_group_ids(body) == frozenset({
+        "897927458651235",
+    })
+    assert kb.grace_allows_facebook_group_posting(body) is False
 
 
 def test_group_post_reservation_is_one_shot(tmp_path):

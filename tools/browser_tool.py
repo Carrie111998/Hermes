@@ -3095,8 +3095,13 @@ def _run_atomic_ref_action(
     ):
         try:
             with _kanban_db.connect_closing() as scope_conn:
-                task = _kanban_db.get_task(scope_conn, kanban_task_id)
-            body = task.body if task is not None else ""
+                (
+                    allowed_group_ids,
+                    group_posting_allowed,
+                ) = _kanban_db.grace_task_facebook_group_permissions(
+                    scope_conn,
+                    kanban_task_id,
+                )
         except Exception as exc:
             return json.dumps({
                 "success": False,
@@ -3105,10 +3110,6 @@ def _run_atomic_ref_action(
                     f"{type(exc).__name__}: {exc}"
                 ),
             }, ensure_ascii=False)
-        allowed_group_ids = _kanban_db.grace_external_group_ids(body)
-        group_posting_allowed = (
-            _kanban_db.grace_allows_facebook_group_posting(body)
-        )
         group_id = group_match.group(1)
         if group_id not in allowed_group_ids:
             return json.dumps({

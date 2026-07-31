@@ -329,7 +329,10 @@ _EXTERNAL_CREATE_HOSTS = {
     }),
 }
 _FACEBOOK_GROUP_TARGET_RE = re.compile(
-    r"Facebook Group ([0-9]+)(?:（[^）]+）)?",
+    r"Facebook Group (?P<group_id>[0-9]+)"
+    r"(?:(?:（[^）]+）)|(?:「[^」]+」))?"
+    r"(?:https://(?:www\.)?facebook\.com/groups/"
+    r"(?P<url_group_id>[0-9]+)/?)?",
     flags=re.IGNORECASE,
 )
 
@@ -368,33 +371,172 @@ def grace_external_group_ids(body: str) -> frozenset[str]:
         normalized = str(target or "").strip()
         match = _FACEBOOK_GROUP_TARGET_RE.fullmatch(normalized)
         if match is not None:
-            group_ids.add(match.group(1))
+            group_id = match.group("group_id")
+            url_group_id = match.group("url_group_id")
+            if url_group_id is not None and url_group_id != group_id:
+                return frozenset()
+            group_ids.add(group_id)
         elif normalized.casefold().startswith("facebook group"):
             return frozenset()
     return frozenset(group_ids)
 
 
-def grace_allows_facebook_group_posting(body: str) -> bool:
-    """Return whether the compiled execution contract authorizes group posts."""
-    if _grace_loop_stage_header(str(body or "")) != "execution":
-        return False
-    contract = _grace_compiled_contract(body)
-    if contract is None or not grace_external_group_ids(body):
-        return False
+def _grace_contract_has_legacy_human_approval(
+    contract: Mapping[str, Any],
+) -> bool:
+    """Recognize the legacy compiler-injected risk authorization."""
     authorization = contract.get("authorization")
+    return bool(
+        isinstance(authorization, Mapping)
+        and authorization.get("human_approved") is True
+    )
+
+
+def _grace_contract_is_browser_publish(
+    contract: Mapping[str, Any],
+) -> bool:
     routing = contract.get("routing")
-    if not isinstance(authorization, Mapping) or not isinstance(routing, Mapping):
+    if not isinstance(routing, Mapping):
         return False
     resolved = routing.get("resolved")
     resolved_task_type = (
         resolved.get("task_type") if isinstance(resolved, Mapping) else None
     )
+    return str(
+        routing.get("task_type") or resolved_task_type or ""
+    ).strip().casefold() == "browser_publish"
+
+
+def grace_allows_facebook_group_posting(body: str) -> bool:
+    """Return legacy body-only group-post authorization."""
+    if _grace_loop_stage_header(str(body or "")) != "execution":
+        return False
+    contract = _grace_compiled_contract(body)
+    if contract is None or not grace_external_group_ids(body):
+        return False
     return (
-        authorization.get("human_approved") is True
-        and str(
-            routing.get("task_type") or resolved_task_type or ""
-        ).strip().casefold() == "browser_publish"
+        _grace_contract_has_legacy_human_approval(contract)
+        and _grace_contract_is_browser_publish(contract)
     )
+
+
+def grace_task_facebook_group_permissions(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> tuple[frozenset[str], bool]:
+    """Return challenge-bound group targets and group-post authority."""
+    task = conn.execute(
+        "SELECT body FROM tasks WHERE id = ?",
+        (str(task_id or "").strip(),),
+    ).fetchone()
+    if task is None:
+        return frozenset(), False
+    body = str(task["body"] or "")
+    if _grace_loop_stage_header(body) != "execution":
+        return frozenset(), False
+    contract = _grace_compiled_contract(body)
+    group_ids = grace_external_group_ids(body)
+    if contract is None or not group_ids:
+        return frozenset(), False
+    provenance = contract.get("approval_provenance")
+    if not isinstance(provenance, Mapping):
+        return frozenset(), False
+    try:
+        from proactive.loop_contract import contract_fingerprint
+    except (ImportError, TypeError, ValueError):
+        return frozenset(), False
+    rows = conn.execute(
+        """
+        SELECT d.challenge_token, d.contract_fingerprint,
+               d.platform, d.user_id_sha256, d.approved_message_id,
+               a.requested_message_id, a.delegation_args
+          FROM grace_delegations AS d
+          JOIN grace_approval_challenges AS a
+            ON a.token = d.challenge_token
+         WHERE d.execution_task_id = ?
+           AND d.approval_required = 1
+           AND d.state = 'queued'
+           AND a.state = 'consumed'
+           AND a.consumed_at IS NOT NULL
+           AND d.contract_fingerprint = a.contract_fingerprint
+           AND d.request_instance_id = a.request_instance_id
+           AND d.platform = a.platform
+           AND d.chat_id = a.chat_id
+           AND d.thread_id = a.thread_id
+           AND d.session_key = a.session_key
+           AND d.session_id = a.session_id
+           AND d.user_id_sha256 = a.user_id_sha256
+           AND d.approved_message_id = a.approved_message_id
+        """,
+        (str(task_id or "").strip(),),
+    ).fetchall()
+    if len(rows) != 1:
+        return frozenset(), False
+    approval = rows[0]
+    try:
+        delegation_args = json.loads(
+            str(approval["delegation_args"] or "")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return frozenset(), False
+    if not isinstance(delegation_args, Mapping):
+        return frozenset(), False
+    original_request = str(
+        delegation_args.get("original_request") or ""
+    )
+    audit = contract.get("audit")
+    if (
+        not isinstance(audit, Mapping)
+        or audit.get("original_request_location")
+        != "Grace session history only; not disclosed to ClawOps"
+        or audit.get("original_request_sha256")
+        != hashlib.sha256(original_request.encode("utf-8")).hexdigest()
+    ):
+        return frozenset(), False
+    fingerprint_contract = json.loads(json.dumps(dict(contract)))
+    fingerprint_contract.pop("audit", None)
+    fingerprint_contract.pop("authorization", None)
+    fingerprint_contract["original_request"] = original_request
+    # contract_fingerprint removes all approval_provenance before hashing,
+    # including its embedded copy of the expected digest.
+    compiled_fingerprint = contract_fingerprint(fingerprint_contract)
+    approval_valid = (
+        provenance.get("source")
+        == "one_time_authenticated_owner_challenge"
+        and provenance.get("scope_binding")
+        == "exact_loop_contract_fingerprint"
+        and provenance.get("internal") is False
+        and str(provenance.get("platform") or "")
+        == str(approval["platform"] or "")
+        and str(provenance.get("requested_message_id") or "")
+        == str(approval["requested_message_id"] or "")
+        and str(provenance.get("approved_message_id") or "")
+        == str(approval["approved_message_id"] or "")
+        and str(provenance.get("user_id_sha256") or "")
+        == str(approval["user_id_sha256"] or "")
+        and str(provenance.get("contract_fingerprint") or "")
+        == compiled_fingerprint
+        == str(approval["contract_fingerprint"] or "")
+        and str(provenance.get("challenge_token_sha256") or "")
+        == hashlib.sha256(
+            str(approval["challenge_token"] or "").encode("utf-8")
+        ).hexdigest()
+    )
+    if not approval_valid:
+        return frozenset(), False
+    return group_ids, _grace_contract_is_browser_publish(contract)
+
+
+def grace_task_allows_facebook_group_posting(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether the task has DB-bound group-post authority."""
+    _, posting_allowed = grace_task_facebook_group_permissions(
+        conn,
+        task_id,
+    )
+    return posting_allowed
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -4006,7 +4148,11 @@ def reserve_external_group_join(
                 "Facebook group join blocked: caller is not the active "
                 "worker run."
             )
-        if normalized_group_id not in grace_external_group_ids(task["body"]):
+        allowed_group_ids, _ = grace_task_facebook_group_permissions(
+            conn,
+            task_id,
+        )
+        if normalized_group_id not in allowed_group_ids:
             return (
                 "Facebook group join blocked: target is not in the current "
                 "compiled Loop Contract."
@@ -4143,10 +4289,10 @@ def reserve_external_group_post(
                 "Facebook group post blocked: caller is not the active "
                 "worker run."
             )
-        if (
-            normalized_group_id not in grace_external_group_ids(task["body"])
-            or not grace_allows_facebook_group_posting(task["body"])
-        ):
+        allowed_group_ids, posting_allowed = (
+            grace_task_facebook_group_permissions(conn, task_id)
+        )
+        if normalized_group_id not in allowed_group_ids or not posting_allowed:
             return (
                 "Facebook group post blocked: target or browser_publish "
                 "authority is absent from the compiled Loop Contract."
