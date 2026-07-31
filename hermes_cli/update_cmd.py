@@ -3083,8 +3083,23 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
+    def _real_dirty():
+        out = subprocess.run(
+            probe + ["diff", "-z", "--ignore-cr-at-eol", "--numstat"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+        if out.returncode != 0:
+            return None
+        # Whitespace-ignore flags are inert under ``--name-only`` (every
+        # differing path is listed regardless), so the set of files that
+        # still differ after ignoring CRLF-at-EOL is read from ``--numstat``
+        # records, which drop files whose only change is CRLF-at-EOL.
+        return {t.split("\t", 2)[2] for t in out.stdout.split("\0") if "\t" in t}
+
     def _eol_only():
-        all_dirty, real_dirty = _dirty(), _dirty("--ignore-cr-at-eol")
+        all_dirty, real_dirty = _dirty(), _real_dirty()
         if all_dirty is None or real_dirty is None:
             return None
         return all_dirty - real_dirty
