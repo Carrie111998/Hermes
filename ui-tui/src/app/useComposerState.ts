@@ -16,6 +16,14 @@ import { useQueue } from '../hooks/useQueue.js'
 import { isUsableClipboardText, readClipboardText } from '../lib/clipboard.js'
 import { resolveEditor } from '../lib/editor.js'
 import { readOsc52Clipboard } from '../lib/osc52.js'
+import {
+  clipboardImageFingerprint,
+  createQuietClipboardProbeState,
+  noteQuietClipboardAttach,
+  noteQuietClipboardProbe,
+  shouldAttachQuietClipboardImage,
+  shouldQuietClipboardProbe
+} from '../lib/quietClipboardProbe.js'
 import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 
@@ -198,6 +206,11 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     [setComposerTokens]
   )
 
+  // Empty-bracketed-paste storms (#75150): mouse/focus fragments can look like
+  // empty pastes and re-probe the pasteboard. Quiet probes share this gate;
+  // explicit `/paste` and hotkey paste (quiet=false) always go through.
+  const quietClipboardProbeRef = useRef(createQuietClipboardProbeState())
+
   /**
    * Pull an image off the system clipboard into the composer as a token.
    *
@@ -213,11 +226,30 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         return null
       }
 
+      const now = Date.now()
+      const probeState = quietClipboardProbeRef.current
+
+      if (quiet && !shouldQuietClipboardProbe(probeState, now)) {
+        return null
+      }
+
+      if (quiet) {
+        noteQuietClipboardProbe(probeState, now)
+      }
+
       const r = await gw
         .request<ClipboardPasteResponse & { path?: string }>('clipboard.paste', { session_id: sid })
         .catch(() => null)
 
       if (r?.attached) {
+        const fingerprint = clipboardImageFingerprint(r)
+
+        if (quiet && !shouldAttachQuietClipboardImage(probeState, fingerprint, now)) {
+          return null
+        }
+
+        noteQuietClipboardAttach(probeState, fingerprint, now)
+
         return attachImageToken(r, value, cursor)
       }
 
