@@ -6907,6 +6907,56 @@ function readActiveDesktopProfile() {
   return null
 }
 
+// Read the list of local profiles from the filesystem, independent of any
+// remote/SSH connection. This ensures the Settings UI always shows local
+// profiles even when the primary backend is remote (issue #74092).
+// Returns a shallow profile list (name, is_default, path) — enough for the
+// renderer to render scope chips and identify which profiles exist locally.
+function readLocalProfiles() {
+  const profiles = []
+
+  // Default profile (~/.hermes)
+  if (fs.existsSync(HERMES_HOME)) {
+    profiles.push({
+      name: 'default',
+      is_default: true,
+      has_env: fs.existsSync(path.join(HERMES_HOME, '.env')),
+      model: null,
+      provider: null,
+      skill_count: 0
+    })
+  }
+
+  // Named profiles (~/.hermes/profiles/<name>)
+  const profilesRoot = path.join(HERMES_HOME, 'profiles')
+
+  if (fs.existsSync(profilesRoot)) {
+    const entries = fs.readdirSync(profilesRoot, { withFileTypes: true })
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue
+      }
+
+      if (entry.name === 'default' || !PROFILE_NAME_RE.test(entry.name)) {
+        continue
+      }
+
+      const profilePath = path.join(profilesRoot, entry.name)
+      profiles.push({
+        name: entry.name,
+        is_default: false,
+        has_env: fs.existsSync(path.join(profilePath, '.env')),
+        model: null,
+        provider: null,
+        skill_count: 0
+      })
+    }
+  }
+
+  return { profiles }
+}
+
 function writeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
 
@@ -10154,6 +10204,15 @@ ipcMain.handle('hermes:api', async (_event, request) => {
 
   if (rerouted !== undefined) {
     return rerouted
+  }
+
+  // Always serve the local profile list — the renderer's Settings UI needs to
+  // show LOCAL profiles even when the primary backend routes to a remote/SSH
+  // host (issue #74092). POST/PATCH/DELETE still go through the normal route.
+  const apiMethod = (request.method || 'GET').toUpperCase()
+
+  if (request.path === '/api/profiles' && apiMethod === 'GET' && !request.profile) {
+    return readLocalProfiles()
   }
 
   const tornDownProfile = await prepareProfileDeleteRequest(request)

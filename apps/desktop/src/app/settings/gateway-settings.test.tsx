@@ -23,6 +23,22 @@ const localConnection = {
   remoteUrl: ''
 }
 
+const sshOverrideConnection = {
+  cloudOrg: '',
+  envOverride: false,
+  mode: 'ssh',
+  remoteAuthMode: 'token',
+  remoteOauthConnected: false,
+  remoteTokenPreview: null,
+  remoteTokenSet: false,
+  remoteUrl: '',
+  sshHost: 'remote.example.com',
+  sshUser: 'alice',
+  sshPort: 22,
+  sshKeyPath: '',
+  sshRemoteHermesPath: ''
+}
+
 beforeEach(() => {
   profiles.set([
     {
@@ -74,5 +90,25 @@ describe('GatewaySettings', () => {
     expect(
       screen.queryByText('Start a private Hermes backend on localhost. This is the default and works offline.')
     ).toBeNull()
+  })
+
+  it('shows the default profile chip when it has a connection override', async () => {
+    // Simulate a connection.json with profiles.default SSH override
+    getConnectionConfig.mockImplementation(async (profile: string | null) =>
+      profile === 'default' ? sshOverrideConnection : localConnection
+    )
+
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings />)
+
+    // The "default" chip should appear since the default profile has an SSH override
+    expect(await screen.findByRole('button', { name: 'default' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'All profiles' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'work' })).toBeTruthy()
+
+    // Click the "default" chip to see its SSH connection config
+    fireEvent.click(screen.getByRole('button', { name: 'default' }))
+    await waitFor(() => expect(getConnectionConfig).toHaveBeenLastCalledWith('default'))
   })
 })

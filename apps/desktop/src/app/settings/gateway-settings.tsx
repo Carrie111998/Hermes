@@ -200,11 +200,43 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   // each profile can point at its own backend.
   const [scope, setScope] = useState<null | string>(null)
   const profiles = useStore($profiles)
+  // Does the "default" profile have its own per-profile connection override?
+  // When true, show a "default" scope chip so users can manage it (issue #74092).
+  const [defaultHasOverride, setDefaultHasOverride] = useState(false)
 
   useEffect(() => {
     void refreshActiveProfile()
   }, [])
 
+  useEffect(() => {
+    let cancelled = false
+
+    window.hermesDesktop
+      .getConnectionConfig('default')
+      .then(config => {
+        if (cancelled) {
+          return
+        }
+
+        // An override exists when the mode is NOT 'local' or the config carries
+        // SSH/remote connection details. A clean 'local' config with empty
+        // remote fields means "no override — inherit global".
+        setDefaultHasOverride(
+          config.mode !== 'local' || Boolean(config.sshHost || config.remoteUrl)
+        )
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setDefaultHasOverride(false)
+        }
+      })
+
+    return () => void (cancelled = true)
+  }, [])
+
+  // The 'default' profile uses the global ("All profiles") connection — unless
+  // it has its own per-profile override. When an override exists we surface the
+  // "default" chip so users can manage it through the UI (issue #74092).
   // Auth-mode probe: as the user types a remote URL we ask the gateway (via
   // its public /api/status) whether it gates with OAuth or a static session
   // token, so we can show the right control (login button vs token box).
@@ -367,9 +399,15 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     return providers.length > 0 && providers.every(p => p.supportsPassword)
   }, [probe])
 
-  // The 'default' profile uses the global ("All profiles") connection, so the
-  // per-profile scopes are the named, non-default profiles.
-  const namedProfiles = useMemo(() => profiles.filter(profile => profile.name !== 'default'), [profiles])
+  // The profiles that get their own scope chip. "default" is excluded unless it
+  // has its own per-profile connection override (issue #74092).
+  const namedProfiles = useMemo(
+    () =>
+      defaultHasOverride
+        ? profiles
+        : profiles.filter(profile => profile.name !== 'default'),
+    [profiles, defaultHasOverride]
+  )
 
   useEffect(() => {
     // One-directional: a saved host that isn't in the suggestions must render
