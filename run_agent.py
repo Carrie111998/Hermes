@@ -492,6 +492,7 @@ class AIAgent:
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
+        persist_session: bool = True,
         session_db=None,
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
@@ -576,6 +577,7 @@ class AIAgent:
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
+            persist_session=persist_session,
             session_db=session_db,
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
@@ -1830,6 +1832,9 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        if getattr(self, "_persist_disabled", False):
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -4051,7 +4056,10 @@ class AIAgent:
         # an already-ended row, so this never clobbers a 'compression' /
         # 'cron_complete' / 'cli_close' reason set by an earlier terminal path.
         try:
-            if getattr(self, "_end_session_on_close", True):
+            if (
+                not getattr(self, "_persist_disabled", False)
+                and getattr(self, "_end_session_on_close", True)
+            ):
                 session_db = getattr(self, "_session_db", None)
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:

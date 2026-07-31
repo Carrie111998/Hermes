@@ -4232,6 +4232,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Initialize Rich console
         self.console = Console()
         self.config = CLI_CONFIG
+
+        from hermes_cli.config import resolve_session_persistence
+
+        self.persist_session = resolve_session_persistence(self.config)
+        if resume and not self.persist_session:
+            raise ValueError(
+                "cannot resume a session when sessions.persist is false"
+            )
+
         self.compact = compact if compact is not None else CLI_CONFIG["display"].get("compact", False)
         # tool_progress: "off", "new", "all", "verbose" (from config.yaml display section)
         # YAML 1.1 parses bare `off` as boolean False — normalise to string.
@@ -4542,8 +4551,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._session_db = None
         self._session_db_unavailable = False
         try:
-            from hermes_state import SessionDB
-            self._session_db = SessionDB()
+            if self.persist_session:
+                from hermes_state import SessionDB
+                self._session_db = SessionDB()
         except Exception as e:
             # #41386: a failed session store means the transcript is NOT
             # persisted to state.db — the live chat looks healthy but resume
@@ -4575,7 +4585,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # min_interval_hours, tracked via state_meta in state.db itself so
         # it's shared across all Hermes processes for this HERMES_HOME.
         # Never blocks startup on failure.
-        _run_state_db_auto_maintenance(self._session_db)
+        if self.persist_session:
+            _run_state_db_auto_maintenance(self._session_db)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via

@@ -42,6 +42,22 @@ logger = logging.getLogger(__name__)
 _CONFIG_PARSE_WARNED: set = set()
 
 
+def resolve_session_persistence(config: Dict[str, Any]) -> bool:
+    """Return the strict profile-scoped session persistence policy.
+
+    Persistence remains enabled by default for backward compatibility.
+    Only actual booleans are accepted so malformed security settings cannot
+    silently become truthy and enable storage.
+    """
+    sessions_config = config.get("sessions") or {}
+    value = sessions_config.get("persist", True)
+
+    if not isinstance(value, bool):
+        raise ValueError("sessions.persist must be a boolean")
+
+    return value
+
+
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
     """Preserve a corrupted ``config.yaml`` by copying it to a timestamped ``.bak``.
 

@@ -250,8 +250,8 @@ class CLIAgentSetupMixin:
 
         wait_for_mcp_discovery()
 
-        # Initialize SQLite session store for CLI sessions (if not already done in __init__)
-        if self._session_db is None:
+        # Initialize SQLite session storage only when profile persistence is enabled.
+        if self.persist_session and self._session_db is None:
             try:
                 from hermes_state import SessionDB
                 self._session_db = SessionDB()
@@ -388,6 +388,7 @@ class CLIAgentSetupMixin:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
+                persist_session=self.persist_session,
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),

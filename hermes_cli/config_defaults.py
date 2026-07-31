@@ -2560,6 +2560,10 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
+        # Persist sessions, messages, tool calls, and tool results to state.db.
+        # Restricted profiles may explicitly disable this to keep session
+        # transcript content in memory for the lifetime of the process only.
+        "persist": True,
         # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
         # Activity is the latest message timestamp, falling back to creation

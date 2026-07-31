@@ -506,6 +506,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    persist_session: bool = True,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
@@ -1470,7 +1471,8 @@ def init_agent(
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    if persist_session:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
@@ -1479,7 +1481,10 @@ def init_agent(
     try:
         from hermes_cli.config import load_config_readonly as _load_sess_cfg
         _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        agent._session_json_enabled = (
+            persist_session
+            and bool(_sess_cfg.get("write_json_snapshots", False))
+        )
     except Exception:
         pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
@@ -1535,7 +1540,7 @@ def init_agent(
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = not persist_session
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
