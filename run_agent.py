@@ -372,9 +372,9 @@ def _apply_run_terminal_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
 
     Conversation sessions intentionally remain open across user messages. The
     per-run receipt is the terminal boundary: every returned invocation is
-    ``done``, ``blocked``, or ``failed`` and separately reports whether a
-    visible final was generated. Platform delivery proof is added later by the
-    gateway and must never be inferred from generation alone.
+    ``done``, ``blocked``, ``failed``, or ``cancelled`` and separately reports
+    whether a visible final was generated. Platform delivery proof is added
+    later by the gateway and must never be inferred from generation alone.
     """
 
     reason = str(
@@ -390,6 +390,12 @@ def _apply_run_terminal_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
     )
     reason_lower = reason.lower()
     if (
+        result.get("interrupted") is True
+        or "interrupt" in reason_lower
+        or "cancel" in reason_lower
+    ):
+        terminal_state = "cancelled"
+    elif (
         result.get("guardrail") is not None
         or "guardrail" in reason_lower
         or (
@@ -416,6 +422,33 @@ def _apply_run_terminal_receipt(result: Dict[str, Any]) -> Dict[str, Any]:
     )
     result["final_generated"] = final_generated
     return result
+
+
+def _exception_run_terminal_receipt(exc: BaseException) -> Dict[str, Any]:
+    """Build a bounded structured receipt before propagating an exception."""
+
+    cancelled = isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
+        type(exc).__name__ == "CancelledError"
+    )
+    timed_out = isinstance(exc, TimeoutError)
+    terminal_state = "cancelled" if cancelled else "failed"
+    reason = (
+        "interrupted_by_user"
+        if cancelled
+        else "timed_out"
+        if timed_out
+        else "system_aborted"
+    )
+    return {
+        "completed": False,
+        "failed": not cancelled,
+        "interrupted": cancelled,
+        "turn_exit_reason": reason,
+        "run_terminal_state": terminal_state,
+        "run_ended_at": time.time(),
+        "run_end_reason": reason,
+        "final_generated": False,
+    }
 
 
 class _StreamErrorEvent(Exception):
@@ -7199,6 +7232,17 @@ class AIAgent:
             finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            terminal_receipt = _exception_run_terminal_receipt(exc)
+            try:
+                setattr(
+                    exc,
+                    "hermes_terminal_receipt",
+                    dict(terminal_receipt),
+                )
+            except Exception:
+                # Some foreign exception types may reject custom attributes.
+                # The durable task receipt below still closes the run.
+                pass
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):
@@ -7212,7 +7256,10 @@ class AIAgent:
                 )
             if task_started and not task_finished:
                 task_finished = True
-                finish_task_run(**task_context, error=exc)
+                finish_task_run(
+                    **task_context,
+                    result=terminal_receipt,
+                )
             raise
         finally:
             try:

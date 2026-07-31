@@ -50,3 +50,21 @@ def test_malformed_owner_hold_fails_closed(tmp_path, monkeypatch):
     assert status.read_gateway_owner_hold() is None
     assert status.gateway_owner_hold_active() is True
     assert status.gateway_owner_hold_targets_self() is True
+
+
+def test_owner_hold_with_malformed_target_pid_targets_self_fail_closed(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(status, "_get_process_hermes_home", lambda: tmp_path)
+    status.get_gateway_owner_hold_path().write_text(
+        (
+            '{"schema_version": 1, "state": "held", '
+            '"target_pid": "not-a-pid"}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    assert status.read_gateway_owner_hold() is not None
+    assert status.gateway_owner_hold_active() is True
+    assert status.gateway_owner_hold_targets_self() is True

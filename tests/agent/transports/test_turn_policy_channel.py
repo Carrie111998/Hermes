@@ -11,7 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from agent.request_phase import activate_turn_policy, clear_turn_policy
+from agent.request_phase import (
+    MAX_SKILL_PAYLOAD_CHARS_PER_RESULT,
+    activate_turn_policy,
+    clear_turn_policy,
+)
 from agent.transports.codex_app_server_session import CodexAppServerSession
 from agent.transports.turn_policy_channel import (
     CodexTurnPolicyChannel,
@@ -145,8 +149,10 @@ print("POLICY_RESULT=" + raw)
     return json.loads(line.split("=", 1)[1])
 
 
-def test_actual_mcp_subprocess_blocks_exact_incident_skill_packets(tmp_path):
-    """The 103k/119k quote fan-out cannot bypass the parent turn budget."""
+def test_actual_mcp_subprocess_blocks_oversized_incident_skill_packets(
+    tmp_path,
+):
+    """Oversized quote fan-out cannot bypass the parent turn budget."""
 
     policy = activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=tmp_path)
     policy.loaded_root_skills.extend(
@@ -164,8 +170,14 @@ def test_actual_mcp_subprocess_blocks_exact_incident_skill_packets(tmp_path):
         results = _run_policy_subprocess(
             channel,
             names_and_sizes=[
-                ("terrain-quote-workflows", 103_000),
-                ("terrain-communications", 119_000),
+                (
+                    "terrain-quote-workflows",
+                    MAX_SKILL_PAYLOAD_CHARS_PER_RESULT + 1,
+                ),
+                (
+                    "terrain-communications",
+                    MAX_SKILL_PAYLOAD_CHARS_PER_RESULT + 2,
+                ),
             ],
         )
 
@@ -258,7 +270,14 @@ def test_codex_session_passes_exact_parent_policy_to_child_environment(tmp_path)
             POLICY_ID_ENV,
             POLICY_KEY_ENV,
         }
-        assert "extra_args" not in captured
+        extra_args = captured["extra_args"]
+        assert isinstance(extra_args, list)
+        assert extra_args[:4] == [
+            "-c",
+            "features.apps=false",
+            "-c",
+            "features.plugins=false",
+        ]
         assert session._turn_policy_channel is not None
         state = session._turn_policy_channel.read_state()
         assert state["phase"] == "investigation"

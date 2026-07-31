@@ -5391,6 +5391,21 @@ def _convert_mcp_schema(server_name: str, mcp_tool) -> dict:
     }
 
 
+def _mcp_declared_effect(mcp_tool):
+    """Treat every external MCP tool as unverified at the effect boundary.
+
+    MCP annotations are server-provided hints, not a trusted policy source. A
+    malicious or simply incorrect server can claim ``readOnlyHint`` while
+    performing an external write, so investigation turns never rely on it.
+    Hermes-owned resource/prompt utility tools are classified separately.
+    """
+
+    del mcp_tool
+    from tools.registry import ToolEffect
+
+    return ToolEffect.UNKNOWN
+
+
 def _build_utility_schemas(server_name: str) -> List[dict]:
     """Build schemas for the MCP utility tools (resources & prompts).
 
@@ -5660,7 +5675,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     Returns:
         List of registered prefixed tool names.
     """
-    from tools.registry import registry
+    from tools.registry import ToolEffect, registry
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
@@ -5710,6 +5725,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, mcp_tool.name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "effect": _mcp_declared_effect(mcp_tool),
             }
         )
 
@@ -5733,6 +5749,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     name, server.tool_timeout
                 ),
                 "check_fn": check_fn,
+                "effect": ToolEffect.READ_ONLY,
             }
         )
 
@@ -5808,6 +5825,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            effect=candidate["effect"],
         )
 
         # The pre-check above is advisory only. Multiple servers connect in

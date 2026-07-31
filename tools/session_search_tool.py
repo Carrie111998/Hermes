@@ -1119,7 +1119,7 @@ SESSION_SEARCH_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 
 registry.register(
     name="session_search",
@@ -1138,5 +1138,6 @@ registry.register(
         current_session_id=kw.get("current_session_id"),
     ),
     check_fn=check_session_search_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="🔍",
 )

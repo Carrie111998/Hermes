@@ -114,20 +114,54 @@ def test_dirty_implementation_is_automatically_isolated(clean_repo, tmp_path):
         "PREEXISTING = True\n"
     )
 
-    reused_cwd, _, reused_read_only = _select_codex_turn_workspace(
+    reused_cwd, reused_instructions, reused_read_only = (
+        _select_codex_turn_workspace(
+            agent,
+            source_cwd=str(clean_repo),
+            phase_name="implementation",
+            phase_instructions="phase=implementation.",
+            enforce_read_only=True,
+            isolation_root=tmp_path / "isolated",
+        )
+    )
+    assert reused_cwd == cwd
+    assert reused_read_only is False
+    assert "freshly revalidated clean" in reused_instructions
+    _git(clean_repo, "worktree", "remove", "--force", str(isolated))
+
+
+def test_cached_clean_implementation_lane_is_revalidated_and_reused(
+    clean_repo,
+    tmp_path,
+):
+    agent = SimpleNamespace()
+
+    cwd, _, enforce_read_only = _select_codex_turn_workspace(
         agent,
         source_cwd=str(clean_repo),
         phase_name="implementation",
         phase_instructions="phase=implementation.",
-        enforce_read_only=True,
+        enforce_read_only=False,
         isolation_root=tmp_path / "isolated",
     )
+    reused_cwd, instructions, reused_read_only = _select_codex_turn_workspace(
+        agent,
+        source_cwd=str(clean_repo),
+        phase_name="implementation",
+        phase_instructions="phase=implementation.",
+        enforce_read_only=False,
+        isolation_root=tmp_path / "isolated",
+    )
+
+    assert enforce_read_only is False
     assert reused_cwd == cwd
     assert reused_read_only is False
-    _git(clean_repo, "worktree", "remove", "--force", str(isolated))
+    assert "freshly revalidated clean" in instructions
+    assert _git(reused_cwd, "status", "--porcelain").stdout == ""
+    _git(clean_repo, "worktree", "remove", "--force", str(reused_cwd))
 
 
-def test_clean_source_always_gets_a_dedicated_codex_lane(
+def test_cached_dirty_implementation_lane_is_preserved_and_replaced(
     clean_repo,
     tmp_path,
 ):
@@ -150,25 +184,78 @@ def test_clean_source_always_gets_a_dedicated_codex_lane(
     # That must never cause Codex to claim or reuse the shared source lane.
     (clean_repo / "app.py").write_text("CODEX_OWNED = True\n", encoding="utf-8")
     (isolated / "app.py").write_text("CODEX_LANE = True\n", encoding="utf-8")
-    reused_cwd, instructions, reused_read_only = _select_codex_turn_workspace(
-        agent,
-        source_cwd=str(clean_repo),
-        phase_name="implementation",
-        phase_instructions="phase=implementation.",
-        enforce_read_only=True,
-        isolation_root=tmp_path / "isolated",
+    replacement_cwd, instructions, replacement_read_only = (
+        _select_codex_turn_workspace(
+            agent,
+            source_cwd=str(clean_repo),
+            phase_name="implementation",
+            phase_instructions="phase=implementation.",
+            enforce_read_only=True,
+            isolation_root=tmp_path / "isolated",
+        )
     )
+    replacement = Path(replacement_cwd)
 
-    assert reused_cwd == cwd
-    assert reused_cwd != str(clean_repo)
-    assert enforce_read_only is False
-    assert reused_read_only is False
-    assert "existing owner-isolated Codex worktree" in instructions
+    assert replacement != isolated
+    assert replacement != clean_repo
+    assert replacement_read_only is False
+    assert agent._codex_isolated_workspace == str(replacement)
+    assert "prior cached Codex worktree" in instructions
+    assert "was not deleted or overwritten" in instructions
+    assert _git(replacement, "status", "--porcelain").stdout == ""
+    assert (replacement / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert isolated.is_dir()
     assert (isolated / "app.py").read_text(encoding="utf-8") == (
         "CODEX_LANE = True\n"
     )
     assert (clean_repo / "app.py").read_text(encoding="utf-8") == (
         "CODEX_OWNED = True\n"
+    )
+
+    _git(clean_repo, "worktree", "remove", "--force", str(replacement))
+    _git(clean_repo, "worktree", "remove", "--force", str(isolated))
+
+
+def test_cached_dirty_lane_replacement_failure_is_read_only_and_preserves_work(
+    clean_repo,
+    tmp_path,
+    monkeypatch,
+):
+    agent = SimpleNamespace()
+    cwd, _, _ = _select_codex_turn_workspace(
+        agent,
+        source_cwd=str(clean_repo),
+        phase_name="implementation",
+        phase_instructions="phase=implementation.",
+        enforce_read_only=False,
+        isolation_root=tmp_path / "isolated",
+    )
+    isolated = Path(cwd)
+    (isolated / "app.py").write_text("PARTIAL = True\n", encoding="utf-8")
+
+    def fail_replacement(*_args, **_kwargs):
+        raise RuntimeError("injected replacement failure")
+
+    monkeypatch.setattr(
+        "agent.codex_runtime._create_codex_isolated_worktree",
+        fail_replacement,
+    )
+    selected_cwd, instructions, enforce_read_only = _select_codex_turn_workspace(
+        agent,
+        source_cwd=str(clean_repo),
+        phase_name="implementation",
+        phase_instructions="phase=implementation.",
+        enforce_read_only=False,
+        isolation_root=tmp_path / "isolated",
+    )
+
+    assert selected_cwd == str(clean_repo)
+    assert enforce_read_only is True
+    assert str(isolated) in instructions
+    assert "injected replacement failure" in instructions
+    assert "Remain read-only" in instructions
+    assert (isolated / "app.py").read_text(encoding="utf-8") == (
+        "PARTIAL = True\n"
     )
     _git(clean_repo, "worktree", "remove", "--force", str(isolated))
 
@@ -193,6 +280,7 @@ def test_clean_explicit_implementation_keeps_codex_native_power(clean_repo):
 
 def test_codex_receives_enforced_read_only_phase_and_minimal_skill_guidance(
     clean_repo,
+    tmp_path,
 ):
     activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
 
@@ -202,6 +290,22 @@ def test_codex_receives_enforced_read_only_phase_and_minimal_skill_guidance(
     assert enforce_read_only is True
     assert "smallest directly governing skill set" in instructions
 
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        """
+[mcp_servers.hermes-tools]
+command = "python"
+
+[mcp_servers."external.writer"]
+command = "external-writer"
+
+[plugins."external-plugin@marketplace"]
+enabled = true
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
     captured = {}
 
     class FakeClient:
@@ -218,12 +322,17 @@ def test_codex_receives_enforced_read_only_phase_and_minimal_skill_guidance(
         def close(self):
             return None
 
+    def client_factory(**kwargs):
+        captured["client_kwargs"] = kwargs
+        return FakeClient()
+
     session = CodexAppServerSession(
         cwd=str(clean_repo),
+        codex_home=str(codex_home),
         request_phase=phase,
         developer_instructions=instructions,
         enforce_read_only=enforce_read_only,
-        client_factory=lambda **_kwargs: FakeClient(),
+        client_factory=client_factory,
     )
     session.ensure_started()
 
@@ -231,6 +340,11 @@ def test_codex_receives_enforced_read_only_phase_and_minimal_skill_guidance(
     assert params["sandbox"] == "read-only"
     assert params["approvalPolicy"] == "never"
     assert "phase=investigation" in params["developerInstructions"]
+    extra_args = captured["client_kwargs"]["extra_args"]
+    assert "features.apps=false" in extra_args
+    assert "features.plugins=false" in extra_args
+    assert 'mcp_servers."external.writer".enabled=false' in extra_args
+    assert not any("hermes-tools" in arg for arg in extra_args)
 
 
 def test_clean_implementation_codex_thread_keeps_native_permissions(clean_repo):
@@ -280,3 +394,36 @@ def test_clean_implementation_codex_thread_keeps_native_permissions(clean_repo):
     params = captured["thread/start"]
     assert params["sandbox"] == "workspace-write"
     assert params["approvalPolicy"] == "never"
+
+
+def test_operation_codex_thread_keeps_native_external_tools(clean_repo):
+    captured = {}
+
+    class FakeClient:
+        def initialize(self, **_kwargs):
+            return {}
+
+        def notify(self, *_args, **_kwargs):
+            return None
+
+        def request(self, method, params, **_kwargs):
+            captured[method] = params
+            return {"thread": {"id": "thread-operation"}}
+
+        def close(self):
+            return None
+
+    def client_factory(**kwargs):
+        captured["client_kwargs"] = kwargs
+        return FakeClient()
+
+    session = CodexAppServerSession(
+        cwd=str(clean_repo),
+        request_phase="operation",
+        developer_instructions="phase=operation.",
+        enforce_read_only=True,
+        client_factory=client_factory,
+    )
+    session.ensure_started()
+
+    assert "extra_args" not in captured["client_kwargs"]

@@ -411,6 +411,22 @@ def _run_agent_tool_execution_middleware(
         block_message = scope_block
         block_error_type = "tool_scope_block"
         if block_message is None:
+            try:
+                from agent.request_phase import guard_tool_call
+
+                block_message = guard_tool_call(
+                    function_name,
+                    final_args,
+                )
+            except Exception as exc:
+                block_message = (
+                    "Request-phase safety block: the final tool-effect "
+                    f"classification failed ({exc}). No effect was executed."
+                )
+            if block_message is not None:
+                block_error_type = "request_phase_block"
+
+        if block_message is None:
             block_error_type = "plugin_block"
 
             def _resolve_pre_tool_block():

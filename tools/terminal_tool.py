@@ -3154,7 +3154,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry
+from tools.registry import ToolEffect, registry
 
 TERMINAL_SCHEMA = {
     "name": "terminal",
@@ -3215,6 +3215,15 @@ def _handle_terminal(args, **kw):
     )
 
 
+def _terminal_effect(args):
+    from agent.request_phase import _terminal_read_is_proven
+
+    command = args.get("command")
+    if isinstance(command, str) and _terminal_read_is_proven(command):
+        return ToolEffect.READ_ONLY
+    return ToolEffect.EFFECTFUL
+
+
 registry.register(
     name="terminal",
     toolset="terminal",
@@ -3223,4 +3232,5 @@ registry.register(
     check_fn=check_terminal_requirements,
     emoji="💻",
     max_result_size_chars=100_000,
+    effect=_terminal_effect,
 )

@@ -198,20 +198,48 @@ def _select_codex_turn_workspace(
     source_key = os.path.normcase(str(source_root))
     cached_source = getattr(agent, "_codex_isolated_source_cwd", None)
     cached_workspace = getattr(agent, "_codex_isolated_workspace", None)
-    if (
+    cached_matches_source = (
         cached_source == source_key
         and getattr(agent, "_codex_isolated_workspace_owned", False) is True
         and isinstance(cached_workspace, str)
-        and Path(cached_workspace).is_dir()
-        and (Path(cached_workspace) / ".git").exists()
-    ):
-        return (
-            cached_workspace,
-            phase_instructions
-            + " Continue in the existing owner-isolated Codex worktree; "
-            "the original dirty checkout remains untouched.",
-            False,
-        )
+    )
+    preserved_cached_workspace = ""
+    cached_reuse_issue = ""
+    if cached_matches_source:
+        cached_path = Path(cached_workspace).expanduser().resolve(strict=False)
+        if cached_path.is_dir() and (cached_path / ".git").exists():
+            try:
+                cached_status = _run_workspace_git(
+                    cached_path,
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                    timeout=5.0,
+                )
+            except Exception as exc:
+                cached_reuse_issue = f"cleanliness check failed: {exc}"
+            else:
+                if cached_status.returncode == 0 and not cached_status.stdout.strip():
+                    return (
+                        str(cached_path),
+                        phase_instructions
+                        + " Continue in the freshly revalidated clean "
+                        "owner-isolated Codex worktree; the original checkout "
+                        "remains untouched.",
+                        False,
+                    )
+                cached_reuse_issue = (
+                    "uncommitted or untracked changes are present"
+                    if cached_status.returncode == 0
+                    else (
+                        cached_status.stderr.strip()
+                        or cached_status.stdout.strip()
+                        or "git status failed"
+                    )
+                )
+            preserved_cached_workspace = str(cached_path)
+        else:
+            cached_reuse_issue = "cached worktree path is no longer valid"
 
     try:
         isolated = _create_codex_isolated_worktree(
@@ -223,6 +251,15 @@ def _select_codex_turn_workspace(
             source_cwd,
             phase_instructions
             + " Automatic clean-worktree isolation failed: "
+            + (
+                "the prior cached lane was preserved at "
+                + preserved_cached_workspace
+                + " because "
+                + cached_reuse_issue
+                + "; replacement failed: "
+                if preserved_cached_workspace
+                else ""
+            )
             + str(exc)
             + ". Remain read-only and end with this exact blocker.",
             True,
@@ -231,12 +268,22 @@ def _select_codex_turn_workspace(
     agent._codex_isolated_source_cwd = source_key
     agent._codex_isolated_workspace = isolated
     agent._codex_isolated_workspace_owned = True
+    replacement_note = (
+        " Hermes preserved the prior cached Codex worktree at "
+        + preserved_cached_workspace
+        + " because "
+        + cached_reuse_issue
+        + "; it was not deleted or overwritten."
+        if preserved_cached_workspace
+        else ""
+    )
     return (
         isolated,
         phase_instructions
         + " Hermes created a clean detached Codex worktree automatically at "
         + isolated
-        + "; work there and preserve the original checkout.",
+        + "; work there and preserve the original checkout."
+        + replacement_note,
         False,
     )
 

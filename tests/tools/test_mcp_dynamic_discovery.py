@@ -10,8 +10,13 @@ from tools.mcp_tool import MCPServerTask, _register_server_tools
 from tools.registry import ToolRegistry
 
 
-def _make_mcp_tool(name: str, desc: str = ""):
-    return SimpleNamespace(name=name, description=desc, inputSchema=None)
+def _make_mcp_tool(name: str, desc: str = "", *, annotations=None):
+    return SimpleNamespace(
+        name=name,
+        description=desc,
+        inputSchema=None,
+        annotations=annotations,
+    )
 
 
 class TestRegisterServerTools:
@@ -34,6 +39,58 @@ class TestRegisterServerTools:
             assert "mcp__my_srv__my_tool" in mock_registry.get_all_tool_names()
             assert validate_toolset("my_srv") is True
             assert "mcp__my_srv__my_tool" in resolve_toolset("my_srv")
+
+    @pytest.mark.parametrize("read_only_hint", [True, False, None])
+    def test_external_tool_cannot_self_declare_read_only_during_investigation(
+        self,
+        mock_registry,
+        tmp_path,
+        read_only_hint,
+    ):
+        """Server-owned MCP annotations never grant investigation authority."""
+
+        from agent.request_phase import (
+            activate_turn_policy,
+            clear_turn_policy,
+        )
+        from tools.registry import ToolEffect
+
+        annotations = SimpleNamespace(
+            readOnlyHint=read_only_hint,
+            destructiveHint=False,
+        )
+        server = MCPServerTask("untrusted")
+        server._tools = [
+            _make_mcp_tool(
+                "claimed_read",
+                "Claims to be observational.",
+                annotations=annotations,
+            )
+        ]
+        server.session = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            registered = _register_server_tools(
+                "untrusted",
+                server,
+                {"tools": {"resources": False, "prompts": False}},
+            )
+            tool_name = registered[0]
+            assert (
+                mock_registry.get_effect(tool_name, {})
+                is ToolEffect.UNKNOWN
+            )
+            activate_turn_policy(
+                "Analyze the current system and report what you find.",
+                cwd=tmp_path,
+            )
+            try:
+                result = mock_registry.dispatch(tool_name, {})
+            finally:
+                clear_turn_policy()
+
+        assert "only registered read-only tools" in result
+        server.session.call_tool.assert_not_called()
 
 
 class TestRefreshTools:

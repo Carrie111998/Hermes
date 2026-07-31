@@ -2593,6 +2593,17 @@ class TestRunConversation:
                 "failed",
                 "failed",
             ),
+            (
+                {
+                    "final_response": "The run was cancelled.",
+                    "completed": False,
+                    "failed": False,
+                    "interrupted": True,
+                    "turn_exit_reason": "interrupted_by_user",
+                },
+                "cancelled",
+                "cancelled",
+            ),
         ],
     )
     def test_each_returned_run_gets_one_terminal_receipt(
@@ -2676,12 +2687,63 @@ class TestRunConversation:
                 agent.run_conversation("hello", task_id="terminal-error")
 
         finish_task_run.assert_called_once()
-        assert finish_task_run.call_args.kwargs["error"] is run_error
+        receipt = finish_task_run.call_args.kwargs["result"]
+        assert receipt["run_terminal_state"] == "failed"
+        assert receipt["run_end_reason"] == "system_aborted"
+        assert receipt["final_generated"] is False
+        assert receipt["failed"] is True
+        assert receipt["interrupted"] is False
+        assert isinstance(receipt["run_ended_at"], float)
+        assert run_error.hermes_terminal_receipt == receipt
         coordinator.end_turn.assert_called_once_with(
             relay_turn,
             outcome="failed",
         )
         coordinator.release_conversation.assert_called_once_with(relay_lease)
+
+    def test_cancelled_exception_closes_run_as_cancelled_receipt(self, agent):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        relay_turn = object()
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = relay_turn
+        run_error = InterruptedError("owner cancelled")
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run"
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run"
+            ) as finish_task_run,
+            patch(
+                "agent.conversation_loop.run_conversation",
+                side_effect=run_error,
+            ),
+        ):
+            with pytest.raises(InterruptedError, match="owner cancelled"):
+                agent.run_conversation("hello", task_id="terminal-cancel")
+
+        receipt = finish_task_run.call_args.kwargs["result"]
+        assert receipt["run_terminal_state"] == "cancelled"
+        assert receipt["run_end_reason"] == "interrupted_by_user"
+        assert receipt["final_generated"] is False
+        assert receipt["failed"] is False
+        assert receipt["interrupted"] is True
+        assert run_error.hermes_terminal_receipt == receipt
+        coordinator.end_turn.assert_called_once_with(
+            relay_turn,
+            outcome="cancelled",
+        )
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)

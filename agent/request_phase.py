@@ -22,7 +22,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 
@@ -216,6 +216,7 @@ class RepoSnapshot:
     root: Path
     dirty: bool
     probe_error: str = ""
+    status_porcelain: str = ""
 
 
 @dataclass
@@ -225,6 +226,8 @@ class TurnPolicy:
     workspace: Path
     repo_snapshots: dict[str, RepoSnapshot] = field(default_factory=dict)
     workspace_probe_error: str = ""
+    expected_repo_status: dict[str, str] = field(default_factory=dict)
+    repo_drift_block: dict[str, str] = field(default_factory=dict)
     loaded_root_skills: list[str] = field(default_factory=list)
     skill_payload_chars: int = 0
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -279,7 +282,7 @@ def _probe_repo(
         return None, "git returned an empty repository root"
     root = Path(root_text).resolve(strict=False)
     if not check_dirty:
-        return RepoSnapshot(root=root, dirty=False), ""
+        return RepoSnapshot(root=root, dirty=False, status_porcelain=""), ""
     try:
         status_result = _run_git(
             [
@@ -296,7 +299,12 @@ def _probe_repo(
     if status_result.returncode != 0:
         error = status_result.stderr.strip() or "git status failed"
         return RepoSnapshot(root=root, dirty=True, probe_error=error), error
-    return RepoSnapshot(root=root, dirty=bool(status_result.stdout.strip())), ""
+    status = status_result.stdout
+    return RepoSnapshot(
+        root=root,
+        dirty=bool(status.strip()),
+        status_porcelain=status,
+    ), ""
 
 
 def _repo_key(root: Path) -> str:
@@ -350,7 +358,9 @@ def _build_turn_policy(
     if policy.phase is RequestPhase.IMPLEMENTATION:
         snapshot, error = _probe_repo(workspace)
         if snapshot is not None:
-            policy.repo_snapshots[_repo_key(snapshot.root)] = snapshot
+            key = _repo_key(snapshot.root)
+            policy.repo_snapshots[key] = snapshot
+            policy.expected_repo_status[key] = snapshot.status_porcelain
         elif error:
             # A broken/timed-out git probe must not silently disable the guard
             # in the very workspace the agent is about to edit.
@@ -359,7 +369,9 @@ def _build_turn_policy(
                 dirty=True,
                 probe_error=error,
             )
-            policy.repo_snapshots[_repo_key(snapshot.root)] = snapshot
+            key = _repo_key(snapshot.root)
+            policy.repo_snapshots[key] = snapshot
+            policy.expected_repo_status[key] = snapshot.status_porcelain
         policy.workspace_probe_error = error
     return policy
 
@@ -418,7 +430,12 @@ def _snapshot_for_path(policy: TurnPolicy, path: Path) -> Optional[RepoSnapshot]
             root = _existing_directory(resolved)
             snapshot = RepoSnapshot(root=root, dirty=True, probe_error=error)
         if snapshot is not None:
-            policy.repo_snapshots[_repo_key(snapshot.root)] = snapshot
+            key = _repo_key(snapshot.root)
+            policy.repo_snapshots[key] = snapshot
+            policy.expected_repo_status.setdefault(
+                key,
+                snapshot.status_porcelain,
+            )
         return snapshot
 
 
@@ -1255,6 +1272,150 @@ def _repo_mutation_targets_at_cwd(
     return [], None, ""
 
 
+def _investigation_effect_block(
+    policy: TurnPolicy,
+    function_name: str,
+    args: Mapping[str, Any],
+) -> Optional[str]:
+    """Permit only tools explicitly registered as read-only in investigation."""
+
+    if policy.phase is not RequestPhase.INVESTIGATION:
+        return None
+    try:
+        from tools.registry import ToolEffect, registry
+
+        effect = registry.get_effect(function_name, args)
+    except Exception as exc:
+        return (
+            "Request-phase safety block: Hermes could not verify that "
+            f"`{function_name}` is read-only ({exc}). No effect was executed."
+        )
+    if effect is ToolEffect.READ_ONLY:
+        return None
+    return (
+        "Request-phase safety block: investigation permits only registered "
+        f"read-only tools. `{function_name}` is classified as {effect.value}; "
+        "no effect was executed. Ask for the operation or implementation "
+        "explicitly if a change is intended."
+    )
+
+
+def _reprobe_mutation_snapshots(
+    policy: TurnPolicy,
+    snapshots: Iterable[RepoSnapshot],
+) -> Optional[str]:
+    """Fail closed if repository state drifted since the last landed effect."""
+
+    unique = {
+        _repo_key(snapshot.root): snapshot
+        for snapshot in snapshots
+    }
+    for key, baseline in unique.items():
+        prior_block = policy.repo_drift_block.get(key)
+        if prior_block:
+            return prior_block
+        current, error = _probe_repo(baseline.root, check_dirty=True)
+        if current is None or error:
+            detail = error or "repository probe returned no snapshot"
+            block = (
+                "Repository safety block: Hermes could not revalidate the "
+                f"target repository immediately before mutation: "
+                f"{baseline.root} ({detail}). No mutation was executed."
+            )
+            policy.repo_drift_block[key] = block
+            return block
+        expected = policy.expected_repo_status.get(
+            key,
+            baseline.status_porcelain,
+        )
+        if current.status_porcelain != expected:
+            block = (
+                "Repository safety block: the target repository changed after "
+                "this turn's last verified state. Preserve the concurrent work "
+                f"at {baseline.root} and continue in a fresh isolated worktree."
+            )
+            policy.repo_drift_block[key] = block
+            return block
+    return None
+
+
+def _tool_result_failed(result: Any) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("error")) or result.get("success") is False
+    if not isinstance(result, str):
+        return True
+    stripped = result.strip()
+    if not stripped:
+        return False
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError):
+        return stripped.lower().startswith(("error", "[tool_error]"))
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("error") or parsed.get("success") is False:
+        return True
+    exit_code = parsed.get("exit_code")
+    return exit_code is not None and exit_code != 0
+
+
+def record_tool_effect_result(
+    function_name: str,
+    args: dict[str, Any],
+    result: Any,
+    *,
+    trusted_cwd: Optional[Path | str] = None,
+) -> None:
+    """Advance the verified repository state only after a landed mutation."""
+
+    policy = current_turn_policy()
+    if policy is None or policy.phase is not RequestPhase.IMPLEMENTATION:
+        return
+    targets, _, resolution_error = _repo_mutation_targets_at_cwd(
+        policy,
+        function_name,
+        args,
+        trusted_cwd=trusted_cwd,
+    )
+    if resolution_error or not targets:
+        return
+    snapshots = [
+        snapshot
+        for target in targets
+        if (snapshot := _snapshot_for_path(policy, target)) is not None
+    ]
+    failed = _tool_result_failed(result)
+    with policy.lock:
+        for baseline in {
+            _repo_key(snapshot.root): snapshot
+            for snapshot in snapshots
+        }.values():
+            key = _repo_key(baseline.root)
+            current, error = _probe_repo(baseline.root, check_dirty=True)
+            if current is None or error:
+                policy.repo_drift_block[key] = (
+                    "Repository safety block: Hermes could not read back the "
+                    f"repository after `{function_name}` at {baseline.root}. "
+                    "Preserve the work and continue only in a fresh isolated "
+                    "worktree."
+                )
+                continue
+            expected = policy.expected_repo_status.get(
+                key,
+                baseline.status_porcelain,
+            )
+            if failed and current.status_porcelain != expected:
+                policy.repo_drift_block[key] = (
+                    "Repository safety block: a failed or interrupted "
+                    f"`{function_name}` changed {baseline.root}. Preserve the "
+                    "partial work and continue only in a fresh isolated "
+                    "worktree."
+                )
+                continue
+            if not failed:
+                policy.expected_repo_status[key] = current.status_porcelain
+
+
 def guard_tool_call(
     function_name: str,
     args: dict[str, Any],
@@ -1415,7 +1576,7 @@ def guard_tool_call(
         if (snapshot := _snapshot_for_path(policy, target)) is not None
     ]
     if not snapshots:
-        return None
+        return _investigation_effect_block(policy, function_name, args)
 
     if policy.phase is not RequestPhase.IMPLEMENTATION:
         return (
@@ -1423,6 +1584,10 @@ def guard_tool_call(
             "repository inspection is allowed but source changes are not. Continue "
             "read-only or obtain an explicit implementation instruction."
         )
+
+    drift_block = _reprobe_mutation_snapshots(policy, snapshots)
+    if drift_block is not None:
+        return drift_block
 
     dirty_snapshots = [
         snapshot for snapshot in snapshots if snapshot.dirty
@@ -1460,6 +1625,7 @@ __all__ = [
     "current_turn_policy",
     "enforce_skill_payload_budget",
     "guard_tool_call",
+    "record_tool_effect_result",
     "push_turn_policy",
     "reset_turn_policy",
     "resume_local_mutations",

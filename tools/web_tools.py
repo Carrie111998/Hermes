@@ -1164,7 +1164,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
@@ -1217,6 +1217,7 @@ registry.register(
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
+    effect=ToolEffect.READ_ONLY,
     emoji="🔍",
     max_result_size_chars=100_000,
 )
@@ -1232,6 +1233,7 @@ registry.register(
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     is_async=True,
+    effect=ToolEffect.READ_ONLY,
     emoji="📄",
     max_result_size_chars=100_000,
 )

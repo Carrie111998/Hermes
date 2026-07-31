@@ -77,7 +77,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Dict, Any, List, Optional, Set, Tuple
 
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
 from agent.skill_utils import (
@@ -1801,6 +1801,7 @@ registry.register(
         category=args.get("category"), task_id=kw.get("task_id")
     ),
     check_fn=check_skills_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="📚",
 )
 def _skill_view_with_bump(args, **kw):
@@ -1863,5 +1864,6 @@ registry.register(
     schema=SKILL_VIEW_SCHEMA,
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="📚",
 )

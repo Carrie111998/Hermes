@@ -2091,15 +2091,110 @@ def _migrate_gateway_hygiene_hold_support(system: bool = False):
 
 
 def _stop_gateway_hygiene_units(system: bool = False) -> None:
-    """Stop every known hygiene trigger before stopping the gateway itself."""
+    """Best-effort stop every known hygiene trigger.
+
+    A broken, missing, or wedged legacy hygiene unit must never prevent the
+    owner-requested gateway stop that follows this containment step.
+    """
 
     for unit_name in _gateway_hygiene_unit_names():
-        _run_systemctl(
-            ["stop", unit_name],
-            system=system,
-            check=False,
-            timeout=30,
+        try:
+            _run_systemctl(
+                ["stop", unit_name],
+                system=system,
+                check=False,
+                timeout=30,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not stop gateway hygiene unit %s during owner stop: %s",
+                unit_name,
+                exc,
+            )
+
+
+def _capture_gateway_owner_hold() -> tuple[bool, dict | None]:
+    """Capture the exact fail-closed state before an explicit activation."""
+
+    from gateway.status import (
+        gateway_owner_hold_active,
+        read_gateway_owner_hold,
+    )
+
+    active = gateway_owner_hold_active()
+    return active, read_gateway_owner_hold() if active else None
+
+
+def _restore_gateway_owner_hold(snapshot: tuple[bool, dict | None]) -> None:
+    """Restore a released hold after a definite or unknown activation failure."""
+
+    active, record = snapshot
+    if not active:
+        return
+
+    from gateway.status import write_gateway_owner_hold
+
+    if record is None:
+        # Preserve a malformed marker's fail-closed meaning without copying
+        # untrusted bytes back into the owner-hold path.
+        write_gateway_owner_hold(
+            target_pid=None,
+            owner="hermes gateway activation rollback",
+            reason="restored malformed owner hold after activation failure",
         )
+        return
+
+    raw_target_pid = record.get("target_pid")
+    try:
+        target_pid = (
+            int(raw_target_pid)
+            if raw_target_pid is not None
+            else None
+        )
+    except (TypeError, ValueError):
+        target_pid = None
+    write_gateway_owner_hold(
+        target_pid=target_pid,
+        owner=str(record.get("owner") or "hermes gateway stop"),
+        reason=str(record.get("reason") or "explicit owner stop"),
+    )
+
+
+def _systemd_service_active_state(system: bool = False) -> bool | None:
+    """Return active/inactive, or None when the real state cannot be proven."""
+
+    try:
+        result = _run_systemctl(
+            ["is-active", get_service_name()],
+            system=system,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+    try:
+        return result.returncode == 0 and result.stdout.strip() == "active"
+    except (AttributeError, TypeError):
+        return None
+
+
+def _restore_hold_unless_service_is_active(
+    snapshot: tuple[bool, dict | None],
+    *,
+    system: bool = False,
+) -> bool:
+    """Resolve an unknown activation outcome without blindly re-freezing it."""
+
+    if not snapshot[0]:
+        return True
+    active = _systemd_service_active_state(system=system)
+    if active is True:
+        return True
+    _restore_gateway_owner_hold(snapshot)
+    return False
 
 
 def _start_gateway_hygiene_timer_if_installed(system: bool = False) -> None:
@@ -3402,9 +3497,24 @@ def systemd_start(system: bool = False):
 
     # This explicit owner command is the only path that releases a durable
     # stop. Dependency starts and watchdog retries cannot clear the hold.
+    hold_snapshot = _capture_gateway_owner_hold()
     clear_gateway_owner_hold()
-    _run_systemctl(["start", get_service_name()], system=system, check=True, timeout=30)
-    _start_gateway_hygiene_timer_if_installed(system=system)
+    try:
+        _run_systemctl(
+            ["start", get_service_name()],
+            system=system,
+            check=True,
+            timeout=30,
+        )
+        _start_gateway_hygiene_timer_if_installed(system=system)
+    finally:
+        # ``systemctl`` can fail after accepting the job or time out while the
+        # result is unknown. Preserve the owner's prior stop unless the real
+        # service is provably active.
+        _restore_hold_unless_service_is_active(
+            hold_snapshot,
+            system=system,
+        )
     print(f"✓ {_service_scope_label(system).capitalize()} service started")
 
 
@@ -3453,23 +3563,9 @@ def systemd_stop(system: bool = False):
     print(f"✓ {_service_scope_label(system).capitalize()} service stopped")
 
 
-def systemd_restart(system: bool = False):
-    system = _select_systemd_scope(system)
-    if system:
-        _require_root_for_system_service("restart")
-    else:
-        _preflight_user_systemd()
-    _require_service_installed("restart", system=system)
-    # HERMES_HOME sync happens inside refresh_systemd_unit_if_needed's
-    # systemd_unit_is_current gate (the single chokepoint). The unit exists
-    # here (_require_service_installed), so the gate runs and its os.environ
-    # mutation persists for the get_running_pid / drain-timeout reads below —
-    # no separate pre-sync needed.
-    refresh_systemd_unit_if_needed(system=system)
-    _migrate_gateway_hygiene_hold_support(system=system)
-    from gateway.status import clear_gateway_owner_hold
+def _systemd_restart_after_owner_unhold(system: bool) -> None:
+    """Restart after the explicit boundary has released an owner hold."""
 
-    clear_gateway_owner_hold()
     from gateway.status import get_running_pid
 
     pid = get_running_pid() or _systemd_main_pid(system=system)
@@ -3558,6 +3654,36 @@ def systemd_restart(system: bool = False):
         )
         return
     _wait_for_systemd_service_restart(system=system, previous_pid=pid)
+
+
+def systemd_restart(system: bool = False):
+    system = _select_systemd_scope(system)
+    if system:
+        _require_root_for_system_service("restart")
+    else:
+        _preflight_user_systemd()
+    _require_service_installed("restart", system=system)
+    # HERMES_HOME sync happens inside refresh_systemd_unit_if_needed's
+    # systemd_unit_is_current gate (the single chokepoint). The unit exists
+    # here (_require_service_installed), so the gate runs and its os.environ
+    # mutation persists for the get_running_pid / drain-timeout reads below —
+    # no separate pre-sync needed.
+    refresh_systemd_unit_if_needed(system=system)
+    _migrate_gateway_hygiene_hold_support(system=system)
+    from gateway.status import clear_gateway_owner_hold
+
+    hold_snapshot = _capture_gateway_owner_hold()
+    clear_gateway_owner_hold()
+    try:
+        _systemd_restart_after_owner_unhold(system)
+    finally:
+        # Every early return and exception reaches this readback. A failed,
+        # timed-out, or otherwise unknown restart restores the prior owner
+        # containment unless the replacement service is provably active.
+        _restore_hold_unless_service_is_active(
+            hold_snapshot,
+            system=system,
+        )
 
 
 def systemd_status(deep: bool = False, system: bool = False, full: bool = False):

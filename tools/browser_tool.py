@@ -4941,7 +4941,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
@@ -4949,6 +4949,7 @@ registry.register(
     name="browser_navigate",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_navigate"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_navigate(url=args.get("url", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🌐",
@@ -4957,6 +4958,7 @@ registry.register(
     name="browser_snapshot",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_snapshot"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_snapshot(
         full=args.get("full", False), task_id=kw.get("task_id"), user_task=kw.get("user_task")),
     check_fn=check_browser_requirements,
@@ -4966,6 +4968,7 @@ registry.register(
     name="browser_click",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_click"],
+    effect=ToolEffect.EFFECTFUL,
     handler=lambda args, **kw: browser_click(ref=args.get("ref", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="👆",
@@ -4974,6 +4977,7 @@ registry.register(
     name="browser_type",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_type"],
+    effect=ToolEffect.EFFECTFUL,
     handler=lambda args, **kw: browser_type(ref=args.get("ref", ""), text=args.get("text", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
@@ -4982,6 +4986,7 @@ registry.register(
     name="browser_scroll",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_scroll"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_scroll(direction=args.get("direction", "down"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="📜",
@@ -4990,6 +4995,7 @@ registry.register(
     name="browser_back",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_back"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_back(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="◀️",
@@ -4998,6 +5004,7 @@ registry.register(
     name="browser_press",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_press"],
+    effect=ToolEffect.EFFECTFUL,
     handler=lambda args, **kw: browser_press(key=args.get("key", ""), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="⌨️",
@@ -5007,6 +5014,7 @@ registry.register(
     name="browser_get_images",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_get_images"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_get_images(task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖼️",
@@ -5015,6 +5023,7 @@ registry.register(
     name="browser_vision",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_vision"],
+    effect=ToolEffect.READ_ONLY,
     handler=lambda args, **kw: browser_vision(question=args.get("question", ""), annotate=args.get("annotate", False), task_id=kw.get("task_id")),
     check_fn=check_browser_vision_requirements,
     emoji="👁️",
@@ -5023,6 +5032,7 @@ registry.register(
     name="browser_console",
     toolset="browser",
     schema=_BROWSER_SCHEMA_MAP["browser_console"],
+    effect=ToolEffect.EFFECTFUL,
     handler=lambda args, **kw: browser_console(clear=args.get("clear", False), expression=args.get("expression"), task_id=kw.get("task_id")),
     check_fn=check_browser_requirements,
     emoji="🖥️",

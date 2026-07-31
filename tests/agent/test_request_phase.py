@@ -20,6 +20,7 @@ from agent.request_phase import (
     current_turn_policy,
     guard_tool_call,
     push_turn_policy,
+    record_tool_effect_result,
     reset_turn_policy,
 )
 
@@ -258,6 +259,8 @@ def test_exact_quote_investigation_cannot_patch_repo(clean_repo):
 def test_exact_quote_prompt_allows_direct_skills_without_arbitrary_count_cap(
     clean_repo,
 ):
+    import tools.skills_tool  # noqa: F401 - registers the real skill tools
+
     policy = _activate_quote_skill_policy(clean_repo)
 
     assert guard_tool_call(
@@ -266,7 +269,7 @@ def test_exact_quote_prompt_allows_direct_skills_without_arbitrary_count_cap(
     ) is None
     assert (
         guard_tool_call(
-            "skill_view", {"name": "maione-business-operator"}
+            "skill_view", {"name": "maione-canonical-operator"}
         )
         is None
     )
@@ -294,13 +297,13 @@ def test_exact_quote_prompt_allows_direct_skills_without_arbitrary_count_cap(
     assert "load the root skill" in nested_fanout
     assert policy.loaded_root_skills == [
         "terrain-quote-workflows",
-        "maione-business-operator",
+        "maione-canonical-operator",
         "terrain-communications",
         "terrain-scheduling",
     ]
 
 
-def test_real_registry_loads_full_27387_char_terrain_router_then_domain_skill(
+def test_real_registry_loads_complete_router_then_domain_skill(
     monkeypatch,
     clean_repo,
     tmp_path,
@@ -318,8 +321,9 @@ def test_real_registry_loads_full_27387_char_terrain_router_then_domain_skill(
         f"# {router_name}\n\n"
         "Use this complete real-registry test workflow.\n"
     )
+    router_size = MAX_SKILL_PAYLOAD_CHARS_PER_RESULT - 1
     router_content = router_prefix + (
-        "R" * (27_387 - len(router_prefix))
+        "R" * (router_size - len(router_prefix))
     )
     domain_name = "terrain-quote-workflows"
     domain_description = "Domain workflow for Terrain quotes."
@@ -372,10 +376,10 @@ def test_real_registry_loads_full_27387_char_terrain_router_then_domain_skill(
     )
 
     assert router["success"] is True
-    assert len(router["content"]) == 27_387
+    assert len(router["content"]) == router_size
     assert (
         router["payload_budget"]["returned_content_chars"]
-        == 27_387
+        == router_size
     )
     assert router["payload_budget"]["blocked"] is False
     assert "# terrain-operations" in router["content"]
@@ -446,10 +450,10 @@ def test_skill_payload_budget_accounts_actual_returned_content(
 
     policy = _activate_quote_skill_policy(clean_repo)
     payloads = {
-        "maione-business-operator": "U" * 5_886,
-        "terrain-scheduling": "S" * 3_994,
-        "terrain-communications": "C" * 2_394,
-        "terrain-quotes": "Q" * 7_321,
+        "maione-canonical-operator": "# Canonical\nUse one front door.\n",
+        "terrain-scheduling": "# Scheduling\nResolve the exact event.\n",
+        "terrain-communications": "# Communications\nProve delivery.\n",
+        "terrain-quotes": "# Quotes\nRead back the published version.\n",
     }
 
     def fake_skill_view(name, file_path=None, task_id=None):
@@ -479,7 +483,7 @@ def test_skill_payload_budget_accounts_actual_returned_content(
     assert returned_chars < MAX_SKILL_PAYLOAD_CHARS_PER_TURN
 
 
-def test_july_quote_failure_cannot_load_103k_and_119k_skill_packets(
+def test_july_quote_failure_cannot_load_oversized_skill_packets(
     monkeypatch,
     clean_repo,
 ):
@@ -490,18 +494,27 @@ def test_july_quote_failure_cannot_load_103k_and_119k_skill_packets(
     quote_suffix = "\n## Verification\n"
     communications_prefix = "# Communications\n"
     communications_suffix = "\n## Delivery proof\n"
+    quote_packet_chars = MAX_SKILL_PAYLOAD_CHARS_PER_RESULT + 1
+    communications_packet_chars = MAX_SKILL_PAYLOAD_CHARS_PER_RESULT + 2
     payloads = {
-        "maione-business-operator": "U" * 5_886,
+        "maione-canonical-operator": (
+            "# Canonical operator\nUse the smallest sufficient specialist.\n"
+        ),
         "terrain-quote-workflows": (
             quote_prefix
-            + "Q" * (103_000 - len(quote_prefix) - len(quote_suffix))
+            + "Q"
+            * (
+                quote_packet_chars
+                - len(quote_prefix)
+                - len(quote_suffix)
+            )
             + quote_suffix
         ),
         "terrain-communications": (
             communications_prefix
             + "C"
             * (
-                119_000
+                communications_packet_chars
                 - len(communications_prefix)
                 - len(communications_suffix)
             )
@@ -533,7 +546,7 @@ def test_july_quote_failure_cannot_load_103k_and_119k_skill_packets(
 
     umbrella = json.loads(
         skills_tool._skill_view_with_bump(
-            {"name": "maione-business-operator"}
+            {"name": "maione-canonical-operator"}
         )
     )
     quotes = json.loads(
@@ -547,12 +560,15 @@ def test_july_quote_failure_cannot_load_103k_and_119k_skill_packets(
         )
     )
 
-    assert umbrella["content"] == payloads["maione-business-operator"]
+    assert umbrella["content"] == payloads["maione-canonical-operator"]
     assert quotes["success"] is False
     assert quotes["payload_budget"]["blocked"] is True
     assert quotes["payload_budget"]["no_partial_content_loaded"] is True
     assert quotes["payload_budget"]["reason"] == "per_result_limit"
-    assert quotes["payload_budget"]["original_content_chars"] == 103_000
+    assert (
+        quotes["payload_budget"]["original_content_chars"]
+        == quote_packet_chars
+    )
     assert (
         quotes["payload_budget"]["per_result_limit_chars"]
         == MAX_SKILL_PAYLOAD_CHARS_PER_RESULT
@@ -572,11 +588,11 @@ def test_july_quote_failure_cannot_load_103k_and_119k_skill_packets(
     assert communications["payload_budget"]["reason"] == "per_result_limit"
     assert (
         communications["payload_budget"]["original_content_chars"]
-        == 119_000
+        == communications_packet_chars
     )
     assert "content" not in communications
     assert calls == [
-        "maione-business-operator",
+        "maione-canonical-operator",
         "terrain-quote-workflows",
         "terrain-communications",
     ]
@@ -617,13 +633,13 @@ def test_oversized_supporting_file_is_blocked_without_partial_instructions(
 
     root = json.loads(
         skills_tool._skill_view_with_bump(
-            {"name": "maione-business-operator"}
+            {"name": "maione-canonical-operator"}
         )
     )
     support = json.loads(
         skills_tool._skill_view_with_bump(
             {
-                "name": "maione-business-operator",
+                "name": "maione-canonical-operator",
                 "file_path": "references/routes.md",
             }
         )
@@ -646,11 +662,16 @@ def test_cumulative_skill_payload_budget_blocks_whole_next_packet(
     from tools import skills_tool
 
     policy = _activate_quote_skill_policy(clean_repo)
+    accepted_packet_size = MAX_SKILL_PAYLOAD_CHARS_PER_TURN // 4
+    accepted_total = accepted_packet_size * 3
+    blocked_packet_size = (
+        MAX_SKILL_PAYLOAD_CHARS_PER_TURN - accepted_total + 1
+    )
     payloads = {
-        "maione-business-operator": "U" * 20_000,
-        "terrain-scheduling": "S" * 20_000,
-        "terrain-communications": "C" * 20_000,
-        "terrain-quotes": "Q" * 10_000,
+        "maione-canonical-operator": "U" * accepted_packet_size,
+        "terrain-scheduling": "S" * accepted_packet_size,
+        "terrain-communications": "C" * accepted_packet_size,
+        "terrain-quotes": "Q" * blocked_packet_size,
     }
 
     def fake_skill_view(name, file_path=None, task_id=None):
@@ -679,12 +700,15 @@ def test_cumulative_skill_payload_budget_blocks_whole_next_packet(
 
     assert blocked["success"] is False
     assert blocked["payload_budget"]["reason"] == "turn_limit"
-    assert blocked["payload_budget"]["used_chars"] == 60_000
-    assert blocked["payload_budget"]["remaining_chars"] == 4_000
+    assert blocked["payload_budget"]["used_chars"] == accepted_total
+    assert (
+        blocked["payload_budget"]["remaining_chars"]
+        == MAX_SKILL_PAYLOAD_CHARS_PER_TURN - accepted_total
+    )
     assert blocked["payload_budget"]["returned_content_chars"] == 0
     assert blocked["payload_budget"]["no_partial_content_loaded"] is True
     assert "content" not in blocked
-    assert policy.skill_payload_chars == 60_000
+    assert policy.skill_payload_chars == accepted_total
 
 
 def test_common_dispatch_counts_skill_payload_once(
@@ -718,7 +742,7 @@ def test_common_dispatch_counts_skill_payload_once(
     result = json.loads(
         handle_function_call(
             "skill_view",
-            {"name": "maione-business-operator"},
+            {"name": "maione-canonical-operator"},
             skip_pre_tool_call_hook=True,
             skip_tool_execution_middleware=True,
         )
@@ -741,8 +765,9 @@ def test_final_dispatch_rechecks_transformed_skill_payload(
     huge_transformed_result = json.dumps(
         {
             "success": True,
-            "name": "maione-business-operator",
-            "content": "# Operator\n" + ("X" * 103_000),
+            "name": "maione-canonical-operator",
+            "content": "# Operator\n"
+            + ("X" * (MAX_SKILL_PAYLOAD_CHARS_PER_RESULT + 1)),
             "linked_files": {
                 "references": ["references/operator-core.md"],
             },
@@ -754,7 +779,7 @@ def test_final_dispatch_rechecks_transformed_skill_payload(
         lambda *_args, **_kwargs: json.dumps(
             {
                 "success": True,
-                "name": "maione-business-operator",
+                "name": "maione-canonical-operator",
                 "content": "small original",
             }
         ),
@@ -776,7 +801,7 @@ def test_final_dispatch_rechecks_transformed_skill_payload(
     result = json.loads(
         handle_function_call(
             "skill_view",
-            {"name": "maione-business-operator"},
+            {"name": "maione-canonical-operator"},
             skip_pre_tool_call_hook=True,
             skip_tool_execution_middleware=True,
         )
@@ -795,7 +820,7 @@ def test_supporting_skill_file_is_available_after_root_load(clean_repo):
     assert (
         guard_tool_call(
             "skill_view",
-            {"name": "maione-business-operator"},
+            {"name": "maione-canonical-operator"},
         )
         is None
     )
@@ -803,7 +828,7 @@ def test_supporting_skill_file_is_available_after_root_load(clean_repo):
         guard_tool_call(
             "skill_view",
             {
-                "name": "maione-business-operator",
+                "name": "maione-canonical-operator",
                 "file_path": "references/quotes.md",
             },
         )
@@ -829,20 +854,21 @@ def test_registered_skill_handler_cannot_bypass_nested_file_guard(clean_repo):
     assert "load the root skill" in result["error"]
 
 
-def test_investigation_may_write_a_non_repo_report(clean_repo):
+def test_investigation_cannot_write_an_unbounded_non_repo_report(clean_repo):
     activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
     report_path = clean_repo.parent / "quote-analysis.md"
 
-    assert (
-        guard_tool_call(
-            "write_file",
-            {
-                "path": str(report_path),
-                "content": "# Quote analysis\n",
-            },
-        )
-        is None
+    block = guard_tool_call(
+        "write_file",
+        {
+            "path": str(report_path),
+            "content": "# Quote analysis\n",
+        },
     )
+
+    assert block is not None
+    assert "only registered read-only tools" in block
+    assert not report_path.exists()
 
 
 def test_investigation_move_patch_cannot_bypass_from_a_non_repo_cwd(
@@ -1286,6 +1312,137 @@ def test_explicit_implementation_is_allowed_in_clean_repo(clean_repo):
         )
         is None
     )
+
+
+def test_concurrent_repository_drift_blocks_before_first_mutation(clean_repo):
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    (clean_repo / "concurrent.txt").write_text(
+        "another process changed the checkout\n",
+        encoding="utf-8",
+    )
+
+    block = guard_tool_call(
+        "write_file",
+        {
+            "path": str(clean_repo / "app.py"),
+            "content": "VALUE = 2\n",
+        },
+    )
+
+    assert block is not None
+    assert "changed after this turn's last verified state" in block
+    assert (clean_repo / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_successful_native_file_effect_advances_verified_repo_state(clean_repo):
+    args = {
+        "path": str(clean_repo / "app.py"),
+        "content": "VALUE = 2\n",
+    }
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    assert guard_tool_call("write_file", args) is None
+    (clean_repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    record_tool_effect_result(
+        "write_file",
+        args,
+        json.dumps({"success": True}),
+    )
+
+    assert (
+        guard_tool_call(
+            "write_file",
+            {
+                "path": str(clean_repo / "app.py"),
+                "content": "VALUE = 3\n",
+            },
+        )
+        is None
+    )
+
+
+def test_failed_partial_native_file_effect_blocks_every_later_mutation(
+    clean_repo,
+):
+    args = {
+        "path": str(clean_repo / "app.py"),
+        "content": "VALUE = 2\n",
+    }
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    assert guard_tool_call("write_file", args) is None
+    (clean_repo / "app.py").write_text(
+        "PARTIAL = True\n",
+        encoding="utf-8",
+    )
+    record_tool_effect_result(
+        "write_file",
+        args,
+        json.dumps({"error": "fault injected after partial write"}),
+    )
+
+    block = guard_tool_call(
+        "write_file",
+        {
+            "path": str(clean_repo / "app.py"),
+            "content": "VALUE = 3\n",
+        },
+    )
+
+    assert block is not None
+    assert "failed or interrupted" in block
+    assert "fresh isolated worktree" in block
+    assert (clean_repo / "app.py").read_text(encoding="utf-8") == (
+        "PARTIAL = True\n"
+    )
+
+
+def test_registry_exception_receipts_partial_native_file_effect(clean_repo):
+    from tools.registry import ToolRegistry
+
+    args = {
+        "path": str(clean_repo / "app.py"),
+        "content": "VALUE = 2\n",
+    }
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    registry = ToolRegistry()
+
+    def partial_then_raise(_args, **_kwargs):
+        (clean_repo / "app.py").write_text(
+            "PARTIAL = True\n",
+            encoding="utf-8",
+        )
+        raise RuntimeError("fault after partial write")
+
+    registry.register(
+        name="write_file",
+        toolset="test",
+        schema={},
+        handler=partial_then_raise,
+    )
+
+    result = json.loads(registry.dispatch("write_file", args))
+    later_block = guard_tool_call(
+        "write_file",
+        {
+            "path": str(clean_repo / "app.py"),
+            "content": "VALUE = 3\n",
+        },
+    )
+
+    assert "fault after partial write" in result["error"]
+    assert later_block is not None
+    assert "failed or interrupted" in later_block
 
 
 def test_explicit_implementation_is_blocked_in_preexisting_dirty_repo(clean_repo):

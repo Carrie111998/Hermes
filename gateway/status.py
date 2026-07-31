@@ -1638,7 +1638,7 @@ def gateway_owner_hold_targets_self() -> bool:
     try:
         return int(target_pid) == os.getpid()
     except (TypeError, ValueError):
-        return False
+        return True
 
 
 def write_gateway_owner_hold(

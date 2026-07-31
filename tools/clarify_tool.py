@@ -250,7 +250,7 @@ CLARIFY_SCHEMA = {
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import ToolEffect, registry, tool_error
 
 registry.register(
     name="clarify",
@@ -262,5 +262,6 @@ registry.register(
         multi_select=args.get("multi_select", False),
         callback=kw.get("callback")),
     check_fn=check_clarify_requirements,
+    effect=ToolEffect.READ_ONLY,
     emoji="❓",
 )

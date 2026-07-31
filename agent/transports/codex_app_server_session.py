@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 import threading
 import time
+import tomllib
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -62,6 +64,69 @@ _HERMES_TO_CODEX_PERMISSION_PROFILE = {
     # Backstop alias used by some skills/tests.
     "yolo": "full-access",
 }
+
+
+def _toml_key_segment(value: str) -> str:
+    """Quote one TOML dotted-key segment for a Codex config override."""
+
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _restricted_external_tool_args(codex_home: Optional[str]) -> list[str]:
+    """Disable effect-capable tools that bypass Hermes' turn-policy channel.
+
+    Codex's shell and file tools are governed by the protocol sandbox. The
+    built-in ``hermes-tools`` MCP callback is governed by our authenticated
+    per-turn policy channel. Other MCP servers and plugin/app tools run outside
+    both boundaries, and their self-declared read-only annotations are not a
+    trustworthy effect control. Investigation and source-implementation turns
+    therefore start Codex with those direct surfaces disabled. Operation turns
+    retain the user's normal native tool configuration.
+    """
+
+    args = [
+        "-c",
+        "features.apps=false",
+        "-c",
+        "features.plugins=false",
+    ]
+    home = Path(
+        codex_home
+        or os.environ.get("CODEX_HOME")
+        or (Path.home() / ".codex")
+    ).expanduser()
+    config_path = home / "config.toml"
+    if not config_path.exists():
+        return args
+
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(
+            "Cannot enforce the request-phase boundary because Codex's "
+            f"MCP configuration could not be read: {exc}"
+        ) from exc
+
+    servers = config.get("mcp_servers") or {}
+    if not isinstance(servers, dict):
+        raise RuntimeError(
+            "Cannot enforce the request-phase boundary because Codex's "
+            "mcp_servers configuration is not a table."
+        )
+    for server_name in sorted(str(name) for name in servers):
+        if server_name == "hermes-tools":
+            continue
+        args.extend(
+            [
+                "-c",
+                (
+                    "mcp_servers."
+                    f"{_toml_key_segment(server_name)}.enabled=false"
+                ),
+            ]
+        )
+    return args
 
 
 @dataclass
@@ -338,6 +403,10 @@ class CodexAppServerSession:
                 "codex_bin": self._codex_bin,
                 "codex_home": self._codex_home,
             }
+            if self.request_phase and self.request_phase != "operation":
+                client_kwargs["extra_args"] = _restricted_external_tool_args(
+                    self._codex_home
+                )
             if self._turn_policy_channel is not None:
                 policy_environment = self._turn_policy_channel.environment
                 client_kwargs["env"] = policy_environment
