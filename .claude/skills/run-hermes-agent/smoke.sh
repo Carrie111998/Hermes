@@ -19,6 +19,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.." # repo root
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$HOME/.venvs/hermes-agent}"
 mkdir -p "$(dirname "$UV_PROJECT_ENVIRONMENT")"
 
+# Isolate the two oneshot invocations below from any real config the
+# developer already has at ~/.hermes/.env (or HERMES_HOME elsewhere).
+# main.py loads that file unconditionally on every invocation, so without
+# this, "no provider configured" / "bogus key" runs against a machine with
+# a real key already set up would silently call a real provider instead of
+# exercising the failure paths this script is meant to prove out.
+HERMES_SMOKE_HOME="$(mktemp -d)"
+trap 'rm -rf "$HERMES_SMOKE_HOME"' EXIT
+export HERMES_HOME="$HERMES_SMOKE_HOME"
+
 echo "== uv python pin =="
 uv python pin 3.12.13
 
@@ -45,6 +55,17 @@ echo "exit: $?"
 set -e
 
 echo "== pytest smoke subset (skip anything symlink-based — see Gotchas) =="
-uv run pytest tests/test_account_usage.py -q
+# AGENTS.md requires scripts/run_tests.sh over raw pytest: it enforces
+# hermetic CI-parity (unset credential vars, TZ=UTC, LANG=C.UTF-8,
+# per-file subprocess isolation) that a bare `pytest` invocation skips.
+# It only probes ./.venv, ./venv, and $HERMES_PYTHON for an interpreter
+# with pytest — since UV_PROJECT_ENVIRONMENT above relocates the venv
+# outside OneDrive, point HERMES_PYTHON at it so run_tests.sh finds it.
+if [ -x "$UV_PROJECT_ENVIRONMENT/Scripts/python.exe" ]; then
+  export HERMES_PYTHON="$UV_PROJECT_ENVIRONMENT/Scripts/python.exe"
+elif [ -x "$UV_PROJECT_ENVIRONMENT/bin/python" ]; then
+  export HERMES_PYTHON="$UV_PROJECT_ENVIRONMENT/bin/python"
+fi
+scripts/run_tests.sh tests/test_account_usage.py -q
 
 echo "== done =="

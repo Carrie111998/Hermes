@@ -48,7 +48,9 @@ run unattended. What it does, in order:
 | health | `uv run hermes doctor` | config/deps/dirs check; exits 0 even with warnings |
 | oneshot, no key | `uv run hermes -z "say hi"` | fails fast with a clear message, **exit 1** |
 | oneshot, dummy key | `OPENROUTER_API_KEY=<dummy> uv run hermes -z "say hi"` | request path reaches the provider; prints the HTTP error as if it were the reply, **exit 0** (see Gotchas) |
-| tests | `uv run pytest tests/test_account_usage.py -q` | test harness works |
+| tests | `scripts/run_tests.sh tests/test_account_usage.py -q` | test harness works, CI-parity |
+
+The no-key and dummy-key rows above are verified against current `main` (`hermes_cli/oneshot.py`), run inside an isolated `HERMES_HOME` — see the next paragraph for why that isolation matters.
 
 To actually get a real answer out of `-z`/`hermes chat -q`, set a real
 key first — `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, etc. (env var, or
@@ -74,8 +76,18 @@ uv run hermes         # interactive chat once configured
 
 ```bash
 uv sync --extra dev
-uv run pytest tests/test_account_usage.py -q   # → 4 passed
+scripts/run_tests.sh tests/test_account_usage.py -q   # → 4 passed
 ```
+
+Use `scripts/run_tests.sh`, not raw `pytest` — it enforces hermetic
+CI-parity (unset credential vars, `TZ=UTC`, `LANG=C.UTF-8`, per-file
+subprocess isolation) per `AGENTS.md`'s Testing section. A bare `pytest`
+invocation on a dev machine with real API keys set can diverge from CI in
+ways that pass locally and fail (or vice versa) upstream. It only looks
+for an interpreter at `./.venv`, `./venv`, or `$HERMES_PYTHON` — if
+you've relocated the venv per the OneDrive Gotcha below, export
+`HERMES_PYTHON=$UV_PROJECT_ENVIRONMENT/Scripts/python.exe` (or
+`.../bin/python` on POSIX) first. `smoke.sh` does this automatically.
 
 The full `tests/` tree is large; run a targeted subset rather than the
 whole suite unless you specifically need full coverage. Note: any test
@@ -99,10 +111,28 @@ without Developer Mode / admin (see Gotchas) — not a code bug.
   "succeeds" but leaves a half-replaced package — don't trust a retry,
   relocate instead.
 - **`hermes -z` exits 0 even when the LLM call itself fails upstream**
-  (e.g. bad API key → `HTTP 401: User not found.` printed to stdout).
-  Only a *local* config problem (no provider configured at all) exits
-  1. A script checking "did this succeed" by exit code alone will
-  treat a 401 as success — check the printed text too.
+  (e.g. bad API key → `HTTP 401: ...` printed to stdout as if it were
+  the reply). Only a *local* config problem (no provider configured at
+  all) exits 1. Verified directly against current `main`
+  (`hermes_cli/oneshot.py`) with an isolated `HERMES_HOME` — the 401
+  response text makes `response` non-empty, so the failure never reaches
+  the `result.get("failed")` / empty-response checks that would otherwise
+  return 1 or 2. A script checking "did this succeed" by exit code alone
+  will treat a 401 as success — check the printed text too.
+- **`hermes` loads `~/.hermes/.env` (or `$HERMES_HOME/.env`)
+  unconditionally on every invocation** (`hermes_cli/main.py`, before
+  dispatch). On a machine that already has a real provider configured,
+  the "no key" / "dummy key" smoke steps above would silently call the
+  real provider instead of exercising the failure path — `smoke.sh`
+  isolates this by pointing `HERMES_HOME` at a fresh `mktemp -d` for its
+  own run. Do the same (`HERMES_HOME=$(mktemp -d) ...`) if you run the
+  oneshot steps manually outside the script.
+- **`scripts/run_tests.sh` prints a `UnicodeEncodeError` traceback from
+  `run_tests_parallel.py`'s progress printer on stock Windows consoles**
+  (cp1252 can't encode the `✓` progress character), but the run still
+  completes and reports `N passed, 0 failed` with exit 0 — cosmetic, not
+  a real failure. Pre-existing in the repo's test runner, not specific to
+  this skill.
 - **`tests/test_atomic_replace_symlinks.py` fails on stock Windows**
   with `OSError: [WinError 1314] A required privilege is not held by
   the client` — creating symlinks needs Developer Mode or admin.
