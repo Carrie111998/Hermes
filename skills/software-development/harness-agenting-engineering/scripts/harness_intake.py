@@ -17,7 +17,26 @@ from pathlib import Path
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 TEMPLATE = SKILL_DIR / "templates" / "task-intake-form.md"
-DEFAULT_OUT_DIR = Path.home() / ".hermes" / "harness" / "intake"
+
+
+def _fallback_hermes_home() -> Path:
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        return base / "hermes"
+    return Path.home().joinpath(".hermes")
+
+
+def _default_out_dir() -> Path:
+    """Return the active-profile intake directory without importing Hermes.
+
+    Hermes profile launches set HERMES_HOME before plugin/helper execution. The
+    standalone helper still has a platform fallback so it can run outside Hermes
+    for migration or bootstrapping, but it honors HERMES_HOME whenever present.
+    """
+    hermes_home = os.environ.get("HERMES_HOME", "").strip()
+    root = Path(hermes_home).expanduser() if hermes_home else _fallback_hermes_home()
+    return root / "harness" / "intake"
 
 FIELD_PATTERNS = {
     "task_title": re.compile(r"^- Task title:[ \t]*(.*)$", re.MULTILINE),
@@ -80,7 +99,7 @@ def command_new(args: argparse.Namespace) -> int:
     if out is None:
         stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         slug = _slugify(title) if title else "task"
-        out = DEFAULT_OUT_DIR / f"{stamp}-{slug}.md"
+        out = _default_out_dir() / f"{stamp}-{slug}.md"
     _write(out.expanduser().resolve(), content, force=args.force)
     print(out.expanduser().resolve())
     return 0

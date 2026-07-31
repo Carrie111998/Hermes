@@ -1,8 +1,8 @@
 """Harness / Agenting Engineering Hermes plugin.
 
 The plugin delegates intake-form operations to the bundled skill helper when the
-repo ships it, while keeping the user-local ``~/.hermes/bin/hermes-harness``
-helper as a compatibility fallback for existing profiles.
+repo ships it, while keeping an active-profile ``bin/hermes-harness`` helper as
+a compatibility fallback for existing profiles.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ import re
 import subprocess
 from pathlib import Path
 from typing import Any, Sequence
+
+from hermes_constants import display_hermes_home, get_hermes_home
 
 HELP_TEXT = """Harness / Agenting Engineering intake
 
@@ -29,7 +31,7 @@ CLI:
   hermes harness migration-pack --output-dir /path/to/repo
 
 Helper resolution:
-  bundled skill script first, then ~/.hermes/bin/hermes-harness
+  bundled skill script first, then the active profile's hermes-harness helper
 
 Purpose:
   Move non-trivial AI-assisted coding tasks from vibe coding to sustainable
@@ -81,7 +83,7 @@ def _bundled_helper_path() -> Path:
 
 
 def _user_helper_path() -> Path:
-    return Path.home() / ".hermes" / "bin" / "hermes-harness"
+    return get_hermes_home() / "bin" / "hermes-harness"
 
 
 def _helper_command() -> list[str] | None:
@@ -99,42 +101,45 @@ def _run_helper(argv: Sequence[str]) -> int:
     if command is None:
         print("Missing Harness intake helper.")
         print(f"Expected bundled script: {_bundled_helper_path()}")
-        print(f"Or user-local helper: {_user_helper_path()}")
+        print(f"Or profile-local helper: {display_hermes_home()}/bin/hermes-harness")
         return 2
     proc = subprocess.run([*command, *argv], check=False)
     return int(proc.returncode)
 
 
 def _setup_harness_cli(parser) -> None:
+    # Keep the public flag surface exact: argparse's default abbreviation would
+    # otherwise continue accepting the removed `--out` spelling for `--output`.
+    parser.allow_abbrev = False
     sub = parser.add_subparsers(dest="harness_action")
 
-    template_p = sub.add_parser("template", help="Print or copy the Harness task intake template")
+    template_p = sub.add_parser("template", help="Print or copy the Harness task intake template", allow_abbrev=False)
     template_p.add_argument("--output", "-o", default="", help="Copy template to this path instead of stdout")
 
-    classify_p = sub.add_parser("classify", help="Classify a task and print advisory Harness routing")
+    classify_p = sub.add_parser("classify", help="Classify a task and print advisory Harness routing", allow_abbrev=False)
     classify_p.add_argument("--text", "-t", default="", help="Task text to classify")
     classify_p.add_argument("--format", choices=("markdown", "json"), default="markdown", help="Output format")
 
-    new_p = sub.add_parser("new", help="Create a new Harness task intake form")
+    new_p = sub.add_parser("new", help="Create a new Harness task intake form", allow_abbrev=False)
     new_p.add_argument("--title", default="", help="Task title")
     new_p.add_argument("--workspace", default="", help="Workspace / repo path")
     new_p.add_argument("--mode", default="", help="Desired mode / permission level")
-    new_p.add_argument("--out", default="", help="Output path or directory")
+    new_p.add_argument("--output", "-o", default="", help="Output path or directory")
     new_p.add_argument("--print-path", action="store_true", help="Print only the created file path")
 
-    check_p = sub.add_parser("check", help="Validate a filled Harness intake form")
+    check_p = sub.add_parser("check", help="Validate a filled Harness intake form", allow_abbrev=False)
     check_p.add_argument("file", help="Intake markdown file")
 
-    prompt_p = sub.add_parser("prompt", help="Render a compact prompt from a filled intake form")
+    prompt_p = sub.add_parser("prompt", help="Render a compact prompt from a filled intake form", allow_abbrev=False)
     prompt_p.add_argument("file", help="Intake markdown file")
     prompt_p.add_argument("--allow-incomplete", action="store_true", help="Render even if required fields are missing")
     prompt_p.add_argument("--output", "-o", default="", help="Write prompt to this file instead of stdout")
     prompt_p.add_argument("--force", action="store_true", help="Overwrite output file if it exists")
 
-    kanban_p = sub.add_parser("kanban", help="Bridge Harness intake into Kanban lifecycle")
+    kanban_p = sub.add_parser("kanban", help="Bridge Harness intake into Kanban lifecycle", allow_abbrev=False)
     kanban_sub = kanban_p.add_subparsers(dest="harness_kanban_action")
 
-    kanban_create = kanban_sub.add_parser("create", help="Create a Kanban triage card from a filled intake form")
+    kanban_create = kanban_sub.add_parser("create", help="Create a Kanban triage card from a filled intake form", allow_abbrev=False)
     kanban_create.add_argument("file", help="Filled intake markdown file")
     kanban_create.add_argument("--assignee", default="architect", help="Kanban assignee/profile (default: architect)")
     kanban_create.add_argument("--workspace", default="", help="Override workspace; defaults to the intake form workspace")
@@ -143,7 +148,7 @@ def _setup_harness_cli(parser) -> None:
     kanban_create.add_argument("--dry-run", action="store_true", help="Print the hermes kanban command instead of running it")
     kanban_create.add_argument("--json", action="store_true", help="Emit JSON from hermes kanban create when running")
 
-    kanban_decompose = kanban_sub.add_parser("decompose", help="Create or print implementation/review child-card commands")
+    kanban_decompose = kanban_sub.add_parser("decompose", help="Create or print implementation/review child-card commands", allow_abbrev=False)
     kanban_decompose.add_argument("task_id", help="Parent Kanban task id")
     kanban_decompose.add_argument("--worker", default="loop-worker", help="Worker profile for implementation card")
     kanban_decompose.add_argument("--reviewer", default="loop-reviewer", help="Reviewer profile for review card")
@@ -152,16 +157,16 @@ def _setup_harness_cli(parser) -> None:
     kanban_decompose.add_argument("--execute", action="store_true", help="Actually create child cards; default is dry-run")
     kanban_decompose.add_argument("--json", action="store_true", help="Emit JSON from hermes kanban create when executing")
 
-    evidence_p = sub.add_parser("evidence", help="Generate a Harness Evidence markdown report for a Kanban task or workspace")
+    evidence_p = sub.add_parser("evidence", help="Generate a Harness Evidence markdown report for a Kanban task or workspace", allow_abbrev=False)
     evidence_p.add_argument("task_id", nargs="?", default="", help="Optional Kanban task id to include via hermes kanban show")
     evidence_p.add_argument("--workspace", default="", help="Repo/workspace to inspect; defaults to cwd")
     evidence_p.add_argument("--output", "-o", default="", help="Write evidence markdown to this file")
 
-    gc_p = sub.add_parser("gc-template", help="Write a weekly Harness GC / drift-review checklist template")
+    gc_p = sub.add_parser("gc-template", help="Write a weekly Harness GC / drift-review checklist template", allow_abbrev=False)
     gc_p.add_argument("--output", "-o", default="", help="Write template to this file instead of stdout")
     gc_p.add_argument("--board", default="hermes-engineering-loop", help="Target board slug to mention in the template")
 
-    migration_p = sub.add_parser("migration-pack", help="Generate cross-agent Harness migration files")
+    migration_p = sub.add_parser("migration-pack", help="Generate cross-agent Harness migration files", allow_abbrev=False)
     migration_p.add_argument("--output-dir", "-o", default=".", help="Repository/directory where pack files should be written")
     migration_p.add_argument("--force", action="store_true", help="Overwrite existing migration-pack files")
     migration_p.add_argument("--json", action="store_true", help="Print written file paths as JSON")
@@ -201,7 +206,7 @@ def _handle_harness_cli(args) -> None:
             value = getattr(args, flag, "")
             if value:
                 argv.extend([f"--{flag}", value])
-        out_value = getattr(args, "out", "")
+        out_value = getattr(args, "output", "")
         if out_value:
             argv.extend(["--output", out_value])
         # The helper already prints the created path for `new`; keep
@@ -626,7 +631,7 @@ HARNESS_ALREADY_PRESENT = re.compile(
 
 PREFLIGHT_NOTICE = """[Harness / Agenting Engineering preflight]\nThis appears to be a non-trivial engineering task. Before implementing, use the harness discipline:\n- define scope, acceptance criteria, risk surface, and rollback plan;\n- inspect the codebase before editing;\n- preserve tests / quality gates as evidence;\n- prefer reusable Skill/Rules/Plugin updates for repeated workflow.\nIf the task is underspecified, ask only for missing information that changes the implementation.\n\nOriginal user request:\n"""
 
-STRICT_NOTICE = """[Harness / Agenting Engineering preflight: intake required]\nThis appears to be a high-risk engineering task. Ask the user to create or fill a Harness intake before implementation:\n  hermes harness new --title \"<task>\" --workspace \"<repo>\" --mode \"Implement changes\" --out /tmp/task-intake.md\n  hermes harness check /tmp/task-intake.md\nProceed only after scope, acceptance criteria, risk surface, and verification evidence are explicit.\n\nOriginal user request:\n"""
+STRICT_NOTICE = """[Harness / Agenting Engineering preflight: intake required]\nThis appears to be a high-risk engineering task. Ask the user to create or fill a Harness intake before implementation:\n  hermes harness new --title \"<task>\" --workspace \"<repo>\" --mode \"Implement changes\" --output /tmp/task-intake.md\n  hermes harness check /tmp/task-intake.md\nProceed only after scope, acceptance criteria, risk surface, and verification evidence are explicit.\n\nOriginal user request:\n"""
 
 
 def _has(pattern: re.Pattern[str], text: str) -> bool:
@@ -778,9 +783,6 @@ def _configured_preflight_mode() -> str:
 
 
 def _preflight_mode() -> str:
-    env_value = os.getenv("HERMES_HARNESS_PREFLIGHT")
-    if env_value is not None:
-        return env_value.strip().lower()
     return _configured_preflight_mode()
 
 
@@ -798,7 +800,7 @@ def _looks_like_engineering_task(text: str) -> bool:
 def _handle_pre_gateway_dispatch(event: Any = None, **_: Any) -> dict[str, str] | None:
     """Soft Level-4 preflight for gateway messages.
 
-    Modes via HERMES_HARNESS_PREFLIGHT:
+    Modes via config.yaml `harness_engineering.preflight_mode`:
       off/0/false/no  -> disabled
       advisory/warn/rewrite (default) -> prepend Harness discipline reminder
       strict -> prepend an intake-required instruction
