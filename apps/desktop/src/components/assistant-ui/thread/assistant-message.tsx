@@ -78,6 +78,16 @@ export const AssistantMessage: FC<{
     s.message.status?.type === 'running' ? '' : messageContentText(s.message.content)
   )
 
+  const statusError = useAuiState(s =>
+    s.message.status?.type === 'incomplete' &&
+    s.message.status.reason === 'error' &&
+    typeof s.message.status.error === 'string'
+      ? s.message.status.error
+      : ''
+  )
+
+  const errorRenderedAsContent = Boolean(statusError && completedText.trim() === statusError.trim())
+
   const previewTargets = useMemo(() => {
     if (!completedText || !/(https?:\/\/|file:\/\/)/i.test(completedText)) {
       return []
@@ -109,6 +119,17 @@ export const AssistantMessage: FC<{
   // are off, so the root carries no listener at all.
   const onDoubleClick = useTapbackDoubleClick(messageId, 'assistant')
 
+  const dismissErrorButton = onDismissError ? (
+    <TooltipIconButton
+      className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
+      onClick={() => onDismissError(messageId)}
+      side="top"
+      tooltip={t.assistant.thread.dismissError}
+    >
+      <XIcon className="size-3.5" />
+    </TooltipIconButton>
+  ) : null
+
   return (
     <MessagePrimitive.Root
       className="group flex w-full min-w-0 max-w-full flex-col gap-0 self-start overflow-hidden"
@@ -121,9 +142,13 @@ export const AssistantMessage: FC<{
       <div
         className="wrap-anywhere min-w-0 max-w-full overflow-hidden text-pretty text-[length:var(--conversation-text-font-size)] leading-(--dt-line-height) text-foreground"
         data-slot="aui_assistant-message-content"
+        role={errorRenderedAsContent ? 'alert' : undefined}
       >
         {/* Todos render in the composer status stack now, not inline. */}
         <MessagePrimitive.Parts components={MESSAGE_PARTS_COMPONENTS} />
+        {errorRenderedAsContent && dismissErrorButton && (
+          <div className="mt-1 flex justify-end">{dismissErrorButton}</div>
+        )}
         {isPlaceholder ? <ResponseLoadingIndicator /> : isRunning && <StreamStallIndicator />}
         {previewTargets.length > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
@@ -132,24 +157,17 @@ export const AssistantMessage: FC<{
             ))}
           </div>
         )}
-        <MessagePrimitive.Error>
-          <ErrorPrimitive.Root
-            className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
-            role="alert"
-          >
-            <ErrorPrimitive.Message className="min-w-0 flex-1" />
-            {onDismissError && (
-              <TooltipIconButton
-                className="-my-0.5 shrink-0 text-current opacity-70 hover:opacity-100"
-                onClick={() => onDismissError(messageId)}
-                side="top"
-                tooltip={t.assistant.thread.dismissError}
-              >
-                <XIcon className="size-3.5" />
-              </TooltipIconButton>
-            )}
-          </ErrorPrimitive.Root>
-        </MessagePrimitive.Error>
+        {!errorRenderedAsContent && (
+          <MessagePrimitive.Error>
+            <ErrorPrimitive.Root
+              className="mt-1.5 flex items-start gap-1.5 text-[0.78rem] leading-5 text-[color-mix(in_srgb,var(--dt-destructive)_78%,var(--ui-text-secondary))]"
+              role="alert"
+            >
+              <ErrorPrimitive.Message className="min-w-0 flex-1" />
+              {dismissErrorButton}
+            </ErrorPrimitive.Root>
+          </MessagePrimitive.Error>
+        )}
       </div>
       {hasVisibleText && !isInterim && (
         <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />

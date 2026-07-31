@@ -131,6 +131,13 @@ function assistantErrorMessage(error: string): ThreadMessage {
   } as ThreadMessage
 }
 
+function assistantErrorMessageWithContent(error: string): ThreadMessage {
+  return {
+    ...assistantErrorMessage(error),
+    content: [{ type: 'text', text: error }]
+  } as ThreadMessage
+}
+
 function assistantReasoningMessage(text: string, running = false): ThreadMessage {
   return {
     id: 'assistant-reasoning-1',
@@ -458,9 +465,15 @@ function IntroHarness() {
   )
 }
 
-function DismissibleErrorHarness({ onDismissError }: { onDismissError: (messageId: string) => void }) {
+function DismissibleErrorHarness({
+  message = assistantErrorMessage('OpenRouter rejected the request (403).'),
+  onDismissError
+}: {
+  message?: ThreadMessage
+  onDismissError: (messageId: string) => void
+}) {
   const runtime = useExternalStoreRuntime<ThreadMessage>({
-    messages: [assistantErrorMessage('OpenRouter rejected the request (403).')],
+    messages: [message],
     isRunning: false,
     onNew: async () => {}
   })
@@ -547,6 +560,26 @@ describe('assistant-ui streaming renderer', () => {
     render(<MessageHarness message={assistantErrorMessage('OpenRouter rejected the request (403).')} />)
 
     expect(screen.getByRole('alert').textContent).toContain('OpenRouter rejected the request (403).')
+  })
+
+  it('renders a durable terminal error text part once without duplicating the status error', () => {
+    const error = '⚠️ Provider authentication failed. Check the configured credentials.'
+    const { container } = render(<MessageHarness message={assistantErrorMessageWithContent(error)} />)
+
+    expect(container.textContent?.split(error)).toHaveLength(2)
+    expect(screen.getByRole('alert').textContent).toContain(error)
+  })
+
+  it('keeps durable terminal errors dismissible', () => {
+    const error = '⚠️ Provider authentication failed. Check the configured credentials.'
+    const onDismissError = vi.fn()
+    render(
+      <DismissibleErrorHarness message={assistantErrorMessageWithContent(error)} onDismissError={onDismissError} />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss error' }))
+
+    expect(onDismissError).toHaveBeenCalledWith('assistant-error-1')
   })
 
   it('omits the dismiss control when no onDismissError handler is supplied', () => {

@@ -506,7 +506,15 @@ export function useMessageStream({
           const settled = { ...message, pending: false, interim: false }
 
           if (completionError && !keepFailedPartialText) {
-            return { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
+            // Keep a real text part for terminal failures. Removing the last
+            // part while assistant-ui still has an index-0 subscriber races
+            // its child-scope lookup and can leave the error row permanently
+            // blank after the boundary catches the transient throw.
+            return {
+              ...settled,
+              error: completionError,
+              parts: mergeFinalAssistantText(message.parts, completionError)
+            }
           }
 
           return {
@@ -519,7 +527,7 @@ export function useMessageStream({
         const newAssistantFromCompletion = (): ChatMessage => ({
           id: `assistant-${Date.now()}`,
           role: 'assistant',
-          parts: completionError && !keepFailedPartialText ? [] : [assistantTextPart(finalText)],
+          parts: [assistantTextPart(completionError && !keepFailedPartialText ? completionError : finalText)],
           branchGroupId: state.pendingBranchGroup ?? undefined,
           ...(completionError && { error: completionError })
         })
