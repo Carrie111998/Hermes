@@ -46,6 +46,15 @@ _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
+# Canonical media-routing extension sets. These decide which adapter method a
+# delivered file goes to (send_video / send_image_file / send_document), and
+# cron's out-of-band delivery must route identically — a set that drifts here
+# silently changes how the same file is delivered depending on whether it came
+# from a live turn or a scheduled job. Defined once, imported by
+# cron.scheduler, and previously duplicated three times in this repo.
+_VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
+_IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+
 
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
@@ -4260,7 +4269,6 @@ class BasePlatformAdapter(ABC):
         must see a failure notice instead of a silent drop (#66797).
         """
         ext = Path(media_path).suffix.lower()
-        _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
             text = "⚠️ Couldn't deliver the audio attachment."
         elif ext in _VIDEO_EXTS:
@@ -6121,9 +6129,6 @@ class BasePlatformAdapter(ABC):
 
 
                 # Send extracted media files — route by file type
-                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
-
                 # Partition images out of media_files + local_files so they
                 # can be sent as a single batch (Signal RPC). When
                 # ``[[as_document]]`` was set on the original response, image
