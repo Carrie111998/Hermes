@@ -49,7 +49,12 @@ _SECRET_SOURCE_VALUES_BY_HOME: dict[str, dict[str, str]] = {}
 # in-process cache prevents redundant network calls, but the print, the
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
+# Cache metadata is shared by normal startup and multiplex profile hydration.
+# Keep the global lock short: source fetches can involve a network/CLI timeout,
+# so a separate lock serializes only concurrent hydration for the *same* home.
 _SECRET_SOURCE_CACHE_LOCK = threading.RLock()
+_SECRET_SOURCE_HYDRATION_LOCKS: dict[str, threading.Lock] = {}
+_SECRET_SOURCE_CACHE_GENERATION = 0
 
 
 def get_secret_source(env_var: str) -> str | None:
@@ -62,7 +67,8 @@ def get_secret_source(env_var: str) -> str | None:
     persistence may store it to explain the origin of a borrowed secret, but
     must never treat it as authorization to persist the raw value.
     """
-    return _SECRET_SOURCES.get(env_var)
+    with _SECRET_SOURCE_CACHE_LOCK:
+        return _SECRET_SOURCES.get(env_var)
 
 
 def get_secret_source_values(
@@ -70,7 +76,8 @@ def get_secret_source_values(
 ) -> dict[str, str]:
     """Return the external-secret value snapshot for ``hermes_home``."""
     home_key = str(Path(hermes_home).resolve())
-    return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
+    with _SECRET_SOURCE_CACHE_LOCK:
+        return dict(_SECRET_SOURCE_VALUES_BY_HOME.get(home_key, {}))
 
 
 def hydrate_profile_secret_sources(
@@ -79,32 +86,56 @@ def hydrate_profile_secret_sources(
     """Resolve one profile's configured sources without mutating ``os.environ``.
 
     Multiplex gateways can route a first turn to a secondary profile that has
-    never run the process-global dotenv startup path.  Resolve that profile's
+    never run the process-global dotenv startup path. Resolve that profile's
     sources against a private mapping seeded from its own ``.env`` and
     ``.op.env`` bootstrap file, then record the usual per-home snapshot for
     ``build_profile_secret_scope()``.
 
     Fail-open and once-per-home semantics intentionally mirror
-    ``_apply_external_secret_sources``.  The returned mapping contains only
+    ``_apply_external_secret_sources``. The returned mapping contains only
     values actually contributed by external sources, never the profile's
     plaintext ``.env`` entries.
     """
-    with _SECRET_SOURCE_CACHE_LOCK:
-        return _hydrate_profile_secret_sources(Path(hermes_home))
-
-
-def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
-    """Locked implementation for :func:`hydrate_profile_secret_sources`."""
+    home = Path(hermes_home)
     home_key = str(home.resolve())
-    if home_key in _APPLIED_HOMES:
-        return get_secret_source_values(home)
 
+    # Do not hold the metadata lock while a source fetches: different cold
+    # profiles can resolve concurrently, while same-home calls share one fetch.
+    while True:
+        with _SECRET_SOURCE_CACHE_LOCK:
+            if home_key in _APPLIED_HOMES:
+                return get_secret_source_values(home)
+            home_lock = _SECRET_SOURCE_HYDRATION_LOCKS.setdefault(
+                home_key, threading.Lock()
+            )
+
+        with home_lock:
+            with _SECRET_SOURCE_CACHE_LOCK:
+                if home_key in _APPLIED_HOMES:
+                    return get_secret_source_values(home)
+                generation = _SECRET_SOURCE_CACHE_GENERATION
+
+            values, reset_during_fetch = _hydrate_profile_secret_sources(
+                home, home_key, generation
+            )
+            if not reset_during_fetch:
+                return values
+
+
+def _hydrate_profile_secret_sources(
+    home: Path, home_key: str, generation: int
+) -> tuple[dict[str, str], bool]:
+    """Fetch a cold profile outside the metadata lock.
+
+    Returns ``(values, reset_during_fetch)``. A reset invalidates an in-flight
+    fetch so the caller retries against the post-reset cache generation.
+    """
     try:
         cfg = _load_secrets_config(home)
     except Exception:  # noqa: BLE001 — external sources must not block routing
-        return {}
+        return {}, False
     if not cfg:
-        return {}
+        return {}, False
 
     try:
         from agent.secret_scope import _is_global_env, load_env_file
@@ -118,29 +149,35 @@ def _hydrate_profile_secret_sources(home: Path) -> dict[str, str]:
         local_env.update(load_env_file(home / ".env"))
         # Mirror load_hermes_dotenv(): .op.env supplies the 1Password
         # bootstrap token for headless/cold-profile resolution, but never
-        # overrides profile .env values.  Keep it local so neither the token
+        # overrides profile .env values. Keep it local so neither the token
         # nor resolved source values escape into the shared process environment.
         for name, value in load_env_file(home / ".op.env").items():
             local_env.setdefault(name, value)
         local_env["HERMES_HOME"] = str(home)
         report = apply_all(cfg, home, environ=local_env)
     except Exception:  # noqa: BLE001 — preserve fail-open startup behavior
-        return {}
+        return {}, False
 
     if not report.sources:
-        return {}
+        return {}, False
 
-    _APPLIED_HOMES.add(home_key)
-    values: dict[str, str] = {}
-    for name, applied in report.provenance.items():
-        value = local_env.get(name)
-        if value is None:
-            continue
-        _SECRET_SOURCES[name] = applied.source
-        values[name] = value
-    if values:
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
-    return dict(values)
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if generation != _SECRET_SOURCE_CACHE_GENERATION:
+            return {}, True
+        if home_key in _APPLIED_HOMES:
+            return get_secret_source_values(home), False
+
+        values: dict[str, str] = {}
+        for name, applied in report.provenance.items():
+            value = local_env.get(name)
+            if value is None:
+                continue
+            _SECRET_SOURCES[name] = applied.source
+            values[name] = value
+        if values:
+            _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        _APPLIED_HOMES.add(home_key)
+        return dict(values), False
 
 
 def reset_secret_source_cache() -> None:
@@ -153,9 +190,12 @@ def reset_secret_source_cache() -> None:
     next call to re-pull — useful for tests, and for long-running processes
     that want to refresh after a config change.
     """
-    _APPLIED_HOMES.clear()
-    _SECRET_SOURCES.clear()
-    _SECRET_SOURCE_VALUES_BY_HOME.clear()
+    global _SECRET_SOURCE_CACHE_GENERATION
+    with _SECRET_SOURCE_CACHE_LOCK:
+        _SECRET_SOURCE_CACHE_GENERATION += 1
+        _APPLIED_HOMES.clear()
+        _SECRET_SOURCES.clear()
+        _SECRET_SOURCE_VALUES_BY_HOME.clear()
 
 
 def format_secret_source_suffix(env_var: str) -> str:
@@ -473,8 +513,10 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     (tests, long-running processes after a config change).
     """
     home_key = str(Path(home_path).resolve())
-    if home_key in _APPLIED_HOMES:
-        return
+    with _SECRET_SOURCE_CACHE_LOCK:
+        if home_key in _APPLIED_HOMES:
+            return
+        generation = _SECRET_SOURCE_CACHE_GENERATION
 
     try:
         cfg = _load_secrets_config(home_path)
@@ -506,28 +548,33 @@ def _apply_external_secret_sources(home_path: Path) -> None:
         # mid-process takes effect on the next call.
         return
 
-    # A real fetch attempt happened (success OR error).  Mark the home now
-    # so the 3-5 import-time load_hermes_dotenv() calls per startup don't
-    # re-fetch / re-print — error retries within one process are opt-in via
-    # reset_secret_source_cache().  Marking AFTER the attempt (not before,
-    # see #40597) is what lets the earlier failure paths stay retryable.
-    _APPLIED_HOMES.add(home_key)
-
+    # Re-run the ASCII sanitization pass: vault values are user-supplied and
+    # might have the same copy-paste corruption as a manually edited .env.
     if report.applied_any:
-        # Re-run the ASCII sanitization pass: vault values are
-        # user-supplied and might have the same copy-paste corruption as
-        # a manually edited .env (see #6843).
         _sanitize_loaded_credentials()
-        # Remember where each var came from so setup / `hermes model`
-        # flows can label detected credentials with "(from Bitwarden)" /
-        # "(from 1Password)" — otherwise users see "credentials ✓" with
-        # no hint the value came from a vault rather than .env.
-        values: dict[str, str] = {}
-        for name, applied in report.provenance.items():
-            _SECRET_SOURCES[name] = applied.source
-            if name in os.environ:
-                values[name] = os.environ[name]
-        _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+
+    with _SECRET_SOURCE_CACHE_LOCK:
+        # A concurrent reset invalidates cache metadata for this completed
+        # fetch. Leave it retryable rather than re-marking stale state.
+        if generation != _SECRET_SOURCE_CACHE_GENERATION:
+            return
+        if home_key in _APPLIED_HOMES:
+            return
+
+        # A real fetch attempt happened (success OR error). Mark the home now
+        # so repeated import-time loads do not re-fetch / re-print. Marking
+        # after the attempt keeps malformed/disabled configs retryable.
+        _APPLIED_HOMES.add(home_key)
+
+        if report.applied_any:
+            # Remember where each var came from so setup / `hermes model`
+            # flows can label detected credentials with their source.
+            values: dict[str, str] = {}
+            for name, applied in report.provenance.items():
+                _SECRET_SOURCES[name] = applied.source
+                if name in os.environ:
+                    values[name] = os.environ[name]
+            _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
 
     for src in report.sources:
         if src.applied:

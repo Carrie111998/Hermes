@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -449,3 +450,100 @@ def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypa
 
     # Coerced to the 300s default rather than raising ValueError.
     assert captured["cache_ttl_seconds"] == 300
+
+
+def test_cold_profile_hydration_allows_distinct_homes_to_fetch_concurrently(
+    tmp_path, monkeypatch
+):
+    """A slow source for one cold profile must not stall another profile."""
+    from types import SimpleNamespace
+
+    from agent.secret_sources import registry
+
+    homes = [tmp_path / "alpha", tmp_path / "beta"]
+    for home in homes:
+        home.mkdir()
+    monkeypatch.setattr(
+        env_loader, "_load_secrets_config", lambda _home: {"fake": {"enabled": True}}
+    )
+    fetch_barrier = threading.Barrier(2, timeout=2)
+
+    def _fake_apply_all(_cfg, home, *, environ):
+        fetch_barrier.wait()
+        key = f"{home.name.upper()}_API_KEY"
+        environ[key] = f"{home.name}-only"
+        return SimpleNamespace(
+            sources=[SimpleNamespace()],
+            provenance={key: SimpleNamespace(source="fake")},
+        )
+
+    monkeypatch.setattr(registry, "apply_all", _fake_apply_all)
+    results: dict[str, dict[str, str]] = {}
+    errors: list[BaseException] = []
+
+    def _hydrate(home):
+        try:
+            results[home.name] = env_loader.hydrate_profile_secret_sources(home)
+        except BaseException as exc:  # test thread must report failures
+            errors.append(exc)
+
+    workers = [threading.Thread(target=_hydrate, args=(home,)) for home in homes]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=5)
+
+    assert not errors
+    assert all(not worker.is_alive() for worker in workers)
+    assert results == {
+        "alpha": {"ALPHA_API_KEY": "alpha-only"},
+        "beta": {"BETA_API_KEY": "beta-only"},
+    }
+
+
+def test_reset_during_cold_profile_hydration_retries_for_a_complete_snapshot(
+    tmp_path, monkeypatch
+):
+    """A reset cannot leave a home marked applied with no snapshot."""
+    from types import SimpleNamespace
+
+    from agent.secret_sources import registry
+
+    home = tmp_path / "secondary"
+    home.mkdir()
+    monkeypatch.setattr(
+        env_loader, "_load_secrets_config", lambda _home: {"fake": {"enabled": True}}
+    )
+    first_fetch_started = threading.Event()
+    release_first_fetch = threading.Event()
+    calls = {"count": 0}
+
+    def _fake_apply_all(_cfg, _home, *, environ):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            first_fetch_started.set()
+            assert release_first_fetch.wait(timeout=5)
+        environ["TEST_PROVIDER_API_KEY"] = "profile-only"
+        return SimpleNamespace(
+            sources=[SimpleNamespace()],
+            provenance={
+                "TEST_PROVIDER_API_KEY": SimpleNamespace(source="fake")
+            },
+        )
+
+    monkeypatch.setattr(registry, "apply_all", _fake_apply_all)
+    result: dict[str, str] = {}
+
+    worker = threading.Thread(
+        target=lambda: result.update(env_loader.hydrate_profile_secret_sources(home))
+    )
+    worker.start()
+    assert first_fetch_started.wait(timeout=5)
+    env_loader.reset_secret_source_cache()
+    release_first_fetch.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert calls["count"] == 2
+    assert result == {"TEST_PROVIDER_API_KEY": "profile-only"}
+    assert env_loader.get_secret_source_values(home) == result
