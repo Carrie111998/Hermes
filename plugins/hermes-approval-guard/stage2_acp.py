@@ -176,6 +176,32 @@ def _store_decision(
         logger.debug("Failed to store ACP decision: %s", exc)
 
 
+def _kill_review_process(proc: subprocess.Popen) -> Tuple[str, str]:
+    """Kill a timed-out review process and drain its remaining output.
+
+    POSIX: kill the whole process group so ``hermes chat`` grandchildren
+    can't be orphaned (subprocess.run only kills the direct child).
+    Windows has no killpg/SIGKILL — fall back to killing the direct child.
+    """
+    killpg = getattr(_os, "killpg", None)
+    sigkill = getattr(signal, "SIGKILL", None)
+    try:
+        if killpg is not None:
+            killpg(_os.getpgid(proc.pid), signal.SIGTERM)
+        else:
+            proc.terminate()
+        try:
+            return proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            if killpg is not None and sigkill is not None:
+                killpg(_os.getpgid(proc.pid), sigkill)
+            else:
+                proc.kill()
+            return proc.communicate()
+    except (ProcessLookupError, OSError):
+        return "", ""
+
+
 def acp_agent_review(
     tool_name: str,
     args: Dict[str, Any],
@@ -246,6 +272,13 @@ def acp_agent_review(
         # process group on timeout — subprocess.run only kills the direct
         # child, leaving grandchild processes (e.g. hermes chat subprocesses)
         # orphaned.
+        # Strip HERMES_YOLO_MODE from the child env: tools/approval freezes
+        # it at import time, so inheriting it from a --yolo parent gateway
+        # would let the reviewer bypass every approval gate. The reviewer
+        # is additionally restricted to the read-only session_search
+        # toolset via the -t flag in the argv below.
+        child_env = dict(_os.environ)
+        child_env.pop("HERMES_YOLO_MODE", None)
         proc = subprocess.Popen(
             [
                 "hermes", "chat", "-q", review_prompt,
@@ -256,21 +289,12 @@ def acp_agent_review(
             stderr=subprocess.PIPE,
             text=True,
             start_new_session=True,
-            env={**_os.environ},  # No YOLO_MODE — reviewer must not bypass approval
+            env=child_env,
         )
         try:
             stdout, stderr = proc.communicate(timeout=timeout + 5)
         except subprocess.TimeoutExpired:
-            # Kill entire process group so no orphans survive
-            try:
-                _os.killpg(_os.getpgid(proc.pid), signal.SIGTERM)
-                try:
-                    stdout, stderr = proc.communicate(timeout=3)
-                except subprocess.TimeoutExpired:
-                    _os.killpg(_os.getpgid(proc.pid), signal.SIGKILL)
-                    stdout, stderr = proc.communicate()
-            except (ProcessLookupError, OSError):
-                stdout, stderr = "", ""
+            _kill_review_process(proc)
             raise  # Re-raise so the outer except block below handles it
 
         output = stdout.strip()
