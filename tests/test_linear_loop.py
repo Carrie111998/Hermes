@@ -163,6 +163,9 @@ class FakeLinear:
     def __init__(self, issues):
         self.issues = {issue.key: issue for issue in issues}
         self.comments: list[tuple[str, str]] = []
+        #: Commentaires deja presents sur Linear avant le tick (par issue id),
+        #: pour simuler un historique que la boucle n'a pas ecrit elle-meme.
+        self.preexisting: dict[str, list[str]] = {}
         self.updates: list[dict] = []
         self.labels = {
             name: f"label-{name}"
@@ -179,12 +182,23 @@ class FakeLinear:
             linear_loop.STATE_DONE: "state-done",
         }
 
+    def issue_comment_bodies(self, issue_id):
+        return self.preexisting.get(issue_id, []) + [
+            body for posted_id, body in self.comments if posted_id == issue_id
+        ]
+
     def __call__(self, payload):
         query = payload["query"]
         variables = payload.get("variables") or {}
         if "commentCreate" in query:
             self.comments.append((variables["input"]["issueId"], variables["input"]["body"]))
             return {"data": {"commentCreate": {"success": True}}}
+        if "comments(" in query:
+            bodies = self.issue_comment_bodies(variables["id"])
+            return {"data": {"issue": {"comments": {
+                "nodes": [{"body": body} for body in bodies],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }}}}
         if "issueUpdate" in query:
             self.updates.append({"id": variables["id"], **variables["input"]})
             return {"data": {"issueUpdate": {"success": True}}}
@@ -468,6 +482,401 @@ def test_empty_backlog_stays_silent(tmp_path):
 # ---------------------------------------------------------------------------
 # Tick — closeout
 # ---------------------------------------------------------------------------
+
+
+def test_closeout_comment_contains_the_exact_branch_pr_sha_and_verdict():
+    comment = linear_loop.closeout_comment(
+        key="HER-96",
+        assignee="hermes-code-a",
+        branch="agent/her-96-truth",
+        pull_request="https://github.com/nousresearch/hermes-agent/pull/96",
+        candidate_sha="abcdef123456",
+        verdict="APPROVE",
+        summary="Tests verts.",
+        marker="linear-loop:closeout:HER-96:abcdef123456:APPROVE",
+    )
+
+    assert "Triplet de closeout : {branche/PR: `agent/her-96-truth` / `https://github.com/nousresearch/hermes-agent/pull/96`, SHA candidat: `abcdef123456`, verdict: `APPROVE`}" in comment
+    assert "<!-- linear-loop:closeout:HER-96:abcdef123456:APPROVE -->" in comment
+
+
+def test_new_candidate_sha_refuses_stale_verdict_and_does_not_ask_for_merge(tmp_path):
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_stale", "HER-206 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-206", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    state_path = linear_loop.mission_state_path(config, "HER-206")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({
+        "branch": "agent/her-200-x",
+        "verdict": "APPROVE",
+        # SHA complet et bien formé, mais qui n'est pas le candidat actuel.
+        "for_sha": "a" * 40,
+    }))
+
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), FakeKanban([done])
+    )
+
+    assert report.skipped["HER-206"] == "verdict stale"
+    assert "À toi de jouer" not in report.render()
+    assert linear.comments == []
+
+
+def test_replaying_a_closeout_tick_does_not_duplicate_its_linear_comment(tmp_path):
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_once", "HER-207 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-207", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+
+    linear_loop.run_tick(config, linear_loop.LinearClient("k", transport=linear), kanban)
+    done.status = "done"  # simule un retry apres echec d'archivage.
+    linear_loop.run_tick(config, linear_loop.LinearClient("k", transport=linear), kanban)
+
+    assert len(linear.comments) == 1
+    assert "<!-- linear-loop:closeout:HER-207:" in linear.comments[0][1]
+
+
+def repo_head(repo):
+    """Le SHA complet (40 hex) du HEAD d'un worktree de test."""
+    import subprocess
+
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo,
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_full_sha_verdict_bound_to_current_head_authorizes_closeout(tmp_path):
+    """Un verdict lié au SHA complet du candidat courant doit passer le closeout."""
+    repo = build_finished_repo(tmp_path)
+    head = repo_head(repo)
+    assert len(head) == 40
+    done = FakeTask("t_ok", "HER-220 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-220", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    state_path = linear_loop.mission_state_path(config, "HER-220")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"verdict": "APPROVE", "for_sha": head}))
+    kanban = FakeKanban([done])
+
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert "HER-220" not in report.skipped
+    assert len(linear.comments) == 1
+    assert f"SHA candidat: `{head}`" in linear.comments[0][1]
+    assert f"<!-- linear-loop:closeout:HER-220:{head}:APPROVE -->" in linear.comments[0][1]
+    assert kanban.archived == ["t_ok"]
+
+
+def test_short_prefix_of_current_head_cannot_authorize_closeout(tmp_path):
+    """Un préfixe court (même exact) est ambigu : il ne lie aucun verdict."""
+    repo = build_finished_repo(tmp_path)
+    head = repo_head(repo)
+    done = FakeTask("t_short", "HER-221 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-221", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    state_path = linear_loop.mission_state_path(config, "HER-221")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"verdict": "APPROVE", "for_sha": head[:7]}))
+    kanban = FakeKanban([done])
+
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert report.skipped["HER-221"] == "verdict unbound"
+    assert linear.comments == []
+    assert kanban.archived == []
+
+
+def test_unbound_approve_verdict_fails_closed(tmp_path):
+    """Un APPROVE sans for_sha ne se rattache à rien : aucun writeback."""
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_unbound", "HER-222 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-222", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    state_path = linear_loop.mission_state_path(config, "HER-222")
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"verdict": "APPROVE"}))
+    kanban = FakeKanban([done])
+
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert report.skipped["HER-222"] == "verdict unbound"
+    assert linear.comments == []
+    assert kanban.archived == []
+
+
+def test_record_verdict_is_the_producer_of_the_binding_end_to_end(tmp_path):
+    """record_mission -> record_verdict -> tick : le contrat vit hors des tests."""
+    config = make_config(tmp_path)
+    repo = build_finished_repo(tmp_path)
+    head = repo_head(repo)
+    linear_loop.record_mission(
+        config, make_issue("HER-223"), repo=str(repo),
+        branch="agent/her-200-x", worktree=repo,
+    )
+
+    linear_loop.record_verdict(config, "HER-223", "APPROVE", head)
+
+    state = linear_loop.read_mission(config, "HER-223")
+    assert state["verdict"] == "APPROVE"
+    assert state["for_sha"] == head
+
+    done = FakeTask("t_e2e", "HER-223 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-223", labels=(linear_loop.LABEL_BUILDING,))])
+    kanban = FakeKanban([done])
+    report = linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert "HER-223" not in report.skipped
+    assert len(linear.comments) == 1
+    assert kanban.archived == ["t_e2e"]
+
+
+def test_record_verdict_refuses_malformed_sha_or_unknown_mission(tmp_path):
+    config = make_config(tmp_path)
+    repo = build_finished_repo(tmp_path)
+    head = repo_head(repo)
+    linear_loop.record_mission(
+        config, make_issue("HER-224"), repo=str(repo),
+        branch="agent/her-200-x", worktree=repo,
+    )
+
+    with pytest.raises(linear_loop.LoopError, match="40"):
+        linear_loop.record_verdict(config, "HER-224", "APPROVE", head[:7])
+    with pytest.raises(linear_loop.LoopError, match="40"):
+        linear_loop.record_verdict(config, "HER-224", "APPROVE", "z" * 40)
+    with pytest.raises(linear_loop.LoopError, match="mission"):
+        linear_loop.record_verdict(config, "HER-999", "APPROVE", head)
+    assert "verdict" not in (linear_loop.read_mission(config, "HER-224") or {})
+
+
+def test_cli_verdict_command_records_the_binding(tmp_path, monkeypatch):
+    """Le producteur est invocable en vrai : la CLI écrit le rattachement exact."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = make_config(tmp_path)
+    repo = build_finished_repo(tmp_path)
+    head = repo_head(repo)
+    linear_loop.record_mission(
+        config, make_issue("HER-225"), repo=str(repo),
+        branch="agent/her-200-x", worktree=repo,
+    )
+
+    rc = linear_loop.main(
+        ["verdict", "--issue", "HER-225", "--verdict", "APPROVE", "--for-sha", head]
+    )
+
+    assert rc == 0
+    state = linear_loop.read_mission(config, "HER-225")
+    assert state["verdict"] == "APPROVE"
+    assert state["for_sha"] == head
+
+
+class OutageLinear(FakeLinear):
+    """commentCreate passe, issueUpdate tombe : la fenêtre de crash du closeout."""
+
+    def __init__(self, issues):
+        super().__init__(issues)
+        self.fail_updates = True
+
+    def __call__(self, payload):
+        if self.fail_updates and "issueUpdate" in payload["query"]:
+            return {"errors": [{"message": "gateway timeout"}]}
+        return super().__call__(payload)
+
+
+def test_comment_is_not_duplicated_when_issue_update_fails_midway(tmp_path):
+    """Si issueUpdate échoue après le commentaire, le rejeu ne reposte pas."""
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_crash", "HER-226 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = OutageLinear([make_issue("HER-226", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+
+    with pytest.raises(linear_loop.LoopError):
+        linear_loop.run_tick(
+            config, linear_loop.LinearClient("k", transport=linear), kanban
+        )
+    assert len(linear.comments) == 1
+    assert kanban.archived == []
+
+    linear.fail_updates = False
+    linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert len(linear.comments) == 1
+    assert kanban.archived == ["t_crash"]
+
+
+def test_crash_after_comment_accepted_but_before_marker_write_does_not_duplicate(
+    tmp_path, monkeypatch
+):
+    """La fenêtre résiduelle : Linear a le commentaire, le disque n'a pas le marqueur.
+
+    Le processus meurt entre commentCreate et la persistance locale. Au rejeu,
+    l'état local ne connaît pas le marqueur : la boucle doit relire les
+    commentaires existants sur Linear et reconnaître le sien au lieu de reposter.
+    """
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_window", "HER-227 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = FakeLinear([make_issue("HER-227", labels=(linear_loop.LABEL_BUILDING,))])
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+
+    def dying_write(config, key, state):
+        raise OSError("kill -9 avant la persistance du marqueur")
+
+    monkeypatch.setattr(linear_loop, "write_mission_state", dying_write)
+    with pytest.raises(OSError):
+        linear_loop.run_tick(
+            config, linear_loop.LinearClient("k", transport=linear), kanban
+        )
+
+    # Linear a accepté le commentaire ; l'état local ne le sait pas.
+    assert len(linear.comments) == 1
+    assert not (linear_loop.read_mission(config, "HER-227") or {}).get("closeout_markers")
+
+    monkeypatch.undo()
+    linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert len(linear.comments) == 1
+    assert kanban.archived == ["t_window"]
+    state = linear_loop.read_mission(config, "HER-227")
+    assert any(marker.startswith("linear-loop:closeout:HER-227:")
+               for marker in state["closeout_markers"])
+
+
+class PagedLinear(FakeLinear):
+    """Sert les commentaires un par page, pour exercer la pagination réelle."""
+
+    def __call__(self, payload):
+        query = payload["query"]
+        variables = payload.get("variables") or {}
+        if "comments(" in query:
+            bodies = self.issue_comment_bodies(variables["id"])
+            start = int(variables.get("after") or 0)
+            has_next = start + 1 < len(bodies)
+            return {"data": {"issue": {"comments": {
+                "nodes": [{"body": body} for body in bodies[start:start + 1]],
+                "pageInfo": {
+                    "hasNextPage": has_next,
+                    "endCursor": str(start + 1) if has_next else None,
+                },
+            }}}}
+        return super().__call__(payload)
+
+
+def test_marker_on_a_later_comment_page_still_prevents_reposting(tmp_path):
+    """Le marqueur peut être enfoui derrière d'autres commentaires : il faut paginer."""
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_paged", "HER-228 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    issue = make_issue("HER-228", labels=(linear_loop.LABEL_BUILDING,))
+    linear = PagedLinear([issue])
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+    head = repo_head(repo)
+    marker = linear_loop.closeout_marker("HER-228", head, "PENDING_REVIEW")
+    linear.preexisting[issue.id] = [
+        "Discussion humaine sans rapport.",
+        "Encore un commentaire intermédiaire.",
+        f"Mission autonome terminée.\n\n<!-- {marker} -->",
+    ]
+
+    linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    assert linear.comments == []
+    assert kanban.archived == ["t_paged"]
+    state = linear_loop.read_mission(config, "HER-228")
+    assert marker in state["closeout_markers"]
+
+
+def test_marker_quoted_in_prose_is_not_proof_of_closeout(tmp_path):
+    """Un résumé qui cite le texte du marqueur ne vaut pas le marqueur canonique."""
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_decoy", "HER-229 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    issue = make_issue("HER-229", labels=(linear_loop.LABEL_BUILDING,))
+    linear = FakeLinear([issue])
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+    head = repo_head(repo)
+    marker = linear_loop.closeout_marker("HER-229", head, "PENDING_REVIEW")
+    linear.preexisting[issue.id] = [
+        f"Le prochain closeout portera le marqueur {marker}, à surveiller.",
+        f"citation en ligne : <!-- {marker} --> au milieu d'une phrase.",
+    ]
+
+    linear_loop.run_tick(
+        config, linear_loop.LinearClient("k", transport=linear), kanban
+    )
+
+    # Aucune des citations n'est la forme canonique : la boucle poste pour de vrai.
+    assert len(linear.comments) == 1
+    assert f"<!-- {marker} -->" in linear.comments[0][1]
+
+
+class UnreadableCommentsLinear(FakeLinear):
+    """La relecture des commentaires tombe en erreur GraphQL."""
+
+    def __call__(self, payload):
+        if "comments(" in payload["query"]:
+            return {"errors": [{"message": "internal error"}]}
+        return super().__call__(payload)
+
+
+def test_comment_read_failure_fails_closed_without_posting(tmp_path):
+    """Si on ne peut pas prouver l'absence du marqueur, on ne poste rien."""
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_blind", "HER-230 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    linear = UnreadableCommentsLinear(
+        [make_issue("HER-230", labels=(linear_loop.LABEL_BUILDING,))]
+    )
+    config = make_config(tmp_path)
+    kanban = FakeKanban([done])
+
+    with pytest.raises(linear_loop.LoopError):
+        linear_loop.run_tick(
+            config, linear_loop.LinearClient("k", transport=linear), kanban
+        )
+
+    assert linear.comments == []
+    assert kanban.archived == []
+
+
+def test_every_notification_is_prefixed_with_its_linear_team(tmp_path):
+    repo = build_finished_repo(tmp_path)
+    done = FakeTask("t_prefix", "HER-208 — corriger", "hermes-code-a", "done",
+                    workspace_path=str(repo), branch_name="agent/her-200-x")
+    report = linear_loop.run_tick(
+        make_config(tmp_path), linear_loop.LinearClient("k", transport=FakeLinear([make_issue("HER-208")])),
+        FakeKanban([done]),
+    )
+
+    assert report.messages
+    assert all(message.startswith("[HER]") for message in report.messages)
 
 
 def build_finished_repo(tmp_path):

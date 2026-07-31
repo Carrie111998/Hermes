@@ -75,6 +75,15 @@ MISSION_MAX_RUNTIME_SECONDS = 3600
 _KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-[1-9][0-9]*)\b")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
+#: Seule forme de SHA qui lie un verdict : l'identifiant complet de l'objet
+#: commit. Un prefixe court est ambigu (plusieurs objets peuvent le partager)
+#: et ne prouve pas que la revue portait sur le candidat actuel.
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+#: Verdict implicite d'une mission jamais revue : le closeout peut avoir lieu
+#: (Jean relit lui-meme), mais tout autre verdict doit citer son SHA exact.
+VERDICT_PENDING = "PENDING_REVIEW"
+
 #: Statuts qui retiennent une issue : tant qu'une carte est dans un de ces
 #: etats, la boucle ne redistribue pas son issue. ``blocked`` en fait partie —
 #: une mission bloquee attend une reponse de Jean, elle n'est pas perdue.
@@ -137,6 +146,40 @@ class TickReport:
 
     def render(self) -> str:
         return "\n\n".join(self.messages).strip()
+
+
+def team_prefix(team: str) -> str:
+    """Prefixe stable des alertes Telegram, borne aux equipes Linear."""
+    return f"[{team.strip().upper() or DEFAULT_TEAM}]"
+
+
+def closeout_marker(key: str, candidate_sha: str, verdict: str) -> str:
+    return f"linear-loop:closeout:{key}:{candidate_sha or 'unknown'}:{verdict}"
+
+
+def marker_comment_pattern(marker: str) -> re.Pattern[str]:
+    """Seule preuve d'un closeout : le marqueur sous sa forme canonique.
+
+    ``closeout_comment`` ecrit le marqueur comme commentaire HTML seul sur sa
+    ligne. Une citation du meme texte au fil d'une phrase (resume, discussion)
+    ne compte pas — sinon n'importe quelle prose pourrait etouffer un vrai post.
+    """
+    return re.compile(rf"(?m)^<!-- {re.escape(marker)} -->[ \t\r]*$")
+
+
+def closeout_comment(
+    *, key: str, assignee: str | None, branch: str, pull_request: str,
+    candidate_sha: str, verdict: str, summary: str, marker: str,
+) -> str:
+    """Le fait canonique de closeout, re-jouable par son marqueur HTML."""
+    return (
+        f"Mission autonome terminée par `{assignee or 'un codeur'}`.\n\n"
+        f"Triplet de closeout : {{branche/PR: `{branch}` / `{pull_request or 'non créée'}`, "
+        f"SHA candidat: `{candidate_sha or '?'}`, verdict: `{verdict}`}}\n\n"
+        f"{summary or '(pas de résumé fourni)'}\n\n"
+        "Rien n'a été poussé ni fusionné : en attente du GO de Jean.\n\n"
+        f"<!-- {marker} -->"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -234,6 +277,43 @@ class LinearClient:
         labels = {n["name"]: n["id"] for n in team_node["labels"]["nodes"]}
         states = {n["name"]: n["id"] for n in team_node["states"]["nodes"]}
         return issues, labels, states
+
+    COMMENTS_QUERY = """
+    query($id: String!, $after: String) {
+      issue(id: $id) {
+        comments(first: 100, after: $after) {
+          nodes { body }
+          pageInfo { hasNextPage endCursor }
+        }
+      }
+    }
+    """
+
+    def issue_comment_bodies(self, issue_id: str) -> list[str]:
+        """Tous les corps de commentaires de l'issue, toutes pages confondues.
+
+        Toute reponse anormale (erreur GraphQL via ``query``, issue absente,
+        curseur qui ne progresse pas) leve : le lecteur echoue ferme plutot que
+        de laisser croire qu'un commentaire n'existe pas.
+        """
+        bodies: list[str] = []
+        after: Optional[str] = None
+        while True:
+            data = self.query(self.COMMENTS_QUERY, {"id": issue_id, "after": after})
+            issue = data.get("issue")
+            if not issue:
+                raise LoopError(
+                    f"issue {issue_id!r} introuvable en relisant ses commentaires"
+                )
+            page = issue.get("comments") or {}
+            bodies.extend(str(node.get("body") or "") for node in page.get("nodes") or [])
+            info = page.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return bodies
+            cursor = info.get("endCursor")
+            if not cursor or cursor == after:
+                raise LoopError("pagination des commentaires Linear ne progresse pas")
+            after = cursor
 
     def issue_label_ids(self, issue_id: str) -> list[str]:
         data = self.query(
@@ -504,7 +584,7 @@ def mission_result(workspace: Path, branch: str) -> dict[str, str]:
     """Ce que la mission a reellement produit, lu dans son worktree."""
     if not workspace.exists():
         return {"commits": "0", "head": "", "dirty": "", "log": ""}
-    head = git_output(workspace, "rev-parse", "--short", "HEAD")
+    head = git_output(workspace, "rev-parse", "HEAD")
     base = git_output(workspace, "merge-base", "HEAD", "main") or "HEAD"
     log = git_output(workspace, "log", "--oneline", f"{base}..HEAD")
     dirty = git_output(workspace, "status", "--porcelain")
@@ -544,7 +624,16 @@ def run_tick(config: LoopConfig, client: LinearClient, kanban) -> TickReport:
         _closeout_finished(config, client, kanban, conn, by_key, labels, states, report)
         _report_blocked(config, client, kanban, conn, by_key, labels, report)
         _feed_free_coders(config, client, kanban, conn, issues, labels, states, report)
+    prefix = team_prefix(config.team)
+    report.messages = [message if message.startswith(prefix) else f"{prefix} {message}"
+                       for message in report.messages]
     return report
+
+
+def _closeout_already_posted(client, issue_id: str, marker: str) -> bool:
+    """Vrai si l'issue porte deja le marqueur canonique de ce closeout."""
+    pattern = marker_comment_pattern(marker)
+    return any(pattern.search(body) for body in client.issue_comment_bodies(issue_id))
 
 
 def _closeout_finished(config, client, kanban, conn, by_key, labels, states, report) -> None:
@@ -560,17 +649,41 @@ def _closeout_finished(config, client, kanban, conn, by_key, labels, states, rep
     ]
     for task in done:
         key = issue_key_of_title(task.title)
+        task_key = key or task.id
         issue = by_key.get(key)
         workspace = Path(task.workspace_path) if task.workspace_path else None
         result = mission_result(workspace, task.branch_name or "") if workspace else {}
         summary = _mission_summary(kanban, conn, task, result)
+        state = read_mission(config, task_key) or {}
+        candidate_sha = result.get("head", "")
+        verdict = str(state.get("verdict") or VERDICT_PENDING)
+        for_sha = str(state.get("for_sha") or "")
+        if verdict != VERDICT_PENDING and not _FULL_SHA_RE.fullmatch(for_sha):
+            report.skipped[task_key] = "verdict unbound"
+            report.messages.append(
+                f"⛔ {key} — verdict `{verdict}` sans rattachement exact : il doit "
+                f"citer le SHA complet du candidat (`{candidate_sha or '?'}`). "
+                "Rien n'a été écrit sur Linear."
+            )
+            continue
+        if for_sha and for_sha != candidate_sha:
+            report.skipped[task_key] = "verdict stale"
+            report.messages.append(
+                f"⛔ {key} — verdict `{verdict}` lié à `{for_sha}` est périmé : "
+                f"le candidat actuel est `{candidate_sha or '?'}`."
+            )
+            continue
+        branch = result.get("branch") or task.branch_name or "?"
+        pull_request = str(state.get("pull_request") or "")
+        marker = closeout_marker(task_key, candidate_sha, verdict)
+        markers = set(state.get("closeout_markers") or ())
 
         commits = result.get("commits", "?")
         pluriel = "s" if commits not in ("0", "1", "?") else ""
         lines = [
             f"✅ {key} — {short_title(issue.title if issue else task.title)}",
             f"{coder_label(task.assignee)} a terminé : {commits} commit{pluriel} "
-            f"sur `{result.get('branch') or task.branch_name}`.",
+            f"sur `{branch}`.",
         ]
         if summary:
             lines.append(f"\n📝 {quote(summary)}")
@@ -587,23 +700,39 @@ def _closeout_finished(config, client, kanban, conn, by_key, labels, states, rep
             continue
 
         if issue:
-            comment = (
-                f"Mission autonome terminée par `{task.assignee}`.\n\n"
-                f"- Branche locale : `{result.get('branch') or task.branch_name}`\n"
-                f"- HEAD : `{result.get('head', '?')}` ({result.get('commits', '?')} commit(s))\n"
-                f"- Worktree : `{workspace}`\n\n"
-                f"{summary or '(pas de résumé fourni)'}\n\n"
-                "Rien n'a été poussé ni fusionné : en attente du GO de Jean."
-            )
-            client.add_comment(issue.id, comment)
+            if marker not in markers:
+                # L'etat local peut mentir par omission : un tick precedent a pu
+                # mourir apres que Linear a accepte commentCreate mais avant la
+                # persistance du marqueur. Avant de poster, on relit donc les
+                # commentaires existants ; si la relecture echoue, on ne poste
+                # pas (mieux vaut un closeout en retard qu'un doublon).
+                if not _closeout_already_posted(client, issue.id, marker):
+                    client.add_comment(issue.id, closeout_comment(
+                        key=task_key,
+                        assignee=task.assignee,
+                        branch=branch,
+                        pull_request=pull_request,
+                        candidate_sha=candidate_sha,
+                        verdict=verdict,
+                        summary=summary,
+                        marker=marker,
+                    ))
+                # Le marqueur est persiste des que le commentaire existe, AVANT
+                # issueUpdate : si la transition d'etat echoue, le rejeu retente
+                # la transition sans reposter. Un echec du post lui-meme leve
+                # avant cette ecriture, donc on n'affirme jamais un commentaire
+                # qui n'existe pas.
+                markers.add(marker)
+                state["closeout_markers"] = sorted(markers)
+                write_mission_state(config, task_key, state)
             label_ids = _labels_after_build(client, issue, labels, LABEL_REVIEW)
             client.update_issue(
                 issue.id, label_ids=label_ids, state_id=states.get(STATE_REVIEW)
             )
-        state = read_mission(config, key) or {}
-        if state:
+        if state or issue:
+            state["closeout_markers"] = sorted(markers) if issue else state.get("closeout_markers", [])
             state["closed_out"] = True
-            mission_state_path(config, key).write_text(json.dumps(state, indent=1))
+            write_mission_state(config, task_key, state)
         kanban.archive_task(conn, task.id)
 
 
@@ -682,17 +811,45 @@ def mission_state_path(config, key: str) -> Path:
     return Path(config.hermes_home) / "linear-loop" / f"{key}.json"
 
 
+def write_mission_state(config, key: str, state: dict[str, Any]) -> None:
+    path = mission_state_path(config, key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=1))
+
+
 def record_mission(config, issue: Issue, *, repo: str, branch: str, worktree: Path) -> None:
     """Note d'ou part la mission, pour pouvoir juger la suite sans deviner."""
-    path = mission_state_path(config, issue.key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
+    write_mission_state(config, issue.key, {
         "issue": issue.key,
         "repo": repo,
         "branch": branch,
         "worktree": str(worktree),
         "base": git_output(Path(repo), "rev-parse", "HEAD"),
-    }, indent=1))
+    })
+
+
+def record_verdict(config, key: str, verdict: str, for_sha: str) -> None:
+    """Producteur canonique du couple (verdict, SHA exact) lu par le closeout.
+
+    Un verdict de revue n'a de sens que rattache a l'identifiant complet du
+    commit juge : c'est ce qui permet au tick de refuser tout verdict devenu
+    perime ou ambigu. On refuse donc d'ecrire un rattachement invalide plutot
+    que de laisser le closeout le decouvrir trop tard.
+    """
+    verdict_value = (verdict or "").strip()
+    if not verdict_value:
+        raise LoopError("verdict vide : rien a enregistrer")
+    sha = (for_sha or "").strip().lower()
+    if not _FULL_SHA_RE.fullmatch(sha):
+        raise LoopError(
+            f"for_sha doit etre le SHA complet (40 hexa) du commit juge, recu {for_sha!r}"
+        )
+    state = read_mission(config, key)
+    if state is None:
+        raise LoopError(f"aucune mission enregistree pour {key} : verdict orphelin refuse")
+    state["verdict"] = verdict_value
+    state["for_sha"] = sha
+    write_mission_state(config, key, state)
 
 
 def read_mission(config, key: str) -> Optional[dict[str, Any]]:
@@ -963,11 +1120,20 @@ def build_config(args: argparse.Namespace) -> LoopConfig:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["tick", "status", "ensure-labels"])
+    parser.add_argument("command", choices=["tick", "status", "ensure-labels", "verdict"])
     parser.add_argument("--team", default=DEFAULT_TEAM)
     parser.add_argument("--coder", action="append", default=None)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--runtime", default=DEFAULT_REPO)
+    parser.add_argument("--issue", default=None, help="cle Linear visee par `verdict`.")
+    parser.add_argument(
+        "--verdict", dest="verdict_value", default=None,
+        help="verdict de revue a lier (ex. APPROVE).",
+    )
+    parser.add_argument(
+        "--for-sha", dest="for_sha", default=None,
+        help="SHA complet (40 hexa) du commit candidat juge par la revue.",
+    )
     parser.add_argument(
         "--apply",
         action="store_true",
@@ -977,6 +1143,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config = build_config(args)
 
     try:
+        if args.command == "verdict":
+            # Producteur local du rattachement verdict<->SHA : aucun acces Linear.
+            if not (args.issue and args.verdict_value and args.for_sha):
+                parser.error("verdict exige --issue, --verdict et --for-sha")
+            record_verdict(config, args.issue, args.verdict_value, args.for_sha)
+            print(f"verdict {args.verdict_value} lié à {args.issue}@{args.for_sha}")
+            return 0
         client = LinearClient(load_api_key(config.hermes_home))
         if args.command == "ensure-labels":
             print(cmd_ensure_labels(config, client))
