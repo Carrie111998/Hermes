@@ -98,6 +98,39 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_null_chunks_are_ignored(self, mock_close, mock_create):
+        """Literal null items from compatible proxies do not abort the stream."""
+        from run_agent import AIAgent
+
+        chunks = [
+            None,
+            _make_stream_chunk(content="Hello"),
+            None,
+            _make_stream_chunk(content=" world", finish_reason="stop"),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.com/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "Hello world"
+        assert response.choices[0].finish_reason == "stop"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_chat_stream_closes_original_provider_resource(
         self,
         mock_close,

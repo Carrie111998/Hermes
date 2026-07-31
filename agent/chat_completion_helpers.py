@@ -3194,6 +3194,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _discard_stale_stream_chunk(stream_attempt_id, chunk)
                 continue
 
+            # Some OpenAI-compatible proxies emit a literal null SSE item,
+            # which the SDK surfaces as None rather than a completion chunk.
+            if chunk is None:
+                continue
+
             if not chunk.choices:
                 if hasattr(chunk, "model") and chunk.model:
                     model_name = chunk.model
