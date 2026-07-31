@@ -392,6 +392,10 @@ def _load_oneshot_resume(
                     "Failed to restore recorded session working directory: "
                     f"{saved_cwd}"
                 ) from exc
+            # Prompt construction and file/terminal tools prefer this value.
+            # Publish it only after chdir succeeds so a failed resume leaves
+            # the caller's runtime context untouched.
+            os.environ["TERMINAL_CWD"] = saved_cwd
 
     session_db.reopen_session(resolved_session_id)
     return resolved_session_id, conversation_history
