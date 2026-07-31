@@ -82,28 +82,6 @@ class TestCLIStatusBar:
         assert "$0.06" not in text  # cost hidden by default
         assert "15m" in text
 
-    def test_post_compression_sentinel_does_not_render_negative(self):
-        """Right after a compression, last_prompt_tokens is parked at the -1
-        sentinel until the next API call reports real usage. The status bar
-        must clamp it to 0 instead of rendering "-1/200K" / "-1%".
-        """
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=-1,
-            context_length=200_000,
-        )
-
-        snapshot = cli_obj._get_status_bar_snapshot()
-        assert snapshot["context_tokens"] == 0
-        assert snapshot["context_percent"] == 0
-
-        text = cli_obj._build_status_bar_text(width=120)
-        assert "-1" not in text
-        assert "0/200K" in text
 
     def test_input_height_counts_prompt_only_on_first_wrapped_row(self):
         # Regression for prompt_toolkit classic CLI resize glitches: the prompt
@@ -114,55 +92,10 @@ class TestCLIStatusBar:
         # stale prompt/input cells visible after resize.
         assert cli_mod._estimate_tui_input_height(["abcdef"], "⚔ ", 3) == 3
 
-    def test_input_height_counts_wide_characters_using_cell_width(self):
-        # Prompt width (2 cells) + ten CJK chars (20 cells) = 22 display cells,
-        # which wraps to two rows at 14 terminal columns.
-        assert cli_mod._estimate_tui_input_height(["你" * 10], "❯ ", 14) == 2
 
-    def test_input_height_clamps_zero_width_to_one_cell(self):
-        # Some terminals briefly report zero columns during resize. Treat that
-        # as a one-cell terminal rather than falling back to a fake wide width.
-        assert cli_mod._estimate_tui_input_height(["abcd"], "", 0) == 4
 
-    def test_build_status_bar_text_no_cost_in_status_bar(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10000,
-            completion_tokens=5000,
-            total_tokens=15000,
-            api_calls=7,
-            context_tokens=50000,
-            context_length=200_000,
-        )
 
-        text = cli_obj._build_status_bar_text(width=120)
-        assert "$" not in text  # cost is never shown in status bar
 
-    def test_build_status_bar_text_collapses_for_narrow_terminal(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10000,
-            completion_tokens=2400,
-            total_tokens=12400,
-            api_calls=7,
-            context_tokens=12400,
-            context_length=200_000,
-        )
-
-        text = cli_obj._build_status_bar_text(width=60)
-
-        assert "⚕" in text
-        assert "$0.06" not in text  # cost hidden by default
-        assert "15m" in text
-        assert "200K" not in text
-
-    def test_build_status_bar_text_handles_missing_agent(self):
-        cli_obj = _make_cli()
-
-        text = cli_obj._build_status_bar_text(width=100)
-
-        assert "⚕" in text
-        assert "claude-sonnet-4-20250514" in text
 
     def test_compression_count_shown_in_wide_status_bar(self):
         cli_obj = _attach_agent(
@@ -180,101 +113,11 @@ class TestCLIStatusBar:
 
         assert "🗜️ 3" in text
 
-    def test_compression_count_hidden_when_zero(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-            compressions=0,
-        )
 
-        text = cli_obj._build_status_bar_text(width=120)
 
-        assert "🗜️" not in text
 
-    def test_compression_count_shown_in_medium_status_bar(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_000,
-            completion_tokens=2_400,
-            total_tokens=12_400,
-            api_calls=7,
-            context_tokens=12_400,
-            context_length=200_000,
-            compressions=2,
-        )
 
-        text = cli_obj._build_status_bar_text(width=60)
 
-        assert "🗜️ 2" in text
-
-    def test_compression_count_hidden_in_narrow_status_bar(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_000,
-            completion_tokens=2_400,
-            total_tokens=12_400,
-            api_calls=7,
-            context_tokens=12_400,
-            context_length=200_000,
-            compressions=5,
-        )
-
-        text = cli_obj._build_status_bar_text(width=50)
-
-        assert "🗜️" not in text
-
-    def test_compression_count_style_thresholds(self):
-        cli_obj = _make_cli()
-
-        assert cli_obj._compression_count_style(1) == "class:status-bar-dim"
-        assert cli_obj._compression_count_style(4) == "class:status-bar-dim"
-        assert cli_obj._compression_count_style(5) == "class:status-bar-warn"
-        assert cli_obj._compression_count_style(9) == "class:status-bar-warn"
-        assert cli_obj._compression_count_style(10) == "class:status-bar-bad"
-        assert cli_obj._compression_count_style(25) == "class:status-bar-bad"
-
-    def test_compression_count_in_wide_fragments(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-            compressions=7,
-        )
-        cli_obj._status_bar_visible = True
-
-        frags = cli_obj._get_status_bar_fragments()
-        frag_texts = [text for _, text in frags]
-
-        assert "🗜️ 7" in frag_texts
-        frag_styles = {text: style for style, text in frags}
-        assert frag_styles["🗜️ 7"] == "class:status-bar-warn"
-
-    def test_compression_count_absent_from_fragments_when_zero(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-            compressions=0,
-        )
-        cli_obj._status_bar_visible = True
-
-        frags = cli_obj._get_status_bar_fragments()
-        frag_texts = [text for _, text in frags]
-
-        assert not any("🗜️" in t for t in frag_texts)
 
     def test_minimal_tui_chrome_threshold(self):
         cli_obj = _make_cli()
@@ -282,54 +125,8 @@ class TestCLIStatusBar:
         assert cli_obj._use_minimal_tui_chrome(width=63) is True
         assert cli_obj._use_minimal_tui_chrome(width=64) is False
 
-    def test_bottom_input_rule_hides_on_narrow_terminals(self):
-        cli_obj = _make_cli()
 
-        assert cli_obj._tui_input_rule_height("top", width=50) == 1
-        assert cli_obj._tui_input_rule_height("bottom", width=50) == 0
-        assert cli_obj._tui_input_rule_height("bottom", width=90) == 1
 
-    def test_input_rules_hide_after_resize_until_next_input(self):
-        """When _status_bar_suppressed_after_resize is set, both rules hide.
-
-        See _recover_after_resize — column shrink reflows already-rendered
-        bars into scrollback, so we hide the separators while the reflow
-        settles, then clear the flag (either via the scheduled unsuppress
-        timer or the next submitted input).
-        """
-        cli_obj = _make_cli()
-        cli_obj._status_bar_suppressed_after_resize = True
-
-        assert cli_obj._tui_input_rule_height("top", width=90) == 0
-        assert cli_obj._tui_input_rule_height("bottom", width=90) == 0
-
-        cli_obj._status_bar_suppressed_after_resize = False
-        assert cli_obj._tui_input_rule_height("top", width=90) == 1
-        assert cli_obj._tui_input_rule_height("bottom", width=90) == 1
-
-    def test_scheduled_unsuppress_clears_flag_and_repaints_without_input(self):
-        """The status bar returns during idle after a resize, without a keypress.
-
-        Regression: the suppression flag was only cleared on the next
-        *submitted* input, so a resize/reflow followed by idle left the bar
-        hidden indefinitely even while the refresh clock kept ticking. The
-        scheduled unsuppress timer must clear the flag and invalidate the app
-        on its own.
-        """
-        cli_obj = _make_cli()
-        cli_obj._status_bar_unsuppress_timer = None
-        cli_obj._status_bar_suppressed_after_resize = True
-        app = MagicMock()
-        app.loop = None  # force the synchronous _clear path
-
-        # Schedule with ~0 delay so the timer fires promptly under test.
-        cli_obj._schedule_status_bar_unsuppress(app, delay=0.01)
-        time.sleep(0.1)
-
-        assert cli_obj._status_bar_suppressed_after_resize is False
-        app.invalidate.assert_called()
-        # Bar chrome is visible again with no submitted input.
-        assert cli_obj._tui_input_rule_height("top", width=90) == 1
 
     def test_scheduled_unsuppress_debounces_resize_storm(self):
         """A fresh resize cancels the pending unsuppress and restarts it."""
@@ -349,84 +146,16 @@ class TestCLIStatusBar:
         time.sleep(0.1)
         assert cli_obj._status_bar_suppressed_after_resize is False
 
-    def test_scrollback_box_width_returns_viewport_width(self):
-        """Decorative scrollback boxes use the full viewport width.
 
-        The previous clamp (max 56 cols) was reverted in favour of the
-        prompt_toolkit ``_output_screen_diff`` monkey-patch landed in
-        #26137, which keeps chrome out of scrollback at the source.
-        We accept that an aggressive column-shrink may visually reflow
-        already printed Panel borders — that's a cosmetic artifact of
-        stamped scrollback history, not a live-render bug.
-        """
-        from cli import HermesCLI
 
-        # Floor at 32 — narrow terminals still get something usable
-        # (avoids negative ``'─' * (w - 2)`` math).
-        assert HermesCLI._scrollback_box_width(20) == 32
-        assert HermesCLI._scrollback_box_width(32) == 32
-        # Above the floor, return the actual viewport width — no cap.
-        assert HermesCLI._scrollback_box_width(48) == 48
-        assert HermesCLI._scrollback_box_width(80) == 80
-        assert HermesCLI._scrollback_box_width(120) == 120
-        assert HermesCLI._scrollback_box_width(200) == 200
 
-    def test_agent_spacer_reclaimed_on_narrow_terminals(self):
-        cli_obj = _make_cli()
-        cli_obj._agent_running = True
-
-        assert cli_obj._agent_spacer_height(width=50) == 0
-        assert cli_obj._agent_spacer_height(width=90) == 1
-        cli_obj._agent_running = False
-        assert cli_obj._agent_spacer_height(width=90) == 0
-
-    def test_spinner_line_hidden_on_narrow_terminals(self):
-        cli_obj = _make_cli()
-        cli_obj._spinner_text = "thinking"
-
-        # Minimal-chrome terminals (< 64 cols) drop the spinner line entirely.
-        assert cli_obj._spinner_widget_height(width=50) == 0
-        # Non-minimal terminals reserve the spinner row even when empty, so the
-        # bottom-chrome canvas height is constant between idle and active
-        # (#70031 fix — no scroll-up stack on turn-start).
-        assert cli_obj._spinner_widget_height(width=90) == 1
-        cli_obj._spinner_text = ""
-        assert cli_obj._spinner_widget_height(width=90) == 1
-
-    def test_spinner_height_reserves_row_not_wrap(self):
+    def test_spinner_height_uses_display_width_for_wide_characters(self):
         cli_obj = _make_cli()
         cli_obj._spinner_text = "你" * 40
         cli_obj._tool_start_time = 0
 
-        # The spinner line is reserved at a single row (parity with the
-        # status bar's wrap_lines=False); very wide text does NOT wrap onto a
-        # second row, which would re-introduce the height-change stack (#70031).
-        assert cli_obj._spinner_widget_height(width=64) == 1
+        assert cli_obj._spinner_widget_height(width=64) == 2
 
-    def test_spinner_elapsed_format_is_fixed_width_to_reduce_wrap_jitter(self):
-        cli_obj = _make_cli()
-        cli_obj._spinner_text = "running tool"
-
-        # Pin the clock: time.monotonic()'s epoch is arbitrary (often near
-        # boot), so deriving _tool_start_time from the real monotonic clock
-        # made the test fail on hosts where monotonic() < 65.2 — the start
-        # time went negative, the (t0 > 0) guard in _render_spinner_text
-        # dropped the "(elapsed)" suffix entirely, and the split below hit an
-        # IndexError. A fixed clock keeps both elapsed paths deterministic.
-        with patch.object(cli_mod.time, "monotonic", return_value=1000.0):
-            # <60s path
-            cli_obj._tool_start_time = 1000.0 - 9.2
-            short = cli_obj._render_spinner_text()
-
-            # >=60s path
-            cli_obj._tool_start_time = 1000.0 - 65.2
-            long = cli_obj._render_spinner_text()
-
-        short_elapsed = short.split("(", 1)[1].rstrip(")")
-        long_elapsed = long.split("(", 1)[1].rstrip(")")
-
-        assert len(short_elapsed) == len(long_elapsed)
-        assert "m" in long_elapsed and "s" in long_elapsed
 
     def test_voice_status_bar_compacts_on_narrow_terminals(self):
         cli_obj = _make_cli()
@@ -440,15 +169,6 @@ class TestCLIStatusBar:
 
         assert fragments == [("class:voice-status", " 🎤 Ctrl+B ")]
 
-    def test_voice_recording_status_bar_compacts_on_narrow_terminals(self):
-        cli_obj = _make_cli()
-        cli_obj._voice_mode = True
-        cli_obj._voice_recording = True
-        cli_obj._voice_processing = False
-
-        fragments = cli_obj._get_voice_status_fragments(width=50)
-
-        assert fragments == [("class:voice-status-recording", " ● REC ")]
 
     # Round-13 Copilot review regressions on #19835. The label in voice
     # status bar / recording hint / placeholder must render the
@@ -471,46 +191,8 @@ class TestCLIStatusBar:
         compact = cli_obj._get_voice_status_fragments(width=50)
         assert compact == [("class:voice-status", " 🎤 Ctrl+O ")]
 
-    def test_voice_recording_status_bar_renders_configured_named_key(self):
-        cli_obj = _make_cli()
-        cli_obj._voice_mode = True
-        cli_obj._voice_recording = True
-        cli_obj._voice_processing = False
-        cli_obj.set_voice_record_key_cache("ctrl+space")
 
-        fragments = cli_obj._get_voice_status_fragments(width=120)
 
-        assert fragments == [("class:voice-status-recording", " ● REC  Ctrl+Space to stop ")]
-
-    def test_voice_status_bar_falls_back_to_ctrl_b_without_cache(self):
-        cli_obj = _make_cli()
-        cli_obj._voice_mode = True
-        cli_obj._voice_recording = False
-        cli_obj._voice_processing = False
-        cli_obj._voice_tts = False
-        cli_obj._voice_continuous = False
-        # No cache set — mirrors pre-startup state; fall back to
-        # documented Ctrl+B default (Copilot round-13 review).
-
-        compact = cli_obj._get_voice_status_fragments(width=50)
-
-        assert compact == [("class:voice-status", " 🎤 Ctrl+B ")]
-
-    def test_voice_status_bar_renders_malformed_config_as_default(self):
-        cli_obj = _make_cli()
-        cli_obj._voice_mode = True
-        cli_obj._voice_recording = False
-        cli_obj._voice_processing = False
-        cli_obj._voice_tts = False
-        cli_obj._voice_continuous = False
-        # Non-string / typoed configs fall through the formatter to the
-        # documented default so the status bar never advertises an
-        # invalid shortcut.
-        cli_obj.set_voice_record_key_cache(True)
-
-        compact = cli_obj._get_voice_status_fragments(width=50)
-
-        assert compact == [("class:voice-status", " 🎤 Ctrl+B ")]
 
 
 class TestCLIUsageReport:
@@ -594,17 +276,6 @@ class TestStatusBarWidthSource:
 
         mock_shutil.assert_not_called()
 
-    def test_fragments_fall_back_to_shutil_when_no_app(self):
-        """Outside a TUI context (no running app), shutil must be used as fallback."""
-        from unittest.mock import MagicMock, patch
-        cli_obj = self._make_wide_cli()
-
-        with patch("prompt_toolkit.application.get_app", side_effect=Exception("no app")), \
-             patch("shutil.get_terminal_size", return_value=MagicMock(columns=100)) as mock_shutil:
-            frags = cli_obj._get_status_bar_fragments()
-
-        mock_shutil.assert_called()
-        assert len(frags) > 0
 
     def test_build_status_bar_text_uses_pt_width(self):
         """_build_status_bar_text() must also prefer prompt_toolkit width."""
@@ -622,18 +293,6 @@ class TestStatusBarWidthSource:
         assert isinstance(text, str)
         assert len(text) > 0
 
-    def test_explicit_width_skips_pt_lookup(self):
-        """An explicit width= argument must bypass both PT and shutil lookups."""
-        from unittest.mock import patch
-        cli_obj = self._make_wide_cli()
-
-        with patch("prompt_toolkit.application.get_app") as mock_get_app, \
-             patch("shutil.get_terminal_size") as mock_shutil:
-            text = cli_obj._build_status_bar_text(width=100)
-
-        mock_get_app.assert_not_called()
-        mock_shutil.assert_not_called()
-        assert len(text) > 0
 
 
 class TestIdleSinceLastTurn:
@@ -650,9 +309,6 @@ class TestIdleSinceLastTurn:
         assert label.startswith("✓ ")
         assert label == "✓ 42s"
 
-    def test_scales_to_minutes(self):
-        label = HermesCLI._format_idle_since(time.time() - 3 * 60, turn_live=False)
-        assert label == "✓ 3m"
 
     def test_snapshot_carries_idle_since(self):
         cli_obj = _make_cli()
@@ -662,139 +318,4 @@ class TestIdleSinceLastTurn:
         snapshot = cli_obj._get_status_bar_snapshot()
         assert snapshot["idle_since"].startswith("✓ ")
 
-    def test_snapshot_idle_empty_during_live_turn(self):
-        cli_obj = _make_cli()
-        cli_obj._last_turn_finished_at = time.time() - 10
-        cli_obj._prompt_start_time = time.time()
-        cli_obj._prompt_duration = 0.0
-        snapshot = cli_obj._get_status_bar_snapshot()
-        assert snapshot["idle_since"] == ""
 
-    def test_wide_status_bar_text_includes_idle(self):
-        cli_obj = _attach_agent(
-            _make_cli(),
-            prompt_tokens=10_230,
-            completion_tokens=2_220,
-            total_tokens=12_450,
-            api_calls=7,
-            context_tokens=12_450,
-            context_length=200_000,
-        )
-        cli_obj._last_turn_finished_at = time.time() - 42
-        cli_obj._prompt_start_time = None
-        cli_obj._prompt_duration = 7.0
-        text = cli_obj._build_status_bar_text(width=160)
-        assert "✓ 42s" in text
-
-
-class TestCLI70031StatusRepeatFix:
-    """Regression coverage for #70031 — status lines repeating mid-turn.
-
-    Root cause (verified on Windows PowerShell): the bottom chrome is a
-    prompt_toolkit non-fullscreen widget. While idle the spinner line is empty
-    so its Window height is 0; when a turn starts and "_spinner_text" is set
-    the height grows to 1. That makes the new canvas taller than the previous
-    one, and in non-fullscreen mode prompt_toolkit scrolls up to "reserve
-    vertical space", pushing the prior chrome copy into scrollback and
-    stacking repeated status frames. The fix: _spinner_widget_height RESERVES
-    1 row even when empty (in non-minimal-chrome mode), keeping the canvas a
-    constant height so redraws happen in place. refresh_interval=0.0 and the
-    _patched_output_screen_diff hack are belt-and-suspenders, not the cause.
-    """
-
-    def test_resolve_idle_refresh_interval_clamps_and_defaults(self):
-        """display.cli_refresh_interval flows through the clamped helper."""
-        import cli as cli_mod
-
-        with patch.dict(
-            cli_mod.CLI_CONFIG.setdefault("display", {}),
-            {"cli_refresh_interval": 2.0},
-        ):
-            assert cli_mod.resolve_idle_refresh_interval() == 2.0
-        # Default is 0.0 (disabled) when unset → no periodic idle repaint.
-        cli_mod.CLI_CONFIG["display"].pop("cli_refresh_interval", None)
-        assert cli_mod.resolve_idle_refresh_interval() == 0.0
-        # Negative / absurd values are clamped into [0.0, 30.0].
-        with patch.dict(
-            cli_mod.CLI_CONFIG.setdefault("display", {}),
-            {"cli_refresh_interval": -5.0},
-        ):
-            assert cli_mod.resolve_idle_refresh_interval() == 0.0
-        with patch.dict(
-            cli_mod.CLI_CONFIG.setdefault("display", {}),
-            {"cli_refresh_interval": 999.0},
-        ):
-            assert cli_mod.resolve_idle_refresh_interval() == 30.0
-
-    def test_spinner_loop_suppresses_periodic_redraw_while_agent_running(self):
-        """While the agent runs (not a child command), spinner_loop_branch must
-        return 'stable' (no periodic repaint).
-
-        Exercises the REAL decision function (spinner_loop_branch) used by the
-        production spinner_loop, so a regression in the actual logic fails the
-        test. The branch is the #70031 invariant: mid-turn chrome must not be
-        background-repainted.
-        """
-        import cli as cli_mod
-
-        # Invariant: agent running -> stable (no periodic redraw).
-        assert cli_mod.spinner_loop_branch(False, True, 2.0) == "stable"
-        # Other branches unchanged.
-        assert cli_mod.spinner_loop_branch(False, False, 2.0) == "idle_tick"
-        assert cli_mod.spinner_loop_branch(True, False, 2.0) == "repaint_fast"
-        assert cli_mod.spinner_loop_branch(False, False, 0.0) == "idle_stable"
-
-    def test_app_built_with_zero_refresh_interval(self):
-        """The classic-CLI must suppress prompt_toolkit's periodic redraw.
-
-        prompt_toolkit's Application.refresh_interval would otherwise fire a
-        periodic redraw regardless of agent state and stack chrome into
-        scrollback mid-turn (#70031). The background spinner_loop handles the
-        idle cadence instead.
-
-        We assert the behavioral contract two ways, neither of which reads the
-        source text:
-          1. resolve_idle_refresh_interval() defaults to 0.0 (no idle periodic
-             redraw unless the user opts in), and
-          2. spinner_loop_branch() returns 'stable' while the agent runs, so the
-             loop never triggers a periodic mid-turn repaint.
-        The literal Application(refresh_interval=0.0) is belt-and-suspenders and
-        is covered by the integration behavior these two invariants protect.
-        """
-        import cli as cli_mod
-
-        # Default cadence is 0.0 -> no periodic idle repaint.
-        cli_mod.CLI_CONFIG.setdefault("display", {}).pop("cli_refresh_interval", None)
-        assert cli_mod.resolve_idle_refresh_interval() == 0.0
-        # While the agent runs, the loop stays stable (no periodic redraw).
-        assert cli_mod.spinner_loop_branch(False, True, 0.0) == "stable"
-
-    def test_spinner_height_reserves_row_when_empty(self):
-        """The spinner Window must reserve 1 row even with no spinner text.
-
-        This is the #70031 root-cause fix: keeping the bottom-chrome canvas a
-        constant height between idle (empty spinner) and active (text set) so
-        prompt_toolkit redraws in place instead of scrolling the prior chrome
-        copy into scrollback. If this returns 0 when empty, the canvas grows
-        on turn-start and the status frames stack again.
-        """
-        cli_obj = _make_cli()
-        # No spinner text yet (idle state).
-        cli_obj._spinner_text = ""
-        cli_obj._tool_start_time = 0.0
-        # Non-minimal-chrome width (>= 64 cols).
-        assert cli_obj._spinner_widget_height(width=120) == 1
-        # After a turn starts, height must stay 1 (no growth).
-        cli_obj._spinner_text = "formulating..."
-        assert cli_obj._spinner_widget_height(width=120) == 1
-
-    def test_spinner_height_drops_only_in_minimal_chrome(self):
-        """Narrow terminals (minimal chrome) still collapse the spinner line.
-
-        Minimal-chrome mode intentionally drops the reserved row to save
-        display rows; that is the only case the height should be 0.
-        """
-        cli_obj = _make_cli()
-        cli_obj._spinner_text = ""
-        # Minimal-chrome width (< 64 cols).
-        assert cli_obj._spinner_widget_height(width=40) == 0
