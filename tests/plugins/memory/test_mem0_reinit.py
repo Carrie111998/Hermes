@@ -159,6 +159,7 @@ class TestSyncTurn:
         p._backend = None
         p._reinit_backend_at = 0.0
         added = []
+        added_event = threading.Event()
         healthy = FakeBackend()
 
         def fake_create():
@@ -166,21 +167,19 @@ class TestSyncTurn:
 
         def fake_add(self_, messages, **kwargs):
             added.append(messages)
+            added_event.set()
 
         monkeypatch.setattr(p, "_create_backend", fake_create)
         monkeypatch.setattr(FakeBackend, "add", fake_add)
 
         p.sync_turn("user msg", "assistant msg")
 
-        # sync_turn is async; join the worker via the sync lock path is not
-        # exposed, so wait briefly for the daemon thread to run.
-        import time as _time
-        for _ in range(50):
-            if added:
-                break
-            _time.sleep(0.02)
-
-        assert added, "sync worker never ran"
+        # Deterministic sync: the fake backend's add() signals completion,
+        # then we join the worker thread — no polling.
+        assert added_event.wait(2), "sync worker never ran"
+        worker = p._sync_thread
+        if worker is not None:
+            worker.join(timeout=2)
         assert added[0][0]["role"] == "user"
         assert added[0][1]["role"] == "assistant"
         assert p._backend is healthy
@@ -194,31 +193,22 @@ class _GateBackend(FakeBackend):
         self.added = []
         self.in_add = threading.Event()
         self.release_add = threading.Event()
+        self.drained = threading.Event()
 
     def add(self, messages, **kwargs):
         self.added.append(messages)
         self.in_add.set()
         self.release_add.wait(timeout=5)
+        if len(self.added) >= 2:
+            self.drained.set()
         return {"results": []}
 
 
 class TestSyncBacklog:
-    def _wait_for(self, predicate, timeout=3.0):
-        import time as _time
-
-        deadline = _time.time() + timeout
-        while _time.time() < deadline:
-            if predicate():
-                return True
-            _time.sleep(0.02)
-        return predicate()
-
     def test_turns_are_buffered_not_dropped_while_worker_busy(self, monkeypatch):
         # Worker is stuck in a slow extraction; two more turns arrive. The
         # newest must be coalesced into the backlog and drained after the
         # first completes — never silently dropped (the old 5s-join skip).
-        import time as _time
-
         p = _make_provider()
         p._backend = None
         p._reinit_backend_at = 0.0
@@ -232,7 +222,10 @@ class TestSyncBacklog:
         p.sync_turn("t3 user", "t3 asst")  # coalesces over t2
         gate.release_add.set()
 
-        assert self._wait_for(lambda: len(gate.added) >= 2), "backlog never drained"
+        assert gate.drained.wait(3), "backlog never drained"
+        worker = p._sync_thread
+        if worker is not None:
+            worker.join(timeout=2)
 
         contents = [[m["content"] for m in msgs] for msgs in gate.added]
         assert contents[0] == ["t1 user", "t1 asst"]
@@ -244,15 +237,15 @@ class TestSyncBacklog:
         # First add hits a dead store (backend invalidated, worker exits).
         # The next sync_turn spawns a fresh worker that re-initializes the
         # backend and delivers the turn.
-        import time as _time
-
         p = _make_provider()
         p._backend = None
         p._reinit_backend_at = 0.0
         calls = []
+        call_event = threading.Event()
 
         def flaky_add(self_, messages, **kwargs):
             calls.append(messages)
+            call_event.set()
             if len(calls) == 1:
                 raise ConnectionError("Connection refused")
             return {"results": []}
@@ -262,14 +255,20 @@ class TestSyncBacklog:
         monkeypatch.setattr(p, "_create_backend", lambda: healthy)
 
         p.sync_turn("u1", "a1")
-        assert self._wait_for(lambda: len(calls) >= 1), "first add never ran"
-        assert self._wait_for(lambda: not (p._sync_thread and p._sync_thread.is_alive())), "worker did not exit"
+        assert call_event.wait(2), "first add never ran"
+        worker = p._sync_thread
+        if worker is not None:
+            worker.join(timeout=2)
         assert p._backend is None  # invalidated for lazy rebuild
 
         # Cooldown elapses; the next turn triggers a fresh worker + rebuild.
+        call_event.clear()
         p._reinit_backend_at = 0.0
         p.sync_turn("u2", "a2")
-        assert self._wait_for(lambda: len(calls) >= 2), "retry add never ran"
+        assert call_event.wait(2), "retry add never ran"
+        worker = p._sync_thread
+        if worker is not None:
+            worker.join(timeout=2)
         assert p._backend is healthy  # re-initialized
         assert [[m["content"] for m in calls[1]]] == [["u2", "a2"]]
 
@@ -277,13 +276,22 @@ class TestSyncBacklog:
         p = _make_provider()
         p._backend = None
         p._reinit_backend_at = 0.0
+        added_event = threading.Event()
         healthy = FakeBackend()
+
+        def fake_add(self_, messages, **kwargs):
+            added_event.set()
+            return {"results": []}
+
         monkeypatch.setattr(p, "_create_backend", lambda: healthy)
+        monkeypatch.setattr(FakeBackend, "add", fake_add)
 
         p.sync_turn("u", "a")
-        assert self._wait_for(
-            lambda: not (p._sync_thread and p._sync_thread.is_alive())
-        ), "worker leaked after draining the queue"
+        assert added_event.wait(2), "sync worker never ran"
+        worker = p._sync_thread
+        if worker is not None:
+            worker.join(timeout=2)
+        assert not worker.is_alive(), "worker leaked after draining the queue"
 
 
 class TestEOFDependencyError:
