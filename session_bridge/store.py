@@ -50,6 +50,11 @@ from .models import (
     decode_bridge_marker,
     encode_bridge_marker,
 )
+from .sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationProofInput,
+    sidebar_reconciliation_proof_digest,
+)
 
 if TYPE_CHECKING:
     from .claude_visibility import (
@@ -6257,6 +6262,172 @@ class SessionBridgeStore:
         ):
             raise ValueError("invalid sidebar create reservation identity")
         return reservation
+
+    def record_sidebar_reconciliation_proof(
+        self,
+        *,
+        lease_token: str,
+        evidence: SidebarReconciliationEvidence,
+        marker_digest: str,
+        placement_generation: int,
+        delivery_generation: int,
+        now: float,
+    ) -> dict[str, Any]:
+        """Append one authoritative proof and bind it to the current lease."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        if not isinstance(evidence, SidebarReconciliationEvidence):
+            raise TypeError("sidebar reconciliation evidence is malformed")
+        evidence.validate()
+        normalized_marker_digest = _lowercase_sha256(
+            marker_digest,
+            "sidebar reconciliation marker digest",
+        )
+        if not hmac.compare_digest(
+            evidence.marker_digest,
+            normalized_marker_digest,
+        ):
+            raise ValueError("sidebar reconciliation marker digest mismatch")
+        if type(placement_generation) is not int or placement_generation <= 0:
+            raise ValueError("sidebar placement generation is malformed")
+        if type(delivery_generation) is not int or delivery_generation <= 0:
+            raise ValueError("sidebar delivery generation is malformed")
+        recorded_at = _finite_number(now, "sidebar reconciliation proof time")
+        if evidence.expires_at <= recorded_at:
+            raise ValueError("sidebar reconciliation evidence has expired")
+
+        def _write(conn):
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            if float(job["lease_expires_at"]) <= recorded_at:
+                _recover_one_expired_sidebar_lease(conn, job, now=recorded_at)
+                return None, True
+            proof_input = SidebarReconciliationProofInput(
+                job_id=job["id"],
+                source_session_id=job["source_session_id"],
+                bridge_id=job["bridge_id"],
+                marker_digest=normalized_marker_digest,
+                placement_generation=placement_generation,
+                delivery_generation=delivery_generation,
+                reconciliation_generation=evidence.generation,
+                completed_at=evidence.completed_at,
+                expires_at=evidence.expires_at,
+                inventory_digest=evidence.inventory_digest,
+                state=evidence.state,
+                match_count=evidence.match_count,
+                recovered_thread_id=evidence.recovered_thread_id,
+                fixed_reason=evidence.fixed_reason,
+            )
+            proof_digest = sidebar_reconciliation_proof_digest(proof_input)
+            proof = {
+                "proof_digest": proof_digest,
+                "job_id": proof_input.job_id,
+                "source_session_id": proof_input.source_session_id,
+                "bridge_id": proof_input.bridge_id,
+                "marker_digest": proof_input.marker_digest,
+                "placement_generation": proof_input.placement_generation,
+                "delivery_generation": proof_input.delivery_generation,
+                "reconciliation_generation": proof_input.reconciliation_generation,
+                "completed_at": proof_input.completed_at,
+                "expires_at": proof_input.expires_at,
+                "inventory_digest": proof_input.inventory_digest,
+                "state": proof_input.state.value,
+                "match_count": proof_input.match_count,
+                "recovered_thread_id": proof_input.recovered_thread_id,
+                "fixed_reason": proof_input.fixed_reason,
+                "created_at": recorded_at,
+            }
+            conn.execute(
+                """INSERT INTO session_sidebar_reconciliation_proofs (
+                       proof_digest, job_id, source_session_id, bridge_id,
+                       marker_digest, placement_generation, delivery_generation,
+                       reconciliation_generation, completed_at, expires_at,
+                       inventory_digest, state, match_count, recovered_thread_id,
+                       fixed_reason, created_at
+                   ) VALUES (
+                       :proof_digest, :job_id, :source_session_id, :bridge_id,
+                       :marker_digest, :placement_generation, :delivery_generation,
+                       :reconciliation_generation, :completed_at, :expires_at,
+                       :inventory_digest, :state, :match_count,
+                       :recovered_thread_id, :fixed_reason, :created_at
+                   ) ON CONFLICT(proof_digest) DO NOTHING""",
+                proof,
+            )
+            persisted = conn.execute(
+                """SELECT * FROM session_sidebar_reconciliation_proofs
+                   WHERE proof_digest = ?""",
+                (proof_digest,),
+            ).fetchone()
+            if persisted is None:
+                raise ValueError("sidebar reconciliation proof was not persisted")
+            persisted_proof = dict(persisted)
+            comparison = dict(proof)
+            comparison["created_at"] = persisted_proof["created_at"]
+            if persisted_proof != comparison:
+                raise ValueError("conflicting sidebar reconciliation proof replay")
+            cursor = conn.execute(
+                """UPDATE session_sidebar_jobs
+                   SET reconciliation_proof_digest = ?, updated_at = ?
+                   WHERE id = ? AND state = ? AND lease_digest = ?""",
+                (
+                    proof_digest,
+                    recorded_at,
+                    job["id"],
+                    SidebarJobState.LEASED.value,
+                    token_digest,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("stale sidebar reconciliation proof lease")
+            return persisted_proof, False
+
+        proof, expired = self.db._execute_write(_write)
+        if expired:
+            raise ValueError("sidebar lease has expired")
+        assert proof is not None
+        return proof
+
+    def get_sidebar_reconciliation_proof(
+        self,
+        *,
+        lease_token: str,
+    ) -> dict[str, Any] | None:
+        """Read the proof currently bound to one exact active lease."""
+
+        token_digest = _sidebar_lease_digest(lease_token)
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            job, _ = _find_sidebar_job_by_digest(
+                conn,
+                token_digest,
+                allow_completion=False,
+            )
+            if job is None:
+                raise ValueError("invalid sidebar lease token")
+            proof_digest = job["reconciliation_proof_digest"]
+            if proof_digest is None:
+                return None
+            proof = conn.execute(
+                """SELECT * FROM session_sidebar_reconciliation_proofs
+                   WHERE proof_digest = ?""",
+                (proof_digest,),
+            ).fetchone()
+            if proof is None:
+                raise ValueError("missing sidebar reconciliation proof")
+            result = dict(proof)
+            if (
+                result["job_id"] != job["id"]
+                or result["source_session_id"] != job["source_session_id"]
+                or result["bridge_id"] != job["bridge_id"]
+            ):
+                raise ValueError("invalid sidebar reconciliation proof identity")
+            return result
 
     def clear_sidebar_create_reservation(
         self,

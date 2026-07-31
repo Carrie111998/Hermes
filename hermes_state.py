@@ -238,7 +238,7 @@ def _default_db_path() -> Path:
 # name-gated in session_bridge_migrations, not version-gated). Live DBs sit
 # at 28 without the upstream migrations, so those are re-gated on < 29
 # below (both are idempotent/self-gating).
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1154,6 +1154,7 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
     visible_at REAL,
     placement_generation INTEGER,
     placement_verified_at REAL,
+    reconciliation_proof_digest TEXT,
     CHECK (
         (state = 'sidebar_leased' AND lease_digest IS NOT NULL AND lease_expires_at IS NOT NULL)
         OR (state != 'sidebar_leased' AND lease_digest IS NULL AND lease_expires_at IS NULL)
@@ -1167,6 +1168,62 @@ CREATE TABLE IF NOT EXISTS session_sidebar_jobs (
         )
     )
 );
+
+CREATE TABLE IF NOT EXISTS session_sidebar_reconciliation_proofs (
+    proof_digest TEXT PRIMARY KEY CHECK (
+        length(proof_digest) = 64
+        AND proof_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    job_id TEXT NOT NULL
+        REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    source_session_id TEXT NOT NULL,
+    bridge_id TEXT NOT NULL,
+    marker_digest TEXT NOT NULL CHECK (
+        length(marker_digest) = 64
+        AND marker_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    placement_generation INTEGER NOT NULL CHECK (placement_generation > 0),
+    delivery_generation INTEGER NOT NULL CHECK (delivery_generation > 0),
+    reconciliation_generation TEXT NOT NULL,
+    completed_at REAL NOT NULL,
+    expires_at REAL NOT NULL CHECK (expires_at >= completed_at),
+    inventory_digest TEXT NOT NULL CHECK (
+        length(inventory_digest) = 64
+        AND inventory_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (
+        state IN ('recovered', 'absence_proven', 'blocked')
+    ),
+    match_count INTEGER NOT NULL CHECK (match_count >= 0),
+    recovered_thread_id TEXT,
+    fixed_reason TEXT,
+    created_at REAL NOT NULL,
+    CHECK (
+        (state = 'recovered'
+            AND match_count = 1
+            AND recovered_thread_id IS NOT NULL
+            AND fixed_reason IS NULL)
+        OR (state = 'absence_proven'
+            AND match_count = 0
+            AND recovered_thread_id IS NULL
+            AND fixed_reason IS NULL)
+        OR (state = 'blocked'
+            AND recovered_thread_id IS NULL
+            AND fixed_reason IS NOT NULL)
+    )
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_sidebar_reconciliation_proofs_no_update
+BEFORE UPDATE ON session_sidebar_reconciliation_proofs
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar reconciliation proof is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_sidebar_reconciliation_proofs_no_delete
+BEFORE DELETE ON session_sidebar_reconciliation_proofs
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar reconciliation proof is immutable');
+END;
 
 CREATE TABLE IF NOT EXISTS session_sidebar_hydration_jobs (
     id TEXT PRIMARY KEY,
@@ -1703,6 +1760,8 @@ CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_completion_digest
 CREATE INDEX IF NOT EXISTS idx_session_sidebar_jobs_visible_at
     ON session_sidebar_jobs(state, visible_at DESC, id DESC)
     WHERE visible_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sidebar_reconciliation_job_created
+    ON session_sidebar_reconciliation_proofs(job_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_state_next_attempt_at
     ON session_claude_visibility_jobs(state, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_session_claude_visibility_jobs_lease_digest

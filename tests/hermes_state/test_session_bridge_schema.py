@@ -12,6 +12,7 @@ EXPECTED_BRIDGE_TABLES = {
     "session_links",
     "session_mirror_jobs",
     "session_sidebar_jobs",
+    "session_sidebar_reconciliation_proofs",
     "session_sidebar_terminal_resolutions",
     "session_context_packs",
     "session_bridge_state",
@@ -35,6 +36,7 @@ EXPECTED_BRIDGE_INDEXES = {
     "idx_session_sidebar_jobs_lease_digest": ("lease_digest",),
     "idx_session_sidebar_jobs_completion_digest": ("completion_digest",),
     "idx_session_sidebar_jobs_visible_at": ("state", "visible_at", "id"),
+    "idx_sidebar_reconciliation_job_created": ("job_id", "created_at"),
 }
 
 EXPECTED_SIDEBAR_PARTIAL_INDEX_SQL = {
@@ -71,6 +73,9 @@ EXPECTED_BRIDGE_FOREIGN_KEYS = {
     },
     "session_sidebar_jobs": {
         ("source_session_id", "sessions", "id", "NO ACTION"),
+    },
+    "session_sidebar_reconciliation_proofs": {
+        ("job_id", "session_sidebar_jobs", "id", "RESTRICT"),
     },
     "session_sidebar_terminal_resolutions": {
         ("job_id", "session_sidebar_jobs", "id", "RESTRICT"),
@@ -269,6 +274,61 @@ def test_fresh_database_creates_bridge_tables_indexes_and_current_schema(tmp_pat
             ).fetchone()
             assert row is not None
             assert " ".join(row[0].split()) == expected_sql
+    finally:
+        db.close()
+
+
+def test_sidebar_reconciliation_proof_schema_is_append_only(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-reconciliation.db")
+    try:
+        columns = {
+            row[1]
+            for row in db._conn.execute(
+                'PRAGMA table_info("session_sidebar_reconciliation_proofs")'
+            )
+        }
+        sidebar_job_columns = {
+            row[1]
+            for row in db._conn.execute(
+                'PRAGMA table_info("session_sidebar_jobs")'
+            )
+        }
+        triggers = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = ?",
+                ("session_sidebar_reconciliation_proofs",),
+            )
+        }
+
+        assert columns == {
+            "proof_digest",
+            "job_id",
+            "source_session_id",
+            "bridge_id",
+            "marker_digest",
+            "placement_generation",
+            "delivery_generation",
+            "reconciliation_generation",
+            "completed_at",
+            "expires_at",
+            "inventory_digest",
+            "state",
+            "match_count",
+            "recovered_thread_id",
+            "fixed_reason",
+            "created_at",
+        }
+        assert "reconciliation_proof_digest" in sidebar_job_columns
+        assert triggers == {
+            "trg_sidebar_reconciliation_proofs_no_update",
+            "trg_sidebar_reconciliation_proofs_no_delete",
+        }
+        assert (
+            db._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            == 31
+        )
     finally:
         db.close()
 

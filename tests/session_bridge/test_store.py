@@ -53,6 +53,10 @@ from session_bridge.sidebar import (
     sidebar_create_recovery_key,
     sidebar_idempotency_key,
 )
+from session_bridge.sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from session_bridge.store import (
     SIDEBAR_EXCLUSION_REASONS,
     SIDEBAR_FATAL_ERRORS,
@@ -8683,6 +8687,111 @@ def test_sidebar_create_reservation_is_lease_validated_and_survives_reopen(
         )
     finally:
         reopened_db.close()
+
+
+def test_sidebar_reconciliation_proof_is_durable_append_only_and_replay_safe(
+    db,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("proof-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="reconciliation-proof")
+    queued = store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    evidence = SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.ABSENCE_PROVEN,
+        generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=0,
+        recovered_thread_id=None,
+        fixed_reason=None,
+    )
+
+    proof = store.record_sidebar_reconciliation_proof(
+        lease_token=lease["lease_token"],
+        evidence=evidence,
+        marker_digest="1" * 64,
+        placement_generation=1,
+        delivery_generation=1,
+        now=100.0,
+    )
+    replay = store.record_sidebar_reconciliation_proof(
+        lease_token=lease["lease_token"],
+        evidence=evidence,
+        marker_digest="1" * 64,
+        placement_generation=1,
+        delivery_generation=1,
+        now=101.0,
+    )
+
+    assert replay == proof
+    assert proof["job_id"] == queued["id"]
+    assert proof["state"] == "absence_proven"
+    assert proof["match_count"] == 0
+    assert store.get_sidebar_reconciliation_proof(
+        lease_token=lease["lease_token"]
+    ) == proof
+    persisted = store.get_sidebar_job_for_source(candidate.source_session_id)
+    assert persisted["reconciliation_proof_digest"] == proof["proof_digest"]
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._conn.execute(
+            "UPDATE session_sidebar_reconciliation_proofs SET state='blocked'"
+        )
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+        db._conn.execute("DELETE FROM session_sidebar_reconciliation_proofs")
+
+
+@pytest.mark.parametrize(
+    ("state", "match_count", "thread_id", "reason"),
+    [
+        ("recovered", 0, "codex-thread", None),
+        ("absence_proven", 0, "codex-thread", None),
+        ("blocked", 0, None, None),
+    ],
+)
+def test_sidebar_reconciliation_proof_schema_rejects_invalid_state_shape(
+    db,
+    state: str,
+    match_count: int,
+    thread_id: str | None,
+    reason: str | None,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(f"proof-shape-{state}"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"proof-shape-{state}")
+    job = store.enqueue_sidebar_job(candidate)
+
+    with pytest.raises(sqlite3.IntegrityError, match="CHECK constraint failed"):
+        db._conn.execute(
+            """INSERT INTO session_sidebar_reconciliation_proofs (
+                   proof_digest, job_id, source_session_id, bridge_id,
+                   marker_digest, placement_generation, delivery_generation,
+                   reconciliation_generation, completed_at, expires_at,
+                   inventory_digest, state, match_count, recovered_thread_id,
+                   fixed_reason, created_at
+               ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, 100, 130, ?, ?, ?, ?, ?, 100)""",
+            (
+                hashlib.sha256(state.encode()).hexdigest(),
+                job["id"],
+                candidate.source_session_id,
+                candidate.bridge_id,
+                "1" * 64,
+                "scan:invalid",
+                "2" * 64,
+                state,
+                match_count,
+                thread_id,
+                reason,
+            ),
+        )
 
 
 def test_sidebar_failure_atomically_retains_known_thread_after_bind_ambiguity(
