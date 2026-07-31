@@ -41,6 +41,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    _INBOUND_EVENT_ID_METADATA_KEY,
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
@@ -194,7 +195,7 @@ def _should_skip_email(
     body: str,
     *,
     category_auto_reply: Optional[Dict[str, bool]] = None,
-    custom_skip_patterns: Optional[str] = None,
+    custom_skip_patterns: str = "",
 ) -> bool:
     """Return whether deterministic filters should suppress the LLM.
 
@@ -206,15 +207,10 @@ def _should_skip_email(
     if any(not enabled.get(category, False) for category in _classify_email(subject, body)):
         return True
 
-    raw_patterns = (
-        os.getenv("EMAIL_SKIP_PATTERNS", "")
-        if custom_skip_patterns is None
-        else custom_skip_patterns
-    )
     combined = f"{subject}\n{body}" if subject else body
     return any(
         pattern.search(combined)
-        for pattern in _compile_patterns(_split_regex_patterns(raw_patterns))
+        for pattern in _compile_patterns(_split_regex_patterns(custom_skip_patterns))
     )
 
 
@@ -768,8 +764,9 @@ class EmailAdapter(BasePlatformAdapter):
         # sender or the externally supplied Message-ID.  Message-ID is not
         # guaranteed unique, while a UID is unique within this mailbox.
         self._reply_context: Dict[str, Dict[str, Any]] = {}
-        # Attachment helpers do not receive an inbound event identifier. Keep
-        # their legacy display/thread metadata separate from reply policy.
+        # Kept only for chat-info display. Delivery never uses this sender-keyed
+        # cache because several queued emails from one sender are independent
+        # conversations for reply threading and policy enforcement.
         self._thread_context: Dict[str, Dict[str, Any]] = {}
 
         logger.info("[Email] Adapter initialized for %s", self._address)
@@ -1307,42 +1304,106 @@ class EmailAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an email, applying reply policy only to an inbound event reply."""
-        ctx = self._reply_context.get(reply_to or "")
+        event_id, ctx = self._reply_context_for_delivery(reply_to, metadata)
         body = content
         if ctx is not None:
-            force_reply = bool(ctx.get("force_reply"))
-            need_response, body = _parse_agent_reply(
-                content,
-                require_structured=self._require_structured_response,
-            )
-            if force_reply:
-                need_response = True
+            policy_decision = ctx.get("reply_delivery_allowed")
+            if policy_decision is False:
+                return SendResult(
+                    success=True,
+                    message_id="skipped-auto-reply-policy",
+                    suppress_follow_up_delivery=True,
+                )
+            if policy_decision is True:
+                # Retries receive the original structured response again; later
+                # fallback sends receive ordinary text. Retain the parsed body
+                # for the former without treating either as a new decision.
+                if content == ctx.get("reply_response_content"):
+                    body = str(ctx.get("reply_response_body", ""))
+            else:
+                force_reply = bool(ctx.get("force_reply"))
+                need_response, body = _parse_agent_reply(
+                    content,
+                    require_structured=self._require_structured_response,
+                )
+                if force_reply:
+                    need_response = True
+                    if not body:
+                        body = "Your email has been received."
+                if need_response is None:
+                    logger.warning("[Email] Invalid structured reply for %s", chat_id)
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-invalid-response-format",
+                        suppress_follow_up_delivery=True,
+                    )
+                if not need_response:
+                    logger.info("[Email] Model requested no reply to %s", chat_id)
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-no-response-needed",
+                        suppress_follow_up_delivery=True,
+                    )
                 if not body:
-                    body = "Your email has been received."
-            elif need_response is None:
-                logger.warning("[Email] Invalid structured reply for %s", chat_id)
-                self._reply_context.pop(reply_to or "", None)
-                return SendResult(success=True, message_id="skipped-invalid-response-format")
-            elif not need_response:
-                logger.info("[Email] Model requested no reply to %s", chat_id)
-                self._reply_context.pop(reply_to or "", None)
-                return SendResult(success=True, message_id="skipped-no-response-needed")
-            elif not body:
-                self._reply_context.pop(reply_to or "", None)
-                return SendResult(success=True, message_id="skipped-empty-response")
+                    ctx["reply_delivery_allowed"] = False
+                    return SendResult(
+                        success=True,
+                        message_id="skipped-empty-response",
+                        suppress_follow_up_delivery=True,
+                    )
+                ctx["reply_delivery_allowed"] = True
+                ctx["reply_response_content"] = content
+                ctx["reply_response_body"] = body
 
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, body, reply_to, ctx
+                None, self._send_email, chat_id, body, event_id, ctx
             )
-            if ctx and ctx.get("uid"):
-                await loop.run_in_executor(None, self._mark_replied_unread, ctx["uid"])
-                self._reply_context.pop(reply_to or "", None)
+            await self._mark_reply_context_delivered(ctx)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send failed to %s: %s", chat_id, e)
             return SendResult(success=False, error=str(e))
+
+    def _reply_context_for_delivery(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Resolve automatic-reply state from the inbound event, never sender."""
+        metadata_event_id = ""
+        if isinstance(metadata, dict):
+            metadata_event_id = str(
+                metadata.get(_INBOUND_EVENT_ID_METADATA_KEY, "") or ""
+            )
+        reply_event_id = str(reply_to or "")
+        reply_context = self._reply_context.get(reply_event_id)
+        if reply_context is not None:
+            return reply_event_id, reply_context
+        event_id = metadata_event_id or reply_event_id or None
+        return event_id, self._reply_context.get(event_id or "")
+
+    async def _mark_reply_context_delivered(
+        self, reply_context: Optional[Dict[str, Any]]
+    ) -> None:
+        """Persist the reply marker once after any automatic reply artifact."""
+        if (
+            not reply_context
+            or not reply_context.get("uid")
+            or reply_context.get("reply_marked")
+        ):
+            return
+        # Avoid duplicate IMAP writes when one automatic reply carries text
+        # plus several native attachments. A failed marker intentionally leaves
+        # the message seen, which is safer than replaying an auto-reply.
+        reply_context["reply_marked"] = True
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, self._mark_replied_unread, reply_context["uid"]
+        )
 
     def _message_id_domain(self) -> str:
         """Domain part for generated Message-IDs.
@@ -1365,22 +1426,7 @@ class EmailAdapter(BasePlatformAdapter):
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
-
-        subject = (reply_context or {}).get("subject", "Hermes Agent")
-        if reply_context and not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        # Threading headers
-        original_msg_id = (reply_context or {}).get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
-        if reply_context is not None:
-            # RFC 3834: suppress mail loops when this is an automatic reply to
-            # a received email.  Ordinary gateway/cron deliveries do not carry
-            # a reply context and must remain normal user-authored mail.
-            msg["Auto-Submitted"] = "auto-replied"
+        subject = self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1400,6 +1446,24 @@ class EmailAdapter(BasePlatformAdapter):
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
+
+    @staticmethod
+    def _apply_reply_headers(
+        msg: MIMEMultipart, reply_context: Optional[Dict[str, Any]]
+    ) -> str:
+        """Apply threading and RFC 3834 headers from one inbound event."""
+        subject = (reply_context or {}).get("subject", "Hermes Agent")
+        if reply_context and not subject.startswith("Re:"):
+            subject = f"Re: {subject}"
+        msg["Subject"] = subject
+
+        original_msg_id = (reply_context or {}).get("message_id")
+        if original_msg_id:
+            msg["In-Reply-To"] = original_msg_id
+            msg["References"] = original_msg_id
+        if reply_context is not None:
+            msg["Auto-Submitted"] = "auto-replied"
+        return subject
 
     def _mark_replied_unread(self, uid: str) -> None:
         """Persist a reply marker before restoring the user's unread state."""
@@ -1439,7 +1503,9 @@ class EmailAdapter(BasePlatformAdapter):
         """
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(
+            chat_id, text.strip(), reply_to=reply_to, metadata=metadata
+        )
 
     async def send_multiple_images(
         self,
@@ -1456,6 +1522,11 @@ class EmailAdapter(BasePlatformAdapter):
         attachments fine, subject to SMTP message size limits.
         """
         if not images:
+            return
+
+        _, reply_context = self._reply_context_for_delivery(None, metadata)
+        if reply_context is not None and not reply_context.get("reply_delivery_allowed"):
+            logger.info("[Email] Skipping attachments without an approved reply decision")
             return
 
         from urllib.parse import unquote as _unquote
@@ -1488,7 +1559,9 @@ class EmailAdapter(BasePlatformAdapter):
                 chat_id,
                 body,
                 local_paths,
+                reply_context,
             )
+            await self._mark_reply_context_delivered(reply_context)
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
@@ -1498,22 +1571,14 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        reply_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
@@ -1554,9 +1619,18 @@ class EmailAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
         """Send a file as an email attachment."""
+        _, reply_context = self._reply_context_for_delivery(reply_to, metadata)
+        if reply_context is not None and not reply_context.get("reply_delivery_allowed"):
+            logger.info("[Email] Skipping attachment without an approved reply decision")
+            return SendResult(
+                success=True,
+                message_id="skipped-auto-reply-policy",
+                suppress_follow_up_delivery=True,
+            )
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
@@ -1566,7 +1640,9 @@ class EmailAdapter(BasePlatformAdapter):
                 caption or "",
                 file_path,
                 file_name,
+                reply_context,
             )
+            await self._mark_reply_context_delivered(reply_context)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             logger.error("[Email] Send document failed: %s", e)
@@ -1578,22 +1654,14 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        reply_context: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
-        msg["Subject"] = subject
-
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_reply_headers(msg, reply_context)
 
         msg["Date"] = formatdate(localtime=True)
         msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"

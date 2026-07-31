@@ -20,7 +20,13 @@ from email.mime.base import MIMEBase
 from email import encoders
 from unittest.mock import patch, MagicMock, AsyncMock, ANY, call
 
-from gateway.platforms.base import SendResult
+from gateway.platforms.base import (
+    MessageEvent,
+    MessageType,
+    SendResult,
+    _INBOUND_EVENT_ID_METADATA_KEY,
+)
+from gateway.session import build_session_key
 
 
 class TestConfigEnvOverrides(unittest.TestCase):
@@ -156,6 +162,19 @@ class TestEmailReplyPolicy(unittest.TestCase):
                 "A normal question",
                 category_auto_reply={},
                 custom_skip_patterns="[invalid",
+            )
+        )
+
+    @patch.dict(os.environ, {"EMAIL_SKIP_PATTERNS": "^ordinary question$"})
+    def test_skip_patterns_environment_variable_cannot_change_policy(self):
+        """Reply filtering is config.yaml-only; .env remains credentials-only."""
+        from plugins.platforms.email.adapter import _should_skip_email
+
+        self.assertFalse(
+            _should_skip_email(
+                "ordinary question",
+                "",
+                category_auto_reply={},
             )
         )
 
@@ -654,8 +673,95 @@ class TestStructuredReplySend(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "skipped-no-response-needed")
+        self.assertTrue(result.suppress_follow_up_delivery)
         adapter._send_email.assert_not_called()
         adapter._mark_replied_unread.assert_not_called()
+
+    def test_no_reply_decision_blocks_follow_up_attachment(self):
+        """A rejected automatic reply cannot leak its file after text suppression."""
+        import asyncio
+        import tempfile
+
+        adapter = self._make_adapter()
+        event_id = "<m@test.com>"
+        adapter._reply_context[event_id] = {"uid": b"12", "force_reply": False}
+        adapter._send_email = MagicMock()
+
+        text_result = asyncio.run(
+            adapter.send(
+                "user@test.com",
+                '{"need_response": false, "response": ""}',
+                reply_to=event_id,
+            )
+        )
+        self.assertTrue(text_result.suppress_follow_up_delivery)
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as document:
+            document.write(b"do not send")
+            document_path = document.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                attachment_result = asyncio.run(
+                    adapter.send_document(
+                        "user@test.com",
+                        document_path,
+                        metadata={_INBOUND_EVENT_ID_METADATA_KEY: event_id},
+                    )
+                )
+        finally:
+            os.unlink(document_path)
+
+        self.assertTrue(attachment_result.success)
+        self.assertTrue(attachment_result.suppress_follow_up_delivery)
+        mock_smtp.assert_not_called()
+
+    def test_gateway_skips_media_after_no_reply_decision(self):
+        """The final delivery pipeline cannot send a rejected reply's file."""
+        import asyncio
+        import tempfile
+
+        adapter = self._make_adapter()
+        event_id = "<hermes-imap-12@test.com>"
+        adapter._reply_context[event_id] = {"uid": b"12", "force_reply": False}
+        source = adapter.build_source(chat_id="user@test.com", chat_type="dm")
+        event = MessageEvent(
+            text="please send the report",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=event_id,
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as document, \
+                tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+            document.write(b"private report")
+            document_path = document.name
+            image.write(b"private image")
+            image_path = image.name
+        try:
+            adapter.set_message_handler(
+                lambda _event: asyncio.sleep(
+                    0,
+                    result=(
+                        '{"need_response": false, "response": ""}\n'
+                        f"MEDIA:{document_path}\nMEDIA:{image_path}"
+                    ),
+                )
+            )
+            with patch(
+                "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+                (os.path.dirname(document_path),),
+            ), patch("smtplib.SMTP") as mock_smtp:
+                asyncio.run(
+                    adapter._process_message_background(
+                        event, build_session_key(source)
+                    )
+                )
+        finally:
+            os.unlink(document_path)
+            os.unlink(image_path)
+
+        self.assertFalse(adapter._reply_context[event_id]["reply_delivery_allowed"])
+        mock_smtp.assert_not_called()
 
     def test_true_json_sends_only_response_body(self):
         import asyncio
@@ -746,6 +852,33 @@ class TestStructuredReplySend(unittest.TestCase):
             "user@test.com", "ordinary delivery", None, None
         )
 
+    def test_generic_attachment_ignores_sender_thread_cache(self):
+        """Scheduled and notification attachments are never replies by sender."""
+        import asyncio
+        import tempfile
+
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Earlier inbound email",
+            "message_id": "<earlier@test.com>",
+        }
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as document:
+            document.write(b"ordinary delivery")
+            document_path = document.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                result = asyncio.run(
+                    adapter.send_document("user@test.com", document_path)
+                )
+        finally:
+            os.unlink(document_path)
+
+        self.assertTrue(result.success)
+        sent = mock_smtp.return_value.send_message.call_args.args[0]
+        self.assertEqual(sent["Subject"], "Hermes Agent")
+        self.assertIsNone(sent["In-Reply-To"])
+        self.assertIsNone(sent["Auto-Submitted"])
+
     def test_reply_marker_is_persisted_before_restoring_unread(self):
         adapter = self._make_adapter()
         imap = MagicMock()
@@ -775,6 +908,102 @@ class TestStructuredReplySend(unittest.TestCase):
 
         sent = server.send_message.call_args.args[0]
         self.assertEqual(sent["Auto-Submitted"], "auto-replied")
+
+    def test_attachment_uses_its_inbound_event_context(self):
+        """Attachment replies retain subject, headers, and IMAP state per event."""
+        import asyncio
+        import tempfile
+
+        adapter = self._make_adapter()
+        first_event = "<hermes-imap-41@test.com>"
+        second_event = "<hermes-imap-42@test.com>"
+        adapter._reply_context[first_event] = {
+            "subject": "First question",
+            "message_id": "<first@test.com>",
+            "uid": b"41",
+            "reply_delivery_allowed": True,
+        }
+        adapter._reply_context[second_event] = {
+            "subject": "Second question",
+            "message_id": "<second@test.com>",
+            "uid": b"42",
+            "reply_delivery_allowed": True,
+        }
+        adapter._mark_replied_unread = MagicMock()
+
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as document:
+            document.write(b"attachment")
+            document_path = document.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                first_result = asyncio.run(
+                    adapter.send_document(
+                        "same-sender@test.com",
+                        document_path,
+                        metadata={_INBOUND_EVENT_ID_METADATA_KEY: first_event},
+                    )
+                )
+                second_result = asyncio.run(
+                    adapter.send_document(
+                        "same-sender@test.com",
+                        document_path,
+                        metadata={_INBOUND_EVENT_ID_METADATA_KEY: second_event},
+                    )
+                )
+        finally:
+            os.unlink(document_path)
+
+        self.assertTrue(first_result.success)
+        self.assertTrue(second_result.success)
+        first_sent, second_sent = [
+            call.args[0] for call in mock_smtp.return_value.send_message.call_args_list
+        ]
+        self.assertEqual(first_sent["Subject"], "Re: First question")
+        self.assertEqual(first_sent["In-Reply-To"], "<first@test.com>")
+        self.assertEqual(first_sent["Auto-Submitted"], "auto-replied")
+        self.assertEqual(second_sent["Subject"], "Re: Second question")
+        self.assertEqual(second_sent["In-Reply-To"], "<second@test.com>")
+        self.assertEqual(second_sent["Auto-Submitted"], "auto-replied")
+        self.assertEqual(
+            adapter._mark_replied_unread.call_args_list,
+            [call(b"41"), call(b"42")],
+        )
+
+    def test_image_attachments_use_their_inbound_event_context(self):
+        """The native image batch follows the same reply policy and headers."""
+        import asyncio
+        import tempfile
+
+        adapter = self._make_adapter()
+        event_id = "<hermes-imap-51@test.com>"
+        adapter._reply_context[event_id] = {
+            "subject": "Image question",
+            "message_id": "<image@test.com>",
+            "uid": b"51",
+            "reply_delivery_allowed": True,
+        }
+        adapter._mark_replied_unread = MagicMock()
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as image:
+            image.write(b"image")
+            image_path = image.name
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                asyncio.run(
+                    adapter.send_multiple_images(
+                        "user@test.com",
+                        [(f"file://{image_path}", "")],
+                        metadata={_INBOUND_EVENT_ID_METADATA_KEY: event_id},
+                    )
+                )
+        finally:
+            os.unlink(image_path)
+
+        sent = mock_smtp.return_value.send_message.call_args.args[0]
+        self.assertEqual(sent["Subject"], "Re: Image question")
+        self.assertEqual(sent["In-Reply-To"], "<image@test.com>")
+        self.assertEqual(sent["Auto-Submitted"], "auto-replied")
+        adapter._mark_replied_unread.assert_called_once_with(b"51")
 
     def test_generic_delivery_has_no_auto_submitted_header(self):
         """Cron and notification email remains ordinary outbound mail."""
