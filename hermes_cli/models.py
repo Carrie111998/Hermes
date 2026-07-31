@@ -2835,6 +2835,43 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                     return live
         except Exception:
             pass
+    if normalized == "gemini":
+        # Query Google's live API for real-time model availability first,
+        # ahead of the curated static list and models.dev merge further
+        # down in this function (both remain as fallbacks when live fetch
+        # is unavailable -- no live path is 100% verified reliable, and
+        # neither the static list nor models.dev's catalog is confirmed
+        # wrong here). Uses the OpenAI-compatible /v1beta/openai surface (Gemini's own documented compat layer)
+        # because it returns the standard {"data": [{"id": ...}]} shape
+        # fetch_api_models() already parses -- the native /v1beta/models
+        # endpoint uses a different response shape that would need
+        # separate parsing.
+        try:
+            from hermes_cli.auth import resolve_api_key_provider_credentials
+
+            creds = resolve_api_key_provider_credentials("gemini")
+            api_key = str(creds.get("api_key") or "").strip()
+            if api_key:
+                live = fetch_api_models(
+                    api_key, "https://generativelanguage.googleapis.com/v1beta/openai"
+                )
+                if live:
+                    # Gemini's OpenAI-compat endpoint returns IDs prefixed
+                    # with "models/" (e.g. "models/gemini-2.5-flash") --
+                    # native Gemini-API convention. Strip it so the picker
+                    # returns/caches the same bare-ID form the curated list,
+                    # user input, and the existing validation path (#12532,
+                    # hermes_cli/models.py's Gemini branch a few hundred
+                    # lines below) all use -- otherwise a successful live
+                    # discovery here would cache IDs the native provider
+                    # doesn't accept as-is.
+                    live = [
+                        m[len("models/"):] if isinstance(m, str) and m.startswith("models/") else m
+                        for m in live
+                    ]
+                    return live
+        except Exception:
+            pass
     if normalized == "anthropic":
         model_cfg = _get_model_config_dict()
         cfg_provider = normalize_provider(str(model_cfg.get("provider", "") or ""))
