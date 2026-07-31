@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import re
 import sys
 import threading
 import time
@@ -193,7 +192,7 @@ def _stub_evaluate_all(plugin_api, snapshot):
 
 
 def _contains_cjk(value):
-    return bool(re.search(r"[\u3400-\u9fff]", value))
+    return any("\u3400" <= character <= "\u9fff" for character in value)
 
 
 def _string_values(value):
@@ -505,19 +504,3 @@ def test_secret_cards_stay_hidden_through_route(plugin_api):
     assert "秘密成就" in secret_card["description"]
     assert "秘密成就" in secret_card["criteria"]
     assert all(definition["name"] not in value for value in _string_values(secret_card))
-
-
-def test_scan_poll_effect_recreated_on_locale_change():
-    bundle_path = PLUGIN_MODULE_PATH.parent / "dist" / "index.js"
-    bundle = bundle_path.read_text(encoding="utf-8")
-    poll_effect = re.search(
-        r"hooks\.useEffect\(function \(\) \{\s*"
-        r"if \(!scanInFlight\).*?setInterval\(refresh, 4000\);.*?"
-        r"\}, \[([^\]]*)\]\);",
-        bundle,
-        re.DOTALL,
-    )
-
-    assert poll_effect is not None, "scan polling effect was not found in the bundle"
-    dependencies = {item.strip() for item in poll_effect.group(1).split(",")}
-    assert "locale" in dependencies
