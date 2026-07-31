@@ -103,6 +103,10 @@ from tools.xai_http import hermes_xai_user_agent
 # crashing in headless environments (SSH, Docker, WSL, no PortAudio).
 # ---------------------------------------------------------------------------
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _import_edge_tts():
     """Lazy import edge_tts. Returns the module or raises ImportError.
 
@@ -112,13 +116,14 @@ def _import_edge_tts():
     """
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
-        _lazy_ensure("tts.edge", prompt=False)
+        feature = "tts.edge.windows" if _is_windows() else "tts.edge"
+        _lazy_ensure(feature, prompt=False)
     except ImportError:
         pass
     except Exception:
         pass
 
-    if os.name == "nt":
+    if _is_windows():
         try:
             import truststore
             truststore.inject_into_ssl()
