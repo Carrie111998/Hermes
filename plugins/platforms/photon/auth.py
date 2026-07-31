@@ -43,6 +43,7 @@ import re
 import time
 from base64 import b64encode
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -84,6 +85,13 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # ---------------------------------------------------------------------------
 # auth.json helpers — share the file with the rest of hermes-agent.
 
+def auth_json_path() -> Path:
+    """Return the residence-aware Hermes auth store path."""
+    from hermes_constants import get_hermes_auth_home_strict
+
+    return get_hermes_auth_home_strict() / "auth.json"
+
+
 def _load_auth() -> Dict[str, Any]:
     try:
         from hermes_cli.auth import _load_auth_store
@@ -93,7 +101,7 @@ def _load_auth() -> Dict[str, Any]:
         # _load_auth_store swallows OSError/JSONDecodeError itself and returns
         # an empty store; what actually escapes is the pytest seat belt's
         # RuntimeError or a home-resolution failure. Deliberately not calling
-        # _auth_json_path() in the message — under those failures it raises
+        # auth_json_path() in the message — under those failures it raises
         # again, turning a logged warning into a crash.
         logger.warning("photon: could not read the Hermes auth store: %s", e)
         return {}

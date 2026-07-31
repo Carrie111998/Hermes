@@ -341,9 +341,10 @@ def test_symlinked_credential_file_is_included_from_residence(
         assert zf.read("_auth-residence/auth.json") == b'{"value":"mounted"}\n'
 
 
-def test_runtime_nested_beneath_residence_is_not_omitted(
+def test_runtime_nested_beneath_residence_is_rejected_before_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     from hermes_cli.backup import run_backup
 
@@ -357,11 +358,11 @@ def test_runtime_nested_beneath_residence_is_not_omitted(
 
     archive = tmp_path / "nested.zip"
     run_backup(Namespace(output=str(archive)))
-    with zipfile.ZipFile(archive) as zf:
-        names = set(zf.namelist())
-        assert "config.yaml" in names
-        assert "notes.txt" in names
-        assert "_auth-residence/auth.json" in names
+
+    assert not archive.exists()
+    assert "HERMES_AUTH_HOME must not contain HERMES_HOME" in (
+        capsys.readouterr().out
+    )
 
 
 def test_no_override_backup_keeps_flat_credential_layout(
@@ -566,6 +567,51 @@ def test_quick_snapshot_uses_explicit_profile_home_and_restores_old_credentials(
         assert (
             explicit_auth / ".anthropic_oauth.json"
         ).stat().st_mode & 0o777 == 0o600
+
+
+def test_quick_snapshot_round_trips_runtime_credential_suppressions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli.backup import (
+        QuickSnapshotStatus,
+        create_quick_snapshot,
+        restore_quick_snapshot,
+    )
+
+    runtime_home = tmp_path / "runtime"
+    auth_home = tmp_path / "auth"
+    runtime_home.mkdir()
+    auth_home.mkdir()
+    (runtime_home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    suppression_path = runtime_home / ".credential_suppressions.json"
+    original = (
+        b'{"version":1,"suppressed_sources":'
+        b'{"custom:foo":["config:Foo"]}}\n'
+    )
+    suppression_path.write_bytes(original)
+    if os.name != "nt":
+        suppression_path.chmod(0o600)
+    residence_sentinel = auth_home / ".credential_suppressions.json"
+    residence_sentinel.write_bytes(b'{"residence":"untouched"}\n')
+    _configure(monkeypatch, runtime_home, auth_home, tmp_path / "operator")
+
+    snapshot_id = create_quick_snapshot(hermes_home=runtime_home)
+    assert snapshot_id is not None
+    snapshot_file = (
+        runtime_home
+        / "state-snapshots"
+        / snapshot_id
+        / ".credential_suppressions.json"
+    )
+    assert snapshot_file.read_bytes() == original
+
+    suppression_path.write_bytes(b'{"version":1}\n')
+    result = restore_quick_snapshot(snapshot_id, hermes_home=runtime_home)
+
+    assert result.status is QuickSnapshotStatus.COMPLETE
+    assert suppression_path.read_bytes() == original
+    assert residence_sentinel.read_bytes() == b'{"residence":"untouched"}\n'
 
 
 def test_quick_restore_preserves_live_change_during_lock_acquisition(

@@ -1891,6 +1891,7 @@ _QUICK_STATE_FILES = (
     "state.db",
     "config.yaml",
     ".env",
+    ".credential_suppressions.json",
     "auth.json",
     ".anthropic_oauth.json",
     "cron/jobs.json",

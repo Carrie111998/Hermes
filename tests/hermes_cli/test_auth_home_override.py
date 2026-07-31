@@ -86,6 +86,125 @@ def test_auth_home_defaults_to_runtime_home_and_validates_override(
     assert get_hermes_auth_home() == residence.resolve()
 
 
+def test_auth_home_rejects_os_home_and_its_ancestor(monkeypatch, tmp_path):
+    import hermes_constants
+
+    operator_home = tmp_path / "operator" / "home"
+    runtime_home = tmp_path / "runtime"
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+
+    for residence in (operator_home, operator_home.parent):
+        monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+        with pytest.raises(
+            hermes_constants.HermesAuthHomeError,
+            match="OS user home",
+        ):
+            hermes_constants.validate_hermes_auth_home()
+
+
+def test_auth_home_uses_real_home_when_home_is_profile_scoped(
+    monkeypatch, tmp_path
+):
+    import hermes_constants
+
+    runtime_home = tmp_path / "runtime"
+    profile_home = runtime_home / "home"
+    profile_home.mkdir(parents=True)
+    operator_home = tmp_path / "operator"
+    monkeypatch.setenv("HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(operator_home))
+
+    with pytest.raises(
+        hermes_constants.HermesAuthHomeError,
+        match="OS user home",
+    ):
+        hermes_constants.validate_hermes_auth_home()
+
+
+def test_auth_home_rejects_runtime_ancestor(monkeypatch, tmp_path):
+    import hermes_constants
+
+    operator_home = tmp_path / "operator"
+    runtime_root = tmp_path / "runtime"
+    runtime_home = runtime_root / "sessions" / "one"
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(runtime_root))
+
+    with pytest.raises(
+        hermes_constants.HermesAuthHomeError,
+        match="must not contain HERMES_HOME",
+    ):
+        hermes_constants.validate_hermes_auth_home()
+
+
+def test_auth_home_rejects_active_runtime_ancestor(monkeypatch, tmp_path):
+    import hermes_constants
+
+    process_home = tmp_path / "runtime"
+    residence = tmp_path / "auth"
+    active_home = residence / "tenant"
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+
+    token = hermes_constants.set_hermes_home_override(active_home)
+    try:
+        with pytest.raises(
+            hermes_constants.HermesAuthHomeError,
+            match="must not contain HERMES_HOME",
+        ):
+            hermes_constants.validate_hermes_auth_home()
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+
+def test_auth_home_boundary_validation_preserves_supported_layouts(
+    monkeypatch, tmp_path
+):
+    import hermes_constants
+
+    operator_home = tmp_path / "operator"
+    runtime_home = tmp_path / "runtime"
+    monkeypatch.setenv("HOME", str(operator_home))
+
+    monkeypatch.setenv("HERMES_HOME", str(operator_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(operator_home))
+    assert hermes_constants.get_hermes_auth_home_strict() == operator_home.resolve()
+
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(runtime_home))
+    profile_home = runtime_home / "profiles" / "work"
+    token = hermes_constants.set_hermes_home_override(profile_home)
+    try:
+        assert hermes_constants.get_hermes_auth_home_strict() == profile_home
+    finally:
+        hermes_constants.reset_hermes_home_override(token)
+
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(runtime_home))
+    assert hermes_constants.get_hermes_auth_home_strict() == profile_home
+
+    monkeypatch.setenv("HERMES_HOME", str(runtime_home))
+    for residence in (operator_home / ".hermes-auth", tmp_path / "auth-residence"):
+        monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+        assert (
+            hermes_constants.get_hermes_auth_home_strict()
+            == residence.resolve()
+        )
+
+    profile_home = runtime_home / "profiles" / "work"
+    residence = tmp_path / "profile-auth-residence"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_AUTH_HOME", str(residence))
+    assert hermes_constants.get_hermes_auth_home_strict() == (
+        residence.resolve() / "profiles" / "work"
+    )
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [("", "set but empty"), ("   ", "set but empty"),

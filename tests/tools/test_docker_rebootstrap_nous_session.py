@@ -90,6 +90,92 @@ def test_auth_layout_matches_default_profile_and_path_equal_mapping(tmp_path):
     )
 
 
+def test_auth_layout_rejects_os_home_and_its_ancestor(monkeypatch, tmp_path):
+    operator_home = tmp_path / "operator" / "home"
+    runtime_home = tmp_path / "runtime"
+    monkeypatch.setenv("HOME", str(operator_home))
+
+    for residence in (operator_home, operator_home.parent):
+        with pytest.raises(ValueError, match="OS user home"):
+            mod.resolve_auth_layout(
+                str(runtime_home),
+                True,
+                str(residence),
+            )
+
+
+def test_auth_layout_uses_real_home_when_home_is_profile_scoped(
+    monkeypatch, tmp_path
+):
+    runtime_home = tmp_path / "runtime"
+    profile_home = runtime_home / "home"
+    profile_home.mkdir(parents=True)
+    operator_home = tmp_path / "operator"
+    monkeypatch.setenv("HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(operator_home))
+
+    with pytest.raises(ValueError, match="OS user home"):
+        mod.resolve_auth_layout(
+            str(runtime_home),
+            True,
+            str(operator_home),
+        )
+
+
+def test_auth_layout_rejects_runtime_ancestor(monkeypatch, tmp_path):
+    runtime_root = tmp_path / "runtime"
+    runtime_home = runtime_root / "sessions" / "work"
+    monkeypatch.setenv("HOME", str(tmp_path / "operator"))
+
+    with pytest.raises(ValueError, match="must not contain HERMES_HOME"):
+        mod.resolve_auth_layout(
+            str(runtime_home),
+            True,
+            str(runtime_root),
+        )
+
+
+def test_auth_layout_boundary_validation_preserves_supported_layouts(
+    monkeypatch, tmp_path
+):
+    operator_home = tmp_path / "operator"
+    runtime_home = tmp_path / "runtime"
+    monkeypatch.setenv("HOME", str(operator_home))
+
+    assert mod.resolve_auth_layout(
+        str(operator_home),
+        True,
+        str(operator_home),
+    ) == (operator_home.resolve(), operator_home.resolve())
+
+    for residence in (operator_home / ".hermes-auth", tmp_path / "auth-residence"):
+        assert mod.resolve_auth_layout(
+            str(runtime_home),
+            True,
+            str(residence),
+        ) == (residence.resolve(), residence.resolve())
+
+    profile_home = runtime_home / "profiles" / "work"
+    assert mod.resolve_auth_layout(
+        str(profile_home),
+        True,
+        str(runtime_home),
+    ) == (
+        runtime_home.resolve(),
+        profile_home.resolve(),
+    )
+
+    residence = tmp_path / "profile-auth-residence"
+    assert mod.resolve_auth_layout(
+        str(profile_home),
+        True,
+        str(residence),
+    ) == (
+        residence.resolve(),
+        residence.resolve() / "profiles" / "work",
+    )
+
+
 @pytest.mark.parametrize("named_profile", (False, True))
 @pytest.mark.parametrize(
     "override",
@@ -238,16 +324,18 @@ def test_layout_subprocess_maps_named_profile_for_stage2(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("set_path_equal_override", (False, True))
+@pytest.mark.parametrize("override_kind", ("unset", "profile", "root"))
 def test_layout_subprocess_keeps_shared_store_at_runtime_root_for_no_op(
-    tmp_path, set_path_equal_override
+    tmp_path, override_kind
 ):
     runtime_root = tmp_path / "runtime"
     runtime = runtime_root / "profiles" / "work"
     env = os.environ.copy()
     env["HERMES_HOME"] = str(runtime)
-    if set_path_equal_override:
+    if override_kind == "profile":
         env["HERMES_AUTH_HOME"] = str(runtime)
+    elif override_kind == "root":
+        env["HERMES_AUTH_HOME"] = str(runtime_root)
     else:
         env.pop("HERMES_AUTH_HOME", None)
 
@@ -260,8 +348,9 @@ def test_layout_subprocess_keeps_shared_store_at_runtime_root_for_no_op(
     )
 
     assert result.returncode == 0, result.stderr
+    expected_residence = runtime_root if override_kind == "root" else runtime
     assert result.stdout.splitlines() == [
-        str(runtime),
+        str(expected_residence),
         str(runtime),
         "same",
         str(runtime_root / "shared"),

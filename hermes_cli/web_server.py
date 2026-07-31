@@ -12348,16 +12348,12 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 @app.get("/api/credentials/pool")
 async def list_credential_pool():
-    from agent.credential_pool import load_pool
-    from hermes_cli.auth import read_credential_pool
+    from agent.credential_pool import list_pool_providers, load_pool
 
     providers = []
-    # read_credential_pool(None) lists every provider that has pooled entries;
-    # load_pool() then gives us the rich PooledCredential objects per provider.
-    raw_pool = read_credential_pool()
-    for provider_id in sorted(raw_pool.keys()):
+    for provider_id in list_pool_providers():
         try:
-            pool = load_pool(provider_id)
+            pool = load_pool(provider_id, passive=True)
         except Exception:
             _log.exception("load_pool(%s) failed", provider_id)
             continue
@@ -12409,11 +12405,10 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
         if not provider.startswith(CUSTOM_POOL_PREFIX):
             try:
                 from hermes_cli.auth import (
-                    _load_auth_store,
+                    get_suppressed_credential_sources,
                     unsuppress_credential_source,
                 )
-                suppressed = _load_auth_store().get("suppressed_sources", {})
-                for src in list(suppressed.get(provider, []) or []):
+                for src in get_suppressed_credential_sources(provider):
                     unsuppress_credential_source(provider, src)
             except Exception:
                 _log.exception("unsuppress after pool add failed (non-fatal)")

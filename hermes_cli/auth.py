@@ -50,14 +50,24 @@ from hermes_cli.config import (
 )
 from hermes_constants import (
     OPENROUTER_BASE_URL,
+    get_hermes_home,
     get_hermes_auth_home_strict,
     get_hermes_auth_home_override,
     get_hermes_auth_home_override_strict,
     is_hermes_auth_home_relocated_strict,
     secure_parent_dir,
 )
-from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from agent.credential_persistence import (
+    is_runtime_local_credential_source,
+    sanitize_borrowed_credential_payload,
+)
+from utils import (
+    atomic_json_write,
+    atomic_replace,
+    atomic_yaml_write,
+    env_float,
+    is_truthy_value,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1616,7 +1626,9 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def _read_credential_pool_unfiltered(
+    provider_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1661,6 +1673,32 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
     return list(global_entries) if isinstance(global_entries, list) else []
+
+
+def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+    """Return persisted pool rows visible to the active runtime home."""
+    pool = _read_credential_pool_unfiltered(provider_id)
+    if not is_hermes_auth_home_relocated_strict():
+        return pool
+
+    def visible(entries: Any) -> Any:
+        if not isinstance(entries, list):
+            return entries
+        return [
+            entry
+            for entry in entries
+            if not (
+                isinstance(entry, dict)
+                and is_runtime_local_credential_source(entry.get("source"))
+            )
+        ]
+
+    if provider_id is None:
+        return {
+            pool_provider: visible(entries)
+            for pool_provider, entries in pool.items()
+        }
+    return visible(pool)
 
 
 _POOL_STATUS_FIELDS = (
@@ -1760,8 +1798,10 @@ def write_credential_pool(
     def persistable(entry: Any) -> bool:
         if not isinstance(entry, dict):
             return True
-        source = str(entry.get("source") or "")
-        return not (shared_residence and source.startswith("env:"))
+        return not (
+            shared_residence
+            and is_runtime_local_credential_source(entry.get("source"))
+        )
 
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -1811,8 +1851,198 @@ def write_credential_pool(
         return _save_auth_store(auth_store)
 
 
+_RUNTIME_SUPPRESSION_STORE_VERSION = 1
+_runtime_suppression_migrations_checked: set[Tuple[str, str]] = set()
+_runtime_suppression_migration_guard = threading.Lock()
+
+
+def _runtime_suppression_file_path() -> Path:
+    return get_hermes_home() / ".credential_suppressions.json"
+
+
+@contextmanager
+def _runtime_suppression_store_lock(
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    state_path = _runtime_suppression_file_path()
+    with _file_lock(
+        state_path.with_suffix(".lock"),
+        _auth_lock_holder_for(state_path),
+        timeout_seconds,
+        "Timed out waiting for runtime credential suppression lock",
+    ):
+        yield state_path
+
+
+def _load_runtime_suppression_store(
+    state_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    path = state_path or _runtime_suppression_file_path()
+    if not path.exists():
+        return {"version": _RUNTIME_SUPPRESSION_STORE_VERSION}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(
+            "auth: failed to parse runtime credential suppressions at %s: %s",
+            path,
+            exc,
+        )
+        return {"version": _RUNTIME_SUPPRESSION_STORE_VERSION}
+    if not isinstance(raw, dict):
+        return {"version": _RUNTIME_SUPPRESSION_STORE_VERSION}
+    suppressed = raw.get("suppressed_sources")
+    if suppressed is not None and not isinstance(suppressed, dict):
+        raw.pop("suppressed_sources", None)
+    return raw
+
+
+def _save_runtime_suppression_store(
+    state: Dict[str, Any],
+    state_path: Optional[Path] = None,
+) -> Path:
+    path = state_path or _runtime_suppression_file_path()
+    state["version"] = _RUNTIME_SUPPRESSION_STORE_VERSION
+    atomic_json_write(path, state, indent=2, mode=0o600)
+    return path
+
+
+def _suppression_is_runtime_local(source: str) -> bool:
+    return (
+        is_runtime_local_credential_source(source)
+        and is_hermes_auth_home_relocated_strict()
+    )
+
+
+def _suppressed_sources_for_provider(
+    store: Dict[str, Any],
+    provider_id: str,
+) -> List[str]:
+    suppressed = store.get("suppressed_sources")
+    if not isinstance(suppressed, dict):
+        return []
+    provider_list = suppressed.get(provider_id)
+    if not isinstance(provider_list, list):
+        return []
+    return [source for source in provider_list if isinstance(source, str)]
+
+
+def _remove_source_suppression(
+    store: Dict[str, Any],
+    provider_id: str,
+    source: str,
+) -> bool:
+    suppressed = store.get("suppressed_sources")
+    if not isinstance(suppressed, dict):
+        return False
+    provider_list = suppressed.get(provider_id)
+    if not isinstance(provider_list, list) or source not in provider_list:
+        return False
+    provider_list.remove(source)
+    if not provider_list:
+        suppressed.pop(provider_id, None)
+    if not suppressed:
+        store.pop("suppressed_sources", None)
+    return True
+
+
+def _migrate_runtime_suppressions_from_auth_store() -> None:
+    try:
+        if not is_hermes_auth_home_relocated_strict():
+            return
+        migration_key = (
+            str(get_hermes_home().resolve(strict=False)),
+            str(get_hermes_auth_home_strict().resolve(strict=False)),
+        )
+    except Exception:
+        return
+
+    with _runtime_suppression_migration_guard:
+        if migration_key in _runtime_suppression_migrations_checked:
+            return
+        with _runtime_suppression_store_lock() as state_path:
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                suppressed = auth_store.get("suppressed_sources")
+                legacy_sources: Dict[str, List[str]] = {}
+                if isinstance(suppressed, dict):
+                    for provider_id, sources in suppressed.items():
+                        if not isinstance(provider_id, str) or not isinstance(
+                            sources,
+                            list,
+                        ):
+                            continue
+                        runtime_sources = [
+                            source
+                            for source in sources
+                            if isinstance(source, str)
+                            and is_runtime_local_credential_source(source)
+                        ]
+                        if runtime_sources:
+                            legacy_sources[provider_id] = runtime_sources
+
+                if legacy_sources:
+                    local_store = _load_runtime_suppression_store(state_path)
+                    local_suppressed = local_store.setdefault(
+                        "suppressed_sources",
+                        {},
+                    )
+                    for provider_id, sources in legacy_sources.items():
+                        provider_list = local_suppressed.get(provider_id)
+                        if not isinstance(provider_list, list):
+                            provider_list = []
+                            local_suppressed[provider_id] = provider_list
+                        for source in sources:
+                            if source not in provider_list:
+                                provider_list.append(source)
+                    _save_runtime_suppression_store(local_store, state_path)
+                    for provider_id, sources in legacy_sources.items():
+                        for source in sources:
+                            _remove_source_suppression(
+                                auth_store,
+                                provider_id,
+                                source,
+                            )
+                    _save_auth_store(auth_store)
+        _runtime_suppression_migrations_checked.add(migration_key)
+
+
+def get_suppressed_credential_sources(provider_id: str) -> List[str]:
+    """Return the active runtime's suppression markers for one provider."""
+    _migrate_runtime_suppressions_from_auth_store()
+    sources = _suppressed_sources_for_provider(_load_auth_store(), provider_id)
+    try:
+        if is_hermes_auth_home_relocated_strict():
+            local_sources = _suppressed_sources_for_provider(
+                _load_runtime_suppression_store(),
+                provider_id,
+            )
+            sources = [
+                source
+                for source in sources
+                if not is_runtime_local_credential_source(source)
+            ]
+            sources.extend(local_sources)
+    except Exception:
+        pass
+    return list(dict.fromkeys(sources))
+
+
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
+    if _suppression_is_runtime_local(source):
+        with _runtime_suppression_store_lock() as state_path:
+            state = _load_runtime_suppression_store(state_path)
+            suppressed = state.setdefault("suppressed_sources", {})
+            provider_list = suppressed.setdefault(provider_id, [])
+            if source not in provider_list:
+                provider_list.append(source)
+                _save_runtime_suppression_store(state, state_path)
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            if _remove_source_suppression(auth_store, provider_id, source):
+                _save_auth_store(auth_store)
+        return
     with _auth_store_lock():
         auth_store = _load_auth_store()
         suppressed = auth_store.setdefault("suppressed_sources", {})
@@ -1825,9 +2055,16 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user."""
     try:
-        auth_store = _load_auth_store()
-        suppressed = auth_store.get("suppressed_sources", {})
-        return source in suppressed.get(provider_id, [])
+        if _suppression_is_runtime_local(source):
+            _migrate_runtime_suppressions_from_auth_store()
+            return source in _suppressed_sources_for_provider(
+                _load_runtime_suppression_store(),
+                provider_id,
+            )
+        return source in _suppressed_sources_for_provider(
+            _load_auth_store(),
+            provider_id,
+        )
     except Exception:
         return False
 
@@ -1837,21 +2074,19 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
 
     Returns True if a marker was cleared, False if no marker existed.
     """
+    removed = False
+    if _suppression_is_runtime_local(source):
+        with _runtime_suppression_store_lock() as state_path:
+            state = _load_runtime_suppression_store(state_path)
+            if _remove_source_suppression(state, provider_id, source):
+                _save_runtime_suppression_store(state, state_path)
+                removed = True
     with _auth_store_lock():
         auth_store = _load_auth_store()
-        suppressed = auth_store.get("suppressed_sources")
-        if not isinstance(suppressed, dict):
-            return False
-        provider_list = suppressed.get(provider_id)
-        if not isinstance(provider_list, list) or source not in provider_list:
-            return False
-        provider_list.remove(source)
-        if not provider_list:
-            suppressed.pop(provider_id, None)
-        if not suppressed:
-            auth_store.pop("suppressed_sources", None)
-        _save_auth_store(auth_store)
-        return True
+        if _remove_source_suppression(auth_store, provider_id, source):
+            _save_auth_store(auth_store)
+            removed = True
+    return removed
 
 
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:

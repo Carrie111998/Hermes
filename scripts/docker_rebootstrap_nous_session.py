@@ -57,6 +57,39 @@ def _is_filesystem_anchor(path: PurePath) -> bool:
     return path.parent == path
 
 
+def _path_is_within(path: Path, directory: Path) -> bool:
+    """Return whether *path* is equal to or below *directory*."""
+    try:
+        path.relative_to(directory)
+        return True
+    except ValueError:
+        return False
+
+
+def _real_user_home(runtime_home: Path) -> Path:
+    profile_home = runtime_home / "home"
+    candidates = [
+        os.environ.get("HERMES_REAL_HOME", ""),
+        os.environ.get("HOME", ""),
+    ]
+    try:
+        import pwd
+
+        candidates.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        pass
+    candidates.append(os.path.expanduser("~"))
+
+    for raw in candidates:
+        if not raw:
+            continue
+        candidate = Path(raw).resolve(strict=False)
+        if profile_home.is_dir() and candidate == profile_home.resolve(strict=False):
+            continue
+        return candidate
+    return Path("/tmp")
+
+
 def resolve_auth_layout(
     hermes_home: str,
     auth_home_is_set: bool,
@@ -73,7 +106,7 @@ def resolve_auth_layout(
         return runtime_path, runtime_path
     try:
         runtime_home = runtime_path.resolve(strict=False)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(f"HERMES_HOME cannot be resolved: {exc}") from exc
 
     raw = auth_home_raw
@@ -114,6 +147,25 @@ def resolve_auth_layout(
     if os.path.lexists(auth_dir) and not auth_dir.is_dir():
         raise ValueError(
             f"mapped credential path must be a directory (got {str(auth_dir)!r})"
+        )
+    if auth_dir == runtime_home:
+        return residence, auth_dir
+
+    try:
+        user_home = _real_user_home(runtime_home)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(
+            f"HERMES_AUTH_HOME cannot be checked against the OS user home: {exc}"
+        ) from exc
+    if _path_is_within(user_home, residence):
+        raise ValueError(
+            "HERMES_AUTH_HOME must not be the OS user home or one of its "
+            "ancestors; use a dedicated directory"
+        )
+    if _path_is_within(runtime_home, residence):
+        raise ValueError(
+            "HERMES_AUTH_HOME must not contain HERMES_HOME; "
+            "use a dedicated directory"
         )
     return residence, auth_dir
 
@@ -336,7 +388,7 @@ def main() -> int:
         print(auth_dir)
         runtime_home = Path(os.environ.get("HERMES_HOME", "")).resolve(strict=False)
         is_distinct = (
-            "HERMES_AUTH_HOME" in os.environ and residence != runtime_home
+            "HERMES_AUTH_HOME" in os.environ and auth_dir != runtime_home
         )
         print("distinct" if is_distinct else "same")
         if is_distinct:

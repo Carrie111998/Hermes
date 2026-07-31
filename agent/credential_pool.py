@@ -19,6 +19,7 @@ from hermes_cli.config import load_env
 from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
+    is_runtime_local_credential_source,
     sanitize_borrowed_credential_payload,
 )
 import hermes_cli.auth as auth_mod
@@ -30,6 +31,7 @@ from hermes_cli.auth import (
     _decode_jwt_claims,
     _load_auth_store,
     _load_provider_state,
+    _read_credential_pool_unfiltered,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _save_auth_store,
@@ -445,15 +447,50 @@ def get_custom_provider_pool_key(base_url: Optional[str], provider_name: Optiona
     return None
 
 
-def list_custom_pool_providers() -> List[str]:
-    """Return all 'custom:*' pool keys that have entries in auth.json."""
+def _pool_provider_candidates() -> Set[str]:
     pool_data = read_credential_pool(None)
-    return sorted(
-        key for key in pool_data
-        if key.startswith(CUSTOM_POOL_PREFIX)
-        and isinstance(pool_data.get(key), list)
-        and pool_data[key]
+    candidates = {
+        provider.strip().lower()
+        for provider in pool_data
+        if isinstance(provider, str) and provider.strip()
+    }
+    candidates.update(PROVIDER_REGISTRY)
+    candidates.add("openrouter")
+    candidates.update(
+        f"{CUSTOM_POOL_PREFIX}{name}"
+        for name, _entry in _iter_custom_providers()
     )
+    return candidates
+
+
+def _active_pool_providers(candidates: Set[str]) -> List[str]:
+    providers = []
+    for provider in sorted(candidates):
+        try:
+            if load_pool(provider, passive=True).entries():
+                providers.append(provider)
+        except Exception:
+            logger.debug(
+                "Could not enumerate credential pool %s",
+                provider,
+                exc_info=True,
+            )
+    return providers
+
+
+def list_pool_providers() -> List[str]:
+    """Return candidate provider pools that currently expose credentials."""
+    return _active_pool_providers(_pool_provider_candidates())
+
+
+def list_custom_pool_providers() -> List[str]:
+    """Return configured or persisted custom pools with active entries."""
+    candidates = {
+        provider
+        for provider in _pool_provider_candidates()
+        if provider.startswith(CUSTOM_POOL_PREFIX)
+    }
+    return _active_pool_providers(candidates)
 
 
 def _get_custom_provider_config(pool_key: str) -> Optional[Dict[str, Any]]:
@@ -2175,7 +2212,12 @@ def _normalize_pool_priorities(provider: str, entries: List[PooledCredential]) -
     return changed
 
 
-def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
+def _seed_from_singletons(
+    provider: str,
+    entries: List[PooledCredential],
+    *,
+    passive: bool = False,
+) -> Tuple[bool, Set[str]]:
     changed = False
     active_sources: Set[str] = set()
     auth_store = _load_auth_store()
@@ -2328,6 +2370,13 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             )
 
     elif provider == "copilot":
+        if passive:
+            active_sources.update(
+                entry.source
+                for entry in entries
+                if entry.source == "gh_cli"
+            )
+            return changed, active_sources
         # Copilot tokens are resolved dynamically via `gh auth token` or
         # env vars (COPILOT_GITHUB_TOKEN / GH_TOKEN).  They don't live in
         # the auth store or credential pool, so we resolve them here.
@@ -2632,12 +2681,11 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     return changed, active_sources
 
 
-def _auth_store_outlives_env_home() -> bool:
-    """True when the credential store is shared by sessions with distinct .env.
+def _auth_store_outlives_runtime_home() -> bool:
+    """True when the credential store is shared by distinct runtime homes.
 
     ``HERMES_AUTH_HOME`` relocates the pool (it lives in ``auth.json``) but
-    deliberately does NOT relocate ``.env``, which stays per-``HERMES_HOME``.
-    In that layout the two files no longer belong to the same session.
+    deliberately does not relocate ``.env`` or ``config.yaml``.
     """
     try:
         from hermes_constants import is_hermes_auth_home_relocated
@@ -2650,15 +2698,14 @@ def _auth_store_outlives_env_home() -> bool:
 def _is_session_private_entry(entry: PooledCredential) -> bool:
     """True for pool rows that must stay out of a shared credential store.
 
-    ``env:*`` rows are references to a variable in this session's ``.env``.
-    Persisting them into a store shared with other sessions publishes a row
-    whose token those sessions can never rehydrate — they inherit an empty
-    credential plus this session's secret fingerprint, and two sessions
-    holding different values for the same variable overwrite each other
-    (``_upsert_entry`` keys on ``source``). Keeping them in memory preserves
-    the #9331 non-destructive-read behavior for the session that owns them.
+    Runtime-derived rows are keyed by source, so sharing them would transfer
+    cooldowns, terminal status, and secret fingerprints between independent
+    ``.env`` and ``config.yaml`` files.
     """
-    return entry.source.startswith("env:") and _auth_store_outlives_env_home()
+    return (
+        _auth_store_outlives_runtime_home()
+        and is_runtime_local_credential_source(entry.source)
+    )
 
 
 def _prune_stale_seeded_entries(
@@ -2769,17 +2816,17 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(provider: str, *, passive: bool = False) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    raw_entries = _read_credential_pool_unfiltered(provider)
     removed_session_private = False
-    if _auth_store_outlives_env_home():
+    if _auth_store_outlives_runtime_home():
         filtered_entries = [
             payload
             for payload in raw_entries
             if not (
                 isinstance(payload, dict)
-                and str(payload.get("source") or "").startswith("env:")
+                and is_runtime_local_credential_source(payload.get("source"))
             )
         ]
         removed_session_private = len(filtered_entries) != len(raw_entries)
@@ -2823,7 +2870,17 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _prune_stale_seeded_entries(entries, custom_sources)
     else:
-        singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+        if passive:
+            singleton_changed, singleton_sources = _seed_from_singletons(
+                provider,
+                entries,
+                passive=True,
+            )
+        else:
+            singleton_changed, singleton_sources = _seed_from_singletons(
+                provider,
+                entries,
+            )
         env_changed, env_sources = _seed_from_env(provider, entries)
         changed = (
             removed_session_private

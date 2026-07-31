@@ -29,8 +29,9 @@ in the same shape:
 
     1. Clean up whatever externally-readable state the source reads from
        (.env line, auth.json block, OAuth file, etc.)
-    2. Suppress the ``(provider, source_id)`` in auth.json so the
-       corresponding ``_seed_from_*`` branch skips the upsert on re-load
+    2. Suppress the ``(provider, source_id)`` in the source-appropriate
+       persistence scope so the corresponding ``_seed_from_*`` branch skips
+       the upsert on re-load
     3. Return ``RemovalResult`` describing what was cleaned and any
        diagnostic hints the user should see (shell-exported env vars,
        external credential files we deliberately don't delete, etc.)
