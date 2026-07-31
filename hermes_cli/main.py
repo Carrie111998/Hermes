@@ -1951,6 +1951,8 @@ def _tui_external_local_workspaces(tui_dir: Path) -> list[tuple[Path, Path]]:
 
 def _iter_tui_workspace_inputs(relative: Path, workspace: Path):
     """Yield copied workspace files, rejecting symlinks before they can escape."""
+    if workspace.is_symlink():
+        raise RuntimeError(f"refusing symlink TUI workspace: {workspace}")
     for path in sorted(workspace.rglob("*"), key=lambda candidate: candidate.as_posix()):
         workspace_relative = path.relative_to(workspace)
         if any(part in {"node_modules", "dist"} for part in workspace_relative.parts):

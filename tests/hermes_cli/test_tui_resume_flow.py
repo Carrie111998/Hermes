@@ -579,6 +579,21 @@ def test_tui_bundle_stamp_rejects_symlinks_in_primary_workspace(main_mod, tmp_pa
         main_mod._tui_bundle_stamp(tui_dir)
 
 
+def test_tui_workspace_input_iterator_rejects_symlinked_workspace_root(
+    main_mod, tmp_path
+):
+    real_workspace = tmp_path / "real-ui-tui"
+    real_workspace.mkdir()
+    (real_workspace / "package.json").write_text(
+        '{"name":"hermes-tui"}', encoding="utf-8"
+    )
+    linked_workspace = tmp_path / "linked-ui-tui"
+    linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="symlink"):
+        list(main_mod._iter_tui_workspace_inputs(Path("ui-tui"), linked_workspace))
+
+
 def test_tui_cache_advisory_lock_serializes_builders(main_mod, tmp_path):
     lock_path = tmp_path / "tui-bundle.lock"
     first = main_mod._try_acquire_tui_cache_lock(lock_path)
