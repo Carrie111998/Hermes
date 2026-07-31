@@ -37,6 +37,38 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+def test_make_agent_applies_tui_runtime_status_target(monkeypatch, tmp_path):
+    from tui_gateway import synthetic_turn
+
+    target = tmp_path / "runtime-status.json"
+    fake_agent = types.SimpleNamespace(
+        session_id="session-key",
+        context_compressor=types.SimpleNamespace(
+            context_length=272_000,
+            last_prompt_tokens=182_079,
+            compression_count=2,
+        ),
+    )
+    monkeypatch.setenv("HERMES_TUI_RUNTIME_STATUS_FILE", str(target))
+    monkeypatch.setattr(
+        synthetic_turn,
+        "maybe_build_synthetic_agent",
+        lambda *_args, **_kwargs: fake_agent,
+    )
+
+    assert server._make_agent("sid", "session-key") is fake_agent
+    assert fake_agent.runtime_status_file == str(target)
+    assert json.loads(target.read_text(encoding="utf-8")) | {"updated_at": "ignored"} == {
+        "schema_version": "1.0.0",
+        "pid": os.getpid(),
+        "session_id": "session-key",
+        "context_used": 182_079,
+        "context_size": 272_000,
+        "compression_count": 2,
+        "updated_at": "ignored",
+    }
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
