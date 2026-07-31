@@ -45,6 +45,7 @@ from session_bridge.models import (
     SidebarJobState,
     decode_bridge_marker,
 )
+from session_bridge.preview import build_session_preview
 from session_bridge.sidebar import (
     SidebarCandidate,
     VerifiedSidebarThread,
@@ -227,7 +228,7 @@ def _seed_sidebar_source(db: SessionDB) -> tuple[SessionBridgeStore, SidebarCand
         db,
         Provider.CLAUDE,
         "sidebar-source",
-        title="Fix private token sk-secret-value",
+        title="Fix private token sk-abcdefghijklmnopqrstuvwxyz123456",
         cwd="C:/work/sidebar-tree",
         repo="C:/repo/sidebar",
         timestamp=900.0,
@@ -918,6 +919,93 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
         Provider.CODEX,
         1,
     )
+
+
+def test_session_sidebar_pending_uses_snapshot_title_not_candidate_title(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE sessions SET title = ? WHERE id = ?",
+            ("Raw snapshot title", candidate.source_session_id),
+        )
+    )
+    snapshot = store.get_sidebar_preview_source(candidate.source_session_id)
+    direct_preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor=snapshot["source_cursor"],
+        source_hash=snapshot["source_hash"],
+        title=snapshot["title"],
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=snapshot["captured_at"],
+        messages=snapshot["messages"],
+        git_root=candidate.git_root,
+        git_branch=candidate.git_branch,
+        git_head=candidate.git_head,
+        worktree_id=candidate.worktree_id,
+    )
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="snapshot-title-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        ),
+    )
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+
+    prompt = response["jobs"][0]["registration_prompt"]
+    assert "Title: Raw snapshot title" in prompt
+    assert "Title: [Claude] Fix private token [REDACTED]" not in prompt
+    assert "Title: [Claude] [Claude]" not in prompt
+    assert f"Preview digest: {direct_preview.digest}" in prompt
+
+
+def test_session_sidebar_pending_ignores_disabled_preview_flag_and_stays_readable(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_claims = (
+        SidebarDeliveryClaim(
+            lease_token="disabled-preview-lease",
+            source_session_id=candidate.source_session_id,
+            bridge_id=candidate.bridge_id,
+            reconcile_required=True,
+            rename_required=False,
+            recovered_thread=None,
+        ),
+    )
+
+    with _test_client(
+        _create_test_app(
+            db,
+            store,
+            coordinator,
+            config=BridgeConfig(sidebar=SidebarConfig(readable_preview_enabled=False)),
+        )
+    ) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+
+    prompt = response["jobs"][0]["registration_prompt"]
+    assert prompt.startswith("# Imported Claude Code Session")
+    assert "## Bridge Registration" in prompt
+    assert "This is a Hermes Session Bridge placeholder registration." in prompt
 
 
 @pytest.mark.parametrize("supplied", [0, -1, 2, 5, 99])

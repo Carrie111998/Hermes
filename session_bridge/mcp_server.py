@@ -1905,7 +1905,7 @@ def _build_sidebar_broker_job(
             snapshot.get("source_hash"),
             "preview source hash",
         ),
-        title=candidate.title,
+        title=cast(str | None, snapshot["title"]),
         provider=candidate.provider.value,
         cwd=candidate.cwd,
         captured_at=snapshot.get("captured_at"),

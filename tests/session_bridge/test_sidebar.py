@@ -7,6 +7,7 @@ import json
 import pytest
 
 import session_bridge.sidebar as sidebar_module
+from session_bridge.config import MIN_READABLE_PREVIEW_BUDGET_CHARS
 from session_bridge.models import (
     BridgeMarkerPayload,
     HydrationMarkerPayload,
@@ -688,6 +689,35 @@ def test_readable_registration_prompt_puts_preview_before_bridge_metadata() -> N
         "Until that later user message, reply with only: REGISTERED"
     )
     assert is_registration_prompt(prompt)
+
+
+def test_minimum_readable_preview_builds_a_registration_valid_prompt() -> None:
+    source_cwd = "C:\\repo\\" + ("source-directory-" * 6)
+    git_root = "C:\\repo\\" + ("repository-root-" * 6)
+    candidate = _candidate(cwd=source_cwd, git_root=git_root)
+    preview = build_session_preview(
+        source_session_id=candidate.source_session_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        title="Snapshot title " + ("detail-" * 14),
+        provider=candidate.provider.value,
+        cwd=candidate.cwd,
+        captured_at=NOW,
+        messages=[],
+        git_root=candidate.git_root,
+        git_branch="feature/" + ("long-branch-" * 10),
+        git_head=None,
+        worktree_id="worktree-" + ("metadata-" * 10),
+        budget_chars=MIN_READABLE_PREVIEW_BUDGET_CHARS,
+    )
+
+    prompt = build_registration_prompt(candidate, _marker_for(candidate), preview=preview)
+
+    assert is_registration_prompt(prompt)
+    assert "## Continuation Brief" in prompt
+    assert "## Last 5 Messages" in prompt
+    assert "## Source and Filesystem Safety" in prompt
+    assert f"Source working directory: {source_cwd}" in prompt
 
 
 def test_hydration_message_is_a_maintenance_only_turn() -> None:

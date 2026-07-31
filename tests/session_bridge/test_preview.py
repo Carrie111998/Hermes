@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import session_bridge.config as bridge_config
 from hermes_state import SessionDB
 from session_bridge.models import (
     PreviewMessage,
@@ -90,6 +91,47 @@ def test_preview_orders_readable_sections_and_filesystem_safety() -> None:
     assert "Source working directory: C:\\repo" in rendered
     assert ".hermes Session Inbox" in rendered
     assert "source-project handoff" in rendered
+    assert "\nWorking directory:" not in rendered
+
+
+def test_preview_minimum_readable_budget_preserves_required_structure() -> None:
+    preview = _preview(
+        [],
+        budget_chars=bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS,
+    )
+
+    assert preview.rendered.startswith("# Imported Claude Code Session")
+    assert "## Continuation Brief" in preview.rendered
+    assert "## Last 5 Messages" in preview.rendered
+    assert "## Source and Filesystem Safety" in preview.rendered
+    assert "Source working directory: C:\\repo" in preview.rendered
+
+
+def test_preview_rejects_budget_below_minimum_readable_structure() -> None:
+    with pytest.raises(ValueError, match="preview budget_chars must be at least"):
+        _preview(
+            [],
+            budget_chars=bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS - 1,
+        )
+
+
+def test_preview_rejects_oversized_metadata_instead_of_rendering_a_fragment() -> None:
+    with pytest.raises(ValueError, match="cannot fit the configured structural budget"):
+        build_session_preview(
+            source_session_id="claude:source",
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            title="title-" * 1_000,
+            provider="claude",
+            cwd="C:\\repo\\" + ("source-directory-" * 1_000),
+            captured_at=8.0,
+            messages=[],
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            budget_chars=bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS,
+        )
 
 
 def test_preview_exact_latest_five_messages_are_chronological() -> None:
@@ -116,6 +158,37 @@ def test_preview_exact_latest_five_messages_are_chronological() -> None:
     assert [last_five.index(f"message-{index}") for index in range(2, 7)] == sorted(
         last_five.index(f"message-{index}") for index in range(2, 7)
     )
+
+
+def test_preview_uses_canonical_input_order_for_equal_and_missing_timestamps() -> None:
+    # Store snapshots are ordered by immutable message ID; the builder preserves that
+    # canonical source order and deliberately does not re-sort equal/missing timestamps.
+    canonical = [
+        {"role": "user", "content": "message-1", "timestamp": 7.0},
+        {"role": "assistant", "content": "message-2", "timestamp": 7.0},
+        {"role": "user", "content": "message-3"},
+        {"role": "assistant", "content": "message-4", "timestamp": None},
+        {"role": "user", "content": "message-5", "timestamp": 6.0},
+        {"role": "assistant", "content": "message-6", "timestamp": 5.0},
+    ]
+
+    preview = _preview(canonical)
+    reordered = _preview(list(reversed(canonical)))
+
+    assert [message.content for message in preview.recent_messages] == [
+        "message-2",
+        "message-3",
+        "message-4",
+        "message-5",
+        "message-6",
+    ]
+    assert [message.content for message in reordered.recent_messages] == [
+        "message-5",
+        "message-4",
+        "message-3",
+        "message-2",
+        "message-1",
+    ]
 
 
 def test_preview_excludes_control_noise_inactive_and_redaction_only_messages() -> None:

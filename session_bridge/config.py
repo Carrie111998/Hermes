@@ -38,6 +38,10 @@ _ENV_NAMES = frozenset({
 _LIVE_CHARACTERIZATION_ENV_NAMES = frozenset({
     f"{_ENV_PREFIX}LIVE_TESTS",
 })
+# A minimum structural envelope for a readable preview with no retained context.
+# It keeps the title/source headers, continuation sections, message heading, and
+# filesystem-safety instructions intact rather than allowing a partial fragment.
+MIN_READABLE_PREVIEW_BUDGET_CHARS = 1024
 _Result = TypeVar("_Result")
 
 
@@ -517,7 +521,7 @@ class BridgeConfig:
                     sidebar_defaults.preview_budget_chars,
                 ),
                 "session_bridge.sidebar.preview_budget_chars",
-                minimum=1,
+                minimum=MIN_READABLE_PREVIEW_BUDGET_CHARS,
                 maximum=100_000,
             ),
         )

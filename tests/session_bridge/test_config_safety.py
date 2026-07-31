@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+import session_bridge.config as bridge_config
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
 _DEFAULT_CONFIG_DIRECTORY = tempfile.TemporaryDirectory(
@@ -260,6 +261,33 @@ def test_sidebar_config_defaults_are_exact_disabled_and_environment_free(
     assert config.sidebar == SidebarConfig()
     assert config.sidebar.enabled is False
     assert config.sidebar.continuous is False
+
+
+def test_sidebar_preview_budget_rejects_values_below_readable_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="preview_budget_chars must be at least"):
+        _load_with_sidebar(
+            monkeypatch,
+            {
+                "preview_budget_chars": (
+                    bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS - 1
+                ),
+            },
+        )
+
+
+def test_sidebar_preview_budget_default_is_readable_minimum_or_larger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _load_with_sidebar(monkeypatch, {})
+
+    assert config.sidebar.preview_budget_chars >= (
+        bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS
+    )
+    assert _SIDEBAR_DEFAULTS["preview_budget_chars"] >= (
+        bridge_config.MIN_READABLE_PREVIEW_BUDGET_CHARS
+    )
 
 
 def test_default_config_import_is_safe_without_a_resolvable_home(
