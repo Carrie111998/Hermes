@@ -1113,42 +1113,42 @@ class BuzzAdapter(BasePlatformAdapter):
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
     def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+        """True for a raw npub/hex identity or literal @display-name mention."""
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?!\w)"
             if re.search(pattern, lowered):
                 return True
         return False
 
     def _strip_mention(self, content: str) -> str:
-        """Remove a leading @mention of this agent so the remaining text can be
+        """Remove a leading explicit identity so the remaining text can be
         recognized as a slash command or clean prompt.
 
         Mirrors the Discord adapter, which strips its own ``<@id>`` mention
         before dispatch. Without this a channel message like ``@Chip /whoami``
         arrives with a leading ``@Chip``; the gateway's ``is_command()`` checks
         ``text.lstrip().startswith("/")`` and never fires the command. Only a
-        LEADING mention is stripped (case-insensitive); mentions mid-sentence
-        are left intact so normal prose is unaffected.
+        LEADING literal @display-name mention or raw/optional-@ npub/hex identity
+        is stripped (case-insensitive); mentions mid-sentence are left intact.
         """
         text = content.strip()
         candidates = []
         if self._display_name:
-            candidates.append(re.escape(self._display_name))
+            candidates.append(rf"@{re.escape(self._display_name)}(?!\w)")
         if self._self_npub:
-            candidates.append(re.escape(self._self_npub))
+            candidates.append(rf"@?{re.escape(self._self_npub)}")
         if self._self_pubkey:
-            candidates.append(re.escape(self._self_pubkey))
+            candidates.append(rf"@?{re.escape(self._self_pubkey)}")
         if not candidates:
             return text
-        # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
+        # Each candidate carries its own @ policy; trailing punctuation and
+        # surrounding whitespace remain optional for every identity form.
+        pattern = rf"^(?:{'|'.join(candidates)})[\s:,]*"
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 
