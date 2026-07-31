@@ -36,6 +36,7 @@ def _make_agent(*, platform="cron"):
     agent._interrupt_requested = False
     agent._consecutive_stale_streams = 0
     agent._touch_activity = MagicMock()
+    agent._compute_non_stream_stale_timeout.return_value = float("inf")
     agent._close_request_openai_client = MagicMock()
     return agent
 
@@ -98,5 +99,4 @@ def test_direct_api_call_interrupt_aborts_active_client_and_raises():
     assert not worker.is_alive()
     assert isinstance(result.get("exception"), InterruptedError)
     assert agent._active_request_abort is None
-
 

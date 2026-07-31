@@ -24,6 +24,7 @@ def _make_agent(*, platform="cron"):
     agent.provider = "openrouter"
     agent._interrupt_requested = False
     agent._touch_activity = MagicMock()
+    agent._compute_non_stream_stale_timeout.return_value = float("inf")
     agent._create_request_openai_client = MagicMock()
     agent._close_request_openai_client = MagicMock()
     return agent
