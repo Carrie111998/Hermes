@@ -232,19 +232,37 @@ export function useGatewayBoot({
     }
 
     // Adopt the profile the primary (window) backend booted as, so same-profile
-    // resumes are no-op swaps and reconnects target the right backend.
-    // Best-effort: a missing preference means "default". Shared by boot + soft
-    // switch.
-    async function adoptPrimaryProfile() {
+    // resumes are no-op swaps and reconnects target the right backend. The IPC
+    // read is best-effort: a missing preference means "default".
+    let sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+
+    async function readPrimaryProfile(): Promise<string> {
       try {
         const pref = await desktop.profile?.get?.()
-        const profileKey = (pref?.profile ?? '').trim() || 'default'
-        $activeGatewayProfile.set(profileKey)
-        setPrimaryGateway(gateway, profileKey)
-        void ensureGatewayForProfile(profileKey)
+
+        return normalizeProfileKey((pref?.profile ?? '').trim() || 'default')
       } catch {
-        $activeGatewayProfile.set('default')
+        return 'default'
       }
+    }
+
+    function applyPrimaryProfile(profile: string): void {
+      const profileKey = normalizeProfileKey(profile)
+      $activeGatewayProfile.set(profileKey)
+      sourceProfile = profileKey
+      setPrimaryGateway(gateway, profileKey)
+      // Align the registry's active pointer with the primary. Without this,
+      // gateway state events (tagged with primaryProfile) fail the
+      // activeKey match in reportGatewayState and the "open" state never
+      // publishes — the UI hangs at "connecting". For the primary key this
+      // is the synchronous setActive fast path, safe pre-connect.
+      void ensureGatewayForProfile(profileKey)
+    }
+
+    // A soft gateway-mode apply establishes the socket before the primary
+    // profile is available, so it also wakes the matching profile socket.
+    async function adoptPrimaryProfile() {
+      applyPrimaryProfile(await readPrimaryProfile())
     }
 
     // Seed the working dir from the backend default on a fresh view (nothing
@@ -360,7 +378,6 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -390,7 +407,8 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+    // Set by applyPrimaryProfile() before boot starts, so every initial event
+    // carries the persisted primary profile rather than the atom's default.
 
     const offEvent = gateway.onEvent(event =>
       callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
@@ -491,13 +509,6 @@ export function useGatewayBoot({
           return
         }
 
-        // Profile adoption must land first: refreshSessions scopes its fetch by
-        // $profileScope ← $activeGatewayProfile. The remaining three fetches
-        // (cwd seed, config, sessions) are independent REST calls — running
-        // them serially added their sum to time-to-populated-sidebar when only
-        // the max is needed.
-        await adoptPrimaryProfile()
-
         setDesktopBootStep({
           phase: 'renderer.config',
           message: translateNow('boot.steps.loadingSettings'),
@@ -565,11 +576,26 @@ export function useGatewayBoot({
       await callbacksRef.current.refreshSessions().catch(() => undefined)
     }
 
-    if (adoptedFromHmr) {
-      void adoptBoot()
-    } else {
-      void boot()
+    async function startBoot() {
+      // The primary connection descriptor does not carry a profile. Seed the
+      // renderer from active-profile.json before getConnection() so the first
+      // sidebar fetch cannot issue against the atom's initial "default" value.
+      const profile = survivor?.profile ? normalizeProfileKey(survivor.profile) : await readPrimaryProfile()
+
+      if (cancelled) {
+        return
+      }
+
+      applyPrimaryProfile(profile)
+
+      if (adoptedFromHmr) {
+        void adoptBoot()
+      } else {
+        void boot()
+      }
     }
+
+    void startBoot()
 
     return () => {
       cancelled = true

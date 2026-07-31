@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
 import { $gatewayState } from '@/store/session'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -160,6 +161,7 @@ beforeEach(() => {
     timestamp: Date.now(),
     visible: true
   })
+  $activeGatewayProfile.set('default')
 })
 
 afterEach(() => {
@@ -234,6 +236,33 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     })
 
     expect($desktopBoot.get().error).toBeTruthy()
+  })
+
+  it('adopts the persisted primary profile before obtaining the primary connection', async () => {
+    const desktop = fakeDesktop()
+    const profileGet = vi.fn(async () => ({ profile: 'atlas' }))
+    const getConnection = desktop.getConnection
+    desktop.profile.get = profileGet
+    desktop.getConnection = vi.fn(async () => {
+      expect($activeGatewayProfile.get()).toBe('atlas')
+
+      return getConnection()
+    })
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect(profileGet).toHaveBeenCalledOnce()
+    expect(desktop.getConnection).toHaveBeenCalledOnce()
+    expect(profileGet.mock.invocationCallOrder[0]).toBeLessThan(desktop.getConnection.mock.invocationCallOrder[0])
+
+    // Regression: adopting a non-default primary must also move the registry's
+    // active pointer. If activeKey stays "default" while state events are
+    // tagged "atlas", reportGatewayState drops the open transition and the
+    // UI hangs at "connecting" forever.
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect($gatewayState.get()).toBe('open')
   })
 
   it('resets the old machine context before connecting an applied gateway', async () => {
