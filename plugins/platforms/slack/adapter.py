@@ -950,6 +950,7 @@ class SlackAdapter(BasePlatformAdapter):
         # user never clicks would otherwise leak its entry forever. Keys may
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
+        self._approval_core_ids: Dict[Any, str] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
@@ -6436,11 +6437,19 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = result.get("ts", "")
             if msg_ts:
                 team_id = self._metadata_team_id(metadata)
-                self._approval_resolved[
-                    self._workspace_message_marker(team_id, msg_ts)
-                ] = False
+                marker = self._workspace_message_marker(team_id, msg_ts)
+                self._approval_resolved[marker] = False
+                core_approval_id = str(
+                    (metadata or {}).get("approval_id") or ""
+                )
+                if core_approval_id:
+                    self._approval_core_ids[marker] = core_approval_id
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
+                )
+                self._trim_oldest_dict_entries(
+                    self._approval_core_ids,
+                    self._APPROVAL_RESOLVED_MAX,
                 )
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
@@ -6898,6 +6907,11 @@ class SlackAdapter(BasePlatformAdapter):
         approval_key = self._workspace_message_marker(team_id, msg_ts)
         if msg_ts in self._approval_resolved:
             approval_key = msg_ts
+        core_approval_id = getattr(
+            self,
+            "_approval_core_ids",
+            {},
+        ).pop(approval_key, "")
         if self._approval_resolved.pop(approval_key, True):
             return
 
@@ -6907,7 +6921,15 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             from tools.approval import resolve_gateway_approval
 
-            count = resolve_gateway_approval(session_key, choice)
+            count = resolve_gateway_approval(
+                session_key,
+                choice,
+                **(
+                    {"approval_id": core_approval_id}
+                    if core_approval_id
+                    else {}
+                ),
+            )
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count,

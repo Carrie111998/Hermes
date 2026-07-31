@@ -3,7 +3,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
 import { $gateway } from '@/store/gateway'
-import { $approvalRequest, clearAllPrompts, setApprovalRequest } from '@/store/prompts'
+import { $approvalRequest, clearAllPrompts, clearApprovalRequest, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 
 import { PendingApprovalFallback, PendingToolApproval } from './approval'
@@ -26,21 +26,31 @@ beforeAll(() => {
   }
 })
 
-function part(toolName: string): ToolPart {
-  return { toolName, type: `tool-${toolName}` } as unknown as ToolPart
+function part(toolName: string, toolCallId = 'tool-call-1'): ToolPart {
+  return { toolCallId, toolName, type: `tool-${toolName}` } as unknown as ToolPart
 }
+
+let approvalSequence = 0
 
 function setRequest(
   command = 'rm -rf /tmp/x',
   allowPermanent?: boolean,
-  extra: { choices?: string[]; smartDenied?: boolean } = {}
+  extra: { approvalId?: string; choices?: string[]; smartDenied?: boolean; toolCallId?: string } = {}
 ) {
   $activeSessionId.set('sess-1')
-  setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
+  setApprovalRequest({
+    approvalId: extra.approvalId ?? `approval-test-${++approvalSequence}`,
+    allowPermanent,
+    command,
+    description: 'dangerous command',
+    sessionId: 'sess-1',
+    toolCallId: 'tool-call-1',
+    ...extra
+  })
 }
 
 function mockGateway() {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
+  const request = vi.fn().mockResolvedValue({ resolved: 1 })
   $gateway.set({ request } as unknown as HermesGateway)
 
   return request
@@ -75,15 +85,69 @@ describe('PendingToolApproval', () => {
     expect(screen.getByRole('button', { name: /Reject/ })).toBeTruthy()
   })
 
+  it('does not attach an approval to a different tool-call row', () => {
+    setRequest('chmod -R 777 /tmp/x', undefined, {
+      approvalId: 'approval-row-mismatch',
+      toolCallId: 'call-a'
+    })
+    const { container } = render(<PendingToolApproval part={part('terminal', 'call-b')} />)
+
+    expect(container.innerHTML).toBe('')
+  })
+
+  it('moves the inline controls from A to B only when the exact queued approval advances', async () => {
+    $activeSessionId.set('sess-1')
+    setApprovalRequest({
+      approvalId: 'approval-row-a',
+      command: 'first',
+      description: 'first approval',
+      sessionId: 'sess-1',
+      toolCallId: 'call-a'
+    })
+    setApprovalRequest({
+      approvalId: 'approval-row-b',
+      command: 'second',
+      description: 'second approval',
+      sessionId: 'sess-1',
+      toolCallId: 'call-b'
+    })
+
+    const { container } = render(
+      <>
+        <div data-testid="row-a">
+          <PendingToolApproval part={part('terminal', 'call-a')} />
+        </div>
+        <div data-testid="row-b">
+          <PendingToolApproval part={part('terminal', 'call-b')} />
+        </div>
+      </>
+    )
+
+    expect(within(screen.getByTestId('row-a')).getByRole('button', { name: /Run/ })).toBeTruthy()
+    expect(within(screen.getByTestId('row-b')).queryByRole('button', { name: /Run/ })).toBeNull()
+
+    clearApprovalRequest('sess-1', 'approval-row-a')
+
+    await waitFor(() => {
+      expect(within(screen.getByTestId('row-a')).queryByRole('button', { name: /Run/ })).toBeNull()
+      expect(within(screen.getByTestId('row-b')).getByRole('button', { name: /Run/ })).toBeTruthy()
+      expect(container.querySelectorAll('[data-slot="tool-approval-inline"]')).toHaveLength(1)
+    })
+  })
+
   it('sends approval.respond {choice: "once"} and clears the request on Run', async () => {
     const request = mockGateway()
-    setRequest()
+    setRequest(undefined, undefined, { approvalId: 'approval-123' })
     render(<PendingToolApproval part={part('terminal')} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Run/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        approval_id: 'approval-123',
+        choice: 'once',
+        session_id: 'sess-1'
+      })
     })
     expect($approvalRequest.get()).toBeNull()
   })
@@ -103,13 +167,17 @@ describe('PendingToolApproval', () => {
 
   it('sends choice "deny" on Reject', async () => {
     const request = mockGateway()
-    setRequest()
+    setRequest(undefined, undefined, { approvalId: 'approval-default' })
     render(<PendingToolApproval part={part('terminal')} />)
 
     fireEvent.click(screen.getByRole('button', { name: /Reject/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        approval_id: 'approval-default',
+        choice: 'deny',
+        session_id: 'sess-1'
+      })
     })
   })
 

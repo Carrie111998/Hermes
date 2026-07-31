@@ -35,14 +35,10 @@ import type { ToolPart } from './fallback-model'
 // the command, so the strip deliberately doesn't repeat it) instead of as a
 // modal overlay.
 //
-// Binding is POSITIONAL, not command-matched: the desktop `tool.start` payload
-// carries no structured args (only tool_id/name/context — see
-// tui_gateway/server.py::_on_tool_start), so we cannot join the approval to the
-// row by command string. But `approval.request` only ever fires from the
-// `terminal` / `execute_code` guards and the agent thread blocks on exactly one
-// approval at a time, so the single pending row of those tools IS the row that
-// raised it. The command/description text comes from `$approvalRequest` (the
-// event payload), which is the only place that data reliably exists.
+// The core approval request and tool.start both carry the model tool-call id.
+// Only mount an inline control when those exact ids match. Missing/legacy ids
+// deliberately fall back to the floating approval surface instead of attaching
+// a session's head waiter to an unrelated terminal row.
 export const APPROVAL_TOOLS = new Set(['terminal', 'execute_code'])
 
 // Canonical gateway choices (ui-tui/src/components/prompts.tsx).
@@ -55,7 +51,13 @@ export const PendingToolApproval: FC<{ part: ToolPart }> = ({ part }) => {
   const $request = useMemo(() => sessionApprovalRequest(sessionId), [sessionId])
   const request = useStore($request)
 
-  if (!request || !APPROVAL_TOOLS.has(part.toolName)) {
+  if (
+    !request ||
+    !APPROVAL_TOOLS.has(part.toolName) ||
+    !request.toolCallId ||
+    !part.toolCallId ||
+    request.toolCallId !== part.toolCallId
+  ) {
     return null
   }
 
@@ -65,7 +67,7 @@ export const PendingToolApproval: FC<{ part: ToolPart }> = ({ part }) => {
 const InlineApprovalBar: FC<{ request: ApprovalRequest }> = ({ request }) => {
   useEffect(() => registerApprovalInlineAnchor(request.sessionId), [request.sessionId])
 
-  return <ApprovalBar request={request} surface="inline" />
+  return <ApprovalBar key={request.approvalId ?? request.command} request={request} surface="inline" />
 }
 
 export const PendingApprovalFallback: FC = () => {
@@ -94,7 +96,7 @@ export const PendingApprovalFallback: FC = () => {
             <span className="min-w-0 truncate text-(--ui-text-tertiary)">{request.description}</span>
           )}
         </div>
-        <ApprovalBar request={request} surface="floating" />
+        <ApprovalBar key={request.approvalId ?? request.command} request={request} surface="floating" />
       </div>
     </div>
   )
@@ -129,7 +131,13 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       // Another bar (or the keyboard path) may have already resolved this
       // approval; the map is the single source of truth, so bail if this
       // session's request is gone.
-      if (busy || !sessionApprovalRequest(request.sessionId).get()) {
+      const current = sessionApprovalRequest(request.sessionId).get()
+
+      if (
+        busy ||
+        !current ||
+        (request.approvalId && current.approvalId !== request.approvalId)
+      ) {
         return
       }
 
@@ -139,21 +147,38 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
         return
       }
 
+      if (!request.approvalId) {
+        clearApprovalRequest(request.sessionId)
+        notifyError(
+          new Error('Approval identity missing'),
+          copy.sendFailed
+        )
+
+        return
+      }
+
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
+        const response = await gateway.request<{ resolved?: number }>('approval.respond', {
+          approval_id: request.approvalId,
           choice,
           session_id: request.sessionId ?? undefined
         })
+
+        if (!response?.resolved) {
+          clearApprovalRequest(request.sessionId, request.approvalId)
+          throw new Error('Approval no longer pending')
+        }
+
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
-        clearApprovalRequest(request.sessionId)
+        clearApprovalRequest(request.sessionId, request.approvalId)
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.approvalId, request.sessionId]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

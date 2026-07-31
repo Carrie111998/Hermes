@@ -351,6 +351,79 @@ class TestTeamsSend:
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
 
 
+class TestTeamsApprovalButtons:
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        adapter._app = MagicMock()
+        adapter._send_card = AsyncMock(return_value=SimpleNamespace(id="approval-message"))
+        return adapter
+
+    @pytest.mark.anyio
+    async def test_send_exec_approval_embeds_exact_core_id_in_every_action(
+        self, monkeypatch
+    ):
+        adapter = self._make_adapter()
+        actions = []
+
+        def capture_action(**kwargs):
+            actions.append(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        monkeypatch.setattr(_teams_mod, "ExecuteAction", capture_action)
+
+        result = await adapter.send_exec_approval(
+            "conv-id",
+            "rm /tmp/example",
+            "session-1",
+            metadata={"approval_id": "approval-exact-1"},
+        )
+
+        assert result.success is True
+        assert result.message_id == "approval-message"
+        action_data = [action["data"] for action in actions]
+        assert action_data
+        assert {
+            data["approval_id"] for data in action_data
+        } == {"approval-exact-1"}
+
+    @pytest.mark.anyio
+    async def test_card_action_resolves_only_the_embedded_core_id(
+        self, monkeypatch
+    ):
+        adapter = self._make_adapter()
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        resolve = MagicMock(return_value=1)
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            resolve,
+        )
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                from_=SimpleNamespace(id="actor-1", aad_object_id="actor-1"),
+                value=SimpleNamespace(
+                    action=SimpleNamespace(
+                        data={
+                            "approval_id": "approval-exact-2",
+                            "hermes_action": "approve_once",
+                            "session_key": "session-1",
+                        }
+                    )
+                ),
+            )
+        )
+
+        response = await adapter._on_card_action(ctx)
+
+        assert response.status == 200
+        resolve.assert_called_once_with(
+            "session-1",
+            "once",
+            approval_id="approval-exact-2",
+        )
+
+
 def _make_summary_payload():
     return TeamsMeetingSummaryPayload(
         meeting_ref=TeamsMeetingRef(meeting_id="meeting-123"),
@@ -712,5 +785,3 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
-

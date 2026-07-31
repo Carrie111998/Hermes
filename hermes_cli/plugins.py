@@ -34,11 +34,13 @@ so plugin-defined tools appear alongside the built-in tools.
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.metadata
 import importlib.util
 import inspect
 import logging
 import os
+import secrets
 import sys
 import threading
 import types
@@ -180,11 +182,14 @@ VALID_HOOKS: Set[str] = {
     #
     # Kwargs for pre_approval_request:
     #   command: str, description: str, pattern_key: str, pattern_keys: list[str],
-    #   session_key: str, surface: "cli" | "gateway" | "smart"
+    #   session_key: str, surface: "cli" | "gateway" | "smart",
+    #   turn_id: str, tool_call_id: str, approval_request: ApprovalRequest
     # Kwargs for post_approval_response: same as above plus
     #   choice: "once" | "session" | "always" | "deny" | "timeout"
     #           | "smart_approve" | "smart_deny"
     #   decided_by: "aux_llm"  -- only on surface="smart"
+    #   attestation: frozen ApprovalAttestation -- core-authored; plugins must
+    #                treat it as immutable evidence, not a mutable result bag.
     "pre_approval_request",
     "post_approval_response",
     # Kanban task lifecycle hooks. Fired by hermes_cli.kanban_db when a task
@@ -599,15 +604,140 @@ class PluginContext:
         }
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
 
+    # -- Discord component registration ------------------------------------
+
+    def register_discord_component(
+        self,
+        namespace: str,
+        handler: Callable,
+    ) -> None:
+        """Register one shared-gateway Discord component namespace.
+
+        ``handler`` must be async and receives a frozen
+        :class:`gateway.discord_components.DiscordComponentInteraction`.
+        The Discord adapter, bot client, token, and raw interaction are never
+        exposed to plugin code. Custom IDs use the strict core-owned form
+        ``hermes-plugin:<namespace>:<action>``.
+
+        Core rejects short-window duplicate clicks. Handlers that commit a
+        durable or irreversible side effect must transactionally persist the
+        interaction's stable ``idempotency_key`` with the business result so a
+        click replay after gateway restart or TTL expiry is still harmless.
+        """
+        plugin_owner = self.manifest.key or self.manifest.name
+        self._manager._discord_component_registry.register(
+            namespace,
+            plugin_owner=plugin_owner,
+            handler=handler,
+        )
+        logger.debug(
+            "Plugin %s registered Discord component namespace: %s",
+            self.manifest.name,
+            namespace,
+        )
+
+    async def send_discord_components(
+        self,
+        namespace: str,
+        content: str,
+        buttons,
+        *,
+        reply_to_current_message: bool = True,
+    ):
+        """Send typed buttons through the current shared Discord gateway.
+
+        The destination is always the caller's bound Discord session. Plugins
+        cannot supply a bot token, client, arbitrary channel, raw ``View``, or
+        foreign namespace. ``buttons`` must contain
+        :class:`gateway.discord_components.DiscordComponentButton` values.
+        """
+        from gateway.discord_components import DiscordComponentSendReceipt
+
+        plugin_owner = self.manifest.key or self.manifest.name
+        try:
+            from gateway.session_context import get_session_env
+
+            platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+            chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+            thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+            reply_to = (
+                get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+                if reply_to_current_message
+                else ""
+            )
+        except Exception:
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="session_context_unavailable",
+            )
+        if platform != "discord" or not chat_id:
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="discord_session_required",
+            )
+
+        try:
+            message = self._manager._discord_component_registry.build_message(
+                namespace,
+                plugin_owner=plugin_owner,
+                content=content,
+                buttons=buttons,
+            )
+        except Exception:
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="invalid_component_message",
+            )
+
+        try:
+            from gateway.config import Platform
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+            adapter = (
+                runner.adapters.get(Platform.DISCORD)
+                if runner is not None
+                else None
+            )
+            send_components = getattr(
+                adapter,
+                "send_plugin_component_message",
+                None,
+            )
+            if not callable(send_components):
+                return DiscordComponentSendReceipt(
+                    success=False,
+                    error="discord_gateway_unavailable",
+                )
+            receipt = await send_components(
+                chat_id=chat_id,
+                message=message,
+                thread_id=thread_id or None,
+                reply_to=reply_to or None,
+            )
+        except Exception:
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="discord_component_send_failed",
+            )
+        if isinstance(receipt, DiscordComponentSendReceipt):
+            return receipt
+        return DiscordComponentSendReceipt(
+            success=False,
+            error="invalid_discord_gateway_response",
+        )
+
     # -- tool dispatch -------------------------------------------------------
 
     def dispatch_tool(self, tool_name: str, args: dict, **kwargs) -> str:
-        """Dispatch a tool call through the registry, with parent agent context.
+        """Dispatch a tool call through core policy, with parent agent context.
 
         This is the public interface for plugin slash commands that need to call
         tools like ``delegate_task`` without reaching into framework internals.
         The parent agent (if available) is resolved automatically — plugins never
-        need to access the agent directly.
+        need to access the agent directly.  The call is authorized through the
+        same ``pre_tool_call`` approval chokepoint used by model-issued calls;
+        a policy error or denial fails closed before registry dispatch.
 
         Args:
             tool_name: Registry name of the tool (e.g. ``"delegate_task"``).
@@ -617,7 +747,27 @@ class PluginContext:
         Returns:
             JSON string from the tool handler (same format as model tool calls).
         """
-        from tools.registry import registry
+        from tools.registry import registry, tool_error
+
+        if not isinstance(args, dict):
+            return tool_error(
+                "Plugin tool arguments must be a dict",
+                error_type="plugin_policy_error",
+                tool=tool_name,
+            )
+
+        # Keep execution data isolated from both the caller and observer hooks.
+        # pre_tool_call is a policy surface, not a transform surface: a hook
+        # that mutates its input must not change what executes after approval.
+        try:
+            execution_args = copy.deepcopy(args)
+            policy_args = copy.deepcopy(execution_args)
+        except Exception:
+            return tool_error(
+                "Plugin tool arguments could not be safely copied",
+                error_type="plugin_policy_error",
+                tool=tool_name,
+            )
 
         # Wire up parent agent context when available (CLI mode).
         # In gateway mode _cli_ref is None — tools degrade gracefully
@@ -628,7 +778,45 @@ class PluginContext:
             if agent is not None:
                 kwargs["parent_agent"] = agent
 
-        return registry.dispatch(tool_name, args, **kwargs)
+        # Plugin calls do not originate from a model response, so mint
+        # correlation identifiers in core rather than accepting identities
+        # asserted through **kwargs.  This gives once-only gateway approvals
+        # non-empty, non-reusable tool/turn bindings.
+        tool_call_id = f"plugin-call-{secrets.token_hex(16)}"
+        turn_id = f"plugin-turn-{secrets.token_hex(16)}"
+        try:
+            from gateway.session_context import get_session_env
+
+            session_id = (
+                get_session_env("HERMES_SESSION_ID", "")
+                or get_session_env("HERMES_SESSION_KEY", "")
+            )
+        except Exception:
+            session_id = ""
+
+        try:
+            block_message = resolve_pre_tool_block(
+                tool_name,
+                policy_args,
+                task_id="",
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            return tool_error(
+                f"BLOCKED: plugin policy check failed for {tool_name}",
+                error_type="plugin_policy_error",
+                tool=tool_name,
+            )
+        if block_message is not None:
+            return tool_error(
+                block_message,
+                error_type="plugin_block",
+                tool=tool_name,
+            )
+
+        return registry.dispatch(tool_name, execution_args, **kwargs)
 
     # -- context engine registration -----------------------------------------
 
@@ -1188,7 +1376,11 @@ class PluginContext:
                 hook_name,
                 ", ".join(sorted(VALID_HOOKS)),
             )
-        self._manager._hooks.setdefault(hook_name, []).append(callback)
+        callbacks = self._manager._hooks.setdefault(hook_name, [])
+        callbacks.append(callback)
+        self._manager._hook_owners[(hook_name, len(callbacks) - 1)] = (
+            self.manifest.key or self.manifest.name
+        )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
 
     # -- middleware registration -------------------------------------------
@@ -1209,7 +1401,11 @@ class PluginContext:
                 kind,
                 ", ".join(sorted(VALID_MIDDLEWARE)),
             )
-        self._manager._middleware.setdefault(kind, []).append(callback)
+        callbacks = self._manager._middleware.setdefault(kind, [])
+        callbacks.append(callback)
+        self._manager._middleware_owners[(kind, len(callbacks) - 1)] = (
+            self.manifest.key or self.manifest.name
+        )
         logger.debug("Plugin %s registered middleware: %s", self.manifest.name, kind)
 
     # -- skill registration -------------------------------------------------
@@ -1268,9 +1464,13 @@ class PluginManager:
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self) -> None:
+        from gateway.discord_components import DiscordComponentRegistry
+
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
+        self._hook_owners: Dict[tuple[str, int], str] = {}
         self._middleware: Dict[str, List[Callable]] = {}
+        self._middleware_owners: Dict[tuple[str, int], str] = {}
         self._plugin_tool_names: Set[str] = set()
         self._plugin_platform_names: Set[str] = set()
         self._cli_commands: Dict[str, dict] = {}
@@ -1290,6 +1490,7 @@ class PluginManager:
         # ``re.Pattern``, or a constraint dict); ``callback`` is an async
         # function with the slack_bolt signature ``(ack, body, action)``.
         self._slack_action_handlers: List[tuple] = []
+        self._discord_component_registry = DiscordComponentRegistry()
 
     # -----------------------------------------------------------------------
     # Public
@@ -1309,9 +1510,13 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            from gateway.discord_components import DiscordComponentRegistry
+
             self._plugins.clear()
             self._hooks.clear()
+            self._hook_owners.clear()
             self._middleware.clear()
+            self._middleware_owners.clear()
             self._plugin_tool_names.clear()
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
@@ -1319,6 +1524,7 @@ class PluginManager:
             self._plugin_skills.clear()
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
+            self._discord_component_registry = DiscordComponentRegistry()
             self._context_engine = None
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
@@ -1704,6 +1910,60 @@ class PluginManager:
     # Loading
     # -----------------------------------------------------------------------
 
+    @staticmethod
+    def _snapshot_external_provider_registries() -> List[Dict[str, Any]]:
+        """Snapshot every provider registry exposed through PluginContext."""
+        specs = (
+            ("agent.image_gen_registry", "_providers"),
+            ("hermes_cli.dashboard_auth.registry", "_providers"),
+            ("agent.video_gen_registry", "_providers"),
+            ("agent.web_search_registry", "_providers"),
+            ("agent.browser_registry", "_providers"),
+            ("agent.tts_registry", "_providers"),
+            ("agent.transcription_registry", "_providers"),
+            ("agent.secret_sources.registry", "_SOURCES"),
+        )
+        snapshots: List[Dict[str, Any]] = []
+        for module_name, mapping_name in specs:
+            module = importlib.import_module(module_name)
+            mapping = getattr(module, mapping_name)
+            lock = getattr(module, "_lock", None)
+            if lock is None:
+                values = dict(mapping)
+            else:
+                with lock:
+                    values = dict(mapping)
+            snapshot = {
+                "module": module,
+                "mapping_name": mapping_name,
+                "values": values,
+            }
+            if module_name == "agent.secret_sources.registry":
+                snapshot["builtins_loaded"] = bool(
+                    getattr(module, "_BUILTINS_LOADED", False)
+                )
+            snapshots.append(snapshot)
+        return snapshots
+
+    @staticmethod
+    def _restore_external_provider_registries(
+        snapshots: List[Dict[str, Any]],
+    ) -> None:
+        """Restore provider maps after a plugin load transaction fails."""
+        for snapshot in snapshots:
+            module = snapshot["module"]
+            mapping = getattr(module, snapshot["mapping_name"])
+            lock = getattr(module, "_lock", None)
+            if lock is None:
+                mapping.clear()
+                mapping.update(snapshot["values"])
+            else:
+                with lock:
+                    mapping.clear()
+                    mapping.update(snapshot["values"])
+            if "builtins_loaded" in snapshot:
+                module._BUILTINS_LOADED = snapshot["builtins_loaded"]
+
     def _platform_name_from_manifest(self, manifest: PluginManifest) -> str:
         """Derive the gateway platform name (e.g. ``feishu``) for a platform plugin.
 
@@ -1764,6 +2024,143 @@ class PluginManager:
             )
             self._load_plugin(manifest)
 
+    def _rollback_failed_registration(
+        self,
+        *,
+        plugin_identity: str,
+        hook_counts_before: Dict[str, int],
+        discord_namespaces_before: Set[str],
+        middleware_counts_before: Optional[Dict[str, int]] = None,
+        registration_state_before: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Remove every executable surface added by failed ``register()``."""
+
+        for hook_name, callbacks in list(self._hooks.items()):
+            before_count = hook_counts_before.get(hook_name, 0)
+            retained: List[tuple[Callable, str]] = []
+            for callback_index, callback in enumerate(callbacks):
+                owner = self._hook_owners.get(
+                    (hook_name, callback_index),
+                    "unknown",
+                )
+                added_by_failed_plugin = (
+                    callback_index >= before_count
+                    and owner == plugin_identity
+                )
+                if not added_by_failed_plugin:
+                    retained.append((callback, owner))
+
+            for owner_key in [
+                key for key in self._hook_owners if key[0] == hook_name
+            ]:
+                self._hook_owners.pop(owner_key, None)
+            if retained:
+                self._hooks[hook_name] = [
+                    callback for callback, _owner in retained
+                ]
+                for callback_index, (_callback, owner) in enumerate(retained):
+                    self._hook_owners[(hook_name, callback_index)] = owner
+            else:
+                self._hooks.pop(hook_name, None)
+
+        if middleware_counts_before is not None:
+            for kind, callbacks in list(self._middleware.items()):
+                before_count = middleware_counts_before.get(kind, 0)
+                retained_middleware: List[tuple[Callable, str]] = []
+                for callback_index, callback in enumerate(callbacks):
+                    owner = self._middleware_owners.get(
+                        (kind, callback_index),
+                        "unknown",
+                    )
+                    added_by_failed_plugin = (
+                        callback_index >= before_count
+                        and owner == plugin_identity
+                    )
+                    if not added_by_failed_plugin:
+                        retained_middleware.append((callback, owner))
+
+                for owner_key in [
+                    key for key in self._middleware_owners if key[0] == kind
+                ]:
+                    self._middleware_owners.pop(owner_key, None)
+                if retained_middleware:
+                    self._middleware[kind] = [
+                        callback
+                        for callback, _owner in retained_middleware
+                    ]
+                    for callback_index, (_callback, owner) in enumerate(
+                        retained_middleware
+                    ):
+                        self._middleware_owners[
+                            (kind, callback_index)
+                        ] = owner
+                else:
+                    self._middleware.pop(kind, None)
+
+        added_namespaces = (
+            set(self._discord_component_registry.registered_namespaces)
+            - discord_namespaces_before
+        )
+        for namespace in added_namespaces:
+            try:
+                self._discord_component_registry.unregister(
+                    namespace,
+                    plugin_owner=plugin_identity,
+                )
+            except Exception:
+                # Never remove a namespace when ownership is uncertain.  This
+                # branch indicates out-of-contract concurrent registry
+                # mutation and is intentionally fail-closed.
+                logger.warning(
+                    "Could not roll back Discord component namespace %r "
+                    "for failed plugin %r",
+                    namespace,
+                    plugin_identity,
+                )
+
+        if registration_state_before is None:
+            return
+
+        # Registration runs synchronously during discovery. Restore the exact
+        # pre-register snapshots for every other executable registry so a
+        # plugin that raises after a tool override, command, platform, skill,
+        # auxiliary task, or Slack action cannot leave live behavior behind.
+        self._plugin_tool_names = set(
+            registration_state_before["plugin_tool_names"]
+        )
+        self._plugin_platform_names = set(
+            registration_state_before["plugin_platform_names"]
+        )
+        self._cli_commands = dict(
+            registration_state_before["cli_commands"]
+        )
+        self._plugin_commands = dict(
+            registration_state_before["plugin_commands"]
+        )
+        self._plugin_skills = dict(
+            registration_state_before["plugin_skills"]
+        )
+        self._aux_tasks = dict(
+            registration_state_before["aux_tasks"]
+        )
+        self._slack_action_handlers = list(
+            registration_state_before["slack_action_handlers"]
+        )
+        self._context_engine = registration_state_before["context_engine"]
+        self._restore_external_provider_registries(
+            registration_state_before["provider_registries"]
+        )
+
+        from tools.registry import registry as tool_registry
+        from gateway.platform_registry import platform_registry
+
+        tool_registry._restore_registration_state(
+            registration_state_before["tool_registry"]
+        )
+        platform_registry._restore_registration_state(
+            registration_state_before["platform_registry"]
+        )
+
     def _load_plugin(self, manifest: PluginManifest) -> None:
         """Import a plugin module and call its ``register(ctx)`` function."""
         loaded = LoadedPlugin(manifest=manifest)
@@ -1779,6 +2176,42 @@ class PluginManager:
             f"{_NS_PARENT}.{_slug}",
             PluginContext(manifest, self)._tool_override_allowed(""),
         )
+        from gateway.platform_registry import platform_registry
+
+        # Snapshot before importing plugin code. Import-time side effects are
+        # part of the same transaction as register(); neither may survive a
+        # failed or missing register() function.
+        _tools_before = set(self._plugin_tool_names)
+        _hook_counts_before = {
+            h: len(cbs) for h, cbs in self._hooks.items()
+        }
+        _discord_namespaces_before = set(
+            self._discord_component_registry.registered_namespaces
+        )
+        _mw_counts_before = {
+            kind: len(cbs) for kind, cbs in self._middleware.items()
+        }
+        _registration_state_before: Dict[str, Any] = {
+            "plugin_tool_names": set(self._plugin_tool_names),
+            "plugin_platform_names": set(
+                self._plugin_platform_names
+            ),
+            "cli_commands": dict(self._cli_commands),
+            "plugin_commands": dict(self._plugin_commands),
+            "plugin_skills": dict(self._plugin_skills),
+            "aux_tasks": dict(self._aux_tasks),
+            "slack_action_handlers": list(
+                self._slack_action_handlers
+            ),
+            "context_engine": self._context_engine,
+            "provider_registries": (
+                self._snapshot_external_provider_registries()
+            ),
+            "tool_registry": _registry._snapshot_registration_state(),
+            "platform_registry": (
+                platform_registry._snapshot_registration_state()
+            ),
+        }
         try:
             if manifest.source in {"user", "project", "bundled"}:
                 module = self._load_directory_module(manifest)
@@ -1790,24 +2223,9 @@ class PluginManager:
             # Call register()
             register_fn = getattr(module, "register", None)
             if register_fn is None:
-                loaded.error = "no register() function"
-                logger.warning("Plugin '%s' has no register() function", manifest.name)
+                raise RuntimeError("no register() function")
             else:
                 ctx = PluginContext(manifest, self)
-                # Snapshot registry state BEFORE register() so each registry's
-                # attribution counts only what THIS plugin actually added.
-                # The previous approach diffed names against all already-loaded
-                # plugins, which mis-credited a plugin that registered a hook /
-                # middleware / tool name an earlier plugin had already used:
-                # the shared name was attributed to the first plugin only, so
-                # later plugins under-reported in `hermes plugins list`.
-                _tools_before = set(self._plugin_tool_names)
-                _hook_counts_before = {
-                    h: len(cbs) for h, cbs in self._hooks.items()
-                }
-                _mw_counts_before = {
-                    kind: len(cbs) for kind, cbs in self._middleware.items()
-                }
                 register_fn(ctx)
                 loaded.tools_registered = [
                     t for t in self._plugin_tool_names
@@ -1841,6 +2259,23 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            self._rollback_failed_registration(
+                plugin_identity=_plugin_id,
+                hook_counts_before=_hook_counts_before,
+                discord_namespaces_before=_discord_namespaces_before,
+                middleware_counts_before=_mw_counts_before,
+                registration_state_before=_registration_state_before,
+            )
+            failed_module_prefix = f"{_NS_PARENT}.{_slug}"
+            for module_name in [
+                name
+                for name in sys.modules
+                if (
+                    name == failed_module_prefix
+                    or name.startswith(f"{failed_module_prefix}.")
+                )
+            ]:
+                sys.modules.pop(module_name, None)
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
@@ -1945,6 +2380,78 @@ class PluginManager:
                 )
         return results
 
+    def invoke_hook_with_identity(
+        self, hook_name: str, **kwargs: Any
+    ) -> List[tuple[str, Any]]:
+        """Invoke result-producing hooks with core-recorded plugin ownership.
+
+        Approval policy must bind the callback's registered plugin identity,
+        not an identity asserted in a plugin return value.  Observer hooks do
+        not need this attribution and should keep using :meth:`invoke_hook`.
+        """
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        results: List[tuple[str, Any]] = []
+        for index, cb in enumerate(self._hooks.get(hook_name, [])):
+            callback_kwargs = kwargs
+            if hook_name == "pre_tool_call":
+                try:
+                    callback_kwargs = dict(kwargs)
+                    callback_kwargs["args"] = copy.deepcopy(
+                        kwargs.get("args", {})
+                    )
+                    callback_kwargs["middleware_trace"] = copy.deepcopy(
+                        kwargs.get("middleware_trace", [])
+                    )
+                except Exception:
+                    results.append(
+                        (
+                            "core",
+                            {
+                                "action": "block",
+                                "message": (
+                                    "BLOCKED: plugin policy argument "
+                                    "snapshot failed"
+                                ),
+                            },
+                        )
+                    )
+                    break
+            try:
+                ret = cb(**callback_kwargs)
+                if ret is not None:
+                    results.append(
+                        (
+                            self._hook_owners.get(
+                                (hook_name, index),
+                                "unknown",
+                            ),
+                            ret,
+                        )
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Hook '%s' callback %s raised: %s",
+                    hook_name,
+                    getattr(cb, "__name__", repr(cb)),
+                    exc,
+                )
+                if hook_name == "pre_tool_call":
+                    results.append(
+                        (
+                            self._hook_owners.get(
+                                (hook_name, index),
+                                "unknown",
+                            ),
+                            {
+                                "action": "block",
+                                "message": (
+                                    "BLOCKED: pre-tool policy callback failed"
+                                ),
+                            },
+                        )
+                    )
+        return results
+
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
@@ -1991,6 +2498,10 @@ class PluginManager:
         :meth:`PluginContext.register_slack_action_handler`.
         """
         return list(self._slack_action_handlers)
+
+    def get_discord_component_registry(self):
+        """Return the core-owned registry populated by enabled plugins."""
+        return self._discord_component_registry
 
     # -----------------------------------------------------------------------
     # Introspection
@@ -2056,6 +2567,11 @@ def get_plugin_manager() -> PluginManager:
     return _plugin_manager
 
 
+def get_discord_component_registry():
+    """Return the shared-gateway Discord component registry."""
+    return _ensure_plugins_discovered().get_discord_component_registry()
+
+
 def discover_plugins(force: bool = False) -> None:
     """Discover and load all plugins.
 
@@ -2071,6 +2587,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return get_plugin_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_hook_with_identity(
+    hook_name: str, **kwargs: Any
+) -> List[tuple[str, Any]]:
+    """Invoke a result-producing hook with core-owned plugin attribution."""
+    return get_plugin_manager().invoke_hook_with_identity(hook_name, **kwargs)
 
 
 def invoke_middleware(kind: str, **kwargs: Any) -> List[Any]:
@@ -2103,6 +2626,9 @@ class _PreToolCallDirective:
     action: Optional[str] = None
     message: Optional[str] = None
     rule_key: Optional[str] = None
+    plugin_identity: Optional[str] = None
+    decision_scope: str = "standard"
+    risk_class: Optional[str] = None
 
 
 def set_thread_tool_whitelist(
@@ -2135,6 +2661,9 @@ def _get_pre_tool_call_directive_details(
         {"action": "block",   "message": "Reason the tool was blocked"}
         {"action": "approve", "message": "Why this needs human confirmation"}
         {"action": "approve", "message": "...", "rule_key": "write_file:ssh"}
+        {"action": "approve", "message": "...",
+         "approval_policy": {"decision_scope": "once",
+                             "risk_class": "financial"}}
 
     from their ``pre_tool_call`` callback.
 
@@ -2149,9 +2678,17 @@ def _get_pre_tool_call_directive_details(
       :func:`tools.approval.request_tool_approval`).
     - ``rule_key`` is optional and only honored for ``approve`` directives. It
       lets plugins choose the allowlist grain for `[a]lways` approvals.
+    - ``approval_policy.decision_scope == "once"`` requests the generic
+      destructive-operation contract: no YOLO/smart/session/permanent reuse,
+      only an exact one-operation human decision. ``risk_class`` is
+      descriptive metadata and never changes policy by itself.
 
-    The first valid directive wins. Invalid or irrelevant hook return values
-    are silently ignored so existing observer-only hooks are unaffected.
+    Valid directives are composed monotonically: ``block`` dominates
+    ``once`` approval, which dominates standard approval.  Two once-only
+    policies must name the same core-recorded plugin owner and effective rule;
+    otherwise the call fails closed instead of silently choosing one
+    authorization domain. Invalid or irrelevant hook return values are
+    silently ignored so existing observer-only hooks are unaffected.
     """
     allowed = getattr(_thread_tool_whitelist, "allowed", None)
     if allowed is not None and tool_name not in allowed:
@@ -2161,10 +2698,21 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    hook_results = invoke_hook(
+    try:
+        hook_args = copy.deepcopy(args) if isinstance(args, dict) else {}
+    except Exception:
+        return _PreToolCallDirective(
+            action="block",
+            message=(
+                "BLOCKED: plugin policy argument snapshot failed for "
+                f"{tool_name}"
+            ),
+        )
+
+    hook_results = invoke_hook_with_identity(
         "pre_tool_call",
         tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
+        args=hook_args,
         task_id=task_id,
         session_id=session_id,
         tool_call_id=tool_call_id,
@@ -2173,7 +2721,8 @@ def _get_pre_tool_call_directive_details(
         middleware_trace=list(middleware_trace or []),
     )
 
-    for result in hook_results:
+    directives: List[_PreToolCallDirective] = []
+    for plugin_identity, result in hook_results:
         if not isinstance(result, dict):
             continue
         action = result.get("action")
@@ -2189,7 +2738,89 @@ def _get_pre_tool_call_directive_details(
         rule_key = rule_key.strip() if isinstance(rule_key, str) else None
         if not rule_key:
             rule_key = None
-        return _PreToolCallDirective(action=action, message=message, rule_key=rule_key)
+        approval_policy = result.get("approval_policy")
+        if approval_policy is None:
+            approval_policy = {}
+        elif not isinstance(approval_policy, dict):
+            directives.append(
+                _PreToolCallDirective(
+                    action="block",
+                    message=(
+                        "BLOCKED: invalid approval policy from plugin "
+                        f"{plugin_identity or 'unknown'}"
+                    ),
+                )
+            )
+            continue
+        decision_scope = approval_policy.get(
+            "decision_scope",
+            "standard",
+        )
+        if decision_scope not in {"standard", "once"}:
+            directives.append(
+                _PreToolCallDirective(
+                    action="block",
+                    message=(
+                        "BLOCKED: invalid approval decision scope from plugin "
+                        f"{plugin_identity or 'unknown'}"
+                    ),
+                )
+            )
+            continue
+        risk_class = approval_policy.get("risk_class")
+        risk_class = (
+            risk_class.strip()
+            if isinstance(risk_class, str) and risk_class.strip()
+            else None
+        )
+        if risk_class is not None:
+            risk_class = risk_class[:64]
+        directives.append(
+            _PreToolCallDirective(
+                action=action,
+                message=message,
+                rule_key=rule_key,
+                plugin_identity=plugin_identity,
+                decision_scope=decision_scope,
+                risk_class=risk_class,
+            )
+        )
+
+    blocks = [directive for directive in directives if directive.action == "block"]
+    if blocks:
+        return blocks[0]
+
+    once_approvals = [
+        directive
+        for directive in directives
+        if directive.action == "approve"
+        and directive.decision_scope == "once"
+    ]
+    if once_approvals:
+        policy_owners = {
+            (
+                directive.plugin_identity or "unknown",
+                directive.rule_key or tool_name,
+            )
+            for directive in once_approvals
+        }
+        if len(policy_owners) != 1:
+            return _PreToolCallDirective(
+                action="block",
+                message=(
+                    "BLOCKED: conflicting once-only approval policies for "
+                    f"{tool_name}"
+                ),
+            )
+        return once_approvals[0]
+
+    standard_approvals = [
+        directive
+        for directive in directives
+        if directive.action == "approve"
+    ]
+    if standard_approvals:
+        return standard_approvals[0]
 
     return _PreToolCallDirective()
 
@@ -2268,26 +2899,55 @@ def resolve_pre_tool_block(
     times out is fail-closed to a block; ``block`` blocks with its message;
     anything else proceeds.
     """
+    try:
+        approval_args = copy.deepcopy(args) if isinstance(args, dict) else {}
+    except Exception:
+        return f"BLOCKED: plugin policy argument snapshot failed for {tool_name}"
+
     details = _get_pre_tool_call_directive_details(
-        tool_name, args, task_id=task_id, session_id=session_id,
+        tool_name, approval_args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
     )
     if details.action == "block":
         return details.message
     if details.action == "approve":
+        approval_tokens = None
         try:
-            from tools.approval import request_tool_approval
+            from tools.approval import (
+                request_tool_approval,
+                reset_current_observability_context,
+                set_current_observability_context,
+            )
+            approval_tokens = set_current_observability_context(
+                turn_id=turn_id,
+                tool_call_id=tool_call_id,
+            )
             result = request_tool_approval(
                 tool_name,
                 details.message or "",
                 rule_key=details.rule_key or tool_name,
+                tool_args=approval_args,
+                plugin_identity=details.plugin_identity or "unknown",
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                decision_scope=details.decision_scope,
+                risk_class=details.risk_class or "",
             )
         except Exception:
             # Fail-closed: if the gate itself errors, block rather than
             # silently execute an action a plugin flagged for approval.
             return f"BLOCKED: plugin approval gate failed for {tool_name}"
-        if not result.get("approved"):
+        finally:
+            if approval_tokens is not None:
+                reset_current_observability_context(approval_tokens)
+        if (
+            result.get("approved") is not True
+            or (
+                details.decision_scope == "once"
+                and result.get("choice") != "once"
+            )
+        ):
             return str(
                 result.get("message")
                 or f"BLOCKED: plugin approval required for {tool_name}"

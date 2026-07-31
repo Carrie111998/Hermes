@@ -618,6 +618,14 @@ class TestApprovalButtonData:
         result = parse_approval_button_data("approve:agent:main:qqbot:c2c:UID:allow-once")
         assert result == ("agent:main:qqbot:c2c:UID", "allow-once")
 
+    def test_parse_v2_preserves_exact_core_approval_id(self):
+        from gateway.platforms.qqbot.keyboards import (
+            parse_approval_button_binding,
+        )
+
+        assert parse_approval_button_binding(
+            "approve2:core-123:agent:main:qqbot:c2c:UID:deny"
+        ) == ("agent:main:qqbot:c2c:UID", "deny", "core-123")
 
     def test_parse_empty_returns_none(self):
         from gateway.platforms.qqbot.keyboards import parse_approval_button_data
@@ -645,6 +653,20 @@ class TestBuildApprovalKeyboard:
         assert datas[0] == "approve:agent:main:qqbot:c2c:UID:allow-once"
         assert datas[1] == "approve:agent:main:qqbot:c2c:UID:allow-always"
         assert datas[2] == "approve:agent:main:qqbot:c2c:UID:deny"
+
+    def test_v2_button_data_embeds_exact_core_approval_id(self):
+        from gateway.platforms.qqbot.keyboards import build_approval_keyboard
+
+        kb = build_approval_keyboard(
+            "agent:main:qqbot:c2c:UID",
+            approval_id="core-123",
+        )
+        datas = [b.action.data for b in kb.content.rows[0].buttons]
+        assert datas == [
+            "approve2:core-123:agent:main:qqbot:c2c:UID:allow-once",
+            "approve2:core-123:agent:main:qqbot:c2c:UID:allow-always",
+            "approve2:core-123:agent:main:qqbot:c2c:UID:deny",
+        ]
 
 
 class TestBuildUpdatePromptKeyboard:
@@ -879,6 +901,45 @@ class TestDefaultInteractionDispatch:
 
         assert resolve_calls == [("agent:main:qqbot:c2c:u-42", "once", False)]
 
+    @pytest.mark.asyncio
+    async def test_v2_approval_click_routes_exact_core_approval_id(self):
+        adapter = self._make_adapter()
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, **kwargs):
+            resolve_calls.append((session_key, choice, kwargs))
+            return 1
+
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i",
+                "chat_type": 2,
+                "user_openid": "u-42",
+                "data": {
+                    "resolved": {
+                        "button_data": (
+                            "approve2:core-123:"
+                            "agent:main:qqbot:c2c:u-42:allow-once"
+                        )
+                    }
+                },
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == [
+            (
+                "agent:main:qqbot:c2c:u-42",
+                "once",
+                {"approval_id": "core-123"},
+            )
+        ]
+
 
     @pytest.mark.asyncio
     async def test_approval_click_rejects_unauthorized_operator(self):
@@ -956,6 +1017,7 @@ class TestSendExecApproval:
             command="rm -rf /tmp/demo",
             session_key="sess:abc",
             description="delete temp dir",
+            metadata={"approval_id": "core-123"},
         )
         assert result.success
         assert len(calls) == 1
@@ -963,6 +1025,7 @@ class TestSendExecApproval:
         assert req.session_key == "sess:abc"
         assert req.command_preview == "rm -rf /tmp/demo"
         assert req.description == "delete temp dir"
+        assert req.approval_id == "core-123"
         assert calls[0]["reply_to"] == "inbound-42"
 
 
@@ -1221,4 +1284,3 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = SimpleNamespace(closed=True)
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
-

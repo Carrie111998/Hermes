@@ -4,7 +4,7 @@ import { persistString, storedString } from '@/lib/storage'
 
 import { $gateway } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -140,6 +140,7 @@ export interface NativeNotificationAction {
 }
 
 export interface NativeNotificationInput {
+  approvalId?: string
   kind: NativeNotificationKind
   title: string
   body?: string
@@ -169,12 +170,18 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
     return
   }
 
-  if (throttled(`${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}`, Date.now())) {
+  if (
+    throttled(
+      `${input.kind}:${input.sessionId ?? (input.global ? 'global' : '')}:${input.approvalId ?? ''}`,
+      Date.now()
+    )
+  ) {
     return
   }
 
   void window.hermesDesktop?.notify({
     actions: input.actions,
+    approvalId: input.approvalId,
     body: input.body,
     kind: input.kind,
     sessionId: input.sessionId ?? undefined,
@@ -185,7 +192,11 @@ export function dispatchNativeNotification(input: NativeNotificationInput): void
 
 // Resolve a pending approval from a notification button, mirroring the in-app
 // Run/Reject bar. Keyed by session id — a background approval has no local guard.
-export async function respondToApprovalAction(sessionId: null | string, actionId: string): Promise<void> {
+export async function respondToApprovalAction(
+  sessionId: null | string,
+  actionId: string,
+  notificationApprovalId?: string
+): Promise<void> {
   const choice = actionId === 'approve' ? 'once' : actionId === 'reject' ? 'deny' : null
 
   if (!choice) {
@@ -199,8 +210,30 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    if (!notificationApprovalId) {
+      const current = sessionApprovalRequest(sessionId).get()
+
+      // Never retarget an old id-less OS action to the current exact waiter.
+      // An equally old id-less prompt is no longer backend-resolvable, so
+      // remove only that stale local record.
+      if (current && !current.approvalId) {
+        clearApprovalRequest(sessionId)
+      }
+
+      return
+    }
+
+    const response = await gateway.request<{ resolved?: number }>('approval.respond', {
+      approval_id: notificationApprovalId,
+      choice,
+      session_id: sessionId ?? undefined
+    })
+
+    if (response?.resolved) {
+      clearApprovalRequest(sessionId, notificationApprovalId)
+    } else {
+      clearApprovalRequest(sessionId, notificationApprovalId)
+    }
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

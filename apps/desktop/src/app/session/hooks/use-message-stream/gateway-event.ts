@@ -895,6 +895,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
         setApprovalRequest({
+          approvalId: typeof payload?.approval_id === 'string' ? payload.approval_id : undefined,
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
@@ -903,7 +904,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           command,
           description,
           sessionId: sessionId ?? null,
-          smartDenied: payload?.smart_denied === true
+          smartDenied: payload?.smart_denied === true,
+          toolCallId: typeof payload?.tool_call_id === 'string' ? payload.tool_call_id : undefined
         })
 
         if (sessionId) {
@@ -915,6 +917,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             { id: 'approve', text: translateNow('notifications.native.approveAction') },
             { id: 'reject', text: translateNow('notifications.native.rejectAction') }
           ],
+          approvalId: typeof payload?.approval_id === 'string' ? payload.approval_id : undefined,
           body: command || description,
           kind: 'approval',
           sessionId,

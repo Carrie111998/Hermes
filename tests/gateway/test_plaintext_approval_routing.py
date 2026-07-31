@@ -2,14 +2,12 @@
 dangerous-command approval instead of being steered/queued.
 
 When the agent is blocked inside tools/approval.py waiting for a dangerous
-command to be approved, a messaging user who replies "yes" / "approve" /
-"deny" (without the leading slash) must have that response routed to the
-approval handler.  Previously the bare-word reply fell through to the
-steer/queue/interrupt logic in _handle_active_session_busy_message — the
-approval never resolved, timed out, and auto-denied.
+command to be approved, a text-only messaging user may omit the leading slash
+but must echo the exact approval ID printed in the prompt. This routes the
+reply around steer/queue/interrupt without reviving ambiguous FIFO approval.
 
 Slash forms (/approve, /deny) already bypass at the base-adapter guard;
-this covers the bare-word forms Signal/SMS users naturally type.
+this covers forms such as ``approve <id>`` used by Signal/SMS users.
 """
 
 import asyncio
@@ -46,6 +44,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_notify_epochs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -84,22 +83,41 @@ def _make_runner():
 
 def _register_blocking_approval(runner):
     """Register a real blocking approval entry for the runner's session."""
-    from tools.approval import _ApprovalEntry, _gateway_queues
+    from tools.approval import (
+        _ApprovalEntry,
+        _gateway_notify_epochs,
+        _gateway_queues,
+        register_gateway_notify,
+    )
     source = _make_source()
     session_key = runner._session_key_for_source(source)
-    entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
-    _gateway_queues.setdefault(session_key, []).append(entry)
+    notify_epoch = _gateway_notify_epochs.get(session_key)
+    if notify_epoch is None:
+        notify_epoch = register_gateway_notify(
+            session_key,
+            lambda _data: None,
+        )
+    entry = _ApprovalEntry(
+        {"command": "rm -rf /tmp/test", "session_key": session_key},
+        notify_epoch=notify_epoch,
+    )
+    _gateway_queues.setdefault(session_key, {})[
+        entry.request.approval_id
+    ] = entry
     return session_key, entry
 
 
 @pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
-def test_plaintext_yes_resolves_approval(reply):
+def test_plaintext_approval_with_exact_id_resolves(reply):
     _clear_approval_state()
     runner, adapter = _make_runner()
     session_key, entry = _register_blocking_approval(runner)
 
     handled = asyncio.run(
-        runner._handle_active_session_busy_message(_make_event(reply), session_key)
+        runner._handle_active_session_busy_message(
+            _make_event(f"{reply} {entry.request.approval_id}"),
+            session_key,
+        )
     )
 
     assert handled is True
@@ -107,6 +125,41 @@ def test_plaintext_yes_resolves_approval(reply):
     assert entry.result == "once"
     # The user gets a confirmation reply, not silence.
     adapter._send_with_retry.assert_awaited()
+    _clear_approval_state()
+
+
+def test_plaintext_exact_id_separates_concurrent_waiters():
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    session_key, first = _register_blocking_approval(runner)
+    _, second = _register_blocking_approval(runner)
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(
+            _make_event(f"approve {second.request.approval_id}"),
+            session_key,
+        )
+    )
+
+    assert handled is True
+    assert not first.event.is_set()
+    assert second.event.is_set()
+    assert second.result == "once"
+    _clear_approval_state()
+
+
+@pytest.mark.parametrize("reply", ["yes", "approve", "ok", "y", "confirm"])
+def test_plaintext_approval_without_id_fails_closed(reply):
+    _clear_approval_state()
+    runner, _adapter = _make_runner()
+    session_key, entry = _register_blocking_approval(runner)
+
+    asyncio.run(
+        runner._handle_active_session_busy_message(_make_event(reply), session_key)
+    )
+
+    assert not entry.event.is_set()
+    assert entry.result is None
     _clear_approval_state()
 
 
@@ -131,5 +184,3 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     from tools.approval import _gateway_queues
     assert session_key not in _gateway_queues
     _clear_approval_state()
-
-

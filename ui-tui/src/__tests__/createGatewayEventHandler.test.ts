@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
-import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
+import {
+  completeApprovalRequest,
+  getOverlayState,
+  patchOverlayState,
+  resetOverlayState
+} from '../app/overlayStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
@@ -1175,6 +1180,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({
       payload: {
+        approval_id: 'approval-123',
         allow_permanent: true,
         choices: ['once', 'deny'],
         command: 'rm -rf /tmp/x',
@@ -1184,7 +1190,57 @@ describe('createGatewayEventHandler', () => {
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ choices: ['once', 'deny'], smartDenied: true })
+    expect(getOverlayState().approval).toMatchObject({
+      approvalId: 'approval-123',
+      choices: ['once', 'deny'],
+      smartDenied: true
+    })
+  })
+
+  it('queues same-session approvals by exact id instead of overwriting', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({
+      payload: {
+        approval_id: 'approval-1',
+        command: 'first',
+        description: 'first approval'
+      },
+      type: 'approval.request'
+    } as any)
+    onEvent({
+      payload: {
+        approval_id: 'approval-2',
+        command: 'second',
+        description: 'second approval'
+      },
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approval?.approvalId).toBe('approval-1')
+    expect(getOverlayState().approvalQueue).toHaveLength(1)
+    completeApprovalRequest('approval-1')
+    expect(getOverlayState().approval?.approvalId).toBe('approval-2')
+  })
+
+  it('does not resurrect a resolved approval from a late duplicate event', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    const event = {
+      payload: {
+        approval_id: 'approval-late-replay',
+        command: 'first',
+        description: 'first approval'
+      },
+      type: 'approval.request'
+    } as any
+
+    onEvent(event)
+    completeApprovalRequest('approval-late-replay')
+    onEvent(event)
+
+    expect(getOverlayState().approval).toBeNull()
+    expect(getOverlayState().approvalQueue).toHaveLength(0)
   })
 
   it('still surfaces terminal turn failures as errors', () => {

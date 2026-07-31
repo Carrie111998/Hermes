@@ -1,10 +1,11 @@
 """Tests for the Hermes plugin system (hermes_cli.plugins)."""
 
+import json
 import logging
 import sys
 import types
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import yaml
@@ -239,6 +240,226 @@ class TestPluginLoading:
     """Tests for plugin module loading."""
 
 
+    def test_failed_register_rolls_back_hooks_and_discord_components(
+        self, tmp_path
+    ):
+        """A disabled plugin must not leave executable callbacks behind."""
+        manager = PluginManager()
+        stable_context = PluginContext(
+            PluginManifest(name="stable-plugin", key="stable-plugin"),
+            manager,
+        )
+
+        def stable_hook(**_kwargs):
+            return {"stable": True}
+
+        def stable_middleware(**kwargs):
+            return kwargs["next_call"](kwargs["payload"])
+
+        async def stable_component(_interaction):
+            return "stable"
+
+        stable_context.register_hook("pre_tool_call", stable_hook)
+        stable_context.register_middleware(
+            "tool_request",
+            stable_middleware,
+        )
+        stable_context.register_discord_component(
+            "stable",
+            stable_component,
+        )
+
+        plugin_dir = tmp_path / "failing-plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text(
+            "def _hook(**kwargs):\n"
+            "    return {'action': 'block', 'message': 'stale'}\n"
+            "def _middleware(**kwargs):\n"
+            "    payload = dict(kwargs['payload'])\n"
+            "    payload['stale'] = True\n"
+            "    return kwargs['next_call'](payload)\n"
+            "def _tool(**kwargs):\n"
+            "    return 'stale'\n"
+            "def _command(raw_args):\n"
+            "    return 'stale'\n"
+            "def _setup(parser):\n"
+            "    return None\n"
+            "async def _slack(ack, body, action):\n"
+            "    return None\n"
+            "async def _component(interaction):\n"
+            "    return 'stale'\n"
+            "def register(ctx):\n"
+            "    ctx.register_hook('pre_tool_call', _hook)\n"
+            "    ctx.register_middleware('tool_request', _middleware)\n"
+            "    ctx.register_tool(\n"
+            "        'failed_registration_stale_tool', 'test',\n"
+            "        {'name': 'failed_registration_stale_tool', "
+            "'description': 'stale', 'parameters': {'type': 'object', "
+            "'properties': {}}}, _tool)\n"
+            "    ctx.register_command('stale-command', _command)\n"
+            "    ctx.register_cli_command('stale-cli', 'stale', _setup)\n"
+            "    ctx.register_slack_action_handler('stale-action', _slack)\n"
+            "    ctx.register_discord_component('failing', _component)\n"
+            "    raise RuntimeError('registration failed')\n"
+        )
+        manifest = PluginManifest(
+            name="failing-plugin",
+            key="failing-plugin",
+            source="user",
+            path=plugin_dir,
+        )
+
+        manager._load_plugin(manifest)
+
+        loaded = manager._plugins["failing-plugin"]
+        assert loaded.enabled is False
+        assert "registration failed" in (loaded.error or "")
+        assert manager.invoke_hook_with_identity("pre_tool_call") == [
+            ("stable-plugin", {"stable": True})
+        ]
+        assert manager.has_middleware("tool_request") is True
+        assert manager._middleware["tool_request"] == [stable_middleware]
+        assert "stale-command" not in manager._plugin_commands
+        assert "stale-cli" not in manager._cli_commands
+        assert manager._slack_action_handlers == []
+        from tools.registry import registry
+        assert (
+            registry.get_entry("failed_registration_stale_tool")
+            is None
+        )
+        component_registry = manager.get_discord_component_registry()
+        assert component_registry.registered_namespaces == ("stable",)
+        assert component_registry.owner_for("stable") == "stable-plugin"
+        assert component_registry.owner_for("failing") is None
+
+    def test_failed_register_restores_context_engine_and_provider(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """A failed registration restores singleton/provider state exactly."""
+        from agent import image_gen_registry
+        from agent.image_gen_provider import ImageGenProvider
+
+        provider_name = "failed_registration_image"
+
+        class StableImageProvider(ImageGenProvider):
+            @property
+            def name(self):
+                return provider_name
+
+            def generate(self, prompt, aspect_ratio="landscape", **_kwargs):
+                return {
+                    "success": True,
+                    "prompt": prompt,
+                    "aspect_ratio": aspect_ratio,
+                }
+
+        stable_provider = StableImageProvider()
+        monkeypatch.setitem(
+            image_gen_registry._providers,
+            provider_name,
+            stable_provider,
+        )
+
+        manager = PluginManager()
+        assert manager._context_engine is None
+        assert image_gen_registry.get_provider(provider_name) is stable_provider
+
+        plugin_dir = tmp_path / "failing-stateful-plugin"
+        plugin_dir.mkdir()
+        (plugin_dir / "__init__.py").write_text(
+            "from agent.context_engine import ContextEngine\n"
+            "from agent.image_gen_provider import ImageGenProvider\n"
+            "class FailedContextEngine(ContextEngine):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            "        return 'failed-context'\n"
+            "    def update_from_response(self, usage):\n"
+            "        return None\n"
+            "    def should_compress(self, prompt_tokens=None):\n"
+            "        return False\n"
+            "    def compress(self, messages, **kwargs):\n"
+            "        return messages\n"
+            "class FailedImageProvider(ImageGenProvider):\n"
+            "    @property\n"
+            "    def name(self):\n"
+            f"        return {provider_name!r}\n"
+            "    def generate(self, prompt, aspect_ratio='landscape', "
+            "**kwargs):\n"
+            "        return {'success': False}\n"
+            "def register(ctx):\n"
+            "    ctx.register_context_engine(FailedContextEngine())\n"
+            "    ctx.register_image_gen_provider(FailedImageProvider())\n"
+            "    raise RuntimeError('registration failed after providers')\n"
+        )
+        manifest = PluginManifest(
+            name="failing-stateful-plugin",
+            key="failing-stateful-plugin",
+            source="user",
+            path=plugin_dir,
+        )
+
+        manager._load_plugin(manifest)
+
+        loaded = manager._plugins["failing-stateful-plugin"]
+        assert loaded.enabled is False
+        assert "registration failed after providers" in (loaded.error or "")
+        assert manager._context_engine is None
+        assert image_gen_registry.get_provider(provider_name) is stable_provider
+
+    def test_failed_registration_rollback_is_owner_scoped(self):
+        """Rollback must preserve registrations from a different owner."""
+        manager = PluginManager()
+
+        def _hook(result):
+            return lambda **_kwargs: result
+
+        async def _component(_interaction):
+            return "ok"
+
+        stable = PluginContext(
+            PluginManifest(name="stable", key="stable"),
+            manager,
+        )
+        stable.register_hook("pre_tool_call", _hook("stable"))
+        stable.register_discord_component("stable", _component)
+        hook_counts_before = {
+            name: len(callbacks)
+            for name, callbacks in manager._hooks.items()
+        }
+        namespaces_before = set(
+            manager.get_discord_component_registry().registered_namespaces
+        )
+
+        failing = PluginContext(
+            PluginManifest(name="failing", key="failing"),
+            manager,
+        )
+        other = PluginContext(
+            PluginManifest(name="other", key="other"),
+            manager,
+        )
+        failing.register_hook("pre_tool_call", _hook("failing"))
+        failing.register_discord_component("failing", _component)
+        other.register_hook("pre_tool_call", _hook("other"))
+        other.register_discord_component("other", _component)
+
+        manager._rollback_failed_registration(
+            plugin_identity="failing",
+            hook_counts_before=hook_counts_before,
+            discord_namespaces_before=namespaces_before,
+        )
+
+        assert manager.invoke_hook_with_identity("pre_tool_call") == [
+            ("stable", "stable"),
+            ("other", "other"),
+        ]
+        registry = manager.get_discord_component_registry()
+        assert registry.registered_namespaces == ("other", "stable")
+        assert registry.owner_for("failing") is None
+
+
 
     def test_load_registers_namespace_module(self, tmp_path, monkeypatch):
         """Directory plugins are importable under hermes_plugins.<name>."""
@@ -367,6 +588,49 @@ class TestPluginHooks:
         )
         assert results == [{"seen": 2, "mc": 5, "tc": 3}]
 
+    def test_shared_callback_keeps_each_registered_plugin_identity(self):
+        manager = PluginManager()
+
+        def callback(**_kwargs):
+            return {"action": "approve"}
+
+        PluginContext(
+            PluginManifest(name="plugin-a", key="plugin-a"),
+            manager,
+        ).register_hook("pre_tool_call", callback)
+        PluginContext(
+            PluginManifest(name="plugin-b", key="plugin-b"),
+            manager,
+        ).register_hook("pre_tool_call", callback)
+
+        assert manager.invoke_hook_with_identity("pre_tool_call") == [
+            ("plugin-a", {"action": "approve"}),
+            ("plugin-b", {"action": "approve"}),
+        ]
+
+    def test_pre_tool_policy_exception_fails_closed(self):
+        manager = PluginManager()
+
+        def broken_policy(**_kwargs):
+            raise RuntimeError("sensitive internal failure")
+
+        PluginContext(
+            PluginManifest(name="policy", key="policy"),
+            manager,
+        ).register_hook("pre_tool_call", broken_policy)
+
+        assert manager.invoke_hook_with_identity("pre_tool_call") == [
+            (
+                "policy",
+                {
+                    "action": "block",
+                    "message": (
+                        "BLOCKED: pre-tool policy callback failed"
+                    ),
+                },
+            )
+        ]
+
 
 
 class TestPreToolCallBlocking:
@@ -374,8 +638,10 @@ class TestPreToolCallBlocking:
 
     def test_block_message_returned_for_valid_directive(self, monkeypatch):
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "block", "message": "blocked by plugin"}],
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("test-plugin", {"action": "block", "message": "blocked by plugin"})
+            ],
         )
         assert get_pre_tool_call_block_message("todo", {}, task_id="t1") == "blocked by plugin"
 
@@ -384,14 +650,188 @@ class TestPreToolCallDirective:
     """Tests for the extended (block | approve) directive helper."""
 
 
+    def test_block_dominates_earlier_standard_and_once_approvals(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("standard-plugin", {"action": "approve"}),
+                (
+                    "finance-plugin",
+                    {
+                        "action": "approve",
+                        "rule_key": "transfer",
+                        "approval_policy": {"decision_scope": "once"},
+                    },
+                ),
+                (
+                    "policy-plugin",
+                    {"action": "block", "message": "blocked by policy"},
+                ),
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("transfer", {})
+        assert details.action == "block"
+        assert details.message == "blocked by policy"
+
+    def test_once_approval_dominates_earlier_standard_approval(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("standard-plugin", {"action": "approve"}),
+                (
+                    "finance-plugin",
+                    {
+                        "action": "approve",
+                        "rule_key": "transfer",
+                        "approval_policy": {
+                            "decision_scope": "once",
+                            "risk_class": "financial",
+                        },
+                    },
+                ),
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("transfer", {})
+        assert details.action == "approve"
+        assert details.decision_scope == "once"
+        assert details.plugin_identity == "finance-plugin"
+        assert details.rule_key == "transfer"
+        assert details.risk_class == "financial"
+
+    def test_each_policy_hook_receives_an_isolated_argument_snapshot(
+        self, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_module
+
+        manager = PluginManager()
+        second_seen = []
+
+        def mutating_standard(args, **_kwargs):
+            args["amount"] = 1
+            return {"action": "approve"}
+
+        def once_policy(args, **_kwargs):
+            second_seen.append(args)
+            return {
+                "action": "approve",
+                "rule_key": "transfer",
+                "approval_policy": {"decision_scope": "once"},
+            }
+
+        PluginContext(
+            PluginManifest(name="standard", key="standard"),
+            manager,
+        ).register_hook("pre_tool_call", mutating_standard)
+        PluginContext(
+            PluginManifest(name="finance", key="finance"),
+            manager,
+        ).register_hook("pre_tool_call", once_policy)
+        monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+
+        details = plugins_module._get_pre_tool_call_directive_details(
+            "transfer",
+            {"amount": 100},
+        )
+
+        assert details.decision_scope == "once"
+        assert second_seen == [{"amount": 100}]
+
+    @pytest.mark.parametrize(
+        "second_identity,second_rule",
+        [
+            ("other-plugin", "transfer"),
+            ("finance-plugin", "other-transfer"),
+        ],
+    )
+    def test_conflicting_once_owner_or_rule_fails_closed(
+        self,
+        monkeypatch,
+        second_identity,
+        second_rule,
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                (
+                    "finance-plugin",
+                    {
+                        "action": "approve",
+                        "rule_key": "transfer",
+                        "approval_policy": {"decision_scope": "once"},
+                    },
+                ),
+                (
+                    second_identity,
+                    {
+                        "action": "approve",
+                        "rule_key": second_rule,
+                        "approval_policy": {"decision_scope": "once"},
+                    },
+                ),
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("transfer", {})
+        assert details.action == "block"
+        assert details.message == (
+            "BLOCKED: conflicting once-only approval policies for transfer"
+        )
+
     def test_approve_without_message_is_valid(self, monkeypatch):
         """approve may omit a message (block may not)."""
         from hermes_cli.plugins import get_pre_tool_call_directive
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "approve"}],
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("test-plugin", {"action": "approve"})
+            ],
         )
         assert get_pre_tool_call_directive("write_file", {}) == ("approve", None)
+
+    @pytest.mark.parametrize(
+        "approval_policy",
+        [
+            {"decision_scope": "onec", "risk_class": "financial"},
+            {"decision_scope": None},
+            "once",
+        ],
+    )
+    def test_explicit_invalid_approval_policy_fails_closed(
+        self,
+        monkeypatch,
+        approval_policy,
+    ):
+        from hermes_cli.plugins import _get_pre_tool_call_directive_details
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                (
+                    "finance-plugin",
+                    {
+                        "action": "approve",
+                        "approval_policy": approval_policy,
+                    },
+                )
+            ],
+        )
+
+        details = _get_pre_tool_call_directive_details("transfer", {})
+        assert details.action == "block"
+        assert details.message is not None
+        assert "invalid approval" in details.message.lower()
 
 
 class TestResolvePreToolBlock:
@@ -405,13 +845,16 @@ class TestResolvePreToolBlock:
         seen = {}
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.plugins.invoke_hook_with_identity",
             lambda hook_name, **kwargs: [
-                {
-                    "action": "approve",
-                    "message": "why",
-                    "rule_key": "write_file:ssh",
-                }
+                (
+                    "test-plugin",
+                    {
+                        "action": "approve",
+                        "message": "why",
+                        "rule_key": "write_file:ssh",
+                    },
+                )
             ],
         )
 
@@ -434,14 +877,100 @@ class TestResolvePreToolBlock:
     def test_approve_gate_exception_fails_closed(self, monkeypatch):
         from hermes_cli.plugins import resolve_pre_tool_block
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
-            lambda hook_name, **kwargs: [{"action": "approve", "message": "why"}],
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("test-plugin", {"action": "approve", "message": "why"})
+            ],
         )
         def _boom(*a, **k):
             raise RuntimeError("gate crashed")
         monkeypatch.setattr("tools.approval.request_tool_approval", _boom)
         msg = resolve_pre_tool_block("terminal", {})
         assert msg is not None and "gate failed" in msg  # fail-closed
+
+    def test_once_only_policy_binds_core_plugin_identity_and_exact_choice(
+        self, monkeypatch
+    ):
+        from hermes_cli.plugins import resolve_pre_tool_block
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                (
+                    "registered-finance-plugin",
+                    {
+                        "action": "approve",
+                        "message": "confirm transfer",
+                        "rule_key": "transfer",
+                        "approval_policy": {
+                            "decision_scope": "once",
+                            "risk_class": "financial",
+                        },
+                    },
+                )
+            ],
+        )
+        seen = {}
+
+        def _approve(_tool_name, _reason, **kwargs):
+            seen.update(kwargs)
+            return {"approved": True, "choice": "session"}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+        blocked = resolve_pre_tool_block(
+            "transfer",
+            {"amount": 1000},
+            tool_call_id="call-1",
+            turn_id="turn-1",
+        )
+        assert blocked is not None
+        assert seen["plugin_identity"] == "registered-finance-plugin"
+        assert seen["decision_scope"] == "once"
+        assert seen["risk_class"] == "financial"
+        assert seen["tool_args"] == {"amount": 1000}
+        assert seen["tool_call_id"] == "call-1"
+        assert seen["turn_id"] == "turn-1"
+
+    def test_hook_argument_mutation_cannot_change_approval_binding(
+        self, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins_module
+
+        manager = PluginManager()
+
+        def mutating_once_policy(args, **_kwargs):
+            args["amount"] = 1
+            return {
+                "action": "approve",
+                "rule_key": "transfer",
+                "approval_policy": {"decision_scope": "once"},
+            }
+
+        PluginContext(
+            PluginManifest(name="finance", key="finance"),
+            manager,
+        ).register_hook("pre_tool_call", mutating_once_policy)
+        monkeypatch.setattr(plugins_module, "_plugin_manager", manager)
+        approval_call = {}
+
+        def _approve(_tool_name, _reason, **kwargs):
+            approval_call.update(kwargs)
+            return {"approved": True, "choice": "once"}
+
+        monkeypatch.setattr("tools.approval.request_tool_approval", _approve)
+        original = {"amount": 100}
+
+        assert (
+            plugins_module.resolve_pre_tool_block(
+                "transfer",
+                original,
+                tool_call_id="call-1",
+                turn_id="turn-1",
+            )
+            is None
+        )
+        assert original == {"amount": 100}
+        assert approval_call["tool_args"] == {"amount": 100}
 
 
 class TestGetPreVerifyContinueMessage:
@@ -476,7 +1005,7 @@ class TestThreadToolWhitelist:
         )
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.plugins.invoke_hook_with_identity",
             lambda hook_name, **kwargs: [],
         )
         set_thread_tool_whitelist({"memory", "skill_manage"})
@@ -493,7 +1022,7 @@ class TestThreadToolWhitelist:
         )
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.plugins.invoke_hook_with_identity",
             lambda hook_name, **kwargs: [],
         )
         set_thread_tool_whitelist({"memory"})
@@ -512,7 +1041,7 @@ class TestThreadToolWhitelist:
         )
 
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.plugins.invoke_hook_with_identity",
             lambda hook_name, **kwargs: [],
         )
 
@@ -542,6 +1071,129 @@ class TestThreadToolWhitelist:
 
 class TestPluginContext:
     """Tests for the PluginContext facade."""
+
+    @pytest.mark.asyncio
+    async def test_register_discord_component_binds_core_plugin_owner(self):
+        from gateway.discord_components import DiscordComponentInteraction
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(
+                name="friendly-name",
+                key="user/commute",
+                source="user",
+            ),
+            manager,
+        )
+
+        async def handler(_interaction: DiscordComponentInteraction):
+            return "ok"
+
+        context.register_discord_component("commute", handler)
+        registry = manager.get_discord_component_registry()
+        assert registry.owner_for("commute") == "user/commute"
+
+    @pytest.mark.asyncio
+    async def test_send_discord_components_uses_bound_shared_gateway(
+        self,
+        monkeypatch,
+    ):
+        from gateway.config import Platform
+        from gateway.discord_components import (
+            DiscordComponentButton,
+            DiscordComponentSendReceipt,
+        )
+        from gateway.session_context import (
+            clear_session_vars,
+            set_session_vars,
+        )
+
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(
+                name="commute",
+                key="user/commute",
+                source="user",
+            ),
+            manager,
+        )
+
+        async def handler(_interaction):
+            return "ok"
+
+        context.register_discord_component("commute", handler)
+        adapter = types.SimpleNamespace(
+            send_plugin_component_message=AsyncMock(
+                return_value=DiscordComponentSendReceipt(
+                    success=True,
+                    message_id="sent-1",
+                )
+            )
+        )
+        runner = types.SimpleNamespace(
+            adapters={Platform.DISCORD: adapter}
+        )
+        monkeypatch.setattr(
+            "gateway.run._gateway_runner_ref",
+            lambda: runner,
+        )
+        tokens = set_session_vars(
+            platform="discord",
+            chat_id="123",
+            thread_id="456",
+            user_id="operator-1",
+            scope_id="guild-1",
+            session_key="discord:guild-1:123:operator-1",
+            message_id="source-message-1",
+        )
+        try:
+            receipt = await context.send_discord_components(
+                "commute",
+                "Choose an action",
+                [
+                    DiscordComponentButton(
+                        action="check-in",
+                        label="Check in",
+                        style="success",
+                    )
+                ],
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert receipt.success is True
+        call = adapter.send_plugin_component_message.await_args
+        assert call.kwargs["chat_id"] == "123"
+        assert call.kwargs["thread_id"] == "456"
+        assert call.kwargs["reply_to"] == "source-message-1"
+        assert call.kwargs["message"].buttons[0].custom_id == (
+            "hermes-plugin:commute:check-in"
+        )
+        assert "token" not in call.kwargs
+        assert "client" not in call.kwargs
+
+    def test_force_rediscover_replaces_discord_component_registry(
+        self,
+        monkeypatch,
+    ):
+        manager = PluginManager()
+
+        async def handler(_interaction):
+            return "ok"
+
+        PluginContext(
+            PluginManifest(name="commute", key="commute"),
+            manager,
+        ).register_discord_component("commute", handler)
+        manager._discovered = True
+        monkeypatch.setattr(
+            PluginManager,
+            "_discover_and_load_inner",
+            lambda self_inner: None,
+        )
+
+        manager.discover_and_load(force=True)
+        assert manager.get_discord_component_registry().registered_namespaces == ()
 
 
 
@@ -990,12 +1642,22 @@ class TestPluginCommandResultResolution:
 class TestPluginDispatchTool:
     """Tests for PluginContext.dispatch_tool() — tool dispatch with agent context."""
 
-    def test_dispatch_tool_calls_registry(self):
-        """dispatch_tool() delegates to registry.dispatch()."""
+    def test_dispatch_tool_runs_policy_before_registry(self, monkeypatch):
+        """dispatch_tool() uses the same pre-tool approval chokepoint."""
         mgr = PluginManager()
         manifest = PluginManifest(name="test-plugin", source="user")
         ctx = PluginContext(manifest, mgr)
 
+        policy_calls = []
+
+        def _allow(tool_name, args, **kwargs):
+            policy_calls.append((tool_name, args, kwargs))
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            _allow,
+        )
         mock_registry = MagicMock()
         mock_registry.dispatch.return_value = '{"result": "ok"}'
 
@@ -1005,6 +1667,110 @@ class TestPluginDispatchTool:
                     result = ctx.dispatch_tool("web_search", {"query": "test"})
 
         assert result == '{"result": "ok"}'
+        assert len(policy_calls) == 1
+        assert policy_calls[0][0] == "web_search"
+        assert policy_calls[0][1] == {"query": "test"}
+        assert policy_calls[0][2]["tool_call_id"]
+        assert policy_calls[0][2]["turn_id"]
+        mock_registry.dispatch.assert_called_once_with(
+            "web_search",
+            {"query": "test"},
+        )
+
+    def test_dispatch_tool_policy_block_never_reaches_registry(
+        self, monkeypatch
+    ):
+        mgr = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="test-plugin", source="user"),
+            mgr,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *args, **kwargs: "BLOCKED: approval required",
+        )
+        mock_registry = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            result = ctx.dispatch_tool("transfer", {"amount": 100})
+
+        assert json.loads(result) == {
+            "error": "BLOCKED: approval required",
+            "error_type": "plugin_block",
+            "tool": "transfer",
+        }
+        mock_registry.dispatch.assert_not_called()
+
+    def test_dispatch_tool_policy_mutation_cannot_change_executed_args(
+        self, monkeypatch
+    ):
+        mgr = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="test-plugin", source="user"),
+            mgr,
+        )
+        original_args = {"amount": 100, "nested": {"currency": "KRW"}}
+        observed_ids = []
+
+        def _mutate_policy_snapshot(tool_name, args, **kwargs):
+            args["amount"] = 999
+            args["nested"]["currency"] = "USD"
+            observed_ids.append(
+                (kwargs["tool_call_id"], kwargs["turn_id"])
+            )
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            _mutate_policy_snapshot,
+        )
+        mock_registry = MagicMock()
+        mock_registry.dispatch.return_value = '{"result": "ok"}'
+
+        with patch("tools.registry.registry", mock_registry):
+            ctx.dispatch_tool("transfer", original_args)
+            ctx.dispatch_tool("transfer", original_args)
+
+        assert original_args == {
+            "amount": 100,
+            "nested": {"currency": "KRW"},
+        }
+        assert [
+            recorded.args for recorded in mock_registry.dispatch.call_args_list
+        ] == [
+            ("transfer", original_args),
+            ("transfer", original_args),
+        ]
+        assert observed_ids[0][0] != observed_ids[1][0]
+        assert observed_ids[0][1] != observed_ids[1][1]
+
+    def test_dispatch_tool_policy_failure_is_fail_closed(
+        self, monkeypatch
+    ):
+        mgr = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="test-plugin", source="user"),
+            mgr,
+        )
+
+        def _raise(*args, **kwargs):
+            raise RuntimeError("policy unavailable")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            _raise,
+        )
+        mock_registry = MagicMock()
+
+        with patch("tools.registry.registry", mock_registry):
+            result = ctx.dispatch_tool("transfer", {"amount": 100})
+
+        parsed = json.loads(result)
+        assert parsed["error_type"] == "plugin_policy_error"
+        assert parsed["tool"] == "transfer"
+        assert "policy check failed" in parsed["error"]
+        assert "policy unavailable" not in parsed["error"]
+        mock_registry.dispatch.assert_not_called()
 
 
     def test_dispatch_tool_respects_explicit_parent_agent(self):

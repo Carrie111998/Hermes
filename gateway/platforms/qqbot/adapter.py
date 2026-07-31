@@ -131,7 +131,7 @@ from gateway.platforms.qqbot.keyboards import (
     InteractionEvent,
     build_approval_keyboard,
     build_update_prompt_keyboard,
-    parse_approval_button_data,
+    parse_approval_button_binding,
     parse_interaction_event,
     parse_update_prompt_button_data,
 )
@@ -1137,9 +1137,9 @@ class QQAdapter(BasePlatformAdapter):
         if not button_data:
             return
 
-        approval = parse_approval_button_data(button_data)
+        approval = parse_approval_button_binding(button_data)
         if approval is not None:
-            session_key, decision = approval
+            session_key, decision, approval_id = approval
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
@@ -1158,7 +1158,15 @@ class QQAdapter(BasePlatformAdapter):
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    **(
+                        {"approval_id": approval_id}
+                        if approval_id
+                        else {}
+                    ),
+                )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s "
                     "(choice=%s, operator=%s)",
@@ -2649,7 +2657,7 @@ class QQAdapter(BasePlatformAdapter):
 
         Users click the button → ``INTERACTION_CREATE`` fires → the adapter's
         registered :meth:`set_interaction_callback` handler decodes
-        ``button_data`` via :func:`parse_approval_button_data`.
+        ``button_data`` via :func:`parse_approval_button_binding`.
         """
         from gateway.platforms.qqbot.keyboards import build_approval_text
         return await self.send_with_keyboard(
@@ -2658,6 +2666,7 @@ class QQAdapter(BasePlatformAdapter):
             build_approval_keyboard(
                 req.session_key,
                 allow_permanent=getattr(req, "allow_permanent", True),
+                approval_id=getattr(req, "approval_id", ""),
             ),
             reply_to=reply_to,
         )
@@ -2672,12 +2681,12 @@ class QQAdapter(BasePlatformAdapter):
     # Matrix, and Feishu already implement the same contract.
 
     async def send_exec_approval(
-            self,
-            chat_id: str,
-            command: str,
-            session_key: str,
-            description: str = "dangerous command",
-            metadata: Optional[Dict[str, Any]] = None,
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None,
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
@@ -2689,7 +2698,6 @@ class QQAdapter(BasePlatformAdapter):
         :func:`tools.approval.resolve_gateway_approval` — dispatched by the
         adapter's interaction callback (:meth:`_default_interaction_dispatch`).
         """
-        del metadata  # QQ doesn't have thread_id / DM targeting overrides.
         del allow_session  # QQ's 3-button keyboard has no session tier (once/always/deny).
         if smart_denied:
             description += " Owner override applies to this one operation only."
@@ -2706,6 +2714,7 @@ class QQAdapter(BasePlatformAdapter):
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
             allow_permanent=allow_permanent and not smart_denied,
+            approval_id=str((metadata or {}).get("approval_id") or ""),
         )
         return await self.send_approval_request(
             chat_id, req, reply_to=msg_id,

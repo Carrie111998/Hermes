@@ -113,6 +113,40 @@ def test_exec_approval_view_accepts_role_allowlist():
     assert view._check_auth(_interaction(99999, role_ids=[7])) is False
 
 
+def test_exec_approval_view_uses_adapter_authorization_and_exact_actor():
+    calls = []
+
+    def authorize(interaction):
+        calls.append(interaction)
+        return (True, None)
+
+    view = ExecApprovalView(
+        session_key="sess-1",
+        allowed_user_ids=set(),
+        authorization_check=authorize,
+        source_operator_id="99999",
+    )
+    correct_actor = _interaction(99999)
+    wrong_actor = _interaction(11111)
+
+    assert view._check_auth(correct_actor) is True
+    assert view._check_auth(wrong_actor) is False
+    assert calls == [correct_actor, wrong_actor]
+
+
+def test_exec_approval_view_fails_closed_when_adapter_authorization_errors():
+    view = ExecApprovalView(
+        session_key="sess-1",
+        allowed_user_ids={"99999"},
+        authorization_check=lambda _interaction: (_ for _ in ()).throw(
+            RuntimeError("authorization unavailable")
+        ),
+        source_operator_id="99999",
+    )
+
+    assert view._check_auth(_interaction(99999)) is False
+
+
 def test_slash_confirm_view_accepts_role_allowlist():
     view = SlashConfirmView(
         session_key="sess-1",
@@ -277,4 +311,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

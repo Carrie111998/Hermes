@@ -1008,7 +1008,7 @@ class TeamsAdapter(BasePlatformAdapter):
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
         """Handle an Adaptive Card Action.Execute button click."""
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        from tools.approval import resolve_gateway_approval
 
         action = ctx.activity.value.action
         data = action.data or {}
@@ -1064,7 +1064,17 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        if not has_blocking_approval(session_key):
+        core_approval_id = str(data.get("approval_id") or "")
+        resolved_count = resolve_gateway_approval(
+            session_key,
+            choice,
+            **(
+                {"approval_id": core_approval_id}
+                if core_approval_id
+                else {}
+            ),
+        )
+        if not resolved_count:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(
@@ -1073,8 +1083,6 @@ class TeamsAdapter(BasePlatformAdapter):
                     .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
                 ),
             )
-
-        resolve_gateway_approval(session_key, choice)
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1120,6 +1128,7 @@ class TeamsAdapter(BasePlatformAdapter):
             "session_key": session_key,
             "cmd": command[:200] + "..." if len(command) > 200 else command,
             "desc": description,
+            "approval_id": str((metadata or {}).get("approval_id") or ""),
         }
 
         actions = [ExecuteAction(

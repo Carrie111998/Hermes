@@ -866,6 +866,13 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    approval_id = str(params.get("approval_id") or "")
+    if params.get("all") or not approval_id:
+        return _err(
+            rid,
+            4012,
+            "exact approval_id required; batch resolution is not supported",
+        )
     try:
         from tools.approval import resolve_gateway_approval
 
@@ -875,7 +882,7 @@ def _(rid, params: dict) -> dict:
                 "resolved": resolve_gateway_approval(
                     session["session_key"],
                     params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
+                    approval_id=approval_id,
                 )
             },
         )

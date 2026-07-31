@@ -21,6 +21,7 @@ import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
+  ApprovalRespondResponse,
   ClarifyRespondResponse,
   ClipboardPasteResponse,
   ConfigSetResponse,
@@ -47,7 +48,7 @@ import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type TranscriptRow } from './interfaces.js'
-import { $overlayState, patchOverlayState } from './overlayStore.js'
+import { $overlayState, completeApprovalRequest, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
@@ -949,13 +950,34 @@ export function useMainApp(gw: GatewayClient) {
   )
 
   const answerApproval = useCallback(
-    (choice: string) =>
-      respondWith('approval.respond', { choice, session_id: ui.sid }, () => {
-        patchOverlayState({ approval: null })
+    (choice: string) => {
+      const approvalId = overlay.approval?.approvalId
+
+      if (!approvalId) {
+        completeApprovalRequest()
+        patchUiState({ status: 'approval identity missing' })
+
+        return Promise.resolve()
+      }
+
+      return rpc<ApprovalRespondResponse>('approval.respond', {
+        approval_id: approvalId,
+        choice,
+        session_id: ui.sid
+      }).then(response => {
+        if (!response?.resolved) {
+          completeApprovalRequest(approvalId)
+          patchUiState({ status: 'approval expired or already resolved' })
+
+          return
+        }
+
+        completeApprovalRequest(approvalId)
         patchTurnState({ outcome: choice === 'deny' ? 'denied' : `approved (${choice})` })
         patchUiState({ status: 'running…' })
-      }),
-    [respondWith, ui.sid]
+      })
+    },
+    [overlay.approval?.approvalId, rpc, ui.sid]
   )
 
   const answerSudo = useCallback(

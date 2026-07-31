@@ -2717,9 +2717,24 @@ def _(rid, params: dict) -> dict:
                 _get_compute_host_supervisor().interrupt(sid, request_id=f"interrupt-{rid}")
             except Exception as exc:
                 return _err(rid, 5019, f"compute-host interrupt failed: {exc}")
+        try:
+            from tools.approval import unregister_gateway_notify
+        except Exception:
+            unregister_gateway_notify = None
         with session["history_lock"]:
             session["_turn_cancel_requested"] = True
             session["queued_prompt"] = None
+            approval_epoch = session.get("approval_notify_epoch")
+            if (
+                unregister_gateway_notify is not None
+                and approval_epoch is not None
+            ):
+                unregister_gateway_notify(
+                    session["session_key"],
+                    approval_epoch,
+                )
+                if session.get("approval_notify_epoch") == approval_epoch:
+                    session["approval_notify_epoch"] = None
         _clear_pending(sid)
         try:
             from tools.approval import resolve_gateway_approval
@@ -2741,11 +2756,26 @@ def _(rid, params: dict) -> dict:
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
     should_interrupt = bool(session.get("running"))
-    if should_interrupt and hasattr(session["agent"], "interrupt"):
-        session["agent"].interrupt()
+    try:
+        from tools.approval import unregister_gateway_notify
+    except Exception:
+        unregister_gateway_notify = None
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
+        approval_epoch = session.get("approval_notify_epoch")
+        if (
+            unregister_gateway_notify is not None
+            and approval_epoch is not None
+        ):
+            unregister_gateway_notify(
+                session["session_key"],
+                approval_epoch,
+            )
+            if session.get("approval_notify_epoch") == approval_epoch:
+                session["approval_notify_epoch"] = None
+    if should_interrupt and hasattr(session["agent"], "interrupt"):
+        session["agent"].interrupt()
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):

@@ -10,7 +10,7 @@ import {
   setNativeNotifyKind
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
-import { $approvalRequest, setApprovalRequest } from './prompts'
+import { $approvalRequest, clearApprovalRequest, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -48,6 +48,8 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  clearApprovalRequest()
+
   if (initialHermesDesktop) {
     desktopWindow.hermesDesktop = initialHermesDesktop
   } else {
@@ -139,6 +141,20 @@ describe('dispatchNativeNotification preferences', () => {
       expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
     )
   })
+
+  it('forwards approvalId to bind an OS action to the exact prompt', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId('on-screen')
+    dispatchNativeNotification({
+      approvalId: 'approval-123',
+      kind: 'approval',
+      sessionId: 'background',
+      title: 'approve'
+    })
+    expect(notify).toHaveBeenCalledWith(
+      expect.objectContaining({ approvalId: 'approval-123' })
+    )
+  })
 })
 
 describe('dispatchNativeNotification post-connect baseline', () => {
@@ -178,6 +194,24 @@ describe('dispatchNativeNotification throttle', () => {
     dispatchNativeNotification({ kind: 'turnDone', sessionId, title: 'done again' })
     expect(notify).toHaveBeenCalledTimes(1)
   })
+
+  it('does not collapse distinct concurrent approval ids in one session', () => {
+    setWindowState({ focused: true, hidden: false })
+    setActiveSessionId('on-screen')
+    dispatchNativeNotification({
+      approvalId: 'approval-1',
+      kind: 'approval',
+      sessionId: 'background',
+      title: 'first'
+    })
+    dispatchNativeNotification({
+      approvalId: 'approval-2',
+      kind: 'approval',
+      sessionId: 'background',
+      title: 'second'
+    })
+    expect(notify).toHaveBeenCalledTimes(2)
+  })
 })
 
 describe('sendTestNativeNotification', () => {
@@ -197,7 +231,7 @@ describe('$activeSessionId wiring', () => {
 })
 
 describe('respondToApprovalAction', () => {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
+  const request = vi.fn().mockResolvedValue({ resolved: 1 })
 
   beforeEach(() => {
     request.mockClear()
@@ -210,17 +244,89 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({
+      approvalId: 'approval-123',
+      command: 'rm -rf /',
+      description: 'dangerous',
+      sessionId: 'bg'
+    })
 
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approve', 'approval-123')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: 'approval-123',
+      choice: 'once',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
-  it('rejects via approval.respond {choice: "deny"}', async () => {
+  it('fails closed for a legacy id-less notification action', async () => {
+    setApprovalRequest({
+      command: 'legacy command',
+      description: 'legacy approval without an id',
+      sessionId: 'bg'
+    })
     await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('removes the exact stale prompt when the waiter is already gone', async () => {
+    request.mockResolvedValueOnce({ resolved: 0 })
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      approvalId: 'approval-stale',
+      command: 'rm -rf /',
+      description: 'dangerous',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve', 'approval-stale')
+
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('never retargets a stale OS action to the next queued approval', async () => {
+    request.mockResolvedValueOnce({ resolved: 0 })
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      approvalId: 'approval-old',
+      command: 'old',
+      description: 'old prompt',
+      sessionId: 'bg'
+    })
+    setApprovalRequest({
+      approvalId: 'approval-new',
+      command: 'new',
+      description: 'new prompt',
+      sessionId: 'bg'
+    })
+    clearApprovalRequest('bg', 'approval-old')
+
+    await respondToApprovalAction('bg', 'approve', 'approval-old')
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      approval_id: 'approval-old',
+      choice: 'once',
+      session_id: 'bg'
+    })
+    expect($approvalRequest.get()?.approvalId).toBe('approval-new')
+  })
+
+  it('never retargets an id-less legacy OS action to an exact-id waiter', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({
+      approvalId: 'approval-exact-head',
+      command: 'new',
+      description: 'exact prompt',
+      sessionId: 'bg'
+    })
+
+    await respondToApprovalAction('bg', 'approve')
+
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.approvalId).toBe('approval-exact-head')
   })
 
   it('ignores unknown action ids', async () => {

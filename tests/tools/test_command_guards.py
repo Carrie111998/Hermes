@@ -375,7 +375,9 @@ class TestGatewayApprovalAllowPermanent:
         single notify payload the renderer would have received."""
         from tools.approval import (
             register_gateway_notify,
+            reset_current_gateway_notify_epoch,
             resolve_gateway_approval,
+            set_current_gateway_notify_epoch,
             unregister_gateway_notify,
         )
 
@@ -385,9 +387,14 @@ class TestGatewayApprovalAllowPermanent:
             captured.append(dict(data))
             # The notify fires synchronously before _await_gateway_decision
             # blocks, so resolving here releases the wait without a thread.
-            resolve_gateway_approval(session_key, "deny")
+            resolve_gateway_approval(
+                session_key,
+                "deny",
+                approval_id=data["approval_id"],
+            )
 
-        register_gateway_notify(session_key, notify)
+        notify_epoch = register_gateway_notify(session_key, notify)
+        notify_token = set_current_gateway_notify_epoch(notify_epoch)
         token = set_current_session_key(session_key)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_EXEC_ASK"] = "1"
@@ -399,7 +406,8 @@ class TestGatewayApprovalAllowPermanent:
             os.environ.pop("HERMES_EXEC_ASK", None)
             os.environ.pop("HERMES_SESSION_KEY", None)
             reset_current_session_key(token)
-            unregister_gateway_notify(session_key)
+            reset_current_gateway_notify_epoch(notify_token)
+            unregister_gateway_notify(session_key, notify_epoch)
 
         assert len(captured) == 1
         return captured[0]

@@ -6,12 +6,15 @@ ignored) and must fire on BOTH the CLI-interactive path and the async gateway
 path, so external tools like macOS notifiers can be alerted regardless of
 which surface the user is on.
 """
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 import pytest
 
 import tools.approval as approval_module
 from tools.approval import (
+    ApprovalAttestation,
+    ApprovalRequest,
     check_all_command_guards,
     check_execute_code_guard,
     set_current_session_key,
@@ -88,11 +91,27 @@ class TestCliPathFiresHooks:
         assert isinstance(pre_kwargs["pattern_keys"], list)
         assert pre_kwargs["pattern_key"]  # non-empty primary pattern
         assert pre_kwargs["description"]
+        request = pre_kwargs["approval_request"]
+        assert isinstance(request, ApprovalRequest)
+        assert request.tool_name == "terminal"
+        assert request.session_key == isolated_session
+        assert len(request.approval_id) >= 24
+        assert len(request.canonical_arguments_digest) == 64
 
         post_kwargs = next(kw for name, kw in captured if name == "post_approval_response")
         assert post_kwargs["choice"] == "once"
         assert post_kwargs["surface"] == "cli"
         assert post_kwargs["command"] == "rm -rf /tmp/test-hook"
+        attestation = post_kwargs["attestation"]
+        assert isinstance(attestation, ApprovalAttestation)
+        assert attestation.approval_id == request.approval_id
+        assert attestation.choice == "once"
+        assert attestation.decision is True
+        assert attestation.canonical_arguments_digest == (
+            request.canonical_arguments_digest
+        )
+        with pytest.raises(FrozenInstanceError):
+            attestation.choice = "always"
 
     def test_deny_reported_to_post_hook(self, isolated_session, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
@@ -117,6 +136,35 @@ class TestCliPathFiresHooks:
         assert result["approved"] is False
         post_kwargs = next(kw for name, kw in captured if name == "post_approval_response")
         assert post_kwargs["choice"] == "deny"
+        assert post_kwargs["attestation"].decision is False
+
+    def test_unknown_cli_choice_fails_closed_with_negative_attestation(
+        self, isolated_session, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+        captured = []
+
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            side_effect=lambda name, **kwargs: captured.append((name, kwargs)),
+        ):
+            result = check_all_command_guards(
+                "rm -rf /tmp/test-invalid-choice",
+                "local",
+                approval_callback=lambda *_args, **_kwargs: "approve",
+            )
+
+        assert result["approved"] is False
+        post = next(
+            kwargs
+            for name, kwargs in captured
+            if name == "post_approval_response"
+        )
+        assert post["choice"] == "approve"
+        assert post["attestation"].decision is False
 
     def test_plugin_hook_crash_does_not_break_approval(
         self, isolated_session, monkeypatch
@@ -203,6 +251,24 @@ class TestSmartModeFiresHooks:
         assert secret not in post["command"]
         assert pre["pattern_keys"]
         assert pre["pattern_key"] == post["pattern_key"]
+        request = pre["approval_request"]
+        attestation = post["attestation"]
+        assert isinstance(request, ApprovalRequest)
+        assert isinstance(attestation, ApprovalAttestation)
+        assert post["approval_request"] is request
+        assert attestation.approval_id == request.approval_id
+        assert attestation.choice == choice
+        assert attestation.decision is approved
+        assert attestation.canonical_arguments_digest == (
+            request.canonical_arguments_digest
+        )
+        assert request.tool_name == (
+            "execute_code"
+            if guard is check_execute_code_guard
+            else "terminal"
+        )
+        with pytest.raises(FrozenInstanceError):
+            request.rule_key = "forged"
         if pattern_key is not None:
             assert pre["pattern_key"] == pattern_key
             assert pre["pattern_keys"] == [pattern_key]
@@ -341,5 +407,4 @@ class TestSmartModeFiresHooks:
             "smart_approve",
             "smart_deny",
         ]
-
 

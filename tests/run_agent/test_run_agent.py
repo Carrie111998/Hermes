@@ -6,6 +6,7 @@ are made.
 """
 
 import ast
+import copy
 import inspect
 import io
 import json
@@ -1782,6 +1783,175 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_direct_invoke_tool_reauthorizes_execution_rewrite(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from tools.approval import canonical_tool_arguments_digest
+
+        approved = []
+        dispatched = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, _args, callback, **_kwargs: callback(
+                {"amount": 250}
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda _name, args, **_kwargs: approved.append(
+                canonical_tool_arguments_digest(args)
+            )
+            or None,
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=lambda _name, args, *_a, **_kw: (
+                dispatched.append(args) or "ok"
+            ),
+        ):
+            result = agent._invoke_tool(
+                "transfer",
+                {"amount": 100},
+                "task-1",
+                tool_call_id="call-1",
+            )
+
+        assert result == "ok"
+        assert dispatched == [{"amount": 250}]
+        assert approved == [
+            canonical_tool_arguments_digest({"amount": 100}),
+            canonical_tool_arguments_digest({"amount": 250}),
+        ]
+
+    def test_direct_invoke_policy_blocks_short_circuit_middleware(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        middleware_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda *_args, **_kwargs: middleware_calls.append(True)
+            or '{"bypassed":true}',
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: "Blocked before middleware",
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError("dispatch must not run"),
+        ):
+            result = agent._invoke_tool(
+                "transfer",
+                {"amount": 100},
+                "task-1",
+                tool_call_id="call-1",
+            )
+
+        assert json.loads(result) == {
+            "error": "Blocked before middleware"
+        }
+        assert middleware_calls == []
+
+    def test_direct_invoke_policy_infrastructure_exception_fails_closed(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        middleware_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda *_args, **_kwargs: middleware_calls.append(True)
+            or '{"bypassed":true}',
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy registry unavailable")),
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=AssertionError(
+                "dispatch must not run after a policy failure"
+            ),
+        ):
+            result = agent._invoke_tool(
+                "transfer",
+                {"amount": 100},
+                "task-1",
+                tool_call_id="call-1",
+            )
+
+        assert json.loads(result) == {
+            "error": (
+                "BLOCKED: plugin policy infrastructure failed for transfer"
+            )
+        }
+        assert middleware_calls == []
+
+    def test_prechecked_direct_invoke_still_reauthorizes_rewrite(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        approved = []
+        dispatched = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, _args, callback, **_kwargs: callback(
+                {"amount": 250}
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda _name, args, **_kwargs: approved.append(args) or None,
+        )
+
+        with patch(
+            "run_agent.handle_function_call",
+            side_effect=lambda _name, args, *_a, **_kw: (
+                dispatched.append(args) or "ok"
+            ),
+        ):
+            result = agent._invoke_tool(
+                "transfer",
+                {"amount": 100},
+                "task-1",
+                tool_call_id="call-1",
+                pre_tool_block_checked=True,
+                skip_tool_request_middleware=True,
+            )
+
+        assert result == "ok"
+        assert approved == [{"amount": 250}]
+        assert dispatched == [{"amount": 250}]
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
@@ -2059,6 +2229,324 @@ class TestConcurrentToolExecution:
         assert dispatched == [{"command": "true"}]
         assert errors == ["Hermes tool execution callback invoked more than once"]
         assert outcome.blocked is False
+
+    def test_managed_policy_runs_before_short_circuiting_middleware(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+
+        middleware_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda *_args, **_kwargs: middleware_calls.append(True)
+            or '{"bypassed":true}',
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: "Blocked before middleware",
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda name, args, callback, **_kwargs: (
+                callback(args),
+                args,
+            ),
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="transfer",
+            function_args={"amount": 100},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda _args: (_ for _ in ()).throw(
+                AssertionError("dispatch must not run")
+            ),
+        )
+
+        assert json.loads(outcome.result) == {
+            "error": "Blocked before middleware"
+        }
+        assert outcome.blocked is True
+        assert middleware_calls == []
+
+    def test_managed_policy_infrastructure_exception_fails_closed(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+
+        middleware_calls = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda *_args, **_kwargs: middleware_calls.append(True)
+            or '{"bypassed":true}',
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy registry unavailable")),
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda name, args, callback, **_kwargs: (
+                callback(args),
+                args,
+            ),
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="transfer",
+            function_args={"amount": 100},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda _args: (_ for _ in ()).throw(
+                AssertionError(
+                    "dispatch must not run after a policy failure"
+                )
+            ),
+        )
+
+        assert json.loads(outcome.result) == {
+            "error": (
+                "BLOCKED: plugin policy infrastructure failed for transfer"
+            )
+        }
+        assert outcome.blocked is True
+        assert middleware_calls == []
+
+    def test_managed_policy_mutation_cannot_change_dispatch_snapshot(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+        from tools.approval import canonical_tool_arguments_digest
+
+        seen = {}
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+
+        def authorize(_name, args, **_kwargs):
+            seen["approved_digest"] = canonical_tool_arguments_digest(args)
+            seen["policy_args"] = args
+            args["amount"] = 999
+            return None
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            authorize,
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda name, args, callback, **_kwargs: (
+                callback(args),
+                args,
+            ),
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            lambda *_args, **_kwargs: None,
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="transfer",
+            function_args={"amount": 100},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: seen.setdefault("dispatch_args", args)
+            or "ok",
+        )
+
+        assert outcome.blocked is False
+        assert seen["policy_args"] == {"amount": 999}
+        assert seen["dispatch_args"] == {"amount": 100}
+        assert seen["approved_digest"] == canonical_tool_arguments_digest(
+            seen["dispatch_args"]
+        )
+
+    def test_managed_pipeline_reauthorizes_middleware_rewrite(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        from agent import relay_tools, tool_executor
+        from tools.approval import canonical_tool_arguments_digest
+
+        approved = []
+        dispatched = []
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, _args, callback, **_kwargs: callback(
+                {"amount": 250}
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda _name, args, **_kwargs: approved.append(
+                canonical_tool_arguments_digest(args)
+            )
+            or None,
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda name, args, callback, **_kwargs: (
+                callback(args),
+                args,
+            ),
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            lambda *_args, **_kwargs: None,
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="transfer",
+            function_args={"amount": 100},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: dispatched.append(args) or "ok",
+        )
+
+        assert outcome.result == "ok"
+        assert dispatched == [{"amount": 250}]
+        assert approved == [
+            canonical_tool_arguments_digest({"amount": 100}),
+            canonical_tool_arguments_digest({"amount": 250}),
+        ]
+
+    def test_managed_pipeline_approves_schema_normalized_dispatch(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        """Schema coercion must happen before approval, never after it."""
+        from agent import relay_tools, tool_executor
+        import model_tools
+        from tools.approval import canonical_tool_arguments_digest
+
+        approved = []
+        dispatched = []
+
+        def normalize(_name, args):
+            normalized = copy.deepcopy(args)
+            if isinstance(normalized.get("amount"), str):
+                normalized["amount"] = int(normalized["amount"])
+            return normalized
+
+        monkeypatch.setattr(model_tools, "coerce_tool_args", normalize)
+        monkeypatch.setattr(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            lambda _name, args, **_kwargs: SimpleNamespace(
+                payload=args,
+                trace=[],
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            lambda _name, args, callback, **_kwargs: callback(args),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda _name, args, **_kwargs: approved.append(
+                canonical_tool_arguments_digest(args)
+            )
+            or None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook",
+            lambda _name: False,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.notify_other_tool_call",
+            lambda _task_id: None,
+        )
+        monkeypatch.setattr(
+            model_tools.registry,
+            "dispatch",
+            lambda _name, args, **_kwargs: dispatched.append(args) or "ok",
+        )
+        monkeypatch.setattr(
+            relay_tools,
+            "execute",
+            lambda name, args, callback, **_kwargs: (
+                callback(args),
+                args,
+            ),
+        )
+        monkeypatch.setattr(
+            tool_executor,
+            "_begin_tool_execution",
+            lambda *_args, **_kwargs: None,
+        )
+
+        outcome = tool_executor._run_agent_tool_execution_middleware(
+            agent,
+            function_name="transfer",
+            function_args={"amount": "100"},
+            effective_task_id="task-1",
+            tool_call_id="call-1",
+            execute=lambda args: model_tools.handle_function_call(
+                "transfer",
+                args,
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id="session-1",
+                turn_id="turn-1",
+                skip_pre_tool_call_hook=True,
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            ),
+        )
+
+        expected = {"amount": 100}
+        assert outcome.result == "ok"
+        assert outcome.args == expected
+        assert dispatched == [expected]
+        assert approved == [
+            canonical_tool_arguments_digest(expected)
+        ]
 
 
 class TestAgentRuntimePostHookOwnershipSync:
@@ -5712,5 +6200,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
-

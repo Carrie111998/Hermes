@@ -205,10 +205,18 @@ def test_clear_session_boundary_security_state_wakes_blocked_approvals():
     session_key = build_session_key(source)
     other_key = "agent:main:telegram:dm:other-chat"
 
-    target_entry = _ApprovalEntry({"command": "rm -rf /tmp/demo"})
-    other_entry = _ApprovalEntry({"command": "rm -rf /tmp/other"})
-    approval_mod._gateway_queues[session_key] = [target_entry]
-    approval_mod._gateway_queues[other_key] = [other_entry]
+    target_entry = _ApprovalEntry(
+        {"command": "rm -rf /tmp/demo", "session_key": session_key}
+    )
+    other_entry = _ApprovalEntry(
+        {"command": "rm -rf /tmp/other", "session_key": other_key}
+    )
+    approval_mod._gateway_queues[session_key] = {
+        target_entry.request.approval_id: target_entry
+    }
+    approval_mod._gateway_queues[other_key] = {
+        other_entry.request.approval_id: other_entry
+    }
 
     runner._clear_session_boundary_security_state(session_key)
 

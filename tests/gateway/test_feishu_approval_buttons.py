@@ -144,6 +144,7 @@ class TestFeishuExecApproval:
                 chat_id="oc_12345",
                 command="echo test",
                 session_key="my-session-key",
+                metadata={"approval_id": "core-approval-1"},
             )
 
         assert len(adapter._approval_state) == 1
@@ -152,6 +153,7 @@ class TestFeishuExecApproval:
         assert state["session_key"] == "my-session-key"
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
+        assert state["core_approval_id"] == "core-approval-1"
 
 
 # ===========================================================================
@@ -211,12 +213,17 @@ class TestResolveApproval:
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
             "chat_id": "oc_12345",
+            "core_approval_id": "core-approval-1",
         }
 
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345",
+            "once",
+            approval_id="core-approval-1",
+        )
         assert 1 not in adapter._approval_state
 
 
@@ -445,5 +452,4 @@ class TestResolveUpdatePrompt:
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
-
 

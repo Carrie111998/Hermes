@@ -9,19 +9,23 @@ This module is the single source of truth for the dangerous command system:
 """
 
 import contextvars
+import copy
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
 import threading
 import time
 import unicodedata
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -50,6 +54,213 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_approval_notify_epoch: contextvars.ContextVar[int | None] = (
+    contextvars.ContextVar("approval_notify_epoch", default=None)
+)
+
+APPROVAL_ATTESTATION_SCHEMA_VERSION = 1
+_APPROVED_ATTESTATION_CHOICES = frozenset(
+    {"once", "session", "always", "smart_approve"}
+)
+_HUMAN_APPROVAL_CHOICES = frozenset({"once", "session", "always"})
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalRequest:
+    """Immutable identity and provenance bound to one approval waiter."""
+
+    schema_version: int
+    approval_id: str
+    session_key: str
+    rule_key: str
+    tool_call_id: str
+    turn_id: str
+    plugin_identity: str
+    tool_name: str
+    canonical_arguments_digest: str
+    decision_scope: str
+    risk_class: str
+    source_platform: str
+    source_guild_id: str
+    source_channel_id: str
+    source_message_id: str
+    source_operator_id: str
+    issued_at: float
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class ApprovalAttestation:
+    """Core-authored terminal decision passed unchanged to observer hooks."""
+
+    schema_version: int
+    approval_id: str
+    decision: bool
+    choice: str
+    actor_id: str
+    source_operator_id: str
+    session_key: str
+    rule_key: str
+    tool_call_id: str
+    turn_id: str
+    plugin_identity: str
+    tool_name: str
+    canonical_arguments_digest: str
+    issued_at: float
+    decided_at: float
+    expires_at: float
+    source_platform: str
+    source_guild_id: str
+    source_channel_id: str
+    source_message_id: str
+    interaction_guild_id: str
+    interaction_channel_id: str
+    interaction_message_id: str
+
+
+def canonical_tool_arguments_digest(
+    args: object, *, strict: bool = False
+) -> str:
+    """Return a deterministic SHA-256 digest without exposing argument values."""
+    try:
+        payload = json.dumps(
+            args if isinstance(args, dict) else {},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        if strict:
+            raise ValueError(
+                "tool arguments are not canonically JSON serializable"
+            )
+        # Approval cannot safely bind an unserializable mutable object.  Hash a
+        # fixed sentinel rather than ``repr`` (which may contain credentials).
+        payload = '{"__hermes_unserializable_arguments__":true}'
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _current_approval_source() -> dict[str, str]:
+    """Read task-local gateway provenance; empty values cover CLI/cron."""
+    try:
+        from gateway.session_context import get_session_env
+
+        return {
+            "platform": get_session_env("HERMES_SESSION_PLATFORM", ""),
+            "guild_id": get_session_env("HERMES_SESSION_SCOPE_ID", ""),
+            "channel_id": get_session_env("HERMES_SESSION_CHAT_ID", ""),
+            "message_id": get_session_env("HERMES_SESSION_MESSAGE_ID", ""),
+            "operator_id": get_session_env("HERMES_SESSION_USER_ID", ""),
+        }
+    except Exception:
+        return {
+            "platform": "",
+            "guild_id": "",
+            "channel_id": "",
+            "message_id": "",
+            "operator_id": "",
+        }
+
+
+def _new_observer_approval_request(
+    *,
+    command: str,
+    session_key: str,
+    rule_key: str,
+    tool_name: str = "terminal",
+    tool_args: Optional[dict] = None,
+    plugin_identity: str = "core",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    decision_scope: str = "standard",
+    risk_class: str = "",
+    timeout_seconds: int | None = None,
+) -> ApprovalRequest:
+    """Create immutable identity for non-waiter approval observers.
+
+    Smart and local CLI decisions do not enter the gateway waiter registry, but
+    lifecycle observers still need the same core-authored request and decision
+    evidence as gateway approvals.  Arguments are represented only by their
+    canonical digest so secrets never enter hook metadata.
+    """
+    source = _current_approval_source()
+    issued_at = time.time()
+    timeout = (
+        _get_approval_timeout()
+        if timeout_seconds is None
+        else timeout_seconds
+    )
+    return ApprovalRequest(
+        schema_version=APPROVAL_ATTESTATION_SCHEMA_VERSION,
+        approval_id=secrets.token_urlsafe(24),
+        session_key=str(session_key or ""),
+        rule_key=str(rule_key or ""),
+        tool_call_id=str(tool_call_id or _approval_tool_call_id.get()),
+        turn_id=str(turn_id or _approval_turn_id.get()),
+        plugin_identity=str(plugin_identity or "core"),
+        tool_name=str(tool_name or "terminal"),
+        canonical_arguments_digest=canonical_tool_arguments_digest(
+            tool_args if isinstance(tool_args, dict) else {"command": command}
+        ),
+        decision_scope=(
+            "once" if decision_scope == "once" else "standard"
+        ),
+        risk_class=str(risk_class or ""),
+        source_platform=source["platform"],
+        source_guild_id=source["guild_id"],
+        source_channel_id=source["channel_id"],
+        source_message_id=source["message_id"],
+        source_operator_id=source["operator_id"],
+        issued_at=issued_at,
+        expires_at=issued_at + max(float(timeout), 0.0),
+    )
+
+
+def _attestation_from_request(
+    request: ApprovalRequest,
+    *,
+    choice: str,
+    actor_id: str = "",
+    interaction_guild_id: str = "",
+    interaction_channel_id: str = "",
+    interaction_message_id: str = "",
+    decided_at: float | None = None,
+) -> ApprovalAttestation:
+    """Commit one immutable terminal decision for an approval request."""
+    if decided_at is None:
+        decided_at = time.time()
+    approved = (
+        choice in _APPROVED_ATTESTATION_CHOICES
+        and decided_at < request.expires_at
+    )
+    if request.decision_scope == "once" and choice != "once":
+        approved = False
+    return ApprovalAttestation(
+        schema_version=APPROVAL_ATTESTATION_SCHEMA_VERSION,
+        approval_id=request.approval_id,
+        decision=approved,
+        choice=choice,
+        actor_id=str(actor_id or ""),
+        source_operator_id=request.source_operator_id,
+        session_key=request.session_key,
+        rule_key=request.rule_key,
+        tool_call_id=request.tool_call_id,
+        turn_id=request.turn_id,
+        plugin_identity=request.plugin_identity,
+        tool_name=request.tool_name,
+        canonical_arguments_digest=request.canonical_arguments_digest,
+        issued_at=request.issued_at,
+        decided_at=decided_at,
+        expires_at=request.expires_at,
+        source_platform=request.source_platform,
+        source_guild_id=request.source_guild_id,
+        source_channel_id=request.source_channel_id,
+        source_message_id=request.source_message_id,
+        interaction_guild_id=str(interaction_guild_id or ""),
+        interaction_channel_id=str(interaction_channel_id or ""),
+        interaction_message_id=str(interaction_message_id or ""),
+    )
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -127,6 +338,8 @@ def _prepare_smart_approval_observer(
     pattern_key: str,
     pattern_keys: list[str],
     session_key: str,
+    tool_name: str = "terminal",
+    tool_args: Optional[dict] = None,
 ) -> dict | None:
     """Redact and emit the pre-decision smart approval observer hook.
 
@@ -143,6 +356,13 @@ def _prepare_smart_approval_observer(
         logger.debug("Smart approval hook redaction failed: %s", exc)
         return
 
+    request = _new_observer_approval_request(
+        command=command,
+        session_key=session_key,
+        rule_key=pattern_key,
+        tool_name=tool_name,
+        tool_args=tool_args,
+    )
     payload = {
         "command": hook_command,
         "description": hook_description,
@@ -150,6 +370,7 @@ def _prepare_smart_approval_observer(
         "pattern_keys": list(pattern_keys),
         "session_key": session_key,
         "surface": "smart",
+        "approval_request": request,
     }
     _fire_approval_hook("pre_approval_request", **payload)
     return payload
@@ -159,11 +380,24 @@ def _observe_smart_approval_verdict(payload: dict | None, verdict: str) -> None:
     """Emit a smart verdict after the auxiliary LLM decision, if safe."""
     if payload is None or verdict not in {"approve", "deny"}:
         return
+    request = payload.get("approval_request")
+    if not isinstance(request, ApprovalRequest):
+        logger.warning("Smart approval observer lost its core request identity")
+        return
+    choice = f"smart_{verdict}"
     _fire_approval_hook(
         "post_approval_response",
         **payload,
-        choice=f"smart_{verdict}",
+        choice=choice,
         decided_by="aux_llm",
+        attestation=_attestation_from_request(
+            request,
+            choice=choice,
+            # Auxiliary policy has no human actor. Preserve the request
+            # operator separately, but never misstate that operator as the
+            # approver.
+            actor_id="",
+        ),
     )
 
 
@@ -176,6 +410,20 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_gateway_notify_epoch(
+    epoch: int,
+) -> contextvars.Token[int | None]:
+    """Bind the callback lease owned by the active gateway run."""
+    return _approval_notify_epoch.set(int(epoch))
+
+
+def reset_current_gateway_notify_epoch(
+    token: contextvars.Token[int | None],
+) -> None:
+    """Restore the prior gateway callback lease."""
+    _approval_notify_epoch.reset(token)
 
 
 def set_current_observability_context(
@@ -2024,9 +2272,16 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    raw_temp_dir = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(raw_temp_dir)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_operands = {os.path.join(temp_dir, basename)}
+    # macOS exposes its system temp directory through the fixed /tmp symlink
+    # to /private/tmp.  Accept that OS-defined spelling while still rejecting
+    # arbitrary user-controlled symlink aliases (covered below and by tests).
+    if raw_temp_dir == "/tmp":
+        allowed_operands.add(os.path.join(raw_temp_dir, basename))
+    if operand not in allowed_operands:
         return False
 
     target = os.path.realpath(operand)
@@ -2146,64 +2401,290 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
-# Per-session QUEUE of pending approvals.  Multiple threads (parallel
-# subagents, execute_code RPC handlers) can block concurrently — each gets
-# its own threading.Event.  /approve resolves the oldest, /approve all
-# resolves every pending approval in the session.
+# Per-session map of pending approvals. Multiple threads (parallel subagents,
+# execute_code RPC handlers) can block concurrently; every interactive
+# decision addresses one exact (session_key, approval_id) pair.
 
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = (
+        "event",
+        "data",
+        "request",
+        "result",
+        "reason",
+        "attestation",
+        "delivery_platform",
+        "delivery_guild_id",
+        "delivery_channel_id",
+        "delivery_message_id",
+        "notify_epoch",
+    )
 
-    def __init__(self, data: dict):
+    def __init__(
+        self,
+        data: dict,
+        request: Optional[ApprovalRequest] = None,
+        *,
+        notify_epoch: int | None = None,
+    ):
+        if request is None:
+            issued_at = time.time()
+            source = _current_approval_source()
+            approval_id = str(data.get("approval_id") or secrets.token_urlsafe(24))
+            request = ApprovalRequest(
+                schema_version=APPROVAL_ATTESTATION_SCHEMA_VERSION,
+                approval_id=approval_id,
+                session_key=str(data.get("session_key") or ""),
+                rule_key=str(data.get("pattern_key") or ""),
+                tool_call_id=str(data.get("tool_call_id") or ""),
+                turn_id=str(data.get("turn_id") or ""),
+                plugin_identity=str(data.get("plugin_identity") or "core"),
+                tool_name=str(data.get("tool_name") or "terminal"),
+                canonical_arguments_digest=str(
+                    data.get("canonical_arguments_digest")
+                    or canonical_tool_arguments_digest(
+                        data.get("tool_args", {"command": data.get("command", "")})
+                    )
+                ),
+                decision_scope=(
+                    "once"
+                    if data.get("decision_scope") == "once"
+                    else "standard"
+                ),
+                risk_class=str(data.get("risk_class") or ""),
+                source_platform=source["platform"],
+                source_guild_id=source["guild_id"],
+                source_channel_id=source["channel_id"],
+                source_message_id=source["message_id"],
+                source_operator_id=source["operator_id"],
+                issued_at=issued_at,
+                expires_at=issued_at + max(_get_approval_timeout(), 0),
+            )
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
+        self.request = request
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
         # Optional free-text reason supplied with an explicit deny
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        self.attestation: Optional[ApprovalAttestation] = None
+        self.delivery_platform = ""
+        self.delivery_guild_id = ""
+        self.delivery_channel_id = ""
+        self.delivery_message_id = ""
+        self.notify_epoch = notify_epoch
 
 
-_gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+_gateway_queues: dict[str, dict[str, _ApprovalEntry]] = {}
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_notify_epochs: dict[str, int] = {}
+_gateway_notify_epoch_counter = 0
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(
+    session_key: str,
+    cb,
+    *,
+    active_check: Callable[[], bool] | None = None,
+) -> int | None:
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
     *approval_data* contains ``command``, ``description``, and
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
+
+    ``active_check`` is evaluated while the approval lifecycle lock is held.
+    Callers use it to bind callback publication to their own run-generation
+    lease without a check/register TOCTOU window.  A stale caller is rejected
+    without disturbing the callback or waiters owned by a newer run.
     """
+    global _gateway_notify_epoch_counter
     with _lock:
+        if active_check is not None:
+            try:
+                if active_check() is not True:
+                    return None
+            except Exception:
+                logger.warning(
+                    "Rejected gateway approval callback registration because "
+                    "its run lease could not be validated",
+                    exc_info=True,
+                )
+                return None
+        # Replacing a run lease is itself a lifecycle boundary. Release every
+        # waiter owned by the prior lease before publishing the new callback.
+        stale_entries = list(
+            _gateway_queues.pop(session_key, {}).values()
+        )
+        for entry in stale_entries:
+            if entry.attestation is not None:
+                continue
+            entry.result = "deny"
+            entry.attestation = _attestation_for(entry, choice="deny")
+            entry.event.set()
+        _gateway_notify_epoch_counter += 1
         _gateway_notify_cbs[session_key] = cb
+        _gateway_notify_epochs[session_key] = _gateway_notify_epoch_counter
+        return _gateway_notify_epoch_counter
 
 
-def unregister_gateway_notify(session_key: str) -> None:
+def unregister_gateway_notify(
+    session_key: str,
+    epoch: int | None = None,
+) -> bool:
     """Unregister the per-session gateway approval callback.
 
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
     """
     with _lock:
-        _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        return _unregister_gateway_notify_locked(session_key, epoch)
+
+
+def _unregister_gateway_notify_locked(
+    session_key: str,
+    epoch: int | None = None,
+) -> bool:
+    """Revoke one callback lease. Caller must hold ``_lock``."""
+    current_epoch = _gateway_notify_epochs.get(session_key)
+    if epoch is not None and current_epoch != epoch:
+        return False
+    _gateway_notify_cbs.pop(session_key, None)
+    _gateway_notify_epochs.pop(session_key, None)
+    entries = list(_gateway_queues.pop(session_key, {}).values())
     for entry in entries:
+        if entry.attestation is not None:
+            continue
+        entry.result = "deny"
+        entry.attestation = _attestation_for(entry, choice="deny")
         entry.event.set()
+    return current_epoch is not None or bool(entries)
 
 
-def resolve_gateway_approval(session_key: str, choice: str,
-                             resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+def invalidate_gateway_notify(
+    session_key: str,
+    invalidate_run: Callable[[], int],
+) -> int:
+    """Atomically invalidate a caller run lease and revoke approvals.
+
+    The run-generation mutation and callback revocation must share the same
+    lock used by callback registration and approval resolution. Otherwise a
+    stale worker can validate its generation, publish a callback after Stop,
+    and win the resolver race before the separate revoke acquires ``_lock``.
+    Revocation still runs if the caller's mutation unexpectedly raises.
+    """
+    with _lock:
+        try:
+            return invalidate_run()
+        finally:
+            _unregister_gateway_notify_locked(session_key)
+
+
+def _get_gateway_notify_registration(
+    session_key: str,
+) -> tuple[object | None, int | None]:
+    """Return one lock-consistent callback lease for waiter creation."""
+    with _lock:
+        return (
+            _gateway_notify_cbs.get(session_key),
+            _gateway_notify_epochs.get(session_key),
+        )
+
+
+def bind_gateway_approval_delivery(
+    session_key: str,
+    approval_id: str,
+    *,
+    platform: str,
+    guild_id: str = "",
+    channel_id: str,
+    message_id: str,
+) -> bool:
+    """Bind the exact user-visible prompt that may resolve an approval."""
+    with _lock:
+        entry = _gateway_queues.get(session_key, {}).get(approval_id)
+        if entry is None or entry.attestation is not None:
+            return False
+        if (
+            entry.notify_epoch is None
+            or _gateway_notify_epochs.get(session_key) != entry.notify_epoch
+        ):
+            logger.warning(
+                "Rejected approval delivery for stale gateway run %s",
+                approval_id,
+            )
+            return False
+        if time.time() >= entry.request.expires_at:
+            return False
+        if entry.request.source_platform == "discord":
+            if (
+                str(platform or "") != entry.request.source_platform
+                or str(guild_id or "") != entry.request.source_guild_id
+                or str(channel_id or "") != entry.request.source_channel_id
+            ):
+                logger.warning(
+                    "Rejected Discord approval delivery outside request source "
+                    "for %s",
+                    approval_id,
+                )
+                return False
+        entry.delivery_platform = str(platform or "")
+        entry.delivery_guild_id = str(guild_id or "")
+        entry.delivery_channel_id = str(channel_id or "")
+        entry.delivery_message_id = str(message_id or "")
+        return bool(entry.delivery_channel_id and entry.delivery_message_id)
+
+
+def _attestation_for(
+    entry: _ApprovalEntry,
+    *,
+    choice: str,
+    actor_id: str = "",
+    interaction_guild_id: str = "",
+    interaction_channel_id: str = "",
+    interaction_message_id: str = "",
+    decided_at: float | None = None,
+) -> ApprovalAttestation:
+    return _attestation_from_request(
+        entry.request,
+        choice=choice,
+        actor_id=actor_id,
+        interaction_guild_id=interaction_guild_id,
+        interaction_channel_id=interaction_channel_id,
+        interaction_message_id=interaction_message_id,
+        decided_at=decided_at,
+    )
+
+
+def resolve_gateway_approval(
+    session_key: str,
+    choice: str,
+    resolve_all: bool = False,
+    reason: Optional[str] = None,
+    *,
+    approval_id: Optional[str] = None,
+    actor_id: Optional[str] = None,
+    actor_authorized: bool = False,
+    platform: Optional[str] = None,
+    guild_id: Optional[str] = None,
+    channel_id: Optional[str] = None,
+    message_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    plugin_identity: Optional[str] = None,
+    tool_name: Optional[str] = None,
+    canonical_arguments_digest: Optional[str] = None,
+) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
-    When *resolve_all* is True every pending approval in the session is
-    resolved at once (``/approve all``).  Otherwise only the oldest one
-    is resolved (FIFO).
+    Every interactive approval or denial requires an exact *approval_id*.
+    ``resolve_all`` is reserved for fail-closed lifecycle cancellation and is
+    accepted only with ``choice="deny"``; batch approval is never permitted.
 
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
@@ -2211,24 +2692,140 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    if choice not in {"once", "session", "always", "deny"}:
+        logger.warning("Rejected invalid gateway approval choice")
+        return 0
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
+        # One timestamp governs expiry validation, immutable attestation, and
+        # waiter/UI outcome. Multiple clock reads around the expiry boundary
+        # could otherwise return count=1 while recording decision=False.
+        decided_at = time.time()
         if resolve_all:
-            targets = list(queue)
-            queue.clear()
+            if choice != "deny":
+                logger.warning(
+                    "Rejected batch approval resolution for session %s",
+                    session_key,
+                )
+                return 0
+            # Internal session teardown may cancel all waiters. This is not an
+            # approval decision and can only move entries to fail-closed deny.
+            targets = [
+                entry
+                for entry in queue.values()
+                if decided_at < entry.request.expires_at
+            ]
         else:
-            targets = [queue.pop(0)]
+            if not approval_id:
+                logger.warning(
+                    "Rejected approval resolution without exact id for "
+                    "session %s",
+                    session_key,
+                )
+                return 0
+            entry = queue.get(approval_id)
+            if entry is None:
+                logger.warning(
+                    "Rejected unknown approval id for session %s", session_key
+                )
+                return 0
+            request = entry.request
+            if (
+                entry.notify_epoch is None
+                or _gateway_notify_epochs.get(session_key)
+                != entry.notify_epoch
+            ):
+                logger.warning(
+                    "Rejected approval response for stale gateway run %s",
+                    request.approval_id,
+                )
+                return 0
+            strict_discord = request.source_platform == "discord"
+            if request.decision_scope == "once" and not approval_id:
+                return 0
+            if request.decision_scope == "once" and choice != "once" and choice != "deny":
+                logger.warning(
+                    "Rejected non-once choice for once-only approval %s",
+                    request.approval_id,
+                )
+                return 0
+            if strict_discord:
+                exact_fields = (
+                    actor_authorized,
+                    bool(actor_id),
+                    str(actor_id or "") == request.source_operator_id,
+                    bool(request.tool_call_id),
+                    bool(request.turn_id),
+                    str(platform or "") == request.source_platform,
+                    str(guild_id or "") == request.source_guild_id,
+                    entry.delivery_platform == request.source_platform,
+                    entry.delivery_guild_id == request.source_guild_id,
+                    entry.delivery_channel_id == request.source_channel_id,
+                    str(channel_id or "") == entry.delivery_channel_id,
+                    str(message_id or "") == entry.delivery_message_id,
+                    str(tool_call_id or "") == request.tool_call_id,
+                    str(turn_id or "") == request.turn_id,
+                    str(plugin_identity or "") == request.plugin_identity,
+                    str(tool_name or "") == request.tool_name,
+                    str(canonical_arguments_digest or "")
+                    == request.canonical_arguments_digest,
+                    bool(entry.delivery_channel_id),
+                    bool(entry.delivery_message_id),
+                )
+                if not all(exact_fields):
+                    logger.warning(
+                        "Rejected mismatched Discord approval attestation %s",
+                        request.approval_id,
+                    )
+                    return 0
+            if decided_at >= request.expires_at:
+                logger.warning("Rejected expired approval %s", request.approval_id)
+                return 0
+            targets = [entry]
+
+        # Commit terminal state, remove the waiter, and signal it under one
+        # lock. Timeout and session-reset cleanup use this same lock, making
+        # the decision linearizable: a reset cannot observe an empty queue
+        # while an "approved" entry is still mutable off-lock.
+        resolved_count = 0
+        for entry in targets:
+            if entry.attestation is not None:
+                continue
+            if decided_at >= entry.request.expires_at:
+                continue
+            attestation = _attestation_for(
+                entry,
+                choice=choice,
+                actor_id=str(actor_id or ""),
+                interaction_guild_id=str(guild_id or ""),
+                interaction_channel_id=str(channel_id or ""),
+                interaction_message_id=str(message_id or ""),
+                decided_at=decided_at,
+            )
+            expected_decision = choice in _APPROVED_ATTESTATION_CHOICES
+            if (
+                entry.request.decision_scope == "once"
+                and choice != "once"
+            ):
+                expected_decision = False
+            if attestation.decision is not expected_decision:
+                logger.warning(
+                    "Rejected inconsistent approval attestation %s",
+                    entry.request.approval_id,
+                )
+                continue
+            entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.attestation = attestation
+            queue.pop(entry.request.approval_id, None)
+            entry.event.set()
+            resolved_count += 1
         if not queue:
             _gateway_queues.pop(session_key, None)
-
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
-    return len(targets)
+        return resolved_count
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -2295,12 +2892,22 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
-    for entry in entries:
-        # Session-boundary cleanup should cancel any blocked approval waits
-        # immediately so the old run can unwind instead of idling until timeout.
-        entry.result = "deny"
-        entry.event.set()
+        # A conversation boundary invalidates the callback lease as well as
+        # already-enqueued waiters. Otherwise an old worker can enqueue a new
+        # destructive approval after /stop or /new has cleared the session.
+        _gateway_notify_cbs.pop(session_key, None)
+        _gateway_notify_epochs.pop(session_key, None)
+        entries = list(_gateway_queues.pop(session_key, {}).values())
+        for entry in entries:
+            if entry.attestation is not None:
+                continue
+            # Session-boundary cleanup should cancel any blocked approval waits
+            # immediately so the old run can unwind instead of idling until
+            # timeout. Commit the explicit fail-closed terminal attestation
+            # under the same lock used by the resolver and timeout path.
+            entry.result = "deny"
+            entry.attestation = _attestation_for(entry, choice="deny")
+            entry.event.set()
     _release_permission_mode_dependents(session_key)
 
 
@@ -2836,6 +3443,13 @@ def _run_approval_gate(
     autoapprove_log_prefix: str,
     fail_closed_when_no_human: bool = False,
     no_human_block_message: str = "",
+    tool_name: str = "terminal",
+    tool_args: Optional[dict] = None,
+    plugin_identity: str = "core",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    decision_scope: str = "standard",
+    risk_class: str = "",
 ) -> dict:
     """Shared human-approval gate for a flagged action (command or tool).
 
@@ -2877,14 +3491,19 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
+    once_only = decision_scope == "once"
+
+    # --yolo bypasses ordinary approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
-    # here only skips the recoverable approval layer.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    # here only skips the recoverable approval layer.  Once-only destructive
+    # rules deliberately ignore YOLO and every stored approval.
+    if not once_only and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not once_only and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
     if approval_callback is None:
@@ -2898,6 +3517,17 @@ def _run_approval_gate(
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
+        if once_only:
+            return {
+                "approved": False,
+                "choice": None,
+                "message": (
+                    "BLOCKED: this once-only approval requires an exact "
+                    "interactive human attestation."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+            }
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -2953,8 +3583,17 @@ def _run_approval_gate(
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
                 "description": redact_sensitive_text(description),
-                "allow_permanent": True,
-                "allow_session": True,
+                "allow_permanent": not once_only,
+                "allow_session": not once_only,
+                "tool_name": tool_name,
+                "canonical_arguments_digest": canonical_tool_arguments_digest(
+                    dict(tool_args or {})
+                ),
+                "plugin_identity": plugin_identity,
+                "tool_call_id": tool_call_id,
+                "turn_id": turn_id,
+                "decision_scope": "once" if once_only else "standard",
+                "risk_class": risk_class,
             }
             decision = _await_gateway_decision(
                 session_key, notify_cb, approval_data, surface="gateway"
@@ -2966,11 +3605,36 @@ def _run_approval_gate(
                     "pattern_key": pattern_key,
                     "description": description,
                 }
+            if decision.get("invalid_context"):
+                return {
+                    "approved": False,
+                    "choice": None,
+                    "message": (
+                        "BLOCKED: Discord approval context is incomplete; "
+                        "the operation was not presented or executed."
+                    ),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
+            attestation = decision.get("attestation")
 
-            if not resolved or choice is None or choice == "deny":
+            if (
+                not resolved
+                or choice is None
+                or choice == "deny"
+                or not isinstance(attestation, ApprovalAttestation)
+                or attestation.decision is not True
+                or attestation.choice != choice
+                or (
+                    once_only
+                    and (
+                        choice != "once"
+                    )
+                )
+            ):
                 if not resolved:
                     reason = "timed out without user response"
                     timeout_addendum = " Silence is not consent."
@@ -2993,16 +3657,32 @@ def _run_approval_gate(
                     "user_consent": False,
                 }
 
-            if choice == "session":
+            if not once_only and choice == "session":
                 approve_session(session_key, pattern_key)
-            elif choice == "always":
+            elif not once_only and choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
-            return {"approved": True, "message": None}
+            return {
+                "approved": True,
+                "message": None,
+                "choice": choice,
+                "attestation": attestation,
+            }
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
+        if once_only:
+            return {
+                "approved": False,
+                "choice": None,
+                "message": (
+                    "BLOCKED: once-only approval has no attached interactive "
+                    "gateway and cannot be approved out of band."
+                ),
+                "pattern_key": pattern_key,
+                "description": description,
+            }
         submit_pending(session_key, {
             "command": display_target,
             "pattern_key": pattern_key,
@@ -3020,10 +3700,50 @@ def _run_approval_gate(
             ),
         }
 
-    choice = prompt_dangerous_approval(display_target, description,
-                                       approval_callback=approval_callback)
+    request = _new_observer_approval_request(
+        command=display_target,
+        session_key=session_key,
+        rule_key=pattern_key,
+        tool_name=tool_name,
+        tool_args=tool_args,
+        plugin_identity=plugin_identity,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        decision_scope="once" if once_only else "standard",
+        risk_class=risk_class,
+    )
+    hook_payload = {
+        "command": display_target,
+        "description": description,
+        "pattern_key": pattern_key,
+        "pattern_keys": [pattern_key],
+        "session_key": session_key,
+        "surface": "cli",
+        "approval_request": request,
+    }
+    _fire_approval_hook("pre_approval_request", **hook_payload)
+    choice = prompt_dangerous_approval(
+        display_target,
+        description,
+        approval_callback=approval_callback,
+        smart_denied=once_only,
+    )
+    attestation = _attestation_from_request(
+        request,
+        choice=choice,
+        # Local CLI input has no platform-authenticated actor identifier.
+        # Keep source_operator_id as request provenance without inventing an
+        # actor attestation.
+        actor_id="",
+    )
+    _fire_approval_hook(
+        "post_approval_response",
+        **hook_payload,
+        choice=choice,
+        attestation=attestation,
+    )
 
-    if choice == "deny":
+    if choice not in _HUMAN_APPROVAL_CHOICES or not attestation.decision:
         return {
             "approved": False,
             "message": (
@@ -3035,14 +3755,19 @@ def _run_approval_gate(
             "description": description,
         }
 
-    if choice == "session":
+    if not once_only and choice == "session":
         approve_session(session_key, pattern_key)
-    elif choice == "always":
+    elif not once_only and choice == "always":
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
 
-    return {"approved": True, "message": None}
+    return {
+        "approved": True,
+        "message": None,
+        "choice": choice,
+        "attestation": attestation,
+    }
 
 
 def _should_skip_container_guards(env_type: str, has_host_access: bool = False) -> bool:
@@ -3135,6 +3860,12 @@ def request_tool_approval(
     *,
     rule_key: str = "",
     approval_callback=None,
+    tool_args: Optional[dict] = None,
+    plugin_identity: str = "unknown",
+    tool_call_id: str = "",
+    turn_id: str = "",
+    decision_scope: str = "standard",
+    risk_class: str = "",
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3175,6 +3906,19 @@ def request_tool_approval(
     flagged action never runs ungated without a human.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
+    try:
+        safe_tool_args = copy.deepcopy(tool_args if isinstance(tool_args, dict) else {})
+        if decision_scope == "once":
+            canonical_tool_arguments_digest(safe_tool_args, strict=True)
+    except (TypeError, ValueError, copy.Error):
+        return {
+            "approved": False,
+            "choice": None,
+            "message": (
+                f"BLOCKED: Tool '{tool_name}' requires a once-only approval, "
+                "but its arguments cannot be bound to a canonical JSON digest."
+            ),
+        }
     # Allowlist grain: an explicit plugin rule_key wins; otherwise derive from
     # tool + a short hash of the reason so distinct reasons on the same tool
     # get independent [a]lways entries (Finding: rule_key=tool_name alone was
@@ -3213,6 +3957,13 @@ def request_tool_approval(
             "but no interactive user or gateway is present to approve it. "
             "A plugin flagged this action for human confirmation."
         ),
+        tool_name=tool_name,
+        tool_args=safe_tool_args,
+        plugin_identity=plugin_identity,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        decision_scope=decision_scope,
+        risk_class=risk_class,
     )
 
 
@@ -3247,8 +3998,14 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
-def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+def _await_gateway_decision(
+    session_key: str,
+    notify_cb,
+    approval_data: dict,
+    *,
+    surface: str = "gateway",
+    notify_epoch: int | None = None,
+) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3262,20 +4019,191 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    approval_data = dict(approval_data)
+    # Tool arguments may contain passwords, tokens, or private form data.
+    # Consume them only to create the canonical binding, then keep them out of
+    # the queued/transport payload delivered to chat, TUI, or SSE clients.
+    raw_tool_args = approval_data.pop("tool_args", None)
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+    timeout = _get_approval_timeout()
+    issued_at = time.time()
+    source = _current_approval_source()
+    request = ApprovalRequest(
+        schema_version=APPROVAL_ATTESTATION_SCHEMA_VERSION,
+        approval_id=secrets.token_urlsafe(24),
+        session_key=session_key,
+        rule_key=str(primary_key or ""),
+        tool_call_id=str(
+            approval_data.get("tool_call_id") or _approval_tool_call_id.get()
+        ),
+        turn_id=str(approval_data.get("turn_id") or _approval_turn_id.get()),
+        plugin_identity=str(approval_data.get("plugin_identity") or "core"),
+        tool_name=str(approval_data.get("tool_name") or "terminal"),
+        canonical_arguments_digest=str(
+            approval_data.get("canonical_arguments_digest")
+            or canonical_tool_arguments_digest(
+                raw_tool_args
+                if isinstance(raw_tool_args, dict)
+                else {"command": command}
+            )
+        ),
+        decision_scope=(
+            "once"
+            if approval_data.get("decision_scope") == "once"
+            else "standard"
+        ),
+        risk_class=str(approval_data.get("risk_class") or ""),
+        source_platform=source["platform"],
+        source_guild_id=source["guild_id"],
+        source_channel_id=source["channel_id"],
+        source_message_id=source["message_id"],
+        source_operator_id=source["operator_id"],
+        issued_at=issued_at,
+        expires_at=issued_at + max(timeout, 0),
+    )
+    approval_data.update(
+        {
+            "approval_id": request.approval_id,
+            "tool_call_id": request.tool_call_id,
+            "turn_id": request.turn_id,
+            "plugin_identity": request.plugin_identity,
+            "tool_name": request.tool_name,
+            "canonical_arguments_digest": request.canonical_arguments_digest,
+            "decision_scope": request.decision_scope,
+            "risk_class": request.risk_class,
+            "source_platform": request.source_platform,
+            "source_guild_id": request.source_guild_id,
+            "source_channel_id": request.source_channel_id,
+            "source_message_id": request.source_message_id,
+            "source_operator_id": request.source_operator_id,
+            "issued_at": request.issued_at,
+            "expires_at": request.expires_at,
+            "require_actor_attestation": request.source_platform == "discord",
+        }
+    )
 
-    entry = _ApprovalEntry(approval_data)
+    expected_notify_epoch = (
+        notify_epoch
+        if notify_epoch is not None
+        else _approval_notify_epoch.get()
+    )
+    entry = _ApprovalEntry(
+        approval_data,
+        request,
+        notify_epoch=expected_notify_epoch,
+    )
+    if request.source_platform == "discord":
+        required_bindings = (
+            request.session_key,
+            request.rule_key,
+            request.tool_call_id,
+            request.turn_id,
+            request.plugin_identity,
+            request.tool_name,
+            request.canonical_arguments_digest,
+            request.source_channel_id,
+            request.source_message_id,
+            request.source_operator_id,
+        )
+        if not all(required_bindings):
+            logger.warning(
+                "Rejected Discord approval request with incomplete core "
+                "bindings for %s",
+                request.approval_id,
+            )
+            entry.result = "invalid_context"
+            entry.attestation = _attestation_for(
+                entry,
+                choice="invalid_context",
+            )
+            _fire_approval_hook(
+                "pre_approval_request",
+                command=command,
+                description=description,
+                pattern_key=primary_key,
+                pattern_keys=list(all_keys),
+                session_key=session_key,
+                surface=surface,
+                approval_request=request,
+            )
+            _fire_approval_hook(
+                "post_approval_response",
+                command=command,
+                description=description,
+                pattern_key=primary_key,
+                pattern_keys=list(all_keys),
+                session_key=session_key,
+                surface=surface,
+                choice="invalid_context",
+                attestation=entry.attestation,
+            )
+            return {
+                "resolved": False,
+                "choice": None,
+                "invalid_context": True,
+                "attestation": entry.attestation,
+            }
+
+    # Validate and enqueue under the same lock. The callback lease is bound to
+    # the originating run via ContextVar; unregister/replacement invalidates
+    # it, including when an old worker reaches this point only after /new.
     with _lock:
-        _gateway_queues.setdefault(session_key, []).append(entry)
+        registration_current = (
+            expected_notify_epoch is not None
+            and _gateway_notify_epochs.get(session_key)
+            == expected_notify_epoch
+            and _gateway_notify_cbs.get(session_key) is notify_cb
+        )
+        if registration_current:
+            _gateway_queues.setdefault(session_key, {})[
+                request.approval_id
+            ] = entry
+
+    if not registration_current:
+        logger.warning(
+            "Rejected approval request from stale gateway run %s",
+            request.approval_id,
+        )
+        entry.result = "invalid_context"
+        entry.attestation = _attestation_for(
+            entry,
+            choice="invalid_context",
+        )
+        _fire_approval_hook(
+            "pre_approval_request",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            approval_request=request,
+        )
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            choice="invalid_context",
+            attestation=entry.attestation,
+        )
+        return {
+            "resolved": False,
+            "choice": None,
+            "invalid_context": True,
+            "attestation": entry.attestation,
+        }
 
     def _drop_entry() -> None:
         with _lock:
-            queue = _gateway_queues.get(session_key, [])
-            if entry in queue:
-                queue.remove(entry)
+            queue = _gateway_queues.get(session_key, {})
+            queue.pop(request.approval_id, None)
             if not queue:
                 _gateway_queues.pop(session_key, None)
 
@@ -3289,6 +4217,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         pattern_keys=list(all_keys),
         session_key=session_key,
         surface=surface,
+        approval_request=request,
     )
 
     # Notify the user (bridges sync agent thread → async gateway)
@@ -3296,23 +4225,55 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         notify_cb(approval_data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
+        with _lock:
+            if entry.attestation is None:
+                entry.result = "notify_failed"
+                entry.attestation = _attestation_for(
+                    entry, choice="notify_failed"
+                )
+            terminal_choice = entry.attestation.choice
+            terminal_result = entry.result
         _drop_entry()
-        return {"resolved": False, "choice": None, "notify_failed": True}
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            choice=terminal_choice,
+            attestation=entry.attestation,
+        )
+        if terminal_choice != "notify_failed":
+            return {
+                "resolved": True,
+                "choice": terminal_result,
+                "reason": entry.reason,
+                "attestation": entry.attestation,
+            }
+        return {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+            "attestation": entry.attestation,
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 300s). Poll in short slices so we can fire activity heartbeats
     # every ~10s to the agent's inactivity tracker — otherwise the gateway
     # watchdog kills the agent while the user is still responding. Mirrors
     # _wait_for_process() cadence.
-    timeout = _get_approval_timeout()
-
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
 
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    # ``notify_cb`` may itself block on transport work.  Expiry is anchored
+    # to request issuance, so callback latency must consume the approval
+    # window rather than minting a fresh timeout after delivery returns.
+    _deadline = _now + max(0.0, request.expires_at - time.time())
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
@@ -3329,8 +4290,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 "returning deny for session %s",
                 session_key,
             )
-            entry.result = "deny"
-            entry.event.set()
+            with _lock:
+                if entry.attestation is None:
+                    entry.result = "deny"
+                    entry.attestation = _attestation_for(
+                        entry, choice="deny"
+                    )
+                    _gateway_queues.get(session_key, {}).pop(
+                        request.approval_id, None
+                    )
+                    entry.event.set()
             resolved = True
             break
         _remaining = _deadline - time.monotonic()
@@ -3342,13 +4311,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         if touch_activity_if_due is not None:
             touch_activity_if_due(_activity_state, "waiting for user approval")
 
-    _drop_entry()
+    with _lock:
+        if entry.attestation is None:
+            entry.result = None
+            entry.attestation = _attestation_for(entry, choice="timeout")
+        queue = _gateway_queues.get(session_key, {})
+        queue.pop(request.approval_id, None)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
 
     choice = entry.result
-    # Normalize outcome for the post hook. Unresolved (timeout) and None both
-    # mean the user never responded; report that explicitly so plugins can
-    # distinguish timeout from explicit deny.
-    _outcome = "timeout" if not resolved else (choice if choice else "timeout")
+    # The timeout edge can race a session clear/unregister after the wait loop
+    # breaks but before the final lock is acquired. The lock-protected terminal
+    # attestation is authoritative; deriving the result from the stale local
+    # ``resolved`` flag would report timeout to plugins while returning a deny
+    # attestation to the caller.
+    _outcome = entry.attestation.choice
+    resolved = _outcome != "timeout"
     _fire_approval_hook(
         "post_approval_response",
         command=command,
@@ -3358,8 +4337,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         session_key=session_key,
         surface=surface,
         choice=_outcome,
+        attestation=entry.attestation,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        "attestation": entry.attestation,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3578,6 +4563,8 @@ def check_all_command_guards(command: str, env_type: str,
             pattern_key=warnings[0][0],
             pattern_keys=[key for key, _, _ in warnings],
             session_key=session_key,
+            tool_name="terminal",
+            tool_args={"command": command},
         )
         verdict = _smart_approve(command, combined_desc_for_llm)
         _observe_smart_approval_verdict(observer_payload, verdict)
@@ -3650,6 +4637,11 @@ def check_all_command_guards(command: str, env_type: str,
             from agent.redact import redact_sensitive_text
             approval_data = {
                 "command": redact_sensitive_text(command),
+                # Raw arguments are consumed inside _await_gateway_decision
+                # only to compute the canonical digest, then removed before
+                # transport. The displayed command stays redacted.
+                "tool_args": {"command": command},
+                "tool_name": "terminal",
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": redact_sensitive_text(combined_desc),
@@ -3663,6 +4655,12 @@ def check_all_command_guards(command: str, env_type: str,
                 # already caps scope at session. Adapters use this to render
                 # a session tier independently of the permanent tier.
                 "allow_session": not smart_denied_for_owner,
+                # UI capability flags are not an authorization boundary.
+                # Bind the waiter itself to once-only so a forged/stale
+                # session or always response cannot approve this operation.
+                "decision_scope": (
+                    "once" if smart_denied_for_owner else "standard"
+                ),
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
@@ -3679,8 +4677,17 @@ def check_all_command_guards(command: str, env_type: str,
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
+            attestation = decision.get("attestation")
 
-            if not resolved or choice is None or choice == "deny":
+            if (
+                not resolved
+                or choice is None
+                or choice == "deny"
+                or not isinstance(attestation, ApprovalAttestation)
+                or attestation.decision is not True
+                or attestation.choice != choice
+                or (smart_denied_for_owner and choice != "once")
+            ):
                 # Consent contract: silence is NOT consent, and an explicit
                 # deny is also a hard halt — both produce a BLOCKED outcome
                 # that names the agent's most common evasion paths (retry,
@@ -3770,15 +4777,24 @@ def check_all_command_guards(command: str, env_type: str,
 
     # CLI interactive: single combined prompt
     # Hide [a]lways when no persistable (non-tirith) warning is present
-    _fire_approval_hook(
-        "pre_approval_request",
+    request = _new_observer_approval_request(
         command=command,
-        description=combined_desc,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
         session_key=session_key,
-        surface="cli",
+        rule_key=primary_key,
+        tool_name="terminal",
+        tool_args={"command": command},
+        decision_scope="once" if smart_denied_for_owner else "standard",
     )
+    hook_payload = {
+        "command": command,
+        "description": combined_desc,
+        "pattern_key": primary_key,
+        "pattern_keys": list(all_keys),
+        "session_key": session_key,
+        "surface": "cli",
+        "approval_request": request,
+    }
+    _fire_approval_hook("pre_approval_request", **hook_payload)
     choice = prompt_dangerous_approval(
         command,
         combined_desc,
@@ -3786,18 +4802,20 @@ def check_all_command_guards(command: str, env_type: str,
         smart_denied=smart_denied_for_owner,
         approval_callback=approval_callback,
     )
+    attestation = _attestation_from_request(
+        request,
+        choice=choice,
+        # Local CLI input has no platform-authenticated actor identifier.
+        actor_id="",
+    )
     _fire_approval_hook(
         "post_approval_response",
-        command=command,
-        description=combined_desc,
-        pattern_key=primary_key,
-        pattern_keys=list(all_keys),
-        session_key=session_key,
-        surface="cli",
+        **hook_payload,
         choice=choice,
+        attestation=attestation,
     )
 
-    if choice == "deny":
+    if choice not in _HUMAN_APPROVAL_CHOICES or not attestation.decision:
         breaker_addendum = _denial_breaker_addendum(session_key)
         return {
             "approved": False,
@@ -3927,6 +4945,8 @@ def check_execute_code_guard(code: str, env_type: str,
             pattern_key=pattern_key,
             pattern_keys=[pattern_key],
             session_key=session_key,
+            tool_name="execute_code",
+            tool_args={"code": code},
         )
         verdict = _smart_approve(command, description)
         _observe_smart_approval_verdict(observer_payload, verdict)
@@ -4004,11 +5024,20 @@ def check_execute_code_guard(code: str, env_type: str,
 
     approval_data = {
         "command": display_command,
+        # Bind approval to the exact script while keeping raw code out of the
+        # prompt payload sent to chat/TUI clients.
+        "tool_args": {"code": code},
+        "tool_name": "execute_code",
         "pattern_key": pattern_key,
         "pattern_keys": [pattern_key],
         "description": display_description,
         "allow_permanent": not smart_denied_for_owner,
         "allow_session": not smart_denied_for_owner,
+        # Enforce the Smart-DENY owner override in the core resolver, not only
+        # in adapters that happen to hide broader buttons.
+        "decision_scope": (
+            "once" if smart_denied_for_owner else "standard"
+        ),
     }
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
@@ -4029,8 +5058,17 @@ def check_execute_code_guard(code: str, env_type: str,
     resolved = decision["resolved"]
     choice = decision["choice"]
     deny_reason = decision.get("reason")
+    attestation = decision.get("attestation")
 
-    if not resolved or choice is None or choice == "deny":
+    if (
+        not resolved
+        or choice is None
+        or choice == "deny"
+        or not isinstance(attestation, ApprovalAttestation)
+        or attestation.decision is not True
+        or attestation.choice != choice
+        or (smart_denied_for_owner and choice != "once")
+    ):
         reason = "timed out without user response" if not resolved else "denied by user"
         addendum = " Silence is not consent." if not resolved else ""
         reason_addendum = ""

@@ -23,7 +23,10 @@ def _capture_channel(adapter):
 
 
 @pytest.mark.asyncio
-async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason():
+async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason(
+    monkeypatch,
+):
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", "555")
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     sent = _capture_channel(adapter)
 
@@ -46,5 +49,11 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
     assert command in prompt_text
     assert "Reason" in prompt_text
     assert "script execution via -c flag" in prompt_text
-
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id="operator-1", roles=[]),
+        channel=SimpleNamespace(id="555", name="ops"),
+        channel_id="555",
+        guild=SimpleNamespace(id="456"),
+    )
+    assert sent["view"]._check_auth(interaction) is True
 

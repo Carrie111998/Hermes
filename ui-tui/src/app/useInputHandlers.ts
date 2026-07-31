@@ -25,10 +25,10 @@ import {
   type InputHandlerResult,
   type OverlayState
 } from './interfaces.js'
-import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
+import { $isBlocked, $overlayState, completeApprovalRequest, patchOverlayState } from './overlayStore.js'
 import { turnController } from './turnController.js'
 import { patchTurnState } from './turnStore.js'
-import { getUiState } from './uiStore.js'
+import { getUiState, patchUiState } from './uiStore.js'
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
 const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
@@ -178,9 +178,28 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (overlay.approval) {
+      const approvalId = overlay.approval.approvalId
+
+      if (!approvalId) {
+        completeApprovalRequest()
+        patchUiState({ status: 'approval identity missing' })
+
+        return Promise.resolve()
+      }
+
       return gateway
-        .rpc<ApprovalRespondResponse>('approval.respond', { choice: 'deny', session_id: getUiState().sid })
-        .then(r => r && (patchOverlayState({ approval: null }), patchTurnState({ outcome: 'denied' })))
+        .rpc<ApprovalRespondResponse>('approval.respond', {
+          approval_id: approvalId,
+          choice: 'deny',
+          session_id: getUiState().sid
+        })
+        .then(r => {
+          completeApprovalRequest(approvalId)
+
+          if (r?.resolved) {
+            patchTurnState({ outcome: 'denied' })
+          }
+        })
     }
 
     if (overlay.sudo || overlay.secret) {

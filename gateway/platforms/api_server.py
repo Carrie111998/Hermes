@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -68,8 +69,14 @@ _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
 
-def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
-    if smart_denied:
+def _approval_event_choices(
+    *,
+    smart_denied: bool,
+    allow_permanent: bool,
+    allow_session: bool = True,
+    decision_scope: str = "standard",
+) -> list[str]:
+    if smart_denied or decision_scope == "once" or not allow_session:
         return ["once", "deny"]
     return ["once", "session", "always", "deny"] if allow_permanent else ["once", "session", "deny"]
 
@@ -1252,6 +1259,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        self._run_approval_epochs: Dict[str, int] = {}
+        self._run_approval_cancellations: Dict[
+            str, threading.Event
+        ] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
@@ -6217,6 +6228,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        approval_run_cancelled = threading.Event()
+        self._run_approval_cancellations[run_id] = (
+            approval_run_cancelled
+        )
 
         async def _run_and_close():
             try:
@@ -6264,6 +6279,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         "choices": _approval_event_choices(
                             smart_denied=bool(event.get("smart_denied")),
                             allow_permanent=event.get("allow_permanent") is not False,
+                            allow_session=event.get("allow_session") is not False,
+                            decision_scope=str(
+                                event.get("decision_scope") or "standard"
+                            ),
                         ),
                     })
                     self._set_run_status(
@@ -6280,13 +6299,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     from gateway.session_context import clear_session_vars
                     from tools.approval import (
                         register_gateway_notify,
+                        reset_current_gateway_notify_epoch,
                         reset_current_session_key,
+                        set_current_gateway_notify_epoch,
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
 
                     effective_task_id = session_id or run_id
                     approval_token = None
+                    approval_notify_epoch = None
+                    approval_notify_context_token = None
                     session_tokens = []
                     with self._profile_scope(request_profile):
                         try:
@@ -6307,16 +6330,71 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
                             )
-                            register_gateway_notify(approval_session_key, _approval_notify)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
+                            approval_notify_epoch = register_gateway_notify(
+                                approval_session_key,
+                                _approval_notify,
+                                active_check=(
+                                    lambda: not approval_run_cancelled.is_set()
+                                ),
                             )
+                            if approval_notify_epoch is None:
+                                r = {
+                                    "final_response": "",
+                                    "messages": [],
+                                    "api_calls": 0,
+                                    "tools": [],
+                                    "interrupted": True,
+                                }
+                            else:
+                                self._run_approval_epochs[run_id] = (
+                                    approval_notify_epoch
+                                )
+                                approval_notify_context_token = (
+                                    set_current_gateway_notify_epoch(
+                                        approval_notify_epoch
+                                    )
+                                )
+                                # Stop may race immediately after callback
+                                # publication but before the map is visible to
+                                # the event-loop handler. Recheck at the final
+                                # execution boundary; Stop-before-registration
+                                # is rejected by active_check under the approval
+                                # lock, while registration-before-Stop is
+                                # revoked by _handle_stop_run.
+                                if (
+                                    approval_run_cancelled.is_set()
+                                    or run_id in self._stopping_run_ids
+                                ):
+                                    r = {
+                                        "final_response": "",
+                                        "messages": [],
+                                        "api_calls": 0,
+                                        "tools": [],
+                                        "interrupted": True,
+                                    }
+                                else:
+                                    r = agent.run_conversation(
+                                        user_message=user_message,
+                                        conversation_history=conversation_history,
+                                        task_id=effective_task_id,
+                                    )
                         finally:
                             try:
-                                unregister_gateway_notify(approval_session_key)
+                                if approval_notify_context_token is not None:
+                                    reset_current_gateway_notify_epoch(
+                                        approval_notify_context_token
+                                    )
+                                if approval_notify_epoch is not None:
+                                    unregister_gateway_notify(
+                                        approval_session_key,
+                                        approval_notify_epoch,
+                                    )
                             finally:
+                                if (
+                                    self._run_approval_epochs.get(run_id)
+                                    == approval_notify_epoch
+                                ):
+                                    self._run_approval_epochs.pop(run_id, None)
                                 if approval_token is not None:
                                     try:
                                         reset_current_session_key(approval_token)
@@ -6437,6 +6515,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                approval_run_cancelled.set()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -6445,7 +6524,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import unregister_gateway_notify
 
-                    unregister_gateway_notify(approval_session_key)
+                    approval_epoch = self._run_approval_epochs.pop(
+                        run_id,
+                        None,
+                    )
+                    if approval_epoch is not None:
+                        unregister_gateway_notify(
+                            approval_session_key,
+                            approval_epoch,
+                        )
                 except Exception:
                     pass
                 # Sentinel: signal SSE stream to close
@@ -6456,6 +6543,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_epochs.pop(run_id, None)
+                if (
+                    self._run_approval_cancellations.get(run_id)
+                    is approval_run_cancelled
+                ):
+                    self._run_approval_cancellations.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
@@ -6590,13 +6683,23 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        approval_id = str(body.get("approval_id") or "")
+        if resolve_all or not approval_id:
+            return web.json_response(
+                _openai_error(
+                    "An exact approval_id is required; batch approval "
+                    "resolution is not supported",
+                    code="approval_id_required",
+                ),
+                status=400,
+            )
         try:
             from tools.approval import resolve_gateway_approval
 
             resolved = resolve_gateway_approval(
                 approval_session_key,
                 choice,
-                resolve_all=resolve_all,
+                approval_id=approval_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
@@ -6647,12 +6750,31 @@ class APIServerAdapter(BasePlatformAdapter):
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
         self._stopping_run_ids.add(run_id)
+        approval_cancel = self._run_approval_cancellations.get(run_id)
+        if approval_cancel is not None:
+            approval_cancel.set()
 
         if agent is not None:
             try:
                 agent.interrupt("Stop requested via API")
             except Exception:
                 pass
+        try:
+            from tools.approval import unregister_gateway_notify
+
+            approval_session_key = self._run_approval_sessions.get(run_id)
+            approval_epoch = self._run_approval_epochs.pop(run_id, None)
+            if approval_session_key and approval_epoch is not None:
+                unregister_gateway_notify(
+                    approval_session_key,
+                    approval_epoch,
+                )
+        except Exception:
+            logger.debug(
+                "[api_server] approval revoke failed for run %s",
+                run_id,
+                exc_info=True,
+            )
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
@@ -6681,8 +6803,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     from tools.approval import unregister_gateway_notify
 
                     approval_session_key = self._run_approval_sessions.get(run_id)
-                    if approval_session_key:
-                        unregister_gateway_notify(approval_session_key)
+                    approval_epoch = self._run_approval_epochs.pop(
+                        run_id,
+                        None,
+                    )
+                    if approval_session_key and approval_epoch is not None:
+                        unregister_gateway_notify(
+                            approval_session_key,
+                            approval_epoch,
+                        )
                 except Exception:
                     pass
             # The transport TTL always bounds buffering. Live control state is
@@ -6693,6 +6822,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                self._run_approval_epochs.pop(run_id, None)
+                self._run_approval_cancellations.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
 
         stale_statuses = [

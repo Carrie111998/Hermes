@@ -468,28 +468,148 @@ def _format_exec_approval_fallback(
     description: str,
     command_prefix: str,
     *,
+    approval_id: str,
     allow_permanent: bool = True,
     allow_session: bool = True,
     smart_denied: bool = False,
 ) -> str:
-    """Render the text fallback from approval capabilities, not platform names."""
+    """Render an exact-ID text fallback from approval capabilities."""
+    if re.fullmatch(r"[A-Za-z0-9_-]+", approval_id or "") is None:
+        raise ValueError("text approval requires a valid approval_id")
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
     heading = "⚠️ **Dangerous command requires approval:**"
     if smart_denied:
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
-    choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    choices = [
+        f"Reply `{command_prefix}approve {approval_id}` "
+        "to execute this one operation"
+    ]
     if not smart_denied and allow_session:
         choices.append(
-            f"`{command_prefix}approve session` to approve this pattern for the session"
+            f"`{command_prefix}approve {approval_id} session` "
+            "to approve this pattern for the session"
         )
         if allow_permanent:
-            choices.append(f"`{command_prefix}approve always` to approve permanently")
-    choices.append(f"`{command_prefix}deny` to cancel")
+            choices.append(
+                f"`{command_prefix}approve {approval_id} always` "
+                "to approve permanently"
+            )
+    choices.append(f"`{command_prefix}deny {approval_id}` to cancel")
     return (
-        f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
+        f"{heading}\n```\n{cmd_preview}\n```\n"
+        f"Approval ID: `{approval_id}`\nReason: {description}\n\n"
         + ", ".join(choices[:-1]) + f", or {choices[-1]}."
     )
+
+
+def _notify_gateway_approval(
+    ctx: Any, approval_session_key: str, approval_data: dict
+) -> None:
+    """Bridge a blocking approval waiter to the active platform adapter.
+
+    Kept outside ``TurnRunner.run_sync`` so the complete production ordering
+    (core waiter → gateway notify → platform prompt) is integration-testable.
+    """
+    ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+    command = _redact_approval_command(approval_data.get("command", ""))
+    description = approval_data.get("description", "dangerous command")
+    metadata = dict(ctx._status_thread_metadata or {})
+    requires_exact_response = bool(
+        approval_data.get("require_actor_attestation")
+        or approval_data.get("decision_scope") == "once"
+    )
+    for key in (
+        "approval_id",
+        "tool_call_id",
+        "turn_id",
+        "plugin_identity",
+        "tool_name",
+        "canonical_arguments_digest",
+        "decision_scope",
+        "risk_class",
+        "source_platform",
+        "source_guild_id",
+        "source_channel_id",
+        "source_message_id",
+        "source_operator_id",
+        "issued_at",
+        "expires_at",
+        "require_actor_attestation",
+    ):
+        metadata[key] = approval_data.get(key)
+
+    if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
+        try:
+            future = safe_schedule_threadsafe(
+                ctx._status_adapter.send_exec_approval(
+                    chat_id=ctx._status_chat_id,
+                    command=command,
+                    session_key=approval_session_key,
+                    description=description,
+                    metadata=metadata,
+                    allow_permanent=approval_data.get("allow_permanent", True),
+                    allow_session=approval_data.get("allow_session", True),
+                    smart_denied=approval_data.get("smart_denied", False),
+                ),
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="send_exec_approval scheduling error",
+            )
+            if future is None:
+                raise RuntimeError("send_exec_approval: loop unavailable")
+            result = future.result(timeout=15)
+            if result.success:
+                return
+            if requires_exact_response:
+                logger.warning(
+                    "Exact approval prompt delivery failed: %s",
+                    result.error,
+                )
+                raise RuntimeError("exact approval prompt delivery failed")
+            logger.warning(
+                "Button-based approval failed (send returned error), "
+                "falling back to text: %s",
+                result.error,
+            )
+        except Exception:
+            if requires_exact_response:
+                raise
+            logger.warning(
+                "Button-based approval failed, falling back to text",
+                exc_info=True,
+            )
+
+    if requires_exact_response:
+        raise RuntimeError(
+            "exact approval requires a native approval_id-capable surface"
+        )
+
+    prefix = getattr(ctx._status_adapter, "typed_command_prefix", "/")
+    message = _format_exec_approval_fallback(
+        command,
+        description,
+        prefix,
+        approval_id=str(approval_data.get("approval_id") or ""),
+        allow_permanent=approval_data.get("allow_permanent", True),
+        allow_session=approval_data.get("allow_session", True),
+        smart_denied=approval_data.get("smart_denied", False),
+    )
+    try:
+        future = safe_schedule_threadsafe(
+            ctx._status_adapter.send(
+                ctx._status_chat_id,
+                message,
+                metadata=ctx._status_thread_metadata,
+            ),
+            ctx._loop_for_step,
+            logger=logger,
+            log_message="Approval text-send scheduling error",
+        )
+        if future is not None:
+            future.result(timeout=15)
+    except Exception as exc:
+        logger.error("Failed to send approval request: %s", exc)
 
 
 def _gateway_provider_error_reply(text: str) -> str:
@@ -4792,101 +4912,17 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            reset_current_gateway_notify_epoch,
             reset_current_session_key,
+            set_current_gateway_notify_epoch,
             set_current_session_key,
             unregister_gateway_notify,
         )
 
         def _approval_notify_sync(approval_data: dict) -> None:
-            """Send the approval request to the user from the agent thread.
-
-                If the adapter supports interactive button-based approvals
-                (e.g. Discord's ``send_exec_approval``), use that for a richer
-                UX.  Otherwise fall back to a plain text message with
-                ``/approve`` instructions.
-                """
-            # Pause the typing indicator while the agent waits for
-            # user approval.  Critical for Slack's Assistant API where
-            # assistant_threads_setStatus disables the compose box — the
-            # user literally cannot type /approve while "is thinking..."
-            # is active.  The approval message send auto-clears the Slack
-            # status; pausing prevents _keep_typing from re-setting it.
-            # Typing resumes in _handle_approve_command/_handle_deny_command.
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
-
-            cmd = approval_data.get("command", "")
-            desc = approval_data.get("description", "dangerous command")
-
-            # Redact credentials from the command before displaying it in
-            # the approval prompt — Tirith's findings are already redacted,
-            # but the raw command string still leaks secrets to the chat
-            # platform (#48456). Applied here so BOTH the button-based
-            # (send_exec_approval) and plain-text fallback paths below use
-            # the redacted value.
-            cmd = _redact_approval_command(cmd)
-
-            # Prefer button-based approval when the adapter supports it.
-            # Check the *class* for the method, not the instance — avoids
-            # false positives from MagicMock auto-attribute creation in tests.
-            if getattr(type(ctx._status_adapter), "send_exec_approval", None) is not None:
-                try:
-                    _approval_fut = safe_schedule_threadsafe(
-                        ctx._status_adapter.send_exec_approval(
-                            chat_id=ctx._status_chat_id,
-                            command=cmd,
-                            session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
-                            allow_permanent=approval_data.get("allow_permanent", True),
-                            allow_session=approval_data.get("allow_session", True),
-                            smart_denied=approval_data.get("smart_denied", False),
-                        ),
-                        ctx._loop_for_step,
-                        logger=logger,
-                        log_message="send_exec_approval scheduling error",
-                    )
-                    if _approval_fut is None:
-                        raise RuntimeError("send_exec_approval: loop unavailable")
-                    _approval_result = _approval_fut.result(timeout=15)
-                    if _approval_result.success:
-                        return
-                    logger.warning(
-                        "Button-based approval failed (send returned error), falling back to text: %s",
-                        _approval_result.error,
-                    )
-                except Exception as _e:
-                    logger.warning(
-                        "Button-based approval failed, falling back to text: %s", _e
-                    )
-
-            # Fallback: plain text approval prompt.  Use the adapter's
-            # typed prefix so Slack/Matrix users are told the form they
-            # can actually type (`!approve`) — typed "/" is blocked in
-            # Slack threads and reserved by Matrix clients.
-            _p = getattr(ctx._status_adapter, "typed_command_prefix", "/")
-            msg = _format_exec_approval_fallback(
-                cmd,
-                desc,
-                _p,
-                allow_permanent=approval_data.get("allow_permanent", True),
-                allow_session=approval_data.get("allow_session", True),
-                smart_denied=approval_data.get("smart_denied", False),
+            _notify_gateway_approval(
+                ctx, _approval_session_key, approval_data
             )
-            try:
-                _approval_send_fut = safe_schedule_threadsafe(
-                    ctx._status_adapter.send(
-                        ctx._status_chat_id,
-                        msg,
-                        metadata=ctx._status_thread_metadata,
-                    ),
-                    ctx._loop_for_step,
-                    logger=logger,
-                    log_message="Approval text-send scheduling error",
-                )
-                if _approval_send_fut is not None:
-                    _approval_send_fut.result(timeout=15)
-            except Exception as _e:
-                logger.error("Failed to send approval request: %s", _e)
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -5033,7 +5069,33 @@ class TurnRunner:
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
-        register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        _approval_notify_epoch = register_gateway_notify(
+            _approval_session_key,
+            _approval_notify_sync,
+            active_check=ctx._run_still_current,
+        )
+        if _approval_notify_epoch is None:
+            logger.info(
+                "Skipping stale gateway turn for %s before agent execution — "
+                "generation %s is no longer current",
+                _approval_session_key or "?",
+                ctx.run_generation,
+            )
+            reset_current_session_key(_approval_session_token)
+            ctx.result_holder[0] = {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "history_offset": len(ctx.history or []),
+                "session_id": ctx.session_id,
+                "response_previewed": False,
+                "interrupted": True,
+            }
+            return
+        _approval_notify_epoch_token = set_current_gateway_notify_epoch(
+            _approval_notify_epoch
+        )
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -5082,9 +5144,36 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if not ctx._run_still_current():
+                logger.info(
+                    "Skipping stale gateway turn for %s immediately before "
+                    "agent execution — generation %s is no longer current",
+                    _approval_session_key or "?",
+                    ctx.run_generation,
+                )
+                result = {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": [],
+                    "history_offset": len(ctx.history or []),
+                    "session_id": ctx.session_id,
+                    "response_previewed": False,
+                    "interrupted": True,
+                }
+            else:
+                result = agent.run_conversation(
+                    _api_run_message,
+                    **_conversation_kwargs,
+                )
         finally:
-            unregister_gateway_notify(_approval_session_key)
+            reset_current_gateway_notify_epoch(
+                _approval_notify_epoch_token
+            )
+            unregister_gateway_notify(
+                _approval_session_key,
+                _approval_notify_epoch,
+            )
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
             # completion, gateway shutdown).  Idempotent.
@@ -8395,19 +8484,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # --- Approval response routing (#46866) ---
         # When the agent is blocked waiting for a dangerous-command approval,
-        # plain-text responses like "yes" or "approve" must be routed to the
-        # approval handler instead of being steered/queued/interrupted.
+        # plain-text responses carrying an exact approval ID must be routed to
+        # the approval handler instead of being steered/queued/interrupted.
         # Otherwise approval via messaging platforms never succeeds — the
         # reply is queued behind a turn that can't start until the approval
         # resolves, so the approval times out and auto-denies (a deadlock).
         #
         # Slash forms (/approve, /deny) already bypass to the runner at the
-        # base-adapter guard.  This handles the bare-word forms (Signal/SMS
-        # users naturally type "yes" rather than "/approve").  Gating on
-        # has_blocking_approval(session_key) is the disambiguator that keeps
-        # a conversational "yes" from triggering a dangerous command when no
-        # approval is actually pending (design intent — see run.py "Pending
-        # exec approvals are handled by /approve and /deny" note).
+        # base-adapter guard.  Text-only transports may omit the slash, but
+        # they must still echo the approval ID printed in the prompt.  A bare
+        # "yes" can neither select safely among concurrent waiters nor prove
+        # which prompt the user answered, so it deliberately falls through as
+        # ordinary conversation even when an approval is pending.
         #
         # We reuse the canonical /approve and /deny handlers rather than
         # re-deriving the resolution + i18n messaging: they resolve the
@@ -8417,21 +8505,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):
-                _raw_text = (event.text or "").strip().lower()
+                _raw_text = (event.text or "").strip()
                 _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
                 _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
                 _approval_handler = None
                 _normalized_args = ""
-                if _raw_text in _approve_words:
+                _tokens = _raw_text.split()
+                _verb_token = _tokens[0].lower() if _tokens else ""
+                if len(_tokens) >= 2 and _verb_token in _approve_words:
                     _approval_handler = self._handle_approve_command
-                elif _raw_text in _deny_words:
+                    _normalized_args = " ".join(_tokens[1:])
+                elif len(_tokens) >= 2 and _verb_token in _deny_words:
                     _approval_handler = self._handle_deny_command
-                elif _raw_text in {"always", "approve always", "always approve"}:
+                    _normalized_args = " ".join(_tokens[1:])
+                elif len(_tokens) >= 2 and _verb_token in {"always", "session"}:
+                    # Retain the old shorthand ordering while still requiring
+                    # an exact ID: ``always <id>`` -> ``approve <id> always``.
                     _approval_handler = self._handle_approve_command
-                    _normalized_args = "always"
-                elif _raw_text in {"session", "approve session", "session approve"}:
-                    _approval_handler = self._handle_approve_command
-                    _normalized_args = "session"
+                    _normalized_args = f"{' '.join(_tokens[1:])} {_verb_token}"
                 if _approval_handler is not None:
                     # Synthesize the canonical "/approve [args]" / "/deny"
                     # command text so the slash handlers parse modifiers via
@@ -20263,6 +20354,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
+            scope_id=str(context.source.scope_id) if context.source.scope_id else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
@@ -21925,7 +22017,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
-        generation = self._begin_session_run_generation(session_key)
+        # Generation mutation and callback revocation share the approval lock
+        # with callback publication and response resolution.  A registration
+        # linearized first is revoked here; one linearized afterward observes
+        # the bumped generation through its active_check and is rejected.
+        try:
+            from tools.approval import invalidate_gateway_notify
+
+            generation = invalidate_gateway_notify(
+                session_key,
+                lambda: self._begin_session_run_generation(session_key),
+            )
+        except Exception:
+            logger.debug(
+                "Failed to invalidate approval callback for %s",
+                session_key,
+                exc_info=True,
+            )
+            # Preserve the historical monotonic invalidation guarantee even if
+            # approval lifecycle cleanup itself is unavailable. This path is
+            # fail-closed for approvals because registration's generation
+            # check will reject the old worker.
+            generation = self._begin_session_run_generation(session_key)
         if reason:
             logger.info(
                 "Invalidated run generation for %s → %d (%s)",

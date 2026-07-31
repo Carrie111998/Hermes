@@ -320,6 +320,23 @@ class ToolRegistry:
         """Return a stable snapshot of registered tool entries."""
         return self._snapshot_state()[0]
 
+    def _snapshot_registration_state(self) -> dict:
+        """Capture mutable registration state for one plugin load transaction."""
+        with self._lock:
+            return {
+                "tools": dict(self._tools),
+                "toolset_checks": dict(self._toolset_checks),
+                "toolset_aliases": dict(self._toolset_aliases),
+            }
+
+    def _restore_registration_state(self, state: dict) -> None:
+        """Restore a snapshot after a plugin ``register()`` failure."""
+        with self._lock:
+            self._tools = dict(state["tools"])
+            self._toolset_checks = dict(state["toolset_checks"])
+            self._toolset_aliases = dict(state["toolset_aliases"])
+            self._generation += 1
+
     def _toolset_has_exposable_tools(
         self,
         toolset: str,

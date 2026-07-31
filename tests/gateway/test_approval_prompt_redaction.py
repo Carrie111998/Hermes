@@ -17,6 +17,10 @@ the redactor regexes so the assertions stay meaningful, but contain no real
 or real-looking key, so secret scanners do not flag this file.
 """
 
+from types import SimpleNamespace
+
+import pytest
+
 from gateway.run import _redact_approval_command
 
 # Synthetic, scanner-safe credential fixtures. Each matches its redactor
@@ -62,7 +66,7 @@ class TestRedactApprovalCommand:
 
 class TestApprovalCommandWiring:
     """Guard the production wiring on BOTH approval-notify transports:
-    1. the chat-platform path (_approval_notify_sync in gateway/run.py), and
+    1. the chat-platform path (_notify_gateway_approval in gateway/run.py), and
     2. the SSE/API path (_approval_notify in gateway/platforms/api_server.py),
     each of which must route the command through _redact_approval_command and
     REASSIGN the redacted value before any send/enqueue (so the raw command
@@ -113,7 +117,11 @@ class TestApprovalCommandWiring:
     def test_chat_platform_path_redacts_before_send(self):
         import gateway.run as run
 
-        self._assert_redacts_then_uses(run, "_approval_notify_sync", "send_exec_approval")
+        self._assert_redacts_then_uses(
+            run,
+            "_notify_gateway_approval",
+            "send_exec_approval",
+        )
 
     def test_sse_api_path_redacts_before_enqueue(self):
         from gateway.platforms import api_server
@@ -122,17 +130,66 @@ class TestApprovalCommandWiring:
 
 
 class TestApprovalTextFallbackContract:
+    def test_text_fallback_without_valid_id_fails_closed(self):
+        from gateway.run import _format_exec_approval_fallback
+
+        for invalid_id in ("", "approval id", "approval`id"):
+            with pytest.raises(
+                ValueError,
+                match="valid approval_id",
+            ):
+                _format_exec_approval_fallback(
+                    "rm -rf /",
+                    "dangerous deletion",
+                    "/",
+                    approval_id=invalid_id,
+                )
+
     def test_smart_deny_only_advertises_one_operation(self):
         from gateway.run import _format_exec_approval_fallback
 
         text = _format_exec_approval_fallback(
             "rm -rf /", "dangerous deletion", "/",
+            approval_id="approval-Aa_9",
             allow_permanent=False, smart_denied=True,
         )
         assert "owner override" in text.lower()
         assert "one operation" in text.lower()
-        assert "`/approve`" in text
+        assert "Approval ID: `approval-Aa_9`" in text
+        assert "`/approve approval-Aa_9`" in text
+        assert "`/deny approval-Aa_9`" in text
+        assert "`/approve`" not in text
         assert "approve session" not in text
         assert "approve always" not in text
 
+    def test_once_only_request_without_native_id_surface_fails_immediately(self):
+        from gateway.run import _notify_gateway_approval
 
+        class TextOnlyAdapter:
+            def pause_typing_for_chat(self, _chat_id):
+                pass
+
+            async def send(self, *_args, **_kwargs):
+                raise AssertionError("misleading text fallback must not be sent")
+
+        ctx = SimpleNamespace(
+            _loop_for_step=None,
+            _status_adapter=TextOnlyAdapter(),
+            _status_chat_id="chat-1",
+            _status_thread_metadata={},
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="approval_id-capable surface",
+        ):
+            _notify_gateway_approval(
+                ctx,
+                "session-1",
+                {
+                    "approval_id": "approval-1",
+                    "command": "financial operation",
+                    "decision_scope": "once",
+                    "description": "requires exact attestation",
+                },
+            )

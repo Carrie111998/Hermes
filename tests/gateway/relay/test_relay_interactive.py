@@ -121,6 +121,106 @@ async def test_exec_approval_smart_denied_and_flag_gating():
 
 
 @pytest.mark.asyncio
+async def test_relay_discord_approval_preserves_exact_actor_binding(
+    monkeypatch,
+):
+    adapter, stub = _adapter(platform="discord")
+    bound = {}
+    resolved = {}
+
+    def bind(session_key, approval_id, **kwargs):
+        bound.update(
+            session_key=session_key,
+            approval_id=approval_id,
+            **kwargs,
+        )
+        return True
+
+    def resolve(session_key, choice, **kwargs):
+        resolved.update(
+            session_key=session_key,
+            choice=choice,
+            **kwargs,
+        )
+        return 1
+
+    monkeypatch.setattr(
+        "tools.approval.bind_gateway_approval_delivery",
+        bind,
+    )
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        resolve,
+    )
+    metadata = {
+        "approval_id": "approval-1",
+        "source_platform": "discord",
+        "source_guild_id": "g1",
+        "source_channel_id": "c1",
+        "source_operator_id": "u1",
+        "tool_call_id": "call-1",
+        "turn_id": "turn-1",
+        "plugin_identity": "finance",
+        "tool_name": "transfer",
+        "canonical_arguments_digest": "a" * 64,
+        "require_actor_attestation": True,
+    }
+    result = await adapter.send_exec_approval(
+        "c1",
+        "<transfer>",
+        "sess:1",
+        metadata=metadata,
+        allow_session=False,
+        allow_permanent=False,
+    )
+    assert result.success is True
+    action = stub.sent[-1]
+    assert bound == {
+        "session_key": "sess:1",
+        "approval_id": "approval-1",
+        "platform": "discord",
+        "guild_id": "g1",
+        "channel_id": "c1",
+        "message_id": result.message_id,
+    }
+
+    event = MessageEvent(
+        text="/once",
+        message_type=MessageType.COMMAND,
+        source=SessionSource(
+            platform="discord",
+            chat_id="c1",
+            chat_type="channel",
+            user_id="u1",
+            scope_id="g1",
+            delivered_via_upstream_relay=True,
+        ),
+        prompt_response={
+            "prompt_id": action["prompt_id"],
+            "option_id": "once",
+            "prompt_message_id": result.message_id,
+        },
+    )
+    assert await adapter._consume_prompt_response(event) is True
+    assert resolved == {
+        "session_key": "sess:1",
+        "choice": "once",
+        "approval_id": "approval-1",
+        "actor_id": "u1",
+        "actor_authorized": True,
+        "platform": "discord",
+        "guild_id": "g1",
+        "channel_id": "c1",
+        "message_id": result.message_id,
+        "tool_call_id": "call-1",
+        "turn_id": "turn-1",
+        "plugin_identity": "finance",
+        "tool_name": "transfer",
+        "canonical_arguments_digest": "a" * 64,
+    }
+
+
+@pytest.mark.asyncio
 async def test_slash_confirm_renders_three_options():
     adapter, stub = _adapter()
     result = await adapter.send_slash_confirm(
@@ -255,5 +355,4 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
 

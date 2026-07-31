@@ -160,3 +160,36 @@ class TestSessionResetZombieRace:
         assert key not in runner._running_agents_ts
         assert key not in runner._busy_ack_ts
 
+    def test_generation_invalidation_revokes_and_rejects_late_approval_owner(
+        self,
+    ):
+        from tools import approval
+
+        runner = _make_runner()
+        runner._session_run_generation = {}
+        key = "agent:main:discord:channel:approval-race"
+        generation = runner._begin_session_run_generation(key)
+        callback = lambda _data: None
+        epoch = approval.register_gateway_notify(
+            key,
+            callback,
+            active_check=lambda: runner._is_session_run_current(
+                key,
+                generation,
+            ),
+        )
+        assert epoch is not None
+
+        runner._invalidate_session_run_generation(key, reason="stop")
+
+        with approval._lock:
+            assert key not in approval._gateway_notify_cbs
+            assert key not in approval._gateway_notify_epochs
+        assert approval.register_gateway_notify(
+            key,
+            callback,
+            active_check=lambda: runner._is_session_run_current(
+                key,
+                generation,
+            ),
+        ) is None

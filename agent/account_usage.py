@@ -543,9 +543,7 @@ def _fetch_codex_account_usage(
     if isinstance(banked, (int, float)) and int(banked) > 0:
         count = int(banked)
         plural = "s" if count != 1 else ""
-        details.append(
-            f"You have {count} reset{plural} banked - use /usage reset to activate"
-        )
+        details.append(f"You have {count} reset{plural} banked")
     credits = payload.get("credits") or {}
     if credits.get("has_credits"):
         balance = credits.get("balance")

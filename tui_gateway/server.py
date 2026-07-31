@@ -810,7 +810,10 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
         from tools.approval import unregister_gateway_notify
 
         if key := session.get("session_key"):
-            unregister_gateway_notify(key)
+            unregister_gateway_notify(
+                key,
+                session.get("approval_notify_epoch"),
+            )
     except Exception:
         pass
     try:
@@ -1598,7 +1601,11 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
     seam so all approval transports redact consistently."""
     payload = dict(data or {})
     if "choices" not in payload:
-        if payload.get("smart_denied"):
+        if (
+            payload.get("smart_denied")
+            or payload.get("decision_scope") == "once"
+            or payload.get("allow_session") is False
+        ):
             payload["choices"] = ["once", "deny"]
         elif payload.get("allow_permanent") is False:
             payload["choices"] = ["once", "session", "deny"]
@@ -1906,6 +1913,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             return
 
         notify_registered = False
+        notify_epoch = None
         home_token = None
         secret_token = None
         profile_home = current.get("profile_home")
@@ -1990,9 +1998,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     load_permanent_allowlist,
                 )
 
-                register_gateway_notify(
+                notify_epoch = register_gateway_notify(
                     key, lambda data: _emit_approval_request(sid, data)
                 )
+                with _sessions_lock:
+                    if _sessions.get(sid) is current:
+                        current["approval_notify_epoch"] = notify_epoch
                 notify_registered = True
                 load_permanent_allowlist()
             except Exception:
@@ -2059,7 +2070,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 try:
                     from tools.approval import unregister_gateway_notify
 
-                    unregister_gateway_notify(key)
+                    unregister_gateway_notify(key, notify_epoch)
                 except Exception:
                     pass
             ready.set()
@@ -4521,7 +4532,10 @@ def _sync_session_key_after_compress(
         )
 
         try:
-            unregister_gateway_notify(old_key)
+            unregister_gateway_notify(
+                old_key,
+                session.get("approval_notify_epoch"),
+            )
         except Exception:
             pass
         session["session_key"] = new_session_id
@@ -4536,7 +4550,7 @@ def _sync_session_key_after_compress(
             except Exception:
                 pass
         try:
-            register_gateway_notify(
+            session["approval_notify_epoch"] = register_gateway_notify(
                 new_session_id,
                 lambda data: _emit_approval_request(sid, data),
             )
@@ -6227,6 +6241,10 @@ def _init_session(
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
+            # Opaque approval callback lease. Every turn binds this exact
+            # generation so a closed/replaced session cannot enqueue or
+            # resolve approvals through a newer session callback.
+            "approval_notify_epoch": None,
         }
     _init_owns_db = False
     if session_db is not None:
@@ -6273,7 +6291,10 @@ def _init_session(
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        _sessions[sid]["approval_notify_epoch"] = register_gateway_notify(
+            key,
+            lambda data: _emit_approval_request(sid, data),
+        )
         load_permanent_allowlist()
     except Exception:
         pass
@@ -8974,15 +8995,12 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
     agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
-        try:
-            agent.clear_interrupt()
-        except Exception:
-            pass
-    _emit("message.start", sid)
 
     def run():
         approval_token = None
+        approval_notify_session_key = None
+        approval_notify_epoch = None
+        approval_notify_context_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
@@ -8990,7 +9008,7 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_restore = None
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -9004,15 +9022,74 @@ def _run_prompt_submit(
         marker_key = str(session.get("session_key") or "")
         marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
         marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
+                register_gateway_notify,
+                reset_current_gateway_notify_epoch,
                 reset_current_session_key,
+                set_current_gateway_notify_epoch,
                 set_current_session_key,
+                unregister_gateway_notify,
             )
 
-            approval_token = set_current_session_key(session["session_key"])
+            # Admission, interrupt reset, and approval callback publication
+            # share the same lifecycle lock as session.interrupt.  Stop before
+            # this critical section makes the old turn abort; Stop after it
+            # revokes this exact epoch before the turn can create a new waiter.
+            cancelled_before_start = False
+            with session["history_lock"]:
+                if (
+                    session.get("_turn_cancel_requested")
+                    or not session.get("running")
+                ):
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+                    cancelled_before_start = True
+                else:
+                    if hasattr(agent, "clear_interrupt"):
+                        try:
+                            agent.clear_interrupt()
+                        except Exception:
+                            pass
+                    approval_token = set_current_session_key(
+                        session["session_key"]
+                    )
+                    approval_notify_session_key = session["session_key"]
+                    approval_notify_epoch = register_gateway_notify(
+                        approval_notify_session_key,
+                        lambda data: _emit_approval_request(sid, data),
+                    )
+                    if approval_notify_epoch is None:
+                        session["running"] = False
+                        _clear_inflight_turn(session)
+                        cancelled_before_start = True
+                    else:
+                        session["approval_notify_epoch"] = (
+                            approval_notify_epoch
+                        )
+                        one_turn_restore = session.pop(
+                            "one_turn_model_restore",
+                            None,
+                        )
+            if cancelled_before_start:
+                _emit(
+                    "error",
+                    sid,
+                    {"message": "Turn cancelled before agent execution"},
+                )
+                return
+
+            _emit("message.start", sid)
+            if isinstance(marker_text, str) and marker_text.strip():
+                record_turn_start(
+                    marker_home,
+                    marker_key,
+                    marker_text,
+                    attempts=marker_attempt,
+                )
+            approval_notify_context_token = (
+                set_current_gateway_notify_epoch(approval_notify_epoch)
+            )
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
@@ -9619,6 +9696,20 @@ def _run_prompt_submit(
                 except Exception:
                     logger.debug("TUI one-turn model restore failed", exc_info=True)
             try:
+                if approval_notify_context_token is not None:
+                    reset_current_gateway_notify_epoch(
+                        approval_notify_context_token
+                    )
+                if approval_notify_epoch is not None:
+                    unregister_gateway_notify(
+                        approval_notify_session_key or marker_key,
+                        approval_notify_epoch,
+                    )
+                    if (
+                        session.get("approval_notify_epoch")
+                        == approval_notify_epoch
+                    ):
+                        session["approval_notify_epoch"] = None
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
             except Exception:

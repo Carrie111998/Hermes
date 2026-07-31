@@ -13,6 +13,8 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import copy
+import hmac
 import json
 from pathlib import Path
 import logging
@@ -365,7 +367,7 @@ def _run_agent_tool_execution_middleware(
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Run Relay rewrites, authorize immutable arguments, and dispatch once."""
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -381,7 +383,155 @@ def _run_agent_tool_execution_middleware(
     }
     dispatch_lock = threading.Lock()
 
+    def _snapshot_args(value: Any) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            value = {}
+        try:
+            return copy.deepcopy(value)
+        except Exception as exc:
+            raise ValueError(
+                "tool arguments could not be safely snapshotted"
+            ) from exc
+
+    def _normalize_args(value: Any) -> dict[str, Any]:
+        """Return the exact schema-normalized snapshot used for policy and I/O."""
+        snapshot = _snapshot_args(value)
+        try:
+            from model_tools import coerce_tool_args
+
+            normalized = coerce_tool_args(function_name, snapshot)
+        except Exception as exc:
+            raise ValueError(
+                "tool arguments could not be safely normalized"
+            ) from exc
+        return _snapshot_args(normalized)
+
+    def _args_digest(value: dict[str, Any]) -> str | None:
+        try:
+            from tools.approval import canonical_tool_arguments_digest
+
+            return canonical_tool_arguments_digest(value, strict=True)
+        except (TypeError, ValueError):
+            return None
+
+    def _advance_start_order(callback=None) -> None:
+        if begin_execution is None:
+            if callback is not None:
+                callback()
+            return
+        begin_execution(callback)
+
+    def _resolve_policy(value: dict[str, Any]) -> str | None:
+        def _resolve_pre_tool_block():
+            try:
+                from hermes_cli.plugins import resolve_pre_tool_block
+
+                # Policy gets a detached object. Retained references or a
+                # malicious in-place mutation cannot alter dispatch input.
+                return resolve_pre_tool_block(
+                    function_name,
+                    _snapshot_args(value),
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    api_request_id=getattr(
+                        agent,
+                        "_current_api_request_id",
+                        "",
+                    )
+                    or "",
+                    middleware_trace=list(state["middleware_trace"]),
+                )
+            except ValueError as exc:
+                return f"BLOCKED: {exc}"
+            except Exception:
+                logger.warning(
+                    "pre_tool_call policy infrastructure failed for %s",
+                    function_name,
+                )
+                return (
+                    "BLOCKED: plugin policy infrastructure failed for "
+                    f"{function_name}"
+                )
+
+        return (
+            _resolve_pre_tool_block()
+            if authorization_gate is None
+            else authorization_gate.run(_resolve_pre_tool_block)
+        )
+
+    def _evaluate_authorization(
+        value: dict[str, Any],
+        *,
+        include_scope: bool,
+    ) -> tuple[str | None, str, Any]:
+        block_message = scope_block if include_scope else None
+        block_error_type = (
+            "tool_scope_block"
+            if block_message is not None
+            else "plugin_block"
+        )
+        if block_message is None:
+            block_message = _resolve_policy(value)
+
+        guardrail_decision = None
+        if block_message is None:
+            try:
+                guardrail_args = _snapshot_args(value)
+            except ValueError as exc:
+                block_message = f"BLOCKED: {exc}"
+            else:
+                guardrail_decision = agent._tool_guardrails.before_call(
+                    function_name,
+                    guardrail_args,
+                )
+                if guardrail_decision.allows_execution:
+                    guardrail_decision = None
+        return block_message, block_error_type, guardrail_decision
+
+    def _blocked_result(
+        value: dict[str, Any],
+        *,
+        block_message: str | None,
+        block_error_type: str,
+        guardrail_decision: Any,
+    ) -> Any:
+        _advance_start_order()
+        state["blocked"] = True
+        state["args"] = value
+        if block_message is not None:
+            result = json.dumps(
+                {"error": block_message},
+                ensure_ascii=False,
+            )
+            error_type = block_error_type
+            error_message = block_message
+        else:
+            result = agent._guardrail_block_result(guardrail_decision)
+            error_type = "guardrail_block"
+            error_message = (
+                getattr(guardrail_decision, "message", None)
+                or "Tool blocked by guardrail policy"
+            )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=value,
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type=error_type,
+            error_message=error_message,
+            middleware_trace=list(state["middleware_trace"]),
+        )
+        return result
+
+    authorized_digest: str | None = None
+
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
+        nonlocal authorized_digest
         with dispatch_lock:
             if state["dispatched"]:
                 raise RuntimeError(
@@ -389,89 +539,57 @@ def _run_agent_tool_execution_middleware(
                 )
             state["dispatched"] = True
             state["blocked"] = False
-            state["args"] = final_args
+
+        try:
+            dispatch_args = _normalize_args(final_args)
+        except ValueError as exc:
+            return _blocked_result(
+                {},
+                block_message=f"BLOCKED: {exc}",
+                block_error_type="plugin_block",
+                guardrail_decision=None,
+            )
+        state["args"] = dispatch_args
+
+        final_digest = _args_digest(dispatch_args)
+        arguments_changed = (
+            authorized_digest is None
+            or final_digest is None
+            or not hmac.compare_digest(
+                authorized_digest,
+                final_digest,
+            )
+        )
+        if arguments_changed:
+            (
+                block_message,
+                block_error_type,
+                guardrail_decision,
+            ) = _evaluate_authorization(
+                dispatch_args,
+                include_scope=False,
+            )
+            if (
+                block_message is not None
+                or guardrail_decision is not None
+            ):
+                return _blocked_result(
+                    dispatch_args,
+                    block_message=block_message,
+                    block_error_type=block_error_type,
+                    guardrail_decision=guardrail_decision,
+                )
+            authorized_digest = final_digest
 
         def _begin() -> None:
             _begin_tool_execution(
                 agent,
                 function_name=function_name,
-                function_args=final_args,
+                function_args=dispatch_args,
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 display_index=display_index,
             )
-
-        def _advance_start_order(callback=None) -> None:
-            if begin_execution is None:
-                if callback is not None:
-                    callback()
-                return
-            begin_execution(callback)
-
-        block_message = scope_block
-        block_error_type = "tool_scope_block"
-        if block_message is None:
-            block_error_type = "plugin_block"
-
-            def _resolve_pre_tool_block():
-                try:
-                    from hermes_cli.plugins import resolve_pre_tool_block
-
-                    return resolve_pre_tool_block(
-                        function_name,
-                        final_args,
-                        task_id=effective_task_id or "",
-                        session_id=getattr(agent, "session_id", "") or "",
-                        tool_call_id=tool_call_id or "",
-                        turn_id=getattr(agent, "_current_turn_id", "") or "",
-                        api_request_id=getattr(agent, "_current_api_request_id", "")
-                        or "",
-                        middleware_trace=list(state["middleware_trace"]),
-                    )
-                except Exception:
-                    return None
-
-            block_message = (
-                _resolve_pre_tool_block()
-                if authorization_gate is None
-                else authorization_gate.run(_resolve_pre_tool_block)
-            )
-
-        guardrail_decision = None
-        if block_message is None:
-            guardrail_decision = agent._tool_guardrails.before_call(
-                function_name, final_args
-            )
-            if guardrail_decision.allows_execution:
-                guardrail_decision = None
-
-        if block_message is not None or guardrail_decision is not None:
-            _advance_start_order()
-            state["blocked"] = True
-            if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
-                error_type = block_error_type
-                error_message = block_message
-            else:
-                result = agent._guardrail_block_result(guardrail_decision)
-                error_type = "guardrail_block"
-                error_message = (
-                    getattr(guardrail_decision, "message", None)
-                    or "Tool blocked by guardrail policy"
-                )
-            _emit_terminal_post_tool_call(
-                agent,
-                function_name=function_name,
-                function_args=final_args,
-                result=result,
-                effective_task_id=effective_task_id,
-                tool_call_id=tool_call_id,
-                status="blocked",
-                error_type=error_type,
-                error_message=error_message,
-                middleware_trace=list(state["middleware_trace"]),
-            )
-            return result
 
         if function_name == "memory":
             agent._turns_since_memory = 0
@@ -479,9 +597,10 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        return execute(dispatch_args)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
+        nonlocal authorized_digest
         request_result = apply_tool_request_middleware(
             function_name,
             relay_args,
@@ -492,13 +611,38 @@ def _run_agent_tool_execution_middleware(
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
-        request_args = (
-            request_result.payload
-            if isinstance(request_result.payload, dict)
-            else relay_args
-        )
+        try:
+            request_args = _normalize_args(
+                request_result.payload
+                if isinstance(request_result.payload, dict)
+                else relay_args
+            )
+        except ValueError as exc:
+            return _blocked_result(
+                {},
+                block_message=f"BLOCKED: {exc}",
+                block_error_type="plugin_block",
+                guardrail_decision=None,
+            )
+        state["args"] = request_args
         trace.clear()
         trace.extend(request_result.trace)
+        (
+            block_message,
+            block_error_type,
+            guardrail_decision,
+        ) = _evaluate_authorization(
+            request_args,
+            include_scope=True,
+        )
+        if block_message is not None or guardrail_decision is not None:
+            return _blocked_result(
+                request_args,
+                block_message=block_message,
+                block_error_type=block_error_type,
+                guardrail_decision=guardrail_decision,
+            )
+        authorized_digest = _args_digest(request_args)
         return run_tool_execution_middleware(
             function_name,
             request_args,

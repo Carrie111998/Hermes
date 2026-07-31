@@ -23,6 +23,7 @@ Methods covered:
 from __future__ import annotations
 
 import copy
+import hmac
 import json
 import logging
 import re
@@ -2570,30 +2571,102 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     except Exception as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
 
-    # Check plugin hooks for a block or approval directive before executing.
-    block_message: Optional[str] = None
-    if not pre_tool_block_checked:
+    def _snapshot_args(value: Any) -> dict:
+        if not isinstance(value, dict):
+            value = {}
+        try:
+            return copy.deepcopy(value)
+        except Exception as exc:
+            raise ValueError(
+                "tool arguments could not be safely snapshotted"
+            ) from exc
+
+    def _normalize_args(value: Any) -> dict:
+        """Return the exact schema-normalized snapshot used for policy and I/O."""
+        snapshot = _snapshot_args(value)
+        try:
+            from model_tools import coerce_tool_args
+
+            normalized = coerce_tool_args(function_name, snapshot)
+        except Exception as exc:
+            raise ValueError(
+                "tool arguments could not be safely normalized"
+            ) from exc
+        return _snapshot_args(normalized)
+
+    def _args_digest(value: dict) -> Optional[str]:
+        try:
+            from tools.approval import canonical_tool_arguments_digest
+
+            return canonical_tool_arguments_digest(value, strict=True)
+        except (TypeError, ValueError):
+            return None
+
+    def _authorize(value: dict, *, force: bool = False) -> Optional[str]:
+        if pre_tool_block_checked and not force:
+            return None
         try:
             from hermes_cli.plugins import resolve_pre_tool_block
-            block_message = resolve_pre_tool_block(
+
+            return resolve_pre_tool_block(
                 function_name,
-                function_args,
+                _snapshot_args(value),
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
                 tool_call_id=tool_call_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                api_request_id=getattr(
+                    agent,
+                    "_current_api_request_id",
+                    "",
+                )
+                or "",
                 middleware_trace=list(_tool_middleware_trace),
             )
+        except ValueError as exc:
+            return f"BLOCKED: {exc}"
         except Exception:
-            block_message = None
-    if block_message is not None:
-        result = json.dumps({"error": block_message}, ensure_ascii=False)
+            logger.warning(
+                "pre_tool_call policy infrastructure failed for %s",
+                function_name,
+            )
+            return (
+                "BLOCKED: plugin policy infrastructure failed for "
+                f"{function_name}"
+            )
+
+    try:
+        pre_normalization_digest = _args_digest(_snapshot_args(function_args))
+        function_args = _normalize_args(function_args)
+    except ValueError as exc:
+        function_args = {}
+        block_message: Optional[str] = f"BLOCKED: {exc}"
+    else:
+        block_message = None
+
+    # Check plugin hooks for a block or approval directive before executing.
+    if block_message is None:
+        normalized_digest = _args_digest(function_args)
+        normalization_changed = (
+            pre_normalization_digest is None
+            or normalized_digest is None
+            or not hmac.compare_digest(
+                pre_normalization_digest,
+                normalized_digest,
+            )
+        )
+        block_message = _authorize(
+            function_args,
+            force=bool(pre_tool_block_checked and normalization_changed),
+        )
+
+    def _blocked_result(message: str, observed_args: dict) -> str:
+        result = json.dumps({"error": message}, ensure_ascii=False)
         try:
             from model_tools import _emit_post_tool_call_hook
             _emit_post_tool_call_hook(
                 function_name=function_name,
-                function_args=function_args,
+                function_args=observed_args,
                 result=result,
                 task_id=effective_task_id or "",
                 session_id=getattr(agent, "session_id", "") or "",
@@ -2602,12 +2675,17 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
                 status="blocked",
                 error_type="plugin_block",
-                error_message=block_message,
+                error_message=message,
                 middleware_trace=list(_tool_middleware_trace),
             )
         except Exception:
             pass
         return result
+
+    if block_message is not None:
+        return _blocked_result(block_message, function_args)
+
+    authorized_digest = _args_digest(function_args)
 
     tool_start_time = time.monotonic()
 
@@ -2746,10 +2824,36 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
     from hermes_cli.middleware import run_tool_execution_middleware
 
+    def _authorized_execute(next_args: Any) -> Any:
+        try:
+            dispatch_args = _normalize_args(
+                next_args if isinstance(next_args, dict) else function_args
+            )
+        except ValueError as exc:
+            return _blocked_result(f"BLOCKED: {exc}", {})
+
+        final_digest = _args_digest(dispatch_args)
+        arguments_changed = (
+            authorized_digest is None
+            or final_digest is None
+            or not hmac.compare_digest(
+                authorized_digest,
+                final_digest,
+            )
+        )
+        if arguments_changed:
+            # A caller may attest that the initial pre-tool check already ran,
+            # but that attestation never covers a later middleware rewrite.
+            # Reauthorize changed arguments even on that trusted internal path.
+            rewritten_block = _authorize(dispatch_args, force=True)
+            if rewritten_block is not None:
+                return _blocked_result(rewritten_block, dispatch_args)
+        return _execute(dispatch_args)
+
     return run_tool_execution_middleware(
         function_name,
         function_args,
-        lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
+        _authorized_execute,
         original_args=function_args,
         task_id=effective_task_id or "",
         session_id=getattr(agent, "session_id", "") or "",

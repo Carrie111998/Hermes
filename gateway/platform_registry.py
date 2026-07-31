@@ -247,6 +247,18 @@ class PlatformRegistry:
         self._entries[entry.name] = entry
         logger.debug("Registered platform adapter: %s (%s)", entry.name, entry.source)
 
+    def _snapshot_registration_state(self) -> dict:
+        """Capture mutable registration state for one plugin load transaction."""
+        return {
+            "entries": dict(self._entries),
+            "deferred": dict(self._deferred),
+        }
+
+    def _restore_registration_state(self, state: dict) -> None:
+        """Restore a snapshot after a plugin ``register()`` failure."""
+        self._entries = dict(state["entries"])
+        self._deferred = dict(state["deferred"])
+
     def unregister(self, name: str) -> bool:
         """Remove a platform entry.  Returns True if it existed."""
         self._deferred.pop(name, None)

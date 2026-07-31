@@ -451,6 +451,7 @@ class _MatrixApprovalPrompt:
         resolved: bool = False,
         requester_user_id: str | None = None,
         expires_at: float | None = None,
+        approval_id: str = "",
     ):
         self.session_key = session_key
         self.chat_id = chat_id
@@ -458,6 +459,7 @@ class _MatrixApprovalPrompt:
         self.resolved = resolved
         self.requester_user_id = requester_user_id
         self.expires_at = expires_at
+        self.approval_id = approval_id
         self.bot_reaction_events: dict[str, str] = {}  # emoji -> event_id
 
 
@@ -2247,15 +2249,26 @@ class MatrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         requester_user_id = str((metadata or {}).get("requester_user_id") or "") or None
+        approval_id = str((metadata or {}).get("approval_id") or "")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", approval_id) is None:
+            return SendResult(
+                success=False,
+                error="Exact approval ID is required",
+            )
         scope_choices = ""
         if smart_denied:
             scope_choices = "Smart DENY: owner override applies to this one operation only.\n"
         else:
             scope_choices = ""
             if allow_session:
-                scope_choices += "Reply `!approve session` to approve this pattern for the session, "
+                scope_choices += (
+                    f"Reply `!approve {approval_id} session` to approve "
+                    "this pattern for the session, "
+                )
             if allow_permanent:
-                scope_choices += "`!approve always` to approve permanently, "
+                scope_choices += (
+                    f"`!approve {approval_id} always` to approve permanently, "
+                )
         reaction_legend_parts = ["✅ = approve once"]
         if allow_session:
             reaction_legend_parts.append("🌀 = approve for this session")
@@ -2264,7 +2277,9 @@ class MatrixAdapter(BasePlatformAdapter):
         reaction_legend_parts.append("❎ = deny")
         text = (
             f"{self._format_exec_approval(command, description)}\n\n"
-            f"{scope_choices}Reply `!approve` to execute once, or `!deny` to cancel.\n\n"
+            f"Approval ID: `{approval_id}`\n"
+            f"{scope_choices}Reply `!approve {approval_id}` to execute once, "
+            f"or `!deny {approval_id}` to cancel.\n\n"
             "You can also click the reaction to approve:\n"
             + "\n".join(reaction_legend_parts)
         )
@@ -2279,10 +2294,11 @@ class MatrixAdapter(BasePlatformAdapter):
             message_id=result.message_id,
             requester_user_id=requester_user_id,
             expires_at=time.monotonic() + max(self._approval_timeout_seconds, 0),
+            approval_id=approval_id,
         )
-        old_event = self._approval_prompt_by_session.get(session_key)
-        if old_event:
-            self._approval_prompts_by_event.pop(old_event, None)
+        # Keep every event-addressed prompt: multiple approvals can be pending
+        # concurrently in one session and each reaction must resolve its exact
+        # core approval_id rather than evicting the previous prompt.
         self._approval_prompts_by_event[result.message_id] = prompt
         self._approval_prompt_by_session[session_key] = result.message_id
 
@@ -3610,11 +3626,27 @@ class MatrixAdapter(BasePlatformAdapter):
                 try:
                     from tools.approval import resolve_gateway_approval
 
-                    count = resolve_gateway_approval(prompt.session_key, choice)
+                    count = resolve_gateway_approval(
+                        prompt.session_key,
+                        choice,
+                        **(
+                            {"approval_id": prompt.approval_id}
+                            if prompt.approval_id
+                            else {}
+                        ),
+                    )
                     if count:
                         prompt.resolved = True
                         self._approval_prompts_by_event.pop(reacts_to, None)
-                        self._approval_prompt_by_session.pop(prompt.session_key, None)
+                        if (
+                            self._approval_prompt_by_session.get(
+                                prompt.session_key
+                            )
+                            == reacts_to
+                        ):
+                            self._approval_prompt_by_session.pop(
+                                prompt.session_key, None
+                            )
                         logger.info(
                             "Matrix reaction resolved %d approval(s) for session %s "
                             "(choice=%s, user=%s)",
@@ -3763,7 +3795,11 @@ class MatrixAdapter(BasePlatformAdapter):
     ) -> None:
         prompt.resolved = True
         self._approval_prompts_by_event.pop(target_event_id, None)
-        self._approval_prompt_by_session.pop(prompt.session_key, None)
+        if (
+            self._approval_prompt_by_session.get(prompt.session_key)
+            == target_event_id
+        ):
+            self._approval_prompt_by_session.pop(prompt.session_key, None)
         await self._redact_bot_approval_reactions(room_id, prompt)
         await self._send_invalid_reaction_feedback(
             room_id,

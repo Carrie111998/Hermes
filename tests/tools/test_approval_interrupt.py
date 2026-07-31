@@ -23,6 +23,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_notify_epochs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -91,9 +92,17 @@ class TestApprovalInterrupt:
             # been prompted.
             notified.set()
 
+        notify_epoch = mod.register_gateway_notify(
+            self.SESSION_KEY,
+            _notify_cb,
+        )
+
         def _worker():
             result_holder["result"] = mod._await_gateway_decision(
-                self.SESSION_KEY, _notify_cb, approval_data
+                self.SESSION_KEY,
+                _notify_cb,
+                approval_data,
+                notify_epoch=notify_epoch,
             )
             result_holder["thread_id"] = threading.get_ident()
 
@@ -113,7 +122,12 @@ class TestApprovalInterrupt:
         elapsed = time.monotonic() - start
 
         assert not t.is_alive(), "approval wait did not return after interrupt"
-        assert result_holder["result"] == {"resolved": True, "choice": "deny", "reason": None}
+        result = result_holder["result"]
+        assert result["resolved"] is True
+        assert result["choice"] == "deny"
+        assert result["reason"] is None
+        assert result["attestation"].choice == "deny"
+        assert result["attestation"].decision is False
         # Must be far below the 300s timeout — the interrupt, not the deadline,
         # is what released the wait.
         assert elapsed < 10, f"interrupt path too slow ({elapsed:.1f}s)"
@@ -142,9 +156,17 @@ class TestApprovalInterrupt:
         def _notify_cb(_data):
             notified.set()
 
+        notify_epoch = mod.register_gateway_notify(
+            self.SESSION_KEY,
+            _notify_cb,
+        )
+
         def _worker():
             result_holder["result"] = mod._await_gateway_decision(
-                self.SESSION_KEY, _notify_cb, approval_data
+                self.SESSION_KEY,
+                _notify_cb,
+                approval_data,
+                notify_epoch=notify_epoch,
             )
 
         t = threading.Thread(target=_worker, daemon=True)
@@ -157,4 +179,9 @@ class TestApprovalInterrupt:
         t.join(timeout=10)
         assert not t.is_alive()
         # Timed out (no resolution) because the foreign interrupt was ignored.
-        assert result_holder["result"] == {"resolved": False, "choice": None, "reason": None}
+        result = result_holder["result"]
+        assert result["resolved"] is False
+        assert result["choice"] is None
+        assert result["reason"] is None
+        assert result["attestation"].choice == "timeout"
+        assert result["attestation"].decision is False

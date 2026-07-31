@@ -95,6 +95,7 @@ class TestSlackExecApproval:
             command="rm -rf /important",
             session_key="agent:main:slack:group:C1:1111",
             description="dangerous deletion",
+            metadata={"approval_id": "core-approval-1"},
         )
 
         assert result.success is True
@@ -120,6 +121,7 @@ class TestSlackExecApproval:
         # Each button carries the session key as value
         for e in elements:
             assert e["value"] == "agent:main:slack:group:C1:1111"
+        assert adapter._approval_core_ids["1234.5678"] == "core-approval-1"
 
     @pytest.mark.asyncio
     async def test_smart_deny_owner_override_hides_persistent_buttons(self):
@@ -154,6 +156,7 @@ class TestSlackApprovalAction:
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
         adapter._approval_resolved["1.2"] = False
+        adapter._approval_core_ids["1.2"] = "core-approval-1"
 
         # Simulate Slack re-escaping: original was ~2990 chars, but & → &amp;
         # etc. inflates it past 3000.
@@ -172,9 +175,17 @@ class TestSlackApprovalAction:
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+        with patch(
+            "tools.approval.resolve_gateway_approval",
+            return_value=1,
+        ) as mock_resolve:
             await adapter._handle_approval_action(ack, body, action)
 
+        mock_resolve.assert_called_once_with(
+            "session-key",
+            "once",
+            approval_id="core-approval-1",
+        )
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]
         assert len(section_text) <= 3000
@@ -840,4 +851,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

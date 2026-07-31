@@ -24,6 +24,8 @@ import os
 import json
 import re
 import asyncio
+import copy
+import hmac
 import logging
 import threading
 import time
@@ -1231,52 +1233,6 @@ def handle_function_call(
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
 
-        # Check plugin hooks for a block/approve directive (unless caller
-        # already checked — e.g. run_agent._invoke_tool passes skip=True to
-        # avoid double-firing the hook).
-        #
-        # Single-fire contract: pre_tool_call fires exactly once per tool
-        # execution. resolve_pre_tool_block() internally calls
-        # invoke_hook("pre_tool_call", ...) once and returns the block message
-        # for a `block` directive OR for an `approve` directive whose human
-        # gate denied/timed-out/errored (fail-closed). Observer plugins see
-        # the hook on that same pass. When skip=True, the caller already
-        # fired it — do nothing here.
-        if not skip_pre_tool_call_hook:
-            block_message: Optional[str] = None
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=task_id or "",
-                    session_id=session_id or "",
-                    tool_call_id=tool_call_id or "",
-                    turn_id=turn_id or "",
-                    api_request_id=api_request_id or "",
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-            except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
-
-            if block_message is not None:
-                result = tool_error(block_message)
-                _emit_post_tool_call_hook(
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=result,
-                    task_id=task_id,
-                    session_id=session_id,
-                    tool_call_id=tool_call_id,
-                    turn_id=turn_id,
-                    api_request_id=api_request_id,
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(_tool_middleware_trace),
-                )
-                return result
-
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.
@@ -1290,15 +1246,6 @@ def handle_function_call(
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
                 return tool_error("Edit approval denied: approval guard failed")
-
-        # Notify the read-loop tracker when a non-read/search tool runs,
-        # so the *consecutive* counter resets (reads after other work are fine).
-        if function_name not in _READ_SEARCH_TOOLS:
-            try:
-                from tools.file_tools import notify_other_tool_call
-                notify_other_tool_call(task_id or "default")
-            except Exception:
-                pass  # file_tools may not be loaded yet
 
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
@@ -1320,12 +1267,90 @@ def handle_function_call(
             )
         except Exception:
             reset_current_observability_context = None
+        block_message: Optional[str] = None
         try:
+            def _snapshot_args(
+                value: Dict[str, Any],
+            ) -> Dict[str, Any]:
+                """Detach policy and dispatch inputs from mutable middleware."""
+                if not isinstance(value, dict):
+                    value = {}
+                try:
+                    return copy.deepcopy(value)
+                except Exception as exc:
+                    raise ValueError(
+                        "tool arguments could not be safely snapshotted"
+                    ) from exc
+
+            def _args_digest(value: Dict[str, Any]) -> Optional[str]:
+                try:
+                    from tools.approval import (
+                        canonical_tool_arguments_digest,
+                    )
+
+                    return canonical_tool_arguments_digest(
+                        value,
+                        strict=True,
+                    )
+                except (TypeError, ValueError):
+                    return None
+
+            def _authorize_args(
+                value: Dict[str, Any],
+            ) -> Optional[str]:
+                if skip_pre_tool_call_hook:
+                    return None
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+
+                    # Hooks receive their own detached snapshot. A policy
+                    # callback retaining or mutating this object can never
+                    # change the arguments later sent to the tool handler.
+                    policy_args = _snapshot_args(value)
+                    return resolve_pre_tool_block(
+                        function_name,
+                        policy_args,
+                        task_id=task_id or "",
+                        session_id=session_id or "",
+                        tool_call_id=tool_call_id or "",
+                        turn_id=turn_id or "",
+                        api_request_id=api_request_id or "",
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+                except ValueError as exc:
+                    return f"BLOCKED: {exc}"
+                except Exception as _hook_err:
+                    logger.warning(
+                        "pre_tool_call policy infrastructure failed for %s",
+                        function_name,
+                    )
+                    return (
+                        "BLOCKED: plugin policy infrastructure failed for "
+                        f"{function_name}"
+                    )
+
+            try:
+                function_args = _snapshot_args(function_args)
+            except ValueError as exc:
+                block_message = f"BLOCKED: {exc}"
+
+            # Policy runs before execution middleware. A middleware that
+            # short-circuits without calling next_call therefore cannot bypass
+            # a block or once-only approval. If middleware later rewrites the
+            # payload, _dispatch reauthorizes the exact rewritten snapshot.
+            if block_message is None:
+                block_message = _authorize_args(function_args)
+            authorized_digest = (
+                _args_digest(function_args)
+                if block_message is None
+                else None
+            )
+
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1333,14 +1358,67 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
-            if skip_tool_execution_middleware:
+
+            _dispatch_lock = threading.Lock()
+            _dispatch_invoked = False
+
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                """Authorize and execute one immutable post-middleware input."""
+                nonlocal block_message, function_args, _dispatch_invoked
+                with _dispatch_lock:
+                    if _dispatch_invoked:
+                        return tool_error(
+                            "Tool execution callback invoked more than once"
+                        )
+                    _dispatch_invoked = True
+
+                try:
+                    dispatch_args = _snapshot_args(
+                        next_args
+                        if isinstance(next_args, dict)
+                        else function_args
+                    )
+                except ValueError as exc:
+                    block_message = f"BLOCKED: {exc}"
+                    return tool_error(block_message)
+                function_args = dispatch_args
+
+                final_digest = _args_digest(dispatch_args)
+                arguments_changed = (
+                    authorized_digest is None
+                    or final_digest is None
+                    or not hmac.compare_digest(
+                        authorized_digest,
+                        final_digest,
+                    )
+                )
+                if arguments_changed:
+                    block_message = _authorize_args(dispatch_args)
+                    if block_message is not None:
+                        return tool_error(block_message)
+
+                # Notify the read-loop tracker only after policy allows the
+                # actual call, preserving the blocked-tool contract.
+                if function_name not in _READ_SEARCH_TOOLS:
+                    try:
+                        from tools.file_tools import notify_other_tool_call
+
+                        notify_other_tool_call(task_id or "default")
+                    except Exception:
+                        pass  # file_tools may not be loaded yet
+
+                return _registry_dispatch(dispatch_args)
+
+            if block_message is not None:
+                result = tool_error(block_message)
+            elif skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
                 from hermes_cli.middleware import run_tool_execution_middleware
@@ -1363,6 +1441,24 @@ def handle_function_call(
                 except Exception:
                     pass
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
+
+        if block_message is not None:
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=0,
+                status="blocked",
+                error_type="plugin_block",
+                error_message=block_message,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
 
         _emit_post_tool_call_hook(
             function_name=function_name,

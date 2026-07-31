@@ -61,6 +61,7 @@ _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
 # every slash command — not just the overflow ones. We keep the desired set
 # at or below this limit at registration time.
 _DISCORD_MAX_APP_COMMANDS = 100
+_DISCORD_BUTTON_ONLY_COMMANDS = frozenset({"approve", "deny"})
 _DISCORD_SELECT_FIELD_LIMIT = 100
 _DISCORD_BUTTON_LABEL_LIMIT = 80
 _DISCORD_ELLIPSIS = "\u2026"
@@ -1247,6 +1248,10 @@ class DiscordAdapter(BasePlatformAdapter):
             @self._client.event
             async def on_message(message: DiscordMessage):
                 await adapter_self._dispatch_discord_message(message)
+
+            @self._client.event
+            async def on_interaction(interaction: discord.Interaction):
+                await adapter_self._dispatch_plugin_component(interaction)
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
@@ -2893,6 +2898,96 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:
                 await self._add_reaction(message, "❌")
+
+    async def send_plugin_component_message(
+        self,
+        *,
+        chat_id: str,
+        message,
+        thread_id: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ):
+        """Render one core-validated plugin button row on this shared client."""
+        from gateway.discord_components import (
+            DiscordComponentButtonStyle,
+            DiscordComponentMessage,
+            DiscordComponentSendReceipt,
+        )
+
+        if not isinstance(message, DiscordComponentMessage):
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="invalid_component_message",
+            )
+        if not self._client or not DISCORD_AVAILABLE:
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="discord_gateway_unavailable",
+            )
+
+        try:
+            target_id = int(str(thread_id or chat_id))
+            channel = self._client.get_channel(target_id)
+            if channel is None:
+                channel = await self._client.fetch_channel(target_id)
+            if channel is None or self._is_forum_parent(channel):
+                return DiscordComponentSendReceipt(
+                    success=False,
+                    error="discord_channel_unavailable",
+                )
+
+            reference = None
+            if reply_to:
+                referenced = await channel.fetch_message(int(str(reply_to)))
+                reference = (
+                    referenced.to_reference(fail_if_not_exists=False)
+                    if hasattr(referenced, "to_reference")
+                    else referenced
+                )
+
+            style_map = {
+                DiscordComponentButtonStyle.PRIMARY: (
+                    discord.ButtonStyle.primary
+                ),
+                DiscordComponentButtonStyle.SECONDARY: (
+                    discord.ButtonStyle.secondary
+                ),
+                DiscordComponentButtonStyle.SUCCESS: (
+                    discord.ButtonStyle.success
+                ),
+                DiscordComponentButtonStyle.DANGER: (
+                    discord.ButtonStyle.danger
+                ),
+            }
+            view = discord.ui.View(timeout=None)
+            for button in message.buttons:
+                view.add_item(
+                    discord.ui.Button(
+                        label=button.label,
+                        style=style_map[button.style],
+                        custom_id=button.custom_id,
+                        disabled=button.disabled,
+                    )
+                )
+
+            sent = await channel.send(
+                content=message.content,
+                view=view,
+                reference=reference,
+            )
+            return DiscordComponentSendReceipt(
+                success=True,
+                message_id=str(sent.id),
+            )
+        except Exception:
+            # Transport exceptions may include signed URLs or account details.
+            logger.warning(
+                "[Discord] plugin component message send failed"
+            )
+            return DiscordComponentSendReceipt(
+                success=False,
+                error="discord_component_send_failed",
+            )
 
     async def send(
         self,
@@ -5204,6 +5299,182 @@ class DiscordAdapter(BasePlatformAdapter):
             return content
         return convert_table_to_bullets(content)
 
+    async def _dispatch_plugin_component(
+        self,
+        interaction: "discord.Interaction",
+    ) -> bool:
+        """Dispatch a namespaced component through the shared Discord client.
+
+        Returns False for interactions outside the Hermes plugin namespace so
+        discord.py's existing slash command and built-in View paths remain
+        untouched. Plugins receive only the frozen scalar DTO from
+        ``gateway.discord_components``.
+        """
+        data = getattr(interaction, "data", None)
+        custom_id = (
+            str(data.get("custom_id") or "")
+            if isinstance(data, dict)
+            else ""
+        )
+        if not custom_id.startswith("hermes-plugin:"):
+            return False
+
+        from gateway.discord_components import (
+            DiscordComponentResponse,
+            DiscordComponentTransportEvent,
+        )
+        from gateway.session import build_session_key
+        from hermes_cli.plugins import get_discord_component_registry
+
+        response_transport = getattr(interaction, "response", None)
+
+        def response_done() -> bool:
+            marker = getattr(response_transport, "is_done", None)
+            try:
+                return bool(marker()) if callable(marker) else bool(marker)
+            except Exception:
+                return False
+
+        async def respond(response: DiscordComponentResponse) -> None:
+            if response_done():
+                followup = getattr(interaction, "followup", None)
+                sender = getattr(followup, "send", None)
+                if not callable(sender):
+                    raise RuntimeError("Discord followup transport unavailable")
+                await sender(response.content, ephemeral=True)
+                return
+            sender = getattr(response_transport, "send_message", None)
+            if not callable(sender):
+                raise RuntimeError("Discord response transport unavailable")
+            await sender(response.content, ephemeral=True)
+
+        async def defer() -> None:
+            if response_done():
+                return
+            callback = getattr(response_transport, "defer", None)
+            if not callable(callback):
+                raise RuntimeError("Discord defer transport unavailable")
+            await callback(ephemeral=True)
+
+        channel = getattr(interaction, "channel", None)
+        channel_id = str(
+            getattr(interaction, "channel_id", None)
+            or getattr(channel, "id", "")
+            or ""
+        )
+        guild = getattr(interaction, "guild", None)
+        guild_id = str(
+            getattr(interaction, "guild_id", None)
+            or getattr(guild, "id", "")
+            or ""
+        )
+        user = getattr(interaction, "user", None)
+        user_id = str(getattr(user, "id", "") or "")
+        message = getattr(interaction, "message", None)
+        message_id = str(getattr(message, "id", "") or "")
+        interaction_id = str(getattr(interaction, "id", "") or "")
+
+        is_dm = not guild_id
+        is_thread = bool(
+            discord is not None
+            and getattr(discord, "Thread", None) is not None
+            and isinstance(channel, discord.Thread)
+        )
+        thread_id = channel_id if is_thread else None
+        source = self.build_source(
+            chat_id=channel_id,
+            chat_type="dm" if is_dm else ("thread" if is_thread else "group"),
+            user_id=user_id,
+            user_name=str(getattr(user, "display_name", "") or ""),
+            thread_id=thread_id,
+            guild_id=guild_id or None,
+            parent_chat_id=str(getattr(channel, "parent_id", "") or "") or None,
+            message_id=message_id or None,
+        )
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user",
+                True,
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user",
+                False,
+            ),
+            profile=source.profile,
+        )
+
+        async def authorize(_authorization) -> bool:
+            allowed, reason = self._evaluate_slash_authorization(interaction)
+            if allowed is not True:
+                logger.warning(
+                    "[Discord] Unauthorized plugin component: user=%s "
+                    "channel=%s guild=%s reason=%s",
+                    user_id or "?",
+                    channel_id or "?",
+                    guild_id or "?",
+                    reason or "unauthorized",
+                )
+            return allowed is True
+
+        try:
+            event = DiscordComponentTransportEvent(
+                custom_id=custom_id,
+                guild_id=guild_id or None,
+                channel_id=channel_id,
+                message_id=message_id,
+                user_id=user_id,
+                session_key=session_key,
+                interaction_id=interaction_id,
+            )
+        except (TypeError, ValueError):
+            await respond(DiscordComponentResponse("This action is unavailable."))
+            return True
+
+        registry = get_discord_component_registry()
+        from gateway.session_context import (
+            clear_session_vars,
+            reset_session_vars,
+            set_session_vars,
+        )
+        from tools.approval import (
+            reset_current_session_key,
+            set_current_session_key,
+        )
+
+        # Component interactions bypass the normal MessageEvent handler, so
+        # bind their exact source before plugin code can dispatch a tool or
+        # request approval. Reset first to reject ContextVars inherited from a
+        # concurrently spawned task; clear on exit to prevent cross-session
+        # reuse.
+        reset_session_vars()
+        session_tokens = set_session_vars(
+            platform="discord",
+            source="discord",
+            chat_id=channel_id,
+            chat_type=source.chat_type or "",
+            thread_id=thread_id or "",
+            user_id=user_id,
+            user_name=source.user_name or "",
+            scope_id=guild_id,
+            session_key=session_key,
+            message_id=message_id,
+            profile=source.profile or "",
+            async_delivery=True,
+        )
+        approval_session_token = set_current_session_key(session_key)
+        try:
+            await registry.dispatch(
+                event,
+                authorize=authorize,
+                defer=defer,
+                respond=respond,
+            )
+        finally:
+            reset_current_session_key(approval_session_token)
+            clear_session_vars(session_tokens)
+        return True
+
     async def _run_simple_slash(
         self,
         interaction: discord.Interaction,
@@ -5399,16 +5670,6 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_restart(interaction: discord.Interaction):
             await self._run_simple_slash(interaction, "/restart", "Restart requested~")
 
-        @tree.command(name="approve", description="Approve a pending dangerous command")
-        @discord.app_commands.describe(scope="Optional: 'all', 'session', 'always', 'all session', 'all always'")
-        async def slash_approve(interaction: discord.Interaction, scope: str = ""):
-            await self._run_simple_slash(interaction, f"/approve {scope}".strip())
-
-        @tree.command(name="deny", description="Deny a pending dangerous command")
-        @discord.app_commands.describe(scope="Optional: 'all' to deny all pending commands")
-        async def slash_deny(interaction: discord.Interaction, scope: str = ""):
-            await self._run_simple_slash(interaction, f"/deny {scope}".strip())
-
         @tree.command(name="thread", description="Create a new thread and start a Hermes session in it")
         @discord.app_commands.describe(
             name="Thread name",
@@ -5492,6 +5753,11 @@ class DiscordAdapter(BasePlatformAdapter):
                     continue
                 # Discord command names: lowercase, hyphens OK, max 32 chars.
                 discord_name = cmd_def.name.lower()[:32]
+                if discord_name in _DISCORD_BUTTON_ONLY_COMMANDS:
+                    # Discord approvals are bound to the prompt message and
+                    # actual component actor. A free-standing slash invocation
+                    # cannot provide that exact message/tool attestation.
+                    continue
                 if discord_name in already_registered:
                     continue
                 if len(already_registered) >= slot_cap:
@@ -5843,6 +6109,12 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(interaction.guild_id)
+            if getattr(interaction, "guild_id", None)
+            else None,
+            message_id=str(interaction.id)
+            if getattr(interaction, "id", None)
+            else None,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
@@ -5937,6 +6209,16 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(interaction.guild_id)
+            if getattr(interaction, "guild_id", None)
+            else None,
+            parent_chat_id=str(
+                getattr(getattr(interaction, "channel", None), "id", "") or ""
+            )
+            or None,
+            message_id=str(interaction.id)
+            if getattr(interaction, "id", None)
+            else None,
         )
 
         _parent_channel = self._thread_parent_channel(getattr(interaction, "channel", None))
@@ -6862,6 +7144,20 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = ExecApprovalView(
                 session_key=session_key,
+                approval_id=str((metadata or {}).get("approval_id") or ""),
+                source_operator_id=str(
+                    (metadata or {}).get("source_operator_id") or ""
+                ),
+                tool_call_id=str((metadata or {}).get("tool_call_id") or ""),
+                turn_id=str((metadata or {}).get("turn_id") or ""),
+                plugin_identity=str(
+                    (metadata or {}).get("plugin_identity") or ""
+                ),
+                tool_name=str((metadata or {}).get("tool_name") or ""),
+                canonical_arguments_digest=str(
+                    (metadata or {}).get("canonical_arguments_digest") or ""
+                ),
+                authorization_check=self._evaluate_slash_authorization,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
                 require_admin=require_admin,
@@ -6883,6 +7179,41 @@ class DiscordAdapter(BasePlatformAdapter):
                     )
             msg = await channel.send(**send_kwargs)
             view._message = msg  # store for on_timeout expiration editing
+            approval_id = str((metadata or {}).get("approval_id") or "")
+            if approval_id:
+                from tools.approval import bind_gateway_approval_delivery
+
+                guild = getattr(channel, "guild", None)
+                bound = bind_gateway_approval_delivery(
+                    session_key,
+                    approval_id,
+                    platform="discord",
+                    guild_id=str(getattr(guild, "id", "") or ""),
+                    channel_id=str(getattr(channel, "id", "") or ""),
+                    message_id=str(msg.id),
+                )
+                if not bound:
+                    for child in view.children:
+                        child.disabled = True
+                    try:
+                        await msg.edit(view=view)
+                    except Exception:
+                        pass
+                    return SendResult(
+                        success=False,
+                        error="approval delivery binding failed",
+                    )
+            elif (metadata or {}).get("require_actor_attestation"):
+                for child in view.children:
+                    child.disabled = True
+                try:
+                    await msg.edit(view=view)
+                except Exception:
+                    pass
+                return SendResult(
+                    success=False,
+                    error="approval identity missing",
+                )
             return SendResult(success=True, message_id=str(msg.id))
 
         except Exception as e:
@@ -8120,14 +8451,23 @@ def _define_discord_view_classes() -> None:
 
         Shows four buttons: Allow Once, Allow Session, Always Allow, Deny.
         Clicking a button calls ``resolve_gateway_approval()`` to unblock the
-        waiting agent thread — the same mechanism as the text ``/approve`` flow.
-        Only users in the allowed list can click.  Times out after 5 minutes.
+        waiting agent thread. Discord text/slash approval commands are retired;
+        only the exact actor-attested prompt button may resolve the request.
+        Times out after 5 minutes.
         """
 
         def __init__(
             self,
             session_key: str,
             allowed_user_ids: set,
+            approval_id: str = "",
+            source_operator_id: str = "",
+            tool_call_id: str = "",
+            turn_id: str = "",
+            plugin_identity: str = "",
+            tool_name: str = "",
+            canonical_arguments_digest: str = "",
+            authorization_check: Optional[Callable] = None,
             allowed_role_ids: Optional[set] = None,
             require_admin: bool = False,
             admin_user_ids: Optional[set] = None,
@@ -8137,6 +8477,14 @@ def _define_discord_view_classes() -> None:
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.approval_id = approval_id
+            self.source_operator_id = source_operator_id
+            self.tool_call_id = tool_call_id
+            self.turn_id = turn_id
+            self.plugin_identity = plugin_identity
+            self.tool_name = tool_name
+            self.canonical_arguments_digest = canonical_arguments_digest
+            self.authorization_check = authorization_check
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -8163,10 +8511,25 @@ def _define_discord_view_classes() -> None:
             gate fails closed: if it's on but no admins are configured, nobody
             can approve (logged once so the misconfiguration is visible).
             """
-            if not _component_check_auth(
-                interaction, self.allowed_user_ids, self.allowed_role_ids,
+            if self.authorization_check is not None:
+                try:
+                    allowed, _reason = self.authorization_check(interaction)
+                except Exception:
+                    return False
+                if allowed is not True:
+                    return False
+            elif not _component_check_auth(
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
             ):
                 return False
+            if self.source_operator_id:
+                actor_id = str(
+                    getattr(getattr(interaction, "user", None), "id", "") or ""
+                )
+                if actor_id != self.source_operator_id:
+                    return False
             if not self.require_admin:
                 return True
             user = getattr(interaction, "user", None)
@@ -8203,14 +8566,41 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
-            self.resolved = True
-
             # Unblock the waiting agent thread FIRST, then render the outcome.
             # A click that lands after the approval wait timed out (count == 0)
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                interaction_message = getattr(interaction, "message", None)
+                interaction_guild = getattr(interaction, "guild", None)
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    approval_id=self.approval_id or None,
+                    actor_id=str(interaction.user.id),
+                    actor_authorized=True,
+                    platform="discord",
+                    guild_id=str(
+                        getattr(interaction_guild, "id", "")
+                        or getattr(interaction, "guild_id", "")
+                        or ""
+                    ),
+                    channel_id=str(
+                        getattr(interaction, "channel_id", "")
+                        or getattr(
+                            getattr(interaction, "channel", None), "id", ""
+                        )
+                        or ""
+                    ),
+                    message_id=str(
+                        getattr(interaction_message, "id", "") or ""
+                    ),
+                    tool_call_id=self.tool_call_id,
+                    turn_id=self.turn_id,
+                    plugin_identity=self.plugin_identity,
+                    tool_name=self.tool_name,
+                    canonical_arguments_digest=self.canonical_arguments_digest,
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,
@@ -8220,8 +8610,14 @@ def _define_discord_view_classes() -> None:
                 count = 0
 
             if not count:
-                color = discord.Color.dark_grey()
-                label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
+                await interaction.response.send_message(
+                    "This approval was not accepted (expired, mismatched, or "
+                    "already resolved). The command was not run.",
+                    ephemeral=True,
+                )
+                return
+
+            self.resolved = True
 
             # Update the embed with the decision
             embed = interaction.message.embeds[0] if interaction.message.embeds else None

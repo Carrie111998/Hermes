@@ -4753,14 +4753,25 @@ class GatewaySlashCommandsMixin:
         source = event.source
         session_key = self._session_key_for_source(source)
 
-        # `/usage reset [--force]` — redeem one banked Codex rate-limit reset
-        # credit. Parsed before the display path so it never mixes with the
-        # stats rendering below.
+        # `/usage reset [--force]` used to redeem a finite banked Codex reset
+        # directly from any gateway command. Gateway command handlers do not
+        # yet receive an immutable actor/interaction attestation or invocation
+        # dedup key, so consuming a credit here cannot be bound to the exact
+        # authorized caller or protected from replay. Keep the surface
+        # status-only until that core metadata contract exists. Trusted local
+        # CLI redemption remains available for deliberate operator action.
         raw_args = event.get_command_args().strip()
         args = [a.lower() for a in raw_args.split()] if raw_args else []
         wants_reset = bool(args) and args[0] == "reset"
         if args and not wants_reset:
             return t("gateway.usage.unknown_subcommand", args=raw_args)
+        if wants_reset:
+            return (
+                "🔒 `/usage reset` is status-only on gateway surfaces until "
+                "Hermes can attest the exact invoking actor and deduplicate "
+                "the interaction. No reset credit was consumed. Use the "
+                "trusted local CLI for a deliberate redemption."
+            )
 
         # Try running agent first (mid-turn), then cached agent (between turns)
         agent = self._running_agents.get(session_key)
@@ -4788,21 +4799,6 @@ class GatewaySlashCommandsMixin:
                 persisted = {}
             provider = provider or persisted.get("billing_provider")
             base_url = base_url or persisted.get("billing_base_url")
-
-        if wants_reset:
-            normalized_provider = str(provider or "").strip().lower()
-            if normalized_provider != "openai-codex":
-                return t("gateway.usage.reset_wrong_provider")
-            force = "--force" in args[1:]
-            from agent.account_usage import redeem_codex_reset_credit
-
-            result = await asyncio.to_thread(
-                redeem_codex_reset_credit,
-                base_url=base_url,
-                api_key=api_key,
-                force=force,
-            )
-            return result.message
 
         # Fetch account usage off the event loop so slow provider APIs don't
         # block the gateway. Failures are non-fatal -- account_lines stays [].
@@ -5172,19 +5168,26 @@ class GatewaySlashCommandsMixin:
         resumes and the terminal_tool executes the command inline — the same
         flow as the CLI's synchronous input() approval.
 
-        Supports multiple concurrent approvals (parallel subagents,
-        execute_code).  ``/approve`` resolves the oldest pending command;
-        ``/approve all`` resolves every pending command at once.
+        Supports concurrent standard approvals (parallel subagents,
+        execute_code) without FIFO routing. Every text response must name the
+        exact ``approval_id`` printed in its prompt. Once-only approvals still
+        require their platform's attested component and cannot be answered
+        through this text command.
 
         Usage:
-            /approve              — approve oldest pending command once
-            /approve all          — approve ALL pending commands at once
-            /approve session      — approve oldest + remember for session
-            /approve all session  — approve all + remember for session
-            /approve always       — approve oldest + remember permanently
-            /approve all always   — approve all + remember permanently
+            /approve <id>          — approve that one pending command
+            /approve <id> session  — approve it + remember for session
+            /approve <id> always   — approve it + remember permanently
+
+        The legacy modifier-first order (``/approve session <id>``) remains
+        accepted, but ID-less and batch responses fail closed.
         """
         source = event.source
+        if source.platform == Platform.DISCORD:
+            return (
+                "Discord approvals must be answered with the exact Approve "
+                "button attached to the approval prompt."
+            )
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
@@ -5197,19 +5200,55 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.approval_expired")
             return t("gateway.approve.no_pending")
 
-        # Parse args: support "all", "all session", "all always", "session", "always"
-        args = event.get_command_args().strip().lower().split()
-        resolve_all = "all" in args
-        remaining = [a for a in args if a != "all"]
+        # Preserve ID case (token_urlsafe IDs are case-sensitive) while
+        # accepting the historical scope aliases in either order.
+        tokens = event.get_command_args().strip().split()
+        scope_words = {
+            "always",
+            "permanent",
+            "permanently",
+            "session",
+            "ses",
+        }
+        normalized = [token.lower() for token in tokens]
+        id_tokens = [
+            token
+            for token, lowered in zip(tokens, normalized)
+            if lowered not in scope_words
+        ]
+        scope_tokens = [token for token in normalized if token in scope_words]
+        has_always = any(
+            token in {"always", "permanent", "permanently"}
+            for token in scope_tokens
+        )
+        has_session = any(
+            token in {"session", "ses"} for token in scope_tokens
+        )
+        if (
+            len(id_tokens) != 1
+            or id_tokens[0].lower() == "all"
+            or (has_always and has_session)
+        ):
+            logger.warning(
+                "Rejected approval response without one exact approval id "
+                "for session %s",
+                session_key,
+            )
+            return t("gateway.approve.no_pending")
 
-        if any(a in {"always", "permanent", "permanently"} for a in remaining):
+        approval_id = id_tokens[0]
+        if has_always:
             choice = "always"
-        elif any(a in {"session", "ses"} for a in remaining):
+        elif has_session:
             choice = "session"
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            approval_id=approval_id,
+        )
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -5228,12 +5267,17 @@ class GatewaySlashCommandsMixin:
         Signals blocked agent thread(s) with a 'deny' result so they receive
         a definitive BLOCKED message, same as the CLI deny flow.
 
-        ``/deny`` denies the oldest; ``/deny all`` denies everything.
-        ``/deny <reason>`` (or ``/deny all <reason>``) attaches a one-line
-        reason that is relayed back to the agent so it can adapt instead of
-        only hearing "denied". Ported from qwibitai/nanoclaw#2832.
+        ``/deny <id>`` denies the exact pending approval. Additional text after
+        the ID is attached as a one-line reason that is relayed back to the
+        agent so it can adapt instead of only hearing "denied". ID-less and
+        batch responses fail closed.
         """
         source = event.source
+        if source.platform == Platform.DISCORD:
+            return (
+                "Discord denials must be answered with the exact Deny button "
+                "attached to the approval prompt."
+            )
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
@@ -5246,22 +5290,27 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.deny.stale")
             return t("gateway.deny.no_pending")
 
-        # Parse args: a leading "all" token denies every pending command;
-        # anything after it (or the whole arg string when "all" is absent) is
-        # captured verbatim as the optional deny reason relayed to the agent.
+        # The first argument is always the case-sensitive approval ID.
+        # Everything after it is the optional deny reason.
         raw_args = event.get_command_args().strip()
         tokens = raw_args.split()
-        resolve_all = bool(tokens) and tokens[0].lower() == "all"
-        if resolve_all:
-            reason = raw_args[len(tokens[0]):].strip()
-        else:
-            reason = raw_args
+        if not tokens or tokens[0].lower() == "all":
+            logger.warning(
+                "Rejected denial response without one exact approval id "
+                "for session %s",
+                session_key,
+            )
+            return t("gateway.deny.no_pending")
+        approval_id = tokens[0]
+        reason = raw_args[len(tokens[0]):].strip()
         # Cap to a sane one-liner; the agent only needs a short hint.
         if reason:
             reason = reason[:280].strip()
 
         count = resolve_gateway_approval(
-            session_key, "deny", resolve_all=resolve_all,
+            session_key,
+            "deny",
+            approval_id=approval_id,
             reason=reason or None,
         )
         if not count:

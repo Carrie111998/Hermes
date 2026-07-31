@@ -164,7 +164,7 @@ class TestUsageAccountSection:
 
 
 class TestUsageReset:
-    """`/usage reset [--force]` — banked Codex reset redemption via the gateway."""
+    """Gateway reset redemption is fail-closed until actor metadata exists."""
 
     def _event(self, args):
         event = MagicMock()
@@ -172,26 +172,30 @@ class TestUsageReset:
         return event
 
     @pytest.mark.asyncio
-    async def test_reset_dispatches_redeem_for_codex_agent(self, monkeypatch):
+    @pytest.mark.parametrize("args", ["reset", "reset --force"])
+    async def test_reset_is_status_only_and_never_redeems(
+        self,
+        monkeypatch,
+        args,
+    ):
         agent = _make_mock_agent(provider="openai-codex",
                                  base_url="https://chatgpt.com/backend-api/codex",
                                  api_key="tok")
         runner = _make_runner(SK, cached_agent=agent)
 
-        seen = {}
+        redeem = MagicMock(
+            side_effect=AssertionError("gateway must not consume a reset credit")
+        )
+        monkeypatch.setattr(
+            "agent.account_usage.redeem_codex_reset_credit",
+            redeem,
+        )
 
-        def fake_redeem(*, base_url=None, api_key=None, force=False):
-            seen.update(base_url=base_url, api_key=api_key, force=force)
-            from agent.account_usage import CodexResetRedeemResult
-            return CodexResetRedeemResult(status="reset", message="✅ redeemed", available_count=1)
+        result = await runner._handle_usage_command(self._event(args))
 
-        monkeypatch.setattr("agent.account_usage.redeem_codex_reset_credit", fake_redeem)
-
-        result = await runner._handle_usage_command(self._event("reset"))
-
-        assert result == "✅ redeemed"
-        assert seen["force"] is False
-        assert seen["api_key"] == "tok"
+        assert "status-only" in result
+        assert "No reset credit was consumed" in result
+        redeem.assert_not_called()
 
 
 class TestUsageContextBreakdown:
@@ -236,4 +240,3 @@ class TestUsageContextBreakdown:
         assert "60%" in result     # 6000 / 10000
         # Zero-token category is dropped, not rendered.
         assert "Conversation" not in result
-

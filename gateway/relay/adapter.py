@@ -719,7 +719,10 @@ class RelayAdapter(BasePlatformAdapter):
         channel_id = str(payload.get("channel_id") or "")
         guild_id = payload.get("guild_id")  # real Discord interaction wire field
         source = SessionSource(
-            platform=Platform.RELAY,
+            # Preserve the underlying source platform. Approval attestation
+            # must know this is a Discord actor even though RelayAdapter owns
+            # the transport connection.
+            platform=Platform.DISCORD,
             chat_id=channel_id,
             chat_type="channel" if guild_id else "dm",
             user_id=str(user.get("id"))
@@ -732,6 +735,7 @@ class RelayAdapter(BasePlatformAdapter):
             if guild_id
             else None,  # Discord guild → generic scope slot
             message_id=str(payload.get("id")) if payload.get("id") else None,
+            delivered_via_upstream_relay=True,
         )
         event = MessageEvent(text=text, message_type=message_type, source=source)
         if itype == 3:
@@ -1714,9 +1718,30 @@ class RelayAdapter(BasePlatformAdapter):
                 "\n\n**Smart DENY:** owner override applies to this one operation only."
             )
 
+        approval_metadata = {
+            key: (metadata or {}).get(key)
+            for key in (
+                "approval_id",
+                "source_platform",
+                "source_guild_id",
+                "source_channel_id",
+                "source_operator_id",
+                "tool_call_id",
+                "turn_id",
+                "plugin_identity",
+                "tool_name",
+                "canonical_arguments_digest",
+                "require_actor_attestation",
+            )
+            if (metadata or {}).get(key) is not None
+        }
         prompt_id = self._mint_prompt(
             "exec_approval",
-            {"session_key": session_key, "chat_id": str(chat_id)},
+            {
+                "session_key": session_key,
+                "chat_id": str(chat_id),
+                "approval_metadata": approval_metadata,
+            },
         )
         result = await self._send_prompt(
             chat_id,
@@ -1727,6 +1752,31 @@ class RelayAdapter(BasePlatformAdapter):
             metadata=metadata,
         )
         if result is not None:
+            approval_id = str(approval_metadata.get("approval_id") or "")
+            if approval_id:
+                from tools.approval import bind_gateway_approval_delivery
+
+                bound = bind_gateway_approval_delivery(
+                    session_key,
+                    approval_id,
+                    platform=str(
+                        approval_metadata.get("source_platform") or ""
+                    ),
+                    guild_id=str(
+                        approval_metadata.get("source_guild_id") or ""
+                    ),
+                    channel_id=str(chat_id),
+                    message_id=str(result.message_id or ""),
+                )
+                if (
+                    approval_metadata.get("require_actor_attestation")
+                    and not bound
+                ):
+                    self._pending_prompts.pop(prompt_id, None)
+                    return SendResult(
+                        success=False,
+                        error="relay approval delivery binding failed",
+                    )
             return result
         # Lane unavailable: unregister and let run.py's text fallback run.
         self._pending_prompts.pop(prompt_id, None)
@@ -1860,12 +1910,53 @@ class RelayAdapter(BasePlatformAdapter):
             if kind == "exec_approval":
                 from tools.approval import resolve_gateway_approval
 
+                approval_metadata = state.get("approval_metadata") or {}
+                source = getattr(event, "source", None)
+                source_platform = getattr(source, "platform", "")
+                source_platform = str(
+                    getattr(source_platform, "value", source_platform) or ""
+                )
                 choice = (
                     option_id
                     if option_id in {"once", "session", "always", "deny"}
                     else "deny"
                 )
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    approval_id=str(
+                        approval_metadata.get("approval_id") or ""
+                    )
+                    or None,
+                    actor_id=str(getattr(source, "user_id", "") or ""),
+                    actor_authorized=bool(
+                        getattr(
+                            source,
+                            "delivered_via_upstream_relay",
+                            False,
+                        )
+                    ),
+                    platform=source_platform,
+                    guild_id=str(getattr(source, "scope_id", "") or ""),
+                    channel_id=str(getattr(source, "chat_id", "") or ""),
+                    message_id=str(pr.get("prompt_message_id") or ""),
+                    tool_call_id=str(
+                        approval_metadata.get("tool_call_id") or ""
+                    ),
+                    turn_id=str(approval_metadata.get("turn_id") or ""),
+                    plugin_identity=str(
+                        approval_metadata.get("plugin_identity") or ""
+                    ),
+                    tool_name=str(
+                        approval_metadata.get("tool_name") or ""
+                    ),
+                    canonical_arguments_digest=str(
+                        approval_metadata.get(
+                            "canonical_arguments_digest"
+                        )
+                        or ""
+                    ),
+                )
                 label = {
                     "once": "✅ Approved once",
                     "session": "✅ Approved for session",

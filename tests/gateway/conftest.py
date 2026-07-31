@@ -201,6 +201,9 @@ def _ensure_discord_mock() -> None:
             self.children = []
         def add_item(self, item):
             self.children.append(item)
+        def remove_item(self, item):
+            if item in self.children:
+                self.children.remove(item)
         def clear_items(self):
             self.children.clear()
 
@@ -524,4 +527,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-

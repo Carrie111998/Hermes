@@ -960,6 +960,75 @@ def test_tui_verbose_default_cap_stays_small(monkeypatch):
     assert capped.startswith("[showing verbose tail; omitted ")
 
 
+def test_once_only_approval_event_exposes_only_once_and_deny(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload)),
+    )
+
+    server._emit_approval_request(
+        "session-1",
+        {
+            "approval_id": "approval-1",
+            "decision_scope": "once",
+            "allow_session": False,
+            "allow_permanent": False,
+            "command": "<transfer>",
+        },
+    )
+
+    approval_events = [
+        item
+        for item in emitted
+        if item[0:2] == ("approval.request", "session-1")
+    ]
+    assert len(approval_events) == 1
+    assert approval_events[0][2]["approval_id"] == "approval-1"
+    assert approval_events[0][2]["choices"] == ["once", "deny"]
+
+
+def test_approval_respond_requires_exact_id_and_forbids_batch(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_sess",
+        lambda _params, _rid: ({"session_key": "session-1"}, None),
+    )
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or 1,
+    )
+    handler = server._methods["approval.respond"]
+
+    missing = handler("r1", {"choice": "once"})
+    batch = handler(
+        "r2",
+        {
+            "choice": "deny",
+            "approval_id": "approval-1",
+            "all": True,
+        },
+    )
+    exact = handler(
+        "r3",
+        {"choice": "once", "approval_id": "approval-1"},
+    )
+
+    assert missing["error"]["code"] == 4012
+    assert batch["error"]["code"] == 4012
+    assert exact["result"]["resolved"] == 1
+    assert calls == [
+        (
+            ("session-1", "once"),
+            {"approval_id": "approval-1"},
+        )
+    ]
+
+
 def test_tui_verbose_tool_events_omit_details_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 
@@ -9019,6 +9088,86 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_interrupt_before_turn_thread_admission_blocks_approval_owner(
+    monkeypatch,
+):
+    """Stop-before-thread-start cannot register a late approval callback."""
+    from tools import approval
+
+    threads = []
+    emitted = []
+
+    class _DeferredThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            threads.append(self)
+
+        def start(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    agent = types.SimpleNamespace(
+        clear_interrupt=lambda: None,
+        interrupt=lambda: None,
+        run_conversation=lambda *_args, **_kwargs: pytest.fail(
+            "cancelled turn reached agent execution"
+        ),
+        interim_assistant_callback=None,
+    )
+    session = _session(agent=agent, running=True)
+    session["approval_notify_epoch"] = None
+    server._sessions["sid"] = session
+    approval.unregister_gateway_notify(session["session_key"])
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _DeferredThread)
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda *args, **kwargs: emitted.append(args),
+        )
+        monkeypatch.setattr(
+            server,
+            "_retire_turn_marker",
+            lambda *_args, **_kwargs: None,
+        )
+
+        server._run_prompt_submit("1", "sid", session, "hello")
+        assert len(threads) == 1
+
+        response = server.handle_request(
+            {
+                "id": "2",
+                "method": "session.interrupt",
+                "params": {"session_id": "sid"},
+            }
+        )
+        assert response.get("result")
+        threads[0].target()
+
+        assert session["running"] is False
+        assert session.get("approval_notify_epoch") is None
+        with approval._lock:
+            assert (
+                session["session_key"]
+                not in approval._gateway_notify_epochs
+            )
+            assert (
+                session["session_key"]
+                not in approval._gateway_notify_cbs
+            )
+        assert any(
+            event[0] == "error"
+            and "cancelled" in event[2]["message"].lower()
+            for event in emitted
+        )
+    finally:
+        approval.unregister_gateway_notify(session["session_key"])
+        server._sessions.pop("sid", None)
+
+
 def test_interrupt_drops_queued_prompt_for_session():
     """Explicit stop cancels a queued next turn instead of auto-draining it."""
     calls = {"interrupted": False}
@@ -10095,7 +10244,7 @@ def test_session_create_close_race_does_not_orphan_worker(monkeypatch):
     monkeypatch.setattr(
         _approval,
         "unregister_gateway_notify",
-        lambda key: unregistered_keys.append(key),
+        lambda key, epoch=None: unregistered_keys.append(key),
     )
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
@@ -10202,7 +10351,7 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     monkeypatch.setattr(
         _approval,
         "unregister_gateway_notify",
-        lambda key: unregistered_keys.append(key),
+        lambda key, epoch=None: unregistered_keys.append(key),
     )
     monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
@@ -13582,7 +13731,8 @@ def test_close_session_by_id_is_idempotent_and_full(monkeypatch):
     monkeypatch.setattr(server, "_finalize_session", _fake_finalize)
     monkeypatch.setattr(
         "tools.approval.unregister_gateway_notify",
-        lambda key: calls.__setitem__("unreg", calls["unreg"] + 1), raising=False,
+        lambda key, epoch=None: calls.__setitem__("unreg", calls["unreg"] + 1),
+        raising=False,
     )
     server._sessions["sid-1"] = {"session_key": "k1", "agent": A(), "slash_worker": W()}
 

@@ -198,14 +198,14 @@ platform network disconnect as an event-loop failure.
 | `/status` | Show session info |
 | `/whoami` | Show your slash command access on this scope (admin / user / unrestricted) |
 | `/stop` | Stop the running agent |
-| `/approve` | Approve a pending dangerous command |
-| `/deny` | Reject a pending dangerous command |
+| `/approve <approval-id> [session\|always]` | On text transports, approve exactly one request; omitting scope means once. Discord uses the prompt's actor-attested button instead |
+| `/deny <approval-id> [reason]` | On text transports, reject exactly one request. Discord uses the prompt's actor-attested button instead |
 | `/sethome` | Set this chat as the home channel |
 | `/compress` | Manually compress conversation context |
 | `/title [name]` | Set or show the session title |
 | `/resume [name]` | Resume a previously named session |
 | `/sessions [all] [search <query>]` | List previous sessions; `search <query>` filters by title or id |
-| `/usage` | Show token usage for this session (`/usage reset [--force]` redeems a banked Codex limit reset) |
+| `/usage` | Show token usage for this session (`/usage reset [--force]` is status-only on messaging surfaces and never consumes a banked Codex reset) |
 | `/insights [days]` | Show usage insights and analytics |
 | `/reasoning [level\|show\|hide]` | Change reasoning effort or toggle reasoning display |
 | `/voice [on\|off\|tts\|join\|leave\|status]` | Control messaging voice replies and Discord voice-channel behavior |

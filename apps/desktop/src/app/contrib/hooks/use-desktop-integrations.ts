@@ -144,8 +144,8 @@ export function useDesktopIntegrations({
   }, [navigate, runtimeIdByStoredSessionId])
 
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, approvalId, sessionId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId, approvalId)
     })
 
     return () => unsubscribe?.()

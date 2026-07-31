@@ -25,6 +25,8 @@ import pytest
 from tools import approval as A
 from tools.thread_context import propagate_context_to_thread
 
+_notify_context_tokens = []
+
 
 # ---------------------------------------------------------------------------
 # 1. Context + callback propagation helper
@@ -125,24 +127,29 @@ def gw_session(monkeypatch):
     try:
         yield session_key
     finally:
+        while _notify_context_tokens:
+            A.reset_current_gateway_notify_epoch(
+                _notify_context_tokens.pop()
+            )
         A.reset_current_session_key(token)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
+            A._gateway_notify_epochs.pop(session_key, None)
 
 
 def _register_resolver(session_key: str, result):
-    """Register a gateway notify callback that immediately resolves the most
-    recent queued approval entry with *result* (simulating a user response)."""
-    def cb(_approval_data):
-        with A._lock:
-            entries = A._gateway_queues.get(session_key, [])
-            if entries:
-                entry = entries[-1]
-                entry.result = result
-                entry.event.set()
-    with A._lock:
-        A._gateway_notify_cbs[session_key] = cb
+    """Register a callback that resolves the exact displayed approval."""
+    def cb(approval_data):
+        A.resolve_gateway_approval(
+            session_key,
+            result,
+            approval_id=approval_data["approval_id"],
+        )
+    epoch = A.register_gateway_notify(session_key, cb)
+    _notify_context_tokens.append(
+        A.set_current_gateway_notify_epoch(epoch)
+    )
 
 
 def _register_capturing_resolver(session_key: str, result):
@@ -151,14 +158,45 @@ def _register_capturing_resolver(session_key: str, result):
 
     def cb(approval_data):
         seen["approval_data"] = approval_data
-        with A._lock:
-            entries = A._gateway_queues.get(session_key, [])
-            if entries:
-                entries[-1].result = result
-                entries[-1].event.set()
+        A.resolve_gateway_approval(
+            session_key,
+            result,
+            approval_id=approval_data["approval_id"],
+        )
 
-    with A._lock:
-        A._gateway_notify_cbs[session_key] = cb
+    epoch = A.register_gateway_notify(session_key, cb)
+    _notify_context_tokens.append(
+        A.set_current_gateway_notify_epoch(epoch)
+    )
+    return seen
+
+
+def _register_once_only_scope_probe(session_key: str, rejected_choice: str):
+    """Try a forged broad decision, prove the waiter survives, then approve once."""
+    seen = {}
+
+    def cb(approval_data):
+        seen["approval_data"] = approval_data
+        seen["rejected_resolved"] = A.resolve_gateway_approval(
+            session_key,
+            rejected_choice,
+            approval_id=approval_data["approval_id"],
+        )
+        with A._lock:
+            seen["waiter_after_rejected"] = (
+                approval_data["approval_id"]
+                in A._gateway_queues.get(session_key, {})
+            )
+        seen["once_resolved"] = A.resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id=approval_data["approval_id"],
+        )
+
+    epoch = A.register_gateway_notify(session_key, cb)
+    _notify_context_tokens.append(
+        A.set_current_gateway_notify_epoch(epoch)
+    )
     return seen
 
 
@@ -240,7 +278,7 @@ def test_guard_smart_mode(gw_session, monkeypatch):
 
 
 def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
-    """A human may override DENY, but a broad UI choice must not be persisted."""
+    """A forged broad choice is rejected while exact once remains usable."""
     with A._lock:
         A._permanent_approved.discard("owner-override-test-danger")
         A._session_approved.get(gw_session, set()).discard("owner-override-test-danger")
@@ -257,13 +295,18 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
         raising=False,
     )
 
-    shown = _register_capturing_resolver(gw_session, "always")
+    shown = _register_once_only_scope_probe(gw_session, "always")
     result = A.check_all_command_guards("dangerous /tmp/first", "local")
 
     assert result["approved"] is True
     assert result["user_approved"] is True
     assert shown["approval_data"]["smart_denied"] is True
     assert shown["approval_data"]["allow_permanent"] is False
+    assert shown["approval_data"]["allow_session"] is False
+    assert shown["approval_data"]["decision_scope"] == "once"
+    assert shown["rejected_resolved"] == 0
+    assert shown["waiter_after_rejected"] is True
+    assert shown["once_resolved"] == 1
     assert A.is_approved(gw_session, "owner-override-test-danger") is False
 
     _register_resolver(gw_session, "deny")
@@ -273,26 +316,116 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
 
 
 def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, monkeypatch):
-    """Never persist the coarse execute_code key after overriding smart DENY."""
+    """Reject session scope and never persist the coarse execute_code key."""
     with A._lock:
         A._permanent_approved.discard("execute_code")
         A._session_approved.get(gw_session, set()).discard("execute_code")
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
 
-    shown = _register_capturing_resolver(gw_session, "session")
+    shown = _register_once_only_scope_probe(gw_session, "session")
     result = A.check_execute_code_guard("print('first')", "local")
 
     assert result["approved"] is True
     assert result["user_approved"] is True
     assert shown["approval_data"]["smart_denied"] is True
     assert shown["approval_data"]["allow_permanent"] is False
+    assert shown["approval_data"]["allow_session"] is False
+    assert shown["approval_data"]["decision_scope"] == "once"
+    assert shown["rejected_resolved"] == 0
+    assert shown["waiter_after_rejected"] is True
+    assert shown["once_resolved"] == 1
     assert A.is_approved(gw_session, "execute_code") is False
 
     _register_resolver(gw_session, "deny")
     changed = A.check_execute_code_guard("print('second')", "local")
     assert changed["approved"] is False
     assert changed["outcome"] == "denied"
+
+
+def test_terminal_smart_deny_revalidates_attested_choice(gw_session, monkeypatch):
+    """Caller rejects a broad attestation even if a resolver were compromised."""
+    key = "terminal-smart-deny-postcheck"
+    command = "dangerous forged terminal choice"
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(A, "_smart_approve", lambda *_args: "deny")
+    monkeypatch.setattr(
+        A,
+        "detect_dangerous_command",
+        lambda _command: (True, key, "dangerous test command"),
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        raising=False,
+    )
+    request = A._new_observer_approval_request(
+        command=command,
+        session_key=gw_session,
+        rule_key=key,
+        tool_name="terminal",
+        tool_args={"command": command},
+        decision_scope="standard",
+    )
+    attestation = A._attestation_from_request(
+        request,
+        choice="session",
+        actor_id=request.source_operator_id,
+    )
+    assert attestation.decision is True
+    monkeypatch.setattr(
+        A,
+        "_await_gateway_decision",
+        lambda *_args, **_kwargs: {
+            "resolved": True,
+            "choice": "session",
+            "attestation": attestation,
+        },
+    )
+    A.register_gateway_notify(gw_session, lambda _data: None)
+
+    result = A.check_all_command_guards(command, "local")
+
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+    assert A.is_approved(gw_session, key) is False
+
+
+def test_execute_code_smart_deny_revalidates_attested_choice(gw_session, monkeypatch):
+    """execute_code also requires an exact once attestation after the waiter."""
+    code = "print('forged session choice')"
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
+    monkeypatch.setattr(A, "_smart_approve", lambda *_args: "deny")
+    request = A._new_observer_approval_request(
+        command=code,
+        session_key=gw_session,
+        rule_key="execute_code",
+        tool_name="execute_code",
+        tool_args={"code": code},
+        decision_scope="standard",
+    )
+    attestation = A._attestation_from_request(
+        request,
+        choice="session",
+        actor_id=request.source_operator_id,
+    )
+    assert attestation.decision is True
+    monkeypatch.setattr(
+        A,
+        "_await_gateway_decision",
+        lambda *_args, **_kwargs: {
+            "resolved": True,
+            "choice": "session",
+            "attestation": attestation,
+        },
+    )
+    A.register_gateway_notify(gw_session, lambda _data: None)
+
+    result = A.check_execute_code_guard(code, "local")
+
+    assert result["approved"] is False
+    assert result["user_consent"] is False
+    assert A.is_approved(gw_session, "execute_code") is False
 
 
 def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):

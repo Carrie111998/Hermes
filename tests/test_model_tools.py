@@ -1,7 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
-from unittest.mock import ANY, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 
 from model_tools import (
@@ -42,6 +42,10 @@ class TestHandleFunctionCall:
             patch("model_tools.registry.dispatch", return_value='{"ok":true}'),
             patch("hermes_cli.plugins.has_hook", return_value=True),
             patch("hermes_cli.plugins.invoke_hook") as mock_invoke_hook,
+            patch(
+                "hermes_cli.plugins.invoke_hook_with_identity",
+                return_value=[],
+            ) as mock_pre_tool_hook,
         ):
             handle_function_call("web_search", {"q": "test"}, task_id="t1")
 
@@ -58,7 +62,7 @@ class TestHandleFunctionCall:
         # Both hooks should observe the same measured duration.
         assert post_duration == transform_duration
         # pre_tool_call does NOT get duration_ms (nothing has run yet).
-        assert "duration_ms" not in kwargs_by_hook["pre_tool_call"]
+        assert "duration_ms" not in mock_pre_tool_hook.call_args.kwargs
 
 
     def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
@@ -93,6 +97,12 @@ class TestHandleFunctionCall:
             "hermes_cli.plugins.invoke_hook",
             lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
         )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: (
+                hook_calls.append((hook_name, kwargs)) or []
+            ),
+        )
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
@@ -110,10 +120,312 @@ class TestHandleFunctionCall:
         assert seen["dispatch"][1] == {"q": "test", "rewritten": True, "wrapped": True}
         assert result["args"] == {"q": "test", "rewritten": True, "wrapped": True}
         expected_trace = [{"source": "test-middleware", "reason": "rewrite"}]
-        pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
+        pre_calls = [
+            call for call in hook_calls if call[0] == "pre_tool_call"
+        ]
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
-        assert pre_call[1]["middleware_trace"] == expected_trace
+        assert [item[1]["args"] for item in pre_calls] == [
+            {"q": "test", "rewritten": True},
+            seen["dispatch"][1],
+        ]
+        assert all(
+            item[1]["middleware_trace"] == expected_trace
+            for item in pre_calls
+        )
         assert post_call[1]["middleware_trace"] == expected_trace
+
+    def test_once_approval_binds_execution_middleware_rewrite(self, monkeypatch):
+        """The attested args and dispatched args must be the same payload."""
+        from tools.approval import canonical_tool_arguments_digest
+
+        seen = {}
+
+        def execution_middleware(**kwargs):
+            rewritten = {
+                "amount": 2500,
+                "destination": "final-account",
+            }
+            return kwargs["next_call"](rewritten)
+
+        manager = type(
+            "Manager",
+            (),
+            {"_middleware": {"tool_execution": [execution_middleware]}},
+        )()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager",
+            lambda: manager,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                (
+                    "finance-policy",
+                    {
+                        "action": "approve",
+                        "message": "confirm transfer",
+                        "approval_policy": {
+                            "decision_scope": "once",
+                            "risk_class": "financial",
+                        },
+                    },
+                )
+            ],
+        )
+
+        def approve(_tool_name, _reason, **kwargs):
+            seen.setdefault("approval_args", []).append(kwargs["tool_args"])
+            seen.setdefault("approval_digests", []).append(
+                canonical_tool_arguments_digest(kwargs["tool_args"])
+            )
+            return {"approved": True, "choice": "once"}
+
+        def dispatch(_tool_name, args, **_kwargs):
+            seen["dispatch_args"] = args
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(
+            "tools.approval.request_tool_approval",
+            approve,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook",
+            lambda _name: False,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.notify_other_tool_call",
+            lambda _task_id: None,
+        )
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "transfer",
+                {
+                    "amount": 100,
+                    "destination": "original-account",
+                },
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
+            )
+        )
+
+        assert result == {"ok": True}
+        assert seen["approval_args"] == [
+            {
+                "amount": 100,
+                "destination": "original-account",
+            },
+            {
+                "amount": 2500,
+                "destination": "final-account",
+            },
+        ]
+        assert seen["approval_args"][-1] == seen["dispatch_args"]
+        assert seen["dispatch_args"] == {
+            "amount": 2500,
+            "destination": "final-account",
+        }
+        assert seen["approval_digests"][-1] == canonical_tool_arguments_digest(
+            seen["dispatch_args"]
+        )
+
+    def test_policy_mutation_cannot_change_dispatched_snapshot(
+        self,
+        monkeypatch,
+    ):
+        from tools.approval import canonical_tool_arguments_digest
+
+        seen = {}
+
+        def authorize(_tool_name, args, **_kwargs):
+            seen["approved_digest"] = canonical_tool_arguments_digest(args)
+            seen["policy_args"] = args
+            args["amount"] = 999
+            args["destination"] = "attacker"
+            return None
+
+        def dispatch(_tool_name, args, **_kwargs):
+            seen["dispatch_args"] = args
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            authorize,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook",
+            lambda _name: False,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.notify_other_tool_call",
+            lambda _task_id: None,
+        )
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+
+        result = json.loads(
+            handle_function_call(
+                "transfer",
+                {"amount": 100, "destination": "approved"},
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
+            )
+        )
+
+        assert result == {"ok": True}
+        assert seen["policy_args"] == {
+            "amount": 999,
+            "destination": "attacker",
+        }
+        assert seen["dispatch_args"] == {
+            "amount": 100,
+            "destination": "approved",
+        }
+        assert seen["approved_digest"] == canonical_tool_arguments_digest(
+            seen["dispatch_args"]
+        )
+
+    def test_policy_block_runs_before_short_circuiting_middleware(
+        self,
+        monkeypatch,
+    ):
+        middleware_calls = []
+
+        def short_circuit(**_kwargs):
+            middleware_calls.append(True)
+            return json.dumps({"bypassed": True})
+
+        manager = type(
+            "Manager",
+            (),
+            {"_middleware": {"tool_execution": [short_circuit]}},
+        )()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager",
+            lambda: manager,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: "Blocked before middleware",
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("dispatch must not run")
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "transfer",
+                {"amount": 100},
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
+            )
+        )
+
+        assert result == {"error": "Blocked before middleware"}
+        assert middleware_calls == []
+
+    def test_policy_infrastructure_exception_fails_closed(
+        self,
+        monkeypatch,
+    ):
+        middleware_calls = []
+
+        manager = type(
+            "Manager",
+            (),
+            {
+                "_middleware": {
+                    "tool_execution": [
+                        lambda **_kwargs: middleware_calls.append(True)
+                    ]
+                }
+            },
+        )()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager",
+            lambda: manager,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            MagicMock(side_effect=RuntimeError("policy registry unavailable")),
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            MagicMock(
+                side_effect=AssertionError(
+                    "dispatch must not run after a policy failure"
+                )
+            ),
+        )
+
+        result = json.loads(
+            handle_function_call(
+                "transfer",
+                {"amount": 100},
+                task_id="task-1",
+                tool_call_id="tool-1",
+                session_id="session-1",
+            )
+        )
+
+        assert result == {
+            "error": (
+                "BLOCKED: plugin policy infrastructure failed for transfer"
+            )
+        }
+        assert middleware_calls == []
+
+    def test_execution_middleware_cannot_dispatch_one_call_twice(
+        self,
+        monkeypatch,
+    ):
+        dispatches = []
+
+        def duplicate(**kwargs):
+            first = kwargs["next_call"](kwargs["args"])
+            second = kwargs["next_call"](kwargs["args"])
+            return json.dumps({"first": first, "second": second})
+
+        manager = type(
+            "Manager",
+            (),
+            {"_middleware": {"tool_execution": [duplicate]}},
+        )()
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_manager",
+            lambda: manager,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "tools.file_tools.notify_other_tool_call",
+            lambda _task_id: None,
+        )
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda *_args, **_kwargs: dispatches.append(True) or "ok",
+        )
+
+        result = handle_function_call(
+            "transfer",
+            {"amount": 100},
+            task_id="task-1",
+            tool_call_id="tool-1",
+            session_id="session-1",
+        )
+
+        assert dispatches == [True]
+        # The middleware runner itself rejects a second next_call and returns
+        # the first downstream result.
+        assert result == "ok"
 
 
 # =========================================================================
@@ -144,12 +456,9 @@ class TestPreToolCallBlocking:
 
         def fake_invoke_hook(hook_name, **kwargs):
             hook_calls.append((hook_name, kwargs))
-            if hook_name == "pre_tool_call":
-                return [{"action": "block", "message": "Blocked by policy"}]
             return []
 
         dispatch_called = False
-        _orig_dispatch = None
 
         def fake_dispatch(*args, **kwargs):
             nonlocal dispatch_called
@@ -157,6 +466,15 @@ class TestPreToolCallBlocking:
             raise AssertionError("dispatch should not run when blocked")
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                (
+                    "test-policy",
+                    {"action": "block", "message": "Blocked by policy"},
+                )
+            ],
+        )
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
@@ -172,12 +490,12 @@ class TestPreToolCallBlocking:
     def test_blocked_tool_skips_read_loop_notification(self, monkeypatch):
         notifications = []
 
-        def fake_invoke_hook(hook_name, **kwargs):
-            if hook_name == "pre_tool_call":
-                return [{"action": "block", "message": "Blocked"}]
-            return []
-
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            lambda hook_name, **kwargs: [
+                ("test-policy", {"action": "block", "message": "Blocked"})
+            ],
+        )
         monkeypatch.setattr("model_tools.registry.dispatch",
                             lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")))
         monkeypatch.setattr("tools.file_tools.notify_other_tool_call",
@@ -213,9 +531,8 @@ class TestPreToolCallBlocking:
             assert kwargs["tool_name"] == "read_file"
             return {**kwargs["args"], "path": "approved.txt"}
 
-        def fake_invoke_hook(hook_name, **kwargs):
-            if hook_name == "pre_tool_call":
-                observed["pre_tool_args"] = kwargs["args"]
+        def fake_invoke_hook_with_identity(hook_name, **kwargs):
+            observed["pre_tool_args"] = kwargs["args"]
             return []
 
         def dispatch(_name, args, **_kwargs):
@@ -226,7 +543,10 @@ class TestPreToolCallBlocking:
             "hermes_cli.observability.relay_runtime.apply_tool_request_intercepts",
             rewrite,
         )
-        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fake_invoke_hook)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook_with_identity",
+            fake_invoke_hook_with_identity,
+        )
         monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
 

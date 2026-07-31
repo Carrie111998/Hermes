@@ -141,6 +141,14 @@ async def test_registers_native_thread_slash_command(adapter):
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
 
 
+def test_discord_does_not_register_unattested_approval_slash_commands(adapter):
+    adapter._register_slash_commands()
+
+    tree_names = set(adapter._client.tree.commands)
+    assert "approve" not in tree_names
+    assert "deny" not in tree_names
+
+
 @pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
@@ -600,5 +608,4 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
 

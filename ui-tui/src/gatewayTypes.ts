@@ -338,6 +338,7 @@ export interface ClarifyRespondResponse {
 
 export interface ApprovalRespondResponse {
   ok?: boolean
+  resolved?: number
 }
 
 export interface SudoRespondResponse {
@@ -699,6 +700,7 @@ export type GatewayEvent =
     }
   | {
       payload: {
+        approval_id?: string
         allow_permanent?: boolean
         choices?: string[]
         command: string

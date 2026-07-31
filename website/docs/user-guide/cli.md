@@ -90,7 +90,7 @@ The bar adapts to terminal width — full layout at ≥ 76 columns, compact at 5
 
 Use `/usage` for a detailed breakdown including per-category costs (input vs output tokens).
 
-On the `openai-codex` provider, `/usage` also shows any banked usage-limit resets on your ChatGPT account ("You have N resets banked - use /usage reset to activate"). `/usage reset` redeems one banked reset, fully restoring your 5-hour and weekly limits. Hermes refuses to redeem while your limits aren't exhausted (a banked reset restores the full allowance, so spending it early wastes it) — pass `/usage reset --force` to redeem anyway.
+On the `openai-codex` provider, `/usage` also shows any banked usage-limit resets on your ChatGPT account. In the directly operated local CLI, `/usage reset` redeems one banked reset, fully restoring your 5-hour and weekly limits. Hermes refuses to redeem while your limits aren't exhausted (a banked reset restores the full allowance, so spending it early wastes it) — pass `/usage reset --force` to redeem anyway. Messaging/gateway `/usage reset` is status-only until Hermes can attest the exact remote actor and invocation; it never consumes a reset credit.
 
 ### Session Resume Display
 

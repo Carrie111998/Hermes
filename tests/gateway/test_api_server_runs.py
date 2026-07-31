@@ -50,6 +50,15 @@ def test_approval_event_choices_follow_backend_capabilities(
     ) == expected
 
 
+def test_once_only_approval_choices_never_offer_persistent_scope():
+    assert _approval_event_choices(
+        smart_denied=False,
+        allow_permanent=False,
+        allow_session=False,
+        decision_scope="once",
+    ) == ["once", "deny"]
+
+
 def _make_adapter(api_key: str = "") -> APIServerAdapter:
     """Create an adapter with optional API key."""
     extra = {}
@@ -333,8 +342,10 @@ class TestRunEvents:
 
 
     @pytest.mark.asyncio
-    async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):
-        """Same client session_id must not let one run approve another run's queue."""
+    async def test_approval_requires_exact_id_and_is_scoped_to_target_run(
+        self, auth_adapter
+    ):
+        """Batch approval fails closed and exact IDs cannot cross run queues."""
         app = _create_runs_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_create_agent") as mock_create:
@@ -363,23 +374,53 @@ class TestRunEvents:
                 assert auth_adapter._run_approval_sessions[attacker_run] == attacker_run
                 assert auth_adapter._run_approval_sessions[victim_run] != auth_adapter._run_approval_sessions[attacker_run]
 
-                victim_entry = approval_mod._ApprovalEntry({
-                    "command": "bash -c victim-danger",
-                    "description": "victim approval",
-                    "pattern_keys": ["shell-c"],
-                })
-                attacker_entry = approval_mod._ApprovalEntry({
-                    "command": "bash -c attacker-danger",
-                    "description": "attacker approval",
-                    "pattern_keys": ["shell-c"],
-                })
+                victim_epoch = auth_adapter._run_approval_epochs[victim_run]
+                attacker_epoch = auth_adapter._run_approval_epochs[attacker_run]
+                victim_entry = approval_mod._ApprovalEntry(
+                    {
+                        "command": "bash -c victim-danger",
+                        "description": "victim approval",
+                        "pattern_keys": ["shell-c"],
+                    },
+                    notify_epoch=victim_epoch,
+                )
+                attacker_entry = approval_mod._ApprovalEntry(
+                    {
+                        "command": "bash -c attacker-danger",
+                        "description": "attacker approval",
+                        "pattern_keys": ["shell-c"],
+                    },
+                    notify_epoch=attacker_epoch,
+                )
                 with approval_mod._lock:
-                    approval_mod._gateway_queues[victim_run] = [victim_entry]
-                    approval_mod._gateway_queues[attacker_run] = [attacker_entry]
+                    approval_mod._gateway_queues[victim_run] = {
+                        victim_entry.request.approval_id: victim_entry
+                    }
+                    approval_mod._gateway_queues[attacker_run] = {
+                        attacker_entry.request.approval_id: attacker_entry
+                    }
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{attacker_run}/approval",
                     json={"choice": "always", "resolve_all": True},
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                approval_data = await approval_resp.json()
+
+                assert approval_resp.status == 400
+                assert (
+                    approval_data["error"]["code"]
+                    == "approval_id_required"
+                )
+                assert attacker_entry.result is None
+                assert not attacker_entry.event.is_set()
+
+                approval_resp = await cli.post(
+                    f"/v1/runs/{attacker_run}/approval",
+                    json={
+                        "choice": "always",
+                        "approval_id": attacker_entry.request.approval_id,
+                    },
                     headers={"Authorization": "Bearer sk-secret"},
                 )
                 approval_data = await approval_resp.json()
@@ -391,7 +432,9 @@ class TestRunEvents:
                 assert victim_entry.result is None
                 assert not victim_entry.event.is_set()
                 with approval_mod._lock:
-                    assert approval_mod._gateway_queues[victim_run] == [victim_entry]
+                    assert approval_mod._gateway_queues[victim_run] == {
+                        victim_entry.request.approval_id: victim_entry
+                    }
                     assert victim_run in approval_mod._gateway_queues
                     assert attacker_run not in approval_mod._gateway_queues
 
@@ -430,13 +473,19 @@ class TestRunLifecycleSweep:
                 assert isinstance(task, asyncio.Task)
                 assert not task.done()
 
-                pending = approval_mod._ApprovalEntry({
-                    "command": "bash -c long-running",
-                    "description": "approval after stream TTL",
-                    "pattern_keys": ["shell-c"],
-                })
+                approval_epoch = adapter._run_approval_epochs[run_id]
+                pending = approval_mod._ApprovalEntry(
+                    {
+                        "command": "bash -c long-running",
+                        "description": "approval after stream TTL",
+                        "pattern_keys": ["shell-c"],
+                    },
+                    notify_epoch=approval_epoch,
+                )
                 with approval_mod._lock:
-                    approval_mod._gateway_queues[run_id] = [pending]
+                    approval_mod._gateway_queues[run_id] = {
+                        pending.request.approval_id: pending
+                    }
 
                 adapter._run_streams_created[run_id] -= adapter._RUN_STREAM_TTL + 1
                 # Exercise one real sweeper iteration without waiting 60 seconds.
@@ -459,7 +508,10 @@ class TestRunLifecycleSweep:
 
                 approval_resp = await cli.post(
                     f"/v1/runs/{run_id}/approval",
-                    json={"choice": "once"},
+                    json={
+                        "choice": "once",
+                        "approval_id": pending.request.approval_id,
+                    },
                 )
                 assert approval_resp.status == 200
                 assert pending.event.is_set()
@@ -476,6 +528,66 @@ class TestRunLifecycleSweep:
 
 
 class TestStopRun:
+
+    @pytest.mark.asyncio
+    async def test_stop_before_approval_registration_prevents_agent_start(
+        self,
+        adapter,
+        monkeypatch,
+    ):
+        """A stopped executor cannot publish a fresh approval lease later."""
+        app = _create_runs_app(adapter)
+        register_entered = threading.Event()
+        release_register = threading.Event()
+        real_register = approval_mod.register_gateway_notify
+
+        def blocked_register(*args, **kwargs):
+            register_entered.set()
+            assert release_register.wait(timeout=3)
+            return real_register(*args, **kwargs)
+
+        monkeypatch.setattr(
+            approval_mod,
+            "register_gateway_notify",
+            blocked_register,
+        )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "must not execute"},
+                )
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(
+                    register_entered.wait,
+                    3,
+                )
+
+                stop_response = await cli.post(
+                    f"/v1/runs/{run_id}/stop"
+                )
+                assert stop_response.status == 200
+                release_register.set()
+
+                for _ in range(60):
+                    if run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.05)
+
+                mock_agent.run_conversation.assert_not_called()
+                assert (
+                    adapter._run_statuses[run_id]["status"]
+                    == "cancelled"
+                )
+                assert run_id not in adapter._run_approval_epochs
+                assert run_id not in adapter._run_approval_cancellations
 
     @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):

@@ -18,6 +18,7 @@ import pytest
 from tools import approval as A
 
 BREAKER_MARKER = "CIRCUIT BREAKER:"
+_notify_context_tokens = []
 
 
 @pytest.fixture
@@ -56,26 +57,35 @@ def breaker_session(monkeypatch):
         A._session_approved.get(session_key, set()).discard("execute_code")
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
+        A._gateway_notify_epochs.pop(session_key, None)
     try:
         yield session_key
     finally:
+        while _notify_context_tokens:
+            A.reset_current_gateway_notify_epoch(
+                _notify_context_tokens.pop()
+            )
         A.reset_current_session_key(token)
         A._reset_denials(session_key)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
+            A._gateway_notify_epochs.pop(session_key, None)
 
 
 def _register_resolver(session_key: str, result):
-    """Notify callback resolving the newest queued approval with *result*."""
-    def cb(_approval_data):
-        with A._lock:
-            entries = A._gateway_queues.get(session_key, [])
-            if entries:
-                entries[-1].result = result
-                entries[-1].event.set()
-    with A._lock:
-        A._gateway_notify_cbs[session_key] = cb
+    """Notify callback resolving the exact approval shown to the user."""
+    def cb(approval_data):
+        A.resolve_gateway_approval(
+            session_key,
+            result,
+            approval_id=approval_data["approval_id"],
+        )
+    epoch = A.register_gateway_notify(session_key, cb)
+    assert epoch is not None
+    _notify_context_tokens.append(
+        A.set_current_gateway_notify_epoch(epoch)
+    )
 
 
 def _denied_terminal(command="dangerous thing"):

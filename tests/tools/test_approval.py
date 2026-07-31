@@ -1129,6 +1129,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_notify_epochs.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
@@ -1152,6 +1153,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_notify_epochs.clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -1175,7 +1177,12 @@ class TestApprovalTimeoutIsNotConsent:
 
         # Slack-shaped: notify_cb registered, but user doesn't respond.
         notified = []
-        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        notify_cb = lambda data: notified.append(data)
+        notify_epoch = mod.register_gateway_notify(
+            self.SESSION_KEY,
+            notify_cb,
+        )
+        notify_token = mod.set_current_gateway_notify_epoch(notify_epoch)
 
         hook_calls = []
         original_fire = mod._fire_approval_hook
@@ -1186,7 +1193,10 @@ class TestApprovalTimeoutIsNotConsent:
 
         monkeypatch.setattr(mod, "_fire_approval_hook", _capture)
 
-        result = mod.check_all_command_guards("rm -rf .git", "local")
+        try:
+            result = mod.check_all_command_guards("rm -rf .git", "local")
+        finally:
+            mod.reset_current_gateway_notify_epoch(notify_token)
 
         assert result["approved"] is False
         assert result.get("user_consent") is False
@@ -1219,12 +1229,25 @@ class TestApprovalTimeoutIsNotConsent:
         self._force_short_timeout(monkeypatch, seconds=60)
 
         notified = []
-        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        notify_cb = lambda data: notified.append(data)
+        notify_epoch = mod.register_gateway_notify(
+            self.SESSION_KEY,
+            notify_cb,
+        )
 
         # Spawn the approval wait in a thread, then resolve it with "deny".
         result_holder = {}
         def _check():
-            result_holder["r"] = mod.check_all_command_guards("rm -rf .git", "local")
+            notify_token = mod.set_current_gateway_notify_epoch(
+                notify_epoch
+            )
+            try:
+                result_holder["r"] = mod.check_all_command_guards(
+                    "rm -rf .git",
+                    "local",
+                )
+            finally:
+                mod.reset_current_gateway_notify_epoch(notify_token)
         t = threading.Thread(target=_check)
         t.start()
 
@@ -1233,7 +1256,11 @@ class TestApprovalTimeoutIsNotConsent:
             if mod._gateway_queues.get(self.SESSION_KEY):
                 break
             time.sleep(0.005)
-        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        mod.resolve_gateway_approval(
+            self.SESSION_KEY,
+            "deny",
+            approval_id=notified[0]["approval_id"],
+        )
         t.join(timeout=5)
         assert "r" in result_holder, "approval wait did not return after deny"
 

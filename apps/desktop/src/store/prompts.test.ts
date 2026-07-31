@@ -67,6 +67,42 @@ describe('approval prompt store', () => {
 
     expect($approvalRequest.get()?.allowPermanent).toBe(false)
   })
+
+  it('queues concurrent approvals in one session by exact approval id', () => {
+    setApprovalRequest({
+      approvalId: 'approval-1',
+      command: 'first',
+      description: 'd1',
+      sessionId: 's1'
+    })
+    setApprovalRequest({
+      approvalId: 'approval-2',
+      command: 'second',
+      description: 'd2',
+      sessionId: 's1'
+    })
+
+    expect($approvalRequest.get()?.approvalId).toBe('approval-1')
+    clearApprovalRequest('s1', 'approval-1')
+    expect($approvalRequest.get()?.approvalId).toBe('approval-2')
+    clearApprovalRequest('s1', 'approval-2')
+    expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('does not resurrect a resolved approval when its event is replayed late', () => {
+    const request = {
+      approvalId: 'approval-late-replay',
+      command: 'first',
+      description: 'd1',
+      sessionId: 's1'
+    }
+
+    setApprovalRequest(request)
+    clearApprovalRequest('s1', request.approvalId)
+    setApprovalRequest(request)
+
+    expect($approvalRequest.get()).toBeNull()
+  })
 })
 
 describe('sudo prompt store', () => {
