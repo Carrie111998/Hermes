@@ -663,6 +663,62 @@ class TestInit:
             )
             assert a._use_prompt_caching is True
 
+    def test_prompt_caching_claude_ica_next(self):
+        """Claude model via ICA Next should enable OpenAI-wire prompt caching."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                provider="ica-next",
+                model="claude-opus-5",
+                base_url="https://api.nextgen-beta.ica.ibm.com/ica/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert getattr(a, "_use_prompt_caching") is True
+            assert getattr(a, "_use_native_cache_layout") is False
+
+    def test_prompt_caching_claude_ica_next_by_host(self):
+        """ICA Next host detection covers custom-provider aliases."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                provider="custom",
+                model="claude-sonnet-5",
+                base_url="https://api.nextgen-beta.ica.ibm.com/ica/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert getattr(a, "_use_prompt_caching") is True
+            assert getattr(a, "_use_native_cache_layout") is False
+
+    def test_prompt_caching_non_claude_ica_next(self):
+        """ICA Next cache_control opt-in is Claude-only."""
+        with (
+            patch("run_agent.get_tool_definitions", return_value=[]),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            a = AIAgent(
+                api_key="test-k...7890",
+                provider="ica-next",
+                model="gemini-3.6-flash",
+                base_url="https://api.nextgen-beta.ica.ibm.com/ica/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            assert getattr(a, "_use_prompt_caching") is False
+
     def test_prompt_caching_non_claude(self):
         """Non-Claude model should disable prompt caching."""
         with (

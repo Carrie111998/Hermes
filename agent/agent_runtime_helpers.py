@@ -1860,6 +1860,11 @@ def anthropic_prompt_cache_policy(
     gateway implements the Anthropic cache_control contract
     (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
 
+    IBM ICA Next serves Claude models through an OpenAI-compatible
+    ``chat_completions`` endpoint while still forwarding Anthropic-style
+    ``cache_control`` markers.  That route uses the OpenAI-wire envelope
+    layout, not the native Anthropic Messages layout.
+
     Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
     Alibaba (DashScope) also honour Anthropic-style ``cache_control``
     markers on OpenAI-wire chat completions. Upstream pi-mono #3392 /
@@ -1931,6 +1936,10 @@ def anthropic_prompt_cache_policy(
     # OpenAI-wire envelope cache_control semantics. Treat it as an
     # OpenRouter-equivalent endpoint for caching layout purposes.
     is_nous_portal = "nousresearch" in eff_base_url.lower()
+    is_ica_next = (
+        provider_lower == "ica-next"
+        or base_url_host_matches(eff_base_url, "api.nextgen-beta.ica.ibm.com")
+    )
     is_anthropic_wire = eff_api_mode == "anthropic_messages"
     is_native_anthropic = (
         is_anthropic_wire
@@ -1948,6 +1957,16 @@ def anthropic_prompt_cache_policy(
         and (is_claude or is_kimi)
         and not is_anthropic_wire
     ):
+        return True, False
+    # IBM ICA Next exposes Claude models over an OpenAI-compatible
+    # chat-completions endpoint, but empirical API responses report real
+    # Anthropic cache writes/reads when envelope-layout cache_control markers
+    # are present (cache_creation_input_tokens/cache_read_input_tokens). Without
+    # this branch, Hermes sends no markers for provider=ica-next and every
+    # multi-turn Claude request reprocesses the full conversation prefix. Keep
+    # this Claude-gated: non-Claude ICA models (Gemini/GPT/etc.) use their own
+    # server-side caching semantics and should not receive Anthropic markers.
+    if is_ica_next and is_claude and not is_anthropic_wire:
         return True, False
     # Nous Portal Qwen (e.g. qwen3.6-plus) takes the same envelope-layout
     # cache_control path as Portal Claude. Portal proxies to OpenRouter

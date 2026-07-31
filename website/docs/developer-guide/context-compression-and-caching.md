@@ -456,7 +456,15 @@ The marker is applied differently based on content type:
 
 Prompt caching is automatically enabled when:
 - The model is an Anthropic Claude model (detected by model name)
-- The provider supports `cache_control` (native Anthropic API or OpenRouter)
+- The provider supports `cache_control` (native Anthropic API, OpenRouter,
+  Nous Portal/OpenRouter-compatible routes, or IBM ICA Next Claude routes)
+
+IBM ICA Next (`provider: ica-next`, host `api.nextgen-beta.ica.ibm.com`) serves
+Claude models through an OpenAI-compatible `chat_completions` endpoint, but it
+still honors Anthropic `cache_control` markers. Hermes therefore uses the
+OpenAI-wire/envelope marker layout for ICA Claude models (`native_layout=False`).
+Live verification should show `cache_creation_input_tokens` on the first request
+with a stable prefix and `cache_read_input_tokens` on subsequent requests.
 
 ```yaml
 # config.yaml — TTL is configurable (must be "5m" or "1h")

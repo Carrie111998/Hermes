@@ -52,6 +52,10 @@ class TestBaseUrlHostMatchesExact:
     def test_exact_domain_matches(self):
         assert base_url_host_matches("https://openrouter.ai/api/v1", "openrouter.ai") is True
         assert base_url_host_matches("https://moonshot.ai", "moonshot.ai") is True
+        assert base_url_host_matches(
+            "https://api.nextgen-beta.ica.ibm.com/ica/v1",
+            "api.nextgen-beta.ica.ibm.com",
+        ) is True
 
     def test_subdomain_matches(self):
         # A subdomain of the registered domain should match — needed for
