@@ -413,9 +413,6 @@ _DOWNLOAD_CONNECT_TIMEOUT_SECONDS = 15.0
 # way a stalled save is reported as one, instead of being cancelled mid-write
 # with the call's answer lost.
 _DOWNLOAD_GRACE_SECONDS = 5.0
-# A floor, so a save that only starts near the end of the call still gets a
-# fair attempt at a small clip rather than a timeout of nearly zero.
-_MIN_DOWNLOAD_READ_SECONDS = 10.0
 # A rejection page is a few hundred bytes of XML; a clip is megabytes. Anything
 # smaller than this is not the video, whatever the HTTP status said.
 _MIN_PLAUSIBLE_VIDEO_BYTES = 64 * 1024
@@ -432,9 +429,13 @@ def _download_read_timeout(started: float) -> float:
     is never reached: the bridge kills the call first and the model is told
     only "TimeoutError", with no indication the clip exists and is one poll
     away.
+
+    Must not invent time past what remains: clamping upward used to schedule a
+    download the outer ``asyncio.wait_for`` then cancelled, answering with a
+    false ``_still_generating`` while the job was already Ready.
     """
     left = _CALL_BACKSTOP_SECONDS - (time.monotonic() - started) - _DOWNLOAD_GRACE_SECONDS
-    return max(_MIN_DOWNLOAD_READ_SECONDS, min(_DOWNLOAD_READ_TIMEOUT_SECONDS, left))
+    return max(0.0, min(_DOWNLOAD_READ_TIMEOUT_SECONDS, left))
 
 
 async def _save_if_ready(raw: str, save_to, started: float) -> str:

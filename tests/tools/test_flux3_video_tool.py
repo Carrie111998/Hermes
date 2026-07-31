@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import json
+import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -608,6 +609,15 @@ class TestPollTransport:
         # to answer before model_tools' async bridge abandons the tool at 300s.
         assert _DEFAULT_POLL_BUDGET_SECONDS < _DEFAULT_CALL_BACKSTOP_SECONDS
         assert _DEFAULT_CALL_BACKSTOP_SECONDS < 300.0
+
+    def test_download_timeout_never_outlives_the_backstop(self):
+        # Near the end of the call, remaining budget after grace is a few
+        # seconds. Clamping that up used to schedule a download the outer
+        # wait_for then cancelled, answering "still generating" for a Ready job.
+        started = time.monotonic() - (
+            flux3._CALL_BACKSTOP_SECONDS - flux3._DOWNLOAD_GRACE_SECONDS - 2.0
+        )
+        assert flux3._download_read_timeout(started) <= 2.0 + 0.5  # clock noise only
 
     def test_ready_saves_the_clip_and_never_returns_the_signed_url(self, tmp_path):
         # The signed URL is a bearer credential for the clip and it used to be
