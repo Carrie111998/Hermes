@@ -134,8 +134,10 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     assert args.query == "work kanban task t_spawn_tools"
 
 
-def test_supervised_attempt_one_precreates_and_resumes_exact_session(monkeypatch, tmp_path):
-    """Attempt one is durably selected by --resume, not its evidence env."""
+def test_supervised_attempt_one_precreates_kanban_session_and_preserves_ownership(
+    monkeypatch, tmp_path
+):
+    """Attempt one durably owns a hidden Kanban session selected by --resume."""
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "elias"
     profile.mkdir(parents=True)
@@ -199,6 +201,8 @@ def test_supervised_attempt_one_precreates_and_resumes_exact_session(monkeypatch
 
     assert kb._start_supervised_worker(task, str(workspace)) == FakeProc.pid
     session_id = captured["identity"].session_id
+    assert captured["identity"].task_id == task_id
+    assert captured["identity"].run_id == task.current_run_id
     assert captured["env"]["HERMES_WORKER_SESSION_ID"] == session_id
     assert captured["cmd"].count("--resume") == 1
     assert captured["cmd"][captured["cmd"].index("--resume") + 1] == session_id
@@ -211,10 +215,15 @@ def test_supervised_attempt_one_precreates_and_resumes_exact_session(monkeypatch
     session_db = SessionDB(profile / "state.db")
     try:
         stored = session_db.get_session(session_id)
-        assert stored["source"] == "cli"
+        assert stored["source"] == "kanban"
         assert stored["profile_name"] == "elias"
         assert stored["cwd"] == str(workspace.resolve())
         assert stored["git_repo_root"] == str(workspace.resolve())
+
+        # The resumed worker creates the same row when its CLI startup runs.
+        # SessionDB conflict handling intentionally preserves the first source.
+        session_db.create_session(session_id, source="kanban")
+        assert session_db.get_session(session_id)["source"] == "kanban"
 
         output = []
         probe = CLIAgentSetupMixin()
@@ -232,7 +241,10 @@ def test_supervised_attempt_one_precreates_and_resumes_exact_session(monkeypatch
 
     conn = kb.connect(board_db)
     try:
-        assert kb.get_task(conn, task_id).session_id == session_id
+        projected = kb.get_task(conn, task_id)
+        assert projected.id == task_id
+        assert projected.current_run_id == task.current_run_id
+        assert projected.session_id == session_id
     finally:
         conn.close()
 

@@ -9242,7 +9242,7 @@ def _precreate_supervised_worker_session(
     try:
         session_db.create_session(
             session_id,
-            source="cli",
+            source="kanban",
             cwd=canonical_workspace,
             profile_name=profile_name,
             git_repo_root=canonical_workspace,
