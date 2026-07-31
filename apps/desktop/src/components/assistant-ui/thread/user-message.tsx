@@ -111,10 +111,16 @@ export const UserMessage: FC<{
   const threadRunning = useAuiState(s => s.thread.isRunning)
 
   const latestUserId = useAuiState(s => {
-    for (let i = s.thread.messages.length - 1; i >= 0; i--) {
-      const message = s.thread.messages[i] as { id?: string; role?: string }
+    for (let i = s.thread.messages.length - 1; i >= 0; i -= 1) {
+      const message = s.thread.messages[i] as {
+        id?: string
+        metadata?: { custom?: unknown }
+        role?: string
+      }
 
-      if (message.role === 'user') {
+      const displayKind = (message.metadata?.custom as { displayKind?: unknown } | undefined)?.displayKind
+
+      if (message.role === 'user' && !displayKind) {
         return message.id ?? null
       }
     }
@@ -126,7 +132,9 @@ export const UserMessage: FC<{
     let ordinal = 0
 
     for (const message of s.thread.messages) {
-      if (message.role !== 'user') {
+      const custom = (message.metadata?.custom ?? {}) as { displayKind?: unknown }
+
+      if (message.role !== 'user' || custom.displayKind) {
         continue
       }
 

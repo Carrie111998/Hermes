@@ -17,6 +17,7 @@ import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from 
 
 import {
   appendText,
+  isRealUserMessage,
   isSessionBusyError,
   visibleUserIndexAtOrdinal,
   visibleUserOrdinal,
@@ -179,7 +180,7 @@ export interface RestorePlan {
 
 /** Resolve the user turn to rewind to; throws with a user-facing reason. */
 export function planRestore(messages: ChatMessage[], messageId: string, target?: RestoreTarget): RestorePlan {
-  const idIndex = messages.findIndex(m => m.id === messageId && m.role === 'user')
+  const idIndex = messages.findIndex(m => m.id === messageId && isRealUserMessage(m))
 
   const fallbackIndex =
     target?.userOrdinal === null || target?.userOrdinal === undefined
@@ -199,10 +200,7 @@ export function planRestore(messages: ChatMessage[], messageId: string, target?:
     throw new Error('Cannot restore an empty message.')
   }
 
-  const truncateOrdinal =
-    target?.userOrdinal === null || target?.userOrdinal === undefined
-      ? visibleUserOrdinal(messages, sourceIndex)
-      : target.userOrdinal
+  const truncateOrdinal = visibleUserOrdinal(messages, sourceIndex)
 
   return { sourceIndex, text, truncateOrdinal }
 }
