@@ -783,7 +783,20 @@ function renderNodeToOutput(
         // because the user was at bottom.
         const grew = scrollHeight >= prevScrollHeight
 
-        const atBottom = sticky || (grew && scrollTopBeforeFollow >= prevMaxScroll)
+        // Suppress the positional "at bottom" match for 500ms after a
+        // manual upward scroll action (ScrollBox.scrollBy()/scrollTo(), or
+        // selection auto-scroll -- all set node.recentScrollUpTime). Gated
+        // here, at the SAME condition that controls the scrollTop snap
+        // below, not only the nested stickyScroll-restoration check further
+        // down: that nested check runs AFTER the snap already happened, so
+        // gating only it would leave the position jump completely
+        // unprevented (review of #75439's second finding -- a cooldown on
+        // restoration alone doesn't stop the snap that already occurred).
+        const recentScrollUp = Boolean(
+          node.recentScrollUpTime && Date.now() - node.recentScrollUpTime < 500
+        )
+
+        const atBottom = sticky || (grew && scrollTopBeforeFollow >= prevMaxScroll && !recentScrollUp)
 
         if (atBottom && (node.pendingScrollDelta ?? 0) >= 0) {
           node.scrollTop = maxScroll

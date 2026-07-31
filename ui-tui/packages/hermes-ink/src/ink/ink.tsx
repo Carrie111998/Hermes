@@ -2149,6 +2149,16 @@ export default class Ink {
       }
     }
 
+    // Mark recent scroll-up to suppress the follow-on-scroll snap
+    // (render-node-to-output.ts), mirroring ScrollBox's scrollBy()/
+    // scrollTo() handling. Selection auto-scroll (dragging a text
+    // selection past the viewport edge) also clears stickyScroll and
+    // moves scrollTop directly, without going through either ScrollBox
+    // method, so it needs the same tracking (review of #74742/#75439).
+    if (next < current) {
+      box.recentScrollUpTime = Date.now()
+    }
+
     box.stickyScroll = false
     box.pendingScrollDelta = undefined
     box.scrollAnchor = undefined

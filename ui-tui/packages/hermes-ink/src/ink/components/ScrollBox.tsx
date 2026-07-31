@@ -134,13 +134,27 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
           return
         }
 
+        const targetTop = Math.max(0, Math.floor(y))
+
+        // Mark recent scroll-up to suppress the follow-on-scroll snap,
+        // mirroring scrollBy()'s dy < 0 check below. scrollTo() is an
+        // absolute jump (no delta), so an "upward" movement here means the
+        // new position is above the position we're leaving -- this is what
+        // the transcript mouse scrollbar's drag path calls (review of
+        // #74742/#75439, matching #12884's originally reported
+        // interaction: manual scrollbar scrolling, not just keyboard/wheel
+        // scrollBy()).
+        if (targetTop < (el.scrollTop ?? 0)) {
+          el.recentScrollUpTime = Date.now()
+        }
+
         // Explicit false overrides the DOM attribute so manual scroll
         // breaks stickiness. Render code checks ?? precedence.
         el.stickyScroll = false
         manualScrollAtRef.current = Date.now()
         el.pendingScrollDelta = undefined
         el.scrollAnchor = undefined
-        el.scrollTop = Math.max(0, Math.floor(y))
+        el.scrollTop = targetTop
         scrollMutated(el)
       },
       scrollToElement(el: DOMElement, offset = 0) {
@@ -166,6 +180,15 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
           return
         }
 
+        // Mark recent scroll-up to suppress the follow-on-scroll snap
+        // (render-node-to-output.ts) for a short grace window -- without
+        // this, streaming content arriving right after the user scrolls
+        // up could immediately re-snap the viewport to the bottom,
+        // fighting the user's intent to read earlier content (#12884).
+        if (dy < 0) {
+          el.recentScrollUpTime = Date.now()
+        }
+
         el.stickyScroll = false
         manualScrollAtRef.current = Date.now()
         el.scrollAnchor = undefined
@@ -181,6 +204,9 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
 
         el.pendingScrollDelta = undefined
         el.stickyScroll = true
+        // Explicit, unambiguous return to bottom -- clear any pending
+        // scroll-up suppression so streaming content follows immediately.
+        el.recentScrollUpTime = undefined
         markDirty(el)
         notify()
         forceRender(n => n + 1)

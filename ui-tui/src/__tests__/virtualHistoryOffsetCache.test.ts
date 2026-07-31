@@ -281,4 +281,96 @@ describe('useVirtualHistory offset cache reuse', () => {
       instance.cleanup()
     }
   })
+
+  it(
+    'suppresses the positional follow-on-scroll snap after a manual scrollBy() ' +
+      'scroll-up whose pending delta has not yet drained (issue #12884, review of #75439)',
+    async () => {
+      // scrollBy() does NOT move scrollTop immediately -- it only
+      // accumulates a pendingScrollDelta, applied later during
+      // virtualization's own drain cycle. So right after calling
+      // scrollBy(-N), scrollTop can still read at the OLD max for a
+      // render or two, satisfying the positional "at bottom"
+      // predicate (scrollTopBeforeFollow >= prevMaxScroll) in
+      // render-node-to-output.ts even though the user just initiated
+      // an upward scroll. Without gating that predicate on
+      // recentScrollUpTime, streaming content arriving in that window
+      // immediately re-snaps to the new bottom, discarding the user's
+      // still-pending scroll-up -- the exact #12884 symptom. This is
+      // deliberately scrollBy(), not scrollTo() (which DOES move
+      // scrollTop synchronously and so cannot reach this branch, per
+      // the review's third finding).
+      const initial = Array.from({ length: 30 }, (_, index) => ({ height: 2, key: `a${index}` }))
+      const expose = { current: null as Exposed | null }
+      const streams = makeStreams()
+
+      const instance = renderSync(React.createElement(Harness, { expose, items: initial }), {
+        patchConsole: false,
+        stderr: streams.stderr as NodeJS.WriteStream,
+        stdin: streams.stdin as NodeJS.ReadStream,
+        stdout: streams.stdout as NodeJS.WriteStream
+      })
+
+      try {
+        await delay(20)
+        const scroll = expose.current!.scroll!
+        const bottomBeforeScrollUp = scroll.getScrollTop()
+
+        expect(bottomBeforeScrollUp).toBeGreaterThan(0)
+
+        // Manual scroll-up: sets recentScrollUpTime synchronously, but
+        // scrollTop itself has not moved yet (pendingScrollDelta only).
+        scroll.scrollBy(-4)
+        expect(scroll.getScrollTop()).toBe(bottomBeforeScrollUp)
+        expect(scroll.getPendingDelta()).toBe(-4)
+
+        // Streaming content arrives immediately after (well within the
+        // 500ms grace window, and before the pending delta has drained):
+        // scrollTopBeforeFollow still reads at the OLD max here, so
+        // without the recentScrollUp gate this would satisfy the
+        // positional "at bottom" check and snap to the NEW bottom,
+        // discarding the pending upward delta entirely.
+        const grown = [
+          ...initial,
+          ...Array.from({ length: 5 }, (_, index) => ({ height: 2, key: `b${index}` }))
+        ]
+
+        instance.rerender(React.createElement(Harness, { expose, items: grown }))
+        await delay(20)
+
+        const newBottom =
+          (expose.current!.virtualHistory.offsets[grown.length] ?? 0) - scroll.getViewportHeight()
+
+        expect(scroll.getScrollTop()).not.toBe(newBottom)
+        expect(scroll.getScrollTop()).toBeLessThan(newBottom)
+
+        // Past the 500ms grace window, the user explicitly scrolls back
+        // to the (current) bottom themselves -- recentScrollUpTime has
+        // expired, so the NEXT content growth correctly follows again.
+        await delay(520)
+        const currentBottom =
+          (expose.current!.virtualHistory.offsets[grown.length] ?? 0) - scroll.getViewportHeight()
+
+        scroll.scrollTo(Math.max(0, currentBottom))
+        await delay(20)
+
+        const grownMore = [
+          ...grown,
+          ...Array.from({ length: 5 }, (_, index) => ({ height: 2, key: `c${index}` }))
+        ]
+
+        instance.rerender(React.createElement(Harness, { expose, items: grownMore }))
+        await delay(20)
+
+        const finalTranscriptHeight = expose.current!.virtualHistory.offsets[grownMore.length] ?? 0
+        const expectedBottom = Math.max(0, finalTranscriptHeight - scroll.getViewportHeight())
+
+        expect(scroll.getScrollTop()).toBe(expectedBottom)
+        expect(scroll.getScrollTop()).toBeGreaterThan(0)
+      } finally {
+        instance.unmount()
+        instance.cleanup()
+      }
+    }
+  )
 })

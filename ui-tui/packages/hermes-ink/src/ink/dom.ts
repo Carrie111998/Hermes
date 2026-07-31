@@ -66,6 +66,13 @@ export type DOMElement = {
   scrollViewportHeight?: number
   scrollViewportTop?: number
   stickyScroll?: boolean
+  // Timestamp (Date.now()) of the last manual upward scroll action
+  // (ScrollBox.scrollBy() with dy < 0, ScrollBox.scrollTo() to a lower
+  // position, or selection auto-scroll moving up). render-node-to-output's
+  // follow-on-scroll positional check reads this to avoid immediately
+  // re-snapping to the bottom when new content streams in right after the
+  // user scrolled up (issue #12884). Cleared by scrollToBottom().
+  recentScrollUpTime?: number
   notifyScrollChange?: () => void
   // Set by ScrollBox.scrollToElement; render-node-to-output reads
   // el.yogaNode.getComputedTop() (FRESH — same Yoga pass as scrollHeight)
