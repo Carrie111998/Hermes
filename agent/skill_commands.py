@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import re
+import stat
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +24,16 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_environment: tuple[tuple[str, bool], ...] | None = None
+# The catalog also depends on the active profile's local skills root and its
+# configured external roots.  Keep that part separate from the historical
+# platform/environment fields so older integrations that inspect those fields
+# retain their meaning.
+_skill_commands_roots: tuple[str, ...] | None = None
+# A gateway can serve distinct profile ContextVars concurrently.  Serialise the
+# resolve -> walk -> commit sequence so one request cannot commit a catalog
+# under another request's scope while it is still scanning.
+_skill_commands_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -189,6 +201,86 @@ def _resolve_skill_commands_platform() -> Optional[str]:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
+
+def _resolve_skill_commands_environment() -> tuple[tuple[str, bool], ...]:
+    """Return the offer-time environment state used by the slash catalog."""
+    try:
+        from agent.skill_utils import get_skill_environment_fingerprint
+
+        return get_skill_environment_fingerprint()
+    except Exception:
+        return ()
+
+
+def _canonical_skill_root(path: Path) -> str:
+    """Return a stable, comparison-safe spelling of a configured root."""
+    try:
+        return str(path.expanduser().resolve())
+    except (OSError, RuntimeError):
+        return str(path.expanduser().absolute())
+
+
+def _resolve_skill_command_roots() -> tuple[Path, tuple[Path, ...], tuple[str, ...]]:
+    """Snapshot the live local and external roots for one catalog scan.
+
+    ``tools.skills_tool.SKILLS_DIR`` is a legacy import-time compatibility
+    attribute.  Its ``_skills_dir()`` helper resolves the active
+    profile/HERMES_HOME at call time (while continuing to honour patched
+    ``SKILLS_DIR`` in tests and integrations), so slash discovery must use it
+    too.  Return the actual paths alongside their fingerprint to ensure the
+    scan walks exactly the roots it compared and later commits.
+    """
+    from agent.skill_utils import get_external_skills_dirs
+    from tools.skills_tool import _skills_dir
+
+    primary_root = Path(_skills_dir())
+    external_roots = tuple(Path(path) for path in get_external_skills_dirs())
+    roots = (primary_root, *external_roots)
+    return primary_root, external_roots, tuple(
+        _canonical_skill_root(root) for root in roots
+    )
+
+
+def _skill_command_roots_are_accessible(
+    primary_root: Path, external_roots: tuple[Path, ...]
+) -> bool:
+    """Return whether a cached catalog can still describe this exact root scope.
+
+    A missing *primary* root is the normal empty-local-skills case.  Every
+    other error, and a missing configured external root, means this call cannot
+    prove that its catalog is complete.  In particular, ``Path.exists()`` is
+    deliberately not used here because it turns permission failures into
+    ``False`` and would let an external-only catalog replace or reuse a
+    complete one.
+    """
+    try:
+        primary_stat = primary_root.stat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Primary skill root is inaccessible: %s", exc)
+        return False
+    else:
+        if not stat.S_ISDIR(primary_stat.st_mode):
+            logger.warning("Primary skill root is not a directory: %s", primary_root)
+            return False
+
+    for external_root in external_roots:
+        try:
+            external_stat = external_root.stat()
+        except OSError as exc:
+            # An external root was part of this resolved scope.  Treat removal
+            # the same as denial: returning a cached map would advertise skills
+            # that may no longer be available.
+            logger.warning("External skill root is inaccessible: %s", exc)
+            return False
+        if not stat.S_ISDIR(external_stat.st_mode):
+            logger.warning(
+                "External skill root is not a directory: %s", external_root
+            )
+            return False
+    return True
+
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
     raw_identifier = (skill_identifier or "").strip()
@@ -196,14 +288,17 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
+        from tools.skills_tool import _skills_dir, skill_view
         from agent.skill_utils import normalize_skill_lookup_name
 
         normalized = normalize_skill_lookup_name(raw_identifier)
 
-        loaded_skill = json.loads(
-            skill_view(normalized, task_id=task_id, preprocess=False)
-        )
+        # ``skill_view`` owns the package snapshot for every modern skill.
+        # Keep preprocessing there too: it can expand inline shell while its
+        # dirfd still names the inspected package.  Re-rendering below with a
+        # ``Path`` would reopen a directory an attacker could replace after
+        # this call returned (slash, stacked, and preload all use this path).
+        loaded_skill = json.loads(skill_view(normalized, task_id=task_id))
     except Exception:
         return None
 
@@ -222,7 +317,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         skill_dir = Path(abs_skill_dir)
     elif skill_path:
         try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
+            skill_dir = _skills_dir() / Path(skill_path).parent
         except Exception:
             skill_dir = None
 
@@ -277,25 +372,27 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
+    from tools.skills_tool import _skills_dir
 
     content = str(loaded_skill.get("content") or "")
 
-    # ── Template substitution and inline-shell expansion ──
-    # Done before anything else so downstream blocks (setup notes,
-    # supporting-file hints) see the expanded content.
-    skills_cfg = _load_skills_config()
-    if skills_cfg.get("template_vars", True):
-        content = _substitute_template_vars(content, skill_dir, session_id)
-    if skills_cfg.get("inline_shell", False):
-        timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
-        content = _expand_inline_shell(content, skill_dir, timeout)
+    # Modern skill_view payloads were rendered while their package dirfd was
+    # bound to the discovery snapshot.  Do not use the returned path to run
+    # inline shell after that fd has been closed.  Keep this legacy fallback
+    # for integrations which construct a payload directly.
+    if not loaded_skill.get("preprocessed"):
+        skills_cfg = _load_skills_config()
+        if skills_cfg.get("template_vars", True):
+            content = _substitute_template_vars(content, skill_dir, session_id)
+        if skills_cfg.get("inline_shell", False):
+            timeout = int(skills_cfg.get("inline_shell_timeout", 10) or 10)
+            content = _expand_inline_shell(content, skill_dir, timeout)
 
     parts = [activation_note, "", content.strip()]
 
     # ── Inject the absolute skill directory so the agent can reference
     #    bundled scripts without an extra skill_view() round-trip. ──
-    if skill_dir:
+    if skill_dir and not loaded_skill.get("package_bound"):
         parts.append("")
         parts.append(f"[Skill directory: {skill_dir}]")
         parts.append(
@@ -335,18 +432,56 @@ def _build_skill_message(
         if isinstance(entries, list):
             supporting.extend(entries)
 
-    if not supporting and skill_dir:
-        for subdir in ("references", "templates", "scripts", "assets"):
-            subdir_path = skill_dir / subdir
-            if subdir_path.exists():
-                for f in sorted(subdir_path.rglob("*")):
-                    if f.is_file() and not f.is_symlink():
-                        rel = str(f.relative_to(skill_dir))
-                        supporting.append(rel)
+    if not supporting and skill_dir and not loaded_skill.get("package_bound"):
+        try:
+            from tools.skills_tool import build_linked_files_manifest
+
+            linked_files, fallback_summary = build_linked_files_manifest(skill_dir)
+            for entries in linked_files.values():
+                supporting.extend(entries)
+            if not loaded_skill.get("linked_files_summary"):
+                loaded_skill["linked_files_summary"] = fallback_summary
+        except Exception:
+            logger.debug(
+                "Could not build linked-file manifest for %s",
+                skill_dir,
+                exc_info=True,
+            )
 
     if supporting and skill_dir:
+        # A bound package must not advertise mutable absolute paths for direct
+        # execution.  Support files remain readable through a fresh, checked
+        # skill_view request, which binds its own package snapshot.
+        if loaded_skill.get("package_bound"):
+            skill_view_target = str(
+                loaded_skill.get("lookup_name") or loaded_skill.get("name") or "skill"
+            )
+            parts.append("")
+            parts.append("[This skill has supporting files:]")
+            for sf in supporting:
+                parts.append(f"- {sf}")
+            parts.append(
+                f'\nLoad any of these with skill_view(name="{skill_view_target}", '
+                'file_path="<path>").'
+            )
+            linked_summary = loaded_skill.get("linked_files_summary") or {}
+            if linked_summary.get("truncated"):
+                categories = ", ".join(linked_summary.get("truncated_categories") or [])
+                suffix = f" ({categories})" if categories else ""
+                parts.append(
+                    "[Supporting-file preview truncated"
+                    f"{suffix}; use skill_view with an explicit file_path for files "
+                    "not shown.]"
+                )
+            if user_instruction:
+                parts.append("")
+                parts.append(f"The user has provided the following instruction alongside the skill invocation: {user_instruction}")
+            if runtime_note:
+                parts.append("")
+                parts.append(f"[Runtime note: {runtime_note}]")
+            return "\n".join(parts)
         try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
+            skill_view_target = str(skill_dir.relative_to(_skills_dir()))
         except ValueError:
             # Skill is from an external dir — use the skill name instead
             skill_view_target = skill_dir.name
@@ -359,6 +494,15 @@ def _build_skill_message(
             f'file_path="<path>"), or run scripts directly by absolute path '
             f"(e.g. `node {skill_dir}/scripts/foo.js`)."
         )
+        linked_summary = loaded_skill.get("linked_files_summary") or {}
+        if linked_summary.get("truncated"):
+            categories = ", ".join(linked_summary.get("truncated_categories") or [])
+            suffix = f" ({categories})" if categories else ""
+            parts.append(
+                "[Supporting-file preview truncated"
+                f"{suffix}; use skill_view with an explicit file_path for files "
+                "not shown.]"
+            )
 
     if user_instruction:
         parts.append("")
@@ -377,109 +521,206 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands = {}
-    try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
-        from hermes_cli.commands import resolve_command
-        disabled = _get_disabled_skill_names()
-        seen_names: set = set()
+    global _skill_commands, _skill_commands_platform, _skill_commands_environment, _skill_commands_roots
+    with _skill_commands_lock:
+        resolved_platform = _resolve_skill_commands_platform()
+        resolved_environment = _resolve_skill_commands_environment()
+        try:
+            primary_root, external_roots, resolved_roots = _resolve_skill_command_roots()
+        except Exception:
+            logger.warning(
+                "Skill command root resolution failed; refusing a stale catalog",
+                exc_info=True,
+            )
+            return {}
 
-        # Scan local dir first, then external dirs
-        dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
-        dirs_to_scan.extend(get_external_skills_dirs())
+        previous_scope_matches = (
+            _skill_commands_platform == resolved_platform
+            and _skill_commands_environment == resolved_environment
+            and _skill_commands_roots == resolved_roots
+        )
+        new_commands: Dict[str, Dict[str, Any]] = {}
+        scan_incomplete = False
+        root_scan_failed = False
 
-        for scan_dir in dirs_to_scan:
-            for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
-                if any(part in {'.git', '.github', '.hub', '.archive'} for part in skill_md.parts):
-                    continue
+        def mark_scan_incomplete(error: OSError) -> None:
+            nonlocal scan_incomplete
+            scan_incomplete = True
+            logger.warning("Skill command directory scan was incomplete: %s", error)
+
+        try:
+            from tools.skills_tool import (
+                _get_disabled_skill_names,
+                skill_matches_environment,
+                skill_matches_platform,
+            )
+            from agent.skill_utils import (
+                iter_skill_index_files,
+                read_strict_skill_index_file,
+            )
+            from hermes_cli.commands import resolve_command
+
+            disabled = _get_disabled_skill_names()
+            seen_names: set = set()
+            dirs_to_scan = []
+            try:
+                primary_stat = primary_root.stat()
+            except FileNotFoundError:
+                # A first-run profile need not have created its local skills
+                # directory yet; it is an empty local root, not a partial scan.
+                primary_stat = None
+            except OSError as exc:
+                root_scan_failed = True
+                mark_scan_incomplete(exc)
+                primary_stat = None
+            if primary_stat is not None and stat.S_ISDIR(primary_stat.st_mode):
+                dirs_to_scan.append(primary_root)
+            elif primary_stat is not None:
+                root_scan_failed = True
+                mark_scan_incomplete(
+                    NotADirectoryError(
+                        f"Primary skill root is not a directory: {primary_root}"
+                    )
+                )
+
+            for external_root in external_roots:
                 try:
-                    content = skill_md.read_text(encoding='utf-8')
-                    frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
-                    if not skill_matches_platform(frontmatter):
-                        continue
-                    # Skip skills not relevant to the current runtime env
-                    # (kanban/docker/s6). Offer-time only; explicit load bypasses.
-                    if not skill_matches_environment(frontmatter):
-                        continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
-                    if name in disabled:
-                        continue
-                    description = frontmatter.get('description', '')
-                    if not description:
-                        for line in body.strip().split('\n'):
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                description = line[:80]
-                                break
-                    seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
-                    if not cmd_name:
-                        continue
-                    # Skip if this skill's auto-generated /command collides
-                    # with a core Hermes slash command (name or alias). The
-                    # skill remains fully loadable via /skill <name>.
-                    # Uses resolve_command() so aliases and case variants are
-                    # covered without maintaining a separate cache.
-                    if resolve_command(cmd_name) is not None:
-                        logger.warning(
-                            "Skill %r generates slash command '/%s' which "
-                            "collides with a core Hermes command; skipping "
-                            "auto-registration. Use '/skill %s' instead.",
-                            name, cmd_name, name,
-                        )
-                        continue
-                    # Dedup on the resolved slug, not just the raw name: two
-                    # distinct frontmatter names can normalize to the same
-                    # slug (e.g. "git_helper" vs "git-helper"). First-wins
-                    # preserves local-before-external precedence.
-                    cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
-                        logger.warning(
-                            "Skill %r maps to slash command %s already claimed "
-                            "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
-                        )
-                        continue
-                    _skill_commands[cmd_key] = {
-                        "name": name,
-                        "description": description or f"Invoke the {name} skill",
-                        "skill_md_path": str(skill_md),
-                        "skill_dir": str(skill_md.parent),
-                    }
-                except Exception:
+                    external_stat = external_root.stat()
+                except OSError as exc:
+                    # This path has already been selected into the scope.  A
+                    # concurrent deletion is just as incomplete as a permission
+                    # failure: do not publish an external-only subset.
+                    root_scan_failed = True
+                    mark_scan_incomplete(exc)
                     continue
-    except Exception:
-        pass
-    return _skill_commands
+                if stat.S_ISDIR(external_stat.st_mode):
+                    dirs_to_scan.append(external_root)
+                else:
+                    root_scan_failed = True
+                    mark_scan_incomplete(
+                        NotADirectoryError(
+                            f"External skill root is not a directory: {external_root}"
+                        )
+                    )
+
+            # Walk the exact root snapshot that forms this cache scope.  A
+            # subsequent request with another profile cannot interleave here:
+            # the lock covers both this walk and the final global commit.
+            for scan_dir in dirs_to_scan:
+                for skill_md in iter_skill_index_files(
+                    scan_dir, "SKILL.md", on_error=mark_scan_incomplete
+                ):
+                    if any(
+                        part in {".git", ".github", ".hub", ".archive"}
+                        for part in skill_md.parts
+                    ):
+                        continue
+                    try:
+                        _, frontmatter, body = read_strict_skill_index_file(skill_md)
+                        if not skill_matches_platform(frontmatter):
+                            continue
+                        if not skill_matches_environment(frontmatter):
+                            continue
+                        name = frontmatter.get("name", skill_md.parent.name)
+                        if name in seen_names or name in disabled:
+                            continue
+                        description = frontmatter.get("description", "")
+                        if not description:
+                            for line in body.strip().split("\n"):
+                                line = line.strip()
+                                if line and not line.startswith("#"):
+                                    description = line[:80]
+                                    break
+                        seen_names.add(name)
+                        cmd_name = name.lower().replace(" ", "-").replace("_", "-")
+                        cmd_name = _SKILL_INVALID_CHARS.sub("", cmd_name)
+                        cmd_name = _SKILL_MULTI_HYPHEN.sub("-", cmd_name).strip("-")
+                        if not cmd_name:
+                            continue
+                        if resolve_command(cmd_name) is not None:
+                            logger.warning(
+                                "Skill %r generates slash command '/%s' which "
+                                "collides with a core Hermes command; skipping "
+                                "auto-registration. Use '/skill %s' instead.",
+                                name,
+                                cmd_name,
+                                name,
+                            )
+                            continue
+                        cmd_key = f"/{cmd_name}"
+                        if cmd_key in new_commands:
+                            logger.warning(
+                                "Skill %r maps to slash command %s already claimed "
+                                "by %r; keeping the first and skipping this one.",
+                                name,
+                                cmd_key,
+                                new_commands[cmd_key]["name"],
+                            )
+                            continue
+                        new_commands[cmd_key] = {
+                            "name": name,
+                            "description": description or f"Invoke the {name} skill",
+                            "skill_md_path": str(skill_md),
+                            "skill_dir": str(skill_md.parent),
+                        }
+                    except Exception:
+                        scan_incomplete = True
+                        logger.warning(
+                            "Skipping unreadable skill command source %s",
+                            skill_md,
+                            exc_info=True,
+                        )
+        except Exception:
+            logger.warning(
+                "Skill command scan failed; keeping the previous catalog",
+                exc_info=True,
+            )
+            return _skill_commands if previous_scope_matches else {}
+
+        if root_scan_failed:
+            logger.warning(
+                "Skill command root scan was incomplete; refusing the cached catalog"
+            )
+            return {}
+
+        if scan_incomplete:
+            logger.warning("Skill command scan was incomplete; keeping the previous catalog")
+            return _skill_commands if previous_scope_matches else {}
+
+        _skill_commands = new_commands
+        _skill_commands_platform = resolved_platform
+        _skill_commands_environment = resolved_environment
+        _skill_commands_roots = resolved_roots
+        return _skill_commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    Rescans when the active platform scope or offer-time runtime environment
+    changes, so long-lived processes do not retain a stale filtered view.
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
-    return _skill_commands
+    with _skill_commands_lock:
+        try:
+            primary_root, external_roots, resolved_roots = _resolve_skill_command_roots()
+        except Exception:
+            logger.warning(
+                "Skill command root resolution failed; refusing a stale catalog",
+                exc_info=True,
+            )
+            return {}
+        if not _skill_command_roots_are_accessible(primary_root, external_roots):
+            # Re-run the protected scanner so it records the failure under the
+            # same lock and declines a stale exact-scope cache.
+            return scan_skill_commands()
+        if (
+            not _skill_commands
+            or _skill_commands_platform != _resolve_skill_commands_platform()
+            or _skill_commands_environment != _resolve_skill_commands_environment()
+            or _skill_commands_roots != resolved_roots
+        ):
+            return scan_skill_commands()
+        return _skill_commands
 
 
 def reload_skills() -> Dict[str, Any]:

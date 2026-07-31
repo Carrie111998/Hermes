@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -30,12 +31,45 @@ def hermes_home(tmp_path):
 
 class TestGetExternalSkillsDirs:
     def test_empty_config(self, hermes_home):
-        (hermes_home / "config.yaml").write_text("skills:\n  external_dirs: []\n")
+        (hermes_home / "config.yaml").write_text(
+            "skills:\n  external_dirs: []\n", encoding="utf-8"
+        )
         with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
             from agent.skill_utils import get_external_skills_dirs
             result = get_external_skills_dirs()
         assert result == []
 
+    def test_nonexistent_dir_remains_in_configured_scope(self, hermes_home):
+        (hermes_home / "config.yaml").write_text(
+            "skills:\n  external_dirs:\n    - /nonexistent/path\n"
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            from agent.skill_utils import get_external_skills_dirs
+            result = get_external_skills_dirs()
+        assert result == [Path("/nonexistent/path")]
+
+    def test_non_directory_remains_configured_but_is_not_scannable(
+        self, hermes_home, tmp_path
+    ):
+        configured_file = tmp_path / "not-a-skills-dir"
+        configured_file.write_text("not a directory", encoding="utf-8")
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {configured_file}\n"
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            from agent.skill_utils import (
+                get_external_skills_dirs,
+                get_scannable_external_skills_dirs,
+            )
+
+            errors = []
+            configured = get_external_skills_dirs()
+            scannable = get_scannable_external_skills_dirs(on_error=errors.append)
+
+        assert configured == [configured_file.resolve()]
+        assert scannable == []
+        assert len(errors) == 1
+        assert isinstance(errors[0], NotADirectoryError)
 
     def test_valid_dir_returned(self, hermes_home, external_skills_dir):
         (hermes_home / "config.yaml").write_text(

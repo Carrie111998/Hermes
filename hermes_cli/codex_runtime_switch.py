@@ -263,13 +263,13 @@ def apply(
             "(terminal/file ops/patching inside Codex; "
             "Hermes tools available via MCP callback)."
         )
-        msg_lines.append(
-            "Effective on next session — current cached agent keeps "
-            "the prior runtime to preserve prompt cache."
-        )
     else:
         msg_lines.append("OpenAI/Codex turns will use the default Hermes runtime.")
-        msg_lines.append("Effective on next session.")
+    msg_lines.append(
+        "Saved for the next session — the current Hermes session keeps "
+        "its existing runtime to preserve prompt cache and conversation "
+        "continuity. Run `/new` or `/reset` to apply this change."
+    )
     return CodexRuntimeStatus(
         success=True,
         new_value=new_value,

@@ -143,6 +143,9 @@ class TestApply:
         assert "Default sandbox: :workspace" in r.message
         # Hermes tool callback announcement
         assert "via MCP" in r.message
+        assert "current Hermes session keeps its existing runtime" in r.message
+        assert "`/new` or `/reset`" in r.message
+        assert r.requires_new_session is True
 
     def test_disable_does_not_trigger_migration(self):
         """Switching back to auto must not write to ~/.codex/."""
@@ -154,6 +157,9 @@ class TestApply:
             r = crs.apply(cfg, "auto")
         assert r.success
         assert not mig.called  # disabling does not migrate
+        assert "current Hermes session keeps its existing runtime" in r.message
+        assert "`/new` or `/reset`" in r.message
+        assert r.requires_new_session is True
 
     def test_migration_failure_does_not_block_enable(self):
         """If MCP migration raises, the runtime change still proceeds —
@@ -168,5 +174,4 @@ class TestApply:
         assert r.new_value == "codex_app_server"
         assert "MCP migration skipped" in r.message
         assert "disk full" in r.message
-
 

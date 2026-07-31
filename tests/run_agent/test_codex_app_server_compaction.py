@@ -1,5 +1,6 @@
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -113,7 +114,11 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():
     agent = DummyAgent(
-        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=True,
+        )
     )
     agent._codex_session = SlowCodexSession(
         agent._codex_session.result,
@@ -142,6 +147,177 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
 
 
 
+@pytest.mark.parametrize(
+    ("auto_compaction", "force"),
+    [
+        ("hermes", False),
+        ("native", True),
+        ("off", True),
+    ],
+)
+def test_codex_app_server_without_thread_uses_builtin_compressor(
+    auto_compaction,
+    force,
+):
+    """Preflight/hygiene must not count a missing Codex thread as compaction."""
+    agent = MagicMock()
+    agent.api_mode = "codex_app_server"
+    agent.codex_app_server_auto_compaction = auto_compaction
+    agent._codex_session = None
+    agent.session_id = "hermes-session-1"
+    agent.platform = "cli"
+    agent.model = "test/model"
+    agent.provider = "test"
+    agent.tools = []
+    agent._compression_feasibility_checked = True
+    agent.compression_in_place = True
+    agent._memory_manager = None
+    agent._session_db = None
+    agent._memory_store = None
+    agent._memory_enabled = False
+    agent._user_profile_enabled = False
+    agent._todo_store = MagicMock()
+    agent._todo_store.format_for_injection.return_value = ""
+    agent._cached_system_prompt = "cached prompt"
+    agent.context_compressor = MagicMock()
+    compressed = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "assistant", "content": "recent reply"},
+    ]
+    agent.context_compressor.compress.return_value = compressed
+    agent.context_compressor.compression_count = 1
+    agent.context_compressor.last_compression_rough_tokens = 0
+    agent.context_compressor._last_compress_aborted = False
+    agent.context_compressor._last_summary_error = None
+    messages = [{"role": "user", "content": f"message {i}"} for i in range(8)]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=force,
+    )
+
+    assert returned == compressed
+    assert prompt == "cached prompt"
+    agent.context_compressor.compress.assert_called_once()
+
+
+@pytest.mark.parametrize("auto_compaction", ["native", "off"])
+def test_codex_app_server_auto_without_thread_skips_builtin_compressor(
+    auto_compaction,
+):
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1"),
+        auto_compaction=auto_compaction,
+    )
+    agent._codex_session = None
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent.context_compressor.compression_count == 0
+
+
+def test_codex_app_server_off_mode_force_with_thread_uses_native_compaction():
+    agent = DummyAgent(
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=True,
+        ),
+        auto_compaction="off",
+    )
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 1
+    assert agent.context_compressor.compression_count == 1
+
+
+def test_codex_app_server_compression_failure_preserves_bookkeeping():
+    agent = DummyAgent(TurnResult(error="compact failed"))
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 1
+    assert agent.context_compressor.compression_count == 0
+    assert agent.context_compressor.last_prompt_tokens == 123
+    assert agent.warnings
+    assert agent.touch_calls[0] == "context compression started"
+    assert agent.touch_calls[-1] == "context compression failed"
+    assert agent.status_events == [
+        ("lifecycle", COMPACTION_STATUS),
+        ("warn", "⚠ Codex app-server compaction failed: compact failed"),
+        ("compacted", COMPACTION_DONE_STATUS),
+    ]
+
+
+def test_codex_app_server_compaction_requires_context_compaction_event():
+    agent = DummyAgent(
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            compacted=False,
+        )
+    )
+    messages = [{"role": "user", "content": "hi"}]
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+        force=True,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent.context_compressor.compression_count == 0
+    assert agent.warnings == [
+        "⚠ Codex app-server compaction failed: Codex completed the compact "
+        "turn without the required contextCompaction event"
+    ]
+    assert agent.touch_calls[-1] == "context compression failed"
+
+
+def test_forced_compaction_record_does_not_manufacture_missing_boundary():
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
+    )
+
+    assert _record_codex_app_server_compaction(
+        agent,
+        agent._codex_session.result,
+        force=True,
+    ) is False
+    assert agent.context_compressor.compression_count == 0
 
 
 

@@ -187,11 +187,17 @@ class TestSaveRouting:
     def test_async_mode_enqueues(self, make_manager):
         mgr = make_manager(write_frequency="async")
         sess = self._make_session_with_message(mgr)
-        with patch.object(mgr, "_flush_session") as mock_flush:
+        # Keep the consumer stopped so this test observes the enqueue itself
+        # instead of racing the background writer as it drains the queue.
+        with (
+            patch.object(mgr, "_ensure_async_writer") as mock_start,
+            patch.object(mgr, "_flush_session") as mock_flush,
+        ):
             mgr.save(sess)
             # flush_session should NOT be called synchronously
             mock_flush.assert_not_called()
-        assert not mgr._async_queue.empty()
+            mock_start.assert_called_once_with()
+        assert mgr._async_queue.get_nowait() is sess
 
     def test_int_frequency_flushes_on_nth_turn(self, make_manager):
         mgr = make_manager(write_frequency=3)
@@ -455,4 +461,3 @@ class TestPrefetchCacheAccessors:
 
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
-

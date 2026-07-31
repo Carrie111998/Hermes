@@ -66,9 +66,14 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import errno
 import json
 import logging
+import shlex
+import stat
+import tempfile
 import time
+from contextvars import ContextVar, Token
 
 from hermes_constants import get_hermes_home, display_hermes_home
 import os
@@ -83,9 +88,20 @@ from utils import env_var_enabled
 from agent.skill_utils import (
     EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS,
     is_skill_support_path as _is_skill_support_path,
+    parse_strict_fenced_frontmatter,
+    read_strict_skill_index_file,
 )
 
 logger = logging.getLogger(__name__)
+_OS_OPEN_SUPPORTS_DIR_FD = os.open in getattr(os, "supports_dir_fd", set())
+_SECURE_PACKAGE_OPEN_SUPPORTED = (
+    os.name == "nt"
+    or (
+        _OS_OPEN_SUPPORTS_DIR_FD
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_DIRECTORY")
+    )
+)
 
 # Per-session skill discovery cache.  _find_all_skills() re-reads every
 # SKILL.md on every call; with hundreds of skills this is wasteful.
@@ -102,8 +118,16 @@ _SKILLS_CACHE_TTL_SECONDS = 30.0
 _SKILLS_CACHE_KEY_DISABLED = "with_disabled"
 _SKILLS_CACHE_KEY_FILTERED = "filtered"
 
+# Linked-file manifests are discovery hints, not a directory dump. Keep each
+# category bounded so a skill with a large assets tree cannot flood a tool
+# result or slash-invocation message. Explicit ``skill_view(file_path=...)``
+# remains unrestricted by this preview budget.
+MAX_LINKED_FILES_PER_CATEGORY = 50
+MAX_LINKED_FILE_PATH_CHARS = 8_000
+_LINKED_FILE_CATEGORIES = ("references", "templates", "scripts", "assets")
 
-def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
+
+def _skills_scan_signature(dirs_to_scan, disabled, *, on_error=None) -> tuple:
     """Cheap change-signature for the skill scan inputs.
 
     O(#dirs + #categories) stat calls, not a recursive walk. Includes the
@@ -118,7 +142,9 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
     for d in dirs_to_scan:
         try:
             m = d.stat().st_mtime
-        except OSError:
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
             continue
         try:
             with os.scandir(d) as it:
@@ -128,12 +154,734 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
                             em = entry.stat(follow_symlinks=False).st_mtime
                             if em > m:
                                 m = em
-                    except OSError:
+                    except OSError as exc:
+                        if on_error is not None:
+                            on_error(exc)
                         continue
-        except OSError:
-            pass
+        except OSError as exc:
+            if on_error is not None:
+                on_error(exc)
         sig.append((str(d), m))
-    return (tuple(sig), frozenset(disabled), platform)
+    return (
+        tuple(sig),
+        frozenset(disabled),
+        platform,
+        _skill_utils.get_skill_environment_fingerprint(),
+    )
+
+
+def _validate_configured_external_roots() -> tuple[List[Path], Optional[Dict[str, Any]]]:
+    """Return scannable configured roots or a structured scope error.
+
+    Configured roots are discovery inputs even when they are unavailable.
+    Callers must not silently omit one and publish a local-only catalog.
+    """
+    from agent.skill_utils import get_external_skills_dirs
+
+    roots = [Path(root) for root in get_external_skills_dirs()]
+    for root in roots:
+        try:
+            root_stat = root.stat()
+        except OSError as exc:
+            return roots, {
+                "success": False,
+                "error_code": "skills_discovery_incomplete",
+                "error": f"Configured external skills root is unavailable: {root}",
+                "detail": str(exc),
+            }
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return roots, {
+                "success": False,
+                "error_code": "skills_discovery_incomplete",
+                "error": f"Configured external skills root is not a directory: {root}",
+            }
+    return roots, None
+
+
+def build_linked_files_manifest(
+    skill_dir: Path,
+) -> tuple[Dict[str, List[str]], Dict[str, Any]]:
+    """Build a deterministic, bounded preview of a skill's support files.
+
+    The manifest is intentionally shallow in output size while still walking
+    nested support directories. Directory symlinks are not followed. The
+    returned summary tells callers when additional files remain discoverable
+    through an explicit ``skill_view(..., file_path=...)`` call.
+    """
+    linked_files: Dict[str, List[str]] = {}
+    truncated_categories: List[str] = []
+    shown = 0
+    path_chars = 0
+
+    for category in _LINKED_FILE_CATEGORIES:
+        category_dir = skill_dir / category
+        if category_dir.is_symlink() or not category_dir.is_dir():
+            continue
+
+        entries: List[str] = []
+        category_truncated = False
+        stop_category = False
+        for root, dirs, files in os.walk(category_dir, followlinks=False):
+            dirs[:] = sorted(
+                d for d in dirs if not (Path(root) / d).is_symlink()
+            )
+            for filename in sorted(files):
+                file_path = Path(root) / filename
+                if file_path.is_symlink() or not file_path.is_file():
+                    continue
+                rel = file_path.relative_to(skill_dir).as_posix()
+                if (
+                    len(entries) >= MAX_LINKED_FILES_PER_CATEGORY
+                    or path_chars + len(rel) > MAX_LINKED_FILE_PATH_CHARS
+                ):
+                    category_truncated = True
+                    stop_category = True
+                    break
+                entries.append(rel)
+                shown += 1
+                path_chars += len(rel)
+            if stop_category:
+                break
+
+        if entries:
+            linked_files[category] = entries
+        if category_truncated:
+            truncated_categories.append(category)
+
+    return linked_files, {
+        "shown": shown,
+        "truncated": bool(truncated_categories),
+        "truncated_categories": truncated_categories,
+        "per_category_limit": MAX_LINKED_FILES_PER_CATEGORY,
+        "path_char_limit": MAX_LINKED_FILE_PATH_CHARS,
+    }
+
+
+def _stat_signature(value) -> Tuple[int, int, int, int, int]:
+    """Stable identity/content metadata used for bound skill-package reads."""
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _package_signature(path: Path) -> Tuple[int, int, int, int, int]:
+    """Return package metadata from the same no-reparse primitive used to open it."""
+    if os.name == "nt":
+        from tools.nt_secure_fs_optional import open_directory
+
+        with open_directory(path, writable=False) as package:
+            return package.stat().signature
+    return _stat_signature(path.stat())
+
+
+def _bound_open_flags(*, directory: bool) -> int:
+    """Return fail-closed POSIX flags for a package-relative open."""
+    if not hasattr(os, "O_NOFOLLOW") or (directory and not hasattr(os, "O_DIRECTORY")):
+        raise OSError("secure package-relative opens are unsupported on this platform")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    if directory:
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _open_bound_package_dir(
+    skill_dir: Path,
+    expected_signature: Tuple[int, int, int, int, int],
+) -> Any:
+    """Open the already-discovered package and verify its directory identity."""
+    if os.name == "nt":
+        from tools.nt_secure_fs_optional import open_directory
+
+        package_handle = open_directory(skill_dir, writable=False)
+        try:
+            if package_handle.stat().signature != expected_signature:
+                raise RuntimeError("skill package changed during loading")
+            return package_handle
+        except Exception:
+            package_handle.close()
+            raise
+
+    package_fd = os.open(skill_dir, _bound_open_flags(directory=True))
+    try:
+        if _stat_signature(os.fstat(package_fd)) != expected_signature:
+            raise RuntimeError("skill package changed during loading")
+        if not _OS_OPEN_SUPPORTS_DIR_FD:
+            raise OSError("secure package-relative opens are unsupported")
+        return package_fd
+    except Exception:
+        os.close(package_fd)
+        raise
+
+
+def _close_bound_handle(handle: Any) -> None:
+    if os.name == "nt":
+        handle.close()
+    else:
+        os.close(handle)
+
+
+def _bound_handle_signature(handle: Any) -> Tuple[int, int, int, int, int]:
+    if os.name == "nt":
+        return handle.stat().signature
+    return _stat_signature(os.fstat(handle))
+
+
+def _bound_relative_parts(file_path: str) -> Tuple[str, ...]:
+    """Normalize a support path without consulting the mutable package path."""
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("File path must be a non-empty relative path.")
+    windows_path = PureWindowsPath(file_path)
+    normalized = file_path.replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    if (
+        windows_path.is_absolute()
+        or windows_path.drive
+        or posix_path.is_absolute()
+    ):
+        raise ValueError("File path must stay within the skill directory.")
+    if ".." in posix_path.parts:
+        raise ValueError("Path traversal ('..') is not allowed.")
+    if any(part in ("", ".") for part in posix_path.parts):
+        raise ValueError("File path must stay within the skill directory.")
+    return tuple(posix_path.parts)
+
+
+def _read_bound_support_file(
+    package_fd: Any,
+    file_path: str,
+    expected_package_signature: Tuple[int, int, int, int, int],
+) -> tuple[bytes, os.stat_result]:
+    """Read a regular support file through openat without following symlinks."""
+    parts = _bound_relative_parts(file_path)
+    if os.name == "nt":
+        from tools.nt_secure_fs_optional import read_regular_file
+
+        current = package_fd
+        opened = []
+        try:
+            for part in parts[:-1]:
+                current = current.open_dir(part, writable=False)
+                opened.append(current)
+            payload, metadata = read_regular_file(current, parts[-1])
+            if package_fd.stat().signature != expected_package_signature:
+                raise RuntimeError("skill package changed during loading")
+            return payload, metadata
+        finally:
+            for handle in reversed(opened):
+                handle.close()
+
+    current_fd = os.dup(package_fd)
+    file_fd = None
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(
+                part,
+                _bound_open_flags(directory=True),
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+
+        file_fd = os.open(
+            parts[-1],
+            _bound_open_flags(directory=False),
+            dir_fd=current_fd,
+        )
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("Requested support path is not a regular file.")
+        chunks = []
+        while True:
+            chunk = os.read(file_fd, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        if _stat_signature(before) != _stat_signature(after):
+            raise RuntimeError("support file changed during loading")
+        if _stat_signature(os.fstat(package_fd)) != expected_package_signature:
+            raise RuntimeError("skill package changed during loading")
+        return b"".join(chunks), after
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(current_fd)
+
+
+def _build_bound_linked_files_manifest(
+    package_fd: Any,
+    expected_package_signature: Tuple[int, int, int, int, int],
+) -> tuple[Dict[str, List[str]], Dict[str, Any]]:
+    """Build the linked-file preview entirely below a bound package dirfd."""
+    linked_files: Dict[str, List[str]] = {}
+    truncated_categories: List[str] = []
+    shown = 0
+    path_chars = 0
+
+    if os.name == "nt":
+        def walk_nt(directory, relative: str, entries: List[str]) -> bool:
+            nonlocal shown, path_chars
+            before = directory.stat().signature
+            for entry in sorted(
+                directory.list_entries(), key=lambda item: item.name.casefold()
+            ):
+                if entry.is_reparse:
+                    continue
+                rel = f"{relative}/{entry.name}"
+                if entry.is_dir:
+                    with directory.open_dir(
+                        entry.name, writable=False
+                    ) as child:
+                        if walk_nt(child, rel, entries):
+                            return True
+                    continue
+                if (
+                    len(entries) >= MAX_LINKED_FILES_PER_CATEGORY
+                    or path_chars + len(rel) > MAX_LINKED_FILE_PATH_CHARS
+                ):
+                    return True
+                entries.append(rel)
+                shown += 1
+                path_chars += len(rel)
+            if before != directory.stat().signature:
+                raise RuntimeError(
+                    "support directory changed while building manifest"
+                )
+            return False
+
+        for category in _LINKED_FILE_CATEGORIES:
+            try:
+                category_handle = package_fd.open_dir(
+                    category, writable=False
+                )
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            try:
+                entries: List[str] = []
+                category_truncated = walk_nt(
+                    category_handle, category, entries
+                )
+            finally:
+                category_handle.close()
+            if entries:
+                linked_files[category] = entries
+            if category_truncated:
+                truncated_categories.append(category)
+        if package_fd.stat().signature != expected_package_signature:
+            raise RuntimeError("skill package changed while building manifest")
+        return linked_files, {
+            "shown": shown,
+            "truncated": bool(truncated_categories),
+            "truncated_categories": truncated_categories,
+            "per_category_limit": MAX_LINKED_FILES_PER_CATEGORY,
+            "path_char_limit": MAX_LINKED_FILE_PATH_CHARS,
+        }
+
+    def _walk_bound_dir(
+        directory_fd: int,
+        prefix: str,
+        entries: List[str],
+    ) -> bool:
+        nonlocal shown, path_chars
+        before = _stat_signature(os.fstat(directory_fd))
+        truncated = False
+        with os.scandir(directory_fd) as iterator:
+            children = sorted(iterator, key=lambda entry: entry.name)
+        for entry in children:
+            entry_stat = entry.stat(follow_symlinks=False)
+            rel = f"{prefix}/{entry.name}"
+            if stat.S_ISLNK(entry_stat.st_mode):
+                continue
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    _bound_open_flags(directory=True),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    if _walk_bound_dir(child_fd, rel, entries):
+                        truncated = True
+                        break
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                continue
+            if (
+                len(entries) >= MAX_LINKED_FILES_PER_CATEGORY
+                or path_chars + len(rel) > MAX_LINKED_FILE_PATH_CHARS
+            ):
+                truncated = True
+                break
+            entries.append(rel)
+            shown += 1
+            path_chars += len(rel)
+        if before != _stat_signature(os.fstat(directory_fd)):
+            raise RuntimeError("skill support directory changed during loading")
+        return truncated
+
+    for category in _LINKED_FILE_CATEGORIES:
+        try:
+            category_fd = os.open(
+                category,
+                _bound_open_flags(directory=True),
+                dir_fd=package_fd,
+            )
+        except OSError:
+            # Missing, inaccessible, and symlinked support categories are not
+            # part of the manifest, matching the historical path-based helper.
+            continue
+        try:
+            entries: List[str] = []
+            category_truncated = _walk_bound_dir(category_fd, category, entries)
+        finally:
+            os.close(category_fd)
+        if entries:
+            linked_files[category] = entries
+        if category_truncated:
+            truncated_categories.append(category)
+
+    if _stat_signature(os.fstat(package_fd)) != expected_package_signature:
+        raise RuntimeError("skill package changed during loading")
+    return linked_files, {
+        "shown": shown,
+        "truncated": bool(truncated_categories),
+        "truncated_categories": truncated_categories,
+        "per_category_limit": MAX_LINKED_FILES_PER_CATEGORY,
+        "path_char_limit": MAX_LINKED_FILE_PATH_CHARS,
+    }
+
+
+def _expand_inline_shell_bound(
+    content: str,
+    package_fd: Any,
+    timeout: int,
+    *,
+    skill_dir: Path,
+    session_id: Optional[str] = None,
+    template_vars: bool = True,
+) -> str:
+    """Expand inline shell without reopening the mutable package path.
+
+    Template variables in prose use the display path, while variables inside
+    commands use a stable handle-relative location. This distinction must be
+    made before command execution: globally substituting the package path and
+    rewriting it afterwards reintroduces a package-swap race.
+    """
+    from agent import skill_preprocessing
+
+    inline_shell_re = re.compile(r"!`([^`\n]+)`")
+
+    def _substitute_prose(value: str) -> str:
+        if not template_vars:
+            return value
+        pieces: List[str] = []
+        cursor = 0
+        for match in inline_shell_re.finditer(value):
+            pieces.append(
+                skill_preprocessing.substitute_template_vars(
+                    value[cursor:match.start()], skill_dir, session_id
+                )
+            )
+            pieces.append(match.group(0))
+            cursor = match.end()
+        pieces.append(
+            skill_preprocessing.substitute_template_vars(
+                value[cursor:], skill_dir, session_id
+            )
+        )
+        return "".join(pieces)
+
+    content = _substitute_prose(content)
+
+    snapshot_limits = {
+        "max_depth": 32,
+        "max_entries": 4096,
+        "max_file_bytes": 16 * 1024 * 1024,
+        "max_total_bytes": 64 * 1024 * 1024,
+    }
+
+    def _copy_posix_directory(
+        source_fd: int,
+        destination: Path,
+        *,
+        state: Optional[Dict[str, int]] = None,
+        depth: int = 0,
+    ) -> None:
+        if depth > snapshot_limits["max_depth"]:
+            raise OSError("skill snapshot exceeds the safe nesting limit")
+        if state is None:
+            state = {"entries": 0, "bytes": 0}
+        before = _stat_signature(os.fstat(source_fd))
+        destination.mkdir(mode=0o700)
+        for entry in os.scandir(source_fd):
+            state["entries"] += 1
+            if state["entries"] > snapshot_limits["max_entries"]:
+                raise OSError("skill snapshot exceeds the safe entry limit")
+            entry_stat = os.stat(
+                entry.name,
+                dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+            target = destination / entry.name
+            if stat.S_ISDIR(entry_stat.st_mode):
+                child_fd = os.open(
+                    entry.name,
+                    _bound_open_flags(directory=True),
+                    dir_fd=source_fd,
+                )
+                try:
+                    if _stat_signature(os.fstat(child_fd)) != (
+                        _stat_signature(entry_stat)
+                    ):
+                        raise RuntimeError(
+                            "skill package changed while snapshotting"
+                        )
+                    _copy_posix_directory(
+                        child_fd,
+                        target,
+                        state=state,
+                        depth=depth + 1,
+                    )
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(entry_stat.st_mode):
+                raise OSError(
+                    f"refusing non-regular inline-shell input: {entry.name}"
+                )
+            file_fd = os.open(
+                entry.name,
+                _bound_open_flags(directory=False)
+                | getattr(os, "O_NONBLOCK", 0),
+                dir_fd=source_fd,
+            )
+            try:
+                file_before = os.fstat(file_fd)
+                if not stat.S_ISREG(file_before.st_mode):
+                    raise OSError(
+                        f"refusing non-regular inline-shell input: "
+                        f"{entry.name}"
+                    )
+                if _stat_signature(file_before) != _stat_signature(entry_stat):
+                    raise RuntimeError(
+                        "skill file changed while snapshotting"
+                    )
+                if file_before.st_size > snapshot_limits["max_file_bytes"]:
+                    raise OSError(
+                        f"skill snapshot file is too large: {entry.name}"
+                    )
+                with target.open("xb") as destination_file:
+                    copied = 0
+                    while True:
+                        chunk = os.read(file_fd, 64 * 1024)
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if (
+                            copied > snapshot_limits["max_file_bytes"]
+                            or state["bytes"] + copied
+                            > snapshot_limits["max_total_bytes"]
+                        ):
+                            raise OSError(
+                                "skill snapshot exceeds the safe byte limit"
+                            )
+                        destination_file.write(chunk)
+                if _stat_signature(os.fstat(file_fd)) != (
+                    _stat_signature(file_before)
+                ):
+                    raise RuntimeError(
+                        "skill file changed while snapshotting"
+                    )
+                state["bytes"] += copied
+                target.chmod(stat.S_IMODE(file_before.st_mode))
+            finally:
+                os.close(file_fd)
+        if _stat_signature(os.fstat(source_fd)) != before:
+            raise RuntimeError("skill package changed while snapshotting")
+
+    # Both platforms execute from a handle-derived snapshot. Besides avoiding
+    # path replacement, this keeps ${HERMES_SKILL_DIR} stable even when a
+    # command changes cwd before using it.
+    with tempfile.TemporaryDirectory(
+        prefix=".skill-inline-"
+    ) as temp_dir:
+        snapshot = Path(temp_dir) / "skill"
+        if os.name == "nt":
+            from tools.nt_secure_fs_optional import copy_tree_no_reparse
+
+            copy_tree_no_reparse(package_fd, snapshot)
+        else:
+            _copy_posix_directory(package_fd, snapshot)
+
+        snapshot_shell_path = (
+            str(snapshot).replace("\\", "/")
+            if os.name == "nt"
+            else str(snapshot)
+        )
+
+        def _escape_shell_value(
+            value: str,
+            *,
+            in_single_quote: bool,
+            in_double_quote: bool,
+        ) -> str:
+            if in_single_quote:
+                return value.replace("'", "'\"'\"'")
+            if in_double_quote:
+                return (
+                    value.replace("\\", "\\\\")
+                    .replace('"', '\\"')
+                    .replace("$", "\\$")
+                    .replace("`", "\\`")
+                )
+            return shlex.quote(value)
+
+        def _substitute_command_template_vars(command: str) -> str:
+            if not template_vars:
+                return command
+            values = {
+                "${HERMES_SKILL_DIR}": snapshot_shell_path,
+                "${HERMES_SESSION_ID}": (
+                    str(session_id) if session_id is not None else None
+                ),
+            }
+            rendered: List[str] = []
+            index = 0
+            in_single_quote = False
+            in_double_quote = False
+            escaped = False
+            while index < len(command):
+                matched_token = next(
+                    (
+                        token
+                        for token in values
+                        if command.startswith(token, index)
+                    ),
+                    None,
+                )
+                if matched_token is not None:
+                    value = values[matched_token]
+                    if value is None:
+                        rendered.append(matched_token)
+                    else:
+                        rendered.append(
+                            _escape_shell_value(
+                                value,
+                                in_single_quote=in_single_quote,
+                                in_double_quote=in_double_quote,
+                            )
+                        )
+                    index += len(matched_token)
+                    continue
+
+                character = command[index]
+                rendered.append(character)
+                if escaped:
+                    escaped = False
+                elif character == "\\" and not in_single_quote:
+                    escaped = True
+                elif character == "'" and not in_double_quote:
+                    in_single_quote = not in_single_quote
+                elif character == '"' and not in_single_quote:
+                    in_double_quote = not in_double_quote
+                index += 1
+            return "".join(rendered)
+
+        def _replace_command_literal_path(
+            command: str,
+            bound_path: str,
+        ) -> str:
+            rendered: List[str] = []
+            index = 0
+            in_single_quote = False
+            in_double_quote = False
+            escaped = False
+            bound_length = len(bound_path)
+            while index < len(command):
+                candidate = command[index:index + bound_length]
+                matches = (
+                    candidate.casefold() == bound_path.casefold()
+                    if os.name == "nt"
+                    else candidate == bound_path
+                )
+                if matches:
+                    rendered.append(
+                        _escape_shell_value(
+                            snapshot_shell_path,
+                            in_single_quote=in_single_quote,
+                            in_double_quote=in_double_quote,
+                        )
+                    )
+                    index += bound_length
+                    continue
+                character = command[index]
+                rendered.append(character)
+                if escaped:
+                    escaped = False
+                elif character == "\\" and not in_single_quote:
+                    escaped = True
+                elif character == "'" and not in_double_quote:
+                    in_single_quote = not in_single_quote
+                elif character == '"' and not in_single_quote:
+                    in_double_quote = not in_double_quote
+                index += 1
+            return "".join(rendered)
+
+        def _bind_command(match: re.Match) -> str:
+            command = match.group(1)
+            command = _substitute_command_template_vars(command)
+            # A skill may predate the template token and embed its own package
+            # path literally. Keep that legacy form bound too; otherwise a
+            # rename/recreate race can make `cd <skill_dir>` enter an attacker
+            # replacement even though cwd initially points at the snapshot.
+            bound_path_spellings = {str(skill_dir)}
+            if os.name == "nt":
+                bound_path_spellings.add(str(package_fd.final_path()))
+                bound_path_spellings.update(
+                    path.replace("\\", "/")
+                    for path in tuple(bound_path_spellings)
+                )
+            for bound_path in sorted(
+                bound_path_spellings, key=len, reverse=True
+            ):
+                command = _replace_command_literal_path(
+                    command, bound_path
+                )
+            return f"!`{command}`"
+
+        bound_content = inline_shell_re.sub(_bind_command, content)
+        expanded_content = skill_preprocessing.expand_inline_shell(
+            bound_content, snapshot, timeout
+        )
+        # Preserve the historical user-facing path in command output (notably
+        # `pwd`) without ever exposing that mutable path to command execution.
+        snapshot_spellings = {
+            str(snapshot),
+            str(snapshot.resolve()),
+            snapshot.as_posix(),
+        }
+        if os.name == "nt":
+            windows_snapshot = PureWindowsPath(snapshot)
+            if windows_snapshot.drive.endswith(":"):
+                drive = windows_snapshot.drive[0].lower()
+                posix_snapshot = windows_snapshot.as_posix()
+                snapshot_spellings.add(
+                    f"/{drive}{posix_snapshot[len(windows_snapshot.drive):]}"
+                )
+        for snapshot_spelling in sorted(
+            snapshot_spellings, key=len, reverse=True
+        ):
+            expanded_content = expanded_content.replace(
+                snapshot_spelling, str(skill_dir)
+            )
+        return expanded_content
 
 
 # All skills live in ~/.hermes/skills/ (seeded from bundled skills/ on install).
@@ -174,6 +922,11 @@ _REMOTE_ENV_BACKENDS = frozenset(
     {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
 )
 _secret_capture_callback = None
+# Keep the historical process default for CLI callers, but isolate gateway
+# turns: multiple desktop sessions can ask for different secrets concurrently.
+_secret_capture_callback_context: ContextVar = ContextVar(
+    "skills_secret_capture_callback", default=None
+)
 
 
 def _skill_lookup_path_error(name: str) -> Optional[str]:
@@ -242,8 +995,23 @@ _INJECTION_PATTERNS: list = [
 
 
 def set_secret_capture_callback(callback) -> None:
+    """Set the legacy process-default callback (CLI compatibility)."""
     global _secret_capture_callback
     _secret_capture_callback = callback
+
+
+def set_secret_capture_callback_context(callback) -> Token:
+    """Install a secret callback for only the current thread/context."""
+    return _secret_capture_callback_context.set(callback)
+
+
+def reset_secret_capture_callback_context(token: Token) -> None:
+    """Restore the prior thread/context-local callback."""
+    _secret_capture_callback_context.reset(token)
+
+
+def _current_secret_capture_callback():
+    return _secret_capture_callback_context.get() or _secret_capture_callback
 
 
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
@@ -427,7 +1195,8 @@ def _capture_required_environment_variables(
             "gateway_setup_hint": _gateway_setup_hint(),
         }
 
-    if _secret_capture_callback is None:
+    callback = _current_secret_capture_callback()
+    if callback is None:
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -445,7 +1214,7 @@ def _capture_required_environment_variables(
             metadata["required_for"] = entry["required_for"]
 
         try:
-            callback_result = _secret_capture_callback(
+            callback_result = callback(
                 entry["name"],
                 entry["prompt"],
                 metadata,
@@ -683,27 +1452,91 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """
     from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
 
-    cache_key = _SKILLS_CACHE_KEY_DISABLED if skip_disabled else _SKILLS_CACHE_KEY_FILTERED
+    cache_kind = (
+        _SKILLS_CACHE_KEY_DISABLED
+        if skip_disabled
+        else _SKILLS_CACHE_KEY_FILTERED
+    )
 
     # Load disabled set once (not per-skill). Part of the cache signature:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
+    scan_incomplete = False
+    external_root_failed = False
+
+    def _mark_scan_incomplete(error) -> None:
+        nonlocal scan_incomplete
+        scan_incomplete = True
+        logger.debug("Skills discovery scan incomplete: %s", error)
+
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
-    # SKILLS_DIR can be stale in long-lived runtimes).
+    # SKILLS_DIR can be stale in long-lived runtimes). Keep the active root in
+    # the cache scope even when it cannot be stat'ed: otherwise an I/O error
+    # can silently turn a local+external catalog into an external-only cache.
     dirs_to_scan: list = []
     active_skills_dir = _skills_dir()
-    if active_skills_dir.exists():
-        dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    scope_dirs: list = [active_skills_dir]
+    try:
+        active_stat = active_skills_dir.stat()
+    except FileNotFoundError:
+        # A missing local skills root is an ordinary empty catalog, not a
+        # partial scan. skills_list creates it later when appropriate.
+        pass
+    except OSError as exc:
+        _mark_scan_incomplete(exc)
+    else:
+        if stat.S_ISDIR(active_stat.st_mode):
+            dirs_to_scan.append(active_skills_dir)
+        else:
+            _mark_scan_incomplete(
+                NotADirectoryError(
+                    f"Local skills root is not a directory: {active_skills_dir}"
+                )
+            )
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    external_dirs = get_external_skills_dirs()
+    scope_dirs.extend(external_dirs)
+    for external_dir in external_dirs:
+        try:
+            external_stat = external_dir.stat()
+        except OSError as exc:
+            external_root_failed = True
+            _mark_scan_incomplete(exc)
+            continue
+        if not stat.S_ISDIR(external_stat.st_mode):
+            external_root_failed = True
+            _mark_scan_incomplete(
+                NotADirectoryError(
+                    f"External skills root is not a directory: {external_dir}"
+                )
+            )
+            continue
+        dirs_to_scan.append(external_dir)
+
+    # Keep last-good results scoped to the exact discovery inputs. In
+    # particular, a failed scan after a profile/root switch must never return
+    # the old profile's skills just because both use the same cache kind.
+    from agent import skill_utils as _skill_utils
+
+    platform = getattr(getattr(_skill_utils, "sys", None), "platform", "")
+    cache_key = (
+        cache_kind,
+        tuple(str(directory) for directory in scope_dirs),
+        frozenset(disabled),
+        platform,
+        _skill_utils.get_skill_environment_fingerprint(),
+    )
+    signature = _skills_scan_signature(
+        dirs_to_scan, disabled, on_error=_mark_scan_incomplete
+    )
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
     if (
-        cached is not None
+        not scan_incomplete
+        and cached is not None
         and cached[0] == signature
         and (now - cached[1]) < _SKILLS_CACHE_TTL_SECONDS
     ):
@@ -718,15 +1551,19 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # Scan local dir first, then external dirs (local takes precedence) —
     # dirs_to_scan already resolved above for the signature.
     for scan_dir in dirs_to_scan:
-        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+        for skill_md in iter_skill_index_files(
+            scan_dir, "SKILL.md", on_error=_mark_scan_incomplete
+        ):
             if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
                 continue
 
             skill_dir = skill_md.parent
 
             try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
-                frontmatter, body = _parse_frontmatter(content)
+                # Do not follow a canonical SKILL.md symlink.  A package may
+                # be discovered through a configured category symlink, but
+                # its active entry file itself must remain in that package.
+                _, frontmatter, body = read_strict_skill_index_file(skill_md)
 
                 if not skill_matches_platform(frontmatter):
                     continue
@@ -762,12 +1599,27 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
             except (UnicodeDecodeError, PermissionError) as e:
                 logger.debug("Failed to read skill file %s: %s", skill_md, e)
+                _mark_scan_incomplete(e)
                 continue
             except Exception as e:
                 logger.debug(
                     "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
                 )
+                _mark_scan_incomplete(e)
                 continue
+
+    if scan_incomplete:
+        # Do not cache a catalog that omitted a directory or file. A same-scope
+        # completed catalog is safe to serve until the transient failure clears;
+        # otherwise return no listing rather than a misleading partial one.
+        # A configured external root that is itself unavailable is stricter:
+        # advertising its old entries is not a usable catalog, so fail closed
+        # even when an exact-scope cache exists.
+        if external_root_failed:
+            return []
+        if cached is not None:
+            return [dict(s) for s in cached[2]]
+        return []
 
     # Store in cache keyed by the scan signature computed BEFORE the scan
     # (a write racing the scan changes the signature, so the next call
@@ -798,17 +1650,33 @@ def skills_list(category: str = None, task_id: str = None) -> str:
     """
     try:
         active_skills_dir = _skills_dir()
-        if not active_skills_dir.exists():
+        _external_roots, external_root_error = _validate_configured_external_roots()
+        if external_root_error is not None:
+            return json.dumps(external_root_error, ensure_ascii=False)
+        try:
+            active_stat = active_skills_dir.stat()
+        except FileNotFoundError:
             active_skills_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
             return json.dumps(
                 {
-                    "success": True,
-                    "skills": [],
-                    "categories": [],
-                    "message": f"No skills found. Skills directory created at {display_hermes_home()}/skills/",
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": f"Local skills root is unavailable: {active_skills_dir}",
+                    "detail": str(exc),
                 },
                 ensure_ascii=False,
             )
+        else:
+            if not stat.S_ISDIR(active_stat.st_mode):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error_code": "skills_discovery_incomplete",
+                        "error": f"Local skills root is not a directory: {active_skills_dir}",
+                    },
+                    ensure_ascii=False,
+                )
 
         # Find all skills
         all_skills = _find_all_skills()
@@ -859,10 +1727,17 @@ def _serve_plugin_skill(
     namespace: str,
     bare: str,
     *,
+    file_path: str | None = None,
     preprocess: bool = True,
     session_id: str | None = None,
 ) -> str:
-    """Read a plugin-provided skill, apply guards, return JSON."""
+    """Read a plugin skill through a bound package snapshot.
+
+    Plugin registry entries are paths, not capabilities.  Never use the
+    registry path for a later ``read_text``/preprocessor cwd: a directory or
+    symlink replacement between those operations could otherwise serve one
+    package and execute another.
+    """
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
 
     if namespace in _get_disabled_plugins():
@@ -877,19 +1752,76 @@ def _serve_plugin_skill(
             ensure_ascii=False,
         )
 
-    try:
-        content = skill_md.read_text(encoding="utf-8")
-    except Exception as e:
+    if not _SECURE_PACKAGE_OPEN_SUPPORTED:
         return json.dumps(
-            {"success": False, "error": f"Failed to read skill '{namespace}:{bare}': {e}"},
+            {
+                "success": False,
+                "error": (
+                    "Secure plugin-skill package binding is unsupported on "
+                    "this platform; refusing inline-capable plugin skill."
+                ),
+            },
             ensure_ascii=False,
         )
 
-    parsed_frontmatter: Dict[str, Any] = {}
     try:
-        parsed_frontmatter, _ = _parse_frontmatter(content)
-    except Exception:
-        pass
+        # Resolve once, then bind the resolved directory with O_NOFOLLOW and
+        # compare the descriptor identity to the pre-open snapshot.  This is
+        # the same package-identity contract as local skill_view.
+        package_path = skill_md.parent.resolve(strict=True)
+        package_signature = _package_signature(package_path)
+        package_fd = _open_bound_package_dir(package_path, package_signature)
+        try:
+            skill_bytes, _ = _read_bound_support_file(
+                package_fd, skill_md.name, package_signature
+            )
+            content = skill_bytes.decode("utf-8")
+            linked_files, linked_files_summary = _build_bound_linked_files_manifest(
+                package_fd, package_signature
+            )
+            support_bytes = None
+            support_stat = None
+            support_error = None
+            if file_path:
+                try:
+                    support_bytes, support_stat = _read_bound_support_file(
+                        package_fd,
+                        file_path,
+                        package_signature,
+                    )
+                except Exception as exc:
+                    support_error = exc
+        finally:
+            _close_bound_handle(package_fd)
+    except Exception as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Failed to bind skill '{namespace}:{bare}' to its "
+                    f"package snapshot: {e}"
+                ),
+            },
+            ensure_ascii=False,
+        )
+
+    try:
+        parsed_frontmatter, _ = parse_strict_fenced_frontmatter(content)
+        if parsed_frontmatter:
+            # Retain parser compatibility side effects without accepting its
+            # permissive malformed-YAML fallback as the authority.
+            _parse_frontmatter(content)
+    except Exception as e:
+        return json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Plugin skill '{namespace}:{bare}' has invalid "
+                    f"frontmatter: {e}"
+                ),
+            },
+            ensure_ascii=False,
+        )
 
     if not skill_matches_platform(parsed_frontmatter):
         return json.dumps(
@@ -897,6 +1829,52 @@ def _serve_plugin_skill(
                 "success": False,
                 "error": f"Skill '{namespace}:{bare}' is not supported on this platform.",
                 "readiness_status": SkillReadinessStatus.UNSUPPORTED.value,
+            },
+            ensure_ascii=False,
+        )
+
+    if file_path:
+        if support_error is not None or support_bytes is None or support_stat is None:
+            available = [
+                entry
+                for entries in linked_files.values()
+                for entry in entries
+            ]
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"File '{file_path}' is not safely readable within "
+                        f"plugin skill '{namespace}:{bare}': {support_error}"
+                    ),
+                    "available_files": available,
+                    "linked_files_summary": linked_files_summary,
+                },
+                ensure_ascii=False,
+            )
+        try:
+            support_content = support_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return json.dumps(
+                {
+                    "success": True,
+                    "name": f"{namespace}:{bare}",
+                    "file": file_path,
+                    "content": (
+                        f"[Binary file: {PurePosixPath(file_path).name}, "
+                        f"size: {support_stat.st_size} bytes]"
+                    ),
+                    "is_binary": True,
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "success": True,
+                "name": f"{namespace}:{bare}",
+                "file": file_path,
+                "content": support_content,
+                "file_type": PurePosixPath(file_path.replace("\\", "/")).suffix,
             },
             ensure_ascii=False,
         )
@@ -933,16 +1911,43 @@ def _serve_plugin_skill(
     rendered_content = content
     if preprocess:
         try:
-            from agent.skill_preprocessing import preprocess_skill_content
+            from agent import skill_preprocessing
 
-            rendered_content = preprocess_skill_content(
-                content,
-                skill_md.parent,
-                session_id=session_id,
+            preprocessing_config = skill_preprocessing.load_skills_config()
+            (
+                template_vars_enabled,
+                inline_shell_enabled,
+                timeout,
+            ) = skill_preprocessing.normalize_preprocessing_config(
+                preprocessing_config
             )
-        except Exception:
-            logger.debug(
-                "Could not preprocess plugin skill %s:%s", namespace, bare, exc_info=True
+            if inline_shell_enabled:
+                package_fd = _open_bound_package_dir(package_path, package_signature)
+                try:
+                    rendered_content = _expand_inline_shell_bound(
+                        rendered_content,
+                        package_fd,
+                        timeout,
+                        skill_dir=package_path,
+                        session_id=session_id,
+                        template_vars=template_vars_enabled,
+                    )
+                finally:
+                    _close_bound_handle(package_fd)
+            elif template_vars_enabled:
+                rendered_content = skill_preprocessing.substitute_template_vars(
+                    rendered_content, package_path, session_id
+                )
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Could not preprocess plugin skill {namespace}:{bare} "
+                        f"from its bound package: {e}"
+                    ),
+                },
+                ensure_ascii=False,
             )
 
     return json.dumps(
@@ -951,7 +1956,12 @@ def _serve_plugin_skill(
             "name": f"{namespace}:{bare}",
             "content": f"{banner}{rendered_content}" if banner else rendered_content,
             "description": description,
-            "linked_files": None,
+            "skill_dir": str(package_path),
+            "lookup_name": f"{namespace}:{bare}",
+            "package_bound": True,
+            "preprocessed": bool(preprocess),
+            "linked_files": linked_files or None,
+            "linked_files_summary": linked_files_summary,
             "readiness_status": SkillReadinessStatus.AVAILABLE.value,
         },
         ensure_ascii=False,
@@ -973,8 +1983,7 @@ def skill_view(
         file_path: Optional path to a specific file within the skill (e.g., "references/api.md")
         task_id: Optional task identifier used to probe the active backend
         preprocess: Apply configured SKILL.md template and inline shell rendering
-            to main skill content. Internal slash/preload callers disable this
-            because they render the skill message themselves.
+            to main skill content while its package snapshot remains bound.
 
     Returns:
         JSON string with skill content or error message
@@ -1040,6 +2049,7 @@ def skill_view(
                     plugin_skill_md,
                     namespace,
                     bare,
+                    file_path=file_path,
                     preprocess=preprocess,
                     session_id=task_id,
                 )
@@ -1063,8 +2073,6 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs
-
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
         if local_category_name:
@@ -1079,12 +2087,41 @@ def skill_view(
                     ensure_ascii=False,
                 )
 
-        # Build list of all skill directories to search
+        # Build list of all skill directories to search. Validate the complete
+        # configured external scope before looking for a local match; otherwise
+        # a missing external root could hide a collision and load the wrong
+        # skill.
         all_dirs = []
         active_skills_dir = _skills_dir()
-        if active_skills_dir.exists():
+        try:
+            active_stat = active_skills_dir.stat()
+        except FileNotFoundError:
+            active_stat = None
+        except OSError as exc:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": f"Local skills root is unavailable: {active_skills_dir}",
+                    "detail": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        if active_stat is not None and not stat.S_ISDIR(active_stat.st_mode):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": f"Local skills root is not a directory: {active_skills_dir}",
+                },
+                ensure_ascii=False,
+            )
+        if active_stat is not None:
             all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        external_dirs, external_root_error = _validate_configured_external_roots()
+        if external_root_error is not None:
+            return json.dumps(external_root_error, ensure_ascii=False)
+        all_dirs.extend(external_dirs)
 
         if not all_dirs:
             return json.dumps(
@@ -1106,81 +2143,273 @@ def skill_view(
         # loaded the other) so we surface it loudly instead of guessing.
         from agent.skill_utils import iter_skill_index_files
 
-        candidates: List[Tuple[Optional[Path], Path]] = []  # (skill_dir, skill_md)
-        seen_md: set = set()
+        # Bind candidates to the exact regular-file bytes inspected during
+        # discovery. Configured roots may legitimately be directory symlinks,
+        # but a symlink/package swap must not redirect the later load.
+        candidates: List[Tuple[Optional[Path], Path, Dict[str, Any]]] = []
+        seen_file_identities: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+        seen_path_identities: Dict[str, Tuple[int, ...]] = {}
+        discovery_errors: List[str] = []
 
-        def _record(sd: Optional[Path], smd: Path) -> None:
+        def _record_discovery_error(context: str, exc: BaseException) -> None:
+            """Remember a scan failure instead of accepting a partial index."""
+            detail = f"{context}: {exc}"
+            if detail not in discovery_errors:
+                discovery_errors.append(detail)
+
+        def _is_directory_for_discovery(path: Path, context: str) -> bool:
             try:
-                key = smd.resolve()
-            except Exception:
-                key = smd
-            if key in seen_md:
+                return stat.S_ISDIR(path.stat().st_mode)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                _record_discovery_error(context, exc)
+                return False
+
+        def _is_regular_file_for_discovery(path: Path, context: str) -> bool:
+            try:
+                return stat.S_ISREG(path.stat().st_mode)
+            except FileNotFoundError:
+                return False
+            except OSError as exc:
+                _record_discovery_error(context, exc)
+                return False
+
+        def _read_discovery_snapshot(path: Path) -> Optional[Dict[str, Any]]:
+            """Open, strictly parse, and identity-bind one skill index file."""
+            try:
+                if os.name == "nt":
+                    from tools.nt_secure_fs_optional import (
+                        open_directory,
+                        read_regular_file,
+                    )
+
+                    package_path = path.parent.resolve(strict=True)
+                    with open_directory(
+                        package_path, writable=False
+                    ) as package:
+                        parent_metadata = package.stat()
+                        payload, file_metadata = read_regular_file(
+                            package, path.name
+                        )
+                        fm_content = payload.decode("utf-8")
+                        fm, _ = parse_strict_fenced_frontmatter(fm_content)
+                        if fm:
+                            _parse_frontmatter(fm_content)
+
+                        # The supported configured/category alias must still
+                        # resolve to the held package after parsing, and its
+                        # canonical file must still be the object read above.
+                        current_package_path = path.parent.resolve(strict=True)
+                        with open_directory(
+                            current_package_path, writable=False
+                        ) as current_package:
+                            if (
+                                current_package.identity
+                                != parent_metadata.identity
+                            ):
+                                raise RuntimeError(
+                                    "skill package changed during discovery"
+                                )
+                            with current_package.open_file(
+                                path.name, writable=False
+                            ) as current_file:
+                                if (
+                                    current_file.identity
+                                    != file_metadata.identity
+                                ):
+                                    raise RuntimeError(
+                                        "skill file changed during discovery"
+                                    )
+                        return {
+                            "content": fm_content,
+                            "frontmatter": fm,
+                            "identity": file_metadata.identity,
+                            "package_signature": parent_metadata.signature,
+                            "package_path": str(package_path),
+                            "signature": file_metadata.signature,
+                        }
+
+                parent_before = path.parent.stat()
+                if not stat.S_ISDIR(parent_before.st_mode):
+                    raise ValueError("skill package is not a directory")
+                if not hasattr(os, "O_NOFOLLOW"):
+                    raise OSError("secure SKILL.md opens are unsupported on this platform")
+                flags = os.O_RDONLY | os.O_NOFOLLOW
+                if hasattr(os, "O_CLOEXEC"):
+                    flags |= os.O_CLOEXEC
+                fd = os.open(path, flags)
+                try:
+                    before = os.fstat(fd)
+                    if not stat.S_ISREG(before.st_mode):
+                        raise ValueError("skill index is not a regular file")
+                    with os.fdopen(
+                        fd, "r", encoding="utf-8", closefd=False
+                    ) as skill_file:
+                        fm_content = skill_file.read()
+                    after = os.fstat(fd)
+                finally:
+                    os.close(fd)
+
+                signature = _stat_signature(before)
+                if signature != _stat_signature(after):
+                    raise RuntimeError("skill file changed during discovery")
+
+                # ``parse_frontmatter`` intentionally has a permissive
+                # key/value fallback for non-discovery callers. A malformed
+                # fence cannot claim a directory-derived active-skill name.
+                fm, _ = parse_strict_fenced_frontmatter(fm_content)
+                if fm:
+                    _parse_frontmatter(fm_content)
+
+                # Re-resolve after parsing too: compatibility hooks or a racing
+                # writer may rename a path while its bytes are being inspected.
+                current_parent = path.parent.stat()
+                parent_signature = (
+                    parent_before.st_dev,
+                    parent_before.st_ino,
+                    parent_before.st_size,
+                    parent_before.st_mtime_ns,
+                    parent_before.st_ctime_ns,
+                )
+                if (
+                    signature != _stat_signature(path.stat())
+                    or parent_signature != _stat_signature(current_parent)
+                ):
+                    raise RuntimeError("skill file changed during discovery")
+                package_path = path.parent.resolve(strict=True)
+                if parent_signature != _stat_signature(package_path.stat()):
+                    raise RuntimeError("skill package changed during discovery")
+
+                return {
+                    "content": fm_content,
+                    "frontmatter": fm,
+                    "identity": (before.st_dev, before.st_ino),
+                    "package_signature": parent_signature,
+                    "package_path": str(package_path),
+                    "signature": signature,
+                }
+            except Exception as exc:
+                _record_discovery_error(f"cannot inspect {path}", exc)
+                return None
+
+        def _record_direct_candidate(search_dir: Path, relative_name: str) -> None:
+            direct_path = search_dir / relative_name
+            if not _is_skill_support_path(direct_path) and _is_directory_for_discovery(
+                direct_path, f"cannot stat skill directory {direct_path}"
+            ):
+                direct_skill_md = direct_path / "SKILL.md"
+                if _is_regular_file_for_discovery(
+                    direct_skill_md, f"cannot stat skill file {direct_skill_md}"
+                ):
+                    _record(direct_path, direct_skill_md)
                 return
-            seen_md.add(key)
-            candidates.append((sd, smd))
+            legacy_path = direct_path.with_suffix(".md")
+            if not _is_skill_support_path(legacy_path) and _is_regular_file_for_discovery(
+                legacy_path, f"cannot stat legacy skill file {legacy_path}"
+            ):
+                _record(None, legacy_path)
+
+        def _record(
+            sd: Optional[Path],
+            smd: Path,
+            snapshot: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            if snapshot is None:
+                snapshot = _read_discovery_snapshot(smd)
+            if snapshot is None:
+                return
+
+            identity = snapshot["identity"] + snapshot["package_signature"]
+            lexical_path = os.path.abspath(os.fspath(smd))
+            previous_path_identity = seen_path_identities.get(lexical_path)
+            if (
+                previous_path_identity is not None
+                and previous_path_identity != identity
+            ):
+                _record_discovery_error(
+                    f"cannot inspect {smd}",
+                    RuntimeError("skill file changed during discovery"),
+                )
+                return
+            seen_path_identities[lexical_path] = identity
+
+            previous = seen_file_identities.get(identity)
+            if previous is not None:
+                if (
+                    previous["signature"] != snapshot["signature"]
+                    or previous["content"] != snapshot["content"]
+                ):
+                    _record_discovery_error(
+                        f"cannot inspect {smd}",
+                        RuntimeError("skill file changed during discovery"),
+                    )
+                return
+
+            seen_file_identities[identity] = snapshot
+            candidates.append((sd, smd, snapshot))
 
         for search_dir in all_dirs:
             # Strategy 1: direct path (e.g., "mlops/axolotl" or bare "axolotl"
             # at the top of the dir).
-            direct_path = search_dir / name
-            if (
-                not _is_skill_support_path(direct_path)
-                and direct_path.is_dir()
-                and (direct_path / "SKILL.md").exists()
-            ):
-                _record(direct_path, direct_path / "SKILL.md")
-            elif direct_path.with_suffix(".md").exists() and not _is_skill_support_path(
-                direct_path.with_suffix(".md")
-            ):
-                _record(None, direct_path.with_suffix(".md"))
+            _record_direct_candidate(search_dir, name)
 
             # Strategy 1b: categorized form for plugin namespace fall-through
             # (e.g., a "myplugin:explore" name with no plugin registered also
             # tries the on-disk path "myplugin/explore").
             if local_category_name:
-                categorized_path = search_dir / local_category_name
-                if (
-                    not _is_skill_support_path(categorized_path)
-                    and categorized_path.is_dir()
-                    and (categorized_path / "SKILL.md").exists()
-                ):
-                    _record(categorized_path, categorized_path / "SKILL.md")
-                elif categorized_path.with_suffix(
-                    ".md"
-                ).exists() and not _is_skill_support_path(
-                    categorized_path.with_suffix(".md")
-                ):
-                    _record(None, categorized_path.with_suffix(".md"))
+                _record_direct_candidate(search_dir, local_category_name)
 
             # Strategy 2: recursive by directory name (catches nested skills
             # like "foundations/runtime/explore-codebase" called by bare name),
             # plus frontmatter `name:` lookup. `skills_list()` exposes the
             # frontmatter name, so `skill_view(name)` must accept it too even
             # when the on-disk directory is a shorter category/alias.
-            for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
-                if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
+            for found_skill_md in iter_skill_index_files(
+                search_dir,
+                "SKILL.md",
+                on_error=lambda exc, root=search_dir: _record_discovery_error(
+                    f"cannot traverse skills root {root}", exc
+                ),
+            ):
+                snapshot = _read_discovery_snapshot(found_skill_md)
+                if snapshot is None:
                     continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
-                    _record(found_skill_md.parent, found_skill_md)
+                fm = snapshot["frontmatter"]
+                if found_skill_md.parent.name == name or fm.get("name") == name:
+                    _record(found_skill_md.parent, found_skill_md, snapshot)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
             # Exclude skill support docs: references/templates/assets/scripts
             # are loaded through skill_view(skill, file_path=...) and must not
             # shadow or collide with real skills that share the same basename.
-            for found_md in search_dir.rglob(f"{name}.md"):
-                if found_md.name != "SKILL.md" and not _is_skill_support_path(
-                    found_md
-                ):
-                    _record(None, found_md)
+            try:
+                for found_md in search_dir.rglob(f"{name}.md"):
+                    if found_md.name != "SKILL.md" and not _is_skill_support_path(
+                        found_md
+                    ):
+                        _record(None, found_md)
+            except OSError as exc:
+                _record_discovery_error(
+                    f"cannot traverse legacy skills under {search_dir}", exc
+                )
+
+        if discovery_errors:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": (
+                        "Skill discovery is incomplete; refusing to load a "
+                        "partial match."
+                    ),
+                    "detail": "; ".join(discovery_errors[:3]),
+                },
+                ensure_ascii=False,
+            )
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            paths = [str(smd) for _, smd, _ in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1204,9 +2433,9 @@ def skill_view(
             )
 
         if candidates:
-            skill_dir, skill_md = candidates[0]
+            skill_dir, skill_md, discovered_snapshot = candidates[0]
 
-        if not skill_md or not skill_md.exists():
+        if not skill_md:
             available = [s["name"] for s in _sort_skills(_find_all_skills())[:20]]
             return json.dumps(
                 {
@@ -1218,14 +2447,60 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-        except Exception as e:
+        # Re-open once after the complete-root collision scan and require the
+        # same identity, metadata, and bytes. The resulting snapshot supplies
+        # both metadata and content below; there is no redirectable final read.
+        final_snapshot = _read_discovery_snapshot(skill_md)
+        if final_snapshot is None:
             return json.dumps(
                 {
                     "success": False,
-                    "error": f"Failed to read skill '{name}': {e}",
+                    "error_code": "skills_discovery_incomplete",
+                    "error": (
+                        "Skill discovery is incomplete; refusing to load a "
+                        "partial match."
+                    ),
+                    "detail": "; ".join(discovery_errors[-3:]),
+                },
+                ensure_ascii=False,
+            )
+        if (
+            final_snapshot["identity"] != discovered_snapshot["identity"]
+            or final_snapshot["package_signature"]
+            != discovered_snapshot["package_signature"]
+            or final_snapshot["package_path"] != discovered_snapshot["package_path"]
+            or final_snapshot["signature"] != discovered_snapshot["signature"]
+            or final_snapshot["content"] != discovered_snapshot["content"]
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": (
+                        "Skill discovery is incomplete; refusing to load a "
+                        "partial match."
+                    ),
+                    "detail": (
+                        f"cannot inspect {skill_md}: "
+                        "skill file changed during discovery"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        content = final_snapshot["content"]
+        bound_skill_dir = Path(final_snapshot["package_path"])
+
+        def _post_discovery_incomplete(detail: str) -> str:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error_code": "skills_discovery_incomplete",
+                    "error": (
+                        "Skill discovery is incomplete; refusing to load a "
+                        "partial match."
+                    ),
+                    "detail": detail,
                 },
                 ensure_ascii=False,
             )
@@ -1259,11 +2534,7 @@ def skill_view(
                 _warnings.append("skill content contains patterns that may indicate prompt injection")
             logging.getLogger(__name__).warning("Skill security warning for '%s': %s", name, "; ".join(_warnings))
 
-        parsed_frontmatter: Dict[str, Any] = {}
-        try:
-            parsed_frontmatter, _ = _parse_frontmatter(content)
-        except Exception:
-            parsed_frontmatter = {}
+        parsed_frontmatter: Dict[str, Any] = final_snapshot["frontmatter"]
 
         if not skill_matches_platform(parsed_frontmatter):
             return json.dumps(
@@ -1291,81 +2562,87 @@ def skill_view(
 
         # If a specific file path is requested, read that instead
         if file_path and skill_dir:
-            from tools.path_security import validate_within_dir, has_traversal_component
-
-            # Security: Prevent path traversal attacks
-            if has_traversal_component(file_path):
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": "Path traversal ('..') is not allowed.",
-                        "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
-
-            target_file = skill_dir / file_path
-
-            # Security: Verify resolved path is still within skill directory
-            traversal_error = validate_within_dir(target_file, skill_dir)
-            if traversal_error:
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": traversal_error,
-                        "hint": "Use a relative path within the skill directory",
-                    },
-                    ensure_ascii=False,
-                )
-            if not target_file.exists():
-                # List available files in the skill directory, organized by type
-                available_files = {
-                    "references": [],
-                    "templates": [],
-                    "assets": [],
-                    "scripts": [],
-                    "other": [],
-                }
-
-                # Scan for all readable files
-                for f in skill_dir.rglob("*"):
-                    if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
-                        if rel.startswith("references/"):
-                            available_files["references"].append(rel)
-                        elif rel.startswith("templates/"):
-                            available_files["templates"].append(rel)
-                        elif rel.startswith("assets/"):
-                            available_files["assets"].append(rel)
-                        elif rel.startswith("scripts/"):
-                            available_files["scripts"].append(rel)
-                        elif f.suffix in {
-                            ".md",
-                            ".py",
-                            ".yaml",
-                            ".yml",
-                            ".json",
-                            ".tex",
-                            ".sh",
-                        }:
-                            available_files["other"].append(rel)
-
-                # Remove empty categories
-                available_files = {k: v for k, v in available_files.items() if v}
-
-                return json.dumps(
-                    {
-                        "success": False,
-                        "error": f"File '{file_path}' not found in skill '{name}'.",
-                        "available_files": available_files,
-                        "hint": "Use one of the available file paths listed above",
-                    },
-                    ensure_ascii=False,
-                )
-
-            # Read the file content
             try:
-                content = target_file.read_text(encoding="utf-8")
+                relative_parts = _bound_relative_parts(file_path)
+            except ValueError as exc:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": str(exc),
+                        "hint": "Use a relative path within the skill directory",
+                    },
+                    ensure_ascii=False,
+                )
+
+            try:
+                package_fd = _open_bound_package_dir(
+                    bound_skill_dir,
+                    final_snapshot["package_signature"],
+                )
+            except Exception as exc:
+                return _post_discovery_incomplete(
+                    f"cannot bind skill package {bound_skill_dir}: {exc}"
+                )
+            try:
+                try:
+                    support_bytes, support_stat = _read_bound_support_file(
+                        package_fd,
+                        file_path,
+                        final_snapshot["package_signature"],
+                    )
+                except FileNotFoundError:
+                    try:
+                        available_files, files_summary = (
+                            _build_bound_linked_files_manifest(
+                                package_fd,
+                                final_snapshot["package_signature"],
+                            )
+                        )
+                    except Exception as exc:
+                        return _post_discovery_incomplete(
+                            f"cannot inspect skill package {bound_skill_dir}: {exc}"
+                        )
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"File '{file_path}' not found in skill '{name}'."
+                            ),
+                            "available_files": available_files or None,
+                            "linked_files_summary": files_summary,
+                            "hint": "Use one of the available file paths listed above",
+                        },
+                        ensure_ascii=False,
+                    )
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        return json.dumps(
+                            {
+                                "success": False,
+                                "error": (
+                                    "Path escapes the allowed directory "
+                                    "boundary or traverses a symlink."
+                                ),
+                                "hint": (
+                                    "Use a regular file path within the skill "
+                                    "directory"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                    return _post_discovery_incomplete(
+                        f"cannot read support file '{file_path}': {exc}"
+                    )
+                except Exception as exc:
+                    return _post_discovery_incomplete(
+                        f"cannot read support file '{file_path}': {exc}"
+                    )
+            finally:
+                _close_bound_handle(package_fd)
+
+            target_file = bound_skill_dir.joinpath(*relative_parts)
+            try:
+                support_content = support_bytes.decode("utf-8")
             except UnicodeDecodeError:
                 # Binary file - return info about it instead
                 return json.dumps(
@@ -1373,7 +2650,10 @@ def skill_view(
                         "success": True,
                         "name": name,
                         "file": file_path,
-                        "content": f"[Binary file: {target_file.name}, size: {target_file.stat().st_size} bytes]",
+                        "content": (
+                            f"[Binary file: {relative_parts[-1]}, "
+                            f"size: {support_stat.st_size} bytes]"
+                        ),
                         "is_binary": True,
                     },
                     ensure_ascii=False,
@@ -1395,8 +2675,8 @@ def skill_view(
                     "success": True,
                     "name": name,
                     "file": file_path,
-                    "content": content,
-                    "file_type": target_file.suffix,
+                    "content": support_content,
+                    "file_type": PurePosixPath(file_path.replace("\\", "/")).suffix,
                 },
                 ensure_ascii=False,
             )
@@ -1404,50 +2684,39 @@ def skill_view(
         # Reuse the parse from the platform check above
         frontmatter = parsed_frontmatter
 
-        # Get reference, template, asset, and script files if this is a directory-based skill
-        reference_files = []
-        template_files = []
-        asset_files = []
-        script_files = []
-
-        if skill_dir:
-            references_dir = skill_dir / "references"
-            if references_dir.exists():
-                reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
-                ]
-
-            templates_dir = skill_dir / "templates"
-            if templates_dir.exists():
-                for ext in [
-                    "*.md",
-                    "*.py",
-                    "*.yaml",
-                    "*.yml",
-                    "*.json",
-                    "*.tex",
-                    "*.sh",
-                ]:
-                    template_files.extend(
-                        [
-                            str(f.relative_to(skill_dir))
-                            for f in templates_dir.rglob(ext)
-                        ]
+        # Supporting files are a bounded discovery preview. Explicit reads by
+        # file_path remain available even when this manifest is truncated.
+        linked_files: Dict[str, List[str]] = {}
+        linked_files_summary: Dict[str, Any] = {
+            "shown": 0,
+            "truncated": False,
+            "truncated_categories": [],
+            "per_category_limit": MAX_LINKED_FILES_PER_CATEGORY,
+            "path_char_limit": MAX_LINKED_FILE_PATH_CHARS,
+        }
+        if skill_dir and _SECURE_PACKAGE_OPEN_SUPPORTED:
+            try:
+                package_fd = _open_bound_package_dir(
+                    bound_skill_dir,
+                    final_snapshot["package_signature"],
+                )
+            except Exception as exc:
+                return _post_discovery_incomplete(
+                    f"cannot bind skill package {bound_skill_dir}: {exc}"
+                )
+            try:
+                linked_files, linked_files_summary = (
+                    _build_bound_linked_files_manifest(
+                        package_fd,
+                        final_snapshot["package_signature"],
                     )
-
-            # assets/ — agentskills.io standard directory for supplementary files
-            assets_dir = skill_dir / "assets"
-            if assets_dir.exists():
-                for f in assets_dir.rglob("*"):
-                    if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
-
-            scripts_dir = skill_dir / "scripts"
-            if scripts_dir.exists():
-                for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
-                    script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
-                    )
+                )
+            except Exception as exc:
+                return _post_discovery_incomplete(
+                    f"cannot inspect skill package {bound_skill_dir}: {exc}"
+                )
+            finally:
+                _close_bound_handle(package_fd)
 
         # Read tags/related_skills with backward compat:
         # Check metadata.hermes.* first (agentskills.io convention), fall back to top-level
@@ -1460,17 +2729,6 @@ def skill_view(
         related_skills = _parse_tags(
             hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
         )
-
-        # Build linked files structure for clear discovery
-        linked_files = {}
-        if reference_files:
-            linked_files["references"] = reference_files
-        if template_files:
-            linked_files["templates"] = template_files
-        if asset_files:
-            linked_files["assets"] = asset_files
-        if script_files:
-            linked_files["scripts"] = script_files
 
         try:
             rel_path = str(skill_md.relative_to(active_skills_dir))
@@ -1548,18 +2806,98 @@ def skill_view(
 
         rendered_content = content
         if preprocess:
-            try:
-                from agent.skill_preprocessing import preprocess_skill_content
+            if skill_dir and not _SECURE_PACKAGE_OPEN_SUPPORTED:
+                from agent import skill_preprocessing
 
-                rendered_content = preprocess_skill_content(
-                    content,
-                    skill_dir,
-                    session_id=task_id,
+                preprocessing_config = skill_preprocessing.load_skills_config()
+                (
+                    template_vars_enabled,
+                    inline_shell_enabled,
+                    _timeout,
+                ) = skill_preprocessing.normalize_preprocessing_config(
+                    preprocessing_config
                 )
-            except Exception:
-                logger.debug(
-                    "Could not preprocess skill content for %s", skill_name, exc_info=True
-                )
+                if template_vars_enabled:
+                    rendered_content = (
+                        skill_preprocessing.substitute_template_vars(
+                            rendered_content,
+                            bound_skill_dir,
+                            task_id,
+                        )
+                    )
+                if inline_shell_enabled:
+                    return _post_discovery_incomplete(
+                        "secure inline-shell package binding is unsupported "
+                        "on this platform"
+                    )
+            elif skill_dir:
+                try:
+                    package_fd = _open_bound_package_dir(
+                        bound_skill_dir,
+                        final_snapshot["package_signature"],
+                    )
+                except Exception as exc:
+                    return _post_discovery_incomplete(
+                        f"cannot bind skill package {bound_skill_dir}: {exc}"
+                    )
+                try:
+                    from agent import skill_preprocessing
+
+                    preprocessing_config = (
+                        skill_preprocessing.load_skills_config()
+                    )
+                    (
+                        template_vars_enabled,
+                        inline_shell_enabled,
+                        timeout,
+                    ) = skill_preprocessing.normalize_preprocessing_config(
+                        preprocessing_config
+                    )
+                    if inline_shell_enabled:
+                        rendered_content = _expand_inline_shell_bound(
+                            rendered_content,
+                            package_fd,
+                            timeout,
+                            skill_dir=bound_skill_dir,
+                            session_id=task_id,
+                            template_vars=template_vars_enabled,
+                        )
+                    elif template_vars_enabled:
+                        rendered_content = (
+                            skill_preprocessing.substitute_template_vars(
+                                rendered_content,
+                                bound_skill_dir,
+                                task_id,
+                            )
+                        )
+                    if (
+                        _bound_handle_signature(package_fd)
+                        != final_snapshot["package_signature"]
+                    ):
+                        raise RuntimeError(
+                            "skill package changed during preprocessing"
+                        )
+                except Exception as exc:
+                    return _post_discovery_incomplete(
+                        f"cannot preprocess skill package {bound_skill_dir}: {exc}"
+                    )
+                finally:
+                    _close_bound_handle(package_fd)
+            else:
+                try:
+                    from agent.skill_preprocessing import preprocess_skill_content
+
+                    rendered_content = preprocess_skill_content(
+                        content,
+                        None,
+                        session_id=task_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not preprocess legacy skill %s",
+                        skill_name,
+                        exc_info=True,
+                    )
 
         # ── M2 org provenance header (load-time) ──────────────────────────
         # An org-shared skill announces its provenance IN the returned content
@@ -1638,7 +2976,14 @@ def skill_view(
             "path": rel_path,
             "skill_dir": str(skill_dir) if skill_dir else None,
             "org_provenance": org_provenance,
+            # Internal slash/preload consumers use these markers to avoid
+            # reopening this path for rendering or a support-file scan after
+            # the checked dirfd has been closed.
+            "lookup_name": name,
+            "package_bound": bool(skill_dir),
+            "preprocessed": bool(preprocess),
             "linked_files": linked_files if linked_files else None,
+            "linked_files_summary": linked_files_summary,
             "usage_hint": "To view linked files, call skill_view(name, file_path) where file_path is e.g. 'references/api.md' or 'assets/config.yaml'"
             if linked_files
             else None,

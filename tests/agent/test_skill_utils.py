@@ -1,8 +1,15 @@
 """Tests for agent/skill_utils.py."""
 
+import os
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.skill_utils import (
+    SkillsConfigError,
+    discover_all_skill_config_vars,
     extract_skill_config_vars,
     extract_skill_conditions,
     get_disabled_skill_names,
@@ -18,6 +25,146 @@ from agent.skill_utils import (
 )
 
 
+def _write_config_skill(
+    root: Path,
+    name: str,
+    *,
+    platforms: str = "",
+    environments: str = "",
+) -> Path:
+    """Create a minimal, valid skill that declares one config variable."""
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: Test skill\n"
+        f"{platforms}"
+        f"{environments}"
+        "metadata:\n"
+        "  hermes:\n"
+        "    config:\n"
+        f"      - key: {name}.token\n"
+        "        description: A test token\n"
+        "---\n",
+        encoding="utf-8",
+    )
+    return skill_dir / "SKILL.md"
+
+
+def _configure_local_config_discovery(monkeypatch, skills_dir: Path) -> None:
+    monkeypatch.setattr("agent.skill_utils.get_skills_dir", lambda: skills_dir)
+    monkeypatch.setattr(
+        "agent.skill_utils.get_scannable_external_skills_dirs", lambda **_: []
+    )
+    monkeypatch.setattr("agent.skill_utils.get_disabled_skill_names", lambda: set())
+
+
+def test_discover_config_vars_refuses_partial_result_for_malformed_skill(
+    tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    _write_config_skill(skills_dir, "valid")
+    malformed_dir = skills_dir / "malformed"
+    malformed_dir.mkdir(parents=True)
+    (malformed_dir / "SKILL.md").write_text(
+        "---\nname: malformed\n", encoding="utf-8"
+    )
+    _configure_local_config_discovery(monkeypatch, skills_dir)
+
+    assert discover_all_skill_config_vars() == []
+
+
+def test_discover_config_vars_refuses_canonical_skill_symlink(tmp_path, monkeypatch):
+    skills_dir = tmp_path / "skills"
+    _write_config_skill(skills_dir, "valid")
+    outside = _write_config_skill(tmp_path / "outside", "linked")
+    link_dir = skills_dir / "linked"
+    link_dir.mkdir()
+    try:
+        (link_dir / "SKILL.md").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    _configure_local_config_discovery(monkeypatch, skills_dir)
+
+    assert discover_all_skill_config_vars() == []
+
+
+def test_discover_config_vars_applies_platform_and_environment_gates(
+    tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    _write_config_skill(skills_dir, "available")
+    _write_config_skill(skills_dir, "other-platform", platforms="platforms: [windows]\n")
+    _write_config_skill(skills_dir, "other-environment", environments="environments: [kanban]\n")
+    _configure_local_config_discovery(monkeypatch, skills_dir)
+    monkeypatch.setattr("agent.skill_utils.sys.platform", "linux")
+    monkeypatch.setattr("agent.skill_utils.is_termux", lambda: False)
+    monkeypatch.setattr("agent.skill_utils._detect_environment", lambda _: False)
+
+    assert [item["key"] for item in discover_all_skill_config_vars()] == [
+        "available.token"
+    ]
+
+
+def test_discover_config_vars_refuses_partial_result_on_reader_error(
+    tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    _write_config_skill(skills_dir, "valid")
+    broken = _write_config_skill(skills_dir, "broken")
+    _configure_local_config_discovery(monkeypatch, skills_dir)
+
+    from agent import skill_utils
+
+    real_reader = skill_utils.read_strict_skill_index_file
+
+    def fail_for_broken(path):
+        if path == broken:
+            raise OSError("simulated read failure")
+        return real_reader(path)
+
+    monkeypatch.setattr(skill_utils, "read_strict_skill_index_file", fail_for_broken)
+
+    assert discover_all_skill_config_vars() == []
+
+
+def test_discover_config_vars_refuses_malformed_external_scope(
+    tmp_path, monkeypatch
+):
+    skills_dir = tmp_path / "skills"
+    _write_config_skill(skills_dir, "valid")
+    monkeypatch.setattr("agent.skill_utils.get_skills_dir", lambda: skills_dir)
+    monkeypatch.setattr(
+        "agent.skill_utils._resolve_external_skills_dirs",
+        lambda **_: (_ for _ in ()).throw(
+            SkillsConfigError("malformed skills.external_dirs")
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.skill_utils.get_disabled_skill_names", lambda: set()
+    )
+
+    assert discover_all_skill_config_vars() == []
+
+
+def test_metadata_as_dict_with_hermes():
+    """Normal case: metadata is a dict containing hermes keys."""
+    frontmatter = {
+        "metadata": {
+            "hermes": {
+                "fallback_for_toolsets": ["toolset_a"],
+                "requires_toolsets": ["toolset_b"],
+                "fallback_for_tools": ["tool_x"],
+                "requires_tools": ["tool_y"],
+            }
+        }
+    }
+    result = extract_skill_conditions(frontmatter)
+    assert result["fallback_for_toolsets"] == ["toolset_a"]
+    assert result["requires_toolsets"] == ["toolset_b"]
+    assert result["fallback_for_tools"] == ["tool_x"]
+    assert result["requires_tools"] == ["tool_y"]
 
 
 
@@ -26,6 +173,69 @@ from agent.skill_utils import (
 
 
 
+
+
+def test_iter_skill_index_files_breaks_directory_symlink_cycles(tmp_path):
+    skill = tmp_path / "real-skill"
+    skill.mkdir()
+    skill_md = skill / "SKILL.md"
+    skill_md.write_text("---\nname: real-skill\n---\n", encoding="utf-8")
+    try:
+        (skill / "loop").symlink_to(tmp_path, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        return
+
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [skill_md]
+
+
+def test_iter_skill_index_files_reports_walk_and_stat_errors(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    walk_error = OSError("walk failed")
+    stat_error = OSError("stat failed")
+    errors = []
+
+    def fake_walk(root, *, followlinks, onerror):
+        assert root == str(tmp_path)
+        assert followlinks is True
+        onerror(walk_error)
+        yield str(tmp_path / "unreadable"), [], []
+
+    def fake_stat(path, *, follow_symlinks):
+        assert path == str(tmp_path / "unreadable")
+        assert follow_symlinks is True
+        raise stat_error
+
+    monkeypatch.setattr(
+        skill_utils,
+        "os",
+        SimpleNamespace(walk=fake_walk, stat=fake_stat, path=os.path),
+    )
+
+    assert list(
+        iter_skill_index_files(tmp_path, "SKILL.md", on_error=errors.append)
+    ) == []
+    assert errors == [walk_error, stat_error]
+
+
+def test_skill_environment_fingerprint_tracks_dynamic_kanban_env(monkeypatch):
+    from agent.skill_utils import get_skill_environment_fingerprint
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    with patch(
+        "tools.kanban_tools._profile_has_kanban_toolset",
+        return_value=False,
+    ):
+        initial = dict(get_skill_environment_fingerprint())
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-1")
+        active = dict(get_skill_environment_fingerprint())
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        restored = dict(get_skill_environment_fingerprint())
+
+    assert initial["kanban"] is False
+    assert active["kanban"] is True
+    assert restored["kanban"] is False
 
 
 def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
@@ -73,6 +283,149 @@ skills:
 
 
 
+def test_strict_skills_scope_rejects_malformed_config_but_ordinary_lookup_is_compatible(
+    tmp_path, monkeypatch
+):
+    """Mutation scans can detect config loss without breaking read-only callers."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "skills:\n  external_dirs: [\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    # Historical best-effort callers retain their empty-list behavior.
+    assert skill_utils.get_external_skills_dirs() == []
+    with pytest.raises(skill_utils.SkillsConfigError, match="config.yaml"):
+        skill_utils.get_all_skills_dirs(require_valid_config=True)
+
+
+def test_strict_skills_scope_rejects_unreadable_config(tmp_path, monkeypatch):
+    """A stat-able config that cannot be read must not look like no externals."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text("skills: {}\n", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def deny_config_read(path, *args, **kwargs):
+        if path == config_path:
+            raise PermissionError("permission denied")
+        return real_read_text(path, *args, **kwargs)
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+    monkeypatch.setattr(Path, "read_text", deny_config_read)
+
+    assert skill_utils.get_external_skills_dirs() == []
+    with pytest.raises(skill_utils.SkillsConfigError, match="permission denied"):
+        skill_utils.get_all_skills_dirs(require_valid_config=True)
+
+
+@pytest.mark.parametrize(
+    "yaml_value",
+    [
+        "false",
+        "0",
+        "{}",
+        "[false]",
+        "['']",
+    ],
+)
+def test_strict_skills_scope_rejects_falsey_non_path_types(
+    tmp_path, monkeypatch, yaml_value
+):
+    """Falsey YAML scalars/mappings must not collapse to an empty strict scope."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs: {yaml_value}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    # Ordinary discovery keeps its historical best-effort result, including
+    # stringifying legacy list entries. Only strict mutation scope hardens it.
+    expected_ordinary = (
+        [hermes_home / "False"] if yaml_value == "[false]" else []
+    )
+    assert skill_utils.get_external_skills_dirs() == expected_ordinary
+    with pytest.raises(skill_utils.SkillsConfigError, match="external_dirs"):
+        skill_utils.get_all_skills_dirs(require_valid_config=True)
+
+
+def test_strict_skills_scope_rejects_dangling_config_symlink(
+    tmp_path, monkeypatch
+):
+    """A dangling config entry exists and cannot mean an absent configuration."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    try:
+        config_path.symlink_to(hermes_home / "missing-config.yaml")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert skill_utils.get_external_skills_dirs() == []
+    with pytest.raises(skill_utils.SkillsConfigError, match="config.yaml"):
+        skill_utils.get_all_skills_dirs(require_valid_config=True)
+
+
+@pytest.mark.parametrize("yaml_value", ["null", "''", "[]"])
+def test_strict_skills_scope_accepts_explicit_empty_values(
+    tmp_path, monkeypatch, yaml_value
+):
+    """Only the documented null/empty-string/empty-list forms mean no externals."""
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs: {yaml_value}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert skill_utils.get_all_skills_dirs(require_valid_config=True) == [
+        hermes_home / "skills"
+    ]
+
+
+def test_is_external_skill_path_matches_configured_external_dir(tmp_path, monkeypatch):
+    from agent import skill_utils
+
+    hermes_home = tmp_path / ".hermes"
+    local_skills = hermes_home / "skills"
+    external = tmp_path / "external-skills"
+    local_skills.mkdir(parents=True)
+    external.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {external}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    skill_utils._external_dirs_cache_clear()
+
+    assert is_external_skill_path(external / "team-skill" / "SKILL.md") is True
+    assert is_external_skill_path(local_skills / "local-skill" / "SKILL.md") is False
 
 
 def test_iter_skill_index_files_prunes_skill_support_dirs(tmp_path):
@@ -187,6 +540,30 @@ class TestSkillMatchesPlatformTermux:
 
 
 class TestNormalizeSkillLookupName:
+    def test_active_profile_root_is_resolved_at_call_time(self, tmp_path):
+        from agent.skill_utils import normalize_skill_lookup_name
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        skill_a = home_a / "skills" / "a-skill"
+        skill_b = home_b / "skills" / "b-skill"
+        skill_a.mkdir(parents=True)
+        skill_b.mkdir(parents=True)
+
+        token = set_hermes_home_override(str(home_a))
+        try:
+            assert normalize_skill_lookup_name(str(skill_a)) == "a-skill"
+        finally:
+            reset_hermes_home_override(token)
+
+        token = set_hermes_home_override(str(home_b))
+        try:
+            assert normalize_skill_lookup_name(str(skill_b)) == "b-skill"
+            assert normalize_skill_lookup_name(str(skill_a)) == str(skill_a)
+        finally:
+            reset_hermes_home_override(token)
+
     def test_relative_path_unchanged(self, tmp_path, monkeypatch):
         from agent.skill_utils import normalize_skill_lookup_name
 
@@ -301,4 +678,3 @@ class TestBOMToleranceSiblingSites:
         fm = _split_frontmatter("\ufeff---\nname: bp\n---\nbody")
         assert fm is not None
         assert fm.get("name") == "bp"
-

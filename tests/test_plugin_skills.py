@@ -8,6 +8,7 @@ Covers:
 
 import json
 import logging
+from unittest.mock import patch
 
 import pytest
 
@@ -68,7 +69,9 @@ class TestPluginSkillRegistry:
     def test_register_and_find(self, pm, tmp_path):
         skill_md = tmp_path / "foo" / "SKILL.md"
         skill_md.parent.mkdir()
-        skill_md.write_text("---\nname: foo\n---\nBody.\n")
+        skill_md.write_text(
+            "---\nname: foo\n---\nBody.\n", encoding="utf-8"
+        )
 
         pm._plugin_skills["myplugin:foo"] = {
             "path": skill_md,
@@ -84,7 +87,9 @@ class TestPluginSkillRegistry:
         for name in ["bar", "foo", "baz"]:
             md = tmp_path / name / "SKILL.md"
             md.parent.mkdir()
-            md.write_text(f"---\nname: {name}\n---\n")
+            md.write_text(
+                f"---\nname: {name}\n---\n", encoding="utf-8"
+            )
             pm._plugin_skills[f"myplugin:{name}"] = {
                 "path": md, "plugin": "myplugin", "bare_name": name, "description": "",
             }
@@ -94,7 +99,7 @@ class TestPluginSkillRegistry:
 
     def test_remove_plugin_skill(self, pm, tmp_path):
         md = tmp_path / "SKILL.md"
-        md.write_text("---\nname: x\n---\n")
+        md.write_text("---\nname: x\n---\n", encoding="utf-8")
         pm._plugin_skills["p:x"] = {"path": md, "plugin": "p", "bare_name": "x", "description": ""}
 
         pm.remove_plugin_skill("p:x")
@@ -123,14 +128,16 @@ class TestPluginContextRegisterSkill:
     def test_happy_path(self, ctx, tmp_path):
         skill_md = tmp_path / "skills" / "my-skill" / "SKILL.md"
         skill_md.parent.mkdir(parents=True)
-        skill_md.write_text("---\nname: my-skill\n---\nContent.\n")
+        skill_md.write_text(
+            "---\nname: my-skill\n---\nContent.\n", encoding="utf-8"
+        )
 
         ctx.register_skill("my-skill", skill_md, "A test skill")
         assert ctx._manager.find_plugin_skill("testplugin:my-skill") == skill_md
 
     def test_rejects_colon_in_name(self, ctx, tmp_path):
         md = tmp_path / "SKILL.md"
-        md.write_text("test")
+        md.write_text("test", encoding="utf-8")
         with pytest.raises(ValueError, match="must not contain ':'"):
             ctx.register_skill("ns:foo", md)
 
@@ -162,7 +169,11 @@ class TestSkillViewQualifiedName:
         skill_dir = tmp_path / "plugins" / plugin / "skills" / name
         skill_dir.mkdir(parents=True, exist_ok=True)
         md = skill_dir / "SKILL.md"
-        md.write_text(content or f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n")
+        md.write_text(
+            content
+            or f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n",
+            encoding="utf-8",
+        )
         self.pm._plugin_skills[f"{plugin}:{name}"] = {
             "path": md, "plugin": plugin, "bare_name": name, "description": "",
         }
@@ -231,7 +242,7 @@ class TestSkillViewPluginGuards:
         d = tmp_path / "plugins" / plugin / "skills" / name
         d.mkdir(parents=True, exist_ok=True)
         md = d / "SKILL.md"
-        md.write_text(content)
+        md.write_text(content, encoding="utf-8")
         self.pm._plugin_skills[f"{plugin}:{name}"] = {
             "path": md, "plugin": plugin, "bare_name": name, "description": "",
         }
@@ -269,6 +280,125 @@ class TestSkillViewPluginGuards:
         assert "Ignore previous instructions" in result["content"]
         assert any("injection" in r.message.lower() for r in caplog.records)
 
+    def test_malformed_fenced_frontmatter_is_refused(self, tmp_path):
+        """Plugin skills cannot use the local parser's lenient YAML fallback."""
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\ndescription: broken\n")
+        result = json.loads(skill_view("myplugin:foo"))
+
+        assert result["success"] is False
+        assert "invalid frontmatter" in result["error"].lower()
+
+    def test_support_file_uses_qualified_bound_reader(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\n---\nBody.\n")
+        package = tmp_path / "plugins" / "myplugin" / "skills" / "foo"
+        references = package / "references"
+        references.mkdir()
+        (references / "guide.md").write_text("BOUND GUIDE", encoding="utf-8")
+
+        result = json.loads(
+            skill_view("myplugin:foo", file_path="references/guide.md")
+        )
+
+        assert result["success"] is True
+        assert result["name"] == "myplugin:foo"
+        assert result["content"] == "BOUND GUIDE"
+
+    def test_support_file_traversal_is_refused(self, tmp_path):
+        from tools.skills_tool import skill_view
+
+        self._reg(tmp_path, "---\nname: foo\n---\nBody.\n")
+        result = json.loads(
+            skill_view("myplugin:foo", file_path="../outside.txt")
+        )
+
+        assert result["success"] is False
+        assert "not safely readable" in result["error"]
+
+    def test_package_replacement_between_snapshot_and_inline_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """A registry path cannot redirect preprocessing to a replacement dir."""
+        from tools.skills_tool import skill_view
+
+        self._reg(
+            tmp_path,
+            "---\nname: foo\ndescription: foo\n---\nMarker: !`cat marker.txt`\n",
+        )
+        package = tmp_path / "plugins" / "myplugin" / "skills" / "foo"
+        (package / "marker.txt").write_text("ORIGINAL", encoding="utf-8")
+        replacement = tmp_path / "replacement-plugin-skill"
+        replacement.mkdir()
+        (replacement / "SKILL.md").write_text(
+            "---\nname: foo\ndescription: replacement\n---\nMarker: REPLACEMENT\n",
+            encoding="utf-8",
+        )
+        swapped = False
+
+        def swap_before_inline():
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                displaced = package.with_name("foo-original")
+                package.rename(displaced)
+                replacement.rename(package)
+            return {
+                "template_vars": True,
+                "inline_shell": True,
+                "inline_shell_timeout": 5,
+            }
+
+        monkeypatch.setattr(
+            "agent.skill_preprocessing.load_skills_config", swap_before_inline
+        )
+        result = json.loads(skill_view("myplugin:foo"))
+
+        assert swapped is True
+        assert result["success"] is False
+        assert "REPLACEMENT" not in json.dumps(result)
+
+    def test_inline_caller_defers_template_vars_to_bound_expander(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+
+        self._reg(
+            tmp_path,
+            (
+                "---\nname: foo\ndescription: foo\n---\n"
+                "Visible: ${HERMES_SKILL_DIR}\n"
+                "Marker: !`cat ${HERMES_SKILL_DIR}/marker.txt`\n"
+                "Session: ${HERMES_SESSION_ID}\n"
+            ),
+        )
+        monkeypatch.setattr(
+            "agent.skill_preprocessing.load_skills_config",
+            lambda: {
+                "template_vars": True,
+                "inline_shell": True,
+                "inline_shell_timeout": 7,
+            },
+        )
+        with patch(
+            "tools.skills_tool._expand_inline_shell_bound",
+            return_value="BOUND",
+        ) as expand:
+            result = json.loads(
+                skill_view("myplugin:foo", task_id="session-123")
+            )
+
+        assert result["success"] is True
+        assert result["content"].endswith("BOUND")
+        raw_content, _package_handle, timeout = expand.call_args.args
+        assert "${HERMES_SKILL_DIR}" in raw_content
+        assert "${HERMES_SESSION_ID}" in raw_content
+        assert timeout == 7
+        assert expand.call_args.kwargs["session_id"] == "session-123"
+        assert expand.call_args.kwargs["template_vars"] is True
+
 
 class TestBundleContextBanner:
     @pytest.fixture(autouse=True)
@@ -288,7 +418,10 @@ class TestBundleContextBanner:
             d = tmp_path / "plugins" / "myplugin" / "skills" / name
             d.mkdir(parents=True, exist_ok=True)
             md = d / "SKILL.md"
-            md.write_text(f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n")
+            md.write_text(
+                f"---\nname: {name}\ndescription: {name} desc\n---\n\n{name} body.\n",
+                encoding="utf-8",
+            )
             self.pm._plugin_skills[f"myplugin:{name}"] = {
                 "path": md, "plugin": "myplugin", "bare_name": name, "description": "",
             }

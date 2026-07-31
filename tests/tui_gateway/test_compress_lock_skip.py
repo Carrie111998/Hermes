@@ -170,3 +170,129 @@ def test_mirror_slash_side_effects_reports_lock_skip():
     assert "live session sync failed" not in output
 
 
+def test_mirror_slash_side_effects_unconfirmed_lock_skip_wording():
+    """signal=True (no confirmed holder) must use the 'could not acquire'
+    wording rather than claiming another compression is running."""
+    from tui_gateway import server
+
+    agent = _make_lock_skip_agent(True)
+    session = _make_session(agent, _make_history())
+    sid = "sid-lock-mirror-unconfirmed"
+    server._sessions[sid] = session
+    try:
+        with (
+            patch.object(server, "_sync_session_key_after_compress"),
+            patch.object(server, "_emit"),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                return_value=100,
+            ),
+        ):
+            output = server._mirror_slash_side_effects(sid, session, "/compress")
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert "Compression skipped" in output
+    assert "could not acquire" in output
+    assert "already in progress" not in output
+
+
+@pytest.mark.parametrize("route", ["rpc", "command_dispatch", "slash_mirror"])
+def test_manual_compress_reserves_history_before_prompt_can_start(route):
+    """Every in-process route queues prompts during manual compaction.
+
+    The blocking compressor is a deterministic stand-in for the durable
+    SessionDB commit window: while it is paused, ``prompt.submit`` must not
+    mutate ``history`` or ``history_version``.  Once released, the compressed
+    in-memory transcript is the sole committed successor.
+    """
+    from tui_gateway import server
+
+    entered = threading.Event()
+    release = threading.Event()
+    history = _make_history()
+    compressed = [{"role": "user", "content": "[summary]"}]
+    agent = _make_lock_skip_agent(None)
+
+    def _compress(msgs, *_args, **_kwargs):
+        entered.set()
+        assert release.wait(5), "test did not release the compressor"
+        return compressed, ""
+
+    agent._compress_context.side_effect = _compress
+    session = _make_session(agent, history)
+    sid = f"sid-compress-reservation-{route}"
+    server._sessions[sid] = session
+    result = {}
+
+    def _run_compress():
+        if route == "rpc":
+            result["response"] = server._methods["session.compress"](
+                "rpc-compress", {"session_id": sid}
+            )
+        elif route == "command_dispatch":
+            result["response"] = server._methods["command.dispatch"](
+                "dispatch-compress",
+                {"name": "compress", "arg": "", "session_id": sid},
+            )
+        else:
+            result["response"] = server._mirror_slash_side_effects(
+                sid, session, "/compress"
+            )
+
+    try:
+        with (
+            patch.object(server, "_session_uses_compute_host", return_value=False),
+            patch.object(server, "_status_update"),
+            patch.object(server, "_sync_session_key_after_compress"),
+            patch.object(server, "_emit"),
+            patch.object(server, "_session_info", return_value={}),
+            patch.object(server, "_get_usage", return_value={}),
+            patch.object(server, "_ensure_active_session_slot", return_value=None),
+            patch.object(server, "_load_dashboard_process_isolation_config", return_value={}),
+            patch.object(server, "_drain_queued_prompt") as drain,
+            patch(
+                "agent.manual_compression_feedback.summarize_manual_compression",
+                return_value={
+                    "aborted": False,
+                    "headline": "Compressed",
+                    "token_line": "",
+                    "note": "",
+                },
+            ),
+            patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        ):
+            thread = threading.Thread(target=_run_compress)
+            thread.start()
+            assert entered.wait(5), "compressor did not enter its commit window"
+
+            prompt = server._methods["prompt.submit"](
+                "prompt", {"session_id": sid, "text": "must run after compress"}
+            )
+            assert prompt["result"] == {"status": "queued"}
+            assert session["history"] == history
+            assert session["history_version"] == 1
+            assert session["running"] is True
+            assert session["queued_prompt"]["text"] == "must run after compress"
+
+            release.set()
+            thread.join(5)
+            assert not thread.is_alive()
+
+        if route == "slash_mirror":
+            assert "live session sync failed" not in result["response"]
+        else:
+            assert "error" not in result["response"]
+        assert session["history"] == compressed
+        assert session["history_version"] == 2
+        assert session["running"] is False
+        assert "_manual_compression_reservation" not in session
+        expected_rid = (
+            "rpc-compress" if route == "rpc"
+            else "dispatch-compress" if route == "command_dispatch"
+            else "slash-compress"
+        )
+        drain.assert_called_once_with(expected_rid, sid, session)
+    finally:
+        release.set()
+        server._sessions.pop(sid, None)

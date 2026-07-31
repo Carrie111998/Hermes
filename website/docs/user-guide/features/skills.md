@@ -139,6 +139,20 @@ Level 2: skill_view(name, path)  → Specific reference file       (varies)
 
 The agent only loads the full skill content when it actually needs it.
 
+Large skill libraries can also use a category-compact system-prompt index:
+
+```yaml
+skills:
+  prompt_index_mode: category_compact
+```
+
+`full` (the default) includes every skill description in the stable system
+prompt. `category_compact` keeps every category and skill name visible, retains
+the full `hermes-agent` routing anchor, and loads ordinary descriptions on
+demand through `skills_list(category=...)` followed by `skill_view(name=...)`.
+The mode is resolved when a session prompt is built; it does not mutate an
+in-flight prompt or invalidate the prefix cache mid-turn.
+
 ## SKILL.md Format
 
 ```markdown

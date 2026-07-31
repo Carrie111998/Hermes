@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import sqlite3
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -45,6 +46,7 @@ def _runner(adapter, *, origins=None):
     runner._completion_delivery_lock = __import__("threading").Lock()
     runner._completion_deliveries_inflight = set()
     runner._completion_deliveries_delivered = OrderedDict()
+    runner._completion_deliveries_settlement_pending = set()
     runner._completion_delivery_retention = 2048
     return runner
 
@@ -162,7 +164,9 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 ):
     isolated = queue.Queue()
     monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
-    isolated.put(_async_event())
+    event = _async_event()
+    _persist_pending_completion(event)
+    isolated.put(event)
 
     adapter = SimpleNamespace(
         handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
@@ -200,6 +204,416 @@ def _persist_pending_completion(event):
         "status": "completed",
         "summary": event["summary"],
     })
+
+
+def test_compression_parent_delivery_targets_tip_and_is_acked(
+    monkeypatch, isolated_registry,
+):
+    """A compression-rotated parent with a live tip is deliverable + acked."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_compression")
+    event["parent_session_id"] = "sess_parent"
+    _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(side_effect=lambda session_id: {
+            "sess_parent": {
+                "id": "sess_parent",
+                "ended_at": "2026-07-16T12:00:00",
+                "end_reason": "compression",
+            },
+            "sess_tip": {"id": "sess_tip", "ended_at": None, "end_reason": None},
+        }.get(session_id)),
+        get_compression_tip=AsyncMock(return_value="sess_tip"),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+
+    adapter.handle_message.assert_awaited_once()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
+
+
+def test_durable_cas_failure_retries_settlement_without_reinjecting_adapter(
+    monkeypatch, isolated_registry,
+):
+    """An accepted adapter turn is never injected again while its CAS retries."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_settlement_retry")
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    real_complete = async_delegation.complete_completion_delivery
+    calls = 0
+
+    def _lose_then_complete(delegation_id, claim_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return False
+        return real_complete(delegation_id, claim_id)
+
+    monkeypatch.setattr(
+        async_delegation, "complete_completion_delivery", _lose_then_complete,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is False
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+
+    adapter.handle_message.assert_awaited_once()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
+
+
+@pytest.mark.parametrize("terminal_state", ["delivered", "dropped", "pruned"])
+def test_durable_cas_false_rechecks_terminal_successor_without_requeueing(
+    monkeypatch, isolated_registry, terminal_state,
+):
+    """A stale claimant consumes its successor's terminal outcome, not success."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_stale_successor")
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    real_complete = async_delegation.complete_completion_delivery
+
+    def _roll_over_claim_and_complete(delegation_id, _stale_claim_id):
+        # The original gateway claim expires while the adapter has already
+        # accepted. A successor wins the row, reaches a terminal disposition,
+        # and leaves this stale CAS false.
+        with async_delegation._DB_LOCK, async_delegation._transaction() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET delivery_claimed_at=0 WHERE delegation_id=?",
+                (delegation_id,),
+            )
+        successor_claim = "successor-claim"
+        assert async_delegation.claim_completion_delivery(
+            delegation_id, successor_claim,
+        )
+        if terminal_state == "dropped":
+            assert async_delegation.drop_completion_delivery(
+                delegation_id, successor_claim,
+            )
+        else:
+            assert real_complete(delegation_id, successor_claim)
+            if terminal_state == "pruned":
+                async_delegation._delete_durable_delegation(delegation_id)
+        return False
+
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        _roll_over_claim_and_complete,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is None
+
+    adapter.handle_message.assert_awaited_once()
+    assert ("async_delegation", event["delegation_id"], "") in (
+        runner._completion_deliveries_delivered
+    )
+
+
+def test_durable_cas_exception_rechecks_terminal_successor_without_requeueing(
+    monkeypatch, isolated_registry,
+):
+    """An exception after successor settlement is terminal, not a reinjection."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_exception_successor")
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    real_complete = async_delegation.complete_completion_delivery
+
+    def _settle_successor_then_raise(delegation_id, _stale_claim_id):
+        with async_delegation._DB_LOCK, async_delegation._transaction() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET delivery_claimed_at=0 "
+                "WHERE delegation_id=?",
+                (delegation_id,),
+            )
+        assert async_delegation.claim_completion_delivery(
+            delegation_id, "exception-successor"
+        )
+        assert real_complete(delegation_id, "exception-successor")
+        raise sqlite3.OperationalError("ack connection interrupted")
+
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        _settle_successor_then_raise,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is None
+    adapter.handle_message.assert_awaited_once()
+
+
+def test_pending_settlement_survives_delivered_retention_pressure(
+    monkeypatch, isolated_registry,
+):
+    """Bounded delivered dedupe must never evict irreversible acceptance."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_pending_retention")
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._completion_delivery_retention = 2
+    real_complete = async_delegation.complete_completion_delivery
+    calls = 0
+
+    def _lose_then_complete(delegation_id, claim_id):
+        nonlocal calls
+        calls += 1
+        if delegation_id == event["delegation_id"] and calls == 1:
+            return False
+        return real_complete(delegation_id, claim_id)
+
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_completion_delivery",
+        _lose_then_complete,
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is False
+    pending_identity = ("async_delegation", event["delegation_id"], "")
+    assert pending_identity in runner._completion_deliveries_settlement_pending
+
+    async def _apply_retention_pressure():
+        for started_at in (10.0, 20.0, 30.0):
+            assert await runner._deliver_completion_notification(
+                "process completion",
+                _completion_event(started_at=started_at),
+            ) is True
+
+    asyncio.run(_apply_retention_pressure())
+    assert pending_identity in runner._completion_deliveries_settlement_pending
+    accepted_before_retry = adapter.handle_message.await_count
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+    assert adapter.handle_message.await_count == accepted_before_retry
+    assert pending_identity not in runner._completion_deliveries_settlement_pending
+
+
+def test_explicit_reset_drop_is_terminal_not_falsely_delivered(
+    monkeypatch, isolated_registry,
+):
+    """An explicit /new boundary drop gets a terminal 'dropped' disposition.
+
+    Not 'delivered' (the ack must stay honest — nothing was injected) and not
+    'pending' (restart recovery would replay a completion that is fail-closed
+    dropped again on every boot).
+    """
+    from tools import async_delegation
+
+    event = _async_event("deleg_explicit_new")
+    event["parent_session_id"] = "sess_reset"
+    _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={
+            "id": "sess_reset",
+            "ended_at": "2026-07-16T12:00:00",
+            "end_reason": "session_reset",
+        }),
+        get_compression_tip=AsyncMock(),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is None
+
+    adapter.handle_message.assert_not_awaited()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "dropped"
+    restored = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored) == 0
+
+
+def test_midflight_compression_rotation_stays_pending_for_retry(
+    monkeypatch, isolated_registry,
+):
+    """A rotation without a visible continuation yet is retryable, not dropped."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_midflight")
+    event["parent_session_id"] = "sess_rotating"
+    _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={
+            "id": "sess_rotating",
+            "ended_at": "2026-07-16T12:00:00",
+            "end_reason": "compression",
+        }),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is False
+
+    adapter.handle_message.assert_not_awaited()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "pending"
+    restored = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["delegation_id"] == event["delegation_id"]
+
+
+def test_retry_attempts_are_capped_to_a_terminal_drop(
+    monkeypatch, isolated_registry,
+):
+    """Endless claim/release churn converges to a terminal 'dropped' state."""
+    from tools import async_delegation
+
+    event = _async_event("deleg_attempt_cap")
+    event["parent_session_id"] = "sess_rotating"
+    _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._session_db = SimpleNamespace(
+        get_session=AsyncMock(return_value={
+            "id": "sess_rotating",
+            "ended_at": "2026-07-16T12:00:00",
+            "end_reason": "compression",
+        }),
+        get_compression_tip=AsyncMock(return_value=None),
+    )
+
+    async def _churn():
+        for _ in range(async_delegation._MAX_DELIVERY_ATTEMPTS + 2):
+            await runner._deliver_completion_notification("completion", event)
+
+    asyncio.run(_churn())
+
+    adapter.handle_message.assert_not_awaited()
+    durable = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "dropped"
+    assert durable["delivery_attempts"] <= async_delegation._MAX_DELIVERY_ATTEMPTS
+    restored = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored) == 0
+
+
+def test_distinct_process_incarnations_are_not_deduplicated():
+    """Producer spawn time distinguishes a reused process session ID."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        first = await runner._deliver_completion_notification(
+            "first", _completion_event(started_at=10.0)
+        )
+        second = await runner._deliver_completion_notification(
+            "second", _completion_event(started_at=20.0)
+        )
+        return first, second
+
+    assert asyncio.run(_exercise()) == (True, True)
+
+    assert adapter.handle_message.await_count == 2
+
+
+def test_delivered_identity_retention_is_bounded():
+    """Lifecycle dedupe cannot grow without bound in a long-running gateway."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._completion_delivery_retention = 2
+    runner._completion_deliveries_delivered = OrderedDict()
+
+    async def _exercise():
+        for index in range(3):
+            await runner._deliver_completion_notification(
+                f"completion {index}",
+                _async_event(f"deleg_retention_{index}"),
+            )
+
+    asyncio.run(_exercise())
+
+    assert len(runner._completion_deliveries_delivered) == 2
+    assert ("async_delegation", "deleg_retention_0", "") not in (
+        runner._completion_deliveries_delivered
+    )
+    assert ("async_delegation", "deleg_retention_2", "") in (
+        runner._completion_deliveries_delivered
+    )
+
+
+def test_delivery_state_is_isolated_per_gateway_profile_lifecycle():
+    """A process-local claim in one profile never suppresses another runner."""
+    default_adapter = SimpleNamespace(handle_message=AsyncMock())
+    profile_adapter = SimpleNamespace(handle_message=AsyncMock())
+    default_runner = _runner(default_adapter)
+    profile_runner = _runner(profile_adapter)
+    event = _async_event("deleg_same_producer_id")
+
+    async def _exercise():
+        first = await default_runner._deliver_completion_notification(
+            "default", dict(event),
+        )
+        second = await profile_runner._deliver_completion_notification(
+            "profile", dict(event),
+        )
+        return first, second
+
+    assert asyncio.run(_exercise()) == (True, True)
+    default_adapter.handle_message.assert_awaited_once()
+    profile_adapter.handle_message.assert_awaited_once()
+
+
+def test_async_completion_uses_canonical_origin_routing(monkeypatch, isolated_registry):
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    event = _async_event("deleg_routing")
+    isolated.put(event)
+
+    canonical = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="canonical-chat",
+        chat_type="group",
+        thread_id="canonical-topic",
+    )
+    entry = SimpleNamespace(origin=canonical)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: entry})
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.source == canonical
 
 
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):

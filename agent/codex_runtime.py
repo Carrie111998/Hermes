@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
@@ -60,15 +61,6 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
-        compressor = getattr(agent, "context_compressor", None)
-        if (
-            compressor is not None
-            and getattr(compressor, "awaiting_real_usage_after_compression", False)
-        ):
-            # No usage means this turn cannot adjudicate the pending compaction.
-            # Consume the marker so a later unrelated reading is not charged to
-            # it and preflight deferral cannot stay latched indefinitely.
-            compressor.update_from_response({})
         if agent._session_db and agent.session_id:
             try:
                 if not agent._session_db_created:
@@ -124,7 +116,12 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
-            compressor.update_from_response(usage_dict)
+            # ``thread/tokenUsage/updated`` is a sibling notification and can
+            # contain a partial/empty latest bucket.  A completed compaction
+            # remains pending until a real prompt count arrives; otherwise an
+            # empty usage update would erase its effectiveness verdict.
+            if prompt_tokens > 0:
+                compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
@@ -204,7 +201,12 @@ def _record_codex_app_server_compaction(
     rewrite local transcript rows here; state.db records the boundary via the
     session event/usage counters while preserving the visible transcript.
     """
-    if not force and not getattr(turn, "compacted", False):
+    # A successful JSON-RPC response and even turn/completed are not proof of
+    # compaction. The app-server contract requires a contextCompaction item;
+    # fail closed if that authoritative lifecycle signal was not projected.
+    # ``force`` only distinguishes a user-requested boundary from an automatic
+    # one for status reporting—it must never manufacture a success.
+    if not getattr(turn, "compacted", False):
         return False
 
     thread_id = getattr(turn, "thread_id", None) or ""
@@ -242,7 +244,17 @@ def _record_codex_app_server_compaction(
             record_boundary(compressor, used_fallback=False)
         elif hasattr(compressor, "_verify_compaction_cleared_threshold"):
             compressor._verify_compaction_cleared_threshold = True
-        if not getattr(turn, "token_usage_last", None):
+        last_usage = getattr(turn, "token_usage_last", None)
+        # A non-empty sibling usage object is still not a compaction verdict
+        # unless it contains the input side of the request.  Codex can emit a
+        # partial ``last`` bucket (for example output/total only) before the
+        # prompt-size update arrives.
+        has_real_prompt_tokens = isinstance(last_usage, dict) and (
+            _coerce_usage_int(last_usage.get("inputTokens"))
+            + _coerce_usage_int(last_usage.get("cachedInputTokens"))
+            > 0
+        )
+        if not has_real_prompt_tokens:
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
             compressor.awaiting_real_usage_after_compression = True
@@ -673,6 +685,142 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
+        # Codex owns its native compacted context inside the app-server thread
+        # rollout. Persist that thread id separately from Hermes' messaging
+        # origin thread_id, then resume it whenever this in-process adapter is
+        # recreated after a crash, timeout, auth refresh, or app restart.
+        resume_thread_id = None
+        on_thread_ready = None
+        lease_acquire = None
+        lease_refresh = None
+        lease_release = None
+        session_db = getattr(agent, "_session_db", None)
+        session_id = str(getattr(agent, "session_id", None) or "").strip()
+        if session_db is None or not session_id:
+            error = (
+                "Codex app-server has no durable Hermes session store, "
+                "so Hermes refused to start a new thread."
+            )
+            logger.warning(
+                "codex app-server: durable session store unavailable "
+                "(has_db=%s, has_session_id=%s); refusing to start a new "
+                "Codex thread",
+                session_db is not None,
+                bool(session_id),
+            )
+            return {
+                "final_response": error,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "interrupted": False,
+                "error": error,
+            }
+
+        if session_db is not None and session_id:
+            try:
+                if not getattr(agent, "_session_db_created", False):
+                    agent._ensure_db_session()
+                if not getattr(agent, "_session_db_created", False):
+                    raise RuntimeError(
+                        "Hermes session row could not be created"
+                    )
+                if session_db.get_session(session_id) is None:
+                    raise RuntimeError(
+                        "Hermes session row is unavailable"
+                    )
+                resume_thread_id = session_db.get_codex_thread_id(session_id)
+            except Exception as exc:
+                logger.warning(
+                    "codex app-server: could not load persisted thread binding "
+                    "for session=%s; refusing to start a new Codex thread",
+                    session_id,
+                    exc_info=True,
+                )
+                error = (
+                    "Codex app-server could not verify the persisted thread "
+                    "binding, so Hermes refused to start a new thread."
+                )
+                return {
+                    "final_response": error,
+                    "messages": messages,
+                    "api_calls": 0,
+                    "completed": False,
+                    "partial": True,
+                    "interrupted": False,
+                    "error": error,
+                }
+
+            lease_holder = str(uuid.uuid4())
+            lease_state = {"thread_id": resume_thread_id}
+
+            def _acquire_codex_turn_lease(
+                *,
+                _db=session_db,
+                _session_id=session_id,
+                _holder=lease_holder,
+            ) -> bool:
+                return _db.try_acquire_codex_turn_lease(
+                    _session_id,
+                    _holder,
+                    codex_thread_id=lease_state["thread_id"],
+                    ttl_seconds=300.0,
+                )
+
+            def _persist_codex_thread_binding(
+                thread_id: str,
+                *,
+                _db=session_db,
+                _session_id=session_id,
+                _holder=lease_holder,
+            ) -> None:
+                if _db.bind_codex_thread_under_lease(
+                    _session_id,
+                    _holder,
+                    thread_id,
+                ):
+                    lease_state["thread_id"] = thread_id
+                    return
+                existing = _db.get_codex_thread_id(_session_id)
+                if existing and existing != thread_id:
+                    raise RuntimeError(
+                        "Hermes session is already bound to a different "
+                        f"Codex thread ({existing})"
+                    )
+                raise RuntimeError(
+                    "Hermes session row is unavailable for Codex thread binding"
+                )
+
+            def _refresh_codex_turn_lease(
+                *,
+                _db=session_db,
+                _session_id=session_id,
+                _holder=lease_holder,
+            ) -> bool:
+                return _db.refresh_codex_turn_lease(
+                    _session_id,
+                    _holder,
+                    codex_thread_id=lease_state["thread_id"],
+                    ttl_seconds=300.0,
+                )
+
+            def _release_codex_turn_lease(
+                *,
+                _db=session_db,
+                _session_id=session_id,
+                _holder=lease_holder,
+            ) -> bool:
+                return _db.release_codex_turn_lease(
+                    _session_id,
+                    _holder,
+                )
+
+            on_thread_ready = _persist_codex_thread_binding
+            lease_acquire = _acquire_codex_turn_lease
+            lease_refresh = _refresh_codex_turn_lease
+            lease_release = _release_codex_turn_lease
+
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
         # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
         # (tool_progress_callback, _fire_stream_delta,
@@ -688,6 +836,12 @@ def run_codex_app_server_turn(
                 auto_approve_apply_patch=auto_approve_requests,
             ),
             on_event=make_codex_app_server_event_bridge(agent),
+            resume_thread_id=resume_thread_id,
+            on_thread_ready=on_thread_ready,
+            lease_acquire=lease_acquire,
+            lease_refresh=lease_refresh,
+            lease_release=lease_release,
+            lease_refresh_interval=60.0,
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
@@ -815,8 +969,20 @@ def run_codex_app_server_turn(
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
     _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    # Startup/lease failures occur before turn/start and count zero. Once the
+    # turn/start request is attempted, count it even if the JSON-RPC response
+    # times out, is rejected, or is malformed and therefore yields no turn id.
+    # A turn id is also incontrovertible post-hoc evidence for compatibility
+    # with older transport stubs/results that predate turn_start_attempted.
+    api_calls = 1 if (
+        getattr(turn, "turn_start_attempted", False)
+        or getattr(turn, "turn_id", None)
+    ) else 0
+    usage_result = (
+        _record_codex_app_server_usage(agent, turn)
+        if api_calls
+        else {}
+    )
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).

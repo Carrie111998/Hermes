@@ -315,6 +315,46 @@ def _write_suppressed_names(names: Set[str]) -> None:
         logger.debug("Failed to write curator suppression list: %s", e, exc_info=True)
 
 
+def _write_suppressed_names_strict(names: Set[str]) -> None:
+    path = _suppressed_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = "\n".join(sorted(names)) + ("\n" if names else "")
+    fd, tmp = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".curator_suppressed_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        parent_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def set_suppressed_name_strict(skill_name: str, suppressed: bool) -> None:
+    # Share the usage lock with lifecycle state writes: archive/restore update
+    # both metadata files and must not lose a concurrent suppression change.
+    with _usage_file_lock():
+        names = read_suppressed_names()
+        if suppressed:
+            names.add(skill_name)
+        else:
+            names.discard(skill_name)
+        _write_suppressed_names_strict(names)
+        if (skill_name in read_suppressed_names()) != suppressed:
+            raise OSError("curator suppression metadata verification failed")
+
+
 def add_suppressed_name(skill_name: str) -> None:
     """Record that a built-in skill was pruned, so sync won't restore it."""
     if not skill_name:
@@ -701,6 +741,90 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> None:
         logger.debug("Failed to write %s: %s", path, e, exc_info=True)
 
 
+def _save_usage_strict(data: Dict[str, Dict[str, Any]]) -> None:
+    """Durably write lifecycle metadata or raise; never silently drop it."""
+    path = _usage_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".usage_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        parent_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def set_state_strict(skill_name: str, state: str) -> None:
+    """Strict lifecycle-state update for archive/restore filesystem moves."""
+    if state not in _VALID_STATES or not is_curation_eligible(skill_name):
+        raise OSError(f"cannot persist lifecycle state {state!r} for {skill_name}")
+    with _usage_file_lock():
+        data = load_usage()
+        rec = data.get(skill_name)
+        if not isinstance(rec, dict):
+            rec = _empty_record()
+        rec["state"] = state
+        rec["archived_at"] = _now_iso() if state == STATE_ARCHIVED else None
+        data[skill_name] = rec
+        _save_usage_strict(data)
+        persisted = load_usage().get(skill_name, {})
+        if persisted.get("state") != state:
+            raise OSError("lifecycle metadata verification failed")
+
+
+def persist_lifecycle_move_metadata_strict(
+    skill_name: str, state: str, *, suppressed: bool
+) -> None:
+    """Atomically serialize archive/restore's paired metadata intent.
+
+    The two files cannot be atomically replaced together, so retain a snapshot
+    and compensate the suppression file if the usage-state write fails.
+    """
+    if state not in _VALID_STATES or not is_curation_eligible(skill_name):
+        raise OSError(f"cannot persist lifecycle state {state!r} for {skill_name}")
+    with _usage_file_lock():
+        original_names = read_suppressed_names()
+        names = set(original_names)
+        if suppressed:
+            names.add(skill_name)
+        else:
+            names.discard(skill_name)
+        try:
+            _write_suppressed_names_strict(names)
+            data = load_usage()
+            rec = data.get(skill_name)
+            if not isinstance(rec, dict):
+                rec = _empty_record()
+            rec["state"] = state
+            rec["archived_at"] = _now_iso() if state == STATE_ARCHIVED else None
+            data[skill_name] = rec
+            _save_usage_strict(data)
+        except BaseException:
+            try:
+                _write_suppressed_names_strict(original_names)
+            except Exception:
+                logger.exception("failed to compensate curator suppression metadata")
+            raise
+        persisted = load_usage().get(skill_name, {})
+        if persisted.get("state") != state or (
+            (skill_name in read_suppressed_names()) != suppressed
+        ):
+            raise OSError("lifecycle move metadata verification failed")
+
+
 def get_record(skill_name: str) -> Dict[str, Any]:
     """Return the record for *skill_name*, creating a fresh one if missing."""
     data = load_usage()
@@ -881,57 +1005,49 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     when one is archived, its name is added to the suppression list so the
     update-time re-seeder leaves it archived instead of restoring it.
     """
-    local_skill_dir = _find_skill_dir(skill_name)
-    if local_skill_dir is None and _find_external_skill_dir(skill_name) is not None:
-        return False, _external_read_only_message(skill_name)
-
-    if not is_curation_eligible(skill_name, local_skill_dir):
-        if is_protected_builtin(skill_name):
-            return False, (
-                f"skill '{skill_name}' is a protected built-in; it backs "
-                "load-bearing UX and is never archived or consolidated"
-            )
-        if is_hub_installed(skill_name):
-            return False, f"skill '{skill_name}' is hub-installed; never archive"
-        return False, (
-            f"skill '{skill_name}' is a bundled built-in; enable "
-            "curator.prune_builtins to allow pruning it"
-        )
-
-    skill_dir = local_skill_dir
-    if skill_dir is None:
-        return False, f"skill '{skill_name}' not found"
-    if is_external_skill_path(skill_dir):
-        return False, _external_read_only_message(skill_name)
-
-    archive_root = _archive_dir()
-    try:
-        archive_root.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return False, f"failed to create archive dir: {e}"
-
-    # Flatten any category nesting into a single ".archive/<skill>/" so restores
-    # are simple. If a collision exists, append a timestamp.
-    dest = archive_root / skill_dir.name
-    if dest.exists():
-        dest = archive_root / f"{skill_dir.name}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    # Use the same alias -> physical lock and held-dirfd archive primitive as
+    # skill_manage.  This direct API is also called by curator, learning, and
+    # CLI paths, so a path lookup followed by Path.rename is not sufficient.
+    from tools.skill_manager_tool import (
+        _archived_skill_mutation_lock,
+        _containing_skills_root,
+        _existing_skill_mutation_lock,
+        _secure_archive_existing_skill,
+    )
 
     try:
-        skill_dir.rename(dest)
-    except OSError:
-        # Cross-device — fall back to shutil.move
-        import shutil
-        try:
-            shutil.move(str(skill_dir), str(dest))
-        except Exception as e2:
-            return False, f"failed to archive: {e2}"
+        with _existing_skill_mutation_lock(skill_name) as (existing, lock_error):
+            if not lock_error:
+                assert existing is not None
+                return _secure_archive_existing_skill(
+                    existing, _containing_skills_root(existing["path"])
+                )
+            active_error = lock_error["error"]
+    except OSError as exc:
+        return False, f"failed to securely archive: {exc}"
 
-    # Pruning a built-in only sticks if the re-seeder is told to leave it alone.
-    if is_bundled(skill_name):
-        add_suppressed_name(skill_name)
-
-    set_state(skill_name, STATE_ARCHIVED)
-    return True, f"archived to {dest}"
+    # A secure move may commit before strict metadata persistence fails.  The
+    # archive's directory basename can differ from the frontmatter identity,
+    # so reconcile only a unique, no-follow canonical match; never move again.
+    if "not found" not in active_error.lower():
+        return False, active_error
+    try:
+        with _archived_skill_mutation_lock(skill_name, _skills_dir()) as (archived, lock_error):
+            if lock_error:
+                return False, active_error
+            assert archived is not None
+            canonical_name = archived["_canonical_name"]
+            try:
+                persist_lifecycle_move_metadata_strict(
+                    canonical_name,
+                    STATE_ARCHIVED,
+                    suppressed=is_bundled(canonical_name),
+                )
+            except Exception as exc:
+                return False, f"archive already moved; metadata reconciliation failed: {exc}"
+            return True, f"archive already moved; lifecycle metadata reconciled for {archived['path']}"
+    except OSError as exc:
+        return False, f"failed to securely reconcile archive: {exc}"
 
 
 def restore_skill(skill_name: str) -> Tuple[bool, str]:
@@ -945,68 +1061,60 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     way to lift a prune). Restoring clears any suppression entry so future
     updates may re-seed the built-in again.
     """
-    # Hub skills always have an external upstream owner — never shadow them.
-    if is_hub_installed(skill_name):
-        return False, (
-            f"skill '{skill_name}' is now hub-installed; "
-            "restore would shadow the upstream version"
-        )
-    # A bundled built-in is upstream-owned UNLESS prune_builtins is on. With the
-    # flag off, restoring over it would shadow the bundled version.
-    if is_bundled(skill_name) and not _prune_builtins_enabled():
-        return False, (
-            f"skill '{skill_name}' is now bundled; "
-            "restore would shadow the upstream version"
-        )
-    archive_root = _archive_dir()
-    if not archive_root.exists():
-        return False, "no archive directory"
-
-    # Try exact name match first, then the timestamped-duplicate fallback.
-    # Recursive walk handles nested archive layouts (e.g. .archive/<category>/<skill>/)
-    # left behind by older archive paths or external imports.
-    candidates = [p for p in archive_root.rglob("*") if p.is_dir() and p.name == skill_name]
-    if not candidates:
-        # A name collision makes archive_skill() disambiguate by appending its
-        # UTC timestamp ("<skill>-YYYYMMDDHHMMSS", a 14-digit suffix), so only
-        # that exact shape is another copy of THIS skill. A bare
-        # startswith(f"{skill_name}-") also swallows unrelated sibling skills —
-        # restoring "git" would otherwise pull an archived "git-helpers" out of
-        # the archive and rename it to "git", destroying the sibling's only
-        # copy. Require the suffix to be the timestamp archive_skill writes.
-        prefix = f"{skill_name}-"
-        candidates = sorted(
-            [
-                p for p in archive_root.rglob("*")
-                if p.is_dir()
-                and p.name.startswith(prefix)
-                and len(p.name) - len(prefix) == 14
-                and p.name[len(prefix):].isdigit()
-            ],
-            reverse=True,
-        )
-    if not candidates:
-        return False, f"skill '{skill_name}' not found in archive"
-
-    src = candidates[0]
-    dest = _skills_dir() / skill_name
-    if dest.exists():
-        return False, f"destination already exists: {dest}"
+    from tools.skill_manager_tool import (
+        _archived_skill_mutation_lock,
+        _existing_skill_mutation_lock,
+        _open_existing_skill_directory,
+        _parse_frontmatter,
+        _read_canonical_skill_md,
+        _secure_restore_archived_skill,
+    )
 
     try:
-        src.rename(dest)
-    except OSError:
-        import shutil
+        with _archived_skill_mutation_lock(skill_name, _skills_dir()) as (archived, lock_error):
+            if not lock_error:
+                assert archived is not None
+                canonical_name = archived["_canonical_name"]
+                if is_hub_installed(canonical_name):
+                    return False, f"skill '{canonical_name}' is now hub-installed; restore would shadow the upstream version"
+                if is_bundled(canonical_name) and not _prune_builtins_enabled():
+                    return False, f"skill '{canonical_name}' is now bundled; restore would shadow the upstream version"
+                ok, message = _secure_restore_archived_skill(
+                    archived, canonical_name, _skills_dir()
+                )
+                archive_error = message
+            else:
+                archive_error = lock_error["error"]
+                ok = False
+    except OSError as exc:
+        return False, f"failed to securely restore: {exc}"
+    if not ok:
+        # After a committed move with failed metadata, only the active tree
+        # remains. Re-open it under the same alias+physical lock and persist
+        # the canonical frontmatter identity; a missing/ambiguous archive is
+        # never treated as success.
+        if "not found" not in archive_error.lower():
+            return False, archive_error
         try:
-            shutil.move(str(src), str(dest))
-        except Exception as e:
-            return False, f"failed to restore: {e}"
+            with _existing_skill_mutation_lock(skill_name) as (existing, active_error):
+                if active_error:
+                    return False, archive_error
+                assert existing is not None
+                with _open_existing_skill_directory(existing) as (skill_fd, _resolved):
+                    frontmatter, _ = _parse_frontmatter(
+                        _read_canonical_skill_md(skill_fd)
+                    )
+                canonical_name = frontmatter.get("name")
+                if not isinstance(canonical_name, str) or not canonical_name:
+                    return False, "restore target has no valid canonical skill name"
+                persist_lifecycle_move_metadata_strict(canonical_name, STATE_ACTIVE, suppressed=False)
+                return True, f"restore already moved; lifecycle metadata reconciled for {existing['path']}"
+        except Exception as exc:
+            return False, f"restore already moved; metadata reconciliation failed: {exc}"
+    if not ok:
+        return False, message
 
-    # Restoring a pruned built-in lifts its suppression so updates can manage it.
-    remove_suppressed_name(skill_name)
-
-    set_state(skill_name, STATE_ACTIVE)
-    return True, f"restored to {dest}"
+    return True, message
 
 
 def _find_skill_dir(skill_name: str) -> Optional[Path]:

@@ -1,18 +1,25 @@
 """Tests for tools/skill_manager_tool.py — skill creation, editing, and deletion."""
 
 import json
+import multiprocessing
+import os
+import re
+import stat
+import threading
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+import tools.skill_manager_tool as skill_manager_module
 from tools.skill_manager_tool import (
     _validate_name,
     _validate_category,
     _validate_frontmatter,
     _validate_file_path,
-    _create_skill,
+    _create_skill as _create_skill_impl,
     _edit_skill,
     _patch_skill,
     _delete_skill,
@@ -58,6 +65,49 @@ description: Updated description.
 Step 1: Do the new thing.
 """
 
+
+def test_windows_security_scan_gives_nt_backend_a_new_snapshot_path():
+    fake_os = MagicMock()
+    fake_os.name = "nt"
+    observed = {}
+
+    def fake_copy(skill_handle, destination):
+        observed["skill_handle"] = skill_handle
+        observed["destination_existed"] = destination.exists()
+        destination.mkdir()
+        (destination / "SKILL.md").write_text(
+            VALID_SKILL_CONTENT,
+            encoding="utf-8",
+        )
+
+    def fake_scan(destination):
+        assert (destination / "SKILL.md").is_file()
+        return None
+
+    held_skill = object()
+    with (
+        patch.object(skill_manager_module, "os", fake_os),
+        patch(
+            "tools.nt_secure_fs_optional.copy_tree_no_reparse",
+            side_effect=fake_copy,
+        ),
+        patch.object(
+            skill_manager_module,
+            "_security_scan_skill",
+            side_effect=fake_scan,
+        ),
+    ):
+        assert (
+            skill_manager_module._security_scan_held_skill_impl(held_skill)
+            is None
+        )
+
+    assert observed == {
+        "skill_handle": held_skill,
+        "destination_existed": False,
+    }
+
+
 LONG_DESC_CONTENT = """\
 ---
 name: long-desc
@@ -68,6 +118,158 @@ description: Use when deploying multi-region Kubernetes clusters with custom CNI
 
 Step 1.
 """
+
+
+def _content_for_name(content: str, name: str) -> str:
+    """Keep generic CRUD fixtures valid under the create identity contract."""
+    return re.sub(
+        r"(?m)^name:\s*.*$",
+        f"name: {name}",
+        content,
+        count=1,
+    )
+
+
+def _create_skill(name: str, content: str, category: str = None):
+    return _create_skill_impl(name, _content_for_name(content, name), category)
+
+
+def _process_create_same_skill(
+    skills_dir: str,
+    category: str,
+    start,
+    results,
+) -> None:
+    root = Path(skills_dir)
+    content = _content_for_name(VALID_SKILL_CONTENT, "shared-process-name")
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root), patch(
+        "agent.skill_utils.get_all_skills_dirs",
+        return_value=[root],
+    ):
+        start.wait()
+        results.put(
+            _create_skill_impl(
+                "shared-process-name",
+                content,
+                category,
+            )["success"]
+        )
+
+
+def _process_edit_with_controlled_scan(
+    skills_dir: str,
+    content: str,
+    should_fail: bool,
+    entered_scan,
+    release_scan,
+    done,
+    results,
+) -> None:
+    """Process worker used to prove rollback/commit transaction ordering."""
+    root = Path(skills_dir)
+
+    def controlled_scan(_skill_fd):
+        entered_scan.set()
+        if should_fail:
+            release_scan.wait(timeout=10)
+            return "blocked by deterministic scan"
+        return None
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root), patch(
+        "agent.skill_utils.get_all_skills_dirs",
+        return_value=[root],
+    ), patch(
+        "tools.skill_manager_tool._security_scan_held_skill",
+        side_effect=controlled_scan,
+    ):
+        result = _edit_skill("transaction-skill", content)
+        results.put(result)
+        done.set()
+
+
+def _process_write_alias_with_controlled_scan(
+    skills_dir: str,
+    alias: str,
+    content: str,
+    should_fail: bool,
+    entered_scan,
+    release_scan,
+    done,
+    results,
+) -> None:
+    """Mutate one supporting file through either physical-skill alias."""
+    root = Path(skills_dir)
+    scan_snapshot = None
+
+    def controlled_scan(skill_fd):
+        nonlocal scan_snapshot
+        file_fd = os.open(
+            "references/state.txt", os.O_RDONLY, dir_fd=skill_fd
+        )
+        try:
+            scan_snapshot = os.read(file_fd, 100).decode("utf-8")
+        finally:
+            os.close(file_fd)
+        entered_scan.set()
+        if should_fail:
+            release_scan.wait(timeout=10)
+            return "blocked by deterministic cross-process alias scan"
+        return None
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root), patch(
+        "agent.skill_utils.get_all_skills_dirs",
+        return_value=[root],
+    ), patch(
+        "tools.skill_manager_tool._security_scan_held_skill",
+        side_effect=controlled_scan,
+    ):
+        result = _write_file(alias, "references/state.txt", content)
+        results.put((result, scan_snapshot))
+        done.set()
+
+
+def _process_edit_alias_with_controlled_scan(
+    skills_dir: str,
+    alias: str,
+    content: str,
+    entered_scan,
+    release_scan,
+    done,
+    results,
+) -> None:
+    """Pause a canonical edit while its physical skill lock is held."""
+    root = Path(skills_dir)
+
+    def controlled_scan(_skill_fd):
+        entered_scan.set()
+        release_scan.wait(timeout=10)
+        return None
+
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root), patch(
+        "agent.skill_utils.get_all_skills_dirs",
+        return_value=[root],
+    ), patch(
+        "tools.skill_manager_tool._security_scan_held_skill",
+        side_effect=controlled_scan,
+    ):
+        results.put(_edit_skill(alias, content))
+        done.set()
+
+
+def _process_delete_alias(
+    skills_dir: str,
+    alias: str,
+    done,
+    results,
+) -> None:
+    """Delete a skill through one of its aliases."""
+    root = Path(skills_dir)
+    with patch("tools.skill_manager_tool.SKILLS_DIR", root), patch(
+        "agent.skill_utils.get_all_skills_dirs",
+        return_value=[root],
+    ):
+        results.put(_delete_skill(alias))
+        done.set()
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +313,61 @@ class TestValidateFrontmatter:
         err = _validate_frontmatter("# Just a heading\nSome content.\n")
         assert err == "SKILL.md must start with YAML frontmatter (---). See existing skills for format."
 
+    def test_noncanonical_frontmatter_opener_is_rejected(self):
+        content = (
+            "---oops: ignored\n"
+            "name: demo\n"
+            "description: demo routing.\n"
+            "platforms: [windows]\n"
+            "---\nBody.\n"
+        )
+        err = _validate_frontmatter(
+            content, new_skill=True, expected_name="demo"
+        )
+        assert err == (
+            "SKILL.md must start with YAML frontmatter (---). "
+            "See existing skills for format."
+        )
+
+    def test_unclosed_frontmatter(self):
+        content = "---\nname: test\ndescription: desc\nBody content.\n"
+        assert _validate_frontmatter(content) == "SKILL.md frontmatter is not closed. Ensure you have a closing '---' line."
+
+    def test_missing_name_field(self):
+        content = "---\ndescription: desc\n---\n\nBody.\n"
+        assert _validate_frontmatter(content) == "Frontmatter must include 'name' field."
+
+    def test_missing_description_field(self):
+        content = "---\nname: test\n---\n\nBody.\n"
+        assert _validate_frontmatter(content) == "Frontmatter must include 'description' field."
+
+    def test_no_body_after_frontmatter(self):
+        content = "---\nname: test\ndescription: desc\n---\n"
+        assert _validate_frontmatter(content) == "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
+
     def test_invalid_yaml(self):
         content = "---\n: invalid: yaml: {{{\n---\n\nBody.\n"
         assert "YAML frontmatter parse error" in _validate_frontmatter(content)
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("name", ""),
+            ("name", "[]"),
+            ("description", ""),
+            ("description", "[]"),
+        ],
+    )
+    def test_required_metadata_must_be_nonempty_strings(self, field, value):
+        content = (
+            "---\n"
+            f"name: {'valid-name' if field != 'name' else value}\n"
+            f"description: {'Valid description.' if field != 'description' else value}\n"
+            "---\n\nBody.\n"
+        )
+        error = _validate_frontmatter(content)
+        assert error is not None
+        assert field in error
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +386,32 @@ class TestValidateFilePath:
         err = _validate_file_path("references/../../../etc/passwd")
         assert err == "Path traversal ('..') is not allowed."
 
+    def test_disallowed_subdirectory(self):
+        err = _validate_file_path("secret/hidden.txt")
+        assert "File must be under one of:" in err
+        assert "'secret/hidden.txt'" in err
+
+    def test_directory_only_rejected(self):
+        err = _validate_file_path("references")
+        assert "Provide a file path, not just a directory" in err
+        assert "'references/myfile.md'" in err
+
+    def test_root_level_file_rejected(self):
+        err = _validate_file_path("malicious.py")
+        assert "File must be under one of:" in err
+        assert "'malicious.py'" in err
+
+    def test_skill_md_accepted_at_root(self):
+        # SKILL.md is the canonical skill file and must be accepted even
+        # though it does not live under an allowed subdirectory.
+        assert _validate_file_path("SKILL.md") is None
+
+    def test_skill_md_accepted_name_prefixed(self):
+        assert (
+            _validate_file_path("my-skill/SKILL.md", skill_name="my-skill")
+            is None
+        )
+        assert _validate_file_path("other/SKILL.md", skill_name="my-skill")
 
     def test_skill_md_traversal_still_rejected(self):
         # The SKILL.md exception must not weaken the traversal guard.
@@ -156,12 +436,46 @@ class TestCreateSkill:
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "SKILL.md").exists()
 
+    def test_create_with_category(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT, category="devops")
+        assert result["success"] is True
+        assert (tmp_path / "devops" / "my-skill" / "SKILL.md").exists()
+        assert result["category"] == "devops"
+
+    def test_create_normalizes_category_whitespace(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill(
+                "my-skill", VALID_SKILL_CONTENT, category=" devops "
+            )
+        assert result["success"] is True
+        assert result["category"] == "devops"
+        assert (tmp_path / "devops" / "my-skill" / "SKILL.md").exists()
+        assert not (tmp_path / " devops ").exists()
+
     def test_create_duplicate_blocked(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
             result = _create_skill("my-skill", VALID_SKILL_CONTENT)
         assert result["success"] is False
         assert "already exists" in result["error"]
+
+    def test_create_rejects_frontmatter_name_mismatch(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill_impl("requested", VALID_SKILL_CONTENT)
+        assert result["success"] is False
+        assert "must match" in result["error"]
+        assert not (tmp_path / "requested").exists()
+
+    def test_create_invalid_name(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("Invalid Name!", VALID_SKILL_CONTENT)
+        assert result["success"] is False
+
+    def test_create_invalid_content(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", "no frontmatter here")
+        assert result["success"] is False
 
     def test_create_rejects_category_traversal(self, tmp_path):
         skills_dir = tmp_path / "skills"
@@ -175,29 +489,1005 @@ class TestCreateSkill:
         assert "Invalid category '../escape'" in result["error"]
         assert not (tmp_path / "escape").exists()
 
+    def test_create_rejects_absolute_category(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        outside = tmp_path / "outside"
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT, category=str(outside))
+
+        assert result["success"] is False
+        assert f"Invalid category '{outside}'" in result["error"]
+        assert not (outside / "my-skill" / "SKILL.md").exists()
+
+    def test_create_rejects_redirected_category(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        outside = tmp_path / "outside"
+        skills_dir.mkdir()
+        outside.mkdir()
+        category = skills_dir / "redirect"
+        try:
+            category.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable: {exc}")
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), patch(
+            "agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]
+        ):
+            result = _create_skill(
+                "my-skill", VALID_SKILL_CONTENT, category="redirect"
+            )
+
+        assert result["success"] is False
+        assert "redirected category" in result["error"]
+        assert not (outside / "my-skill").exists()
+
+    def test_create_cannot_be_redirected_by_category_swap(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        outside = tmp_path / "outside"
+        skills_dir.mkdir()
+        outside.mkdir()
+        (outside / "my-skill").mkdir()
+        real_replace = __import__("os").replace
+        swapped = False
+
+        def swap_category_before_replace(src, dst, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                (skills_dir / "devops").rename(skills_dir / "moved-devops")
+                (skills_dir / "devops").symlink_to(
+                    outside, target_is_directory=True
+                )
+            return real_replace(src, dst, **kwargs)
+
+        with patch("tools.skill_manager_tool.SKILLS_DIR", skills_dir), patch(
+            "agent.skill_utils.get_all_skills_dirs", return_value=[skills_dir]
+        ), patch(
+            "tools.skill_manager_tool.os.replace",
+            side_effect=swap_category_before_replace,
+        ):
+            result = _create_skill(
+                "my-skill", VALID_SKILL_CONTENT, category="devops"
+            )
+
+        assert result["success"] is False
+        assert "path changed" in result["error"].lower()
+        assert not (outside / "my-skill" / "SKILL.md").exists()
+
+    def test_create_root_retarget_scans_held_new_skill_and_rolls_back(
+        self, tmp_path
+    ):
+        outside_a = tmp_path / "outside-a"
+        outside_b = tmp_path / "outside-b"
+        root_link = tmp_path / "skills"
+        outside_a.mkdir()
+        victim_dir = outside_b / "devops" / "my-skill"
+        victim_dir.mkdir(parents=True)
+        victim_content = "B-VICTIM-MUST-REMAIN-UNCHANGED"
+        (victim_dir / "SKILL.md").write_text(
+            victim_content,
+            encoding="utf-8",
+        )
+        root_link.symlink_to(outside_a, target_is_directory=True)
+        scanned = False
+
+        def inspect_held_snapshot_then_retarget(snapshot):
+            nonlocal scanned
+            scanned = True
+            snapshot_content = (snapshot / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            assert "A test skill for unit testing." in snapshot_content
+            assert "B-VICTIM-MUST-REMAIN-UNCHANGED" not in snapshot_content
+            root_link.unlink()
+            root_link.symlink_to(outside_b, target_is_directory=True)
+            return None
+
+        with _skill_dir(root_link), patch(
+            "tools.skill_manager_tool._agent_created_security_scan_enabled",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool._security_scan_skill",
+            side_effect=inspect_held_snapshot_then_retarget,
+        ):
+            result = _create_skill(
+                "my-skill",
+                VALID_SKILL_CONTENT,
+                category="devops",
+            )
+
+        assert scanned is True
+        assert result["success"] is False
+        assert "path changed" in result["error"].lower()
+        assert not (outside_a / "devops").exists()
+        assert (victim_dir / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == victim_content
+
+    def test_create_fails_closed_without_a_secure_platform_backend(
+        self, tmp_path
+    ):
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._secure_directory_create_supported",
+            return_value=False,
+        ):
+            result = _create_skill(
+                "my-skill", VALID_SKILL_CONTENT, category="devops"
+            )
+
+        assert result["success"] is False
+        assert "secure skill creation" in result["error"].lower()
+        assert not (tmp_path / "devops").exists()
+
+    def test_windows_backend_dispatches_categorized_creation(self):
+        expected = (
+            Path("C:/skills/devops/my-skill"),
+            None,
+        )
+        with patch(
+            "tools.skill_manager_tool._secure_directory_create_supported",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool.os.name",
+            "nt",
+        ), patch(
+            "tools.skill_manager_tool._secure_create_and_write_skill_windows",
+            return_value=expected,
+        ) as windows_create:
+            result = skill_manager_module._secure_create_and_write_skill(
+                "my-skill",
+                "devops",
+                _content_for_name(VALID_SKILL_CONTENT, "my-skill"),
+            )
+
+        assert result == expected
+        windows_create.assert_called_once_with(
+            "my-skill",
+            "devops",
+            _content_for_name(VALID_SKILL_CONTENT, "my-skill"),
+        )
+
+    def test_windows_backend_probe_failure_fails_closed(self):
+        with patch(
+            "tools.skill_manager_tool._secure_directory_create_supported",
+            return_value=False,
+        ), patch(
+            "tools.skill_manager_tool.os.name",
+            "nt",
+        ):
+            result = skill_manager_module._secure_create_and_write_skill(
+                "my-skill",
+                "devops",
+                _content_for_name(VALID_SKILL_CONTENT, "my-skill"),
+            )
+
+        assert result[0] is None
+        assert "unavailable on Windows" in result[1]
+
+    def test_windows_opened_handle_reparse_tag_is_rejected(self):
+        """A post-attributes junction swap is caught on the opened handle."""
+        import ctypes
+        from types import SimpleNamespace
+
+        create_file = MagicMock(return_value=123)
+        get_attributes = MagicMock(return_value=0)
+        close_handle = MagicMock(return_value=True)
+
+        def report_reparse_tag(_handle, info_class, info_ptr, _size):
+            assert info_class == 9
+            fields = ctypes.cast(
+                info_ptr,
+                ctypes.POINTER(ctypes.c_uint32 * 2),
+            ).contents
+            fields[0] = 0x00000400
+            fields[1] = 0xA0000003
+            return True
+
+        get_information = MagicMock(side_effect=report_reparse_tag)
+        kernel32 = SimpleNamespace(
+            CreateFileW=create_file,
+            GetFileAttributesW=get_attributes,
+            GetFileInformationByHandleEx=get_information,
+            CloseHandle=close_handle,
+        )
+        with patch(
+            "ctypes.windll",
+            SimpleNamespace(kernel32=kernel32),
+            create=True,
+        ):
+            with pytest.raises(OSError, match="redirected directory"):
+                skill_manager_module._open_windows_directory_guard(
+                    Path("C:/skills"),
+                    Path("C:/skills"),
+                )
+
+        get_information.assert_called_once()
+        close_handle.assert_called_once_with(123)
+
+    def test_windows_canonical_mutation_uses_held_backend_handle(
+        self,
+    ):
+        from contextlib import contextmanager
+
+        existing = {
+            "path": Path("C:/skills/example"),
+            "_resolved_path": Path("C:/skills/example"),
+            "_dir_identity": (1, 2),
+        }
+        held = MagicMock()
+        held.identity = (1, 2)
+
+        @contextmanager
+        def open_held(_existing):
+            yield held, existing["_resolved_path"]
+
+        with patch(
+            "tools.skill_manager_tool._secure_directory_create_supported",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool.os.name", "nt"
+        ), patch(
+            "tools.skill_manager_tool._open_existing_skill_directory",
+            side_effect=open_held,
+        ), patch(
+            "tools.skill_manager_tool._replace_canonical_skill_md",
+        ) as replace:
+            error = skill_manager_module._secure_replace_existing_skill_md(
+                existing,
+                _content_for_name(VALID_SKILL_CONTENT_2, "example"),
+            )
+
+        assert error is None
+        replace.assert_called_once_with(
+            held,
+            _content_for_name(VALID_SKILL_CONTENT_2, "example"),
+        )
+
+    def test_windows_supporting_mutation_walks_held_backend_handles(
+        self,
+    ):
+        from contextlib import contextmanager
+        from pathlib import PureWindowsPath
+
+        existing = {
+            "path": Path("C:/skills/example"),
+            "_resolved_path": Path("C:/skills/example"),
+            "_dir_identity": (1, 2),
+        }
+        skill_handle = MagicMock()
+        skill_handle.identity = (1, 2)
+        references_handle = MagicMock()
+        references_handle.identity = (1, 3)
+        skill_handle.open_dir.return_value = references_handle
+        skill_handle.entry_identity.return_value = references_handle.identity
+
+        @contextmanager
+        def open_held(_existing):
+            yield skill_handle, existing["_resolved_path"]
+
+        with patch(
+            "tools.skill_manager_tool._secure_directory_create_supported",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool.os.name", "nt"
+        ), patch(
+            "tools.skill_manager_tool._open_existing_skill_directory",
+            side_effect=open_held,
+        ), patch(
+            "tools.skill_manager_tool.Path",
+            PureWindowsPath,
+        ):
+            with skill_manager_module._open_supporting_file_parent(
+                existing,
+                "references/example.md",
+                create_parents=False,
+            ) as opened:
+                assert opened[:4] == (
+                    skill_handle,
+                    references_handle,
+                    "example.md",
+                    existing["_resolved_path"],
+                )
+                assert opened[4]() is True
+
+        skill_handle.open_dir.assert_called_once_with(
+            "references", writable=True
+        )
+        references_handle.close.assert_called_once()
+
+    def test_windows_native_entrypoint_refuses_non_windows_host_without_writes(
+        self, tmp_path
+    ):
+        content = _content_for_name(VALID_SKILL_CONTENT, "windows-skill")
+        with _skill_dir(tmp_path):
+            result = (
+                skill_manager_module._secure_create_and_write_skill_windows(
+                    "windows-skill",
+                    "devops",
+                    content,
+                )
+            )
+
+        assert result[0] is None
+        assert "unavailable on Windows" in result[1]
+        assert not (tmp_path / "devops" / "windows-skill").exists()
+        assert not (tmp_path / "devops").exists()
+
+    def test_concurrent_same_name_across_categories_has_one_winner(
+        self, tmp_path
+    ):
+        content = _content_for_name(VALID_SKILL_CONTENT, "shared-name")
+
+        def create(category):
+            return _create_skill_impl("shared-name", content, category)
+
+        with _skill_dir(tmp_path), ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(create, ("first", "second")))
+
+        assert sum(result["success"] for result in results) == 1
+        assert len(list(tmp_path.rglob("shared-name/SKILL.md"))) == 1
+
+    def test_cross_process_same_name_has_one_winner(self, tmp_path):
+        try:
+            context = multiprocessing.get_context("fork")
+        except ValueError:
+            pytest.skip("fork multiprocessing context unavailable")
+
+        start = context.Event()
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=_process_create_same_skill,
+                args=(str(tmp_path), category, start, results),
+            )
+            for category in ("first", "second")
+        ]
+        for process in processes:
+            process.start()
+        start.set()
+        outcomes = [results.get(timeout=10) for _ in processes]
+        for process in processes:
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        assert sum(outcomes) == 1
+        assert len(list(tmp_path.rglob("shared-process-name/SKILL.md"))) == 1
+
+    def test_create_does_not_reuse_preexisting_non_skill_directory(self, tmp_path):
+        existing = tmp_path / "my-skill"
+        existing.mkdir()
+        marker = existing / "keep.txt"
+        marker.write_text("keep", encoding="utf-8")
+
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        assert result["success"] is False
+        assert marker.read_text(encoding="utf-8") == "keep"
+        assert not (existing / "SKILL.md").exists()
+
+    def test_scan_rejection_rolls_back_only_this_create(self, tmp_path):
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._agent_created_security_scan_enabled",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool._security_scan_skill",
+            return_value="blocked",
+        ):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+
+        assert result == {"success": False, "error": "blocked"}
+        assert not (tmp_path / "my-skill").exists()
+
+    def test_encoding_failure_rolls_back_temporary_create(self, tmp_path):
+        content = _content_for_name(VALID_SKILL_CONTENT, "surrogate-skill")
+        content += "\n\ud800"
+        with _skill_dir(tmp_path):
+            result = _create_skill_impl("surrogate-skill", content)
+
+        assert result["success"] is False
+        assert not (tmp_path / "surrogate-skill").exists()
+        assert not list(tmp_path.rglob(".tmp_SKILL_*"))
+
+    def test_create_normalizes_single_bom_before_persisting(self, tmp_path):
+        content = "\ufeff" + _content_for_name(VALID_SKILL_CONTENT, "bom-skill")
+        with _skill_dir(tmp_path):
+            result = _create_skill_impl("bom-skill", content)
+
+        assert result["success"] is True
+        saved = (tmp_path / "bom-skill" / "SKILL.md").read_text(encoding="utf-8")
+        assert not saved.startswith("\ufeff")
+        assert parse_frontmatter(saved)[0]["name"] == "bom-skill"
+
+    def test_create_long_desc_rejected(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("long-desc", LONG_DESC_CONTENT)
+        assert result["success"] is False
+        assert "system-prompt budget" in result["error"]
+
+    def test_create_short_desc_no_prompt_preview(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+        assert result["success"] is True
+        assert "system_prompt_preview" not in result
+
+    def test_create_boundary_at_limit_accepted_no_preview(self, tmp_path):
+        desc = "U" * SKILL_PROMPT_DESC_LIMIT
+        content = f"---\nname: boundary-at\ndescription: {desc}\n---\n\n# Boundary\n\nStep 1.\n"
+        with _skill_dir(tmp_path):
+            result = _create_skill("boundary-at", content)
+        assert result["success"] is True
+        assert "system_prompt_preview" not in result
+
+    def test_create_boundary_over_limit_rejected(self, tmp_path):
+        desc = "U" * (SKILL_PROMPT_DESC_LIMIT + 1)
+        content = f"---\nname: boundary-over\ndescription: {desc}\n---\n\n# Boundary\n\nStep 1.\n"
+        with _skill_dir(tmp_path):
+            result = _create_skill("boundary-over", content)
+        assert result["success"] is False
+        assert "system-prompt budget" in result["error"]
 
     def test_edit_long_desc_still_allowed_with_preview(self, tmp_path):
         """Edit/patch paths stay permissive so existing over-limit skills
         remain maintainable — they warn via system_prompt_preview instead."""
+        content = _content_for_name(LONG_DESC_CONTENT, "my-skill")
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
-            result = _edit_skill("my-skill", LONG_DESC_CONTENT)
+            result = _edit_skill("my-skill", content)
         assert result["success"] is True
         assert "system_prompt_preview" in result
         assert "System prompt will show" in result["system_prompt_preview"]
-        fm, _ = parse_frontmatter(LONG_DESC_CONTENT)
+        fm, _ = parse_frontmatter(content)
         assert extract_skill_description(fm) in result["system_prompt_preview"]
 
 
 class TestEditSkill:
+    @pytest.mark.parametrize("action", ["edit", "patch", "write_file"])
+    def test_canonical_skill_symlink_never_writes_outside(
+        self, tmp_path, action
+    ):
+        outside = tmp_path / "outside.md"
+        outside.write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "evil"),
+            encoding="utf-8",
+        )
+        skill_dir = tmp_path / "evil"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").symlink_to(outside)
+        replacement = _content_for_name(VALID_SKILL_CONTENT_2, "evil")
+
+        with _skill_dir(tmp_path):
+            if action == "edit":
+                result = _edit_skill("evil", replacement)
+            elif action == "patch":
+                result = _patch_skill(
+                    "evil",
+                    "Do the thing.",
+                    "Do something else.",
+                )
+            else:
+                result = _write_file("evil", "SKILL.md", replacement)
+
+        assert result["success"] is False
+        assert outside.read_text(encoding="utf-8") == _content_for_name(
+            VALID_SKILL_CONTENT, "evil"
+        )
+
+    def test_canonical_symlink_swap_is_replaced_not_followed(self, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text("outside stays unchanged", encoding="utf-8")
+        replacement = _content_for_name(VALID_SKILL_CONTENT_2, "my-skill")
+
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            skill_md = tmp_path / "my-skill" / "SKILL.md"
+            real_replace = os.replace
+            planted = False
+
+            def plant_symlink_before_replace(src, dst, **kwargs):
+                nonlocal planted
+                if (
+                    not planted
+                    and dst == "SKILL.md"
+                    and kwargs.get("dst_dir_fd") is not None
+                ):
+                    planted = True
+                    skill_md.unlink()
+                    skill_md.symlink_to(outside)
+                return real_replace(src, dst, **kwargs)
+
+            with patch(
+                "tools.skill_manager_tool.os.replace",
+                side_effect=plant_symlink_before_replace,
+            ):
+                result = _edit_skill("my-skill", replacement)
+
+        assert result["success"] is True
+        assert outside.read_text(encoding="utf-8") == "outside stays unchanged"
+        assert not skill_md.is_symlink()
+        assert "Updated description." in skill_md.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("action", ["edit", "patch", "write_file"])
+    def test_skill_root_retarget_keeps_canonical_transaction_on_one_directory(
+        self, tmp_path, action
+    ):
+        """Read/write/scan/rollback must not mix A and B through a root link."""
+        outside_a = tmp_path / "outside-a"
+        outside_b = tmp_path / "outside-b"
+        root_link = tmp_path / "skills"
+        for root in (outside_a, outside_b):
+            # Deliberately use a legacy directory name so lookup must inspect
+            # frontmatter through its held candidate directory descriptor.
+            skill_dir = root / "legacy-dir"
+            skill_dir.mkdir(parents=True)
+        (outside_a / "legacy-dir" / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "shared"),
+            encoding="utf-8",
+        )
+        (outside_b / "legacy-dir" / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "shared")
+            + "\nB-VICTIM-MUST-NEVER-BE-COPIED\n",
+            encoding="utf-8",
+        )
+        original_a = (outside_a / "legacy-dir" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        original_b = (outside_b / "legacy-dir" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        root_link.symlink_to(outside_a, target_is_directory=True)
+        replacement = _content_for_name(VALID_SKILL_CONTENT_2, "shared")
+        retargeted = False
+        real_read = skill_manager_module._read_canonical_skill_md
+
+        def retarget_during_candidate_read(skill_fd):
+            nonlocal retargeted
+            if not retargeted:
+                retargeted = True
+                root_link.unlink()
+                root_link.symlink_to(outside_b, target_is_directory=True)
+            return real_read(skill_fd)
+
+        def reject_anchored_snapshot(snapshot):
+            scanned = (snapshot / "SKILL.md").read_text(encoding="utf-8")
+            assert "B-VICTIM-MUST-NEVER-BE-COPIED" not in scanned
+            if action == "patch":
+                assert "Do something else." in scanned
+            else:
+                assert "Updated description." in scanned
+            return "blocked after anchored scan"
+
+        with _skill_dir(root_link), patch(
+            "tools.skill_manager_tool._read_canonical_skill_md",
+            side_effect=retarget_during_candidate_read,
+        ), patch(
+            "tools.skill_manager_tool._agent_created_security_scan_enabled",
+            return_value=True,
+        ), patch(
+            "tools.skill_manager_tool._security_scan_skill",
+            side_effect=reject_anchored_snapshot,
+        ):
+            if action == "edit":
+                result = _edit_skill("shared", replacement)
+            elif action == "patch":
+                result = _patch_skill(
+                    "shared",
+                    "Do the thing.",
+                    "Do something else.",
+                )
+            else:
+                result = _write_file("shared", "SKILL.md", replacement)
+
+        assert retargeted is True
+        assert result["success"] is False
+        assert "blocked after anchored scan" in result["error"]
+        assert (outside_a / "legacy-dir" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == original_a
+        assert (outside_b / "legacy-dir" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == original_b
+
     def test_edit_existing_skill(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
-            result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
+            result = _edit_skill(
+                "my-skill", _content_for_name(VALID_SKILL_CONTENT_2, "my-skill")
+            )
         assert result["success"] is True
-        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         assert "Updated description" in content
 
+    def test_failed_rollback_cannot_overwrite_concurrent_success(
+        self, tmp_path
+    ):
+        failed_content = _content_for_name(
+            VALID_SKILL_CONTENT_2.replace(
+                "# Test Skill v2", "# Failed transaction"
+            ),
+            "transaction-skill",
+        )
+        successful_content = _content_for_name(
+            VALID_SKILL_CONTENT_2.replace(
+                "# Test Skill v2", "# Successful transaction"
+            ),
+            "transaction-skill",
+        )
+        failed_scan_entered = threading.Event()
+        release_failed_scan = threading.Event()
+        successful_done = threading.Event()
+
+        def controlled_scan(skill_fd):
+            current = skill_manager_module._read_canonical_skill_md(skill_fd)
+            if "# Failed transaction" in current:
+                failed_scan_entered.set()
+                assert release_failed_scan.wait(timeout=10)
+                return "blocked by deterministic scan"
+            return None
+
+        with _skill_dir(tmp_path):
+            _create_skill("transaction-skill", VALID_SKILL_CONTENT)
+            with patch(
+                "tools.skill_manager_tool._security_scan_held_skill",
+                side_effect=controlled_scan,
+            ), ThreadPoolExecutor(max_workers=2) as pool:
+                failed_future = pool.submit(
+                    _edit_skill, "transaction-skill", failed_content
+                )
+                assert failed_scan_entered.wait(timeout=10)
+
+                def successful_edit():
+                    result = _edit_skill(
+                        "transaction-skill", successful_content
+                    )
+                    successful_done.set()
+                    return result
+
+                successful_future = pool.submit(successful_edit)
+                assert not successful_done.wait(timeout=0.2)
+                release_failed_scan.set()
+                failed_result = failed_future.result(timeout=10)
+                successful_result = successful_future.result(timeout=10)
+
+        assert failed_result["success"] is False
+        assert successful_result["success"] is True
+        assert (
+            tmp_path / "transaction-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8") == successful_content
+
+    def test_directory_and_frontmatter_aliases_share_physical_transaction_lock(
+        self, tmp_path
+    ):
+        """Rollback through one alias cannot clobber a commit via the other."""
+        skill_dir = tmp_path / "legacy-dir"
+        references = skill_dir / "references"
+        references.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "shared"),
+            encoding="utf-8",
+        )
+        target = references / "state.txt"
+        target.write_text("original", encoding="utf-8")
+        failed_scan_entered = threading.Event()
+        release_failed_scan = threading.Event()
+        successful_done = threading.Event()
+
+        def controlled_scan(skill_fd):
+            file_fd = os.open(
+                "references/state.txt",
+                os.O_RDONLY,
+                dir_fd=skill_fd,
+            )
+            try:
+                current = os.read(file_fd, 100).decode("utf-8")
+            finally:
+                os.close(file_fd)
+            if current == "failed":
+                failed_scan_entered.set()
+                assert release_failed_scan.wait(timeout=10)
+                return "blocked by deterministic alias scan"
+            return None
+
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._security_scan_held_skill",
+            side_effect=controlled_scan,
+        ), ThreadPoolExecutor(max_workers=2) as pool:
+            failed_future = pool.submit(
+                _write_file,
+                "legacy-dir",
+                "references/state.txt",
+                "failed",
+            )
+            assert failed_scan_entered.wait(timeout=10)
+
+            def successful_write():
+                result = _write_file(
+                    "shared",
+                    "references/state.txt",
+                    "successful",
+                )
+                successful_done.set()
+                return result
+
+            successful_future = pool.submit(successful_write)
+            assert not successful_done.wait(timeout=0.2)
+            release_failed_scan.set()
+            failed_result = failed_future.result(timeout=10)
+            successful_result = successful_future.result(timeout=10)
+
+        assert failed_result["success"] is False
+        assert successful_result["success"] is True
+        assert target.read_text(encoding="utf-8") == "successful"
+
+    def test_threaded_alias_write_rollback_serializes_remove(self, tmp_path):
+        """A remove through one alias cannot race a rollback through another."""
+        skill_dir = tmp_path / "legacy-directory"
+        target = skill_dir / "references" / "state.txt"
+        target.parent.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "frontmatter-alias"),
+            encoding="utf-8",
+        )
+        target.write_text("original", encoding="utf-8")
+        failed_scan_entered = threading.Event()
+        release_failed_scan = threading.Event()
+        remove_done = threading.Event()
+
+        def controlled_scan(skill_fd):
+            file_fd = os.open("references/state.txt", os.O_RDONLY, dir_fd=skill_fd)
+            try:
+                current = os.read(file_fd, 100).decode("utf-8")
+            finally:
+                os.close(file_fd)
+            if current == "failed":
+                failed_scan_entered.set()
+                assert release_failed_scan.wait(timeout=10)
+                return "blocked by deterministic write/remove scan"
+            return None
+
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._security_scan_held_skill",
+            side_effect=controlled_scan,
+        ), ThreadPoolExecutor(max_workers=2) as pool:
+            write_future = pool.submit(
+                _write_file,
+                "legacy-directory",
+                "references/state.txt",
+                "failed",
+            )
+            assert failed_scan_entered.wait(timeout=10)
+
+            def remove_file():
+                result = _remove_file(
+                    "frontmatter-alias", "references/state.txt"
+                )
+                remove_done.set()
+                return result
+
+            remove_future = pool.submit(remove_file)
+            assert not remove_done.wait(timeout=0.2)
+            release_failed_scan.set()
+            write_result = write_future.result(timeout=10)
+            remove_result = remove_future.result(timeout=10)
+
+        assert write_result["success"] is False
+        assert remove_result["success"] is True
+        assert not target.exists()
+
+    def test_failed_rollback_cannot_overwrite_cross_process_success(
+        self, tmp_path
+    ):
+        try:
+            context = multiprocessing.get_context("fork")
+        except ValueError:
+            pytest.skip("fork multiprocessing context unavailable")
+
+        failed_content = _content_for_name(
+            VALID_SKILL_CONTENT_2.replace(
+                "# Test Skill v2", "# Failed process transaction"
+            ),
+            "transaction-skill",
+        )
+        successful_content = _content_for_name(
+            VALID_SKILL_CONTENT_2.replace(
+                "# Test Skill v2", "# Successful process transaction"
+            ),
+            "transaction-skill",
+        )
+        with _skill_dir(tmp_path):
+            _create_skill("transaction-skill", VALID_SKILL_CONTENT)
+
+        failed_entered = context.Event()
+        successful_entered = context.Event()
+        release_failed = context.Event()
+        failed_done = context.Event()
+        successful_done = context.Event()
+        results = context.Queue()
+        failed_process = context.Process(
+            target=_process_edit_with_controlled_scan,
+            args=(
+                str(tmp_path),
+                failed_content,
+                True,
+                failed_entered,
+                release_failed,
+                failed_done,
+                results,
+            ),
+        )
+        successful_process = context.Process(
+            target=_process_edit_with_controlled_scan,
+            args=(
+                str(tmp_path),
+                successful_content,
+                False,
+                successful_entered,
+                release_failed,
+                successful_done,
+                results,
+            ),
+        )
+        failed_process.start()
+        assert failed_entered.wait(timeout=10)
+        successful_process.start()
+        assert not successful_done.wait(timeout=0.2)
+        assert not successful_entered.is_set()
+        release_failed.set()
+
+        outcomes = [results.get(timeout=10) for _ in range(2)]
+        for process in (failed_process, successful_process):
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        assert sorted(result["success"] for result in outcomes) == [False, True]
+        assert (
+            tmp_path / "transaction-skill" / "SKILL.md"
+        ).read_text(encoding="utf-8") == successful_content
+
+    def test_cross_process_directory_and_frontmatter_aliases_serialize_transaction(
+        self, tmp_path
+    ):
+        """Alias transactions share one physical lock across processes.
+
+        The first process writes through the legacy directory basename and
+        pauses after its held-directory scan rejects the write.  A second
+        process addresses the same directory via its frontmatter name.  It
+        must neither scan the failed content nor commit before the first
+        process has rolled back.
+        """
+        try:
+            context = multiprocessing.get_context("fork")
+        except ValueError:
+            pytest.skip("fork multiprocessing context unavailable")
+
+        skill_dir = tmp_path / "legacy-directory"
+        target = skill_dir / "references" / "state.txt"
+        target.parent.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "frontmatter-alias"),
+            encoding="utf-8",
+        )
+        target.write_text("original", encoding="utf-8")
+
+        failed_entered = context.Event()
+        successful_entered = context.Event()
+        release_failed = context.Event()
+        failed_done = context.Event()
+        successful_done = context.Event()
+        results = context.Queue()
+        failed_process = context.Process(
+            target=_process_write_alias_with_controlled_scan,
+            args=(
+                str(tmp_path),
+                "legacy-directory",
+                "failed",
+                True,
+                failed_entered,
+                release_failed,
+                failed_done,
+                results,
+            ),
+        )
+        successful_process = context.Process(
+            target=_process_write_alias_with_controlled_scan,
+            args=(
+                str(tmp_path),
+                "frontmatter-alias",
+                "successful",
+                False,
+                successful_entered,
+                release_failed,
+                successful_done,
+                results,
+            ),
+        )
+
+        failed_process.start()
+        assert failed_entered.wait(timeout=10)
+        successful_process.start()
+        assert not successful_done.wait(timeout=0.2)
+        assert not successful_entered.is_set()
+        release_failed.set()
+
+        outcomes = [results.get(timeout=10) for _ in range(2)]
+        for process in (failed_process, successful_process):
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        result_by_success = {result["success"]: (result, snapshot) for result, snapshot in outcomes}
+        failed_result, failed_snapshot = result_by_success[False]
+        successful_result, successful_snapshot = result_by_success[True]
+        assert "blocked by deterministic cross-process alias scan" in failed_result["error"]
+        assert successful_result["success"] is True
+        assert failed_snapshot == "failed"
+        assert successful_snapshot == "successful"
+        assert target.read_text(encoding="utf-8") == "successful"
+
+    def test_cross_process_alias_edit_serializes_delete(self, tmp_path):
+        """A delete cannot remove a skill during an edit's held-dir scan."""
+        try:
+            context = multiprocessing.get_context("fork")
+        except ValueError:
+            pytest.skip("fork multiprocessing context unavailable")
+
+        skill_dir = tmp_path / "legacy-directory"
+        skill_dir.mkdir()
+        updated = _content_for_name(
+            VALID_SKILL_CONTENT_2, "frontmatter-alias"
+        )
+        (skill_dir / "SKILL.md").write_text(
+            _content_for_name(VALID_SKILL_CONTENT, "frontmatter-alias"),
+            encoding="utf-8",
+        )
+        edit_entered = context.Event()
+        release_edit = context.Event()
+        edit_done = context.Event()
+        delete_done = context.Event()
+        results = context.Queue()
+        edit_process = context.Process(
+            target=_process_edit_alias_with_controlled_scan,
+            args=(
+                str(tmp_path),
+                "frontmatter-alias",
+                updated,
+                edit_entered,
+                release_edit,
+                edit_done,
+                results,
+            ),
+        )
+        delete_process = context.Process(
+            target=_process_delete_alias,
+            args=(str(tmp_path), "legacy-directory", delete_done, results),
+        )
+
+        edit_process.start()
+        assert edit_entered.wait(timeout=10)
+        delete_process.start()
+        assert not delete_done.wait(timeout=0.2)
+        release_edit.set()
+
+        outcomes = [results.get(timeout=10) for _ in range(2)]
+        for process in (edit_process, delete_process):
+            process.join(timeout=10)
+            assert process.exitcode == 0
+
+        assert all(result["success"] for result in outcomes)
+        assert not skill_dir.exists()
+
+    def test_edit_nonexistent_skill(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _edit_skill(
+                "nonexistent",
+                _content_for_name(VALID_SKILL_CONTENT, "nonexistent"),
+            )
+        assert result["success"] is False
+        assert "not found" in result["error"]
 
     def test_edit_invalid_content_rejected(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -205,8 +1495,119 @@ class TestEditSkill:
             result = _edit_skill("my-skill", "no frontmatter")
         assert result["success"] is False
         # Original content should be preserved
-        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         assert "A test skill" in content
+
+    def test_edit_rejects_frontmatter_identity_change(self, tmp_path):
+        original = _content_for_name(VALID_SKILL_CONTENT, "my-skill")
+        mismatched = _content_for_name(VALID_SKILL_CONTENT_2, "other-skill")
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", original)
+            result = _edit_skill("my-skill", mismatched)
+        assert result["success"] is False
+        assert "must match" in result["error"]
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == original
+
+    def test_edit_rejects_ambiguous_skill_identity(self, tmp_path):
+        original = _content_for_name(VALID_SKILL_CONTENT, "same-skill")
+        for category in ("a", "b"):
+            skill_dir = tmp_path / category / "same-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(original, encoding="utf-8")
+
+        updated = _content_for_name(VALID_SKILL_CONTENT_2, "same-skill")
+        with _skill_dir(tmp_path):
+            result = _edit_skill("same-skill", updated)
+
+        assert result["success"] is False
+        assert "ambiguous" in result["error"]
+        for category in ("a", "b"):
+            assert (
+                tmp_path / category / "same-skill" / "SKILL.md"
+            ).read_text(encoding="utf-8") == original
+
+    def test_unavailable_external_root_fails_closed_before_local_edit(
+        self, tmp_path
+    ):
+        local = tmp_path / "local"
+        missing_external = tmp_path / "configured-but-missing"
+        local.mkdir()
+        with patch(
+            "tools.skill_manager_tool.SKILLS_DIR", local
+        ), patch(
+            "agent.skill_utils.get_all_skills_dirs",
+            return_value=[local, missing_external],
+        ):
+            created = _create_skill(
+                "my-skill",
+                VALID_SKILL_CONTENT,
+            )
+            assert created["success"] is False
+
+            skill_dir = local / "my-skill"
+            skill_dir.mkdir()
+            original = _content_for_name(
+                VALID_SKILL_CONTENT, "my-skill"
+            )
+            (skill_dir / "SKILL.md").write_text(
+                original, encoding="utf-8"
+            )
+            result = _edit_skill(
+                "my-skill",
+                _content_for_name(VALID_SKILL_CONTENT_2, "my-skill"),
+            )
+
+        assert result["success"] is False
+        assert "lookup is incomplete" in result["error"].lower()
+        assert (skill_dir / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == original
+
+    def test_unreadable_candidate_metadata_fails_closed_before_local_edit(
+        self, tmp_path
+    ):
+        local = tmp_path / "local"
+        external = tmp_path / "external"
+        local_skill = local / "my-skill"
+        hidden_candidate = external / "legacy-directory"
+        local_skill.mkdir(parents=True)
+        hidden_candidate.mkdir(parents=True)
+        original = _content_for_name(VALID_SKILL_CONTENT, "my-skill")
+        (local_skill / "SKILL.md").write_text(original, encoding="utf-8")
+        (hidden_candidate / "SKILL.md").write_text(
+            original, encoding="utf-8"
+        )
+
+        with patch(
+            "tools.skill_manager_tool.SKILLS_DIR", local
+        ), patch(
+            "agent.skill_utils.get_all_skills_dirs",
+            return_value=[local, external],
+        ), patch(
+            "tools.skill_manager_tool._read_canonical_skill_md",
+            side_effect=UnicodeError("cannot decode candidate"),
+        ):
+            result = _edit_skill(
+                "my-skill",
+                _content_for_name(VALID_SKILL_CONTENT_2, "my-skill"),
+            )
+
+        assert result["success"] is False
+        assert "lookup is incomplete" in result["error"].lower()
+        assert (local_skill / "SKILL.md").read_text(
+            encoding="utf-8"
+        ) == original
+
+    def test_edit_long_desc_includes_prompt_preview(self, tmp_path):
+        edit_content = LONG_DESC_CONTENT.replace("name: long-desc", "name: test-skill")
+        with _skill_dir(tmp_path):
+            _create_skill("test-skill", VALID_SKILL_CONTENT)
+            result = _edit_skill("test-skill", edit_content)
+        assert result["success"] is True
+        assert "system_prompt_preview" in result
+
 
 class TestPatchSkill:
     def test_patch_unique_match(self, tmp_path):
@@ -214,9 +1615,66 @@ class TestPatchSkill:
             _create_skill("my-skill", VALID_SKILL_CONTENT)
             result = _patch_skill("my-skill", "Do the thing.", "Do the new thing.")
         assert result["success"] is True
-        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         assert "Do the new thing." in content
 
+    def test_canonical_patch_closes_directory_context_on_fuzzy_exception(
+        self, tmp_path
+    ):
+        session = MagicMock()
+        session.__enter__.return_value = (
+            123,
+            tmp_path / "my-skill",
+        )
+        session.__exit__.return_value = False
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            with patch(
+                "tools.skill_manager_tool._open_existing_skill_directory",
+                return_value=session,
+            ), patch(
+                "tools.skill_manager_tool._read_canonical_skill_md",
+                return_value=_content_for_name(
+                    VALID_SKILL_CONTENT,
+                    "my-skill",
+                ),
+            ), patch(
+                "tools.fuzzy_match.fuzzy_find_and_replace",
+                side_effect=RuntimeError("unexpected fuzzy failure"),
+            ):
+                result = _patch_skill(
+                    "my-skill",
+                    "Do the thing.",
+                    "Do something else.",
+                )
+
+        assert result["success"] is False
+        assert "unexpected fuzzy failure" in result["error"]
+        assert session.__exit__.call_count == 2
+        assert session.__exit__.call_args_list[0].args == (None, None, None)
+        assert session.__exit__.call_args_list[1].args[0] is RuntimeError
+
+    def test_patch_rejects_frontmatter_identity_change(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            original = (tmp_path / "my-skill" / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            result = _patch_skill(
+                "my-skill", "name: my-skill", "name: other-skill"
+            )
+        assert result["success"] is False
+        assert "must match" in result["error"]
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == original
+
+    def test_patch_nonexistent_string(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill("my-skill", "this text does not exist", "replacement")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower() or "could not find" in result["error"].lower()
 
     def test_patch_ambiguous_match_rejected(self, tmp_path):
         content = """\
@@ -237,7 +1695,7 @@ word word
 
     def test_patch_supporting_file_symlink_escape_blocked(self, tmp_path):
         outside_file = tmp_path / "outside.txt"
-        outside_file.write_text("old text here")
+        outside_file.write_text("old text here", encoding="utf-8")
 
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -253,6 +1711,59 @@ word word
         assert result["success"] is False
         assert "escapes" in result["error"].lower()
         assert outside_file.read_text() == "old text here"
+
+    @pytest.mark.parametrize("action", ["patch", "write_file"])
+    def test_supporting_parent_symlink_swap_after_validation_is_rejected(
+        self, tmp_path, action
+    ):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside_target = outside / "api.md"
+        outside_target.write_text("outside old text", encoding="utf-8")
+
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            references = tmp_path / "my-skill" / "references"
+            references.mkdir()
+            inside_target = references / "api.md"
+            inside_target.write_text("inside old text", encoding="utf-8")
+            moved_references = tmp_path / "my-skill" / "held-references"
+            real_replace = skill_manager_module._replace_held_regular_text
+            swapped = False
+
+            def replace_then_swap(parent_fd, filename, content, **kwargs):
+                nonlocal swapped
+                real_replace(parent_fd, filename, content, **kwargs)
+                if not swapped:
+                    swapped = True
+                    references.rename(moved_references)
+                    references.symlink_to(outside, target_is_directory=True)
+
+            with patch(
+                "tools.skill_manager_tool._replace_held_regular_text",
+                side_effect=replace_then_swap,
+            ):
+                if action == "patch":
+                    result = _patch_skill(
+                        "my-skill",
+                        "old text",
+                        "new text",
+                        file_path="references/api.md",
+                    )
+                else:
+                    result = _write_file(
+                        "my-skill",
+                        "references/api.md",
+                        "new text",
+                    )
+
+        assert swapped is True
+        assert result["success"] is False
+        assert "path changed" in result["error"].lower()
+        assert outside_target.read_text(encoding="utf-8") == "outside old text"
+        assert (
+            moved_references / "api.md"
+        ).read_text(encoding="utf-8") == "inside old text"
 
 
 class TestDeleteSkill:
@@ -284,6 +1795,48 @@ class TestWriteFile:
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "references" / "api.md").exists()
 
+    def test_write_to_nonexistent_skill(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _write_file("nonexistent", "references/doc.md", "content")
+        assert result["success"] is False
+
+    def test_write_to_disallowed_path(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _write_file("my-skill", "secret/evil.py", "malicious")
+        assert result["success"] is False
+
+    def test_write_skill_md_uses_validated_edit_contract(self, tmp_path):
+        mismatched = _content_for_name(VALID_SKILL_CONTENT_2, "other-skill")
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            original = (tmp_path / "my-skill" / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            result = _write_file("my-skill", "SKILL.md", mismatched)
+        assert result["success"] is False
+        assert "must match" in result["error"]
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == original
+
+    def test_write_support_directory_skill_md_remains_supporting_file(
+        self, tmp_path
+    ):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            original = (tmp_path / "my-skill" / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            result = _write_file(
+                "my-skill",
+                "references/SKILL.md",
+                "preserved package",
+            )
+        assert result["success"] is True
+        assert (
+            tmp_path / "my-skill" / "references" / "SKILL.md"
+        ).read_text() == "preserved package"
+        assert (tmp_path / "my-skill" / "SKILL.md").read_text() == original
+
     def test_write_symlink_escape_blocked(self, tmp_path):
         outside_dir = tmp_path / "outside"
         outside_dir.mkdir()
@@ -313,11 +1866,49 @@ class TestRemoveFile:
         assert result["success"] is True
         assert not (tmp_path / "my-skill" / "references" / "api.md").exists()
 
+    def test_remove_reports_success_when_empty_parent_cleanup_fails(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _write_file("my-skill", "references/api.md", "content")
+            with patch(
+                "tools.skill_manager_tool._secure_cleanup_empty_support_parent",
+                side_effect=OSError("injected cleanup failure"),
+            ):
+                result = _remove_file("my-skill", "references/api.md")
+
+        assert result["success"] is True
+        assert not (tmp_path / "my-skill" / "references" / "api.md").exists()
+
+    def test_remove_nonexistent_file(self, tmp_path):
+        from tools.skills_tool import MAX_LINKED_FILES_PER_CATEGORY
+
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            for index in reversed(range(MAX_LINKED_FILES_PER_CATEGORY + 5)):
+                _write_file(
+                    "my-skill",
+                    f"references/{index:03d}.md",
+                    "content",
+                )
+            result = _remove_file("my-skill", "references/nope.md")
+        assert result["success"] is False
+        assert len(result["available_files"]) == MAX_LINKED_FILES_PER_CATEGORY
+        assert result["available_files"] == sorted(result["available_files"])
+        assert result["linked_files_summary"]["truncated"] is True
+
+    def test_remove_skill_md_requires_delete_action(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _remove_file("my-skill", "SKILL.md")
+        assert result["success"] is False
+        assert "delete" in result["error"]
+        assert (tmp_path / "my-skill" / "SKILL.md").exists()
+
     def test_remove_symlink_escape_blocked(self, tmp_path):
         outside_dir = tmp_path / "outside"
         outside_dir.mkdir()
         outside_file = outside_dir / "keep.txt"
-        outside_file.write_text("content")
+        outside_file.write_text("content", encoding="utf-8")
 
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
@@ -360,6 +1951,44 @@ class TestSkillManageDispatcher:
         rec = usage.get("test-skill") or {}
         assert rec.get("created_by") in {None, "", False}
 
+    def test_create_from_background_review_marks_agent_created(self, tmp_path):
+        """Background-review fork creates ARE marked as agent-created."""
+        from tools.skill_provenance import set_current_write_origin, BACKGROUND_REVIEW
+        token = set_current_write_origin(BACKGROUND_REVIEW)
+        try:
+            with _skill_dir(tmp_path):
+                raw = skill_manage(
+                    action="create",
+                    name="review-sediment",
+                    content=_content_for_name(VALID_SKILL_CONTENT, "review-sediment"),
+                )
+                from tools.skill_usage import load_usage
+                usage = load_usage()
+        finally:
+            from tools.skill_provenance import reset_current_write_origin
+            reset_current_write_origin(token)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert usage["review-sediment"]["created_by"] == "agent"
+
+    def test_delete_via_dispatcher_threads_absorbed_into(self, tmp_path):
+        # Dispatcher must plumb absorbed_into through to _delete_skill so the
+        # validation + message suffix paths are exercised end-to-end.
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="umbrella", content=_content_for_name(VALID_SKILL_CONTENT, "umbrella"))
+            skill_manage(action="create", name="narrow", content=_content_for_name(VALID_SKILL_CONTENT, "narrow"))
+            raw = skill_manage(action="delete", name="narrow", absorbed_into="umbrella")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "absorbed into 'umbrella'" in result["message"]
+
+    def test_delete_via_dispatcher_rejects_missing_absorbed_target(self, tmp_path):
+        with _skill_dir(tmp_path):
+            skill_manage(action="create", name="narrow", content=_content_for_name(VALID_SKILL_CONTENT, "narrow"))
+            raw = skill_manage(action="delete", name="narrow", absorbed_into="ghost")
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "does not exist" in result["error"]
 
     def test_background_review_delete_refuses_bundled_even_with_absorbed_into(self, tmp_path):
         from tools.skill_provenance import (
@@ -375,8 +2004,8 @@ class TestSkillManageDispatcher:
                  patch("tools.skill_usage.is_hub_installed", return_value=False), \
                  patch("tools.skill_usage.is_bundled",
                        side_effect=lambda skill_name: skill_name == "bundled"):
-                skill_manage(action="create", name="umbrella", content=VALID_SKILL_CONTENT)
-                skill_manage(action="create", name="bundled", content=VALID_SKILL_CONTENT)
+                skill_manage(action="create", name="umbrella", content=_content_for_name(VALID_SKILL_CONTENT, "umbrella"))
+                skill_manage(action="create", name="bundled", content=_content_for_name(VALID_SKILL_CONTENT, "bundled"))
                 raw = skill_manage(
                     action="delete",
                     name="bundled",
@@ -393,6 +2022,40 @@ class TestSkillManageDispatcher:
 
 class TestSecurityScanGate:
     """_security_scan_skill is gated by skills.guard_agent_created config flag."""
+
+    @pytest.mark.parametrize("mutation", ["create", "edit", "patch"])
+    def test_disabled_guard_skips_held_snapshot_for_canonical_mutations(
+        self, tmp_path, mutation
+    ):
+        """A disabled guard must not copy even a large skill tree to scan it."""
+        replacement = _content_for_name(VALID_SKILL_CONTENT_2, "my-skill")
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool._GUARD_AVAILABLE", True
+        ), patch(
+            "tools.skill_manager_tool._guard_agent_created_enabled",
+            return_value=False,
+        ), patch(
+            "tools.skill_manager_tool.os.fwalk"
+        ) as mock_fwalk, patch(
+            "tools.skill_manager_tool.shutil.copyfileobj"
+        ) as mock_copy:
+            if mutation == "create":
+                result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+            else:
+                assert _create_skill("my-skill", VALID_SKILL_CONTENT)["success"]
+                assets = tmp_path / "my-skill" / "assets"
+                assets.mkdir()
+                (assets / "large.bin").write_bytes(b"x" * (2 * 1024 * 1024))
+                if mutation == "edit":
+                    result = _edit_skill("my-skill", replacement)
+                else:
+                    result = _patch_skill(
+                        "my-skill", "Do the thing.", "Do the new thing."
+                    )
+
+        assert result["success"] is True
+        mock_fwalk.assert_not_called()
+        mock_copy.assert_not_called()
 
     def test_scan_noop_when_flag_off(self, tmp_path):
         """Default config (flag off) short-circuits before running scan_skill."""
@@ -492,7 +2155,9 @@ class TestExternalSkillMutations:
             result = _patch_skill("ext-skill", "OLD_MARKER", "NEW_MARKER")
 
         assert result["success"] is True, result
-        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text()
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         # No duplicate in local
         assert not (local / "ext-skill").exists()
 
@@ -667,10 +2332,15 @@ class TestPinnedGuard:
         with _skill_dir(tmp_path):
             _create_skill("my-skill", VALID_SKILL_CONTENT)
             with self._pin("my-skill"):
-                result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
+                result = _edit_skill(
+                    "my-skill",
+                    _content_for_name(VALID_SKILL_CONTENT_2, "my-skill"),
+                )
         assert result["success"] is True, result
         # Content updated
-        content = (tmp_path / "my-skill" / "SKILL.md").read_text()
+        content = (tmp_path / "my-skill" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
         assert "A test skill" not in content
 
     def test_delete_refuses_pinned(self, tmp_path):
@@ -724,7 +2394,9 @@ class TestDeleteSkillRmtreeGuard:
         otherwise follow it and delete the link target's contents."""
         victim = tmp_path.parent / "precious_victim"
         victim.mkdir()
-        (victim / "important.txt").write_text("DO NOT DELETE")
+        (victim / "important.txt").write_text(
+            "DO NOT DELETE", encoding="utf-8"
+        )
         skills = tmp_path / "skills"
         skills.mkdir()
         evil = skills / "evil-skill"
@@ -733,7 +2405,11 @@ class TestDeleteSkillRmtreeGuard:
             with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
                  patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
                  patch("tools.skill_manager_tool._find_skill",
-                       return_value={"path": evil}):
+                       return_value={
+                           "path": evil,
+                           "_resolved_path": victim,
+                           "_dir_identity": (victim.stat().st_dev, victim.stat().st_ino),
+                       }):
                 result = _delete_skill("evil-skill", absorbed_into="")
             assert result["success"] is False
             assert "symlink" in result["error"].lower()
@@ -742,6 +2418,21 @@ class TestDeleteSkillRmtreeGuard:
             import shutil as _sh
             _sh.rmtree(victim, ignore_errors=True)
 
+    def test_skills_root_itself_refused(self, tmp_path):
+        """If discovery ever hands back the skills root, refuse — rmtree would
+        wipe every installed skill."""
+        with patch("tools.skill_manager_tool.SKILLS_DIR", tmp_path), \
+             patch("agent.skill_utils.get_all_skills_dirs", return_value=[tmp_path]), \
+             patch("tools.skill_manager_tool._find_skill",
+                   return_value={
+                       "path": tmp_path,
+                       "_resolved_path": tmp_path,
+                       "_dir_identity": (tmp_path.stat().st_dev, tmp_path.stat().st_ino),
+                   }):
+            result = _delete_skill(tmp_path.name, absorbed_into="")
+        assert result["success"] is False
+        assert "skills root" in result["error"].lower()
+        assert tmp_path.exists()
 
     def test_out_of_tree_path_refused(self, tmp_path):
         """A path that resolves outside every known skills root is refused."""
@@ -749,12 +2440,16 @@ class TestDeleteSkillRmtreeGuard:
         skills.mkdir()
         outside = tmp_path / "outside_skill"
         outside.mkdir()
-        (outside / "SKILL.md").write_text("x")
+        (outside / "SKILL.md").write_text("x", encoding="utf-8")
         with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
              patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \
              patch("tools.skill_manager_tool._find_skill",
-                   return_value={"path": outside}):
-            result = _delete_skill("outside", absorbed_into="")
+                   return_value={
+                       "path": outside,
+                       "_resolved_path": outside,
+                       "_dir_identity": (outside.stat().st_dev, outside.stat().st_ino),
+                   }):
+            result = _delete_skill("outside_skill", absorbed_into="")
         assert result["success"] is False
         assert "skills root" in result["error"].lower()
         assert outside.exists()
@@ -810,6 +2505,182 @@ def _skill_content(name: str) -> str:
         f"# {name}\n\n"
         "Step 1: Do the thing.\n"
     )
+
+
+class TestSecureCuratorArchive:
+    def test_curator_archive_accepts_directory_alias_for_frontmatter_skill(
+        self, tmp_path, monkeypatch
+    ):
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            legacy = skills_root / "legacy-directory"
+            legacy.mkdir()
+            (legacy / "SKILL.md").write_text(
+                _skill_content("frontmatter-alias"), encoding="utf-8"
+            )
+            with patch(
+                "tools.skill_manager_tool._background_review_write_guard",
+                return_value=None,
+            ):
+                result = _delete_skill(
+                    "legacy-directory", absorbed_into="umbrella"
+                )
+
+        assert result["success"] is True, result
+        assert not legacy.exists()
+        assert (skills_root / ".archive" / "legacy-directory" / "SKILL.md").exists()
+
+    def test_curator_delete_retry_reconciles_archived_canonical_alias(
+        self, tmp_path, monkeypatch
+    ):
+        """A curator delete retry handles a committed alias archive exactly once."""
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
+            _create_curator_skill("umbrella", _skill_content("umbrella"))
+            legacy = skills_root / "legacy-directory"
+            legacy.mkdir()
+            (legacy / "SKILL.md").write_text(
+                _skill_content("frontmatter-alias"), encoding="utf-8"
+            )
+            from tools.skill_usage import mark_agent_created, get_record
+            import tools.skill_usage as usage
+
+            mark_agent_created("frontmatter-alias")
+            real_persist = usage.persist_lifecycle_move_metadata_strict
+            monkeypatch.setattr(
+                usage,
+                "persist_lifecycle_move_metadata_strict",
+                lambda *args, **kwargs: (_ for _ in ()).throw(
+                    OSError("state write failed")
+                ),
+            )
+            with patch(
+                "tools.skill_manager_tool._background_review_write_guard",
+                return_value=None,
+            ):
+                first = _delete_skill(
+                    "frontmatter-alias", absorbed_into="umbrella"
+                )
+            assert first["success"] is False
+            assert (skills_root / ".archive" / "legacy-directory").is_dir()
+
+            monkeypatch.setattr(
+                usage, "persist_lifecycle_move_metadata_strict", real_persist
+            )
+            with patch(
+                "tools.skill_manager_tool._background_review_write_guard",
+                return_value=None,
+            ):
+                retry = _delete_skill(
+                    "legacy-directory", absorbed_into="umbrella"
+                )
+
+        assert retry["success"] is True, retry
+        assert retry["_archived"] is True
+        assert get_record("frontmatter-alias")["state"] == "archived"
+
+    def test_curator_archive_refuses_parent_swap_before_rename(self, tmp_path):
+        skill_dir = tmp_path / "legacy-directory"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            _skill_content("frontmatter-alias"), encoding="utf-8"
+        )
+        with _skill_dir(tmp_path):
+            existing = skill_manager_module._find_skill("frontmatter-alias")
+            assert existing is not None
+            real_matches = skill_manager_module._directory_entry_matches_fd
+            calls = 0
+
+            def swap_before_final_match(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    skill_dir.rename(tmp_path / "moved-original")
+                    replacement = tmp_path / "legacy-directory"
+                    replacement.mkdir()
+                    (replacement / "SKILL.md").write_text(
+                        _skill_content("replacement"), encoding="utf-8"
+                    )
+                return real_matches(*args)
+
+            with patch(
+                "tools.skill_manager_tool._directory_entry_matches_fd",
+                side_effect=swap_before_final_match,
+            ):
+                ok, message = skill_manager_module._secure_archive_existing_skill(
+                    existing, tmp_path
+                )
+
+        assert ok is False
+        assert "changed before archiving" in message
+        assert (tmp_path / "moved-original" / "SKILL.md").exists()
+        assert (tmp_path / "legacy-directory" / "SKILL.md").exists()
+        assert not list((tmp_path / ".archive").iterdir())
+
+    def test_curator_archive_fails_closed_without_secure_platform(self, tmp_path):
+        skill_dir = tmp_path / "my-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text(
+            _skill_content("my-skill"), encoding="utf-8"
+        )
+        with _skill_dir(tmp_path):
+            existing = skill_manager_module._find_skill("my-skill")
+            assert existing is not None
+            with patch(
+                "tools.skill_manager_tool._secure_directory_create_supported",
+                return_value=False,
+            ), patch("tools.skill_manager_tool.os.name", "nt"):
+                ok, message = skill_manager_module._secure_archive_existing_skill(
+                    existing, tmp_path
+                )
+
+        assert ok is False
+        assert "unavailable" in message
+        assert skill_dir.exists()
+
+
+class TestCommittedFsyncFailures:
+    @staticmethod
+    def _fail_directory_fsync():
+        real_fsync = os.fsync
+
+        def fail_directory(fd):
+            if os.path.exists(f"/dev/fd/{fd}") and stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("injected post-commit directory fsync failure")
+            return real_fsync(fd)
+
+        return fail_directory
+
+    @pytest.mark.parametrize("action", ["edit", "patch", "write"])
+    def test_replace_post_fsync_failure_is_not_reported_as_noop(self, tmp_path, action):
+        replacement = _content_for_name(VALID_SKILL_CONTENT_2, "my-skill")
+        with _skill_dir(tmp_path), patch(
+            "tools.skill_manager_tool.os.fsync", side_effect=self._fail_directory_fsync()
+        ):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            if action == "edit":
+                result = _edit_skill("my-skill", replacement)
+            elif action == "patch":
+                result = _patch_skill("my-skill", "Do the thing.", "Changed.")
+            else:
+                result = _write_file("my-skill", "references/state.txt", "changed")
+        assert result["success"] is True
+
+    def test_remove_post_unlink_fsync_failure_reports_committed_success(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            _write_file("my-skill", "references/state.txt", "old")
+            with patch("tools.skill_manager_tool.os.fsync", side_effect=self._fail_directory_fsync()):
+                result = _remove_file("my-skill", "references/state.txt")
+        assert result["success"] is True
+        assert not (tmp_path / "my-skill" / "references" / "state.txt").exists()
+
+    def test_hard_delete_post_rmdir_fsync_failure_reports_committed_success(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            with patch("tools.skill_manager_tool.os.fsync", side_effect=self._fail_directory_fsync()):
+                result = _delete_skill("my-skill")
+        assert result["success"] is True
+        assert not (tmp_path / "my-skill").exists()
 
 def _create_curator_skill(name: str, content: str):
     """Create a skill and record the agent ownership a real curator create has."""

@@ -102,7 +102,7 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 25
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     chat_id TEXT,
     chat_type TEXT,
     thread_id TEXT,
+    codex_thread_id TEXT,
     display_name TEXT,
     origin_json TEXT,
     expiry_finalized INTEGER DEFAULT 0,
@@ -257,6 +258,17 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS codex_turn_leases (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    codex_thread_id TEXT UNIQUE,
+    holder_uuid TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    owner_started_at INTEGER NOT NULL,
+    acquired_at REAL NOT NULL,
+    refreshed_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -284,6 +296,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_codex_turn_leases_expires ON codex_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery

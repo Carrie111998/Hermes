@@ -131,6 +131,7 @@ def compute_session_context_breakdown(
     context_max = int(getattr(comp, "context_length", 0) or 0) if comp else 0
     measured_used = int(getattr(comp, "last_prompt_tokens", 0) or 0) if comp else 0
     context_used = measured_used if measured_used > 0 else estimated_total
+    context_used_estimated = measured_used <= 0
     context_percent = (
         max(0, min(100, round(context_used / context_max * 100)))
         if context_max
@@ -151,6 +152,7 @@ def compute_session_context_breakdown(
         "context_max": context_max,
         "context_percent": context_percent,
         "context_used": context_used,
+        "context_used_estimated": context_used_estimated,
         "estimated_total": estimated_total,
         "model": getattr(agent, "model", "") or "",
     }

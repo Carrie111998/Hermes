@@ -719,12 +719,23 @@ describe('usePromptActions /compress', () => {
     )
   })
 
-  it('surfaces the RPC error verbatim (e.g. the busy guard) instead of a routing error', async () => {
+  it('interrupts a busy turn and retries compression instead of surfacing the busy guard', async () => {
     const seeds: Record<string, unknown>[] = []
+    let compressAttempts = 0
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.compress') {
-        throw new Error('session busy — /interrupt the current turn before /compress')
+        compressAttempts += 1
+
+        if (compressAttempts === 1) {
+          throw new Error('session busy — /interrupt the current turn before /compress')
+        }
+
+        return { removed: 3 } as never
+      }
+
+      if (method === 'session.interrupt') {
+        return { status: 'interrupted' } as never
       }
 
       return {} as never
@@ -743,7 +754,16 @@ describe('usePromptActions /compress', () => {
     await handle!.submitText('/compress')
 
     const texts = renderedSeedTexts(seeds)
-    expect(texts.some(text => text.includes('session busy'))).toBe(true)
+    expect(requestGateway.mock.calls.map(([method]) => method)).toEqual([
+      'session.compress',
+      'session.interrupt',
+      'session.compress'
+    ])
+    expect(requestGateway).toHaveBeenCalledWith('session.interrupt', {
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(texts.some(text => text.includes('compressed 3 messages'))).toBe(true)
+    expect(texts.some(text => text.includes('session busy'))).toBe(false)
     expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
   })
 

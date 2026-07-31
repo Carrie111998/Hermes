@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -1563,6 +1564,179 @@ class ContextCompressor(ContextEngine):
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
 
+    def checkpoint_compression_transaction(self) -> Dict[str, Any]:
+        """Capture all compressor state that a not-yet-durable rewrite may change.
+
+        ``compress()`` can update iterative-summary state, switch away from a
+        failing auxiliary summary model, and clear a persisted failure cooldown
+        before the caller publishes its rewritten transcript.  A failed
+        publication must not leave any of those speculative changes behind.
+        Keep this ownership here rather than making callers maintain a brittle
+        list of compressor internals.
+        """
+        state = {
+            key: copy.deepcopy(value)
+            for key, value in vars(self).items()
+            # SessionDB owns locks/connections and is deliberately retained by
+            # identity; all other mutable compressor values are copied.
+            if key != "_session_db"
+        }
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        durable: Dict[str, Any] = {
+            "session_id": session_id,
+            "cooldown": None,
+            "fallback_streak": None,
+            "ineffective_count": None,
+        }
+        if session_db and session_id:
+            try:
+                durable["cooldown"] = copy.deepcopy(
+                    session_db.get_compression_failure_cooldown(session_id)
+                )
+                durable["fallback_streak"] = (
+                    session_db.get_compression_fallback_streak(session_id)
+                )
+                durable["ineffective_count"] = (
+                    session_db.get_compression_ineffective_count(session_id)
+                )
+            except Exception as exc:
+                # An unknown durable baseline is unsafe: rollback would treat
+                # it as empty/zero and could erase a cooldown or guard that
+                # predates this attempted compression. Fail before compress()
+                # mutates anything instead of manufacturing a partial
+                # checkpoint.
+                logger.error(
+                    "compression transaction checkpoint persistence read failed "
+                    "for session=%s; aborting before compression",
+                    session_id,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    "compression transaction checkpoint persistence read failed"
+                ) from exc
+        return {"state": state, "durable": durable}
+
+    def rollback_compression_transaction(
+        self,
+        checkpoint: Dict[str, Any],
+        *,
+        preserve_failure_outcome: bool = False,
+    ) -> None:
+        """Restore state after an unpublished rewrite.
+
+        ``preserve_failure_outcome`` is used only when summary generation
+        itself aborted. The transcript rewrite is still speculative and must
+        roll back, but the observed failure/backoff is a real outcome: callers
+        need ``_last_compress_aborted`` for correct feedback and the persisted
+        cooldown to prevent an immediate cross-turn retry loop.
+        """
+        state = checkpoint.get("state") if isinstance(checkpoint, dict) else None
+        if not isinstance(state, dict):
+            raise ValueError("invalid compression transaction checkpoint")
+
+        failure_outcome = None
+        if preserve_failure_outcome:
+            outcome_fields = (
+                "_last_compress_aborted",
+                "_last_summary_error",
+                "_last_summary_auth_failure",
+                "_last_summary_network_failure",
+                "_last_summary_dropped_count",
+                "_last_summary_fallback_used",
+                "_last_aux_model_failure_error",
+                "_last_aux_model_failure_model",
+                "_last_compression_made_progress",
+                "_summary_failure_cooldown_until",
+                "_cooldown_persist_failed",
+                "_consecutive_timeout_failures",
+                "_last_compression_telemetry",
+            )
+            failure_outcome = {
+                key: copy.deepcopy(getattr(self, key))
+                for key in outcome_fields
+                if hasattr(self, key)
+            }
+
+        # Remove speculative fields added during compress(), then replace every
+        # captured value.  Keep the SessionDB object by identity.
+        for key in tuple(vars(self)):
+            if key != "_session_db" and key not in state:
+                delattr(self, key)
+        for key, value in state.items():
+            setattr(self, key, copy.deepcopy(value))
+
+        durable = checkpoint.get("durable", {})
+        session_db = getattr(self, "_session_db", None)
+        session_id = durable.get("session_id") if isinstance(durable, dict) else ""
+        if not session_db or not session_id:
+            if failure_outcome is not None:
+                for key, value in failure_outcome.items():
+                    setattr(self, key, copy.deepcopy(value))
+            return
+        failures: list[tuple[str, Exception]] = []
+
+        def _restore(name: str, operation) -> None:
+            try:
+                operation()
+            except Exception as exc:
+                failures.append((name, exc))
+
+        # In preserve mode the post-summary cooldown is already a committed
+        # failure outcome. Never clear/recreate it as two separate DB writes:
+        # a crash or second-write failure between those operations would lose
+        # the backoff and revive the cross-turn compression loop.
+        if not preserve_failure_outcome:
+            cooldown = durable.get("cooldown")
+            if cooldown:
+                _restore(
+                    "cooldown",
+                    lambda: session_db.record_compression_failure_cooldown(
+                        session_id,
+                        cooldown["cooldown_until"],
+                        cooldown.get("error"),
+                        raise_on_error=True,
+                    ),
+                )
+            else:
+                _restore(
+                    "cooldown",
+                    lambda: session_db.clear_compression_failure_cooldown(
+                        session_id,
+                        raise_on_error=True,
+                    ),
+                )
+        if durable.get("fallback_streak") is not None:
+            _restore(
+                "fallback_streak",
+                lambda: session_db.set_compression_fallback_streak(
+                    session_id, durable["fallback_streak"]
+                ),
+            )
+        if durable.get("ineffective_count") is not None:
+            _restore(
+                "ineffective_count",
+                lambda: session_db.set_compression_ineffective_count(
+                    session_id, durable["ineffective_count"]
+                ),
+            )
+        if not failures and failure_outcome is not None:
+            for key, value in failure_outcome.items():
+                setattr(self, key, copy.deepcopy(value))
+        if failures:
+            failed_steps = ", ".join(name for name, _exc in failures)
+            logger.error(
+                "compression transaction rollback persistence partially failed "
+                "for session=%s (steps=%s)",
+                session_id,
+                failed_steps,
+                exc_info=(type(failures[0][1]), failures[0][1], failures[0][1].__traceback__),
+            )
+            raise RuntimeError(
+                "compression rollback persistence restore failed "
+                f"(steps={failed_steps})"
+            ) from failures[0][1]
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
         super().on_session_start(session_id, **kwargs)
@@ -2243,10 +2417,29 @@ class ContextCompressor(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        reported_prompt_tokens = _safe_int(usage.get("prompt_tokens"))
+        has_real_prompt_tokens = bool(
+            reported_prompt_tokens is not None and reported_prompt_tokens > 0
+        )
+
+        # A completed compaction has no meaningful verdict until the provider
+        # reports the prompt size of the compacted request.  In particular, do
+        # not turn the post-compaction ``-1`` sentinel into zero here: callers
+        # use it to avoid treating a rough estimate as a second compaction
+        # trigger while the real reading is still outstanding.
+        if (
+            not has_real_prompt_tokens
+            and (
+                self.awaiting_real_usage_after_compression
+                or self._verify_compaction_cleared_threshold
+            )
+        ):
+            return
+
+        self.last_prompt_tokens = reported_prompt_tokens or 0
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
-        if self.last_prompt_tokens > 0:
+        if has_real_prompt_tokens:
             self.last_real_prompt_tokens = self.last_prompt_tokens
             if self.last_prompt_tokens < self.threshold_tokens:
                 if self.awaiting_real_usage_after_compression and self.last_compression_rough_tokens > 0:
@@ -2293,9 +2486,9 @@ class ContextCompressor(ContextEngine):
                         )
                 else:
                     self._record_ineffective_compression_verdict(0)
-        # Consume the pending-verification flag once real usage arrives, whether
-        # or not prompt_tokens was reported, so a usage-less response can't leave
-        # it armed for a later, unrelated reading.
+        # Only a real provider prompt count can adjudicate a compaction.  Empty
+        # usage is common on interrupted/streaming responses and must not spend
+        # this one-shot verdict or re-open the host retry budget.
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
 
@@ -3035,6 +3228,7 @@ class ContextCompressor(ContextEngine):
         tool_actions: list[str] = []
         relevant_files: list[str] = []
         blockers: list[str] = []
+        failed_attempts: list[str] = []
         last_dropped_turns: list[str] = []
 
         def _compact_fallback_turn(value: Any) -> str:
@@ -3120,15 +3314,32 @@ class ContextCompressor(ContextEngine):
             elif role == "tool":
                 call_id = str(msg.get("tool_call_id") or "")
                 tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-                tool_actions.append(
-                    _summarize_tool_result(tool_name, tool_args, text or "")
+                tool_summary = _summarize_tool_result(
+                    tool_name, tool_args, text or ""
+                )
+                tool_actions.append(tool_summary)
+                # Successful test/build output routinely contains phrases such
+                # as "0 failed" or "no errors". Remove only those explicit
+                # zero-failure counters before looking for a real failure
+                # signal; otherwise the handoff marks a successful command as
+                # unsafe to repeat.
+                failure_probe = re.sub(
+                    r"\b(?:0|no)\s+(?:errors?|failures?|failed)\b",
+                    "",
+                    text,
+                    flags=re.I,
                 )
                 if re.search(
                     r"\b(error|failed|exception|traceback|timeout|timed out|fatal)\b",
-                    text,
+                    failure_probe,
                     re.I,
                 ):
                     blockers.append(text[:500])
+                    failed_attempts.append(
+                        f"{tool_summary} Exact failure: {text[:500]} "
+                        "Cause unknown; do not repeat the same "
+                        "call unchanged until current state and inputs are verified."
+                    )
 
         def _bullets(items: list[str], limit: int = 8) -> str:
             unique: list[str] = []
@@ -3184,6 +3395,12 @@ Recovered from a deterministic fallback because the LLM context summarizer was u
 
 ## Active State
 Unknown from deterministic fallback. Inspect current repository/session state if needed.
+
+## Failed Attempts
+{_bullets(failed_attempts, limit=5)}
+
+## Next Safe Step
+Verify the current repository/session state and the latest real user request before continuing. Do not replay completed actions merely because they appear in this historical fallback.
 
 ## Blocked
 {_bullets(blockers, limit=5)}
@@ -3507,6 +3724,16 @@ Be specific with file paths, commands, line numbers, and results.]
 - Any running processes or servers
 - Environment details that matter]
 
+## Failed Attempts
+[Each unsuccessful approach — include the action/tool, exact failure, likely
+cause if known, what state changed, and whether/when it is safe to retry.
+Write "Do not repeat unchanged" when the same preconditions would produce the
+same failure. Do not invent a root cause.]
+
+## Next Safe Step
+[The single safest next action based on Active State. Verify current state
+before mutating or retrying. Write "None" when there is no active task.]
+
 ## Blocked
 [Any blockers, errors, or issues not yet resolved. Include exact error messages.]
 
@@ -3553,7 +3780,7 @@ PREVIOUS SUMMARY:
 NEW TURNS TO INCORPORATE:
 {content_to_summarize}{_memory_section}
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Active Task" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Preserve failed approaches under "Failed Attempts" so they are not retried unchanged, and revise "Next Safe Step" to one state-verified action. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "## Historical Task Snapshot" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
         else:
@@ -3679,6 +3906,40 @@ This compaction should PRIORITISE preserving all information related to the focu
             # Redact the summary output as well — the summarizer LLM may
             # ignore prompt instructions and echo back secrets verbatim.
             summary = _redact_compaction_text(content.strip())
+            # Prompts are not an output contract: weaker/local summarizers can
+            # return fluent prose while omitting the two recovery anchors that
+            # prevent a resumed agent from blindly replaying a failed action.
+            # Fill only missing sections from the deterministic parser so we
+            # keep the richer LLM summary while preserving exact observed tool
+            # errors and a state-verification step.
+            missing_handoff_sections = [
+                heading
+                for heading in ("## Failed Attempts", "## Next Safe Step")
+                if heading not in summary
+            ]
+            if missing_handoff_sections:
+                fallback = self._strip_summary_prefix(
+                    self._build_static_fallback_summary(
+                        turns_to_summarize,
+                        reason="LLM summary omitted required recovery sections",
+                    )
+                )
+                for heading in missing_handoff_sections:
+                    # The deterministic fallback may embed the previous summary
+                    # as a snapshot, including headings with the same names.
+                    # Select its own final top-level section, not the stale
+                    # embedded copy.
+                    start = fallback.rfind(heading)
+                    if start < 0:
+                        continue
+                    next_heading = fallback.find("\n## ", start + len(heading))
+                    section = (
+                        fallback[start:next_heading]
+                        if next_heading >= 0
+                        else fallback[start:]
+                    ).strip()
+                    if section:
+                        summary = f"{summary.rstrip()}\n\n{section}"
             # P2 ghost-skill defense (#32106): deterministically restore any
             # [SKILL_PRUNED: ...] marker the summarizer paraphrased away.
             summary = _reinject_pruned_skill_markers(summary, _pruned_skill_names)

@@ -12,7 +12,7 @@ API call with HTTP 400.
 These tests pin:
 - the cache-hit path returns a fresh list (existing #17098 behavior)
 - the first uncached call also returns a fresh list (the fix)
-- every call returns a list that is not the cached one, even after mutation
+- nested schema mutations never leak into the canonical cache
 """
 from __future__ import annotations
 
@@ -52,7 +52,18 @@ class TestQuietModeCacheIsolation:
         cached = next(iter(model_tools._tool_defs_cache.values()))
         assert second is not cached
 
+    def test_nested_schema_mutation_does_not_poison_cache(self):
+        """Provider sanitizers mutate ``function.parameters`` in place."""
+        first = model_tools.get_tool_definitions(quiet_mode=True)
+        assert first
+        first_schema = first[0]["function"]["parameters"]
+        original = dict(first_schema)
+        first_schema.clear()
+        first_schema["type"] = "string"
 
+        second = model_tools.get_tool_definitions(quiet_mode=True)
+        assert second[0]["function"]["parameters"] == original
+        assert second[0]["function"]["parameters"] is not first_schema
 
     def test_cache_bounded_by_eviction(self):
         """The cache evicts the oldest entry when it reaches the cap,

@@ -347,9 +347,16 @@ class TestBridgeWiredInRuntime:
             FakeSession,
         )
 
+        session_db = SimpleNamespace(
+            get_session=lambda session_id: {"id": session_id},
+            get_codex_thread_id=lambda _session_id: None,
+            bind_codex_thread_id=lambda _session_id, _thread_id: True,
+        )
+
         # Minimal stub agent — the runtime only touches a handful of
         # attributes and we mock the heavy ones to keep the test fast.
         agent = SimpleNamespace(
+            session_id="bridge-session",
             session_cwd=None,
             _codex_session=None,
             tool_progress_callback=MagicMock(),
@@ -370,7 +377,8 @@ class TestBridgeWiredInRuntime:
             session_total_tokens=0,
             context_compressor=None,
             event_callback=None,
-            _session_db=None,
+            _session_db=session_db,
+            _session_db_created=True,
         )
 
         codex_runtime.run_codex_app_server_turn(

@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,19 @@ description: test skill
 
 # body
 """,
+        encoding="utf-8",
+    )
+    return d
+
+
+def _write_skill_with_physical_alias(
+    skills_dir: Path, directory_name: str, canonical_name: str
+):
+    """Create a skill whose filesystem alias differs from its lifecycle name."""
+    d = skills_dir / directory_name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "SKILL.md").write_text(
+        f"---\nname: {canonical_name}\ndescription: test skill\n---\n\n# body\n",
         encoding="utf-8",
     )
     return d
@@ -201,6 +215,653 @@ def test_is_agent_created(skills_home):
 # ---------------------------------------------------------------------------
 # Archive / restore
 # ---------------------------------------------------------------------------
+
+def test_archive_skill_moves_directory(skills_home):
+    from tools.skill_usage import archive_skill, get_record
+    import tools.skill_usage as usage
+    skills_dir = skills_home / "skills"
+    skill_dir = _write_skill(skills_dir, "old-skill")
+    assert skill_dir.exists()
+
+    ok, msg = archive_skill("old-skill")
+    assert ok, msg
+    assert not skill_dir.exists()
+    assert (skills_dir / ".archive" / "old-skill" / "SKILL.md").exists()
+    assert get_record("old-skill")["state"] == "archived"
+    assert get_record("old-skill")["archived_at"] is not None
+
+
+def test_archive_refuses_bundled_skill(skills_home):
+    from tools.skill_usage import archive_skill
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "bundled")
+    (skills_dir / ".bundled_manifest").write_text("bundled:abc\n", encoding="utf-8")
+
+    ok, msg = archive_skill("bundled")
+    assert not ok
+    assert "bundled" in msg.lower() or "hub" in msg.lower()
+
+
+def test_archive_refuses_hub_skill(skills_home):
+    from tools.skill_usage import archive_skill
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "hub-skill")
+    hub_dir = skills_dir / ".hub"
+    hub_dir.mkdir()
+    (hub_dir / "lock.json").write_text(
+        json.dumps({"installed": {"hub-skill": {}}}), encoding="utf-8",
+    )
+
+    ok, msg = archive_skill("hub-skill")
+    assert not ok
+
+
+def test_archive_refuses_external_skill(skills_home, monkeypatch):
+    from tools.skill_usage import archive_skill
+
+    skills_dir = skills_home / "skills"
+    external = skills_dir / "shared-vault"
+    skill_dir = _write_skill(external, "external-skill")
+    monkeypatch.setattr(
+        "agent.skill_utils.get_external_skills_dirs",
+        lambda: [external.resolve()],
+    )
+
+    ok, msg = archive_skill("external-skill")
+    assert not ok
+    assert "external" in msg.lower()
+    assert skill_dir.exists()
+
+
+def test_archive_missing_skill_returns_error(skills_home):
+    from tools.skill_usage import archive_skill
+    ok, msg = archive_skill("nonexistent")
+    assert not ok
+    assert "not found" in msg.lower()
+
+
+def test_direct_archive_fails_closed_without_secure_manager_backend(
+    skills_home, monkeypatch
+):
+    from tools.skill_usage import archive_skill
+
+    skills_dir = skills_home / "skills"
+    skill_dir = _write_skill(skills_dir, "unsafe-archive")
+    monkeypatch.setattr(
+        "tools.skill_manager_tool._secure_directory_create_supported",
+        lambda: False,
+    )
+
+    ok, message = archive_skill("unsafe-archive")
+
+    assert ok is False
+    assert "unavailable" in message
+    assert skill_dir.exists()
+
+
+def test_direct_restore_fails_closed_without_secure_manager_backend(
+    skills_home, monkeypatch
+):
+    from tools.skill_usage import archive_skill, restore_skill
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "unsafe-restore")
+    ok, message = archive_skill("unsafe-restore")
+    assert ok, message
+    monkeypatch.setattr(
+        "tools.skill_manager_tool._secure_directory_create_supported",
+        lambda: False,
+    )
+
+    ok, message = restore_skill("unsafe-restore")
+
+    assert ok is False
+    assert "unavailable" in message
+    assert (skills_dir / ".archive" / "unsafe-restore").exists()
+
+
+def test_archive_metadata_failure_is_truthful_and_retry_reconciles(skills_home, monkeypatch):
+    from tools.skill_usage import archive_skill, get_record
+    import tools.skill_usage as usage
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "reconcile-archive")
+    real_persist = usage.persist_lifecycle_move_metadata_strict
+    monkeypatch.setattr(
+        "tools.skill_usage.persist_lifecycle_move_metadata_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("state write failed")),
+    )
+    ok, message = archive_skill("reconcile-archive")
+    assert ok is False
+    assert "filesystem move committed" in message
+    assert (skills_dir / ".archive" / "reconcile-archive").exists()
+    monkeypatch.setattr(usage, "persist_lifecycle_move_metadata_strict", real_persist)
+    ok, message = archive_skill("reconcile-archive")
+    assert ok, message
+    assert get_record("reconcile-archive")["state"] == "archived"
+
+
+def test_restore_metadata_failure_is_truthful_and_retry_reconciles(skills_home, monkeypatch):
+    from tools.skill_usage import archive_skill, restore_skill, get_record
+    import tools.skill_usage as usage
+
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "reconcile-restore")
+    assert archive_skill("reconcile-restore")[0]
+    real_persist = usage.persist_lifecycle_move_metadata_strict
+    monkeypatch.setattr(
+        "tools.skill_usage.persist_lifecycle_move_metadata_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("state write failed")),
+    )
+    ok, message = restore_skill("reconcile-restore")
+    assert ok is False
+    assert "filesystem move committed" in message
+    assert (skills_dir / "reconcile-restore").exists()
+    monkeypatch.setattr(usage, "persist_lifecycle_move_metadata_strict", real_persist)
+    ok, message = restore_skill("reconcile-restore")
+    assert ok, message
+    assert get_record("reconcile-restore")["state"] == "active"
+
+
+def test_alias_archive_metadata_retry_uses_canonical_identity(skills_home, monkeypatch):
+    """A post-move archive retry can use either canonical or physical alias."""
+    from tools.skill_usage import archive_skill, get_record, mark_agent_created
+    import tools.skill_usage as usage
+
+    skills_dir = skills_home / "skills"
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    real_persist = usage.persist_lifecycle_move_metadata_strict
+    monkeypatch.setattr(
+        usage,
+        "persist_lifecycle_move_metadata_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("state write failed")),
+    )
+
+    ok, message = archive_skill("frontmatter-alias")
+    assert ok is False
+    assert "filesystem move committed" in message
+    assert (skills_dir / ".archive" / "legacy-directory").is_dir()
+
+    monkeypatch.setattr(usage, "persist_lifecycle_move_metadata_strict", real_persist)
+    ok, message = archive_skill("legacy-directory")
+    assert ok, message
+    assert get_record("frontmatter-alias")["state"] == "archived"
+
+
+def test_alias_restore_metadata_retry_preserves_physical_directory(skills_home, monkeypatch):
+    """Restore keeps the physical alias but reconciles canonical metadata."""
+    from tools.skill_usage import archive_skill, get_record, mark_agent_created, restore_skill
+    import tools.skill_usage as usage
+
+    skills_dir = skills_home / "skills"
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    assert archive_skill("legacy-directory")[0]
+    real_persist = usage.persist_lifecycle_move_metadata_strict
+    monkeypatch.setattr(
+        usage,
+        "persist_lifecycle_move_metadata_strict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("state write failed")),
+    )
+
+    # Use the old physical archive alias. The restore path must normalize it
+    # to the canonical lifecycle lock before it checks the active tree.
+    ok, message = restore_skill("legacy-directory")
+    assert ok is False
+    assert "filesystem move committed" in message
+    assert (skills_dir / "legacy-directory").is_dir()
+    assert not (skills_dir / "frontmatter-alias").exists()
+
+    monkeypatch.setattr(usage, "persist_lifecycle_move_metadata_strict", real_persist)
+    ok, message = restore_skill("legacy-directory")
+    assert ok, message
+    assert get_record("frontmatter-alias")["state"] == "active"
+
+
+def test_restore_refuses_active_canonical_name_at_new_physical_alias(skills_home):
+    """Restore must not overwrite lifecycle identity held by a new alias."""
+    from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
+
+    skills_dir = skills_home / "skills"
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    assert archive_skill("frontmatter-alias")[0]
+    # A subsequent create can use the canonical physical basename while the
+    # archived version retains an older physical alias.
+    _write_skill(skills_dir, "frontmatter-alias")
+
+    # Exercise the historical physical alias; this must still reserve the
+    # canonical lifecycle lock before checking the active canonical owner.
+    ok, message = restore_skill("legacy-directory")
+
+    assert ok is False
+    assert "already active" in message
+    assert (skills_dir / "frontmatter-alias" / "SKILL.md").exists()
+    assert (skills_dir / ".archive" / "legacy-directory" / "SKILL.md").exists()
+
+
+def test_physical_alias_restore_locks_canonical_before_archive_identity(
+    skills_home, monkeypatch
+):
+    """Physical archive aliases must not invert canonical-to-physical order."""
+    from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
+    import tools.skill_manager_tool as manager
+
+    skills_dir = skills_home / "skills"
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    assert archive_skill("legacy-directory")[0]
+    real_lock = manager._skill_mutation_lock
+    lock_names = []
+
+    @contextmanager
+    def recording_lock(lock_name):
+        lock_names.append(lock_name)
+        with real_lock(lock_name):
+            yield
+
+    monkeypatch.setattr(manager, "_skill_mutation_lock", recording_lock)
+    ok, message = restore_skill("legacy-directory")
+
+    assert ok, message
+    assert lock_names[0] == "frontmatter-alias"
+    assert lock_names[1].startswith("physical\x00")
+
+
+def test_collision_archive_roundtrip_restores_physical_alias(skills_home):
+    """A new collision container retains a non-canonical physical basename."""
+    from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
+
+    skills_dir = skills_home / "skills"
+    # This unrelated archived skill occupies the active skill's physical alias.
+    _write_skill_with_physical_alias(
+        skills_dir / ".archive", "legacy-directory", "unrelated-skill"
+    )
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+
+    ok, message = archive_skill("frontmatter-alias")
+    assert ok, message
+    collision_root = skills_dir / ".archive" / ".collisions"
+    containers = [p for p in collision_root.iterdir() if p.is_dir()]
+    assert len(containers) == 1
+    assert (containers[0] / "legacy-directory" / "SKILL.md").exists()
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok, message
+    assert (skills_dir / "legacy-directory" / "SKILL.md").exists()
+    assert not (skills_dir / "frontmatter-alias").exists()
+    assert not collision_root.exists()
+
+
+def test_collision_restore_refuses_occupied_physical_destination(skills_home):
+    """Restore never overwrites a new entry at the recorded physical alias."""
+    from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
+
+    skills_dir = skills_home / "skills"
+    _write_skill_with_physical_alias(
+        skills_dir / ".archive", "legacy-directory", "unrelated-skill"
+    )
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    assert archive_skill("frontmatter-alias")[0]
+    _write_skill_with_physical_alias(
+        skills_dir, "legacy-directory", "replacement-skill"
+    )
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok is False
+    assert "destination already exists" in message
+    collision_root = skills_dir / ".archive" / ".collisions"
+    assert any((p / "legacy-directory").is_dir() for p in collision_root.iterdir())
+
+
+def test_collision_layout_preserves_legal_timestamped_physical_alias(skills_home):
+    """A valid physical basename ending in a timestamp is never stripped."""
+    from tools.skill_usage import restore_skill
+
+    skills_dir = skills_home / "skills"
+    archived = (
+        skills_dir
+        / ".archive"
+        / ".collisions"
+        / "reserved-container"
+    )
+    physical_name = "frontmatter-alias-20260101000000"
+    _write_skill_with_physical_alias(
+        archived, physical_name, "frontmatter-alias"
+    )
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok, message
+    assert (skills_dir / physical_name / "SKILL.md").exists()
+    assert not (skills_dir / "frontmatter-alias").exists()
+
+
+@pytest.mark.parametrize("container", [None, "legacy-import"])
+def test_restore_rejects_legacy_timestamp_leaf_independent_of_canonical_name(
+    skills_home, container
+):
+    """Old timestamp leaves are unsafe even when canonical and basename differ."""
+    from tools.skill_usage import restore_skill
+
+    archive = skills_home / "skills" / ".archive"
+    if container is not None:
+        archive = archive / container
+    physical_name = "legacy-directory-20260101000000"
+    _write_skill_with_physical_alias(
+        archive, physical_name, "frontmatter-alias"
+    )
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok is False
+    assert "trustworthy" in message
+    assert (archive / physical_name).is_dir()
+
+
+def test_new_archive_roundtrip_preserves_timestamped_physical_alias(skills_home):
+    """A current archive marks a timestamp-looking physical basename safely."""
+    from tools.skill_usage import archive_skill, mark_agent_created, restore_skill
+
+    skills_dir = skills_home / "skills"
+    physical_name = "legacy-directory-20260101000000"
+    _write_skill_with_physical_alias(
+        skills_dir, physical_name, "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+
+    ok, message = archive_skill("frontmatter-alias")
+    assert ok, message
+    collision_root = skills_dir / ".archive" / ".collisions"
+    assert any((p / physical_name).is_dir() for p in collision_root.iterdir())
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok, message
+    assert (skills_dir / physical_name / "SKILL.md").exists()
+    assert not collision_root.exists()
+
+
+def test_failed_timestamp_archive_removes_empty_collision_container(skills_home, monkeypatch):
+    """A pre-commit rename failure leaves no unique collision container behind."""
+    from tools.skill_usage import archive_skill, mark_agent_created
+
+    skills_dir = skills_home / "skills"
+    physical_name = "legacy-directory-20260101000000"
+    _write_skill_with_physical_alias(
+        skills_dir, physical_name, "frontmatter-alias"
+    )
+    mark_agent_created("frontmatter-alias")
+    real_rename = __import__("os").rename
+
+    def fail_skill_rename(src, dst, **kwargs):
+        if src == physical_name:
+            raise OSError("injected rename failure")
+        return real_rename(src, dst, **kwargs)
+
+    import tools.skill_manager_tool as manager
+    monkeypatch.setattr(manager.os, "rename", fail_skill_rename)
+    monkeypatch.setattr(
+        manager.os,
+        "supports_dir_fd",
+        set(manager.os.supports_dir_fd) | {fail_skill_rename},
+    )
+    ok, message = archive_skill("frontmatter-alias")
+    assert ok is False
+    assert "failed to securely archive" in message
+    collision_root = skills_dir / ".archive" / ".collisions"
+    assert not collision_root.exists() or not any(collision_root.iterdir())
+    assert (skills_dir / physical_name).is_dir()
+
+
+def test_restore_rejects_ambiguous_canonical_archive_candidates(skills_home):
+    """Canonical archive recovery must not choose one of several aliases."""
+    from tools.skill_usage import restore_skill
+
+    archive = skills_home / "skills" / ".archive"
+    for directory_name in ("legacy-one", "legacy-two"):
+        _write_skill_with_physical_alias(
+            archive, directory_name, "frontmatter-alias"
+        )
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok is False
+    assert "ambiguous" in message.lower()
+    assert (archive / "legacy-one").is_dir()
+    assert (archive / "legacy-two").is_dir()
+
+
+def test_restore_fails_closed_for_corrupt_archive_metadata(skills_home):
+    """An unreadable canonical candidate is not silently skipped or restored."""
+    from tools.skill_usage import restore_skill
+
+    broken = skills_home / "skills" / ".archive" / "legacy-directory"
+    broken.mkdir(parents=True)
+    (broken / "SKILL.md").write_text(
+        "---\nname: [not-a-string]\ndescription: test\n---\n",
+        encoding="utf-8",
+    )
+
+    ok, message = restore_skill("frontmatter-alias")
+    assert ok is False
+    assert "refusing" in message.lower() or "incomplete" in message.lower()
+    assert broken.is_dir()
+    assert not (skills_home / "skills" / "frontmatter-alias").exists()
+
+
+def test_restore_fails_closed_when_skills_config_is_malformed(skills_home):
+    """A broken config may hide an external canonical-name collision."""
+    from agent import skill_utils
+    from tools.skill_usage import restore_skill
+
+    archive = skills_home / "skills" / ".archive"
+    archived = _write_skill(archive, "config-guarded")
+    config_path = skills_home / "config.yaml"
+    config_path.write_text(
+        "skills:\n  external_dirs: [\n",
+        encoding="utf-8",
+    )
+    skill_utils._external_dirs_cache_clear()
+
+    ok, message = restore_skill("config-guarded")
+
+    assert ok is False
+    assert "config" in message.lower()
+    assert archived.is_dir()
+    assert not (skills_home / "skills" / "config-guarded").exists()
+
+
+def test_restore_fails_closed_when_skills_config_is_unreadable(
+    skills_home, monkeypatch
+):
+    """A read failure must leave both archive and active namespaces untouched."""
+    from agent import skill_utils
+    from tools.skill_usage import restore_skill
+
+    archive = skills_home / "skills" / ".archive"
+    archived = _write_skill(archive, "config-unreadable")
+    config_path = skills_home / "config.yaml"
+    config_path.write_text("skills: {}\n", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def deny_config_read(path, *args, **kwargs):
+        if path == config_path:
+            raise PermissionError("permission denied")
+        return real_read_text(path, *args, **kwargs)
+
+    skill_utils._external_dirs_cache_clear()
+    monkeypatch.setattr(Path, "read_text", deny_config_read)
+
+    ok, message = restore_skill("config-unreadable")
+
+    assert ok is False
+    assert "permission denied" in message.lower()
+    assert archived.is_dir()
+    assert not (skills_home / "skills" / "config-unreadable").exists()
+
+
+def test_restore_fails_closed_when_skills_config_is_dangling_symlink(skills_home):
+    """A dangling config entry must stop restore before its filesystem rename."""
+    from agent import skill_utils
+    from tools.skill_usage import restore_skill
+
+    archive = skills_home / "skills" / ".archive"
+    archived = _write_skill(archive, "config-dangling")
+    config_path = skills_home / "config.yaml"
+    try:
+        config_path.symlink_to(skills_home / "missing-config.yaml")
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable")
+    skill_utils._external_dirs_cache_clear()
+
+    ok, message = restore_skill("config-dangling")
+
+    assert ok is False
+    assert "config" in message.lower()
+    assert archived.is_dir()
+    assert not (skills_home / "skills" / "config-dangling").exists()
+
+
+def test_restore_skill_moves_back(skills_home):
+    from tools.skill_usage import archive_skill, restore_skill, get_record
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "temp-skill")
+    archive_skill("temp-skill")
+    assert not (skills_dir / "temp-skill").exists()
+
+    ok, msg = restore_skill("temp-skill")
+    assert ok, msg
+    assert (skills_dir / "temp-skill" / "SKILL.md").exists()
+    assert get_record("temp-skill")["state"] == "active"
+
+
+def test_restore_skill_finds_nested_archive_subdir(skills_home):
+    """Skills archived under nested category subdirs (e.g.
+    .archive/<category>/<skill>/) — left behind by older archive layouts or
+    external imports — must still be restorable by name."""
+    from tools.skill_usage import restore_skill, get_record
+    skills_dir = skills_home / "skills"
+    nested = skills_dir / ".archive" / "openclaw-imports" / "nested-skill"
+    nested.mkdir(parents=True)
+    (nested / "SKILL.md").write_text(
+        "---\nname: nested-skill\ndescription: x\n---\n", encoding="utf-8",
+    )
+
+    ok, msg = restore_skill("nested-skill")
+    assert ok, msg
+    assert (skills_dir / "nested-skill" / "SKILL.md").exists()
+    assert not nested.exists()
+    assert get_record("nested-skill")["state"] == "active"
+
+
+def test_restore_rejects_legacy_nested_timestamped_archive(skills_home):
+    """Old timestamp suffixes lack a reliable original physical basename."""
+    from tools.skill_usage import restore_skill
+    skills_dir = skills_home / "skills"
+    nested = skills_dir / ".archive" / "imports" / "dup-skill-20260101000000"
+    nested.mkdir(parents=True)
+    (nested / "SKILL.md").write_text(
+        "---\nname: dup-skill\ndescription: x\n---\n", encoding="utf-8",
+    )
+
+    ok, msg = restore_skill("dup-skill")
+    assert not ok
+    assert "trustworthy" in msg
+    assert nested.exists()
+
+
+def test_archive_collision_gets_suffix(skills_home):
+    from tools.skill_usage import archive_skill
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "dup")
+    archive_skill("dup")
+    _write_skill(skills_dir, "dup")  # recreate
+    ok, msg = archive_skill("dup")
+    assert ok
+    # The second copy keeps its physical basename beneath a collision container.
+    archived = sorted(p.name for p in (skills_dir / ".archive").iterdir() if p.is_dir())
+    assert "dup" in archived
+    collision_root = skills_dir / ".archive" / ".collisions"
+    containers = [p for p in collision_root.iterdir() if p.is_dir()]
+    assert len(containers) == 1
+    assert (containers[0] / "dup" / "SKILL.md").exists()
+
+
+def test_restore_does_not_pull_unrelated_sibling_out_of_archive(skills_home):
+    """Restoring a name with no exact archive entry must NOT grab a different
+    archived skill that merely shares a ``<name>-`` prefix.
+
+    The timestamped-duplicate fallback recognises only the suffix
+    ``archive_skill`` writes on a collision (``-YYYYMMDDHHMMSS``). A bare
+    ``startswith(f"{name}-")`` also matches sibling skills, so restoring
+    ``git`` would rip an archived ``git-helpers`` out of the archive, rename
+    it to ``git``, and report success — destroying the sibling's only copy."""
+    from tools.skill_usage import (
+        archive_skill, restore_skill, list_archived_skill_names, mark_agent_created,
+    )
+    skills_dir = skills_home / "skills"
+    _write_skill(skills_dir, "git-helpers")
+    mark_agent_created("git-helpers")
+    ok, msg = archive_skill("git-helpers")
+    assert ok, msg
+
+    # "git" was never archived; only its prefix-sharing sibling was.
+    ok, msg = restore_skill("git")
+    assert not ok, f"restore('git') should not match 'git-helpers': {msg}"
+    assert "not found" in msg.lower()
+
+    # The sibling must be untouched: still in the archive, never moved to skills/git.
+    assert (skills_dir / ".archive" / "git-helpers" / "SKILL.md").exists()
+    assert "git-helpers" in list_archived_skill_names()
+    assert not (skills_dir / "git").exists()
+
+
+def test_restore_rejects_legacy_flat_timestamped_duplicate(skills_home):
+    """A legacy suffix could also be a user's original physical basename."""
+    from tools.skill_usage import restore_skill
+    skills_dir = skills_home / "skills"
+    dupe = skills_dir / ".archive" / "report-tool-20260101000000"
+    dupe.mkdir(parents=True)
+    (dupe / "SKILL.md").write_text(
+        "---\nname: report-tool\ndescription: x\n---\n", encoding="utf-8",
+    )
+
+    ok, msg = restore_skill("report-tool")
+    assert not ok
+    assert "trustworthy" in msg
+    assert dupe.exists()
+
+
+def test_restore_rejects_legacy_timestamped_dupe_with_unrelated_sibling(skills_home):
+    """A sibling never makes an ambiguous legacy suffix safe to restore."""
+    from tools.skill_usage import restore_skill
+    archive = skills_home / "skills" / ".archive"
+
+    dupe = archive / "report-20260101000000"          # real collision dupe of "report"
+    sibling = archive / "report-card"                  # unrelated sibling skill
+    for d, frontname in ((dupe, "report"), (sibling, "report-card")):
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {frontname}\ndescription: x\n---\n", encoding="utf-8",
+        )
+
+    ok, msg = restore_skill("report")
+    assert not ok
+    assert "trustworthy" in msg
+    assert dupe.exists()
+    assert sibling.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -363,4 +1024,3 @@ def test_adopt_rejects_empty_name(skills_home):
     from tools.skill_usage import adopt_skill
 
     assert adopt_skill("")[0] is False
-

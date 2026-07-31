@@ -24,6 +24,7 @@ def _make_agent(**overrides):
         platform="",
         pass_session_id=False,
         session_id="",
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -88,7 +89,7 @@ def _init_code_repo(path):
     import subprocess
 
     subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
-    (path / "main.py").write_text("print('hi')\n")
+    (path / "main.py").write_text("print('hi')\n", encoding="utf-8")
 
 
 class TestCodingContextBlock:
@@ -128,6 +129,31 @@ def test_build_system_prompt_records_stable_prefix():
 
     assert prompt.startswith(agent._cached_system_prompt_static)
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
+
+
+def test_skills_prompt_index_mode_is_wired_from_config():
+    agent = _make_agent(valid_tool_names=["skills_list", "skill_view"])
+    captured = {}
+
+    def fake_skills_prompt(**kwargs):
+        captured.update(kwargs)
+        return "SKILLS"
+
+    with (
+        patch("run_agent.load_soul_md", return_value=""),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.build_skills_system_prompt", side_effect=fake_skills_prompt),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"prompt_index_mode": "category_compact"}},
+        ),
+    ):
+        stable = build_system_prompt_parts(agent)["stable"]
+
+    assert "SKILLS" in stable
+    assert captured["prompt_index_mode"] == "category_compact"
 
 
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):

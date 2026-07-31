@@ -98,6 +98,24 @@ Known failure modes and how to handle them.
 How the agent confirms it worked.
 ```
 
+`name` and `description` must both be non-empty strings. When creating a skill
+through `skill_manage`, the frontmatter `name` must exactly match the requested
+skill name, and `description` must be no longer than 60 characters. Put concise
+trigger and routing language in `description`; keep procedures, examples, and
+edge cases in the body or supporting files. On POSIX, creation and canonical
+`SKILL.md` mutation use no-follow, directory-fd-relative operations. A canonical
+mutation keeps candidate lookup, read, replacement, scan snapshot, and rollback
+attached to one verified directory object. Creation scans a no-follow snapshot
+from the held newly-created directory before it can report success. Windows
+directory guards validate
+`FileAttributeTagInfo` after opening a handle (so a junction swap cannot hide
+between attribute lookup and `CreateFileW`), but Python does not currently
+provide the handle-relative create/replace/rollback primitives this contract
+requires. `skill_manage` therefore fails closed for creation and canonical
+`SKILL.md` mutation on Windows; supporting-file behavior is unchanged. Other
+runtimes also fail closed when they cannot provide an equivalent safe backend.
+Canonical `SKILL.md` files must be regular files and cannot be symlinks.
+
 ### Platform-Specific Skills
 
 Skills can restrict themselves to specific operating systems using the `platforms` field:
@@ -272,6 +290,13 @@ Prefer stdlib Python, curl, and existing Hermes tools (`web_extract`, `terminal`
 ### Progressive Disclosure
 
 Put the most common workflow first. Edge cases and advanced usage go at the bottom. This keeps token usage low for common tasks.
+
+Supporting files under `references/`, `templates/`, `scripts/`, and `assets/`
+are discovered automatically when a skill is activated. To keep activation
+bounded, Hermes previews at most 50 paths per category and applies a total path
+length budget. Any omitted file remains available through
+`skill_view(file_path=...)`, so large skills should link to files by purpose
+instead of copying their full contents into `SKILL.md`.
 
 ### Include Helper Scripts
 

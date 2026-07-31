@@ -1,8 +1,11 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import os
 import sqlite3
+import threading
 import time
 import json
+import uuid
 from unittest import mock
 
 import pytest
@@ -82,6 +85,37 @@ def db(tmp_path):
 # =========================================================================
 
 class TestSessionLifecycle:
+    def test_codex_lease_linux_start_time_handles_spaces_and_parentheses(
+        self, monkeypatch
+    ):
+        suffix = ["S", *(["0"] * 18), "987654"]
+        stat_text = f"123 (worker name ) with spaces) {' '.join(suffix)}"
+        monkeypatch.setattr(
+            hermes_state.Path,
+            "read_text",
+            lambda self, encoding=None: stat_text,
+        )
+
+        assert hermes_state._codex_turn_lease_process_start_time(123) == 987654
+
+    def test_codex_lease_linux_never_mixes_proc_and_psutil_fingerprints(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(hermes_state.sys, "platform", "linux")
+        monkeypatch.setattr(
+            hermes_state.Path,
+            "read_text",
+            lambda self, encoding=None: (_ for _ in ()).throw(
+                PermissionError("proc hidden")
+            ),
+        )
+        fake_psutil = mock.MagicMock()
+        fake_psutil.Process.return_value.create_time.return_value = 1234.5
+        monkeypatch.setattr(hermes_state, "psutil", fake_psutil)
+
+        assert hermes_state._codex_turn_lease_process_start_time(123) is None
+        fake_psutil.Process.assert_not_called()
+
     def test_create_and_get_session(self, db):
         sid = db.create_session(
             session_id="s1",
@@ -96,6 +130,439 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_codex_thread_binding_is_persistent_idempotent_and_immutable(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "codex_binding.db"
+        first = SessionDB(db_path=db_path)
+        first.create_session(
+            session_id="s1",
+            source="telegram",
+            thread_id="telegram-topic-7",
+        )
+        assert first.get_codex_thread_id("s1") is None
+        assert first.bind_codex_thread_id("s1", "codex-thread-1") is True
+        assert first.bind_codex_thread_id("s1", "codex-thread-1") is True
+        assert first.bind_codex_thread_id("s1", "codex-thread-other") is False
+        assert first.bind_codex_thread_id("missing", "codex-thread-1") is False
+        first.close()
+
+        reopened = SessionDB(db_path=db_path)
+        try:
+            session = reopened.get_session("s1")
+            assert session["thread_id"] == "telegram-topic-7"
+            assert reopened.get_codex_thread_id("s1") == "codex-thread-1"
+        finally:
+            reopened.close()
+
+    def test_codex_thread_column_is_reconciled_on_legacy_sessions_table(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "legacy_codex_binding.db"
+        conn = sqlite3.connect(db_path)
+        legacy_schema = SCHEMA_SQL.replace(
+            "    codex_thread_id TEXT,\n",
+            "",
+        )
+        conn.executescript(legacy_schema)
+        conn.execute("INSERT INTO schema_version VALUES (23)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, thread_id, started_at) "
+            "VALUES ('legacy', 'discord', 'discord-thread', 1.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        reconciled = SessionDB(db_path=db_path)
+        try:
+            assert reconciled.get_codex_thread_id("legacy") is None
+            assert reconciled.bind_codex_thread_id(
+                "legacy", "codex-thread-legacy"
+            )
+            session = reconciled.get_session("legacy")
+            assert session["thread_id"] == "discord-thread"
+            assert session["codex_thread_id"] == "codex-thread-legacy"
+        finally:
+            reconciled.close()
+
+    def test_compression_child_does_not_inherit_codex_thread_binding(self, db):
+        db.create_session(session_id="parent", source="cli")
+        assert db.bind_codex_thread_id("parent", "codex-parent")
+
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="cli",
+            messages=[{"role": "user", "content": "bounded handoff"}],
+            require_compression_lease=False,
+        )
+
+        assert db.get_codex_thread_id("parent") == "codex-parent"
+        assert db.get_codex_thread_id("child") is None
+
+
+    def test_cold_start_acquire_then_holder_qualified_thread_attach(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 123456 if pid == os.getpid() else None,
+        )
+        holder = str(uuid.uuid4())
+        other_holder = str(uuid.uuid4())
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.try_acquire_codex_turn_lease("s1", holder, ttl_seconds=60)
+        lease = db.get_codex_turn_lease("s1")
+        assert lease["session_id"] == "s1"
+        assert lease["codex_thread_id"] is None
+        assert lease["holder_uuid"] == holder
+        assert lease["owner_pid"] == os.getpid()
+        assert lease["owner_started_at"] == 123456
+
+        assert not db.bind_codex_thread_under_lease(
+            "s1", other_holder, "codex-thread-1"
+        )
+        assert db.get_codex_thread_id("s1") is None
+        assert db.get_codex_turn_lease("s1")["codex_thread_id"] is None
+        assert db.bind_codex_thread_under_lease(
+            "s1",
+            holder,
+            "codex-thread-1",
+        )
+        assert db.get_codex_turn_lease("s1")["codex_thread_id"] == "codex-thread-1"
+        assert db.get_codex_thread_id("s1") == "codex-thread-1"
+        assert db.bind_codex_thread_under_lease(
+            "s1", holder, "codex-thread-1"
+        )
+
+        assert not db.refresh_codex_turn_lease("s1", other_holder)
+        assert not db.release_codex_turn_lease("s1", other_holder)
+        assert db.release_codex_turn_lease("s1", holder)
+        assert db.get_codex_turn_lease("s1") is None
+
+    def test_schema_upgrade_recreates_codex_turn_lease_table(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "pre_lease_schema.db"
+        initial = SessionDB(db_path=db_path)
+        initial.create_session(session_id="s1", source="cli")
+        initial.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("DROP TABLE codex_turn_leases")
+        conn.execute("UPDATE schema_version SET version = 24")
+        conn.commit()
+        conn.close()
+
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 198765 if pid == os.getpid() else None,
+        )
+        upgraded = SessionDB(db_path=db_path)
+        holder = str(uuid.uuid4())
+        try:
+            assert upgraded.try_acquire_codex_turn_lease("s1", holder)
+            assert upgraded.get_codex_turn_lease("s1")["holder_uuid"] == holder
+            assert upgraded.release_codex_turn_lease("s1", holder)
+        finally:
+            upgraded.close()
+
+    def test_two_connections_compete_atomically_then_handoff_after_release(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 234567 if pid == os.getpid() else None,
+        )
+        db_path = tmp_path / "codex_turn_lease_race.db"
+        first = SessionDB(db_path=db_path)
+        second = None
+        try:
+            first.create_session(session_id="s1", source="cli")
+            assert first.bind_codex_thread_id("s1", "codex-thread-1")
+            second = SessionDB(db_path=db_path)
+
+            holders = {"first": str(uuid.uuid4()), "second": str(uuid.uuid4())}
+            handles = {"first": first, "second": second}
+            barrier = threading.Barrier(2)
+            results = {}
+            errors = []
+
+            def compete(name):
+                try:
+                    barrier.wait(timeout=5)
+                    results[name] = handles[name].try_acquire_codex_turn_lease(
+                        "s1",
+                        holders[name],
+                        codex_thread_id="codex-thread-1",
+                        ttl_seconds=60,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            workers = [
+                threading.Thread(target=compete, args=(name,))
+                for name in ("first", "second")
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+
+            assert not any(worker.is_alive() for worker in workers)
+            assert errors == []
+            assert sorted(results.values()) == [False, True]
+
+            winner = next(name for name, acquired in results.items() if acquired)
+            loser = next(name for name, acquired in results.items() if not acquired)
+            assert handles[winner].release_codex_turn_lease(
+                "s1", holders[winner]
+            )
+            assert handles[loser].try_acquire_codex_turn_lease(
+                "s1",
+                holders[loser],
+                codex_thread_id="codex-thread-1",
+                ttl_seconds=60,
+            )
+        finally:
+            if second is not None:
+                second.close()
+            first.close()
+
+    def test_expired_live_same_process_lease_cannot_be_stolen(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 345678 if pid == os.getpid() else None,
+        )
+        clock = [1000.0]
+        monkeypatch.setattr(hermes_state.time, "time", lambda: clock[0])
+        owner = str(uuid.uuid4())
+        competitor = str(uuid.uuid4())
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.try_acquire_codex_turn_lease("s1", owner, ttl_seconds=1)
+        clock[0] = 2000.0
+        assert not db.try_acquire_codex_turn_lease(
+            "s1", competitor, ttl_seconds=60
+        )
+        assert db.refresh_codex_turn_lease("s1", owner, ttl_seconds=60)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == owner
+        assert db.get_codex_turn_lease("s1")["expires_at"] == 2060.0
+
+    def test_pid_reuse_lease_reclamation_requires_expiry_and_identity_change(
+        self, db, monkeypatch
+    ):
+        """PID reuse is recoverable only after the old lease has expired.
+
+        The stored owner PID is deliberately distinct from this test process.
+        A changed start fingerprint represents PID reuse, while the matching
+        value represents a live owner.  This exercises the three safety cases
+        Sol requested without depending on an actual recycled kernel PID.
+        """
+        owner_pid = 424242
+        old_start = 111111
+        current_start = 222222
+        caller_start = 333333
+        clock = [1000.0]
+        monkeypatch.setattr(hermes_state.time, "time", lambda: clock[0])
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: (
+                caller_start
+                if pid == os.getpid()
+                else current_start
+                if pid == owner_pid
+                else None
+            ),
+        )
+        db.create_session(session_id="s1", source="cli")
+        stale_holder = str(uuid.uuid4())
+        replacement_holder = str(uuid.uuid4())
+
+        def insert_lease(*, expires_at):
+            def _do(conn):
+                conn.execute("DELETE FROM codex_turn_leases WHERE session_id = ?", ("s1",))
+                conn.execute(
+                    "INSERT INTO codex_turn_leases "
+                    "(session_id, codex_thread_id, holder_uuid, owner_pid, "
+                    "owner_started_at, acquired_at, refreshed_at, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        "s1", None, stale_holder, owner_pid, old_start,
+                        900.0, 900.0, expires_at,
+                    ),
+                )
+            db._execute_write(_do)
+
+        # Different start fingerprint is not enough before TTL expiry.
+        insert_lease(expires_at=1100.0)
+        assert not db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == stale_holder
+
+        # Once expired, that changed fingerprint proves PID reuse and permits
+        # recovery by a new owner.
+        insert_lease(expires_at=999.0)
+        assert db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == replacement_holder
+
+        # A matching fingerprint remains a live owner even after expiry.
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: (
+                caller_start
+                if pid == os.getpid()
+                else old_start
+                if pid == owner_pid
+                else None
+            ),
+        )
+        insert_lease(expires_at=999.0)
+        assert not db.try_acquire_codex_turn_lease("s1", replacement_holder)
+        assert db.get_codex_turn_lease("s1")["holder_uuid"] == stale_holder
+
+    def test_expired_dead_process_lease_is_recovered(self, db, monkeypatch):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 456789 if pid == os.getpid() else None,
+        )
+        db.create_session(session_id="s1", source="cli")
+        assert db.bind_codex_thread_id("s1", "codex-thread-1")
+        stale_holder = str(uuid.uuid4())
+
+        def insert_stale(conn):
+            conn.execute(
+                "INSERT INTO codex_turn_leases "
+                "(session_id, codex_thread_id, holder_uuid, owner_pid, "
+                "owner_started_at, acquired_at, refreshed_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "s1",
+                    "codex-thread-1",
+                    stale_holder,
+                    999999999,
+                    111111,
+                    10.0,
+                    10.0,
+                    100.0,
+                ),
+            )
+
+        db._execute_write(insert_stale)
+        clock = [50.0]
+        monkeypatch.setattr(hermes_state.time, "time", lambda: clock[0])
+        liveness_calls = []
+
+        def owner_is_alive(pid, started_at):
+            liveness_calls.append((pid, started_at))
+            return False
+
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_owner_is_alive",
+            owner_is_alive,
+        )
+        new_holder = str(uuid.uuid4())
+
+        # Dead alone is insufficient: recovery also requires TTL expiry.
+        assert not db.try_acquire_codex_turn_lease("s1", new_holder)
+        assert liveness_calls == []
+
+        clock[0] = 200.0
+        assert db.try_acquire_codex_turn_lease("s1", new_holder)
+        assert liveness_calls == [(999999999, 111111)]
+        lease = db.get_codex_turn_lease("s1")
+        assert lease["holder_uuid"] == new_holder
+        assert lease["owner_pid"] == os.getpid()
+        assert lease["owner_started_at"] == 456789
+        assert lease["codex_thread_id"] == "codex-thread-1"
+
+    def test_bind_under_lease_enforces_global_thread_uniqueness(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 512345 if pid == os.getpid() else None,
+        )
+        first_holder = str(uuid.uuid4())
+        second_holder = str(uuid.uuid4())
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        assert db.try_acquire_codex_turn_lease("s1", first_holder)
+        assert db.try_acquire_codex_turn_lease("s2", second_holder)
+
+        assert db.bind_codex_thread_under_lease(
+            "s1", first_holder, "codex-thread-shared"
+        )
+        assert not db.bind_codex_thread_under_lease(
+            "s2", second_holder, "codex-thread-shared"
+        )
+        assert db.get_codex_thread_id("s1") == "codex-thread-shared"
+        assert db.get_codex_thread_id("s2") is None
+        assert db.get_codex_turn_lease("s2")["codex_thread_id"] is None
+        assert not db.bind_codex_thread_id("s2", "codex-thread-shared")
+
+    def test_bind_under_lease_rolls_back_session_if_attach_fails(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 523456 if pid == os.getpid() else None,
+        )
+        holder = str(uuid.uuid4())
+        db.create_session(session_id="s1", source="cli")
+        assert db.try_acquire_codex_turn_lease("s1", holder)
+
+        def install_failure_trigger(conn):
+            conn.execute(
+                "CREATE TRIGGER fail_codex_lease_attach "
+                "BEFORE UPDATE OF codex_thread_id ON codex_turn_leases "
+                "WHEN NEW.codex_thread_id = 'codex-thread-fail' "
+                "BEGIN "
+                "SELECT RAISE(ABORT, 'forced lease attach failure'); "
+                "END"
+            )
+
+        db._execute_write(install_failure_trigger)
+        assert not db.bind_codex_thread_under_lease(
+            "s1", holder, "codex-thread-fail"
+        )
+        assert db.get_codex_thread_id("s1") is None
+        assert db.get_codex_turn_lease("s1")["codex_thread_id"] is None
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            sqlite3.OperationalError("database is locked"),
+            TimeoutError("write patience exhausted"),
+        ],
+    )
+    def test_database_and_timeout_errors_fail_closed(
+        self, db, monkeypatch, error
+    ):
+        monkeypatch.setattr(
+            hermes_state,
+            "_codex_turn_lease_process_start_time",
+            lambda pid: 567890 if pid == os.getpid() else None,
+        )
+        holder = str(uuid.uuid4())
+        db.create_session(session_id="s1", source="cli")
+
+        with mock.patch.object(db, "_execute_write", side_effect=error):
+            assert not db.try_acquire_codex_turn_lease("s1", holder)
+            assert not db.refresh_codex_turn_lease("s1", holder)
+            assert not db.release_codex_turn_lease("s1", holder)
 
 
 

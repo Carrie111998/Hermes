@@ -1202,14 +1202,24 @@ def _(rid, params: dict) -> dict:
     agent = session.get("agent")
     if agent is None:
         usage = _session_usage_snapshot(session) or _get_usage(None)
+        # ``usage.total`` is lifetime API traffic, not the tokens occupying the
+        # current context window.  Falling back to it made a resumed desktop
+        # session report impossible values such as 1.9M / 120K and could
+        # overwrite the last provider-measured status-bar value.  Only a
+        # window-scoped ``context_used`` value is meaningful here.
+        context_used = int(usage.get("context_used", 0) or 0)
+        context_used_estimated = bool(
+            usage.get("context_used_estimated", context_used <= 0)
+        )
         return _ok(
             rid,
             {
                 "categories": [],
                 "context_max": usage.get("context_max", 0) or 0,
                 "context_percent": usage.get("context_percent", 0) or 0,
-                "context_used": usage.get("context_used", 0) or 0,
-                "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
+                "context_used": context_used,
+                "context_used_estimated": context_used_estimated,
+                "estimated_total": context_used,
                 "model": _metadata_mirror(session).get("model", ""),
             },
         )
@@ -2365,7 +2375,8 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
-    if session.get("running"):
+    compression_reservation = _reserve_manual_compression(session)
+    if compression_reservation is None:
         return _err(
             rid, 4009, "session busy — /interrupt the current turn before /compress"
         )
@@ -2484,6 +2495,9 @@ def _(rid, params: dict) -> dict:
             committed=False,
         )
         return _err(rid, 5005, str(e))
+    finally:
+        _release_manual_compression(session, compression_reservation)
+        _drain_queued_prompt(rid, sid, session)
 
 
 @method("session.save")

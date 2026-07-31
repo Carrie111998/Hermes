@@ -22,13 +22,20 @@ def hub_env(monkeypatch, tmp_path):
     import tools.skills_hub as hub
 
     hub_dir = tmp_path / "skills" / ".hub"
-    monkeypatch.setattr(hub, "SKILLS_DIR", tmp_path / "skills")
-    monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
-    monkeypatch.setattr(hub, "LOCK_FILE", hub_dir / "lock.json")
-    monkeypatch.setattr(hub, "QUARANTINE_DIR", hub_dir / "quarantine")
-    monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
-    monkeypatch.setattr(hub, "TAPS_FILE", hub_dir / "taps.json")
-    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
+    # These legacy names are supplied by module-level __getattr__. Using
+    # setattr would make monkeypatch "restore" the dynamically resolved value
+    # as a real module attribute, freezing profile paths for all later tests.
+    # Patch the module dictionary so teardown deletes originally-absent keys.
+    for name, value in {
+        "SKILLS_DIR": tmp_path / "skills",
+        "HUB_DIR": hub_dir,
+        "LOCK_FILE": hub_dir / "lock.json",
+        "QUARANTINE_DIR": hub_dir / "quarantine",
+        "AUDIT_LOG": hub_dir / "audit.log",
+        "TAPS_FILE": hub_dir / "taps.json",
+        "INDEX_CACHE_DIR": hub_dir / "index-cache",
+    }.items():
+        monkeypatch.setitem(hub.__dict__, name, value)
 
     return hub_dir
 
@@ -312,4 +319,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-

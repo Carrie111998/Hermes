@@ -139,10 +139,68 @@ def test_load_on_disk_store_honors_configured_char_limits(hermes_home, monkeypat
 # Skill gate
 # ---------------------------------------------------------------------------
 
-_SKILL = (
-    "---\nname: test-skill\ndescription: A test skill\nversion: 1.0.0\n---\n"
-    "# Test\nbody\n"
-)
+def _skill(name):
+    return (
+        f"---\nname: {name}\ndescription: A test skill\n"
+        "version: 1.0.0\n---\n# Test\nbody\n"
+    )
+
+
+def test_skill_gate_off_allows_create(hermes_home):
+    # Default (gate off) → skill is created normally, not staged.
+    import importlib
+    import tools.skill_manager_tool as smt
+    importlib.reload(smt)
+    from tools import write_approval as wa
+    r = json.loads(
+        smt.skill_manage("create", "free-skill", content=_skill("free-skill"))
+    )
+    assert r.get("success") is True
+    assert wa.pending_count("skills") == 0
+
+
+def test_skill_gate_on_always_stages(hermes_home):
+    # Skills stage even in the foreground (too big to review inline).
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+    _set_approval("skills", True)
+    r = json.loads(
+        skill_manage("create", "staged-skill", content=_skill("staged-skill"))
+    )
+    assert r.get("staged") is True
+    assert "staged-skill" in r.get("gist", "")
+    assert wa.pending_count("skills") == 1
+
+
+def test_skill_gate_on_then_apply_writes_file(hermes_home):
+    # SKILLS_DIR is resolved at import time, so reload the skill module under
+    # this test's HERMES_HOME to exercise the real on-disk write path.
+    import importlib
+    import tools.skill_manager_tool as smt
+    importlib.reload(smt)
+    from tools import write_approval as wa
+    _set_approval("skills", True)
+    r = json.loads(
+        smt.skill_manage(
+            "create", "applied-skill", content=_skill("applied-skill")
+        )
+    )
+    rec = wa.get_pending("skills", r["pending_id"])
+    res = json.loads(smt.apply_skill_pending(rec["payload"]))
+    assert res["success"] is True
+    assert smt._find_skill("applied-skill") is not None
+
+
+def test_skill_create_diff_is_full_content(hermes_home):
+    from tools.skill_manager_tool import skill_manage
+    from tools import write_approval as wa
+    _set_approval("skills", True)
+    r = json.loads(
+        skill_manage("create", "diff-skill", content=_skill("diff-skill"))
+    )
+    rec = wa.get_pending("skills", r["pending_id"])
+    diff = wa.skill_pending_diff(rec)
+    assert "name: diff-skill" in diff
 
 
 # ---------------------------------------------------------------------------

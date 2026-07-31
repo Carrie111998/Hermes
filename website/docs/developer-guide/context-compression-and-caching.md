@@ -195,8 +195,10 @@ local transcript mirror leaves the real thread growing unbounded until a hard
 context reset. For this runtime, compaction goes through the app-server's own
 mechanism instead:
 
-- Manual compaction (`/compress`) asks the app-server to compact the thread
-  (`thread/compact/start`) and waits for the compaction turn to complete.
+- Manual compaction (`/compress`) asks an active app-server thread to compact
+  (`thread/compact/start`) and waits for the compaction turn to complete. If no
+  thread exists yet, it falls back to Hermes' built-in compressor so the
+  durable transcript can still be reduced.
 - Automatic compaction is controlled by `compression.codex_app_server_auto`:
   the default `native` lets the app-server decide when to compact and Hermes
   records the resulting compaction events (compression counters, session
@@ -204,9 +206,12 @@ mechanism instead:
   app-server compaction, or `off` to disable Hermes-initiated automatic
   compaction entirely (codex may still compact natively).
 
-Hermes' local transcript is never rewritten on this runtime — state.db records
-the compaction boundary while the visible transcript stays intact. All other
-routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
+With an active app-server thread, Hermes' local transcript is not rewritten —
+state.db records the native compaction boundary while the visible transcript
+stays intact. In `hermes` mode, preflight or hygiene may run before an
+app-server thread exists; those paths use Hermes' built-in compressor to shrink
+the durable transcript instead of silently doing nothing. All other routes
+(including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
 ### Computed Values (for a 200K context model at defaults)
 

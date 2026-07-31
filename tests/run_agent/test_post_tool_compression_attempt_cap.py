@@ -1,8 +1,9 @@
 """Behavioral regression tests for the post-tool compression attempt cap.
 
 The pre-API pressure gate, the overflow/413 error handlers, and the post-tool
-compaction gate all share ``compression_attempts`` as a per-turn backstop,
-bounded by the resolved ``compression.max_attempts`` cap (default 3).  Before
+compaction gate all share ``compression_attempts`` as a consecutive-failure
+backstop, bounded by the resolved ``compression.max_attempts`` cap (default 3).
+Provider-confirmed recovery starts a fresh interval during a long turn. Before
 the fix the post-tool path neither checked nor incremented the counter, so a
 long tool loop could compact after every tool response for the lifetime of
 the turn.
@@ -21,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_compressor import ContextCompressor
 from run_agent import AIAgent
 
 
@@ -37,7 +39,7 @@ def _tool_call(i: int):
     )
 
 
-def _tool_response(i: int):
+def _tool_response(i: int, *, prompt_tokens: int | None = None):
     msg = SimpleNamespace(
         content=None,
         reasoning_content=None,
@@ -45,7 +47,14 @@ def _tool_response(i: int):
         tool_calls=[_tool_call(i)],
     )
     choice = SimpleNamespace(message=msg, finish_reason="tool_calls")
-    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+    usage = None
+    if prompt_tokens is not None:
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=10,
+            total_tokens=prompt_tokens + 10,
+        )
+    return SimpleNamespace(choices=[choice], model="test/model", usage=usage)
 
 
 def _stop_response():
@@ -86,9 +95,23 @@ def _pressured_compressor() -> MagicMock:
     compressor.threshold_tokens = 10_000
     compressor.context_length = 200_000
     compressor.last_prompt_tokens = 150_000
-    compressor.should_compress.return_value = True
+    compressor.should_compress.side_effect = (
+        lambda prompt_tokens=None: (
+            prompt_tokens
+            if prompt_tokens is not None
+            else compressor.last_prompt_tokens
+        )
+        >= compressor.threshold_tokens
+    )
     compressor.should_defer_preflight_to_real_usage.return_value = True
     compressor.get_active_compression_failure_cooldown.return_value = None
+
+    def _update_from_response(usage):
+        compressor.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        compressor.awaiting_real_usage_after_compression = False
+
+    compressor.update_from_response.side_effect = _update_from_response
+    compressor.awaiting_real_usage_after_compression = False
     return compressor
 
 
@@ -118,9 +141,23 @@ def agent():
     return a
 
 
-def _run_tool_loop(agent, n_tool_iterations: int):
+def _run_tool_loop(
+    agent,
+    n_tool_iterations: int,
+    *,
+    reported_prompt_tokens: int | list[int] | None = None,
+    compaction_makes_progress: bool | set[int] = False,
+):
     """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
-    responses = [_tool_response(i) for i in range(n_tool_iterations)]
+    if isinstance(reported_prompt_tokens, list):
+        assert len(reported_prompt_tokens) == n_tool_iterations
+        prompt_tokens_by_iteration = reported_prompt_tokens
+    else:
+        prompt_tokens_by_iteration = [reported_prompt_tokens] * n_tool_iterations
+    responses = [
+        _tool_response(i, prompt_tokens=prompt_tokens_by_iteration[i])
+        for i in range(n_tool_iterations)
+    ]
     responses.append(_stop_response())
     agent.client.chat.completions.create.side_effect = responses
 
@@ -128,6 +165,12 @@ def _run_tool_loop(agent, n_tool_iterations: int):
 
     def _fake_compress(messages, system_message, **_kwargs):
         compress_calls.append(len(messages))
+        call_number = len(compress_calls)
+        if compaction_makes_progress is True or (
+            isinstance(compaction_makes_progress, set)
+            and call_number in compaction_makes_progress
+        ):
+            agent.context_compressor.awaiting_real_usage_after_compression = True
         return messages, "compressed prompt"
 
     with (
@@ -197,3 +240,129 @@ class TestPostToolCompressionAttemptCap:
 
         assert len(first) == 3
         assert len(second) == 3
+
+    def test_effective_compaction_reopens_budget_during_long_turn(self, agent):
+        """Provider-confirmed recovery makes the cap consecutive, not lifetime.
+
+        The hgfast failure used three effective compactions early in one
+        100-iteration tool turn. Each next provider call reported a prompt well
+        below the threshold, but the cumulative counter stayed at three and
+        disabled later compaction. A real below-threshold reading must reopen
+        the retry budget for later context regrowth.
+        """
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=7,
+            reported_prompt_tokens=[
+                150_000,
+                5_000,
+                150_000,
+                5_000,
+                150_000,
+                5_000,
+                150_000,
+            ],
+            compaction_makes_progress=True,
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 4
+
+    def test_unrelated_low_usage_does_not_reopen_budget_after_noop(self, agent):
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=7,
+            reported_prompt_tokens=[
+                150_000,
+                5_000,
+                150_000,
+                5_000,
+                150_000,
+                5_000,
+                150_000,
+            ],
+            compaction_makes_progress=False,
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 3
+
+    def test_host_consumes_plugin_compaction_verdict_latch_once(self, agent):
+        """Plugins need not know about the host's dynamic one-shot latch."""
+        agent.max_compression_attempts = 1
+        agent.context_compressor.update_from_response.side_effect = (
+            lambda usage: setattr(
+                agent.context_compressor,
+                "last_prompt_tokens",
+                usage.get("prompt_tokens", 0),
+            )
+        )
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=5,
+            reported_prompt_tokens=[
+                150_000,
+                5_000,
+                150_000,
+                5_000,
+                150_000,
+            ],
+            # First attempt succeeds and arms the host latch. The second is a
+            # no-op and must not let the following unrelated low reading reset
+            # the cap a second time.
+            compaction_makes_progress={1},
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 2
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False
+
+    def test_real_compressor_observes_latch_before_host_consumes_it(self, agent):
+        """The host must not erase the built-in compressor's fit baseline."""
+        compressor = ContextCompressor(
+            model="test/model",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        compressor.threshold_tokens = 10_000
+        compressor.last_compression_rough_tokens = 90_000
+        agent.context_compressor = compressor
+
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=2,
+            reported_prompt_tokens=[150_000, 5_000],
+            compaction_makes_progress={1},
+        )
+
+        assert result["completed"] is True
+        assert len(compress_calls) == 1
+        assert compressor.last_rough_tokens_when_real_prompt_fit == 90_000
+        assert compressor.awaiting_real_usage_after_compression is False
+
+    def test_zero_prompt_is_not_forwarded_to_plugin_or_used_to_reset_latch(self, agent):
+        agent.max_compression_attempts = 1
+        observed_plugin_prompts = []
+
+        def _plugin_update(usage):
+            prompt = usage["prompt_tokens"]
+            observed_plugin_prompts.append(prompt)
+            # This deliberately bad third-party engine consumes every update.
+            # The host must protect it from zero/missing prompt payloads.
+            agent.context_compressor.last_prompt_tokens = prompt
+            agent.context_compressor.awaiting_real_usage_after_compression = False
+
+        agent.context_compressor.update_from_response.side_effect = _plugin_update
+        result, compress_calls = _run_tool_loop(
+            agent,
+            n_tool_iterations=4,
+            reported_prompt_tokens=[150_000, 0, 5_000, 150_000],
+            compaction_makes_progress={1},
+        )
+
+        assert result["completed"] is True
+        # The zero-prompt response cannot reach the plug-in, clear its latch,
+        # or reset the one-attempt budget.  The later real low prompt can.
+        assert len(compress_calls) == 2
+        assert 0 not in observed_plugin_prompts
+        assert agent.context_compressor.awaiting_real_usage_after_compression is False

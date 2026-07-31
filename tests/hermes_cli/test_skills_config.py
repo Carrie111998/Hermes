@@ -93,6 +93,13 @@ class TestGetDisabledSkillNames:
 
     def test_session_platform_env_var(self, tmp_path, monkeypatch):
         """HERMES_SESSION_PLATFORM should be used when HERMES_PLATFORM is unset."""
+        # Earlier gateway-oriented tests deliberately leave the current
+        # ContextVar scope explicitly cleared (""), which suppresses the
+        # legacy os.environ fallback. This case models a fresh CLI/test scope,
+        # so establish the corresponding _UNSET state explicitly.
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
         config = tmp_path / "config.yaml"
         config.write_text(
             "skills:\n"
@@ -141,7 +148,10 @@ class TestFindAllSkillsFiltering:
         skill_dir = tmp_path / "my-skill"
         skill_dir.mkdir()
         skill_md = skill_dir / "SKILL.md"
-        skill_md.write_text("---\nname: my-skill\ndescription: A test skill\n---\nContent")
+        skill_md.write_text(
+            "---\nname: my-skill\ndescription: A test skill\n---\nContent",
+            encoding="utf-8",
+        )
         # Point SKILLS_DIR at the real tempdir so iter_skill_index_files
         # (which uses os.walk) can actually find the file.
         import tools.skills_tool as _st

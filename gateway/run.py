@@ -5694,6 +5694,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._completion_delivery_lock = threading.Lock()
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
+        # Adapter acceptance is irreversible even when its durable CAS is
+        # temporarily uncertain. Keep those identities outside the bounded
+        # delivered-LRU so retention pressure cannot permit reinjection.
+        self._completion_deliveries_settlement_pending: set[
+            tuple[str, str, object]
+        ] = set()
         self._completion_delivery_retention = 2048
 
         # Cache AIAgent instances per session to preserve prompt caching.
@@ -21000,10 +21006,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
-        ``True`` means this caller reached adapter acceptance, ``False`` means
-        injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
+        ``True`` means adapter acceptance and durable settlement both
+        completed. ``False`` means injection or settlement must be retried,
+        and ``None`` means another same-lifecycle caller owns/consumed the
+        event or it has no gateway route. Once an adapter accepts, retries in
+        this process are settlement-only; no cross-process exactly-once
         guarantee is claimed.
         """
         identity = self._completion_delivery_identity(evt)
@@ -21013,13 +21020,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        DELIVERY_BUSY_PENDING,
+                        DELIVERY_CLAIMED,
+                        DELIVERY_TERMINAL_CONSUMED,
+                        claim_event_delivery_state,
+                    )
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+                    claim = claim_event_delivery_state(evt, "gateway")
+                    if claim.state == DELIVERY_TERMINAL_CONSUMED:
+                        if identity is not None:
+                            with self._completion_delivery_lock:
+                                self._completion_deliveries_settlement_pending.discard(
+                                    identity
+                                )
+                                self._completion_deliveries_delivered[identity] = None
+                                while (
+                                    len(self._completion_deliveries_delivered)
+                                    > self._completion_delivery_retention
+                                ):
+                                    self._completion_deliveries_delivered.popitem(
+                                        last=False
+                                    )
                         return None
+                    if claim.state == DELIVERY_BUSY_PENDING:
+                        # A live claimant may be injecting, or its lease may
+                        # be approaching rollover. Keep the queue item so a
+                        # successor can observe the eventual terminal state.
+                        return False
+                    if claim.state == DELIVERY_CLAIMED:
+                        durable_claim_id = claim.claim_id
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
@@ -21069,12 +21099,120 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 exc_info=True,
                             )
                     return False
+
+        # An adapter acceptance cannot be revoked.  If a previous pass got
+        # that far but its durable settlement was uncertain, a replay in this
+        # gateway must retry only the compare-and-set acknowledgement, never
+        # inject the same delegation into the adapter again.
+        previously_accepted = False
+        if identity is not None:
+            with self._completion_delivery_lock:
+                previously_accepted = (
+                    identity in self._completion_deliveries_settlement_pending
+                )
+
+        def _remember_durable_settlement_pending() -> None:
+            if identity is None:
+                return
+            with self._completion_delivery_lock:
+                self._completion_deliveries_inflight.discard(identity)
+                self._completion_deliveries_settlement_pending.add(identity)
+
+        def _mark_durable_settlement_terminal() -> None:
+            if identity is None:
+                return
+            with self._completion_delivery_lock:
+                self._completion_deliveries_settlement_pending.discard(identity)
+                # Keep ordinary same-lifecycle deduplication after the
+                # durable ledger has converged (including a successor's
+                # delivered/dropped/pruned terminal disposition).
+                self._completion_deliveries_delivered[identity] = None
+                while (
+                    len(self._completion_deliveries_delivered)
+                    > self._completion_delivery_retention
+                ):
+                    self._completion_deliveries_delivered.popitem(last=False)
+
+        def _settle_durable_acceptance() -> Optional[bool]:
+            """Commit adapter acceptance, retrying safely when CAS is uncertain."""
+            if not durable_claim_id:
+                return True
+            try:
+                from tools.async_delegation import (
+                    DELIVERY_TERMINAL_CONSUMED,
+                    complete_completion_delivery,
+                    inspect_event_delivery_state,
+                    release_completion_delivery,
+                )
+
+                if complete_completion_delivery(
+                    durable_delegation_id, durable_claim_id,
+                ):
+                    _mark_durable_settlement_terminal()
+                    return True
+                logger.warning(
+                    "Durable async completion settlement CAS lost for %s",
+                    durable_delegation_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Could not acknowledge durable async completion %s",
+                    durable_delegation_id, exc_info=True,
+                )
+                try:
+                    from tools.async_delegation import (
+                        DELIVERY_TERMINAL_CONSUMED,
+                        inspect_event_delivery_state,
+                        release_completion_delivery,
+                    )
+                except Exception:
+                    return False
+
+            # A failed CAS is not durable success. Re-read the authoritative
+            # row: a stale claimant must consume a successor's terminal
+            # delivered/dropped/pruned outcome, while a still-pending row is
+            # released and retried through the bounded claim-attempt policy.
+            try:
+                state = inspect_event_delivery_state(evt)
+            except Exception:
+                logger.debug(
+                    "Could not inspect durable completion settlement %s",
+                    durable_delegation_id, exc_info=True,
+                )
+                state = None
+            if state == DELIVERY_TERMINAL_CONSUMED:
+                _mark_durable_settlement_terminal()
+                return None
+            try:
+                release_completion_delivery(durable_delegation_id, durable_claim_id)
+            except Exception:
+                logger.debug("Could not release durable completion claim", exc_info=True)
+            return False
+
+        if previously_accepted:
+            # This invocation owns a fresh durable claim, but not a fresh
+            # adapter delivery.  It is a settlement retry only.
+            return _settle_durable_acceptance()
+
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
                     identity in self._completion_deliveries_inflight
+                    or identity in self._completion_deliveries_settlement_pending
                     or identity in self._completion_deliveries_delivered
                 ):
+                    if durable_claim_id:
+                        try:
+                            from tools.async_delegation import release_completion_delivery
+
+                            release_completion_delivery(
+                                durable_delegation_id, durable_claim_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not release duplicate durable completion claim",
+                                exc_info=True,
+                            )
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
@@ -21086,31 +21224,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             accepted = True
 
             if identity is not None:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-                    self._completion_deliveries_delivered[identity] = None
-                    while (
-                        len(self._completion_deliveries_delivered)
-                        > self._completion_delivery_retention
-                    ):
-                        self._completion_deliveries_delivered.popitem(last=False)
+                if durable_claim_id:
+                    _remember_durable_settlement_pending()
+                else:
+                    _mark_durable_settlement_terminal()
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-            return True
+            return _settle_durable_acceptance()
         finally:
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:

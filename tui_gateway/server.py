@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -149,6 +149,13 @@ _stdout_lock = threading.Lock()
 _cfg_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
 _prompt_lock = threading.Lock()
+# Notification turns run on daemon threads after their poller releases its
+# short-lived publication lock.  Keep their exact session/agent/transport
+# identity in thread-local context for the whole turn so a reused SID cannot
+# redirect an old turn's late frames to a replacement client.
+_notification_turn_binding: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("tui_notification_turn_binding", default=None)
+)
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
@@ -846,10 +853,43 @@ def _pop_session_by_id(sid: str) -> dict | None:
     and close agents/workers.  None of that slow external work belongs under
     the global ``_session_resume_lock``.
     """
-    with _sessions_lock:
-        session = _sessions.pop(sid, None)
-    if session is None:
-        return None
+    # Deferred agent construction can publish its final boundary/info frames
+    # while a close races it.  Such a build installs a per-session publish lock:
+    # claim that lock before detaching so the frame is either fully published
+    # while this exact record is live, or not published at all.  Crucially, the
+    # slow transport write holds only this session's lock — never the global
+    # registry lock — so unrelated sessions can still close/resume promptly.
+    while True:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+            if session is None:
+                return None
+            publish_lock = session.get("_agent_build_publish_lock")
+
+        if publish_lock is None:
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    continue
+                # A publisher can install its per-session lock after our
+                # first lookup but before this detach phase. Re-check under
+                # the same registry lock used by installation; if a lock
+                # appeared, retry and acquire it instead of popping beneath
+                # an in-flight build/refresh transaction.
+                if session.get("_agent_build_publish_lock") is not None:
+                    continue
+                _sessions.pop(sid, None)
+            break
+
+        with publish_lock:
+            with _sessions_lock:
+                # The id may have been reused while we waited for the old
+                # record's publisher. Retry against the new identity instead
+                # of detaching the wrong session.
+                if _sessions.get(sid) is not session:
+                    continue
+                _sessions.pop(sid, None)
+            break
+
     # The session is already out of _sessions here, so downstream teardown
     # (e.g. _finalize_session's per-session async-delegation interrupt) can't
     # recover its live id by scanning the dict — stamp it on the record.
@@ -1350,6 +1390,27 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
+        bound_turn = _notification_turn_binding.get()
+        if bound_turn is not None and sid == str(bound_turn.get("sid") or ""):
+            session = bound_turn.get("session")
+            agent = bound_turn.get("agent")
+            if not isinstance(session, dict) or agent is None:
+                return True
+            # Linearize the identity check and write with session retirement/
+            # replacement.  Deliberately drop after identity loss: falling
+            # through to a fresh SID lookup would leak old output.
+            with _sessions_lock:
+                if _sessions.get(sid) is not session or session.get("agent") is not agent:
+                    return True
+                publish_lock = session.setdefault(
+                    "_agent_build_publish_lock", threading.RLock()
+                )
+            with publish_lock:
+                with _sessions_lock:
+                    if _sessions.get(sid) is not session or session.get("agent") is not agent:
+                        return True
+                transport = bound_turn.get("transport") or _stdio_transport
+                return transport.write(obj)
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
             return t.write(obj)
 
@@ -1901,14 +1962,56 @@ def _start_agent_build(sid: str, session: dict) -> None:
     def _build() -> None:
         with _sessions_lock:
             current = _sessions.get(sid)
-        if current is None:
-            ready.set()
-            return
+            # The deferred worker may not run until after the original record
+            # has been reaped and ``sid`` reused.  A non-empty lookup is not
+            # sufficient: building with the old key and publishing into the
+            # replacement record crosses the session isolation boundary.
+            if current is not session:
+                ready.set()
+                return
+            # Install the publication lock while identity is protected by the
+            # registry lock.  A concurrent reaper therefore either detaches
+            # before this build starts or observes this exact lock and waits.
+            publish_lock = session.setdefault(
+                "_agent_build_publish_lock", threading.RLock()
+            )
 
         notify_registered = False
         home_token = None
         secret_token = None
         profile_home = current.get("profile_home")
+        # Coordinates final session-bound frame publication with
+        # _pop_session_by_id.  It is deliberately per-session: a slow client
+        # transport must not block lifecycle operations for other sessions.
+
+        def _still_attached() -> bool:
+            """Whether *this exact* build record still owns ``sid``.
+
+            A close may remove ``sid`` and reuse the id for a different
+            session while a deferred build is in flight.  Never use mere key
+            presence as a publication permission: all session-bound work in
+            this build must be gated by object identity.
+            """
+            with _sessions_lock:
+                return _sessions.get(sid) is current
+
+        def _run_if_attached(effect: Callable[[], None]) -> bool:
+            """Run one session-bound side effect while this build owns ``sid``.
+
+            The per-session lock makes the identity check and effect linear
+            with _pop_session_by_id without holding the global registry lock
+            across lifecycle hooks, thread scheduling, or transport I/O.
+            """
+            with publish_lock:
+                if not _still_attached():
+                    return False
+                effect()
+            return _still_attached()
+
+        def _emit_if_attached(event: str, payload: dict) -> bool:
+            """Publish only while this build still owns the live session."""
+            return _run_if_attached(lambda: _emit(event, sid, payload))
+
         try:
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
@@ -1963,13 +2066,41 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         kw["reasoning_config_override"] = reasoning
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
+                kw["_callback_session"] = current
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            # Publish the agent under the same lock that serializes every
+            # callback/reaper transition.  Otherwise an old callback could
+            # validate itself, then race this replacement while it is still
+            # performing its side effect.
+            with publish_lock:
+                with _sessions_lock:
+                    attached = _sessions.get(sid) is current
+                    if attached:
+                        current["agent"] = agent
+                if not attached:
+                    try:
+                        if hasattr(agent, "close"):
+                            agent.close()
+                    except Exception:
+                        pass
+                    return
+                if isinstance(getattr(agent, "_tui_callback_identity", None), dict) and not _bind_agent_callback_identity(agent, sid, current):
+                    # A production agent without its exact constructor
+                    # binding must never become a live publisher.
+                    with _sessions_lock:
+                        if _sessions.get(sid) is current and current.get("agent") is agent:
+                            current["agent"] = None
+                    try:
+                        if hasattr(agent, "close"):
+                            agent.close()
+                    except Exception:
+                        pass
+                    return
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -1990,8 +2121,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     load_permanent_allowlist,
                 )
 
+                if not _still_attached():
+                    return
+                _approval_binding = {"sid": sid, "session": current, "agent": agent}
                 register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
+                    key,
+                    lambda data: _run_bound_agent_effect(
+                        _approval_binding,
+                        lambda: _emit_approval_request(sid, data)
+                    ),
                 )
                 notify_registered = True
                 load_permanent_allowlist()
@@ -2006,8 +2144,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # default cold resume) build through here, so without this their
             # review summaries would leak to stdout instead of the chat.
             try:
-                agent.background_review_callback = lambda message, _sid=sid: _emit(
-                    "review.summary", _sid, {"text": str(message)}
+                _review_binding = {"sid": sid, "session": current, "agent": agent}
+                agent.background_review_callback = lambda message: _emit_bound_agent_event(
+                    _review_binding,
+                    "review.summary",
+                    {"text": str(message)},
                 )
                 agent.memory_notifications = _load_memory_notifications()
             except Exception:
@@ -2016,30 +2157,67 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # message), so depletion / usage-band warnings show at "ready". Runs
             # off the build thread, after the notice_callback is wired. Fail-open.
             try:
+                if not _still_attached():
+                    return
                 from agent.credits_tracker import seed_credits_at_session_start
 
                 seed_credits_at_session_start(agent)
             except Exception:
                 pass
+
+            # Starting the poller may wire global callbacks and start a
+            # thread; do it outside the registry lock.  If a reap wins while
+            # it starts, stop the late poller rather than attaching it to an
+            # already-detached record.
+            if not _still_attached():
+                return
+            notif_stop = _start_notification_poller(sid, current)
             with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+                if _sessions.get(sid) is current:
+                    current["_notif_stop"] = notif_stop
+                    poller_attached = True
+                else:
+                    poller_attached = False
+            if not poller_attached:
+                notif_stop.set()
+                return
+
+            # Every following side effect can yield to a close/reaper. Bind
+            # each one atomically to this exact registry record so an old
+            # successful check cannot authorize a ghost lifecycle hook, frame,
+            # or refresh thread after sid reuse.
+            if not _run_if_attached(
+                lambda: _notify_session_boundary(
+                    "on_session_reset", key, _session_source(current)
+                )
+            ):
+                return
 
             info = _session_info(agent, current)
+            if not _still_attached():
+                return
             cfg_warn = _probe_config_health(_load_cfg())
             if cfg_warn:
                 info["config_warning"] = cfg_warn
                 logger.warning(cfg_warn)
-            _emit("session.info", sid, info)
+            if not _emit_if_attached("session.info", info):
+                return
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
             # was built without those tools. Catch up once they land — see
             # _schedule_mcp_late_refresh. Cache-safe (pre-first-turn only).
-            _schedule_mcp_late_refresh(sid, agent)
+            if not _run_if_attached(
+                lambda: _schedule_mcp_late_refresh(sid, agent, current)
+            ):
+                return
         except Exception as e:
-            current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            # A build exception is useful only to the session that still owns
+            # this exact record.  A reaped session must not receive a ghost
+            # error after it has gone away (or been replaced under the same
+            # sid).
+            if _still_attached():
+                current["agent_error"] = str(e)
+                _emit_if_attached("error", {"message": f"agent init failed: {e}"})
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -2060,6 +2238,18 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     from tools.approval import unregister_gateway_notify
 
                     unregister_gateway_notify(key)
+                except Exception:
+                    pass
+            if replaced:
+                # Teardown may have run before the late-built agent was
+                # attached to ``current``. Close it here so a reaped session
+                # cannot leak provider clients or background resources.
+                try:
+                    orphaned_agent = current.get("agent")
+                    if orphaned_agent is not None and hasattr(
+                        orphaned_agent, "close"
+                    ):
+                        orphaned_agent.close()
                 except Exception:
                     pass
             ready.set()
@@ -4340,6 +4530,35 @@ class CompressionLockHeld(Exception):
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
 
 
+def _reserve_manual_compression(session: dict) -> object | None:
+    """Atomically reserve an in-process session for manual compaction.
+
+    ``_compress_context`` can durably rotate/write the SessionDB before the
+    gateway publishes its replacement history.  Holding only the final
+    history-version CAS left a window where a prompt or poller turn could
+    start from the old in-memory transcript and then lose that CAS.  Reuse the
+    normal ``running`` gate (which already excludes notification turns) and
+    retain a private ownership token so only this compression clears it.
+    """
+    token = object()
+    with session["history_lock"]:
+        if session.get("running") or session.get("_manual_compression_reservation"):
+            return None
+        session["_manual_compression_reservation"] = token
+        session["running"] = True
+    return token
+
+
+def _release_manual_compression(session: dict, token: object | None) -> None:
+    """Release exactly the reservation created by this manual compression."""
+    if token is None:
+        return
+    with session["history_lock"]:
+        if session.get("_manual_compression_reservation") is token:
+            session.pop("_manual_compression_reservation", None)
+            session["running"] = False
+
+
 def _compress_session_history(
     session: dict,
     focus_topic: str | None = None,
@@ -5330,6 +5549,232 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             _child_mirrors.pop(child_key, None)
 
 
+def _new_agent_callback_binding(
+    sid: str, session: dict | None = None
+) -> dict[str, Any]:
+    """Mutable identity captured by callbacks created before an agent exists.
+
+    ``AIAgent`` receives its callbacks as constructor arguments, so the exact
+    agent object cannot be captured until construction returns.  Eager session
+    builds also construct the agent before installing the session record.  This
+    holder lets both identities be filled in at the appropriate lifecycle
+    boundary; callbacks fail closed until both are bound.
+    """
+    return {"sid": sid, "session": session, "agent": None}
+
+
+def _bind_agent_callback_identity(agent: Any, sid: str, session: dict) -> bool:
+    """Bind an agent's callbacks to its exact live registry record.
+
+    This is called by deferred build, eager ``_init_session``, and ``/new``
+    reset after ``session["agent"]`` has been published.  A stale or orphaned
+    build cannot bind merely because another record reused the same SID.
+    """
+    binding = getattr(agent, "_tui_callback_identity", None)
+    if not isinstance(binding, dict) or binding.get("sid") != sid:
+        return False
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("agent") is not agent:
+            return False
+        # Reuse the lifecycle publication lock.  _pop_session_by_id observes
+        # locks installed under _sessions_lock, so a notice write and a reap
+        # are linearized without holding the global registry lock across I/O.
+        session.setdefault("_agent_build_publish_lock", threading.RLock())
+        binding["session"] = session
+        binding["agent"] = agent
+    return True
+
+
+def _emit_bound_agent_event(
+    binding: dict[str, Any], event: str, payload: dict
+) -> bool:
+    """Emit only for the exact session record and agent captured at bind time.
+
+    Credits hydration can call the notice spine from a daemon thread long
+    after agent construction.  A one-time SID lookup is insufficient because
+    the old session may be reaped and the SID reused before transport I/O.
+    Acquire the exact record's publication lock, then re-check both record and
+    agent identity immediately before writing.  The global registry lock is
+    used only for short in-memory checks and is never held across ``_emit``.
+    """
+    sid = str(binding.get("sid") or "")
+    session = binding.get("session")
+    agent = binding.get("agent")
+    if not sid or not isinstance(session, dict) or agent is None:
+        return False
+
+    with _sessions_lock:
+        if (
+            _sessions.get(sid) is not session
+            or session.get("agent") is not agent
+        ):
+            return False
+        publish_lock = session.setdefault(
+            "_agent_build_publish_lock", threading.RLock()
+        )
+
+    with publish_lock:
+        with _sessions_lock:
+            if (
+                binding.get("session") is not session
+                or binding.get("agent") is not agent
+                or _sessions.get(sid) is not session
+                or session.get("agent") is not agent
+            ):
+                return False
+        _emit(event, sid, payload)
+        with _sessions_lock:
+            return (
+                binding.get("session") is session
+                and binding.get("agent") is agent
+                and _sessions.get(sid) is session
+                and session.get("agent") is agent
+            )
+
+
+def _run_bound_agent_effect(binding: dict[str, Any], effect: Callable[[], Any]) -> bool:
+    """Run one callback side effect only for its exact live agent/session.
+
+    This is the non-emitting counterpart to :func:`_emit_bound_agent_event`.
+    Tool/status callbacks mutate session-local display state before they emit,
+    so checking only at the transport boundary would still let an old callback
+    alter a replacement record after SID reuse.
+    """
+    sid = str(binding.get("sid") or "")
+    session = binding.get("session")
+    agent = binding.get("agent")
+    if not sid or not isinstance(session, dict) or agent is None:
+        return False
+
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("agent") is not agent:
+            return False
+        publish_lock = session.setdefault(
+            "_agent_build_publish_lock", threading.RLock()
+        )
+
+    with publish_lock:
+        with _sessions_lock:
+            if (
+                binding.get("session") is not session
+                or binding.get("agent") is not agent
+                or _sessions.get(sid) is not session
+                or session.get("agent") is not agent
+            ):
+                return False
+        effect()
+        with _sessions_lock:
+            return (
+                binding.get("session") is session
+                and binding.get("agent") is agent
+                and _sessions.get(sid) is session
+                and session.get("agent") is agent
+            )
+
+
+def _bound_agent_cbs(sid: str, binding: dict[str, Any]) -> dict:
+    """Identity-gated versions of every live AIAgent callback.
+
+    Keep ``_agent_cbs(sid)`` as the direct-call compatibility surface used by
+    lightweight test doubles and integrations.  Real agents receive this
+    overlay from ``_make_agent`` and therefore fail closed until their exact
+    session record and agent object have both been bound.
+    """
+    def _call(effect: Callable[[], Any], default=None):
+        value: list[Any] = []
+        if _run_bound_agent_effect(binding, lambda: value.append(effect())):
+            return value[0] if value else default
+        return default
+
+    return {
+        "tool_start_callback": lambda tc_id, name, args: _call(
+            lambda: _on_tool_start(sid, tc_id, name, args)
+        ),
+        "tool_complete_callback": lambda tc_id, name, args, result: _call(
+            lambda: _on_tool_complete(sid, tc_id, name, args, result)
+        ),
+        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _call(
+            lambda: _on_tool_progress(sid, event_type, name, preview, args, **kwargs)
+        ),
+        "tool_gen_callback": lambda name: _call(
+            lambda: _tool_progress_enabled(sid)
+            and _emit("tool.generating", sid, {"name": name})
+        ),
+        "thinking_callback": lambda text: _emit_bound_agent_event(
+            binding, "thinking.delta", {"text": text}
+        ),
+        "reaction_callback": lambda kind: _emit_bound_agent_event(
+            binding, "reaction", {"kind": kind}
+        ),
+        "reasoning_callback": lambda text: _call(
+            lambda: _emit(
+                "reasoning.delta",
+                sid,
+                {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
+            )
+        ),
+        "status_callback": lambda kind, text=None: _call(
+            lambda: _status_update(sid, str(kind), None if text is None else str(text))
+        ),
+        "clarify_callback": lambda q, c, multi_select=False: _call(
+            lambda: _block(
+                "clarify.request",
+                sid,
+                ({"question": q, "choices": c, "multi_select": True}
+                 if multi_select else {"question": q, "choices": c}),
+                timeout=_clarify_timeout_seconds(),
+            )
+        ),
+        "read_terminal_callback": lambda start=None, count=None: _call(
+            lambda: _block(
+                "terminal.read.request",
+                sid,
+                {k: v for k, v in (("start", start), ("count", count)) if v is not None},
+                timeout=30,
+            )
+        ),
+        "interim_assistant_callback": lambda text, *, already_streamed=False: _emit_bound_agent_event(
+            binding,
+            "message.interim",
+            {"text": str(text), "already_streamed": bool(already_streamed)},
+        ),
+    }
+
+
+def _agent_notice_cbs(
+    sid: str, callback_identity: dict[str, Any] | None = None
+) -> dict[str, Callable[..., None]]:
+    """Credits/notice spine using the gateway's snake_case event payloads."""
+
+    def _notice(n: Any) -> None:
+        payload = {
+            "text": n.text,
+            "level": n.level,
+            "kind": n.kind,
+            "ttl_ms": n.ttl_ms,
+            "key": n.key,
+            "id": n.id,
+        }
+        if callback_identity is None:
+            # Compatibility for direct callback consumers/tests. Production
+            # AIAgents always pass a binding from _make_agent.
+            _emit("notification.show", sid, payload)
+            return
+        _emit_bound_agent_event(callback_identity, "notification.show", payload)
+
+    def _notice_clear(key: str) -> None:
+        payload = {"key": key}
+        if callback_identity is None:
+            _emit("notification.clear", sid, payload)
+            return
+        _emit_bound_agent_event(callback_identity, "notification.clear", payload)
+
+    return {
+        "notice_callback": _notice,
+        "notice_clear_callback": _notice_clear,
+    }
+
+
 def _agent_cbs(sid: str) -> dict:
     callbacks = {
         "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
@@ -5354,24 +5799,6 @@ def _agent_cbs(sid: str) -> dict:
         ),
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
-        ),
-        # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
-        # notification.show WS event; a recovery clear becomes notification.clear.
-        # Snake_case payload to match the existing gateway-event convention.
-        "notice_callback": lambda n: _emit(
-            "notification.show",
-            sid,
-            {
-                "text": n.text,
-                "level": n.level,
-                "kind": n.kind,
-                "ttl_ms": n.ttl_ms,
-                "key": n.key,
-                "id": n.id,
-            },
-        ),
-        "notice_clear_callback": lambda key: _emit(
-            "notification.clear", sid, {"key": key}
         ),
         "clarify_callback": lambda q, c, multi_select=False: _block(
             "clarify.request",
@@ -5412,6 +5839,7 @@ def _agent_cbs(sid: str) -> dict:
             )
         )
 
+    callbacks.update(_agent_notice_cbs(sid))
     return callbacks
 
 
@@ -5476,17 +5904,38 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
 
 def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
-    from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
+    # These global tool hooks outlive the call which installed them. Capture
+    # the exact current record/agent so an old eager init cannot route a later
+    # tool prompt into a replacement that reused its short SID.
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        agent = session.get("agent") if isinstance(session, dict) else None
+    binding = (
+        {"sid": sid, "session": session, "agent": agent}
+        if isinstance(session, dict) and agent is not None
+        else None
+    )
+
+    def _call(effect: Callable[[], Any], default=None):
+        if binding is None:
+            return effect()
+        value: list[Any] = []
+        if _run_bound_agent_effect(binding, lambda: value.append(effect())):
+            return value[0] if value else default
+        return default
+
+    set_sudo_password_callback(
+        lambda: _call(lambda: _block("sudo.request", sid, {}, timeout=120))
+    )
     set_project_workspace_callback(_apply_project_workspace)
 
-    def secret_cb(env_var, prompt, metadata=None):
+    def _new_secret_cb(env_var, prompt, metadata=None):
         pl = {"prompt": prompt, "env_var": env_var}
         if metadata:
             pl["metadata"] = metadata
-        val = _block("secret.request", sid, pl)
+        val = _call(lambda: _block("secret.request", sid, pl))
         if not val:
             return {
                 "success": True,
@@ -5503,7 +5952,18 @@ def _wire_callbacks(sid: str):
             "message": "ok",
         }
 
-    set_secret_capture_callback(secret_cb)
+    # Do not register this in tools.skills_tool's process-global fallback:
+    # concurrent gateway turns would overwrite one another's prompt route.
+    # The turn installs this exact callback in its ContextVar and restores its
+    # prior token on exit. Store it on the record so re-wiring in the turn
+    # thread reuses the callback bound during eager/deferred initialization.
+    if isinstance(session, dict):
+        secret_cb = session.get("_secret_capture_callback")
+        if not callable(secret_cb):
+            secret_cb = _new_secret_cb
+            session["_secret_capture_callback"] = secret_cb
+        return secret_cb
+    return _new_secret_cb
 
 
 def _render_personality_prompt(value) -> str:
@@ -5839,28 +6299,118 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            _callback_session=session,
         )
     finally:
         _clear_session_context(tokens)
+    binding = {"sid": sid, "session": session, "agent": new_agent}
+
+    def _close_new_agent() -> None:
+        try:
+            if hasattr(new_agent, "close"):
+                new_agent.close()
+        except Exception:
+            pass
+
+    def _reset_effect() -> dict:
+        session["config_model_seen"] = _config_model_target()
+        session["attached_images"] = []
+        session["edit_snapshots"] = {}
+        session["image_counter"] = 0
+        session["running"] = False
+        session["show_reasoning"] = _load_show_reasoning()
+        session["tool_progress_mode"] = _load_tool_progress_mode()
+        session["tool_started_at"] = {}
+        with session["history_lock"]:
+            session["history"] = []
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        info = _session_info(new_agent, session)
+        _emit("session.info", sid, info)
+        _restart_slash_worker(sid, session)
+        return info
+
+    with _sessions_lock:
+        live = _sessions.get(sid)
+        previous_agent = session.get("agent")
+        # A real AIAgent always carries the constructor-time identity holder.
+        # If its original record disappeared while /new was building, do not
+        # replace a new SID owner or publish any of this reset's state. The
+        # no-holder path preserves direct unit-test/fake-agent compatibility.
+        requires_live_binding = isinstance(
+            getattr(new_agent, "_tui_callback_identity", None), dict
+        )
+        if live is not session and requires_live_binding:
+            publish_lock = None
+        elif live is session:
+            # Fetch only. Never wait for this lock while holding the registry
+            # lock: old-agent callbacks acquire it before their short registry
+            # identity check, and the reaper follows that same ordering.
+            publish_lock = session.setdefault(
+                "_agent_build_publish_lock", threading.RLock()
+            )
+        else:
+            publish_lock = None
+
+    if live is not session and requires_live_binding:
+        _close_new_agent()
+        return {}
+
+    if live is session:
+        # Agent replacement, callback binding, reset state, UI publication,
+        # and worker restart form one publication transaction. An old callback
+        # that has already passed identity validation finishes before the swap;
+        # a callback arriving after the swap sees ``session["agent"] is not
+        # old_agent`` and fails closed.
+        with publish_lock:
+            with _sessions_lock:
+                attached = _sessions.get(sid) is session
+                if attached:
+                    previous_agent = session.get("agent")
+                    session["agent"] = new_agent
+            if not attached:
+                _close_new_agent()
+                return {}
+
+            if requires_live_binding and not _bind_agent_callback_identity(
+                new_agent, sid, session
+            ):
+                # The record/agent pair changed while binding. Roll back only
+                # if this exact record still owns the SID, then close the
+                # orphaned replacement.
+                with _sessions_lock:
+                    if _sessions.get(sid) is session and session.get("agent") is new_agent:
+                        session["agent"] = previous_agent
+                _close_new_agent()
+                return {}
+
+            with _sessions_lock:
+                attached = (
+                    _sessions.get(sid) is session
+                    and session.get("agent") is new_agent
+                )
+            if not attached:
+                _close_new_agent()
+                return {}
+            result = _reset_effect()
+            with _sessions_lock:
+                attached = (
+                    _sessions.get(sid) is session
+                    and session.get("agent") is new_agent
+                )
+            if not attached:
+                _close_new_agent()
+                return {}
+            return result
+
+    # Compatibility for direct fake-agent unit callers that never register a
+    # session. Production ``/new`` always takes the live branch above.
     session["agent"] = new_agent
-    session["config_model_seen"] = _config_model_target()
-    session["attached_images"] = []
-    session["edit_snapshots"] = {}
-    session["image_counter"] = 0
-    session["running"] = False
-    session["show_reasoning"] = _load_show_reasoning()
-    session["tool_progress_mode"] = _load_tool_progress_mode()
-    session["tool_started_at"] = {}
-    with session["history_lock"]:
-        session["history"] = []
-        session["history_version"] = int(session.get("history_version", 0)) + 1
-    info = _session_info(new_agent, session)
-    _emit("session.info", sid, info)
-    _restart_slash_worker(sid, session)
-    return info
+    return _reset_effect()
 
 
-def _schedule_mcp_late_refresh(sid: str, agent) -> None:
+def _schedule_mcp_late_refresh(
+    sid: str, agent, session: dict | None = None
+) -> None:
     """Refresh a session's tool snapshot when MCP discovery lands late.
 
     The agent snapshots ``agent.tools`` once at build time and never re-reads
@@ -5892,16 +6442,40 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
         return
     if not mcp_discovery_in_flight():
         return
+    with _sessions_lock:
+        current = _sessions.get(sid)
+        if session is None:
+            # Backwards-compatible for direct/internal callers: capture the
+            # exact live record at schedule time, never look it up again by id
+            # as publication authority.
+            session = current
+        if current is not session or session.get("agent") is not agent:
+            return
+        # Share the same per-record lock as deferred build publication and
+        # _pop_session_by_id.  Installing it under the registry lock closes
+        # the no-lock observation window for a concurrent reaper.
+        publish_lock = session.setdefault(
+            "_agent_build_publish_lock", threading.RLock()
+        )
+
+    def _still_current() -> bool:
+        with _sessions_lock:
+            return (
+                _sessions.get(sid) is session
+                and session.get("agent") is agent
+            )
 
     def _wait_then_refresh() -> None:
         # Bounded but generous — a server still not connected after this is
         # genuinely slow/dead; the user can /reload-mcp once it recovers.
         if not join_mcp_discovery(timeout=30.0):
             return
-        with _sessions_lock:
-            session = _sessions.get(sid)
-            # Session may have been closed/reset while we waited.
-            if session is None or session.get("agent") is not agent:
+        # Refresh, info derivation, and publication are one session-scoped
+        # transaction. A reap/reuse waits on this lock, but unrelated sessions
+        # remain independent; the global registry lock is used only for short
+        # identity checks and is never held across refresh or transport I/O.
+        with publish_lock:
+            if not _still_current():
                 return
             # Cache safety: never rebuild the tool list once the conversation
             # has started — that would invalidate the cached prompt prefix.
@@ -5924,9 +6498,15 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             # No new tools landed (discovery added nothing) → don't churn the client.
             if not added:
                 return
+            # A defensive second identity check also covers callers that
+            # replaced the registry entry without going through the normal
+            # _pop_session_by_id lifecycle funnel while refresh was running.
+            if not _still_current():
+                return
             info = _session_info(agent, session)
-        # Emit outside the lock — write_json must not block under _sessions_lock.
-        _emit("session.info", sid, info)
+            if not _still_current():
+                return
+            _emit("session.info", sid, info)
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
@@ -6006,6 +6586,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    _callback_session: dict | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6134,7 +6715,20 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    callback_identity = _new_agent_callback_binding(sid, _callback_session)
+    agent_callbacks = _agent_cbs(sid)
+    bound_callbacks = _bound_agent_cbs(sid, callback_identity)
+    # The base factory owns feature gating for interim text; retain that
+    # contract while replacing every installed live callback with its
+    # identity-bound equivalent.
+    if "interim_assistant_callback" not in agent_callbacks:
+        bound_callbacks.pop("interim_assistant_callback", None)
+    agent_callbacks.update(bound_callbacks)
+    # Replace the public/direct-call notice callbacks with the identity-bound
+    # variants used by live AIAgents. Keep the base _agent_cbs(sid) call shape
+    # stable for downstream drivers and test seams that wrap that factory.
+    agent_callbacks.update(_agent_notice_cbs(sid, callback_identity))
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6179,8 +6773,11 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
-        **_agent_cbs(sid),
+        **agent_callbacks,
     )
+    callback_identity["agent"] = agent
+    agent._tui_callback_identity = callback_identity
+    return agent
 
 
 def _init_session(
@@ -6196,7 +6793,7 @@ def _init_session(
 ):
     now = time.time()
     with _sessions_lock:
-        _sessions[sid] = {
+        session_record = {
             "agent": agent,
             "session_key": key,
             "history": history,
@@ -6227,7 +6824,21 @@ def _init_session(
             # Pin async event emissions to whichever transport created the
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
+            # Installed with the record so eager initialization has the same
+            # reap/publication linearization as deferred construction.
+            "_agent_build_publish_lock": threading.RLock(),
         }
+        _sessions[sid] = session_record
+    binding = {"sid": sid, "session": session_record, "agent": agent}
+    requires_live_binding = isinstance(
+        getattr(agent, "_tui_callback_identity", None), dict
+    )
+    if not _bind_agent_callback_identity(agent, sid, session_record) and requires_live_binding:
+        return
+
+    def _run_init_effect(effect: Callable[[], Any]) -> bool:
+        return _run_bound_agent_effect(binding, effect)
+
     _init_owns_db = False
     if session_db is not None:
         db = session_db
@@ -6245,16 +6856,21 @@ def _init_session(
         if db is not None:
             row = db.get_session(key) if hasattr(db, "get_session") else None
             if row and row.get("cwd"):
-                with _sessions_lock:
-                    if sid in _sessions:
-                        _sessions[sid]["cwd"] = row["cwd"]
+                if not _run_init_effect(
+                    lambda: session_record.__setitem__("cwd", row["cwd"])
+                ):
+                    return
             else:
                 try:
-                    _cwd = _sessions[sid]["cwd"]
-                    if hasattr(db, "update_session_cwd"):
-                        db.update_session_cwd(key, _cwd)
-                    # git branch/root probes run off the hot path (see _set_session_cwd).
-                    _persist_session_git_meta(_sessions[sid], _cwd)
+                    def _persist_cwd() -> None:
+                        _cwd = session_record["cwd"]
+                        if hasattr(db, "update_session_cwd"):
+                            db.update_session_cwd(key, _cwd)
+                        # git branch/root probes run off the hot path (see _set_session_cwd).
+                        _persist_session_git_meta(session_record, _cwd)
+
+                    if not _run_init_effect(_persist_cwd):
+                        return
                 except Exception:
                     logger.debug(
                         "failed to persist resumed session cwd", exc_info=True
@@ -6265,7 +6881,8 @@ def _init_session(
                 db.close()
             except Exception:
                 pass
-    _register_session_cwd(_sessions[sid])
+    if not _run_init_effect(lambda: _register_session_cwd(session_record)):
+        return
     # No eager slash-worker pre-warm — the session dict already carries
     # slash_worker=None and slash.exec builds one on demand. See the
     # deferred-build path in _start_agent_build for the full rationale
@@ -6273,8 +6890,18 @@ def _init_session(
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
-        load_permanent_allowlist()
+        if not _run_init_effect(
+            lambda: (
+                register_gateway_notify(
+                    key,
+                    lambda data: _run_bound_agent_effect(
+                        binding, lambda: _emit_approval_request(sid, data)
+                    ),
+                ),
+                load_permanent_allowlist(),
+            )
+        ):
+            return
     except Exception:
         pass
     # Surface the self-improvement background review's "💾 …" summary as a
@@ -6283,8 +6910,8 @@ def _init_session(
     # prompt_toolkit; the TUI has no equivalent print surface, so without
     # this callback the review would write the skill/memory change silently.
     try:
-        agent.background_review_callback = lambda message, _sid=sid: _emit(
-            "review.summary", _sid, {"text": str(message)}
+        agent.background_review_callback = lambda message: _emit_bound_agent_event(
+            binding, "review.summary", {"text": str(message)}
         )
         # Honor display.memory_notifications (off | on | verbose) like the
         # messaging gateway and CLI do — otherwise the review always behaved as
@@ -6294,13 +6921,29 @@ def _init_session(
         # Bare AIAgents that don't expose the attribute (unlikely, but keep
         # session startup resilient).
         pass
-    _wire_callbacks(sid)
-    with _sessions_lock:
-        if sid in _sessions:
-            _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
-    _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
-    _schedule_mcp_late_refresh(sid, agent)
+    if not _run_init_effect(lambda: _wire_callbacks(sid)):
+        return
+
+    def _start_and_attach_poller() -> None:
+        session_record["_notif_stop"] = _start_notification_poller(sid, session_record)
+
+    if not _run_init_effect(_start_and_attach_poller):
+        # The poller is only started while the publication lock is held, so a
+        # reaper cannot win between start and attach.
+        return
+    if not _run_init_effect(
+        lambda: _notify_session_boundary(
+            "on_session_reset", key, _session_source(session_record)
+        )
+    ):
+        return
+
+    def _publish_info() -> None:
+        _emit("session.info", sid, _session_info(agent, session_record))
+
+    if not _run_init_effect(_publish_info):
+        return
+    _run_init_effect(lambda: _schedule_mcp_late_refresh(sid, agent, session_record))
 
 
 def _new_session_key() -> str:
@@ -8418,6 +9061,91 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _notification_event_reserved_elsewhere(sid: str, session: dict, evt: dict) -> bool:
+    """Whether a requeued event is reserved for a different durable session.
+
+    Queue objects are in-process, so tag a requeued event with the durable
+    owner key that was live when it was set aside.  This prevents a short SID
+    reuse from adopting an old ownerless event merely because it reached the
+    replacement poller first; a real resume with the same durable key remains
+    eligible to deliver it.
+    """
+    reserved_key = str(evt.get("_tui_requeue_session_key") or "")
+    if reserved_key:
+        current_keys = {
+            str(session.get("session_key") or ""),
+            _session_lookup_key(session, fallback=sid),
+        }
+        if reserved_key in current_keys:
+            return False
+        # The durable owner may have compressed while it was absent.  A
+        # literal parent-key reservation must therefore follow the same
+        # lineage resolution as normal ownership checks.  If that proof is
+        # unavailable, leave the reservation in place (fail closed).
+        try:
+            db = _get_db()
+            resolved_key = (
+                db.resolve_resume_session_id(reserved_key)
+                if db is not None
+                else None
+            )
+        except Exception:
+            return True
+        return not resolved_key or str(resolved_key) not in current_keys
+
+    # Origin-only legacy events have no durable session key. Preserve their
+    # original UI route without inventing one from the unrelated poller that
+    # happened to observe the owner gap; that invented key would permanently
+    # strand the event when the real SID came back.
+    reserved_origin = str(evt.get("_tui_requeue_origin_sid") or "")
+    return bool(reserved_origin and reserved_origin != str(sid or ""))
+
+
+def _requeue_notification_event(sid: str, session: dict, evt: dict) -> None:
+    """Return a durable notification without allowing SID reuse to adopt it."""
+    key = str(evt.get("session_key") or "")
+    if key:
+        evt.setdefault("_tui_requeue_session_key", key)
+    else:
+        origin_sid = str(evt.get("origin_ui_session_id") or "")
+        if origin_sid:
+            evt.setdefault("_tui_requeue_origin_sid", origin_sid)
+    from tools.process_registry import process_registry
+
+    process_registry.completion_queue.put(evt)
+
+
+def _release_or_requeue_notification_event(
+    sid: str, session: dict, evt: dict, claim: Any
+) -> bool:
+    """Release a failed claim and requeue only while delivery is still live.
+
+    A lease may have rolled from claimant A to B while A's turn was running.
+    If B has already delivered or dropped the durable row, A's release CAS
+    correctly returns false.  Requeueing A's stale in-memory event in that
+    state creates an immortal queue item, so terminal durable state wins.
+    """
+    from tools.async_delegation import (
+        DELIVERY_TERMINAL_CONSUMED,
+        inspect_event_delivery_state,
+        release_event_delivery,
+    )
+
+    try:
+        release_event_delivery(evt, claim)
+    except Exception:
+        logger.warning("notification delivery release failed", exc_info=True)
+    try:
+        if inspect_event_delivery_state(evt) == DELIVERY_TERMINAL_CONSUMED:
+            return False
+    except Exception:
+        # A state-store read failure is not evidence of terminal consumption.
+        # Preserve the in-memory event so a later pass can retry safely.
+        logger.warning("notification delivery state inspection failed", exc_info=True)
+    _requeue_notification_event(sid, session, evt)
+    return True
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -8453,6 +9181,142 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
         # and the second completion's status update is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
     return (evt_sid, evt_type)
+
+
+def _notification_session_binding(sid: str, session: dict) -> dict[str, Any] | None:
+    """Capture the exact live record/agent for one poller operation.
+
+    Poller threads outlive UI records and short SIDs can be reused.  Never use
+    the SID alone as authority for queue claims, ``running`` mutations, frame
+    writes, or injected prompt turns.
+    """
+    with _sessions_lock:
+        if _sessions.get(sid) is not session:
+            return None
+        agent = session.get("agent")
+        if agent is None:
+            return None
+        session.setdefault("_agent_build_publish_lock", threading.RLock())
+        return {
+            "sid": sid,
+            "session": session,
+            "agent": agent,
+            # Capture once.  A future SID lookup is exactly the replacement
+            # race this binding is meant to prevent.
+            "transport": session.get("transport"),
+        }
+
+
+def _poller_set_running(binding: dict[str, Any], running: bool) -> bool:
+    """Set a poller's running flag only while its agent remains current."""
+    return _run_bound_agent_effect(
+        binding,
+        lambda: _set_notification_running(binding["session"], running),
+    )
+
+
+def _clear_notification_reservation(binding: dict[str, Any]) -> None:
+    """Clear a reservation without ever resolving a replacement by SID.
+
+    A binding that lost registry identity cannot use ``_poller_set_running``;
+    it can still safely clear the exact old record it captured.  That record is
+    not looked up again, so a same-SID replacement is never mutated.
+    """
+    if _poller_set_running(binding, False):
+        return
+    session = binding.get("session")
+    if isinstance(session, dict):
+        _set_notification_running(session, False)
+
+
+def _set_notification_running(session: dict, running: bool) -> None:
+    with session["history_lock"]:
+        session["running"] = running
+
+
+def _start_bound_notification_turn(
+    rid: str,
+    binding: dict[str, Any],
+    evt: dict,
+    claim: Any,
+    text: str,
+    *,
+    display_kind: str | None = None,
+    display_metadata: dict | None = None,
+) -> Callable[[bool], None]:
+    """Start a notification turn and settle its registry claim at turn end.
+
+    ``_run_prompt_submit`` is asynchronous.  Treating thread launch as a
+    delivered event loses notifications when the worker fails or its SID is
+    replaced before terminal frames are emitted.  Production turns receive a
+    lifetime identity binding and report their terminal outcome through this
+    callback; lightweight legacy test seams without the callback keyword keep
+    their synchronous completion behaviour.
+    """
+    from tools.async_delegation import complete_event_delivery
+
+    settled = False
+    settle_lock = threading.Lock()
+
+    def _settle(succeeded: bool) -> None:
+        nonlocal settled
+        with settle_lock:
+            if settled:
+                return
+            settled = True
+        completed = False
+        if succeeded:
+            try:
+                completion_acks: list[bool] = []
+                completed = _run_bound_agent_effect(
+                    binding,
+                    lambda: completion_acks.append(
+                        complete_event_delivery(evt, claim)
+                    ),
+                )
+                # The binding check only proves this exact session/agent was
+                # live around the effect.  Durable async-delegation delivery
+                # additionally requires the DB compare-and-set acknowledgement
+                # to succeed; otherwise release and requeue below.
+                completed = completed and bool(completion_acks and completion_acks[0])
+            except Exception:
+                logger.warning("notification delivery completion failed", exc_info=True)
+        if completed:
+            return
+        _release_or_requeue_notification_event(
+            str(binding.get("sid") or ""), binding["session"], evt, claim
+        )
+
+    kwargs: dict[str, Any] = {}
+    if display_kind is not None:
+        kwargs["display_kind"] = display_kind
+    if display_metadata is not None:
+        kwargs["display_metadata"] = display_metadata
+    try:
+        parameters = inspect.signature(_run_prompt_submit).parameters.values()
+        supports_completion = any(
+            parameter.name == "notification_complete"
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_completion = False
+    if supports_completion:
+        _run_prompt_submit(
+            rid,
+            str(binding["sid"]),
+            binding["session"],
+            text,
+            notification_binding=binding,
+            notification_complete=_settle,
+            **kwargs,
+        )
+        return _settle
+
+    # Compatibility only for test doubles that model a fully synchronous
+    # submit.  The real implementation always takes the lifetime-safe branch.
+    _run_prompt_submit(rid, str(binding["sid"]), binding["session"], text, **kwargs)
+    _settle(True)
+    return _settle
 
 
 # Mirror gateway/kanban_watchers.py TERMINAL_KINDS: claim silent kinds too so
@@ -8607,6 +9471,153 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _dispatch_poller_notification(
+    sid: str,
+    session: dict,
+    evt: dict,
+    text: str,
+    emitted: set,
+) -> str:
+    """Deliver one queue event, or requeue it if this poller lost ownership.
+
+    Each externally visible/ durable action is independently gated by the
+    exact session record and agent.  This deliberately lets a reset happen
+    between actions, but never lets an old poller claim, mutate, emit, or
+    inject into a same-SID replacement.
+    """
+    from tools.async_delegation import (
+        DELIVERY_BUSY_PENDING,
+        DELIVERY_TERMINAL_CONSUMED,
+        claim_event_delivery_state,
+        inspect_event_delivery_state,
+    )
+
+    binding = _notification_session_binding(sid, session)
+    if binding is None:
+        _requeue_notification_event(sid, session, evt)
+        return "requeued"
+    if evt.get("type") == "async_delegation":
+        try:
+            if (
+                inspect_event_delivery_state(evt)
+                == DELIVERY_TERMINAL_CONSUMED
+            ):
+                return "consumed"
+        except Exception:
+            logger.warning(
+                "notification delivery preflight inspection failed",
+                exc_info=True,
+            )
+            _requeue_notification_event(sid, session, evt)
+            return "requeued"
+
+    dedup_key = _notification_event_dedup_key(evt)
+    if dedup_key not in emitted:
+        if not _emit_bound_agent_event(
+            binding, "status.update", {"kind": "process", "text": text}
+        ):
+            _requeue_notification_event(sid, session, evt)
+            return "requeued"
+        emitted.add(dedup_key)
+
+    reserved: list[bool] = []
+
+    def _reserve() -> None:
+        with session["history_lock"]:
+            if session.get("running"):
+                reserved.append(False)
+            else:
+                session["running"] = True
+                reserved.append(True)
+
+    if not _run_bound_agent_effect(binding, _reserve):
+        _clear_notification_reservation(binding)
+        _requeue_notification_event(sid, session, evt)
+        return "requeued"
+    if not reserved or not reserved[0]:
+        _requeue_notification_event(sid, session, evt)
+        return "requeued"
+
+    claims: list[Any] = []
+    try:
+        claimed = _run_bound_agent_effect(
+            binding,
+            lambda: claims.append(
+                claim_event_delivery_state(evt, "tui-poller")
+            ),
+        )
+    except Exception:
+        # A claim failure is not proof that another worker owns this event.
+        # Keep the durable event available for a later retry and release this
+        # session's reservation so the poller cannot wedge itself busy.
+        logger.warning("notification delivery claim failed", exc_info=True)
+        _clear_notification_reservation(binding)
+        _requeue_notification_event(sid, session, evt)
+        return "requeued"
+    if not claimed:
+        if claims and claims[0].claim_id:
+            _release_or_requeue_notification_event(
+                sid, session, evt, claims[0].claim_id
+            )
+        else:
+            _requeue_notification_event(sid, session, evt)
+        _clear_notification_reservation(binding)
+        return "requeued"
+    claim_result = claims[0] if claims else None
+    if claim_result is None or claim_result.state == DELIVERY_BUSY_PENDING:
+        _clear_notification_reservation(binding)
+        _requeue_notification_event(sid, session, evt)
+        return "requeued"
+    if claim_result.state == DELIVERY_TERMINAL_CONSUMED:
+        _clear_notification_reservation(binding)
+        return "consumed"
+    claim = claim_result.claim_id
+
+    rid = f"__notif__{int(time.time() * 1000)}"
+
+    settles: list[Callable[[bool], None]] = []
+
+    def _dispatch() -> None:
+        _emit("message.start", sid)
+        if evt.get("type") == "async_delegation":
+            settles.append(_start_bound_notification_turn(
+                rid,
+                binding,
+                evt,
+                claim,
+                text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(evt),
+            ))
+        else:
+            settles.append(_start_bound_notification_turn(rid, binding, evt, claim, text))
+
+    try:
+        if not _run_bound_agent_effect(binding, _dispatch):
+            if settles:
+                settles[0](False)
+            else:
+                _release_or_requeue_notification_event(
+                    sid, session, evt, claim
+                )
+                _clear_notification_reservation(binding)
+            _clear_notification_reservation(binding)
+            return "requeued"
+        return "handled"
+    except Exception as exc:
+        if settles:
+            settles[0](False)
+        else:
+            _release_or_requeue_notification_event(sid, session, evt, claim)
+        _clear_notification_reservation(binding)
+        print(
+            f"[tui_gateway] notification poller dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return "requeued"
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -8617,8 +9628,8 @@ def _notification_poller_loop(
     agent turn via _run_prompt_submit if the session is idle.
 
     The completion_queue is process-global. In multi-session Desktop each
-    poller requeues events owned by another live session and drops addressed
-    events whose owner is gone; ownerless legacy notifications remain global.
+    poller requeues events owned by another live session and preserves addressed
+    events while their owner is absent; ownerless legacy notifications remain global.
 
     Also polls ``kanban_notify_subs`` every ``_KANBAN_POLL_SECONDS`` for this
     session's TUI kanban subscriptions and delivers terminal task events the
@@ -8633,8 +9644,16 @@ def _notification_poller_loop(
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
+            _kanban_binding = _notification_session_binding(sid, session)
+            _kanban_holder: list[list] = []
             try:
-                _kanban_texts = _collect_kanban_notifications(session)
+                if _kanban_binding is None or not _run_bound_agent_effect(
+                    _kanban_binding,
+                    lambda: _kanban_holder.append(_collect_kanban_notifications(session)),
+                ):
+                    _kanban_texts = []
+                else:
+                    _kanban_texts = _kanban_holder[0] if _kanban_holder else []
             except Exception as _kb_exc:
                 print(
                     f"[tui_gateway] kanban notification poll failed: "
@@ -8644,34 +9663,56 @@ def _notification_poller_loop(
                 _kanban_texts = []
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
-                    _emit("status.update", sid, {"kind": "process", "text": _kb_text})
+                    if _kanban_binding is not None:
+                        _emit_bound_agent_event(
+                            _kanban_binding,
+                            "status.update",
+                            {"kind": "process", "text": _kb_text},
+                        )
                 # Events are cursor-claimed (never re-queued), so buffer them
                 # until the session is idle instead of dropping the agent turn.
-                session.setdefault("_kanban_pending", []).extend(_kanban_texts)
-            _pending = session.get("_kanban_pending") or []
+                if _kanban_binding is not None:
+                    _run_bound_agent_effect(
+                        _kanban_binding,
+                        lambda: session.setdefault("_kanban_pending", []).extend(_kanban_texts),
+                    )
+            _pending = (session.get("_kanban_pending") or []) if _kanban_binding else []
             if _pending:
                 _batch: list = []
-                with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
-                        _batch = list(_pending)
-                        session["_kanban_pending"] = []
+                if _kanban_binding is not None:
+                    def _reserve_kanban() -> None:
+                        with session["history_lock"]:
+                            if not session.get("running"):
+                                session["running"] = True
+                                _batch.extend(_pending)
+                                session["_kanban_pending"] = []
+
+                    _run_bound_agent_effect(_kanban_binding, _reserve_kanban)
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
-                        _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_bound_agent_effect(
+                            _kanban_binding,
+                            lambda: (
+                                _emit("message.start", sid),
+                                _run_prompt_submit(rid, sid, session, "\n".join(_batch)),
+                            ),
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
-                        with session["history_lock"]:
-                            session["running"] = False
+                        _poller_set_running(_kanban_binding, False)
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
+            continue
+
+        if _notification_event_reserved_elsewhere(sid, session, evt):
+            process_registry.completion_queue.put(evt)
+            time.sleep(0.1)
             continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
@@ -8687,8 +9728,9 @@ def _notification_poller_loop(
         # What reaches here is not owned by another LIVE session. Addressed
         # events still require positive proof before injection: exact UI origin,
         # direct durable key, or compression lineage. If none proves ownership,
-        # the event is orphaned and must not be adopted by this chat. Truly
-        # ownerless ordinary notifications retain legacy global delivery.
+        # the event is awaiting its durable owner and must not be adopted by
+        # this chat. Requeue rather than discard: the owner may be temporarily
+        # absent while a resume/reconnect recreates its session record.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
             log = (
@@ -8697,13 +9739,15 @@ def _notification_poller_loop(
                 else logger.debug
             )
             log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
+                "Requeueing unowned %s notification (origin=%r key=%r) while "
+                "awaiting its owner instead of delivering to session %s",
                 evt.get("type", "completion"),
                 str(evt.get("origin_ui_session_id") or ""),
                 str(evt.get("session_key") or ""),
                 sid,
             )
+            _requeue_notification_event(sid, session, evt)
+            time.sleep(0.1)
             continue
 
         _evt_sid = evt.get("session_id", "")
@@ -8714,88 +9758,41 @@ def _notification_poller_loop(
         if not text:
             continue
 
-        # Only emit the same notification identity to TUI once — re-queued
-        # completions get re-emitted every 0.5s otherwise when session is busy,
-        # while distinct watch_match events from the same process must remain
-        # visible independently.
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
-        if _requeued:
+        if _dispatch_poller_notification(sid, session, evt, text, _emitted) == "requeued":
             # Back off before re-polling: the re-queued event keeps the queue
-            # non-empty, so without a sleep this loop spins at full speed
-            # (100% CPU, GIL churn) for as long as the session stays busy.
+            # non-empty, so without a sleep this loop spins at full speed.
             time.sleep(0.25)
-            continue
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
-    # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    # Addressed events whose owner is absent are preserved for a later resume,
+    # matching the main loop's fail-closed ownership rule.
     deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
             break
+        if _notification_event_reserved_elsewhere(sid, session, evt):
+            deferred.append(evt)
+            continue
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
-        # Same positive-proof rule as the live loop. Preserve the existing
-        # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
+        # Same positive-proof rule as the live loop. Every addressed durable
+        # event is deferred for a later resume; a replacement SID must not
+        # silently consume it.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
-            if evt.get("type") == "async_delegation":
-                deferred.append(evt)
+            key = str(evt.get("session_key") or "")
+            if key:
+                evt.setdefault("_tui_requeue_session_key", key)
             else:
-                logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
-                    evt.get("type", "completion"),
-                    str(evt.get("origin_ui_session_id") or ""),
-                    str(evt.get("session_key") or ""),
-                )
+                origin_sid = str(evt.get("origin_ui_session_id") or "")
+                if origin_sid:
+                    evt.setdefault("_tui_requeue_origin_sid", origin_sid)
+            deferred.append(evt)
             continue
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
@@ -8804,47 +9801,10 @@ def _notification_poller_loop(
         if not text:
             continue
 
-        _dedup_key = _notification_event_dedup_key(evt)
-        if _dedup_key not in _emitted:
-            _emit("status.update", sid, {"kind": "process", "text": text})
-            _emitted.add(_dedup_key)
-
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                break
-            session["running"] = True
-
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                )
-            else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        if _dispatch_poller_notification(sid, session, evt, text, _emitted) == "requeued":
+            # Preserve shutdown-drain ordering: leave the shared queue for the
+            # next live owner instead of spinning this stopped poller.
+            break
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -8962,6 +9922,8 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    notification_binding: dict[str, Any] | None = None,
+    notification_complete: Callable[[bool], None] | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -8982,10 +9944,16 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        # This worker outlives the poller's publication lock.  Its output must
+        # remain bound to the exact record and transport that launched it,
+        # rather than resolving ``sid`` again after a reconnect/reset.
+        if notification_binding is not None:
+            _notification_turn_binding.set(notification_binding)
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         secret_token = None
+        skill_secret_capture_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
@@ -8994,6 +9962,11 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        turn_failed = False
+        # Notification claims settle only after a genuinely successful turn.
+        # A returned error/interruption and an early preprocessing refusal are
+        # terminal outcomes for the UI, but not successful delivery.
+        turn_succeeded = False
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -9025,9 +9998,16 @@ def _run_prompt_submit(
             # _callback_tls), so wiring it on the build thread doesn't reach this
             # turn thread — terminal sudo prompts would fall through to /dev/tty
             # and hang the headless gateway. Re-wire here so the prompt routes to
-            # the sudo.request overlay. (secret capture is a module global, so
-            # re-running is a harmless no-op.)
-            _wire_callbacks(sid)
+            # the sudo.request overlay. Secret capture is deliberately
+            # ContextVar-scoped: concurrent desktop sessions must never route a
+            # skill setup prompt through another session's callback.
+            _secret_capture_cb = _wire_callbacks(sid)
+            if _secret_capture_cb is not None:
+                from tools.skills_tool import set_secret_capture_callback_context
+
+                skill_secret_capture_token = set_secret_capture_callback_context(
+                    _secret_capture_cb
+                )
             # Skip the config-model sync while a /model --once override is
             # active: the once-model is intentionally not pinned as a session
             # model_override (it must not persist), so without this guard the
@@ -9424,6 +10404,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            turn_succeeded = status == "complete"
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -9568,6 +10549,7 @@ def _run_prompt_submit(
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
         except Exception as e:
+            turn_failed = True
             import traceback
 
             trace = traceback.format_exc()
@@ -9627,6 +10609,13 @@ def _run_prompt_submit(
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
                 reset_secret_scope(secret_token)
+            if skill_secret_capture_token is not None:
+                try:
+                    from tools.skills_tool import reset_secret_capture_callback_context
+
+                    reset_secret_capture_callback_context(skill_secret_capture_token)
+                except Exception:
+                    pass
             _clear_session_context(session_tokens)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
@@ -9640,7 +10629,17 @@ def _run_prompt_submit(
             # frame paths retire the marker as they emit).
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
-            _emit_settled_session_info(sid, session, agent)
+            try:
+                _emit_settled_session_info(sid, session, agent)
+            finally:
+                if notification_complete is not None:
+                    try:
+                        notification_complete(turn_succeeded and not turn_failed)
+                    except Exception:
+                        logger.warning(
+                            "notification turn completion callback failed",
+                            exc_info=True,
+                        )
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -9683,6 +10682,13 @@ def _run_prompt_submit(
                 with session["history_lock"]:
                     session["running"] = False
 
+        # A notification turn that failed has just released and requeued its
+        # own durable event.  Do not let this same worker's safety-net drain
+        # claim it again synchronously: repeated returned errors would recurse
+        # forever instead of yielding the retry to the live poller.
+        if notification_binding is not None:
+            return
+
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
         # the safety net for events that arrived mid-turn.
@@ -9705,31 +10711,113 @@ def _run_prompt_submit(
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
-                with session["history_lock"]:
-                    if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
-                            process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    DELIVERY_BUSY_PENDING,
+                    DELIVERY_TERMINAL_CONSUMED,
+                    claim_event_delivery_state,
                 )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
+                _binding = _notification_session_binding(sid, session)
+                if _binding is None:
+                    # This ``session`` is the exact record retained by this
+                    # turn; clear it directly rather than looking up a
+                    # replacement sharing the same short SID.
+                    _set_notification_running(session, False)
+                    _requeue_notification_event(sid, session, _evt)
                     continue
+                _reserved: list[bool] = []
+
+                def _reserve_post_turn_notification() -> None:
+                    with session["history_lock"]:
+                        if session.get("running"):
+                            _reserved.append(False)
+                        else:
+                            session["running"] = True
+                            _reserved.append(True)
+
+                if not _run_bound_agent_effect(
+                    _binding, _reserve_post_turn_notification
+                ):
+                    _clear_notification_reservation(_binding)
+                    _requeue_notification_event(sid, session, _evt)
+                    continue
+                if not _reserved or not _reserved[0]:
+                    for pending_evt, _pending_synth in drained[index:]:
+                        process_registry.completion_queue.put(pending_evt)
+                    break
                 try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
+                    _claim = None
+                    _settles: list[Callable[[bool], None]] = []
+                    _claims: list[Any] = []
+                    claimed = _run_bound_agent_effect(
+                        _binding,
+                        lambda: _claims.append(
+                            claim_event_delivery_state(_evt, "tui-post-turn")
+                        ),
+                    )
+                    _claim_result = _claims[0] if _claims else None
+                    _claim = (
+                        _claim_result.claim_id
+                        if _claim_result is not None
+                        else None
+                    )
+                    if not claimed:
+                        # A failed/absent claim has not delivered the event.
+                        # Return it to the durable queue and undo only this
+                        # captured record's reservation; never fall back to a
+                        # same-SID replacement.
+                        if _claim is not None:
+                            _release_or_requeue_notification_event(
+                                sid, session, _evt, _claim
+                            )
+                        else:
+                            _requeue_notification_event(sid, session, _evt)
+                        _clear_notification_reservation(_binding)
+                        continue
+                    if (
+                        _claim_result is None
+                        or _claim_result.state == DELIVERY_BUSY_PENDING
+                    ):
+                        _clear_notification_reservation(_binding)
+                        _requeue_notification_event(sid, session, _evt)
+                        continue
+                    if _claim_result.state == DELIVERY_TERMINAL_CONSUMED:
+                        _clear_notification_reservation(_binding)
+                        continue
+                    def _dispatch_post_turn_notification() -> None:
+                        _emit("message.start", sid)
+                        _settles.append(
+                            _start_bound_notification_turn(
+                                rid, _binding, _evt, _claim, synth
+                            )
+                        )
+
+                    if not _run_bound_agent_effect(
+                        _binding, _dispatch_post_turn_notification
+                    ):
+                        if _settles:
+                            _settles[0](False)
+                        else:
+                            _release_or_requeue_notification_event(
+                                sid, session, _evt, _claim
+                            )
+                            _clear_notification_reservation(_binding)
+                        _clear_notification_reservation(_binding)
                 except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
+                    if _settles:
+                        _settles[0](False)
+                    else:
+                        if _claim is not None:
+                            _release_or_requeue_notification_event(
+                                sid, session, _evt, _claim
+                            )
+                        else:
+                            _requeue_notification_event(sid, session, _evt)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+                    _clear_notification_reservation(_binding)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -11836,7 +12924,10 @@ def _format_live_context_output(session: dict) -> str:
     if model:
         lines.append(f"Model: {model}")
     lines.append(f"Provider: {provider}")
-    context_used = int(usage.get("context_used") or usage.get("total") or 0)
+    # Session ``total`` is lifetime cumulative usage, not the current prompt
+    # window. Showing it here as context occupancy recreates the same impossible
+    # over-capacity gauge guarded against by _get_usage().
+    context_used = int(usage.get("context_used") or 0)
     context_max = int(usage.get("context_max") or 0)
     if context_used:
         if context_max:
@@ -11995,6 +13086,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
+    compression_reservation = None
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
@@ -12019,6 +13111,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 finalize_context_engine_compression_notification,
             )
 
+            compression_reservation = _reserve_manual_compression(session)
+            if compression_reservation is None:
+                return "session busy — /interrupt the current turn before /compress"
+
             with session["history_lock"]:
                 _before_messages = list(session.get("history", []))
             _before_count = len(_before_messages)
@@ -12042,7 +13138,12 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 from agent.manual_compression_feedback import (
                     describe_compression_lock_skip,
                 )
-                return describe_compression_lock_skip(e.holder)
+                try:
+                    return describe_compression_lock_skip(e.holder)
+                finally:
+                    _release_manual_compression(session, compression_reservation)
+                    compression_reservation = None
+                    _drain_queued_prompt("slash-compress", sid, session)
             _sync_session_key_after_compress(sid, session)
 
             with session["history_lock"]:
@@ -12071,6 +13172,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 agent,
                 committed=True,
             )
+            _release_manual_compression(session, compression_reservation)
+            compression_reservation = None
+            _drain_queued_prompt("slash-compress", sid, session)
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()
@@ -12095,6 +13199,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 agent,
                 committed=False,
             )
+            _release_manual_compression(session, compression_reservation)
+            compression_reservation = None
+            _drain_queued_prompt("slash-compress", sid, session)
         return f"live session sync failed: {e}"
     return ""
 
