@@ -55,7 +55,20 @@ def _validate_bundle_path(label: str, value: str, *, require_substantial: bool =
         ctx = ssl.create_default_context(cafile=str(path))
     except Exception as exc:
         raise _ssl_err(f"{label} CA bundle at {value} cannot be loaded: {exc}") from exc
-    if not ctx.get_ca_certs():
+    try:
+        loaded_certs = ctx.get_ca_certs()
+    except NotImplementedError:
+        # ``truststore`` replaces ``ssl.SSLContext`` on Windows and does not
+        # support enumerating the OS-backed certificate store. Reaching this
+        # point means the explicit CA file was already accepted by
+        # ``create_default_context``; treat enumeration as unavailable rather
+        # than misclassifying a healthy bundle as a startup failure.
+        logger.debug(
+            "%s CA bundle loaded, but the active SSL backend cannot enumerate certificates",
+            label,
+        )
+        return
+    if not loaded_certs:
         raise _ssl_err(f"{label} CA bundle at {value} did not load any certificates")
 
 
