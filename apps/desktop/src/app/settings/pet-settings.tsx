@@ -35,6 +35,7 @@ import {
   setPetEnabled,
   setPetScale
 } from '@/store/pet-gallery'
+import { $petOverlayActive, popInPet, popOutPet } from '@/store/pet-overlay'
 import { $gatewayState } from '@/store/session'
 
 import { ListRow, SectionHeading } from './primitives'
@@ -57,6 +58,7 @@ export function PetSettings() {
   const busySlug = useStore($petBusy)
   const petInfo = useStore($petInfo)
   const roam = useStore($petRoam)
+  const overlayActive = useStore($petOverlayActive)
   const [query, setQuery] = useState('')
   const [confirmDelete, setConfirmDelete] = useState<GalleryPet | null>(null)
   const [renameTarget, setRenameTarget] = useState<GalleryPet | null>(null)
@@ -294,6 +296,31 @@ export function PetSettings() {
             }
             description={copy.scaleDesc}
             title={copy.scaleTitle}
+          />
+        )}
+
+        {enabled && (
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={id => {
+                  if (id === 'desktop') {
+                    popOutPet()
+                  } else {
+                    popInPet()
+                  }
+
+                  triggerHaptic('crisp')
+                }}
+                options={[
+                  { id: 'window', label: copy.placementWindow },
+                  { id: 'desktop', label: copy.placementDesktop }
+                ]}
+                value={overlayActive ? 'desktop' : 'window'}
+              />
+            }
+            description={copy.placementDesc}
+            title={copy.placementTitle}
           />
         )}
 
