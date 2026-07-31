@@ -224,18 +224,18 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
 class TestDoctorMemoryProviderSection:
     """The ◆ Memory Provider section should respect memory.provider config."""
 
-    def _make_hermes_home(self, tmp_path, provider=""):
+    def _make_hermes_home(self, tmp_path, provider="", include_provider=False):
         """Create a minimal HERMES_HOME with config.yaml."""
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         import yaml
-        config = {"memory": {"provider": provider}} if provider else {"memory": {}}
+        config = {"memory": {"provider": provider}} if include_provider or provider else {"memory": {}}
         (home / "config.yaml").write_text(yaml.dump(config))
         return home
 
-    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider=""):
+    def _run_doctor_and_capture(self, monkeypatch, tmp_path, provider="", include_provider=False):
         """Run doctor and capture stdout."""
-        home = self._make_hermes_home(tmp_path, provider)
+        home = self._make_hermes_home(tmp_path, provider, include_provider)
         monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
         monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
         monkeypatch.setattr(doctor_mod, "_DHH", str(home))
@@ -271,11 +271,20 @@ class TestDoctorMemoryProviderSection:
         assert "Honcho API key" not in out
         assert "Mem0" not in out
 
-    def test_builtin_provider_shows_builtin_ok(self, monkeypatch, tmp_path):
-        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="builtin")
+    def test_builtin_provider_aliases_show_builtin_ok(self, monkeypatch, tmp_path):
+        for provider in ("default", "builtin", "none", " BuiltIn "):
+            out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider=provider)
+
+            assert "Built-in memory active" in out
+            assert "plugin not found" not in out
+
+    def test_null_provider_shows_builtin_ok(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(
+            monkeypatch, tmp_path, provider=None, include_provider=True
+        )
 
         assert "Built-in memory active" in out
-        assert "builtin plugin not found" not in out
+        assert "check failed" not in out
 
 
     def test_mem0_provider_not_installed_shows_fail(self, monkeypatch, tmp_path):

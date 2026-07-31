@@ -2613,11 +2613,11 @@ def run_doctor(args):
                 _raw_cfg = managed_scope.apply_managed_overlay(_raw_cfg)
             except Exception:
                 pass
-            _active_memory_provider = (_raw_cfg.get("memory") or {}).get("provider", "")
+            _active_memory_provider = str((_raw_cfg.get("memory") or {}).get("provider") or "").strip().lower()
     except Exception:
         pass
 
-    if _active_memory_provider in ("", "builtin"):
+    if _active_memory_provider in ("", "default", "builtin", "none"):
         check_ok("Built-in memory active", "(no external provider configured — this is fine)")
     elif _active_memory_provider == "honcho":
         try:
