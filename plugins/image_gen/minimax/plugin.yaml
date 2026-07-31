@@ -1,0 +1,6 @@
+name: minimax
+version: 1.0.0
+description: "MiniMax text-to-image backends for the global and China image_generation endpoints."
+author: Nous Research
+kind: backend
+requires_env: []
