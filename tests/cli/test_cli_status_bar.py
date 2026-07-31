@@ -319,3 +319,83 @@ class TestIdleSinceLastTurn:
         assert snapshot["idle_since"].startswith("✓ ")
 
 
+class TestShowCostStatusBar:
+    """Tests for the display.show_cost feature in the status bar."""
+
+    def test_show_cost_enabled_shows_cost_and_tokens(self):
+        """When show_cost is enabled, cost, tokens, and cache rate appear."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_000,
+            total_tokens=12_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+            cache_read_tokens=50_000,
+        )
+        cli_obj._show_cost = True
+        text = cli_obj._build_status_bar_text(width=120)
+        # Should show provider, cost label, tokens, and cache rate
+        assert "anthropic" in text  # provider from _attach_agent
+        assert "↓" in text  # input tokens arrow
+        assert "↑" in text  # output tokens arrow
+        assert "cache" in text  # cache rate
+        # Should NOT show the old "tok" suffix (replaced by ↓↑ arrows)
+        assert "tok" not in text.replace("↓", "").replace("↑", "")
+
+    def test_show_cost_disabled_hides_cost_and_tokens_default(self):
+        """When show_cost is not set (default False), cost/tokens should not appear."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_000,
+            total_tokens=12_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+        )
+        # _show_cost not set — defaults to False via getattr
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "claude-sonnet-4-20250514" in text
+        assert "↓" not in text
+        assert "↑" not in text
+        assert "cache" not in text
+
+    def test_show_cost_cache_rate_computed_correctly(self):
+        """Cache rate should be cache_read / (input + cache_read) * 100."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            input_tokens=10_000,
+            output_tokens=2_000,
+            cache_read_tokens=90_000,
+            cache_write_tokens=0,
+            prompt_tokens=100_000,
+            completion_tokens=2_000,
+            total_tokens=102_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+        )
+        cli_obj._show_cost = True
+        snapshot = cli_obj._get_status_bar_snapshot()
+        # 90_000 / (10_000 + 90_000) * 100 = 90.0%
+        assert snapshot["session_cache_rate"] == 90.0
+
+    def test_show_cost_no_cache_returns_zero_rate(self):
+        """When no cache reads, cache_rate should be 0.0."""
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_000,
+            completion_tokens=2_000,
+            total_tokens=12_000,
+            api_calls=5,
+            context_tokens=12_000,
+            context_length=200_000,
+        )
+        cli_obj._show_cost = True
+        snapshot = cli_obj._get_status_bar_snapshot()
+        # 0 / (10_000 + 0) * 100 = 0.0
+        assert snapshot["session_cache_rate"] == 0.0
+
+
