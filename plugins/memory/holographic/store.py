@@ -230,6 +230,27 @@ class MemoryStore:
 
             return fact_id
 
+    # FTS5 MATCH-syntax special characters that must be stripped or
+    # replaced with whitespace before a query reaches `facts_fts MATCH ?`.
+    # unicode61 tokenisation will split on most of these anyway, but the
+    # MATCH parser itself chokes on the raw input (e.g. "v2.5" → syntax
+    # error near '.', "api.foo" → syntax error near '.', "host:8080" →
+    # syntax error near ':'). Strip them up front; downstream FTS5
+    # tokenisation will then do the right thing.
+    _FTS5_SPECIAL_CHARS = re.compile(r'["\'\*:\.\(\)\-\+\^]')
+
+    @classmethod
+    def _sanitize_fts5_query(cls, query: str) -> str:
+        """Return a query string that is safe to pass to FTS5 MATCH.
+
+        Strips/replaces MATCH-syntax special characters with whitespace,
+        collapses runs of whitespace, and returns an empty result marker
+        if nothing usable remains.
+        """
+        sanitized = cls._FTS5_SPECIAL_CHARS.sub(" ", query)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        return sanitized
+
     def search_facts(
         self,
         query: str,
@@ -243,7 +264,7 @@ class MemoryStore:
         descending. Also increments retrieval_count for matched facts.
         """
         with self._lock:
-            query = query.strip()
+            query = self._sanitize_fts5_query(query.strip())
             if not query:
                 return []
 
