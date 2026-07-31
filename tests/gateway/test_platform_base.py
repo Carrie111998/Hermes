@@ -1034,6 +1034,50 @@ class TestMediaDeliveryDiagnosability:
         ])
         assert out == [(str(good.resolve()), False)]
 
+    def test_duplicate_paths_deliver_once(self, tmp_path, monkeypatch):
+        """The same file reaching the filter via two raw paths must be delivered
+        once, not twice.
+
+        An orchestrator plugin may inject an absolute path while the agent's
+        hand-written ``MEDIA:`` tag points at the same file. Both raw strings
+        normalize to the same resolved path; without a dedup guard the file
+        would be sent twice.
+        """
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 test")
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        out = BasePlatformAdapter.filter_media_delivery_paths([
+            (str(f), False),
+            (str(f.resolve()), False),
+        ])
+        assert out == [(str(f.resolve()), False)]
+
+    def test_distinct_paths_all_delivered(self, tmp_path, monkeypatch):
+        """Dedup must not collapse distinct files sharing a common prefix."""
+        a = tmp_path / "a.png"
+        b = tmp_path / "b.png"
+        a.write_bytes(b"\x89PNG")
+        b.write_bytes(b"\x89PNG")
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        out = BasePlatformAdapter.filter_media_delivery_paths([
+            (str(a), False),
+            (str(b), False),
+        ])
+        assert out == [(str(a.resolve()), False), (str(b.resolve()), False)]
+
+    def test_duplicate_skipped_with_info_log(self, tmp_path, monkeypatch, caplog):
+        """Duplicate drops are visible in the log for diagnosis."""
+        f = tmp_path / "x.png"
+        f.write_bytes(b"\x89PNG")
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "0")
+        with caplog.at_level("INFO"):
+            out = BasePlatformAdapter.filter_media_delivery_paths([
+                (str(f), False),
+                (str(f), False),
+            ])
+        assert len(out) == 1
+        assert "duplicate" in caplog.text.lower()
+
 
 # ---------------------------------------------------------------------------
 # Media-send fallback must not leak host filesystem paths into chat
