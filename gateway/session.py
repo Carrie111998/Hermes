@@ -191,6 +191,12 @@ class SessionSource:
     auto_thread_created: bool = False
     auto_thread_initial_name: Optional[str] = None
 
+    # Teams: Microsoft Graph ids parsed from inbound ``channelData``. Needed for
+    # channel-scoped Graph calls, which key off the team (AAD group) id rather
+    # than the Bot Framework conversation id.
+    teams_graph_team_id: Optional[str] = None
+    teams_graph_channel_id: Optional[str] = None
+
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
     # Team Gateway connector). The connector authenticates the gateway's socket
@@ -268,6 +274,10 @@ class SessionSource:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
             d["auto_thread_initial_name"] = self.auto_thread_initial_name
+        if self.teams_graph_team_id:
+            d["teams_graph_team_id"] = self.teams_graph_team_id
+        if self.teams_graph_channel_id:
+            d["teams_graph_channel_id"] = self.teams_graph_channel_id
         return d
 
     @classmethod
@@ -291,6 +301,8 @@ class SessionSource:
             profile=data.get("profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
+            teams_graph_team_id=data.get("teams_graph_team_id"),
+            teams_graph_channel_id=data.get("teams_graph_channel_id"),
         )
     
 
@@ -664,6 +676,38 @@ def build_session_context_prompt(
             "their user_id). Your normal reply is delivered to the group you "
             "are responding in."
         )
+    elif context.source.platform.value == "teams":
+        src = context.source
+        id_lines: list[str] = []
+        # Inbound ids are untrusted gateway metadata: render them through the
+        # same boundary as the rest of this prompt's source fields. Kept as
+        # neutral metadata rather than tool instructions — no Teams Graph read
+        # tool is registered, so naming one would point the model at a call it
+        # cannot make.
+        if src.teams_graph_team_id:
+            id_lines.append(
+                "  - Team (Graph group) id: "
+                f"{_format_untrusted_prompt_value(src.teams_graph_team_id)}"
+            )
+        if src.teams_graph_channel_id:
+            id_lines.append(
+                "  - Channel id: "
+                f"{_format_untrusted_prompt_value(src.teams_graph_channel_id)}"
+            )
+        if src.chat_type in ("dm", "group") and src.chat_id:
+            id_lines.append(
+                f"  - Chat id: {_format_untrusted_prompt_value(src.chat_id)}"
+            )
+        if id_lines:
+            lines.extend(
+                [
+                    "",
+                    "**Teams IDs (Microsoft Graph team/channel context):**",
+                    *id_lines,
+                    "  - The 32-hex segment inside a channel id "
+                    "(e.g. `19:<hex>@thread.tacv2`) is not the team (group) GUID.",
+                ]
+            )
 
     # Connected platforms
     platforms_list = ["local (files on this machine)"]
