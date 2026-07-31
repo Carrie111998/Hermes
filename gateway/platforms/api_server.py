@@ -1515,6 +1515,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+            ("POST", "/v1/sessions/{session_key}/approval", self._handle_session_approval),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
         ]
         if _CRON_AVAILABLE:
@@ -2055,6 +2056,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+                "session_approval": {"method": "POST", "path": "/v1/sessions/{session_key}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
@@ -5271,6 +5273,77 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "hermes.run.approval_response",
             "run_id": run_id,
+            "choice": choice,
+            "resolved": resolved,
+        })
+
+    async def _handle_session_approval(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_key}/approval — resolve a pending approval by its
+        gateway session_key directly, instead of a Runs-API run_id.
+
+        _handle_run_approval above only resolves approvals for runs started through this
+        platform's own POST /v1/runs (it looks up run_id in self._run_approval_sessions, a dict
+        this platform alone populates). Every other gateway platform - WhatsApp, Telegram,
+        Discord, the CLI - blocks on the exact same resolve_gateway_approval(session_key, choice)
+        call (see tools/approval.py's docstring: "Every existing platform ... resolves approvals
+        this same in-process way"), but until now there was no HTTP route to reach it for a
+        session that didn't originate through the Runs API. This route exists for exactly that
+        case: any caller that already knows a pending approval's session_key (e.g. a bridging
+        service like a Runs-API facade that also subscribes to the gateway's own governance/event
+        log) can resolve it here, with no run_id or Runs-API bookkeeping required at all.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_key = request.match_info["session_key"]
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        raw_choice = str(body.get("choice", "")).strip().lower()
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        choice = aliases.get(raw_choice, raw_choice)
+        allowed = {"once", "session", "always", "deny"}
+        if choice not in allowed:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        resolve_all = (
+            _coerce_request_bool(body.get("all"), default=False)
+            or _coerce_request_bool(body.get("resolve_all"), default=False)
+        )
+        try:
+            from tools.approval import resolve_gateway_approval
+
+            resolved = resolve_gateway_approval(
+                session_key,
+                choice,
+                resolve_all=resolve_all,
+            )
+        except Exception as exc:
+            logger.exception("[api_server] approval resolution failed for session %s", session_key)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if resolved <= 0:
+            return web.json_response(
+                _openai_error(
+                    f"Session has no pending approval: {session_key}",
+                    code="approval_not_pending",
+                ),
+                status=409,
+            )
+
+        return web.json_response({
+            "object": "hermes.session.approval_response",
+            "session_key": session_key,
             "choice": choice,
             "resolved": resolved,
         })

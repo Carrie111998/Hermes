@@ -69,6 +69,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
+    app.router.add_post("/v1/sessions/{session_key}/approval", adapter._handle_session_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -836,3 +837,82 @@ class TestStopRun:
                 body = await events_resp.text()
                 # Stream should have received run.failed and closed
                 assert "run.failed" in body or "stream closed" in body
+
+
+class TestSessionApproval:
+    """POST /v1/sessions/{session_key}/approval - resolves a pending approval directly by its
+    gateway session_key, for callers that don't have (and can't get) a Runs-API run_id, e.g. an
+    approval that originated from a platform session (WhatsApp, Telegram, ...) never started
+    through this adapter's own POST /v1/runs."""
+
+    @pytest.mark.asyncio
+    async def test_resolves_via_the_real_gateway_mechanism_no_run_id_needed(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
+                resp = await cli.post(
+                    "/v1/sessions/agent:main:whatsapp:dm:5511999999999/approval",
+                    json={"choice": "once"},
+                )
+
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["session_key"] == "agent:main:whatsapp:dm:5511999999999"
+                assert data["choice"] == "once"
+                assert data["resolved"] == 1
+                mock_resolve.assert_called_once_with(
+                    "agent:main:whatsapp:dm:5511999999999",
+                    "once",
+                    resolve_all=False,
+                )
+
+    @pytest.mark.asyncio
+    async def test_no_pending_approval_returns_409(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=0):
+                resp = await cli.post(
+                    "/v1/sessions/agent:main:cli:default/approval",
+                    json={"choice": "once"},
+                )
+
+                assert resp.status == 409
+                data = await resp.json()
+                assert data["error"]["code"] == "approval_not_pending"
+
+    @pytest.mark.asyncio
+    async def test_invalid_choice_returns_400(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/agent:main:cli:default/approval",
+                json={"choice": "not-a-real-choice"},
+            )
+
+            assert resp.status == 400
+            data = await resp.json()
+            assert data["error"]["code"] == "invalid_approval_choice"
+
+    @pytest.mark.asyncio
+    async def test_resolve_all_flag_is_forwarded(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("tools.approval.resolve_gateway_approval", return_value=3) as mock_resolve:
+                resp = await cli.post(
+                    "/v1/sessions/agent:main:cli:default/approval",
+                    json={"choice": "once", "all": True},
+                )
+
+        assert resp.status == 200
+        mock_resolve.assert_called_once_with("agent:main:cli:default", "once", resolve_all=True)
+
+    @pytest.mark.asyncio
+    async def test_requires_auth_when_configured(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/sessions/agent:main:cli:default/approval",
+                json={"choice": "once"},
+            )
+
+        assert resp.status == 401
