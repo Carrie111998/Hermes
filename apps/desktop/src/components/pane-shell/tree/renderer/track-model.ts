@@ -149,13 +149,18 @@ export const cssMax = (values: (string | null | undefined)[]): string | undefine
  *  are both 28px thick. */
 export const MINIMIZED_TRACK = '1.75rem'
 
-export function fixedTrackSize(node: LayoutNode, axis: 'row' | 'column', ctx: TrackContext): string | null {
+export function fixedTrackSize(
+  node: LayoutNode,
+  axis: 'row' | 'column',
+  ctx: TrackContext,
+  includeMinimized = true
+): string | null {
   if (node.type === 'group') {
     // Ancestor splits must size a minimized zone as its strip, not as its
     // panes' declared widths — otherwise the outer track keeps reserving the
     // full sidebar width and the collapsed rail floats in a dead column.
     if (node.minimized) {
-      return MINIMIZED_TRACK
+      return includeMinimized ? MINIMIZED_TRACK : null
     }
 
     const overrideKey = axis === 'row' ? 'widthOverride' : 'heightOverride'
@@ -204,7 +209,7 @@ export function fixedTrackSize(node: LayoutNode, axis: 'row' | 'column', ctx: Tr
   }
 
   const visible = node.children.filter(child => !subtreeGone(child, ctx))
-  const sizes = visible.map(child => fixedTrackSize(child, axis, ctx))
+  const sizes = visible.map(child => fixedTrackSize(child, axis, ctx, true))
 
   if (node.orientation === axis) {
     if (sizes.length === 0 || sizes.some(size => size === null)) {
@@ -215,7 +220,14 @@ export function fixedTrackSize(node: LayoutNode, axis: 'row' | 'column', ctx: Tr
   }
 
   // Across the axis a flex child just stretches; the fixed ones set the size.
-  return cssMax(sizes) ?? null
+  // A minimized pane contributes its rail only along the split axis that
+  // contains the rail. Across the perpendicular axis it has no meaningful
+  // width/height. Otherwise a minimized terminal's 28px height can make its
+  // whole parent column look fixed-width, causing the final root track (Files)
+  // to absorb the entire remaining window.
+  const acrossAxisSizes = visible.map(child => fixedTrackSize(child, axis, ctx, false))
+
+  return cssMax(acrossAxisSizes) ?? null
 }
 
 /** True when every pane in the subtree is hidden/narrow-collapsed. */
