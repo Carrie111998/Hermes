@@ -22088,14 +22088,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not session_key:
             return False
 
+        def _interrupt_stale() -> None:
+            # Test doubles / partial agents may lack interrupt(); real AIAgent
+            # always has it. Never let a missing method abort the promotion path.
+            if agent is None:
+                return
+            interrupt = getattr(agent, "interrupt", None)
+            if callable(interrupt):
+                interrupt(_INTERRUPT_REASON_STOP)
+
         def _reject_stale() -> bool:
             logger.info(
                 "Skipping stale agent promotion for %s — generation %s is no longer current",
                 session_key or "",
                 run_generation,
             )
-            if agent is not None:
-                agent.interrupt(_INTERRUPT_REASON_STOP)
+            _interrupt_stale()
             return False
 
         if run_generation is not None and not self._is_session_run_current(
@@ -22119,8 +22127,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Skipping stale agent promotion for %s — slot already held by another agent",
                 session_key or "",
             )
-            if agent is not None:
-                agent.interrupt(_INTERRUPT_REASON_STOP)
+            _interrupt_stale()
             return False
 
         self._running_agents[session_key] = agent

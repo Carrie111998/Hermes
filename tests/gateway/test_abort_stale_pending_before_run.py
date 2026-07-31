@@ -256,6 +256,24 @@ def test_promote_or_interrupt_does_not_clobber_other_agent(monkeypatch, tmp_path
     stale.interrupt.assert_called_once_with(gateway_run._INTERRUPT_REASON_STOP)
 
 
+def test_promote_or_interrupt_tolerates_agent_without_interrupt(
+    monkeypatch, tmp_path
+):
+    """Partial agents / test doubles without interrupt() must not crash reject."""
+    runner = _runner(monkeypatch, tmp_path)
+    stale_gen = runner._begin_session_run_generation(SESSION_KEY)
+    runner._invalidate_session_run_generation(SESSION_KEY, reason="stop")
+    runner._running_agents[SESSION_KEY] = "fresh_agent"
+
+    agent = object()  # no interrupt attribute
+    promoted = runner._promote_or_interrupt_stale_agent(
+        SESSION_KEY, agent, stale_gen
+    )
+
+    assert promoted is False
+    assert runner._running_agents[SESSION_KEY] == "fresh_agent"
+
+
 @pytest.mark.asyncio
 async def test_stop_during_prep_replacement_and_stale_cleanup_interleave(
     monkeypatch, tmp_path
