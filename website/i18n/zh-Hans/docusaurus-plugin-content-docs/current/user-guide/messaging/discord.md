@@ -211,7 +211,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID&scope=bot+application
 
 | 级别 | 权限整数 | 包含内容 |
 |-------|-------------------|-----------------|
-| 最低 | `117760` | View Channels、Send Messages、Read Message History、Attach Files |
+| 最低 | `117760` | View Channels、Send Messages、Embed Links、Attach Files、Read Message History |
 | 推荐 | `309237763136` | 以上所有权限，加上 Embed Links、Send Messages in Threads、Add Reactions, Create Public Threads |
 
 ## 第六步：邀请到你的服务器
