@@ -1562,6 +1562,94 @@ def _mark_verification_stale(
         logger.debug("verification stale marker failed", exc_info=True)
 
 
+# AI truncation signatures: placeholder strings that indicate the model
+# produced incomplete/abbreviated content rather than real file content.
+_TRUNCATION_SIGNATURES: tuple[str, ...] = (
+    "/* ... full function ... */",
+    "/* ... unchanged ... */",
+    "// ... unchanged ...",
+    "// ... rest of file ...",
+    "# ... rest of file ...",
+    "# ... unchanged ...",
+    "/* ... rest unchanged ... */",
+    "... (rest of file unchanged)",
+    "... (unchanged)",
+    "<!-- ... unchanged ... -->",
+    "# ... (rest of the function remains the same)",
+    "// ... (rest of the function remains the same)",
+)
+
+
+def _check_truncation_signatures(content: str, original: str | None = None) -> str | None:
+    """Return an error message if content contains AI truncation placeholders.
+
+    Only flags a signature whose occurrence count in `content` EXCEEDS its
+    count in `original` -- so a legitimate pre-existing comment (already in
+    the original file, unchanged) is never blocked, but adding a NEW
+    occurrence (even when one already existed) is. A plain membership check
+    (`sig in original`) is not sufficient here: if the original already
+    contains one literal occurrence of a signature, that would let content
+    retain it AND introduce any number of additional (genuinely truncated)
+    occurrences undetected, since the check only asked "is this signature
+    present in original at all", not "how many are there". When original is
+    None the check is unconditional (count must be 0).
+    Must be called through the backend-aware file_ops pipeline so docker/modal/
+    SSH environments see the same file as the eventual write.
+    """
+    content_lower = content.lower()
+    original_lower = original.lower() if original is not None else None
+    for sig in _TRUNCATION_SIGNATURES:
+        sig_lower = sig.lower()
+        content_count = content_lower.count(sig_lower)
+        if content_count == 0:
+            continue
+        original_count = original_lower.count(sig_lower) if original_lower is not None else 0
+        if content_count > original_count:
+            return (
+                f"Refusing to write: content contains AI truncation placeholder "
+                f"{sig!r}. This indicates the content is incomplete — "
+                "re-read the file fully and reconstruct the complete content "
+                "before writing."
+            )
+    return None
+
+
+def _extract_v4a_added_content(patch_content: str) -> str:
+    """Return only the content a V4A patch actually *adds*.
+
+    V4A hunks represent added ('+'), removed ('-'), and unchanged context
+    (' ') lines distinctly. Scanning the whole serialized patch for
+    truncation placeholders would false-positive on a legitimate edit that
+    removes, or merely anchors context on, a pre-existing placeholder-like
+    literal (e.g. deleting an old "// ... unchanged ..." stub). Restricting
+    the check to '+' hunk lines and full Add-file content means only text
+    the model is actually introducing gets checked.
+    """
+    try:
+        from tools.patch_parser import OperationType, parse_v4a_patch
+
+        operations, error = parse_v4a_patch(patch_content)
+    except Exception:
+        operations, error = [], "parse failed"
+
+    if error or not operations:
+        # Fall back to scanning the raw patch text if parsing fails here --
+        # the real V4A application below will surface the actual parse
+        # error; better a possible false positive on malformed input than
+        # silently skipping the truncation check entirely.
+        return patch_content
+
+    added_parts: list[str] = []
+    for op in operations:
+        if op.operation == OperationType.ADD and op.content:
+            added_parts.append(op.content)
+        for hunk in op.hunks:
+            for hunk_line in hunk.lines:
+                if hunk_line.prefix == "+":
+                    added_parts.append(hunk_line.content)
+    return "\n".join(added_parts)
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -1586,6 +1674,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "Strip read_file line-number prefixes or reconstruct the intended "
             "file contents before writing."
         )
+    # Reject AI truncation placeholders unconditionally on write: there is no
+    # original to compare against at this point, and a write_file that contains
+    # "// ... unchanged ..." is never correct.
+    _trunc_err = _check_truncation_signatures(content)
+    if _trunc_err:
+        return tool_error(_trunc_err)
     try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
@@ -1764,10 +1858,25 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # path would let the two layers disagree about which file is
                 # being edited.
                 _replace_target = _path_to_resolved.get(path) or path
+                # Guard against AI truncation placeholders in new_string.
+                # Compare against old_string so a pre-existing placeholder
+                # in the region being replaced is not re-flagged.
+                _trunc_err = _check_truncation_signatures(new_string, old_string)
+                if _trunc_err:
+                    return tool_error(_trunc_err)
                 result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
+                # V4A "+/* ... full function ... */" patterns are a common
+                # truncation placeholder in patch payloads. Only the content
+                # the patch actually ADDS is checked -- a legitimate edit
+                # that removes, or anchors context on, a pre-existing
+                # placeholder-like literal on a '-' or ' ' hunk line must not
+                # be blocked.
+                _trunc_err = _check_truncation_signatures(_extract_v4a_added_content(patch))
+                if _trunc_err:
+                    return tool_error(_trunc_err)
                 result = file_ops.patch_v4a(patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
