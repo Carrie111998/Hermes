@@ -21,6 +21,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -36,10 +37,22 @@ _CONFIG_PATH = ("acp", "keepalive_interval_s")
 
 
 def _coerce_float(value: Any) -> Optional[float]:
+    # Reject bools explicitly (bool is a subclass of int, so float(True) == 1.0
+    # would silently give the ACP keepalive a 1-second interval — never what
+    # a config-file `true`/`false` was intending).
+    if isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    # Reject NaN and ±Inf. YAML accepts `.nan` / `.inf` as valid scalars, and
+    # NaN in particular is toxic: `remaining = deadline - now` becomes NaN,
+    # every comparison against 0 is False, and the loop either spins or fires
+    # continuously instead of sleeping.
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def _read_config_interval() -> Optional[float]:

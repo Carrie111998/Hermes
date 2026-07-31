@@ -149,3 +149,47 @@ def test_default_payload_is_valid_agent_message_chunk():
     assert payload.session_update == "agent_message_chunk"
     assert isinstance(payload.content, TextContentBlock)
     assert payload.content.text == ""
+
+
+# --- _coerce_float hardening (addresses Copilot review on PR #75124) ---
+
+
+def test_coerce_float_rejects_bool_true():
+    """`true` in YAML must not silently become 1.0s keepalive."""
+    from acp_adapter.keepalive import _coerce_float
+
+    assert _coerce_float(True) is None
+
+
+def test_coerce_float_rejects_bool_false():
+    """`false` in YAML must not silently become 0.0 (disable)."""
+    from acp_adapter.keepalive import _coerce_float
+
+    assert _coerce_float(False) is None
+
+
+def test_coerce_float_rejects_nan():
+    """YAML `.nan` would break the keepalive loop (`remaining > 0` is False)."""
+    from acp_adapter.keepalive import _coerce_float
+
+    assert _coerce_float(float("nan")) is None
+
+
+def test_coerce_float_rejects_inf():
+    """YAML `.inf` would produce an infinite sleep — disable feature instead."""
+    from acp_adapter.keepalive import _coerce_float
+
+    assert _coerce_float(float("inf")) is None
+    assert _coerce_float(float("-inf")) is None
+
+
+def test_coerce_float_accepts_valid_numbers():
+    """Sanity check: real ints and floats still coerce."""
+    from acp_adapter.keepalive import _coerce_float
+
+    assert _coerce_float(45) == 45.0
+    assert _coerce_float(45.0) == 45.0
+    assert _coerce_float("45") == 45.0
+    assert _coerce_float(0) == 0.0  # 0 is a valid disable signal
+    assert _coerce_float(None) is None
+    assert _coerce_float("not-a-number") is None
