@@ -271,6 +271,12 @@ class TestDoctorMemoryProviderSection:
         assert "Honcho API key" not in out
         assert "Mem0" not in out
 
+    def test_builtin_provider_shows_builtin_ok(self, monkeypatch, tmp_path):
+        out = self._run_doctor_and_capture(monkeypatch, tmp_path, provider="builtin")
+
+        assert "Built-in memory active" in out
+        assert "builtin plugin not found" not in out
+
 
     def test_mem0_provider_not_installed_shows_fail(self, monkeypatch, tmp_path):
         # Make mem0 import fail
