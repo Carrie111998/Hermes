@@ -195,7 +195,7 @@ try:
     hs = _load("hindsight_store", "hindsight_store.py")
     pk = hs._build_pattern_key
 except Exception as e:
-    print(f"  WARN hindsight_store load failed: {e} (expected)")
+    check("hindsight_store.py imports cleanly", False, detail=str(e))
     hs = None
 
 if hs:
@@ -232,7 +232,7 @@ print("\n=== 7. stage1_llm: prompt structure ===")
 try:
     s1llm = _load("stage1_llm", "stage1_llm.py")
 except Exception as e:
-    print(f"  WARN stage1_llm load failed: {e} (expected)")
+    check("stage1_llm.py imports cleanly", False, detail=str(e))
     s1llm = None
 
 if s1llm:
