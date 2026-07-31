@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 from types import MappingProxyType
@@ -1189,7 +1190,8 @@ def test_session_sidebar_hydration_tools_have_exact_schemas_and_commit_exact_tas
     }
     assert coordinator.sidebar_hydration_claim_limits == [1]
     job = pending["jobs"][0]
-    assert set(job) == {
+    public_fields = set(job)
+    assert public_fields == {
         "lease_token",
         "codex_thread_id",
         "hydration_message",
@@ -1198,6 +1200,18 @@ def test_session_sidebar_hydration_tools_have_exact_schemas_and_commit_exact_tas
         "git_root",
         "send_reserved",
     }
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / "session_bridge"
+        / "assets"
+        / "session-sidebar-sync"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    required_line = next(
+        line for line in skill.splitlines() if "Required lease fields:" in line
+    )
+    skill_required_fields = set(re.findall(r"`([a-z_]+)`", required_line))
+    assert skill_required_fields == public_fields
     assert job["codex_thread_id"] == thread_id
     assert job["hydration_marker"] == marker
     assert job["hydration_message"].startswith("# Imported Claude Code Session")

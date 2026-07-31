@@ -141,27 +141,11 @@ def _remove_directory_redirect(link: Path) -> None:
         link.unlink()
 
 
-def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
+def test_sidebar_skill_matches_the_single_reviewed_baseline() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
     baseline = BASELINE.read_text(encoding="utf-8")
 
-    assert baseline == (
-        "Baseline pressure run without the skill:\n\n"
-        "- Scenario A refused a valid project-scoped create because optional cwd, "
-        "runtime roots, and idempotency were unavailable.\n"
-        "- Scenario B left an ambiguous create pending/retryable instead of marking "
-        "`native_create_ambiguous` for needs attention with no replacement.\n"
-        "- Scenario C kept the task but omitted hydration send reservation and "
-        "marker reconciliation.\n"
-        "- An empty wake skipped both pending calls.\n\n"
-        "Behavioral GREEN pressure exposed two remaining instruction loopholes: a "
-        "string environment selector and a status-count shortcut that skipped the "
-        "persisted heartbeat calls.\n\n"
-        "Task 6 invariant review then exposed a duplicate registration pending call, "
-        "a source-cwd runtime-root claim, project-ID drift, and an unqualified "
-        "hydration placement failure.\n\n"
-        "It correctly used at most one lease and did not move, fork, archive, or "
-        "rename legacy tasks.\n"
-    )
+    assert baseline == skill
 
 
 def test_sidebar_skill_contains_only_the_generated_skill_and_agent_metadata() -> None:
@@ -247,7 +231,6 @@ def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> No
     assert "`native_task_not_indexed`" in hydration
     assert "`marker_conflict`" in hydration
     assert "`codex_thread_conflict`" in hydration
-    assert "`source_identity_mismatch`" in hydration
     assert "A projectless legacy task is valid and remains valid" in hydration
     assert "Never create, rename, archive, move, fork, or replace a task in hydration mode" in hydration
     assert "create_thread" not in hydration
@@ -255,6 +238,73 @@ def test_sidebar_skill_prioritizes_exact_task_hydration_without_creation() -> No
     assert "set_thread_archived" not in hydration
     assert "move" not in hydration.replace("move, fork", "")
     assert "fork" not in hydration.replace("move, fork", "")
+
+
+def test_sidebar_skill_uses_only_live_public_hydration_lease_fields() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
+        "\n## Registration Procedure\n", 1
+    )[0]
+
+    assert (
+        "Required lease fields: `lease_token`, `codex_thread_id`, "
+        "`hydration_message`, `hydration_marker`, `cwd`, `git_root`, "
+        "`send_reserved`." in hydration
+    )
+    assert "source_session_id" not in hydration
+    assert "bridge ID" not in hydration
+    assert "preview digest" not in hydration
+    assert (
+        "The coordinator already authenticated source, bridge, and preview before "
+        "issuing the lease."
+    ) in hydration
+
+
+def test_sidebar_skill_requires_definite_hydration_reserve_before_send() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
+        "\n## Registration Procedure\n", 1
+    )[0]
+    reserve = hydration.split("- **Reserve and send.**", 1)[1].split(
+        "- **Classify send uncertainty.**", 1
+    )[0]
+
+    assert "immediately before" in reserve
+    assert "`state=hydration_leased` and `send_reserved=true`" in reserve
+    assert "matching exact `codex_thread_id` and `hydration_marker` when supplied" in reserve
+    assert "missing, malformed, stale, or ambiguous" in reserve
+    assert "`bridge_temporarily_unavailable`" in reserve
+    assert "do not call `send_message_to_thread`" in reserve
+    assert reserve.index("session_sidebar_hydration_reserve") < reserve.index(
+        "send_message_to_thread"
+    )
+    assert "Every resumed `send_reserved=true` lease reconciles the exact marker" in hydration
+
+
+def test_sidebar_skill_allows_only_prebind_candidate_authentication_reads() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    registration = skill.split("\n## Registration Procedure\n", 1)[1].split(
+        "\n## Fixed Failure Mapping\n", 1
+    )[0]
+    hard_stops = skill.split("\n## Hard Stops\n", 1)[1].split(
+        "\n## Continuation Contract\n", 1
+    )[0]
+
+    assert "Bounded pre-bind reads are allowed solely to authenticate a candidate" in registration
+    assert "do not poll, rename, or commit during candidate authentication" in registration
+    assert "Never bind an unauthenticated candidate" in registration
+    assert "bind that exact candidate ID" in registration
+    assert "only the bound ID may be polled, renamed, or committed" in registration
+    assert "Bounded pre-bind candidate-authentication reads are permitted" in hard_stops
+    assert "Never poll, rename, or commit a selected task before binding" in hard_stops
+
+
+def test_sidebar_skill_binds_new_create_id_before_first_read() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    create_step = skill.split("\n6. ", 1)[1].split("\n7. ", 1)[0]
+
+    assert "newly returned create ID" in create_step
+    assert create_step.index("session_sidebar_bind") < create_step.index("`read_thread`")
 
 
 def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() -> None:
