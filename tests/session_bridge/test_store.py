@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, localcontext
 from pathlib import Path
 from threading import Barrier, Event
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -7566,6 +7567,37 @@ def _token_factory(*tokens: str):
     return lambda: next(iterator)
 
 
+def _record_absence_proof(
+    store: SessionBridgeStore,
+    lease_token: str,
+    *,
+    completed_at: float = 100.0,
+    expires_at: float = 10_000.0,
+    placement_generation: int = 1,
+    delivery_generation: int = 1,
+    generation: str = "scan:1",
+) -> dict[str, Any]:
+    evidence = SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.ABSENCE_PROVEN,
+        generation=generation,
+        completed_at=completed_at,
+        expires_at=expires_at,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=0,
+        recovered_thread_id=None,
+        fixed_reason=None,
+    )
+    return store.record_sidebar_reconciliation_proof(
+        lease_token=lease_token,
+        evidence=evidence,
+        marker_digest=evidence.marker_digest,
+        placement_generation=placement_generation,
+        delivery_generation=delivery_generation,
+        now=completed_at,
+    )
+
+
 def _failed_bound_ambiguous_sidebar(
     db: SessionDB,
     *,
@@ -7581,9 +7613,12 @@ def _failed_bound_ambiguous_sidebar(
     candidate = _sidebar_candidate(db, native_id=native_id)
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key=f"hermes-session-bridge-create-v1:{native_id}",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     store.bind_sidebar_thread(
@@ -7614,9 +7649,12 @@ def _failed_bound_not_indexed_sidebar(
     candidate = _sidebar_candidate(db, native_id=native_id)
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key=f"hermes-session-bridge-create-v1:{native_id}",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     store.bind_sidebar_thread(
@@ -8653,15 +8691,20 @@ def test_sidebar_create_reservation_is_lease_validated_and_survives_reopen(
         candidate = _sidebar_candidate(first_db, native_id="create-reservation")
         first.enqueue_sidebar_job(candidate)
         lease = first.claim_sidebar_jobs(now=100.0, limit=1)[0]
+        proof = _record_absence_proof(first, lease["lease_token"])
 
         reserved = first.reserve_sidebar_create(
             lease_token=lease["lease_token"],
             recovery_key="hermes-session-bridge-create-v1:recovery-key",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
             now=110.0,
         )
         replay = first.reserve_sidebar_create(
             lease_token=lease["lease_token"],
             recovery_key="hermes-session-bridge-create-v1:recovery-key",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
             now=111.0,
         )
 
@@ -8673,6 +8716,8 @@ def test_sidebar_create_reservation_is_lease_validated_and_survives_reopen(
             first.reserve_sidebar_create(
                 lease_token=lease["lease_token"],
                 recovery_key="hermes-session-bridge-create-v1:different",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
                 now=112.0,
             )
     finally:
@@ -8687,6 +8732,38 @@ def test_sidebar_create_reservation_is_lease_validated_and_survives_reopen(
         )
     finally:
         reopened_db.close()
+
+
+def test_concurrent_sidebar_create_reserve_has_one_exact_replay(db) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("concurrent-create-reserve"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="concurrent-create-reserve")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_absence_proof(store, lease["lease_token"])
+    barrier = Barrier(2)
+
+    def reserve() -> dict[str, Any]:
+        barrier.wait(timeout=5)
+        return store.reserve_sidebar_create(
+            lease_token=lease["lease_token"],
+            recovery_key="hermes-session-bridge-create-v1:concurrent",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
+            now=110.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: reserve(), range(2)))
+
+    assert results[0] == results[1]
+    assert (
+        store.get_sidebar_create_reservation(candidate.source_session_id)
+        == results[0]
+    )
 
 
 def test_sidebar_reconciliation_proof_is_durable_append_only_and_replay_safe(
@@ -8792,6 +8869,79 @@ def test_sidebar_reconciliation_proof_schema_rejects_invalid_state_shape(
                 reason,
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "stale_digest",
+        "expired",
+        "recovered",
+        "placement_generation",
+        "delivery_generation",
+        "reconciliation_generation",
+    ],
+)
+def test_reserve_sidebar_create_rejects_stale_or_changed_proof(
+    db,
+    mutation: str,
+) -> None:
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(f"proof-reserve-{mutation}"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=f"proof-reserve-{mutation}")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    state = (
+        SidebarReconciliationState.RECOVERED
+        if mutation == "recovered"
+        else SidebarReconciliationState.ABSENCE_PROVEN
+    )
+    generation = (
+        "scan:new" if mutation == "reconciliation_generation" else "scan:1"
+    )
+    evidence = SidebarReconciliationEvidence.create(
+        state=state,
+        generation=generation,
+        completed_at=100.0,
+        expires_at=105.0 if mutation == "expired" else 130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=1 if state is SidebarReconciliationState.RECOVERED else 0,
+        recovered_thread_id=(
+            "codex-proof-reserve" if state is SidebarReconciliationState.RECOVERED else None
+        ),
+        fixed_reason=None,
+    )
+    proof = store.record_sidebar_reconciliation_proof(
+        lease_token=lease["lease_token"],
+        evidence=evidence,
+        marker_digest=evidence.marker_digest,
+        placement_generation=2 if mutation == "placement_generation" else 1,
+        delivery_generation=2 if mutation == "delivery_generation" else 1,
+        now=100.0,
+    )
+    supplied_digest = (
+        "f" * 64 if mutation == "stale_digest" else proof["proof_digest"]
+    )
+    supplied_generation = (
+        "scan:1"
+        if mutation == "reconciliation_generation"
+        else proof["reconciliation_generation"]
+    )
+
+    with pytest.raises(ValueError, match="reconciliation proof"):
+        store.reserve_sidebar_create(
+            lease_token=lease["lease_token"],
+            recovery_key="hermes-session-bridge-create-v1:proof-boundary",
+            reconciliation_proof_digest=supplied_digest,
+            reconciliation_generation=supplied_generation,
+            now=110.0,
+        )
+
+    assert store.get_sidebar_create_reservation(candidate.source_session_id) is None
 
 
 def test_sidebar_failure_atomically_retains_known_thread_after_bind_ambiguity(
@@ -9258,9 +9408,12 @@ def test_unbound_create_resolution_is_append_only_after_exact_absence(db) -> Non
         ),
         marker_secret,
     )
+    proof = _record_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=105.0,
     )
     retry = store.fail_sidebar_job(
@@ -11064,9 +11217,12 @@ def test_bound_sidebar_operator_retry_preserves_exact_task_and_reservation(db) -
     candidate = _sidebar_candidate(db, native_id="bound-operator-retry")
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key="hermes-session-bridge-create-v1:bound-operator-retry",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     thread_id = "019f-bound-retry-thread"
@@ -11128,9 +11284,12 @@ def test_bound_sidebar_operator_retry_accepts_exact_project_drift_conflict(db) -
     candidate = _sidebar_candidate(db, native_id="bound-project-drift")
     store.enqueue_sidebar_job(candidate)
     lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    proof = _record_absence_proof(store, lease["lease_token"])
     reservation = store.reserve_sidebar_create(
         lease_token=lease["lease_token"],
         recovery_key="hermes-session-bridge-create-v1:bound-project-drift",
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
         now=110.0,
     )
     thread_id = "019f-bound-project-drift"

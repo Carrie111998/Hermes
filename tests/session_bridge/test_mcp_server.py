@@ -9,7 +9,7 @@ import re
 import subprocess
 import time
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Mapping
 
 import pytest
 from mcp.shared.version import LATEST_PROTOCOL_VERSION
@@ -357,6 +357,11 @@ class _FakeCoordinator:
         self.sidebar_hydration_claim_limits: list[int] = []
         self.sidebar_binds: list[tuple[str, str]] = []
         self.sidebar_commits: list[tuple[str, str]] = []
+        self.sidebar_reserves: list[tuple[str, str, str]] = []
+        self.sidebar_reserve_result: Mapping[str, Any] = {
+            "state": "sidebar_leased",
+            "create_reserved": True,
+        }
 
     async def start(self) -> None:
         self.started += 1
@@ -434,6 +439,22 @@ class _FakeCoordinator:
             "state": "sidebar_leased",
             "codex_thread_id": codex_thread_id,
         }
+
+    async def reserve_sidebar_create_authoritatively(
+        self,
+        *,
+        lease_token: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+    ) -> Mapping[str, Any]:
+        self.sidebar_reserves.append(
+            (
+                lease_token,
+                reconciliation_proof_digest,
+                reconciliation_generation,
+            )
+        )
+        return self.sidebar_reserve_result
 
     def health(self) -> dict[str, Any]:
         return {
@@ -1294,12 +1315,16 @@ def test_session_sidebar_reserve_durably_records_pre_create_boundary(
     db: SessionDB,
 ) -> None:
     store, candidate = _seed_sidebar_source(db)
-    lease = store.claim_sidebar_jobs(now=time.time(), limit=1)[0]
     coordinator = _FakeCoordinator(
         bridge_id=candidate.bridge_id,
         source_id=candidate.source_session_id,
         target_id="codex:unused",
     )
+    arguments = {
+        "lease_token": "opaque-lease-token",
+        "reconciliation_proof_digest": "3" * 64,
+        "reconciliation_generation": "scan:1",
+    }
 
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         tools = _rpc(client, "tools/list")["result"]["tools"]
@@ -1311,73 +1336,104 @@ def test_session_sidebar_reserve_durably_records_pre_create_boundary(
         first = _call_tool(
             client,
             "session_sidebar_reserve",
-            {"lease_token": lease["lease_token"]},
+            arguments,
         )
         replay = _call_tool(
             client,
             "session_sidebar_reserve",
-            {"lease_token": lease["lease_token"]},
+            arguments,
         )
 
-    reservation = store.get_sidebar_create_reservation(candidate.source_session_id)
-    assert set(schema["properties"]) == {"lease_token"}
+    assert set(schema["properties"]) == {
+        "lease_token",
+        "reconciliation_proof_digest",
+        "reconciliation_generation",
+    }
     assert replay == first == {"state": "sidebar_leased", "create_reserved": True}
-    assert reservation is not None
-    assert reservation["source_session_id"] == candidate.source_session_id
-    assert reservation["bridge_id"] == candidate.bridge_id
+    assert coordinator.sidebar_reserves == [
+        ("opaque-lease-token", "3" * 64, "scan:1"),
+        ("opaque-lease-token", "3" * 64, "scan:1"),
+    ]
+
+
+def test_session_sidebar_reserve_returns_fresh_recovery_without_create(
+    db: SessionDB,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    coordinator.sidebar_reserve_result = {
+        "state": "recovered",
+        "codex_thread_id": "codex-thread-recovered",
+    }
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        result = _call_tool(
+            client,
+            "session_sidebar_reserve",
+            {
+                "lease_token": "opaque-lease-token",
+                "reconciliation_proof_digest": "3" * 64,
+                "reconciliation_generation": "scan:1",
+            },
+        )
+
+    assert result == {
+        "state": "recovered",
+        "codex_thread_id": "codex-thread-recovered",
+        "create_reserved": False,
+    }
 
 
 @pytest.mark.parametrize(
     "malformation",
     [
         "missing_field",
-        "boolean_version",
         "extra_field",
-        "wrong_job",
-        "nan_reserved_at",
-        "infinite_reserved_at",
+        "wrong_state",
+        "false_reserved",
+        "malformed_recovered_id",
     ],
 )
-def test_session_sidebar_reserve_rejects_malformed_store_confirmation(
+def test_session_sidebar_reserve_rejects_malformed_coordinator_confirmation(
     db: SessionDB,
-    monkeypatch: pytest.MonkeyPatch,
     malformation: str,
 ) -> None:
     store, candidate = _seed_sidebar_source(db)
-    lease = store.claim_sidebar_jobs(now=time.time(), limit=1)[0]
     coordinator = _FakeCoordinator(
         bridge_id=candidate.bridge_id,
         source_id=candidate.source_session_id,
         target_id="codex:unused",
     )
-    original_reserve = store.reserve_sidebar_create
-
-    def malformed_reserve(**kwargs: Any) -> dict[str, Any]:
-        reservation = dict(original_reserve(**kwargs))
-        if malformation == "missing_field":
-            del reservation["bridge_id"]
-        elif malformation == "boolean_version":
-            reservation["version"] = True
-        elif malformation == "extra_field":
-            reservation["unexpected"] = "field"
-        elif malformation == "wrong_job":
-            reservation["job_id"] = "sidebar-job:wrong"
-        elif malformation == "nan_reserved_at":
-            reservation["reserved_at"] = float("nan")
-        elif malformation == "infinite_reserved_at":
-            reservation["reserved_at"] = float("inf")
-        else:  # pragma: no cover - parameter exhaustiveness
-            raise AssertionError(malformation)
-        return reservation
-
-    monkeypatch.setattr(store, "reserve_sidebar_create", malformed_reserve)
+    malformed_results: dict[str, Mapping[str, Any]] = {
+        "missing_field": {"state": "sidebar_leased"},
+        "extra_field": {
+            "state": "sidebar_leased",
+            "create_reserved": True,
+            "unexpected": True,
+        },
+        "wrong_state": {"state": "visible", "create_reserved": True},
+        "false_reserved": {"state": "sidebar_leased", "create_reserved": False},
+        "malformed_recovered_id": {
+            "state": "recovered",
+            "codex_thread_id": " bad ",
+        },
+    }
+    coordinator.sidebar_reserve_result = malformed_results[malformation]
     with _test_client(_create_test_app(db, store, coordinator)) as client:
         payload = _rpc(
             client,
             "tools/call",
             {
                 "name": "session_sidebar_reserve",
-                "arguments": {"lease_token": lease["lease_token"]},
+                "arguments": {
+                    "lease_token": "opaque-lease-token",
+                    "reconciliation_proof_digest": "3" * 64,
+                    "reconciliation_generation": "scan:1",
+                },
             },
             request_id=44,
         )

@@ -42,8 +42,6 @@ from .preview import build_session_preview
 from .sidebar import (
     build_registration_prompt,
     decode_hydration_marker,
-    sidebar_create_recovery_key,
-    validate_sidebar_create_reservation,
 )
 from .sidebar_reconciliation import SidebarReconciliationState
 from .store import (
@@ -678,49 +676,56 @@ def create_app(
             raise ValueError("sidebar_hydration_fail_failed") from None
 
     @mcp.tool()
-    async def session_sidebar_reserve(lease_token: Any) -> dict[str, Any]:
-        """Persist native-create intent before dispatching one Codex task."""
+    async def session_sidebar_reserve(
+        lease_token: Any,
+        reconciliation_proof_digest: Any,
+        reconciliation_generation: Any,
+    ) -> dict[str, Any]:
+        """Freshly reconcile and reserve create only from authoritative absence."""
 
-        token_text = _exact_sidebar_text(lease_token, "lease token")
         try:
-            secret = marker_key
-            if secret is None:
-                secret = await asyncio.to_thread(resolve_marker_key)
-            job = await asyncio.to_thread(store.lookup_sidebar_job_by_lease, token_text)
-            if not isinstance(job, Mapping) or job.get("state") != "sidebar_leased":
-                raise ValueError("invalid sidebar lease")
-            source_session_id = _exact_sidebar_text(
-                job.get("source_session_id"),
-                "source session ID",
+            token_text = _exact_sidebar_text(lease_token, "lease token")
+            proof_digest = _exact_sidebar_sha256(
+                reconciliation_proof_digest,
+                "reconciliation proof digest",
             )
-            job_id = _exact_sidebar_text(job.get("id"), "job ID")
-            bridge_id = _exact_sidebar_text(job.get("bridge_id"), "bridge ID")
-            if job.get("codex_thread_id") is not None:
-                raise ValueError("sidebar lease already has a native thread")
-            marker = encode_bridge_marker(
-                BridgeMarkerPayload(
-                    bridge_id=bridge_id,
-                    source_session_id=source_session_id,
-                    target_provider=Provider.CODEX,
-                    policy_generation=1,
-                ),
-                secret,
+            proof_generation = _exact_sidebar_text(
+                reconciliation_generation,
+                "reconciliation generation",
             )
-            recovery_key = sidebar_create_recovery_key(marker, secret)
-            reservation = await asyncio.to_thread(
-                store.reserve_sidebar_create,
+            reserve_method = getattr(
+                coordinator,
+                "reserve_sidebar_create_authoritatively",
+                None,
+            )
+            if not callable(reserve_method):
+                raise TypeError("authoritative sidebar reserve is unavailable")
+            result = await reserve_method(
                 lease_token=token_text,
-                recovery_key=recovery_key,
-                now=time.time(),
+                reconciliation_proof_digest=proof_digest,
+                reconciliation_generation=proof_generation,
             )
-            validate_sidebar_create_reservation(
-                reservation,
-                job_id=job_id,
-                source_session_id=source_session_id,
-                bridge_id=bridge_id,
-                expected_recovery_key=recovery_key,
-            )
-            return {"state": "sidebar_leased", "create_reserved": True}
+            if not isinstance(result, Mapping):
+                raise ValueError("authoritative sidebar reserve is malformed")
+            if set(result) == {"state", "create_reserved"} and result == {
+                "state": "sidebar_leased",
+                "create_reserved": True,
+            }:
+                return dict(result)
+            if (
+                set(result) == {"state", "codex_thread_id"}
+                and result.get("state") == "recovered"
+            ):
+                thread_id = _exact_sidebar_text(
+                    result.get("codex_thread_id"),
+                    "recovered Codex thread ID",
+                )
+                return {
+                    "state": "recovered",
+                    "codex_thread_id": thread_id,
+                    "create_reserved": False,
+                }
+            raise ValueError("authoritative sidebar reserve is malformed")
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
         except Exception:
@@ -1848,6 +1853,15 @@ def _exact_sidebar_text(value: object, label: str) -> str:
     ):
         raise ValueError(f"sidebar {label} is malformed")
     return value
+
+
+def _exact_sidebar_sha256(value: object, label: str) -> str:
+    digest = _exact_sidebar_text(value, label)
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError(f"sidebar {label} is malformed")
+    return digest
 
 
 def _sidebar_delivery_claim_tokens(

@@ -145,6 +145,8 @@ class FakeSidebarStore:
         self.binds: list[tuple[str, str, float]] = []
         self.commits: list[tuple[str, str, float]] = []
         self.proofs: list[SidebarReconciliationEvidence] = []
+        self.proof_rows: list[dict[str, Any]] = []
+        self.reserves: list[dict[str, Any]] = []
         self.current_proof_digest = "3" * 64
 
     def claim_sidebar_jobs(
@@ -197,6 +199,7 @@ class FakeSidebarStore:
     def lookup_sidebar_job_by_lease(self, lease_token: str) -> dict[str, Any]:
         assert lease_token == "opaque-lease-token"
         return {
+            "id": "sidebar-job:1",
             "source_session_id": SOURCE,
             "bridge_id": BRIDGE,
             "state": "sidebar_leased",
@@ -237,12 +240,47 @@ class FakeSidebarStore:
         if self.proof_error is not None:
             raise self.proof_error
         self.proofs.append(evidence)
-        return {
+        self.current_proof_digest = f"{len(self.proofs) + 2:x}" * 64
+        row = {
+            "job_id": "sidebar-job:1",
+            "source_session_id": SOURCE,
+            "bridge_id": BRIDGE,
             "proof_digest": self.current_proof_digest,
             "reconciliation_generation": evidence.generation,
             "state": evidence.state.value,
             "recovered_thread_id": evidence.recovered_thread_id,
         }
+        self.proof_rows.append(row)
+        return row
+
+    def get_sidebar_reconciliation_proof(
+        self, *, lease_token: str
+    ) -> dict[str, Any] | None:
+        assert lease_token == "opaque-lease-token"
+        return self.proof_rows[-1] if self.proof_rows else None
+
+    def reserve_sidebar_create(
+        self,
+        *,
+        lease_token: str,
+        recovery_key: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+        now: float,
+    ) -> dict[str, Any]:
+        reservation = {
+            "version": 2,
+            "job_id": "sidebar-job:1",
+            "source_session_id": SOURCE,
+            "bridge_id": BRIDGE,
+            "recovery_key": recovery_key,
+            "reconciliation_proof_digest": reconciliation_proof_digest,
+            "reconciliation_generation": reconciliation_generation,
+            "reserved_at": now,
+        }
+        self.reserves.append({"lease_token": lease_token, **reservation})
+        self.create_reserved = True
+        return reservation
 
 
 class FakeVerifier:
@@ -322,6 +360,26 @@ class BlockingVerifier(FakeVerifier):
         return _absence_evidence()
 
 
+class SequencedVerifier(FakeVerifier):
+    def __init__(self, *results: SidebarReconciliationEvidence) -> None:
+        if not results:
+            raise ValueError("at least one reconciliation result is required")
+        super().__init__(results[0])
+        self._results = list(results)
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        self.reconcile_calls.append((expected, now, ttl_seconds))
+        if not self._results:
+            raise AssertionError("unexpected reconciliation scan")
+        return self._results.pop(0)
+
+
 class ForbiddenTargetAdapter:
     def create_placeholder(self, **_: Any) -> Any:
         raise AssertionError("native sidebar reconciliation must never create")
@@ -368,14 +426,16 @@ def _recovered_evidence(thread_id: str = THREAD) -> SidebarReconciliationEvidenc
     )
 
 
-def _absence_evidence() -> SidebarReconciliationEvidence:
+def _absence_evidence(
+    *, generation: str = "scan:1", marker_digest: str = "1" * 64
+) -> SidebarReconciliationEvidence:
     return SidebarReconciliationEvidence.create(
         state=SidebarReconciliationState.ABSENCE_PROVEN,
-        generation="scan:1",
+        generation=generation,
         completed_at=100.0,
         expires_at=130.0,
         inventory_digest="2" * 64,
-        marker_digest="1" * 64,
+        marker_digest=marker_digest,
         match_count=0,
         recovered_thread_id=None,
         fixed_reason=None,
@@ -417,6 +477,77 @@ async def test_claim_with_prior_reservation_and_zero_match_never_leases_creation
     assert store.failures == [
         ("opaque-lease-token", "native_create_ambiguous", 100.0)
     ]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_reserve_binds_freshly_recovered_thread() -> None:
+    store = FakeSidebarStore()
+    verifier = SequencedVerifier(_absence_evidence(), _recovered_evidence())
+    coordinator = _coordinator(store, verifier)
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    assert len(claims) == 1
+
+    result = await coordinator.reserve_sidebar_create_authoritatively(
+        lease_token=claims[0].lease_token,
+        reconciliation_proof_digest=claims[0].reconciliation_proof_digest,
+        reconciliation_generation=claims[0].reconciliation_generation,
+        now=101.0,
+    )
+
+    assert result == {"state": "recovered", "codex_thread_id": THREAD}
+    assert store.binds == [("opaque-lease-token", THREAD, 101.0)]
+    assert store.reserves == []
+    assert [proof.state for proof in store.proofs] == [
+        SidebarReconciliationState.ABSENCE_PROVEN,
+        SidebarReconciliationState.RECOVERED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authoritative_reserve_uses_only_fresh_absence_proof() -> None:
+    store = FakeSidebarStore()
+    verifier = SequencedVerifier(
+        _absence_evidence(),
+        _absence_evidence(generation="scan:2", marker_digest="4" * 64),
+    )
+    coordinator = _coordinator(store, verifier)
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+    original_digest = claims[0].reconciliation_proof_digest
+
+    result = await coordinator.reserve_sidebar_create_authoritatively(
+        lease_token=claims[0].lease_token,
+        reconciliation_proof_digest=original_digest,
+        reconciliation_generation=claims[0].reconciliation_generation,
+        now=101.0,
+    )
+
+    assert result == {"state": "sidebar_leased", "create_reserved": True}
+    assert len(store.reserves) == 1
+    assert store.reserves[0]["reconciliation_proof_digest"] != original_digest
+    assert store.reserves[0]["reconciliation_proof_digest"] == "4" * 64
+    assert store.reserves[0]["reconciliation_generation"] == "scan:2"
+    assert store.reserves[0]["recovery_key"] == (
+        "hermes-session-bridge-create-v1:" + "4" * 64
+    )
+
+
+@pytest.mark.asyncio
+async def test_authoritative_reserve_rejects_stale_original_proof_without_scan() -> None:
+    store = FakeSidebarStore()
+    verifier = SequencedVerifier(_absence_evidence())
+    coordinator = _coordinator(store, verifier)
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    with pytest.raises(ValueError, match="reconciliation proof is stale"):
+        await coordinator.reserve_sidebar_create_authoritatively(
+            lease_token=claims[0].lease_token,
+            reconciliation_proof_digest="f" * 64,
+            reconciliation_generation=claims[0].reconciliation_generation,
+            now=101.0,
+        )
+
+    assert len(verifier.reconcile_calls) == 1
+    assert store.reserves == []
 
 
 @pytest.mark.asyncio

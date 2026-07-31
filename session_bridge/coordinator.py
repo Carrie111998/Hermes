@@ -1884,6 +1884,192 @@ class SessionBridgeCoordinator:
             raise ValueError("sidebar bind result is malformed")
         return result
 
+    async def reserve_sidebar_create_authoritatively(
+        self,
+        *,
+        lease_token: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+        now: float | None = None,
+    ) -> Mapping[str, Any]:
+        """Reconcile once more, then bind recovery or reserve exact absence."""
+
+        token = _exact_sidebar_claim_text(lease_token, "lease token")
+        supplied_digest = _exact_sidebar_proof_digest(
+            reconciliation_proof_digest
+        )
+        supplied_generation = _exact_sidebar_claim_text(
+            reconciliation_generation,
+            "reconciliation generation",
+        )
+        reserve_time = _finite_number(self._clock() if now is None else now, "now")
+        verifier = self._sidebar_verifier
+        if verifier is None:
+            raise ValueError("sidebar reconciler is unavailable")
+
+        raw_job = await asyncio.to_thread(
+            _call,
+            self._store,
+            "lookup_sidebar_job_by_lease",
+            token,
+        )
+        if not isinstance(raw_job, Mapping) or raw_job.get("state") != "sidebar_leased":
+            raise ValueError("sidebar lease identity is malformed")
+        job_id = _exact_sidebar_claim_text(raw_job.get("id"), "job ID")
+        source_session_id = _exact_sidebar_claim_text(
+            raw_job.get("source_session_id"), "source session ID"
+        )
+        bridge_id = _exact_sidebar_claim_text(raw_job.get("bridge_id"), "bridge ID")
+        if raw_job.get("codex_thread_id") is not None:
+            raise ValueError("sidebar lease already has a native thread")
+
+        current_proof = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_sidebar_reconciliation_proof",
+            lease_token=token,
+        )
+        if not isinstance(current_proof, Mapping):
+            raise ValueError("sidebar reconciliation proof is missing")
+        if (
+            current_proof.get("job_id") != job_id
+            or current_proof.get("source_session_id") != source_session_id
+            or current_proof.get("bridge_id") != bridge_id
+            or current_proof.get("proof_digest") != supplied_digest
+            or current_proof.get("reconciliation_generation")
+            != supplied_generation
+            or current_proof.get("state")
+            != SidebarReconciliationState.ABSENCE_PROVEN.value
+            or current_proof.get("recovered_thread_id") is not None
+        ):
+            raise ValueError("sidebar reconciliation proof is stale")
+
+        existing_reservation = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_sidebar_create_reservation",
+            source_session_id,
+        )
+        if existing_reservation is not None:
+            raise ValueError("sidebar create reservation already exists")
+
+        expected = BridgeMarkerPayload(
+            bridge_id=bridge_id,
+            source_session_id=source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
+        try:
+            evidence = await asyncio.to_thread(
+                verifier.reconcile_marker,
+                expected,
+                now=reserve_time,
+                ttl_seconds=min(
+                    30.0,
+                    float(self._config.service.reconcile_seconds),
+                ),
+            )
+            if not isinstance(evidence, SidebarReconciliationEvidence):
+                raise TypeError("sidebar reconciliation evidence is malformed")
+            fresh_proof = await asyncio.to_thread(
+                _call,
+                self._store,
+                "record_sidebar_reconciliation_proof",
+                lease_token=token,
+                evidence=evidence,
+                marker_digest=evidence.marker_digest,
+                placement_generation=self._config.sidebar.placement_generation,
+                delivery_generation=1,
+                now=reserve_time,
+            )
+            if not isinstance(fresh_proof, Mapping):
+                raise TypeError("sidebar reconciliation proof is malformed")
+            fresh_digest = _exact_sidebar_proof_digest(
+                fresh_proof.get("proof_digest")
+            )
+            fresh_generation = _exact_sidebar_claim_text(
+                fresh_proof.get("reconciliation_generation"),
+                "reconciliation generation",
+            )
+            if (
+                fresh_proof.get("job_id") != job_id
+                or fresh_proof.get("source_session_id") != source_session_id
+                or fresh_proof.get("bridge_id") != bridge_id
+                or fresh_generation != evidence.generation
+                or fresh_proof.get("state") != evidence.state.value
+                or fresh_proof.get("recovered_thread_id")
+                != evidence.recovered_thread_id
+            ):
+                raise ValueError("sidebar reconciliation proof mismatch")
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except SidebarVerificationError as exc:
+            await self._fail_sidebar_delivery_claim(
+                token,
+                _sidebar_reconciliation_failure_code(exc.code),
+            )
+            raise ValueError("sidebar authoritative reconciliation failed") from None
+        except Exception:
+            await self._fail_sidebar_delivery_claim(
+                token,
+                "bridge_temporarily_unavailable",
+            )
+            raise ValueError("sidebar authoritative reconciliation failed") from None
+
+        if evidence.state is SidebarReconciliationState.RECOVERED:
+            recovered_thread_id = _exact_sidebar_claim_text(
+                evidence.recovered_thread_id,
+                "recovered Codex thread ID",
+            )
+            await asyncio.to_thread(
+                _call,
+                self._store,
+                "bind_sidebar_thread",
+                lease_token=token,
+                codex_thread_id=recovered_thread_id,
+                now=reserve_time,
+            )
+            return {"state": "recovered", "codex_thread_id": recovered_thread_id}
+
+        if evidence.state is SidebarReconciliationState.BLOCKED:
+            assert evidence.fixed_reason is not None
+            await self._fail_sidebar_delivery_claim(
+                token,
+                _sidebar_reconciliation_failure_code(evidence.fixed_reason),
+            )
+            raise ValueError("sidebar authoritative reconciliation blocked")
+
+        if evidence.state is not SidebarReconciliationState.ABSENCE_PROVEN:
+            await self._fail_sidebar_delivery_claim(
+                token,
+                "bridge_temporarily_unavailable",
+            )
+            raise ValueError("sidebar authoritative reconciliation failed")
+
+        recovery_key = "hermes-session-bridge-create-v1:" + evidence.marker_digest
+        reservation = await asyncio.to_thread(
+            _call,
+            self._store,
+            "reserve_sidebar_create",
+            lease_token=token,
+            recovery_key=recovery_key,
+            reconciliation_proof_digest=fresh_digest,
+            reconciliation_generation=fresh_generation,
+            now=reserve_time,
+        )
+        if (
+            not isinstance(reservation, Mapping)
+            or reservation.get("version") != 2
+            or reservation.get("job_id") != job_id
+            or reservation.get("source_session_id") != source_session_id
+            or reservation.get("bridge_id") != bridge_id
+            or reservation.get("recovery_key") != recovery_key
+            or reservation.get("reconciliation_proof_digest") != fresh_digest
+            or reservation.get("reconciliation_generation") != fresh_generation
+        ):
+            raise ValueError("sidebar create reservation is malformed")
+        return {"state": "sidebar_leased", "create_reserved": True}
+
     async def commit_sidebar_job(
         self,
         *,
@@ -4853,6 +5039,15 @@ def _exact_sidebar_claim_text(value: object, label: str) -> str:
     if any(character in value for character in "\r\n"):
         raise ValueError(f"sidebar claim {label} is malformed")
     return value
+
+
+def _exact_sidebar_proof_digest(value: object) -> str:
+    digest = _exact_sidebar_claim_text(value, "reconciliation proof digest")
+    if len(digest) != 64 or any(
+        character not in "0123456789abcdef" for character in digest
+    ):
+        raise ValueError("sidebar claim reconciliation proof digest is malformed")
+    return digest
 
 
 def _sidebar_reconciliation_failure_code(code: object) -> str:

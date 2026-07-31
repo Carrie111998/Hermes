@@ -188,13 +188,18 @@ _SIDEBAR_DELIVERY_STATE_FIELDS = frozenset({
     "worktree_id",
     "eligible_at",
 })
-_SIDEBAR_CREATE_RESERVATION_FIELDS = frozenset({
+_SIDEBAR_CREATE_RESERVATION_V1_FIELDS = frozenset({
     "version",
     "job_id",
     "source_session_id",
     "bridge_id",
     "recovery_key",
     "reserved_at",
+})
+_SIDEBAR_CREATE_RESERVATION_FIELDS = frozenset({
+    *_SIDEBAR_CREATE_RESERVATION_V1_FIELDS,
+    "reconciliation_proof_digest",
+    "reconciliation_generation",
 })
 _SIDEBAR_CREATE_RECOVERY_PREFIX = "hermes-session-bridge-create-v1:"
 _STRUCTURED_CONTENT_HEX_PREFIX = "006A736F6E3A"
@@ -6164,12 +6169,22 @@ class SessionBridgeStore:
         *,
         lease_token: str,
         recovery_key: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
         now: float,
     ) -> dict[str, Any]:
         """Persist immutable native-create intent before calling Codex."""
 
         token_digest = _sidebar_lease_digest(lease_token)
         normalized_key = _sidebar_create_recovery_key(recovery_key)
+        normalized_proof_digest = _lowercase_sha256(
+            reconciliation_proof_digest,
+            "sidebar reconciliation proof digest",
+        )
+        normalized_generation = _exact_nonempty_text(
+            reconciliation_generation,
+            "sidebar reconciliation generation",
+        )
         reserved_at = _finite_number(now, "sidebar create reservation time")
 
         def _write(conn):
@@ -6187,12 +6202,44 @@ class SessionBridgeStore:
                 raise ValueError(
                     "sidebar create reservation already has a native thread"
                 )
+            current_proof_digest = job["reconciliation_proof_digest"]
+            if (
+                not isinstance(current_proof_digest, str)
+                or not hmac.compare_digest(
+                    current_proof_digest,
+                    normalized_proof_digest,
+                )
+            ):
+                raise ValueError("sidebar reconciliation proof is stale")
+            proof_row = conn.execute(
+                """SELECT * FROM session_sidebar_reconciliation_proofs
+                   WHERE proof_digest = ?""",
+                (normalized_proof_digest,),
+            ).fetchone()
+            if proof_row is None:
+                raise ValueError("sidebar reconciliation proof is missing")
+            proof = dict(proof_row)
+            if (
+                proof["job_id"] != job["id"]
+                or proof["source_session_id"] != job["source_session_id"]
+                or proof["bridge_id"] != job["bridge_id"]
+                or proof["state"] != "absence_proven"
+                or proof["match_count"] != 0
+                or proof["recovered_thread_id"] is not None
+                or float(proof["expires_at"]) <= reserved_at
+                or proof["placement_generation"] != 1
+                or proof["delivery_generation"] != 1
+                or proof["reconciliation_generation"] != normalized_generation
+            ):
+                raise ValueError("sidebar reconciliation proof is not create eligible")
             payload = {
-                "version": 1,
+                "version": 2,
                 "job_id": job["id"],
                 "source_session_id": job["source_session_id"],
                 "bridge_id": job["bridge_id"],
                 "recovery_key": normalized_key,
+                "reconciliation_proof_digest": normalized_proof_digest,
+                "reconciliation_generation": normalized_generation,
                 "reserved_at": reserved_at,
             }
             state_key = _sidebar_create_reservation_state_key(job["source_session_id"])
@@ -6206,9 +6253,16 @@ class SessionBridgeStore:
                     expected_source_session_id=job["source_session_id"],
                 )
                 if (
-                    decoded["job_id"] != job["id"]
+                    decoded["version"] != 2
+                    or decoded["job_id"] != job["id"]
                     or decoded["bridge_id"] != job["bridge_id"]
                     or not hmac.compare_digest(decoded["recovery_key"], normalized_key)
+                    or not hmac.compare_digest(
+                        decoded["reconciliation_proof_digest"],
+                        normalized_proof_digest,
+                    )
+                    or decoded["reconciliation_generation"]
+                    != normalized_generation
                 ):
                     raise ValueError("conflicting sidebar create reservation")
                 return decoded, False
@@ -11606,11 +11660,18 @@ def _decode_sidebar_create_reservation(
         payload = json.loads(value_json)
     except (json.JSONDecodeError, TypeError) as exc:
         raise ValueError("invalid sidebar create reservation") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("invalid sidebar create reservation")
+    version = payload.get("version")
+    expected_fields = (
+        _SIDEBAR_CREATE_RESERVATION_V1_FIELDS
+        if version == 1 and not isinstance(version, bool)
+        else _SIDEBAR_CREATE_RESERVATION_FIELDS
+    )
     if (
-        not isinstance(payload, dict)
-        or set(payload) != _SIDEBAR_CREATE_RESERVATION_FIELDS
-        or payload.get("version") != 1
-        or isinstance(payload.get("version"), bool)
+        set(payload) != expected_fields
+        or type(version) is not int
+        or version not in {1, 2}
         or payload.get("source_session_id") != expected_source_session_id
     ):
         raise ValueError("invalid sidebar create reservation")
@@ -11630,14 +11691,24 @@ def _decode_sidebar_create_reservation(
     sidebar_idempotency_key(source_session_id)
     if bridge_id != sidebar_bridge_id(source_session_id):
         raise ValueError("invalid sidebar create reservation identity")
-    return {
-        "version": 1,
+    result = {
+        "version": version,
         "job_id": job_id,
         "source_session_id": source_session_id,
         "bridge_id": bridge_id,
         "recovery_key": recovery_key,
         "reserved_at": reserved_at,
     }
+    if version == 2:
+        result["reconciliation_proof_digest"] = _lowercase_sha256(
+            payload.get("reconciliation_proof_digest"),
+            "sidebar reservation reconciliation proof digest",
+        )
+        result["reconciliation_generation"] = _exact_nonempty_text(
+            payload.get("reconciliation_generation"),
+            "sidebar reservation reconciliation generation",
+        )
+    return result
 
 
 def _worktree_snapshot_state_key(source_session_id: str) -> str:
