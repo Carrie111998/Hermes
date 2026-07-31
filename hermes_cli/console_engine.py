@@ -25,6 +25,8 @@ from tools.ansi_strip import strip_ansi as _strip_ansi
 
 ConsoleStatus = Literal["ok", "error", "confirm_required", "exit", "clear"]
 
+_INTERACTIVE_HISTORY_EXCLUDE_SOURCES = ["cron", "tool"]
+
 
 class ConsoleCommandError(RuntimeError):
     """User-facing console command failure."""
@@ -1324,7 +1326,7 @@ def _sessions_list(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         sessions = db.list_sessions_rich(
-            exclude_sources=["tool"],
+            exclude_sources=_INTERACTIVE_HISTORY_EXCLUDE_SOURCES,
             limit=ns.limit,
             order_by_last_active=True,
         )
@@ -1340,7 +1342,10 @@ def _sessions_stats(_engine: HermesConsoleEngine, args: list[str]) -> str:
     db = SessionDB()
     try:
         total = db.session_count()
-        listable = db.session_count(exclude_children=True, exclude_sources=["tool"])
+        listable = db.session_count(
+            exclude_children=True,
+            exclude_sources=_INTERACTIVE_HISTORY_EXCLUDE_SOURCES,
+        )
         messages = db.message_count()
         lines = [
             f"Total sessions: {total}",
