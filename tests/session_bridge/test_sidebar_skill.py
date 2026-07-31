@@ -156,6 +156,9 @@ def test_sidebar_skill_baseline_records_the_verbatim_no_skill_failure() -> None:
         "Behavioral GREEN pressure exposed two remaining instruction loopholes: a "
         "string environment selector and a status-count shortcut that skipped the "
         "persisted heartbeat calls.\n\n"
+        "Task 6 invariant review then exposed a duplicate registration pending call, "
+        "a source-cwd runtime-root claim, project-ID drift, and an unqualified "
+        "hydration placement failure.\n\n"
         "It correctly used at most one lease and did not move, fork, archive, or "
         "rename legacy tasks.\n"
     )
@@ -271,6 +274,41 @@ def test_sidebar_skill_preflights_bridge_and_native_projects_before_leasing() ->
     ) in queue
     assert "Status counts never authorize skipping either persisted-heartbeat call." in queue
     assert "If both registration counts are zero, end immediately" not in skill
+    assert "broker_project_id" in queue
+    assert "equals configured `broker_project_id`" in queue
+    assert "ID differs, preflight stops before lease" in queue
+
+
+def test_sidebar_skill_uses_queue_selected_registration_lease_once() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    registration = skill.split("\n## Registration Procedure\n", 1)[1].split(
+        "\n## Fixed Failure Mapping\n", 1
+    )[0]
+
+    assert skill.count("session_sidebar_pending(limit=1)") == 1
+    assert "session_sidebar_pending(limit=1)" not in registration
+    assert "Use the lease already selected in Queue Selection." in registration
+
+
+def test_sidebar_skill_keeps_source_cwd_as_metadata_not_an_attached_root() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Source cwd is authenticated metadata only; only `.hermes` is an attached root." in skill
+    assert "source cwd only as authenticated metadata and a runtime root" not in skill
+    assert "source cwd as a runtime root" not in skill
+
+
+def test_sidebar_skill_qualifies_registration_placement_failures_from_legacy_hydration() -> None:
+    skill = (ASSET / "SKILL.md").read_text(encoding="utf-8")
+    hydration = skill.split("\n## In-place Hydration Procedure\n", 1)[1].split(
+        "\n## Registration Procedure\n", 1
+    )[0]
+    failure_table = skill.split("\n## Fixed Failure Mapping\n", 1)[1].split(
+        "\n## Deterministic Call-Failure Rules\n", 1
+    )[0]
+
+    assert "Native task outside Session Inbox placement (registration/new mirror only)" in failure_table
+    assert "Exact authenticated projectless legacy hydration is exempt and valid." in hydration
 
 
 def test_sidebar_skill_uses_one_authenticated_local_transport_when_mcp_is_missing() -> (
@@ -446,6 +484,7 @@ def test_sidebar_skill_gives_exact_native_tool_schemas_and_id_rules() -> None:
     assert create_examples
     assert all('"environment":{"type":"local"}' in line for line in create_examples)
     assert all('"environment":"local"' not in line for line in create_examples)
+    assert "illustrates the validated returned production ID" in skill
     assert "Only the returned `threadId` is a successful create result" in skill
     assert (
         "`session_sidebar_bind(lease_token=<exact token>, "

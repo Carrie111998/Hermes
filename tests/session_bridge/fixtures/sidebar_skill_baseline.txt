@@ -7,4 +7,6 @@ Baseline pressure run without the skill:
 
 Behavioral GREEN pressure exposed two remaining instruction loopholes: a string environment selector and a status-count shortcut that skipped the persisted heartbeat calls.
 
+Task 6 invariant review then exposed a duplicate registration pending call, a source-cwd runtime-root claim, project-ID drift, and an unqualified hydration placement failure.
+
 It correctly used at most one lease and did not move, fork, archive, or rename legacy tasks.
