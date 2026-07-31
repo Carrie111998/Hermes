@@ -4367,7 +4367,9 @@ class TurnRunner:
         # can disable streaming for specific platforms even when the global
         # streaming config is enabled.
         _plat_streaming = ctx.resolve_display_setting(
-            ctx.user_config, platform_key, "streaming"
+            ctx.user_config, platform_key, "streaming",
+            chat_id=getattr(ctx.source, "chat_id", None),
+            thread_id=getattr(ctx.source, "thread_id", None),
         )
         # None = no per-platform override → follow global config
         _streaming_enabled = (
@@ -22658,24 +22660,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Failed to rebind turn lease", exc_info=True)
             return False
 
-<<<<<<< ours
     def _clear_conversation_scope(self, session_key: str, *, reason: str) -> None:
         """Clear ALL conversation-scoped per-session state for ``session_key``.
-=======
-        platform_key = _platform_config_key(source.platform)
-        user_config = _load_gateway_config()
-        from gateway.display_config import resolve_display_setting
-        _plat_streaming = resolve_display_setting(
-            user_config, platform_key, "streaming",
-            chat_id=getattr(source, "chat_id", None),
-            thread_id=getattr(source, "thread_id", None),
-        )
-        _streaming_enabled = (
-            _scfg.enabled and _scfg.transport != "off"
-            if _plat_streaming is None
-            else bool(_plat_streaming)
-        )
->>>>>>> theirs
 
         THE single conversation-boundary funnel. Call this — and nothing
         else — whenever a session_key crosses a conversation boundary:
@@ -23097,25 +23083,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             slack_tools = "1" if _slack_tools_loaded() else "0"
 
         try:
-<<<<<<< ours
             from hermes_constants import display_hermes_home
-=======
-            from agent.display import set_tool_preview_max_len
-            _tpl = resolve_display_setting(
-                user_config, platform_key, "tool_preview_length", 0,
-                chat_id=getattr(source, "chat_id", None),
-                thread_id=getattr(source, "thread_id", None),
-            )
-            set_tool_preview_max_len(int(_tpl) if _tpl else 0)
-        except Exception:
-            pass
->>>>>>> theirs
 
             home_display = str(display_hermes_home())
         except Exception:
             home_display = ""
 
-<<<<<<< ours
         key_tuple = (
             platform,
             str(src.chat_id or ""),
@@ -23141,54 +23114,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             bool(redact_pii),
             home_display,
-=======
-        # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(
-            user_config, platform_key, "tool_progress",
-            chat_id=getattr(source, "chat_id", None),
-            thread_id=getattr(source, "thread_id", None),
-        )
-        _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
-        _display_cfg = display_config if isinstance(display_config, dict) else {}
-        _platforms_cfg = _display_cfg.get("platforms") or {}
-        _platform_cfg = _platforms_cfg.get(platform_key) or {}
-        _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
-
-        def _per_chat_tp_configured() -> bool:
-            if not isinstance(_platform_cfg, dict):
-                return False
-            chats_cfg = _platform_cfg.get("chats")
-            if not isinstance(chats_cfg, dict):
-                return False
-            cid = getattr(source, "chat_id", None)
-            if cid is None:
-                return False
-            tid = getattr(source, "thread_id", None)
-            cid_s = str(cid)
-            keys = [f"{cid_s}:{tid}", cid_s] if tid not in (None, "") else [cid_s]
-            for k in keys:
-                entry = chats_cfg.get(k)
-                if isinstance(entry, dict) and "tool_progress" in entry:
-                    return True
-            return False
-
-        _tool_progress_configured = (
-            "tool_progress" in _display_cfg
-            or (
-                isinstance(_platform_cfg, dict)
-                and "tool_progress" in _platform_cfg
-            )
-            or (
-                isinstance(_legacy_tp_overrides, dict)
-                and platform_key in _legacy_tp_overrides
-            )
-            or _per_chat_tp_configured()
-        )
-        progress_mode = (
-            _env_tp
-            if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
->>>>>>> theirs
         )
         return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
 
@@ -23346,41 +23271,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _e:
             logger.debug("Pre-evict memory commit failed for %s: %s", key, _e)
 
-<<<<<<< ours
     def _commit_then_release_soft(self, agent: Any, key: str) -> None:
         """Commit end-of-session memory (if warranted), then soft-release.
-=======
-        # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
-        # that implements ``delete_message``). When enabled via
-        # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
-        # from the tool-progress / "⏳ Working — N min" / status-callback bubbles
-        # are collected here and deleted after the final response lands.
-        # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
-        _cleanup_progress = bool(
-            resolve_display_setting(
-                user_config, platform_key, "cleanup_progress",
-                chat_id=getattr(source, "chat_id", None),
-                thread_id=getattr(source, "thread_id", None),
-            )
-        )
-        _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
-        # getattr, not attribute access — same duck-typed-adapter guard as the
-        # edit_message check in send_progress_messages below: a fake/minimal
-        # adapter without delete_message means "can't delete", not a crash.
-        _cleanup_delete = getattr(type(_cleanup_adapter), "delete_message", None) if _cleanup_adapter is not None else None
-        if _cleanup_adapter is not None and (
-            _cleanup_delete is None
-            or _cleanup_delete is BasePlatformAdapter.delete_message
-        ):
-            # Adapter doesn't support deletion — silently disable.
-            _cleanup_progress = False
-            _cleanup_adapter = None
-        _cleanup_msg_ids: List[str] = []
-        # First-touch onboarding latch: fires at most once per run, even if
-        # several tools exceed the threshold.
-        long_tool_hint_fired = [False]
-        _LONG_TOOL_THRESHOLD_S = 30.0
->>>>>>> theirs
 
         Runs on the daemon eviction thread so the memory-provider call and the
         client teardown never block the caller's held cache lock. Order matters:
@@ -23786,7 +23678,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_config = _load_gateway_config()
         from gateway.display_config import resolve_display_setting
         _plat_streaming = resolve_display_setting(
-            user_config, platform_key, "streaming"
+            user_config, platform_key, "streaming",
+            chat_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
         )
         _streaming_enabled = (
             _scfg.enabled and _scfg.transport != "off"
@@ -24157,109 +24051,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=event_message_id,
             )
-<<<<<<< ours
-=======
-            self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(
-                source=source, session_key=session_key
-            )
-            # Set up stream consumer for token streaming or interim commentary.
-            _stream_consumer = None
-            _stream_delta_cb = None
-            # #60671 — streaming TTS consumer is created on the outer
-            # event-loop thread before run_sync launches.  run_sync only
-            # reads it via ``streaming_tts_consumer_holder[0]`` for delta
-            # callback wiring.
-            _stts_consumer_ref = streaming_tts_consumer_holder[0]
-            _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
-            if _scfg is None:
-                from gateway.config import StreamingConfig
-                _scfg = StreamingConfig()
-
-            # Per-platform streaming gate: display.platforms.<plat>.streaming
-            # can disable streaming for specific platforms even when the global
-            # streaming config is enabled.
-            _plat_streaming = resolve_display_setting(
-                user_config, platform_key, "streaming",
-                chat_id=getattr(source, "chat_id", None),
-                thread_id=getattr(source, "thread_id", None),
-            )
-            # None = no per-platform override → follow global config
-            _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
-            )
-            _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
-                try:
-                    from gateway.stream_consumer import GatewayStreamConsumer
-                    _adapter = self._adapter_for_source(source)
-                    if _adapter:
-                        _consumer_cfg, _pause_typing_before_finalize = (
-                            self._build_stream_consumer_config(
-                                source, _scfg, _adapter,
-                                on_missing_cursor="raise",
-                            )
-                        )
-                        _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
-                            config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
-                            on_new_message=(
-                                (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
-                                else None
-                            ),
-                            on_before_finalize=_pause_typing_before_finalize,
-                            initial_reply_to_id=event_message_id,
-                            run_still_current=_run_still_current,
-                        )
-                        if _want_stream_deltas:
-                            def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
-                                    _stream_consumer.on_delta(text)
-                                    # Tee to the streaming-TTS consumer (#60671).
-                                    if _stts_consumer_ref is not None:
-                                        _stts_consumer_ref.on_delta(text)
-                        stream_consumer_holder[0] = _stream_consumer
-                except Exception as _sc_err:
-                    logger.debug("Could not set up stream consumer: %s", _sc_err)
-
-            # When text streaming is off but streaming TTS is active,
-            # install a TTS-only delta callback so the consumer still
-            # receives LLM deltas for audio synthesis (#60671).
-            if _stream_delta_cb is None and _stts_consumer_ref is not None:
-                def _stream_delta_cb(text: str) -> None:
-                    if _run_still_current():
-                        _stts_consumer_ref.on_delta(text)
-
-            def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-                if not _run_still_current():
-                    return
-                display_text = text
-                if _stream_consumer is not None:
-                    if already_streamed:
-                        _stream_consumer.on_segment_break()
-                    else:
-                        _stream_consumer.on_commentary(display_text)
-                    return
-                if already_streamed or not _status_adapter or not str(display_text or "").strip():
-                    return
-                safe_schedule_threadsafe(
-                    _status_adapter.send(
-                        _status_chat_id,
-                        display_text,
-                        metadata=_status_thread_metadata,
-                    ),
-                    _loop_for_step,
-                    logger=logger,
-                    log_message="interim_assistant_callback scheduling error",
-                )
->>>>>>> theirs
 
         from run_agent import AIAgent
         import queue
@@ -24289,7 +24080,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Apply tool preview length config (0 = no limit)
         try:
             from agent.display import set_tool_preview_max_len
-            _tpl = resolve_display_setting(user_config, platform_key, "tool_preview_length", 0)
+            _tpl = resolve_display_setting(
+                user_config, platform_key, "tool_preview_length", 0,
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+            )
             set_tool_preview_max_len(int(_tpl) if _tpl else 0)
         except Exception:
             pass
@@ -24303,12 +24098,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
+        _resolved_tp = resolve_display_setting(
+            user_config, platform_key, "tool_progress",
+            chat_id=getattr(source, "chat_id", None),
+            thread_id=getattr(source, "thread_id", None),
+        )
         _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
         _display_cfg = display_config if isinstance(display_config, dict) else {}
         _platforms_cfg = _display_cfg.get("platforms") or {}
         _platform_cfg = _platforms_cfg.get(platform_key) or {}
         _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
+
+        def _per_chat_tp_configured() -> bool:
+            if not isinstance(_platform_cfg, dict):
+                return False
+            chats_cfg = _platform_cfg.get("chats")
+            if not isinstance(chats_cfg, dict):
+                return False
+            cid = getattr(source, "chat_id", None)
+            if cid is None:
+                return False
+            tid = getattr(source, "thread_id", None)
+            cid_s = str(cid)
+            keys = [f"{cid_s}:{tid}", cid_s] if tid not in (None, "") else [cid_s]
+            for k in keys:
+                entry = chats_cfg.get(k)
+                if isinstance(entry, dict) and "tool_progress" in entry:
+                    return True
+            return False
+
         _tool_progress_configured = (
             "tool_progress" in _display_cfg
             or (
@@ -24319,6 +24137,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 isinstance(_legacy_tp_overrides, dict)
                 and platform_key in _legacy_tp_overrides
             )
+            or _per_chat_tp_configured()
         )
         progress_mode = (
             _env_tp
@@ -24457,7 +24276,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # are collected here and deleted after the final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
         _cleanup_progress = bool(
-            resolve_display_setting(user_config, platform_key, "cleanup_progress")
+            resolve_display_setting(
+                user_config, platform_key, "cleanup_progress",
+                chat_id=getattr(source, "chat_id", None),
+                thread_id=getattr(source, "thread_id", None),
+            )
         )
         _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
         # getattr, not attribute access — same duck-typed-adapter guard as the
