@@ -215,6 +215,47 @@ model:
 # worktree_sync: false  # Branch from local HEAD (offline / pinned base)
 
 # =============================================================================
+# JetBrains Junie ACP provider (model.provider: "junie-acp")
+# =============================================================================
+# Junie is an autonomous coding agent driven over the Agent Client Protocol:
+# Hermes spawns `junie --acp=true` and speaks ACP to it. Junie runs its OWN
+# read/edit/execute tools; Hermes keeps its agent-level tools (memory / skills /
+# todo) over a text bridge, so the self-improvement loop keeps working.
+#
+# Only the Junie token is an env var (JUNIE_API_KEY) — it is a credential.
+# Everything behavioral lives here.
+
+# junie_acp:
+#   # Path to the Junie CLI when it isn't on PATH.
+#   command: "~/.local/bin/junie"
+#
+#   # Launch args. Defaults to ["--acp=true", "--skip-update-check"].
+#   # args: ["--acp=true", "--skip-update-check"]
+#
+#   # How Hermes answers Junie's permission prompts (matters when Brave Mode is
+#   # off): "deny" (default, safe) rejects every request, "allow" approves once.
+#   permission: "deny"
+#
+#   # Force Junie's Brave Mode (auto-execute without asking). Omit to leave
+#   # Junie on its own persisted setting.
+#   # brave_mode: false
+#
+#   # Which Hermes tools are described to Junie. Default is the agent-level set
+#   # (memory, todo, skill_manage, skill_view, skills_list) — Junie's own
+#   # read/edit/execute capabilities are deliberately NOT re-offered, or Hermes
+#   # would re-run work Junie already finished. "all" forwards every Hermes tool,
+#   # "none" forwards none, or list exactly what you want.
+#   # forwarded_tools: [memory, todo, skill_manage, skill_view, skills_list]
+
+# The background memory/skill review inherits the main provider by default,
+# which on this provider means spawning an extra Junie session per review.
+# Route it to a cheaper model instead:
+# auxiliary:
+#   background_review:
+#     provider: "openrouter"
+#     model: "..."
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.

@@ -1,8 +1,8 @@
 ---
 name: junie
-description: "Delegate coding to the JetBrains Junie CLI (plan, implement, review)."
+description: "Delegate a coding goal to the JetBrains Junie CLI."
 version: 1.0.0
-author: Hermes Agent + JetBrains
+author: Alexander Prendota (@AlexanderPrendota) + Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
@@ -11,82 +11,89 @@ metadata:
     related_skills: [claude-code, codex, hermes-agent, opencode]
 ---
 
-# Junie — Hermes Orchestration Guide
+# Junie Skill
 
-Delegate coding tasks to [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli.html) — JetBrains' autonomous, LLM-agnostic coding agent CLI — via the Hermes terminal. Junie reads/edits files, runs commands, plans before acting, and reviews diffs. It brings its own agent harness (plan mode, code review, orchestrated sub-agents), so you delegate a *goal*, not step-by-step tool calls.
+Hands a coding *goal* to [JetBrains Junie](https://junie.jetbrains.com/docs/junie-cli.html) — JetBrains' autonomous, LLM-agnostic coding agent CLI — and reads back the result. Junie brings its own harness (plan mode, code review, orchestrated sub-agents), so you describe the outcome, not the steps.
 
-> Note: this is the **delegation** skill — Hermes (on any model) drives the `junie` CLI as a tool. It is distinct from the `junie-acp` **provider**, where Junie *is* the model backend driving Hermes. Use this skill when your current agent wants to hand a coding subtask to Junie.
->
-> On the `junie-acp` provider, Junie does the coding with its own tools while Hermes keeps its agent-level tools (`memory`, `todo`, `skill_manage`, `skill_view`, `skills_list`) over an ACP text bridge, so the memory/skill self-improvement loop keeps working. `HERMES_JUNIE_ACP_FORWARD_TOOLS` widens or narrows that set (`all` forwards Hermes' whole toolset). The background review inherits the provider by default, which spawns an extra Junie session per review — set `auxiliary.background_review.{provider,model}` to route it to a cheaper model.
+This skill does **not** drive Junie step by step, does not replace `patch` / `terminal` for small edits, and is not the `junie-acp` provider — see `## Pitfalls` for that distinction.
+
+## When to Use
+
+- A self-contained coding task worth delegating whole: a bug fix, a feature, a refactor across several files.
+- You want a plan before any edit lands (`--plan`) on a risky or large change.
+- You want a second agent to review a diff (`--review`).
+- **Not** for one-line edits or for reading code — `patch`, `read_file` and `search_files` are cheaper and immediate.
 
 ## Prerequisites
 
-- **Install:** `curl -fsSL https://junie.jetbrains.com/install.sh | bash` (EAP: `install-eap.sh`). Also PowerShell on Windows. Binary lands at `~/.local/bin/junie`.
-- **Auth (pick one):**
-  - JetBrains/Junie token: `export JUNIE_API_KEY='perm-...'` (generate at https://junie.jetbrains.com/tokens) or pass `--auth "$JUNIE_API_KEY"`.
-  - Interactive login: run `junie` once and sign in via the Account screen (browser).
-  - **BYOK** (bring your own model key): `--openai-api-key`, `--anthropic-api-key`, `--google-api-key`, `--grok-api-key`, `--openrouter-api-key`, or a LiteLLM proxy (`--litellm-url` + `--litellm-api-key`).
-- **Version:** `junie --version`. Add `--skip-update-check` in automation to avoid the startup update check.
+- **Install:** `curl -fsSL https://junie.jetbrains.com/install.sh | bash` (EAP: `install-eap.sh`; PowerShell on Windows). The binary lands at `~/.local/bin/junie`; check with `junie --version`.
+- **Auth, pick one:**
+  - JetBrains/Junie token: `JUNIE_API_KEY='perm-...'` in the environment (generate at https://junie.jetbrains.com/tokens), or pass `--auth "$JUNIE_API_KEY"`.
+  - Interactive login: run `junie` once and sign in on the Account screen.
+  - BYOK: `--openai-api-key`, `--anthropic-api-key`, `--google-api-key`, `--grok-api-key`, `--openrouter-api-key`, or a LiteLLM proxy (`--litellm-url` + `--litellm-api-key`).
+- **`tmux`** — only for the interactive mode in `## Procedure`.
 
-## Two Orchestration Modes
+## How to Run
 
-### Mode 1: Headless / Non-Interactive (PREFERRED for most tasks)
-
-One-shot: give Junie a task, it works autonomously and exits. No PTY, no prompts.
+Headless is the default. Use the `terminal` tool with `workdir` set to the target project:
 
 ```
-terminal(command="junie --auth=\"$JUNIE_API_KEY\" --skip-update-check --output-format json --json-output-file result.json 'Add error handling to all API calls in src/'", workdir="/path/to/project", timeout=180)
+terminal(
+  command="junie --skip-update-check --output-format json --json-output-file result.json 'Add error handling to all API calls in src/'",
+  workdir="/path/to/project",
+  timeout=180,
+)
 ```
 
-- The task is the positional arg (or `--task "..."`).
-- `--output-format text|json|json-stream`; prefer **`json` + `--json-output-file result.json`** then read the file — plain `text` output carries ANSI color codes that are messy to parse.
-- `--input-format text|json` accepts structured/piped input.
-- `-p, --project <dir>` sets the project dir (or just set `workdir`). ⚠️ In Junie `-p` means **project**, not print — there is no `-p` print flag like Claude Code.
+Then read the outcome with `read_file` on `result.json` — do not scrape the terminal text.
 
-**When to use:** bug fixes, features, refactors, CI/CD automation, structured extraction. Junie runs its own plan→implement→verify loop internally.
+## Quick Reference
 
-### Mode 2: Interactive PTY via tmux — Multi-Turn Sessions
+| Flag | Meaning |
+|---|---|
+| *(positional)* / `--task "..."` | the task itself; there is no print flag |
+| `--output-format text\|json\|json-stream` | prefer `json` with `--json-output-file` |
+| `-p, --project <dir>` | project dir — `-p` is **project**, not print |
+| `--plan` | read-only analysis proposing a plan before edits |
+| `--review` | reviews a git diff (needs a git repo) |
+| `--goal "..."` | multi-step run across sub-agents; CLI/TUI only |
+| `--model <id>`, `--effort low\|medium\|high` | e.g. `claude-opus-4-8`, `gemini-3-flash-preview` |
+| `--brave` | execute commands without asking (interactive) |
+| `--resume`, `--session-id <id>` | continue the last / a specific session |
+| `--skip-update-check` | always set this in automation |
+
+MCP: Junie is an MCP client — servers go in `.junie/mcp/mcp.json` (project) or `~/.junie/mcp/mcp.json` (user), and `/mcp` lists them. Its skills, commands and guidelines are user-authored under `~/.junie/` and `.junie/`; it does not create skills or persist memory across CLI sessions.
+
+## Procedure
+
+1. Confirm the CLI and auth: `junie --version` via `terminal`.
+2. For a risky or large change, run with `--plan` first and read the proposed plan.
+3. Run the task headless with `--output-format json --json-output-file result.json` and a `timeout` that fits the work (start at 180s).
+4. Read `result.json` with `read_file`; on failure the JSON carries the reason.
+5. Inspect what actually changed — `search_files`, `read_file`, and `git diff` via `terminal` — before reporting success.
+6. Multi-turn work only: drive an interactive session through tmux.
 
 ```
 terminal(command="tmux new-session -d -s junie-work -x 140 -y 40")
 terminal(command="tmux send-keys -t junie-work 'cd /path/to/project && junie' Enter")
-# wait for the welcome screen (~5s), then send the task
 terminal(command="sleep 6 && tmux send-keys -t junie-work 'Refactor the auth module to use JWT' Enter")
-# monitor
 terminal(command="sleep 15 && tmux capture-pane -t junie-work -p -S -60")
-# follow-up
-terminal(command="tmux send-keys -t junie-work 'Now add unit tests for the JWT code' Enter")
-# exit
 terminal(command="tmux send-keys -t junie-work '/exit' Enter")
 ```
 
-**When to use:** iterative work, human-in-the-loop, exploratory sessions, or to use Junie's slash commands (`/plan`, `/review`, `/usage`).
+Interactive mode is what unlocks Junie's slash commands (`/plan`, `/review`, `/usage`).
 
-## Junie-Specific Capabilities
+## Pitfalls
 
-- **Plan mode** — `--plan` (or `/plan` in a session): read-only analysis that proposes a plan before editing. Approve/refine, then implement. Good for risky or large changes.
-- **Code review** — `--review` (or `/review`): reviews a git diff (vs main, last commit, or a described scope). Requires a git repo.
-- **Orchestrated mode** — `--goal "..."` runs a multi-step task decomposed across sub-agents (plan → code → review → git). CLI/TUI only.
-- **Model control** — `--model <id>` (e.g. `claude-opus-4-8`, `gemini-3-flash-preview`, `gpt-5.x`, `grok-4.3`), `--effort low|medium|high`, `--provider <byok>`.
-- **Brave Mode** — `--brave` executes commands without asking (interactive). Otherwise Junie asks before acting.
-- **MCP** — Junie is an MCP client: configure servers in `.junie/mcp/mcp.json` (project) or `~/.junie/mcp/mcp.json` (user); `/mcp` lists them.
-- **Skills / commands / guidelines** — user-authored, loaded from `~/.junie/` and `.junie/` (Junie does not auto-create skills or persist cross-session memory in the CLI).
+- **This skill vs the `junie-acp` provider.** Here Hermes drives the `junie` CLI as a tool. On the provider, Junie *is* the backend driving Hermes: it does the coding with its own tools while Hermes keeps its agent-level tools (memory, todo, skills) over an ACP text bridge, so the self-improvement loop keeps working. Provider settings live under `junie_acp:` in `config.yaml`, where `forwarded_tools` widens or narrows that set. The background review inherits the provider by default, which spawns an extra Junie session per review — route it elsewhere with `auxiliary.background_review.{provider,model}`.
+- **ANSI in text output.** Plain `text` output carries color codes; prefer `json` + `--json-output-file` in automation.
+- **Cold start.** The first invocation pays a JVM/agent startup cost of several seconds. An interactive tmux session reuses the process across turns.
+- **Auth in automation.** Headless runs never open a browser login — pass `--auth "$JUNIE_API_KEY"` or make sure the variable is in the process environment.
+- **`--goal` is CLI/TUI only** and does not behave the same in a headless JSON pipeline; for scripted use prefer a plain task or `--plan`.
+- **`-p` is `--project`.** Non-interactive is simply the positional task.
 
-## Session Continuation
+## Verification
 
-- `--resume` resumes the last session; `--session-id <id>` follows a specific one.
-
-## Pitfalls & Gotchas
-
-- **ANSI in text output:** use `--output-format json --json-output-file` for clean, parseable results in automation.
-- **Cold start:** the first invocation pays a JVM/agent startup cost (several seconds). Interactive tmux sessions reuse the process across turns.
-- **Auth in automation:** pass `--auth "$JUNIE_API_KEY"` (perm-...) explicitly, or ensure `JUNIE_API_KEY` is in the process env; headless runs won't open a browser login.
-- **`--goal` is CLI/TUI only** and not available in headless JSON pipelines the same way — for scripted use prefer a plain task or `--plan`.
-- **No `-p` print flag:** `-p` is `--project`. Non-interactive is simply the positional task.
-
-## Rules for Hermes Agents
-
-1. Prefer Mode 1 (headless JSON) for anything scriptable; reach for tmux only when you need multi-turn interaction.
-2. Always run inside the target project (`workdir` / `--project`), and set `--skip-update-check` in automation.
-3. For large or destructive changes, run `--plan` first, inspect the plan, then implement.
-4. Read `result.json` for the outcome rather than scraping colored terminal text.
+- `junie --version` returns a version.
+- `result.json` exists and reports success.
+- The change is real: `git diff --stat` via `terminal` shows the expected files, and the project's own tests pass.

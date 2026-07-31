@@ -22,6 +22,7 @@ import agent.junie_acp_client as junie_mod
 from agent.junie_acp_client import (
     JunieACPClient,
     _HermesClient,
+    _build_subprocess_env,
     _choose_permission_option,
     _extract_model_ids,
     _format_messages_as_prompt,
@@ -122,6 +123,56 @@ class JunieLaunchResolutionTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             client = JunieACPClient(acp_cwd="/tmp")
         self.assertIsNone(client._brave_override)
+
+
+# --------------------------------------------------------------------------- #
+# Subprocess environment: Tier-1 secrets must never reach the agent           #
+# --------------------------------------------------------------------------- #
+class SubprocessEnvTests(unittest.TestCase):
+    """Junie is a third-party model-driving subprocess.
+
+    It legitimately needs LLM provider credentials (BYOK keys), so Tier-2 is
+    inherited — but Tier-1 secrets (gateway bot tokens, GitHub auth, infra) have
+    no business in it. A raw ``os.environ.copy()`` would hand over all of them,
+    which is why this routes through ``hermes_subprocess_env`` like the sibling
+    ACP client does.
+    """
+
+    _TIER1 = {
+        "GITHUB_TOKEN": "ghp_should_not_leak",
+        "GH_TOKEN": "gho_should_not_leak",
+        "TELEGRAM_BOT_TOKEN": "123:should_not_leak",
+        "SLACK_BOT_TOKEN": "xoxb-should-not-leak",
+        "DISCORD_BOT_TOKEN": "discord_should_not_leak",
+    }
+
+    def test_tier1_secrets_are_stripped(self) -> None:
+        with patch.dict(os.environ, self._TIER1, clear=False):
+            env = _build_subprocess_env()
+        leaked = sorted(k for k in self._TIER1 if k in env)
+        self.assertEqual(leaked, [], f"Tier-1 secrets leaked to Junie: {leaked}")
+        leaked_values = sorted(
+            k for k, v in env.items() if isinstance(v, str) and "should_not_leak" in v
+        )
+        self.assertEqual(leaked_values, [], f"secret values leaked under: {leaked_values}")
+
+    def test_provider_credentials_still_reach_junie(self) -> None:
+        # Junie drives models itself: BYOK keys and its own token must survive,
+        # otherwise the provider cannot authenticate at all.
+        creds = {
+            "JUNIE_API_KEY": "perm-junie-token",
+            "ANTHROPIC_API_KEY": "sk-ant-byok",
+            "OPENAI_API_KEY": "sk-openai-byok",
+        }
+        with patch.dict(os.environ, creds, clear=False):
+            env = _build_subprocess_env()
+        for key, value in creds.items():
+            self.assertEqual(env.get(key), value, f"{key} did not reach Junie")
+
+    def test_home_is_always_set(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            env = _build_subprocess_env()
+        self.assertTrue(env.get("HOME"), "child process needs a writable HOME")
 
 
 # --------------------------------------------------------------------------- #
@@ -423,6 +474,47 @@ class ToolBridgeTests(unittest.TestCase):
             self.assertEqual(_resolve_forwarded_tools(), frozenset())
         with patch.dict(os.environ, {"HERMES_JUNIE_ACP_FORWARD_TOOLS": "memory, todo"}, clear=True):
             self.assertEqual(_resolve_forwarded_tools(), frozenset({"memory", "todo"}))
+
+    def test_settings_come_from_config_yaml(self) -> None:
+        """Behavioral settings are config.yaml-backed; .env is for secrets only."""
+        cfg = {
+            "junie_acp": {
+                "permission": "allow",
+                "brave_mode": False,
+                "forwarded_tools": ["memory", "todo"],
+                "command": "/opt/junie/bin/junie",
+                "args": ["--acp=true", "--quiet"],
+            }
+        }
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "hermes_cli.config.load_config_readonly", return_value=cfg
+        ):
+            self.assertEqual(_resolve_permission_policy(), "allow")
+            self.assertIs(_resolve_brave_override(), False)
+            self.assertEqual(_resolve_forwarded_tools(), frozenset({"memory", "todo"}))
+            self.assertEqual(_resolve_command(), "/opt/junie/bin/junie")
+            self.assertEqual(_resolve_args(), ["--acp=true", "--quiet"])
+
+    def test_env_bridge_wins_over_config(self) -> None:
+        # The env names stay as an internal bridge for a one-off run: narrower
+        # scope wins, but config.yaml is the documented surface.
+        cfg = {"junie_acp": {"permission": "deny", "forwarded_tools": "none"}}
+        with patch.dict(
+            os.environ,
+            {"HERMES_JUNIE_ACP_PERMISSION": "allow",
+             "HERMES_JUNIE_ACP_FORWARD_TOOLS": "memory"},
+            clear=True,
+        ), patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+            self.assertEqual(_resolve_permission_policy(), "allow")
+            self.assertEqual(_resolve_forwarded_tools(), frozenset({"memory"}))
+
+    def test_config_all_and_none_keywords(self) -> None:
+        for value, expected in (("all", None), ("none", frozenset())):
+            with patch.dict(os.environ, {}, clear=True), patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"junie_acp": {"forwarded_tools": value}},
+            ):
+                self.assertEqual(_resolve_forwarded_tools(), expected)
 
     def test_prompt_forwards_agent_level_tools_but_not_junies_own_work(self) -> None:
         prompt = _format_messages_as_prompt(

@@ -30,8 +30,8 @@ Two kinds of tool call meet here, and the distinction is load-bearing:
     forwarded into the prompt as text and parsed back out of the response via
     the shared bridge in ``agent/acp_openai_bridge.py``. Without that, nothing
     agentic could be written for a whole junie-acp session. The forwarded set is
-    an allowlist (``HERMES_JUNIE_ACP_FORWARD_TOOLS`` overrides it; ``all``
-    forwards Hermes' entire toolset).
+    an allowlist (``junie_acp.forwarded_tools`` in config.yaml overrides it;
+    ``all`` forwards Hermes' entire toolset).
 
 A Hermes tool call splits one user turn into several ACP prompts. The first
 opens a fresh session with the full transcript; the continuations reuse that
@@ -72,6 +72,7 @@ from agent.acp_openai_bridge import (
 )
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
+from tools.environments.local import hermes_subprocess_env
 
 logger = logging.getLogger(__name__)
 
@@ -205,16 +206,25 @@ def _rough_tokens(text: str | None) -> int:
 
 
 def _resolve_command() -> str:
+    """Path to the Junie CLI. config.yaml: ``junie_acp.command``."""
     return (
         os.getenv("HERMES_JUNIE_ACP_COMMAND", "").strip()
         or os.getenv("JUNIE_CLI_PATH", "").strip()
+        or str(_junie_config().get("command", "") or "").strip()
         or "junie"
     )
 
 
 def _resolve_args() -> list[str]:
+    """Launch args for the Junie CLI. config.yaml: ``junie_acp.args`` (list or
+    string). ``JUNIE_API_KEY`` stays an env var — it is a credential."""
     raw = os.getenv("HERMES_JUNIE_ACP_ARGS", "").strip()
-    args = shlex.split(raw) if raw else ["--acp=true", "--skip-update-check"]
+    cfg_args = _junie_config().get("args") if not raw else None
+    if isinstance(cfg_args, (list, tuple)):
+        args = [str(a) for a in cfg_args if str(a).strip()]
+    else:
+        raw = raw or str(cfg_args or "").strip()
+        args = shlex.split(raw) if raw else ["--acp=true", "--skip-update-check"]
     # Inject auth from the environment when the caller hasn't already supplied
     # a token via --auth. Junie accepts a JetBrains/Junie token (perm-...).
     if "--auth" not in args and not any(a.startswith("--auth=") for a in args):
@@ -224,26 +234,53 @@ def _resolve_args() -> list[str]:
     return args
 
 
+def _junie_config() -> dict[str, Any]:
+    """The ``junie_acp:`` block from config.yaml (empty dict when unset).
+
+    Behavioral settings live here, not in ``HERMES_*`` env vars — ``.env`` is for
+    secrets only (AGENTS.md). The env names are kept as an internal bridge for a
+    one-off run or a test and take precedence when set, being the narrower scope;
+    config.yaml is the documented, persistent surface.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        block = load_config_readonly().get("junie_acp")
+    except Exception:
+        return {}
+    return block if isinstance(block, dict) else {}
+
+
 def _resolve_permission_policy() -> str:
     """How the client answers Junie's session/request_permission requests.
 
     "deny" (default, safe): reject every request (Junie can't act without
     explicit consent — matters only when Brave Mode is OFF). "allow": approve
     once. This is the seam a future Hermes-approval bridge would replace.
+
+    config.yaml: ``junie_acp.permission: allow|deny``.
     """
     val = os.getenv("HERMES_JUNIE_ACP_PERMISSION", "").strip().lower()
+    if not val:
+        val = str(_junie_config().get("permission", "") or "").strip().lower()
     return "allow" if val in ("allow", "allow_once", "yes", "1", "true") else "deny"
 
 
 def _resolve_forwarded_tools() -> frozenset[str] | None:
     """Which Hermes tools are described to Junie via the text bridge.
 
-    Default: the agent-level allowlist (``memory``, ``todo``, ``skill_manage``).
-    ``HERMES_JUNIE_ACP_FORWARD_TOOLS`` overrides it — ``all`` forwards Hermes'
-    entire toolset (returns None, i.e. no filtering), ``none`` forwards nothing,
-    and a comma/space separated list forwards exactly those names.
+    Default: the agent-level allowlist (:data:`_DEFAULT_FORWARDED_TOOLS`).
+    ``all`` forwards Hermes' entire toolset (returns None, i.e. no filtering),
+    ``none`` forwards nothing, and a list forwards exactly those names.
+
+    config.yaml: ``junie_acp.forwarded_tools: all | none | [memory, todo]``.
     """
-    raw = os.getenv("HERMES_JUNIE_ACP_FORWARD_TOOLS", "").strip()
+    raw_env = os.getenv("HERMES_JUNIE_ACP_FORWARD_TOOLS", "").strip()
+    raw_cfg = _junie_config().get("forwarded_tools") if not raw_env else None
+    if isinstance(raw_cfg, (list, tuple, set)):
+        names = frozenset(str(n).strip() for n in raw_cfg if str(n).strip())
+        return names or frozenset()
+    raw = raw_env or str(raw_cfg or "").strip()
     if not raw:
         return frozenset(_DEFAULT_FORWARDED_TOOLS)
     lowered = raw.lower()
@@ -259,8 +296,15 @@ def _resolve_brave_override() -> bool | None:
 
     Returns True/False to force it via session/set_config_option, or None to
     leave Junie on its own persisted/default setting.
+
+    config.yaml: ``junie_acp.brave_mode: true|false`` (omit to not override).
     """
     val = os.getenv("HERMES_JUNIE_ACP_BRAVE", "").strip().lower()
+    if not val:
+        cfg_val = _junie_config().get("brave_mode")
+        if isinstance(cfg_val, bool):
+            return cfg_val
+        val = str(cfg_val or "").strip().lower()
     if val in ("on", "1", "true", "yes"):
         return True
     if val in ("off", "0", "false", "no"):
@@ -294,7 +338,13 @@ def _resolve_home_dir() -> str:
 
 
 def _build_subprocess_env() -> dict[str, str]:
-    env = os.environ.copy()
+    # Junie is a model-driving CLI executor: it legitimately needs LLM provider
+    # credentials (BYOK keys, its own token). Route through the central helper so
+    # Tier-1 secrets (gateway bot tokens, GitHub auth, remote-compute/infra) are
+    # still stripped — a raw os.environ.copy() would hand every one of them to a
+    # third-party subprocess. Same policy as agent/copilot_acp_client.py and
+    # agent/transports/codex_app_server.py (#29157).
+    env = hermes_subprocess_env(inherit_credentials=True)
     home = _resolve_home_dir()
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
