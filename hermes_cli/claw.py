@@ -68,7 +68,7 @@ def _detect_openclaw_processes() -> list[str]:
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "is-active", "openclaw-gateway.service"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
             if result.stdout.strip() == "active":
                 found.append("systemd service: openclaw-gateway.service")
@@ -81,7 +81,7 @@ def _detect_openclaw_processes() -> list[str]:
             for exe in ("openclaw.exe", "clawd.exe"):
                 result = subprocess.run(
                     ["tasklist", "/FI", f"IMAGENAME eq {exe}"],
-                    capture_output=True, text=True, timeout=5,
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
                 )
                 if exe in result.stdout.lower():
                     found.append(f"process: {exe}")
@@ -95,7 +95,7 @@ def _detect_openclaw_processes() -> list[str]:
             )
             result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
             )
             if result.stdout.strip():
                 found.append(f"node.exe process with openclaw in command line (PID {result.stdout.strip()})")
@@ -105,7 +105,7 @@ def _detect_openclaw_processes() -> list[str]:
         try:
             result = subprocess.run(
                 ["pgrep", "-f", "openclaw"],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=3,
             )
             if result.returncode == 0:
                 pids = result.stdout.strip().split()
@@ -177,7 +177,7 @@ def _warn_if_gateway_running(auto_yes: bool) -> None:
         "conflicts (Telegram, Discord, and Slack only allow one active "
         "session per token)."
     )
-    print_info("Recommendation: stop the gateway first with 'hermes stop'.")
+    print_info("Recommendation: stop the gateway first with 'hermes gateway stop'.")
     print()
     if not auto_yes and not prompt_yes_no("Continue anyway?", default=False):
         print_info("Migration cancelled. Stop the gateway and try again.")
@@ -298,7 +298,7 @@ def claw_command(args):
 
     if action == "migrate":
         _cmd_migrate(args)
-    elif action in ("cleanup", "clean"):
+    elif action in {"cleanup", "clean"}:
         _cmd_cleanup(args)
     else:
         print("Usage: hermes claw <command> [options]")
@@ -670,17 +670,16 @@ def _cmd_cleanup(args):
         elif not auto_yes and not sys.stdin.isatty():
             print_info(f"Non-interactive session — would archive: {source_dir}")
             print_info("To execute, re-run with: hermes claw cleanup --yes")
+        elif auto_yes or prompt_yes_no(f"Archive {source_dir}?", default=True):
+            try:
+                archive_path = _archive_directory(source_dir)
+                print_success(f"Archived: {source_dir} → {archive_path}")
+                total_archived += 1
+            except OSError as e:
+                print_error(f"Could not archive: {e}")
+                print_info(f"Try manually: mv {source_dir} {source_dir}.pre-migration")
         else:
-            if auto_yes or prompt_yes_no(f"Archive {source_dir}?", default=True):
-                try:
-                    archive_path = _archive_directory(source_dir)
-                    print_success(f"Archived: {source_dir} → {archive_path}")
-                    total_archived += 1
-                except OSError as e:
-                    print_error(f"Could not archive: {e}")
-                    print_info(f"Try manually: mv {source_dir} {source_dir}.pre-migration")
-            else:
-                print_info("Skipped.")
+            print_info("Skipped.")
 
     # Summary
     print()
