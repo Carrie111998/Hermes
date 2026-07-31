@@ -2890,11 +2890,13 @@ async function releaseBackendLock(updateRoot, tag) {
 // Detection (checkUpdates / commit changelog / "N behind") stays in the UI;
 // only this apply action changed.
 async function applyUpdates(opts = {}) {
-  if (updateInFlight) {
+  if (updateInFlight || readLiveUpdateMarker(HERMES_HOME)) {
     throw new Error('An update is already in progress.')
   }
 
   updateInFlight = true
+
+  let handedOff = false
 
   try {
     const updater = resolveUpdaterBinary()
@@ -3059,9 +3061,19 @@ async function applyUpdates(opts = {}) {
       app.quit()
     }, UPDATE_HANDOFF_DWELL_MS)
 
+    handedOff = true
+
     return { ok: true, handedOff: true, updater }
   } finally {
-    updateInFlight = false
+    // Only reset the in-flight flag on failure. On success the process is
+    // about to quit (UPDATE_HANDOFF_DWELL_MS); clearing the flag here would
+    // reopen a ~2.5s window where a second click / renderer retry spawns a
+    // second updater that then trips the cross-process marker and aborts
+    // ("Another Hermes update is already running") — every GUI update then
+    // fails. The flag stays set until the process exits.
+    if (!handedOff) {
+      updateInFlight = false
+    }
   }
 }
 
