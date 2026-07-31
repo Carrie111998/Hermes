@@ -42,6 +42,19 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         m_run.assert_not_called()
 
+    def test_execute_job_now_rejects_local_overlap_before_claim(self):
+        from cron.scheduler import _acquire_running_job_lease
+
+        lease = _acquire_running_job_lease("job-run-1")
+        assert lease is not None
+        try:
+            with patch("tools.cronjob_tools.claim_job_for_fire") as m_claim:
+                res = _execute_job_now(dict(_JOB))
+            assert res["claimed"] is False
+            m_claim.assert_not_called()
+        finally:
+            lease.release()
+
     def test_execute_job_now_marks_failure_on_exception(self):
         """An exception during fire is captured, marked failed, not propagated."""
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \

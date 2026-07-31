@@ -66,6 +66,22 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_direct_run_one_job_rejects_an_existing_lease_before_execution(monkeypatch):
+    lease = s._acquire_running_job_lease("j2-duplicate")
+    assert lease is not None
+    try:
+        created = []
+        monkeypatch.setattr(
+            s,
+            "create_execution",
+            lambda *_args, **_kwargs: created.append("execution"),
+        )
+        assert s.run_one_job({"id": "j2-duplicate", "name": "t"}) is False
+        assert not created
+    finally:
+        lease.release()
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads

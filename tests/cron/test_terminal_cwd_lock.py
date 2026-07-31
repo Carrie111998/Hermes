@@ -10,6 +10,7 @@ jobs as readers (concurrent with each other, excluded from a writer's run).
 These tests assert that contract.
 """
 
+import os
 import threading
 
 
@@ -189,3 +190,93 @@ def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):
     t.start()
     assert acquired.wait(timeout=5), "writer lock was leaked by run_job on exception"
     t.join(timeout=5)
+
+
+def test_queued_writer_snapshots_terminal_cwd_after_its_lock_acquires(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock, patch
+    import cron.scheduler as sched
+
+    workdir_a = tmp_path / "a"
+    workdir_b = tmp_path / "b"
+    workdir_a.mkdir()
+    workdir_b.mkdir()
+    original = "scheduler-cwd"
+    monkeypatch.setenv("TERMINAL_CWD", original)
+    a_started = threading.Event()
+    b_waiting = threading.Event()
+    release_a = threading.Event()
+    base_lock = sched._ReadWriteLock()
+
+    class ObservedLock:
+        def acquire_write(self):
+            if threading.current_thread().name == "writer-b":
+                b_waiting.set()
+            base_lock.acquire_write()
+
+        def release_write(self):
+            base_lock.release_write()
+
+        def acquire_read(self):
+            base_lock.acquire_read()
+
+        def release_read(self):
+            base_lock.release_read()
+
+    class Agent:
+        def __init__(self, started=None, release=None):
+            self.started = started
+            self.release = release
+
+        def run_conversation(self, _prompt):
+            if self.started is not None:
+                self.started.set()
+            if self.release is not None:
+                assert self.release.wait(timeout=5)
+            return {"final_response": "done"}
+
+        def close(self):
+            return None
+
+    agent_a = Agent(a_started, release_a)
+    agent_b = Agent()
+    monkeypatch.setattr(sched, "_terminal_cwd_lock", ObservedLock())
+    runtime = {
+        "api_key": "test-key",
+        "base_url": "https://example.invalid/v1",
+        "provider": "openrouter",
+        "api_mode": "chat_completions",
+    }
+    patches = [
+        patch("cron.scheduler._hermes_home", tmp_path),
+        patch("cron.scheduler._resolve_origin", return_value=None),
+        patch("hermes_cli.env_loader.load_hermes_dotenv"),
+        patch("hermes_cli.env_loader.reset_secret_source_cache"),
+        patch("hermes_state.SessionDB", return_value=MagicMock()),
+        patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=runtime),
+        patch("run_agent.AIAgent", side_effect=[agent_a, agent_b]),
+    ]
+    with patch("cron.scheduler.save_job_output", return_value=None), \
+         patch("cron.scheduler._deliver_result", return_value=None), \
+         patch("cron.scheduler.mark_job_run"), \
+         patch("cron.scheduler.claim_dispatch", return_value=True):
+        with __import__("contextlib").ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            writer_a = threading.Thread(
+                target=lambda: sched.run_job({"id": "a", "name": "a", "prompt": "a", "workdir": str(workdir_a)}),
+                name="writer-a",
+            )
+            writer_b = threading.Thread(
+                target=lambda: sched.run_job({"id": "b", "name": "b", "prompt": "b", "workdir": str(workdir_b)}),
+                name="writer-b",
+            )
+            writer_a.start()
+            assert a_started.wait(timeout=5)
+            writer_b.start()
+            assert b_waiting.wait(timeout=5)
+            release_a.set()
+            writer_a.join(timeout=5)
+            writer_b.join(timeout=5)
+
+    assert not writer_a.is_alive() and not writer_b.is_alive()
+    assert os.environ["TERMINAL_CWD"] == original

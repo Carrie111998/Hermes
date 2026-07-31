@@ -102,15 +102,21 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
-        from cron.scheduler import run_one_job
+        from cron.scheduler import _acquire_running_job_lease, run_one_job
 
-        if not claim_job_for_fire(job_id):
-            return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        lease = _acquire_running_job_lease(job_id)
+        if lease is None:
+            return False
+        try:
+            if not claim_job_for_fire(job_id):
+                return False  # another machine already claimed this fire
+            job = get_job(job_id)
+            if job is None:
+                return False  # job removed (e.g. repeat-N exhausted) between arm and fire
+            job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+            return run_one_job(job, adapters=adapters, loop=loop, lease=lease)
+        finally:
+            lease.release()
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

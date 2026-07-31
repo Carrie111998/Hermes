@@ -9,10 +9,14 @@ Tests cover:
 """
 
 import concurrent.futures
+import contextvars
+import itertools
 import os
 import sys
+import threading
 import time
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 
 # Ensure project root is importable
@@ -224,6 +228,123 @@ class TestInactivityTimeout:
         # Should NOT have timed out — bare agent has no get_activity_summary
         assert not _inactivity_timeout
         assert result["final_response"] == "no activity tracker"
+
+    def test_timeout_keeps_terminal_lifecycle_open_until_nested_worker_exits(self, tmp_path, monkeypatch):
+        """A timed-out agent stays admitted until its submitted worker exits."""
+        import cron.scheduler as scheduler
+
+        started = threading.Event()
+        interrupted = threading.Event()
+        release = threading.Event()
+        terminalized = threading.Event()
+        terminal = []
+        mark_calls = []
+        fire_heartbeats = []
+        profile_seen = []
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        profile_home = tmp_path / "profile"
+        profile_token = set_hermes_home_override(profile_home)
+
+        class EventControlledAgent:
+            def get_activity_summary(self):
+                return {
+                    "last_activity_desc": "tool_call",
+                    "seconds_since_activity": 1,
+                    "api_call_count": 1,
+                    "max_iterations": 90,
+                }
+
+            def interrupt(self, _message):
+                interrupted.set()
+
+            def run_conversation(self, _prompt):
+                profile_seen.append(get_hermes_home_override())
+                started.set()
+                assert release.wait(timeout=5)
+                return {"final_response": "late success", "messages": []}
+
+            def close(self):
+                terminal.append("teardown")
+
+        def immediate_poll(futures, timeout):
+            done = {future for future in futures if future.done()}
+            return done, set(futures) - done
+
+        agent = EventControlledAgent()
+        fake_db = MagicMock()
+        fake_db.close.side_effect = lambda: terminal.append("db-close")
+        monkeypatch.setattr(scheduler.concurrent.futures, "wait", immediate_poll)
+        clock = itertools.count(start=0, step=61)
+        monkeypatch.setattr(scheduler.time, "monotonic", lambda: next(clock))
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.1")
+        monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+        monkeypatch.setattr(scheduler, "mark_execution_running", lambda _execution_id: None)
+        monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: terminal.append("save"))
+        monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: terminal.append("deliver"))
+        def mark(*args, **kwargs):
+            mark_calls.append((args, kwargs))
+            terminal.append("mark")
+            terminalized.set()
+
+        monkeypatch.setattr(scheduler, "mark_job_run", mark)
+        monkeypatch.setattr(scheduler, "finish_execution", lambda *_args, **_kwargs: terminal.append("finish"))
+        monkeypatch.setattr(
+            scheduler,
+            "heartbeat_fire_claim",
+            lambda job_id, *, expected_incarnation: fire_heartbeats.append((job_id, expected_incarnation)) or True,
+        )
+
+        result = []
+        run_context = contextvars.copy_context()
+        thread = threading.Thread(
+            target=lambda: run_context.run(
+                lambda: result.append(
+                    scheduler.run_one_job({
+                        "id": "timeout-job",
+                        "name": "timeout",
+                        "prompt": "go",
+                        "execution_id": "e1",
+                        "fire_claim": {"incarnation": "fire-incarnation"},
+                    })
+                )
+            ),
+        )
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+                 "api_key": "test-key",
+                 "base_url": "https://example.invalid/v1",
+                 "provider": "openrouter",
+                 "api_mode": "chat_completions",
+             }), \
+             patch("run_agent.AIAgent", return_value=agent):
+            thread.start()
+            assert started.wait(timeout=5)
+            assert interrupted.wait(timeout=5)
+            try:
+                assert not terminalized.wait(timeout=0.2)
+                assert thread.is_alive()
+                assert fire_heartbeats
+            finally:
+                release.set()
+            thread.join(timeout=5)
+        reset_hermes_home_override(profile_token)
+
+        assert not thread.is_alive()
+        assert result == [True]
+        assert terminal == ["db-close", "save", "deliver", "teardown", "mark", "finish"]
+        assert len(mark_calls) == 1
+        assert mark_calls[0][0][1] is False
+        assert "idle for" in mark_calls[0][0][2]
+        assert profile_seen == [str(profile_home)]
+        assert all(heartbeat == ("timeout-job", "fire-incarnation") for heartbeat in fire_heartbeats)
 
 
 class TestSysPathOrdering:

@@ -253,6 +253,22 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     assert ran == ["j1"]
 
 
+def test_fire_due_rejects_local_overlap_before_creating_a_fire_claim(monkeypatch):
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    lease = sched._acquire_running_job_lease("j1-overlap")
+    assert lease is not None
+    try:
+        claimed = []
+        monkeypatch.setattr(jobs, "claim_job_for_fire", lambda job_id: claimed.append(job_id) or True)
+        assert InProcessCronScheduler().fire_due("j1-overlap") is False
+        assert not claimed
+    finally:
+        lease.release()
+
+
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
 
 

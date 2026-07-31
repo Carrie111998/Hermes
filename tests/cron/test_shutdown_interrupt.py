@@ -11,7 +11,10 @@ Covers the cron/scheduler.py primitives directly:
     result AFTER its tool was already killed out from under it
 """
 
-from unittest.mock import patch
+import contextvars
+import itertools
+import threading
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -111,6 +114,127 @@ class TestMarkRunningJobsInterrupted:
             marked = sched.mark_running_jobs_interrupted("shutdown")
 
         assert marked == ["job-2"]
+
+    def test_keeps_timed_out_live_worker_claims_until_its_real_run_exits(
+        self, tmp_path, monkeypatch,
+    ):
+        """Gateway shutdown leaves a timeout join to its existing terminal path."""
+        import cron.jobs as jobs
+        import cron.scheduler as sched
+
+        started = threading.Event()
+        interrupted = threading.Event()
+        release = threading.Event()
+        marks = []
+        shutdown_marks = []
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        stored_job = jobs.create_job(
+            prompt="go",
+            schedule="every 5m",
+            name="timed-out external fire",
+        )
+        job_id = stored_job["id"]
+        assert jobs.claim_job_for_fire(job_id) is True
+        jobs_data = jobs.load_jobs()
+        jobs_data[0]["run_claim"] = {
+            "at": jobs_data[0]["fire_claim"]["at"],
+            "by": "one-shot-owner",
+        }
+        jobs.save_jobs(jobs_data)
+        job = jobs.get_job(job_id)
+        original_fire_claim = dict(job["fire_claim"])
+        original_run_claim = dict(job["run_claim"])
+
+        class EventControlledAgent:
+            def get_activity_summary(self):
+                return {
+                    "last_activity_desc": "tool_call",
+                    "seconds_since_activity": 1,
+                    "api_call_count": 1,
+                    "max_iterations": 90,
+                }
+
+            def interrupt(self, _message):
+                shutdown_marks.append(
+                    sched.mark_running_jobs_interrupted("gateway shutdown")
+                )
+                interrupted.set()
+
+            def run_conversation(self, _prompt):
+                started.set()
+                assert release.wait(timeout=5)
+                return {"final_response": "late success", "messages": []}
+
+            def close(self):
+                return None
+
+        def immediate_poll(futures, timeout):
+            done = {future for future in futures if future.done()}
+            return done, set(futures) - done
+
+        real_mark = jobs.mark_job_run
+
+        def observed_mark(*args, **kwargs):
+            marks.append((args, kwargs))
+            return real_mark(*args, **kwargs)
+
+        monkeypatch.setattr(sched.concurrent.futures, "wait", immediate_poll)
+        clock = itertools.count(start=0, step=61)
+        monkeypatch.setattr(sched.time, "monotonic", lambda: next(clock))
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0.1")
+        monkeypatch.setattr(sched, "claim_dispatch", lambda _job_id: True)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_args: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(sched, "mark_job_run", observed_mark)
+
+        result = []
+        worker_context = contextvars.copy_context()
+        worker = threading.Thread(
+            target=lambda: worker_context.run(
+                lambda: result.append(sched.run_one_job(job))
+            ),
+        )
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=MagicMock()), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+                 "api_key": "test-key",
+                 "base_url": "https://example.invalid/v1",
+                 "provider": "openrouter",
+                 "api_mode": "chat_completions",
+             }), \
+             patch("run_agent.AIAgent", return_value=EventControlledAgent()):
+            worker.start()
+            assert started.wait(timeout=5)
+            assert interrupted.wait(timeout=5)
+            try:
+                assert shutdown_marks == [[]]
+                assert marks == []
+                assert job_id in sched.get_running_job_ids()
+                assert job_id not in sched._interrupted_job_ids
+                persisted = jobs.get_job(job_id)
+                assert (
+                    persisted["fire_claim"]["incarnation"]
+                    == original_fire_claim["incarnation"]
+                )
+                assert persisted["run_claim"] == original_run_claim
+            finally:
+                release.set()
+            worker.join(timeout=5)
+
+        assert not worker.is_alive()
+        assert result == [True]
+        assert len(marks) == 1
+        assert marks[0][0][0] == job_id
+        assert marks[0][0][1] is False
+        assert "idle for" in marks[0][0][2]
+        persisted = jobs.get_job(job_id)
+        assert persisted["fire_claim"] is None
+        assert persisted["run_claim"] is None
+        assert job_id not in sched.get_running_job_ids()
 
 
 class TestIsInterrupted:

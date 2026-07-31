@@ -2013,7 +2013,11 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "incarnation": uuid.uuid4().hex,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
@@ -2022,6 +2026,24 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             save_jobs(jobs)
             return True
         return False
+
+
+def heartbeat_fire_claim(job_id: str, *, expected_incarnation: str) -> bool:
+    """Refresh one matching external-fire claim while its worker remains live."""
+    if not expected_incarnation:
+        return False
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("fire_claim")
+            if not isinstance(claim, dict) or claim.get("incarnation") != expected_incarnation:
+                return False
+            claim["at"] = _hermes_now().isoformat()
+            save_jobs(jobs)
+            return True
+    return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
