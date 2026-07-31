@@ -9,8 +9,9 @@ same key. The fix prefixes keys with platform value: 'telegram:123' vs
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -100,6 +101,47 @@ class TestLegacyKeyMigration:
             assert mock_logger.warning.called
             warning_calls = [str(call) for call in mock_logger.warning.call_args_list]
             assert any("Skipping legacy unprefixed voice mode key" in str(c) for c in warning_calls)
+
+
+class TestMultiplexVoiceInputRouting:
+    """Voice transcripts stay on the Discord adapter that received them."""
+
+    @pytest.mark.asyncio
+    async def test_named_profile_callback_dispatches_through_named_adapter(self):
+        runner = _make_runner()
+        runner.session_store = MagicMock()
+        runner._make_profile_message_handler = MagicMock(return_value=MagicMock())
+        runner._make_profile_fatal_error_handler = MagicMock(return_value=MagicMock())
+        runner._make_adapter_auth_check = MagicMock(return_value=MagicMock())
+        runner._is_user_authorized = MagicMock(return_value=True)
+        runner._is_duplicate_voice_transcript = MagicMock(return_value=False)
+
+        default_adapter = MagicMock()
+        default_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = default_adapter
+
+        named_adapter = MagicMock()
+        named_adapter.platform = Platform.DISCORD
+        named_adapter._voice_input_callback = None
+        named_adapter._voice_text_channels = {111: 123}
+        named_adapter._voice_sources = {}
+        named_adapter._client.get_channel.return_value = None
+        named_adapter._resolve_channel_prompt = MagicMock(return_value=None)
+        named_adapter.handle_message = AsyncMock()
+
+        runner._configure_profile_adapter(
+            named_adapter,
+            "catgirl",
+            Platform.DISCORD,
+        )
+        await named_adapter._voice_input_callback(111, 42, "Hello from named VC")
+
+        named_adapter.handle_message.assert_awaited_once()
+        default_adapter.handle_message.assert_not_awaited()
+        event = named_adapter.handle_message.await_args.args[0]
+        assert event.source.profile == "catgirl"
+        assert event.source.chat_id == "123"
+        assert event.source.user_id == "42"
 
 
 class TestSyncVoiceModeStateToAdapter:

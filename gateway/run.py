@@ -10668,7 +10668,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Wire voice input callback at connect time so voice
                     # transcription is forwarded without requiring /voice join.
                     if hasattr(adapter, "_voice_input_callback"):
-                        adapter._voice_input_callback = self._handle_voice_channel_input
+                        adapter._voice_input_callback = self._make_voice_input_handler(
+                            adapter
+                        )
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,
@@ -11760,7 +11762,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
-                            adapter._voice_input_callback = self._handle_voice_channel_input
+                            adapter._voice_input_callback = self._make_voice_input_handler(
+                                adapter
+                            )
                         self.delivery_router.adapters = self.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
@@ -12696,6 +12700,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
         adapter._busy_text_mode = self._busy_text_mode
+        if hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._make_voice_input_handler(
+                adapter,
+                profile=profile_name,
+            )
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform
@@ -18047,7 +18056,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Wire callbacks BEFORE join so voice input arriving immediately
         # after connection is not lost.
         if hasattr(adapter, "_voice_input_callback"):
-            adapter._voice_input_callback = self._handle_voice_channel_input
+            adapter._voice_input_callback = self._make_voice_input_handler(
+                adapter,
+                profile=event.source.profile,
+            )
         if hasattr(adapter, "_on_voice_disconnect"):
             adapter._on_voice_disconnect = (
                 lambda chat_id, _profile=event.source.profile:
@@ -18191,15 +18203,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recent_store[key] = recent[-5:]
         return False
 
+    def _make_voice_input_handler(
+        self,
+        adapter: BasePlatformAdapter,
+        profile: Optional[str] = None,
+    ) -> Callable[[int, int, str], Awaitable[None]]:
+        """Bind voice transcripts to the adapter and profile that received them."""
+        async def _handler(guild_id: int, user_id: int, transcript: str) -> None:
+            await self._handle_voice_channel_input(
+                guild_id,
+                user_id,
+                transcript,
+                adapter=adapter,
+                profile=profile,
+            )
+
+        return _handler
+
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self,
+        guild_id: int,
+        user_id: int,
+        transcript: str,
+        *,
+        adapter: Optional[BasePlatformAdapter] = None,
+        profile: Optional[str] = None,
     ):
         """Handle transcribed voice from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
-        adapter's full message pipeline (session, typing, agent, TTS reply).
+        receiving adapter's full message pipeline (session, typing, agent,
+        TTS reply).
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is None:
+            adapter = self.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -18221,7 +18258,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=str(user_id),
                 user_name=str(user_id),
                 chat_type="channel",
+                profile=profile,
             )
+        if profile is not None:
+            source.profile = profile
 
         # Check authorization before processing voice input
         if not self._is_user_authorized(source):
