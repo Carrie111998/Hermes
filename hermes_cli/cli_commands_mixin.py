@@ -1135,11 +1135,11 @@ class CLICommandsMixin:
                 _cprint(f"  No sessions matching \"{search_query}\".")
                 return
 
-            _cprint()
+            _cprint("")
             _cprint(f"  ⚙️  /sessions search {search_query}")
-            _cprint()
+            _cprint("")
             _cprint(f"  Sessions matching \"{search_query}\":")
-            _cprint()
+            _cprint("")
 
             # Render as rich cards
             for idx, (sid, r) in enumerate(seen.items(), 1):
@@ -1155,8 +1155,6 @@ class CLICommandsMixin:
                 model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
                 if len(model) > 18:
                     model = model[:17] + "…"
-                mc = meta.get("message_count")
-                msgs = f" {mc} msgs" if mc else ""
 
                 # Clean FTS5 snippet: strip >>>...<<< markers, collapse whitespace
                 snippet = r.get("snippet", "") or ""
@@ -1168,11 +1166,11 @@ class CLICommandsMixin:
                 _cprint(f"  {idx:<3}  {when}  {source:<6} {model:<18} {title[:40]}")
                 if snip_short:
                     _cprint(f"      {snip_short}")
-                _cprint()
+                _cprint("")
 
             _cprint("  Use /resume <number>, /resume <session id>, or /resume <session title> to continue.")
             _cprint("  Example: /resume 2")
-            _cprint()
+            _cprint("")
             return
 
         sub = arg.lower()
