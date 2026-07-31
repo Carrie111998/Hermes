@@ -2861,9 +2861,48 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"^([ \t]{0,3})(`{3,}|~{3,})[ \t]*([^\n`~]*)\n(.*?)^\1(`{3,}|~{3,})[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Matches a single line that IS a fence marker (opening or closing) --
+# used by the streaming line-by-line strip-mode formatter, which processes
+# one line at a time and can't run the whole-response regex above.
+_STREAM_FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[ \t]*[^\n`~]*$")
+
+
 def _strip_markdown_syntax(text: str) -> str:
     """Best-effort markdown marker removal for plain-text display."""
     plain = _rich_text_from_ansi(text or "").plain
+
+    # Extract fenced code blocks BEFORE any prose-markdown stripping below.
+    # Code content must survive byte-for-byte: the emphasis-stripping regexes
+    # further down (`__x__` -> `x`, `*x*` -> `x`) don't know Python from
+    # prose, so a real docstring/dunder like `__name__` or `__main__` was
+    # being silently corrupted into `name`/`main` when it appeared inside a
+    # fenced block in `strip` mode -- code that ran fine got displayed (and,
+    # if copied, executed) with different semantics (issue #73212). Pull
+    # each fenced block out into a placeholder, run the existing prose
+    # stripping on what's left, then splice the untouched code back in. The
+    # opening fence's language tag (e.g. "python") is dropped entirely in
+    # this plain-text mode rather than left as a stray visible line.
+    code_blocks: list[str] = []
+
+    def _extract_fence(match: "re.Match[str]") -> str:
+        opener, closer = match.group(2), match.group(5)
+        if closer[0] != opener[0] or len(closer) < len(opener):
+            # Invalid closer (wrong character type, or shorter than the
+            # opener -- e.g. a ```` opener can't be closed by ```). Leave
+            # the whole match untouched; it falls through to the ordinary
+            # prose-stripping path below, same as an unterminated fence
+            # (review of #75188).
+            return match.group(0)
+        code_blocks.append(match.group(4))
+        return f"\x00FENCE{len(code_blocks) - 1}\x00"
+
+    plain = _FENCED_CODE_BLOCK_RE.sub(_extract_fence, plain)
+
     # Avoid stripping cron-style expressions like "* * * * *" as if they were
     # Markdown horizontal rules. CommonMark treats three or more "*" as an HR,
     # but in Hermes output it's common to display cron schedules verbatim.
@@ -2888,6 +2927,20 @@ def _strip_markdown_syntax(text: str) -> str:
     plain = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", plain)
     plain = re.sub(r"~~([^~]+)~~", r"\1", plain)
     plain = re.sub(r"\n{3,}", "\n\n", plain)
+
+    # Splice the untouched code blocks back in, byte-for-byte -- no
+    # rstrip("\n") here. An earlier version trimmed trailing newlines off
+    # each captured block before splicing it back, which silently dropped
+    # trailing blank lines that were genuinely part of the fenced content
+    # (review of #73217: "trailing blank lines inside a captured block are
+    # not preserved byte-for-byte"). The block's own captured text
+    # (match.group(4) in _extract_fence above) already excludes the
+    # closing-fence line itself (the regex's trailing ^\1\2 anchor stops
+    # capture there), so there's nothing left to trim -- whatever newlines
+    # are in the captured group are genuinely part of the code content.
+    for i, code in enumerate(code_blocks):
+        plain = plain.replace(f"\x00FENCE{i}\x00", code)
+
     return plain.strip("\n")
 
 
@@ -4343,6 +4396,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # populated only while `_in_stream_table` is True.
         self._stream_table_buf: list[str] = []
         self._in_stream_table = False
+        # True while a streamed fenced code block (```/~~~) is open --
+        # i.e. we've seen the opening fence line but not yet the matching
+        # closing fence line. strip mode must skip prose-markdown
+        # stripping for every line in between, or a real code dunder like
+        # __name__ streamed line-by-line gets corrupted the same way the
+        # whole-response path was before it became fence-aware (issue
+        # #73212's fix didn't cover streaming at all -- review of #73217).
+        self._in_stream_code_fence = False
+        # The fence character ('`' or '~') that opened the current block,
+        # so a same-type closing fence is recognized and a different-type
+        # run of the other character mid-block is not mistaken for a
+        # closer.
+        self._stream_code_fence_char = ""
+        # The opener's marker LENGTH (e.g. 4 for "````"), so a closer must
+        # be at least this long to be recognized -- a shorter closer for a
+        # longer opener is invalid per CommonMark (review of #75188).
+        self._stream_code_fence_len = 0
         self._pending_edit_snapshots = {}
         self._last_input_mode_recovery = 0.0
         self._input_mode_recovery_notice_shown = False
@@ -6697,6 +6767,57 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
 
+            # Fence detection must run BEFORE table-row buffering. A
+            # fenced code line can coincidentally look like a table row
+            # (e.g. a fence opener/closer, or content inside the fence
+            # like "| __name__ |"), and must never be swallowed into
+            # table buffering -- which invokes markdown stripping on
+            # flush -- while a code fence is open or transitioning
+            # (review of #75188).
+            _fence_transition = False
+            if self.final_response_markdown == "strip":
+                _fence_m = _STREAM_FENCE_LINE_RE.match(line)
+                if _fence_m:
+                    _fence_marker = _fence_m.group(1)
+                    _fence_char = _fence_marker[0]
+                    _fence_len = len(_fence_marker)
+                    if not self._in_stream_code_fence:
+                        # Opening fence: mark in-fence and remember which
+                        # character (backtick/tilde) and LENGTH close it.
+                        # This line itself (fence markers + language tag)
+                        # is left unstripped rather than reconstructed
+                        # with the language tag dropped, the way the
+                        # whole-response path does -- streaming can't
+                        # safely rewrite a line already flushed to the
+                        # terminal, so the fence markers stay visible
+                        # here (a minor, intentional difference from the
+                        # whole-response splice behavior).
+                        self._in_stream_code_fence = True
+                        self._stream_code_fence_char = _fence_char
+                        self._stream_code_fence_len = _fence_len
+                    elif (
+                        _fence_char == self._stream_code_fence_char
+                        and _fence_len >= self._stream_code_fence_len
+                    ):
+                        # Closing fence: same character type AND at least
+                        # as long as the opener (a shorter closer, e.g.
+                        # ``` closing ````, is invalid per CommonMark and
+                        # doesn't end the block).
+                        self._in_stream_code_fence = False
+                        self._stream_code_fence_char = ""
+                        self._stream_code_fence_len = 0
+                    _fence_transition = True
+
+            if self._in_stream_code_fence or _fence_transition:
+                # Inside an active fence, or this line IS a fence marker
+                # itself: never buffer as a table row (flush any table
+                # already in progress first -- the fence takes
+                # precedence), and never strip.
+                if self._in_stream_table:
+                    _flush_table_buf()
+                _emit_one(line)
+                continue
+
             # Hold table-shaped lines in a side-buffer so we can re-pad
             # the whole block once it ends.  Streaming line-by-line, we
             # cannot re-align mid-table without reflowing already-printed
@@ -6812,6 +6933,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._deferred_content = ""
         self._stream_table_buf = []
         self._in_stream_table = False
+        self._in_stream_code_fence = False
+        self._stream_code_fence_char = ""
+        self._stream_code_fence_len = 0
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
