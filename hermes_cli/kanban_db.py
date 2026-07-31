@@ -9103,112 +9103,113 @@ def _code_owner_hook_spec(profile_home: Path) -> Optional[dict[str, str]]:
 _HOOK_DISABLING_ENV_VARS = ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG")
 
 
-def _worker_probe_interpreter(worker_argv: "list[str] | None") -> str:
-    """Return the interpreter that will actually run the worker's Hermes tree.
+def _trusted_worker_launcher(
+    worker_argv: "list[str] | None", workspace: "str | None",
+) -> str:
+    """Resolve argv[0] to a launcher the worker itself cannot have written.
 
-    The dispatcher's own ``sys.executable`` proves nothing about the worker:
-    ``_resolve_hermes_argv`` may resolve ``$HERMES_BIN`` or a ``hermes`` shim
-    from a completely different install. Either the argv names an interpreter
-    directly (``python -m hermes_cli.main``) or it is a console-script whose
-    shebang names one. Anything else cannot be attested and fails closed.
+    The attestation is only evidence if the thing we execute is the same
+    launcher the worker will run AND is outside every root the worker can
+    write. A worker that could drop its own ``hermes`` in its worktree would
+    otherwise answer its own admission question.
     """
     if not worker_argv:
         raise RuntimeError(
             "cannot attest the worker admission hook: no resolved worker argv"
         )
-    head = worker_argv[0]
-    if Path(head).name.lower().startswith("python"):
-        return head
+    launcher = Path(worker_argv[0])
+    if not launcher.is_absolute():
+        resolved_which = shutil.which(str(launcher))
+        if not resolved_which:
+            raise RuntimeError(
+                "cannot attest the worker admission hook: launcher "
+                f"{worker_argv[0]!r} does not resolve to a path"
+            )
+        launcher = Path(resolved_which)
+    launcher = launcher.resolve()
+    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+        raise RuntimeError(
+            "cannot attest the worker admission hook: launcher "
+            f"{str(launcher)!r} is not an executable file"
+        )
+    untrusted_roots = []
+    if workspace:
+        untrusted_roots.append(Path(workspace).resolve())
     try:
-        with open(head, "rb") as handle:
-            first = handle.readline(512)
-    except OSError as exc:
-        raise RuntimeError(
-            f"cannot attest the worker admission hook: unreadable worker "
-            f"executable {head!r} ({exc})"
-        ) from exc
-    if not first.startswith(b"#!"):
-        raise RuntimeError(
-            "cannot attest the worker admission hook: worker executable "
-            f"{head!r} names no interpreter"
-        )
-    shebang = first[2:].decode("utf-8", "replace").strip().split()
-    if not shebang:
-        raise RuntimeError(
-            "cannot attest the worker admission hook: worker executable "
-            f"{head!r} has an empty interpreter line"
-        )
-    return shebang[-1] if shebang[0].endswith("env") and len(shebang) > 1 else shebang[0]
+        untrusted_roots.append(Path(workspaces_root()).resolve())
+    except Exception:
+        pass
+    for root in untrusted_roots:
+        if launcher == root or root in launcher.parents:
+            raise RuntimeError(
+                "refusing to attest through a launcher inside a "
+                f"worker-writable workspace root: {str(launcher)!r}"
+            )
+    return str(launcher)
 
 
 def _attest_worker_admission_hook_armed(
     *, profile_home: Path, env: dict, worker_argv: "list[str] | None" = None,
-    cwd: "str | None" = None,
+    cwd: "str | None" = None, workspace: "str | None" = None,
 ) -> None:
-    """Fail closed unless the worker's real chain registers the factory hook.
+    """Fail closed unless the worker's own install arms the factory hook.
 
-    The dispatcher-side config read (:func:`_code_owner_hook_spec`) proves what
-    the profile *declares*; it cannot prove what the worker process will
-    actually arm. Safe mode, a disarmed allowlist, or a malformed hooks block
-    all yield zero registered hooks at runtime while the declaration still
-    parses.
+    Runs the **worker's real launcher** — wrapper chain, env mutations and all
+    — with a bounded attestation flag and a challenge nonce, so what is proven
+    is the install the worker will actually execute rather than the
+    dispatcher's. Inferring an interpreter from a shebang cannot work here: the
+    production chain is a bash wrapper that execs an ``sh`` wrapper that finally
+    re-execs Python on itself, and the outer wrapper unsets ``PYTHONPATH``.
 
-    This runs the worker's genuine resolution chain (``load_config`` +
-    ``register_from_config``) using the interpreter the *worker* will use and
-    the exact env the worker will receive, then refuses to open the gate unless
-    (a) the AI Factory admission hook is among the hooks that ended up
-    registered and (b) the Hermes tree the worker imports is the very tree that
-    ships the hook script this dispatcher validated. A worker resolving to a
-    different install would otherwise be attested against code it never runs.
+    Three independent things must hold before the gate may open:
+
+    * the launcher resolves outside every worker-writable root
+      (:func:`_trusted_worker_launcher`) — a self-reported value from modules
+      the worker could have written is not evidence;
+    * the verdict echoes this call's nonce, so no stale or replayed line counts;
+    * the install the launcher resolves is the tree this dispatcher validated,
+      and the fail-closed factory hook is among the hooks it actually armed.
     """
-    interpreter = _worker_probe_interpreter(worker_argv)
+    from hermes_cli.factory_attest import ATTEST_FLAG, VERDICT_PREFIX
+
+    launcher = _trusted_worker_launcher(worker_argv, workspace)
     dispatcher_tree = str(Path(__file__).resolve().parents[1])
-    probe = (
-        "import json\n"
-        "from pathlib import Path\n"
-        "verdict = {'tree': None, 'armed': [], 'error': None}\n"
-        "try:\n"
-        "    import hermes_cli\n"
-        "    verdict['tree'] = str(Path(hermes_cli.__file__).resolve().parents[1])\n"
-        "    from hermes_cli.config import load_config\n"
-        "    from agent.shell_hooks import register_from_config\n"
-        "    specs = register_from_config(load_config(), accept_hooks=True)\n"
-        "    verdict['armed'] = [\n"
-        "        s.command for s in specs\n"
-        "        if s.event == 'pre_tool_call' and getattr(s, 'fail_closed', False)\n"
-        "        and 'factory_admission_hook.py' in s.command\n"
-        "        and '--require-owned-git' in s.command\n"
-        "    ]\n"
-        "except Exception as exc:\n"
-        "    verdict['error'] = f'{type(exc).__name__}: {exc}'\n"
-        "print(json.dumps(verdict))\n"
-    )
+    nonce = secrets.token_hex(16)
+    attest_argv = [
+        launcher, "-p", profile_home.name, ATTEST_FLAG, nonce,
+    ]
     try:
         result = subprocess.run(
-            [interpreter, "-c", probe],
-            # The worker's own cwd: anchoring the probe on the dispatcher tree
-            # would bias ``import hermes_cli`` toward the code we are trying to
-            # verify against, hiding a real install divergence.
+            attest_argv,
+            # The worker's own cwd: the launcher is a console script, so cwd
+            # never joins sys.path, but the environment must otherwise match.
             cwd=cwd or str(profile_home),
             env=dict(env), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=60,
+            encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
             f"cannot attest the worker AI Factory admission hook: {exc}"
         ) from exc
-    try:
-        verdict = json.loads(result.stdout.strip().splitlines()[-1])
-        armed = verdict["armed"]
-        worker_tree = verdict["tree"]
-    except (ValueError, KeyError, IndexError) as exc:
+
+    verdict = None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith(VERDICT_PREFIX):
+            try:
+                verdict = json.loads(line[len(VERDICT_PREFIX):])
+            except ValueError:
+                verdict = None
+    if not isinstance(verdict, dict):
         raise RuntimeError(
             "worker AI Factory admission hook attestation returned no verdict "
-            f"(probe rc={result.returncode}): {result.stderr.strip()[:400]}"
-        ) from exc
-    # Tree first: a divergent install makes every other signal meaningless,
-    # and its import errors would otherwise surface as a confusing arming
-    # failure against code the worker never runs.
+            f"(rc={result.returncode}): {(result.stderr or '').strip()[:400]}"
+        )
+    if verdict.get("nonce") != nonce:
+        raise RuntimeError(
+            "worker AI Factory admission hook attestation failed the challenge "
+            "nonce; the verdict is stale, replayed or forged"
+        )
+    worker_tree = verdict.get("tree")
     if not worker_tree or Path(worker_tree).resolve() != Path(dispatcher_tree).resolve():
         raise RuntimeError(
             "worker resolves a different Hermes tree than the dispatcher "
@@ -9220,7 +9221,7 @@ def _attest_worker_admission_hook_armed(
             "worker AI Factory admission hook attestation failed: "
             f"{verdict['error']}"
         )
-    if not armed:
+    if not verdict.get("armed"):
         raise RuntimeError(
             "worker did not arm the AI Factory admission hook; refusing to "
             f"open the owner gate for profile {profile_home.name}"
@@ -9829,7 +9830,7 @@ def _default_spawn(
                 # admission hook actually arms under the worker's exact env.
                 _attest_worker_admission_hook_armed(
                     profile_home=profile_home, env=env, worker_argv=cmd,
-                    cwd=workspace,
+                    cwd=workspace, workspace=workspace,
                 )
         gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(gate_fd)

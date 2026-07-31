@@ -11030,6 +11030,17 @@ def cmd_claw(args):
 
 def main():
     """Main entry point for hermes CLI."""
+    # Bounded, undocumented attestation mode. The Kanban dispatcher runs the
+    # worker's real launcher with this flag to prove the admission hook arms in
+    # the worker's own install before opening its gate. Handled before argparse
+    # and before any heavy startup so the answer reflects nothing but the
+    # config + hook-registration path the worker itself would take.
+    from hermes_cli.factory_attest import find_attest_nonce, run_attestation
+
+    _attest_nonce = find_attest_nonce(sys.argv[1:])
+    if _attest_nonce is not None:
+        sys.exit(run_attestation(_attest_nonce))
+
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
     _set_process_title()
