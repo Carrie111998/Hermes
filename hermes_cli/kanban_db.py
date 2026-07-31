@@ -1283,6 +1283,25 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Durable, consume-once authorization created by ``promote --force``.
+-- The JSON parent list is the exact set of non-terminal dependencies the
+-- operator approved at promotion time. Claim revalidates that no additional
+-- dependency became non-terminal, then consumes this row in the same
+-- transaction as ready -> running. Historical rows are retained for audit.
+CREATE TABLE IF NOT EXISTS forced_claim_authorizations (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id               TEXT NOT NULL,
+    actor                 TEXT NOT NULL,
+    reason                TEXT,
+    authorized_parent_ids TEXT NOT NULL,
+    created_at            INTEGER NOT NULL,
+    consumed_at           INTEGER,
+    consumed_by           TEXT,
+    consumed_run_id       INTEGER,
+    invalidated_at        INTEGER,
+    invalidation_reason   TEXT
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1368,12 +1387,18 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_forced_claim_auth_active_task
+    ON forced_claim_authorizations(task_id)
+    WHERE consumed_at IS NULL AND invalidated_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_forced_claim_auth_task
+    ON forced_claim_authorizations(task_id, id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
 """
 
 
@@ -2594,6 +2619,77 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _install_forced_claim_authorization_triggers(conn)
+
+
+def _install_forced_claim_authorization_triggers(conn: sqlite3.Connection) -> None:
+    """Install identity and ready-epoch fences for one-shot forced claims."""
+    previous = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' "
+        "AND name='trg_forced_claim_auth_ready_exit'"
+    ).fetchone()
+    previous_sql = (previous["sql"] or "") if previous is not None else ""
+    if "NEW.status NOT IN ('ready', 'running')" in previous_sql:
+        conn.execute(
+            "UPDATE forced_claim_authorizations "
+            "SET invalidated_at = ?, invalidation_reason = ? "
+            "WHERE consumed_at IS NULL AND invalidated_at IS NULL",
+            (int(time.time()), "invalidated by ready-epoch fence upgrade"),
+        )
+    conn.executescript(
+        """
+        DROP TRIGGER IF EXISTS trg_forced_claim_auth_ready_exit;
+        DROP TRIGGER IF EXISTS trg_forced_claim_auth_task_delete;
+        DROP TRIGGER IF EXISTS trg_forced_claim_auth_task_insert;
+        DROP TRIGGER IF EXISTS trg_forced_claim_auth_task_id_change;
+
+        CREATE TRIGGER trg_forced_claim_auth_ready_exit
+        AFTER UPDATE OF status ON tasks
+        WHEN OLD.status = 'ready' AND NEW.status <> 'ready'
+        BEGIN
+            UPDATE forced_claim_authorizations
+               SET invalidated_at = CAST(strftime('%s', 'now') AS INTEGER),
+                   invalidation_reason = 'task left authorized ready state'
+             WHERE task_id = NEW.id
+               AND consumed_at IS NULL
+               AND invalidated_at IS NULL;
+        END;
+
+        CREATE TRIGGER trg_forced_claim_auth_task_delete
+        AFTER DELETE ON tasks
+        BEGIN
+            UPDATE forced_claim_authorizations
+               SET invalidated_at = CAST(strftime('%s', 'now') AS INTEGER),
+                   invalidation_reason = 'authorized task deleted'
+             WHERE task_id = OLD.id
+               AND consumed_at IS NULL
+               AND invalidated_at IS NULL;
+        END;
+
+        CREATE TRIGGER trg_forced_claim_auth_task_insert
+        AFTER INSERT ON tasks
+        BEGIN
+            UPDATE forced_claim_authorizations
+               SET invalidated_at = CAST(strftime('%s', 'now') AS INTEGER),
+                   invalidation_reason = 'task identity inserted or replaced'
+             WHERE task_id = NEW.id
+               AND consumed_at IS NULL
+               AND invalidated_at IS NULL;
+        END;
+
+        CREATE TRIGGER trg_forced_claim_auth_task_id_change
+        AFTER UPDATE OF id ON tasks
+        WHEN OLD.id <> NEW.id
+        BEGIN
+            UPDATE forced_claim_authorizations
+               SET invalidated_at = CAST(strftime('%s', 'now') AS INTEGER),
+                   invalidation_reason = 'authorized task identity changed'
+             WHERE task_id IN (OLD.id, NEW.id)
+               AND consumed_at IS NULL
+               AND invalidated_at IS NULL;
+        END;
+        """
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -3544,11 +3640,15 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
-            conn.execute(
+        if parent_status not in ("done", "archived"):
+            demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
+            if demoted.rowcount:
+                _invalidate_forced_claim_authorization(
+                    conn, child_id, "dependency edge changed after forced promotion"
+                )
         _append_event(
             conn, child_id, "linked",
             {"parent": parent_id, "child": child_id},
@@ -4132,8 +4232,37 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _ready_candidate_rows(
+    conn: sqlite3.Connection,
+    failure_limit: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Read-only eligibility pass shared by recompute and dispatcher dry-run."""
+    effective_default = (
+        DEFAULT_FAILURE_LIMIT if failure_limit is None else int(failure_limit)
+    )
+    candidates: list[sqlite3.Row] = []
+    rows = conn.execute(
+        "SELECT id, status, assignee, priority, created_at, "
+        "       consecutive_failures, max_retries "
+        "FROM tasks WHERE status IN ('todo', 'blocked')"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        if row["status"] == "blocked" and _has_sticky_block(conn, task_id):
+            continue
+        if _open_parent_ids(conn, task_id):
+            continue
+        if row["status"] == "blocked":
+            task_limit = row["max_retries"]
+            limit = int(task_limit) if task_limit is not None else effective_default
+            if int(row["consecutive_failures"] or 0) >= limit:
+                continue
+        candidates.append(row)
+    return candidates
+
+
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection, failure_limit: Optional[int] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -4163,65 +4292,105 @@ def recompute_ready(
          ``kanban.failure_limit`` config value through ``dispatch_once``)
       3. ``DEFAULT_FAILURE_LIMIT``
     """
-    if failure_limit is None:
-        failure_limit = DEFAULT_FAILURE_LIMIT
     promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
-        for row in todo_rows:
+        for row in _ready_candidate_rows(conn, failure_limit):
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = ?",
+                (task_id, cur_status),
+            )
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
     return promoted
 
 
 # ---------------------------------------------------------------------------
 # Claim / complete / block
 # ---------------------------------------------------------------------------
+
+def _parent_dependency_snapshot(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[list[str], list[str]]:
+    """Return ``(open, missing)`` parent IDs using a fail-closed left join."""
+    rows = conn.execute(
+        "SELECT l.parent_id, p.id AS resolved_parent_id, p.status "
+        "FROM task_links l LEFT JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? ORDER BY l.parent_id",
+        (task_id,),
+    ).fetchall()
+    missing = [row["parent_id"] for row in rows if row["resolved_parent_id"] is None]
+    open_parents = [
+        row["parent_id"]
+        for row in rows
+        if row["resolved_parent_id"] is None
+        or row["status"] not in ("done", "archived")
+    ]
+    return open_parents, missing
+
+
+def _open_parent_ids(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """Return sorted dependencies that do not satisfy ordinary claim safety."""
+    return _parent_dependency_snapshot(conn, task_id)[0]
+
+
+def _decode_forced_parent_ids(raw: object) -> Optional[list[str]]:
+    """Decode only canonical sorted/unique JSON emitted by ``promote_task``."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, list) or not all(
+        isinstance(parent_id, str) and parent_id for parent_id in decoded
+    ):
+        return None
+    if decoded != sorted(set(decoded)):
+        return None
+    if raw != json.dumps(decoded, separators=(",", ":")):
+        return None
+    return decoded
+
+
+def _invalidate_forced_claim_authorization(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: str,
+    *,
+    now: Optional[int] = None,
+) -> int:
+    """Invalidate an unconsumed force authorization, preserving its audit row."""
+    cur = conn.execute(
+        "UPDATE forced_claim_authorizations "
+        "SET invalidated_at = ?, invalidation_reason = ? "
+        "WHERE task_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL",
+        (int(time.time()) if now is None else now, reason, task_id),
+    )
+    return cur.rowcount
+
+
+def _claim_parent_gate_preview(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Read-only equivalent of claim's parent/force gate for dispatcher plans."""
+    open_parents, missing_parents = _parent_dependency_snapshot(conn, task_id)
+    if missing_parents:
+        return False
+    if not open_parents:
+        return True
+    authorization = conn.execute(
+        "SELECT authorized_parent_ids FROM forced_claim_authorizations "
+        "WHERE task_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if authorization is None:
+        return False
+    decoded = _decode_forced_parent_ids(authorization["authorized_parent_ids"])
+    if decoded is None:
+        return False
+    return set(open_parents).issubset(decoded)
+
 
 def claim_task(
     conn: sqlite3.Connection,
@@ -4247,21 +4416,63 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        open_parents, missing_parents = _parent_dependency_snapshot(conn, task_id)
+        authorization = conn.execute(
+            "SELECT id, authorized_parent_ids FROM forced_claim_authorizations "
+            "WHERE task_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
-        if undone:
+        if missing_parents:
+            _invalidate_forced_claim_authorization(
+                conn, task_id, "dangling parent dependency", now=now
+            )
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
                 (task_id,),
             )
             _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "malformed_dependencies",
+                    "open_parent_ids": open_parents,
+                    "missing_parent_ids": missing_parents,
+                },
+            )
+            return None
+        authorized_parents: set[str] = set()
+        if authorization is not None:
+            decoded = _decode_forced_parent_ids(
+                authorization["authorized_parent_ids"]
+            )
+            if decoded is not None:
+                authorized_parents = set(decoded)
+            else:
+                _invalidate_forced_claim_authorization(
+                    conn, task_id, "malformed authorization", now=now
+                )
+                authorization = None
+        unexpected_parents = sorted(set(open_parents) - authorized_parents)
+        if open_parents and (authorization is None or unexpected_parents):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            if authorization is not None:
+                _invalidate_forced_claim_authorization(
+                    conn, task_id, "dependencies changed after forced promotion", now=now
+                )
+            _append_event(
                 conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
+                {
+                    "reason": "parents_not_done",
+                    "open_parent_ids": open_parents,
+                    "unexpected_parent_ids": unexpected_parents,
+                },
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -4284,6 +4495,17 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
+        authorization_id: Optional[int] = None
+        if authorization is not None:
+            authorization_id = int(authorization["id"])
+            consumed = conn.execute(
+                "UPDATE forced_claim_authorizations "
+                "SET consumed_at = ?, consumed_by = ? "
+                "WHERE id = ? AND consumed_at IS NULL AND invalidated_at IS NULL",
+                (now, lock, authorization_id),
+            )
+            if consumed.rowcount != 1:
+                raise RuntimeError("forced claim authorization was concurrently consumed")
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4298,6 +4520,9 @@ def claim_task(
             (lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
+            if authorization_id is not None:
+                # Raising rolls back the pre-consumption in this transaction.
+                raise RuntimeError("task changed during forced claim")
             return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
@@ -4329,9 +4554,21 @@ def claim_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        if authorization_id is not None:
+            conn.execute(
+                "UPDATE forced_claim_authorizations SET consumed_run_id = ? WHERE id = ?",
+                (run_id, authorization_id),
+            )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "forced_parent_override": authorization_id is not None,
+                "force_authorization_id": authorization_id,
+                "overridden_parent_ids": open_parents if authorization_id is not None else [],
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -5847,40 +6084,46 @@ def promote_task(
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
     promotion would succeed without mutating state.
     """
-    row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()
-    if row is None:
-        return False, f"task {task_id} not found"
-
-    cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
-        return False, (
-            f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
-        )
-
-    if not force:
-        parents = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ?",
-            (task_id,),
-        ).fetchall()
-        unsatisfied = [
-            p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
-        ]
-        if unsatisfied:
-            return False, (
+    def _validate() -> tuple[Optional[str], list[str]]:
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return f"task {task_id} not found", []
+        cur_status = row["status"]
+        if cur_status not in ("todo", "blocked"):
+            return (
+                f"task {task_id} is {cur_status!r}; promote only applies to "
+                f"'todo' or 'blocked'"
+            ), []
+        open_parents, missing_parents = _parent_dependency_snapshot(conn, task_id)
+        if missing_parents:
+            return (
+                "malformed dependency links reference missing parent tasks: "
+                f"{', '.join(missing_parents)}"
+            ), open_parents
+        if open_parents and not force:
+            return (
                 f"unsatisfied parent dependencies: "
-                f"{', '.join(unsatisfied)} (use --force to override)"
-            )
+                f"{', '.join(open_parents)} (use --force to override)"
+            ), open_parents
+        return None, open_parents
 
     if dry_run:
-        return True, None
+        error, _ = _validate()
+        return error is None, error
 
+    now = int(time.time())
     with write_txn(conn):
+        error, open_parents = _validate()
+        if error is not None:
+            return False, error
+        # A later promotion starts a new ready epoch and supersedes any unused
+        # authorization. A force grant can therefore never be replayed by
+        # moving the task away from ready and back again.
+        _invalidate_forced_claim_authorization(
+            conn, task_id, "superseded by a later promotion", now=now
+        )
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -5888,11 +6131,34 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        authorization_id: Optional[int] = None
+        if force:
+            auth = conn.execute(
+                "INSERT INTO forced_claim_authorizations ("
+                "task_id, actor, reason, authorized_parent_ids, created_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    task_id,
+                    actor,
+                    reason,
+                    json.dumps(open_parents, separators=(",", ":")),
+                    now,
+                ),
+            )
+            if auth.lastrowid is None:
+                raise RuntimeError("forced claim authorization insert returned no id")
+            authorization_id = int(auth.lastrowid)
         _append_event(
             conn,
             task_id,
             "promoted_manual",
-            {"actor": actor, "reason": reason, "forced": force},
+            {
+                "actor": actor,
+                "reason": reason,
+                "forced": force,
+                "force_authorization_id": authorization_id,
+                "authorized_parent_ids": open_parents if force else [],
+            },
         )
 
     return True, None
@@ -6336,6 +6602,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM forced_claim_authorizations WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -6359,6 +6626,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM forced_claim_authorizations WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -8313,34 +8581,35 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
-
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if not dry_run:
+        # Maintenance paths intentionally mutate task/run/event state. A dry
+        # run is a planning read and must not reclaim, demote, promote, consume
+        # a force authorization, or emit events merely by being observed.
+        reap_worker_zombies()
+        result.reclaimed = release_stale_claims(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        # Rate-limited requeues (quota wall, no failure counted) — surface for
+        # telemetry / tests. These tasks went back to ``ready`` and the respawn
+        # guard will defer them until the quota window clears.
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8357,11 +8626,15 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    ready_rows = list(conn.execute(
+        "SELECT id, assignee, priority, created_at FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL"
+    ).fetchall())
+    if dry_run:
+        virtual_ready = _ready_candidate_rows(conn, failure_limit)
+        result.promoted = len(virtual_ready)
+        ready_rows.extend(virtual_ready)
+    ready_rows.sort(key=lambda row: (-int(row["priority"] or 0), int(row["created_at"])))
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -8518,6 +8791,11 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
+            # Match the real claim boundary without consuming or invalidating
+            # the one-shot force authorization. In particular, do not report
+            # a spawn after a new parent became open since promotion.
+            if not _claim_parent_gate_preview(conn, row["id"]):
+                continue
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
