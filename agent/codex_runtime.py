@@ -694,8 +694,25 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    from agent.provider_request_budget import ProviderRequestBudgetExceeded
+
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        _turn_kwargs = {}
+        _budget = getattr(agent, "provider_request_budget", None)
+        if _budget is not None and _budget.enabled:
+            from agent.provider_request_budget import (
+                capture_provider_request_reservation,
+            )
+
+            _turn_kwargs["before_request"] = (
+                capture_provider_request_reservation(agent)
+            )
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            **_turn_kwargs,
+        )
+    except ProviderRequestBudgetExceeded:
+        raise
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -1228,7 +1245,13 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    reserve_request=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1240,6 +1263,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     import httpx as _httpx
 
     from agent import relay_llm
+
+    if reserve_request is None:
+        from agent.provider_request_budget import capture_provider_request_reservation
+
+        reserve_request = capture_provider_request_reservation(agent)
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
@@ -1271,6 +1299,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
+            reserve_request(reason="codex responses stream request")
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:

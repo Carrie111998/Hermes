@@ -448,7 +448,9 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(
+    agent, api_kwargs: dict, *, make_client, reserve_request=None
+):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -464,13 +466,21 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    if reserve_request is None:
+        from agent.provider_request_budget import capture_provider_request_reservation
+
+        reserve_request = capture_provider_request_reservation(agent)
+
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
-        return agent._run_codex_stream(
-            api_kwargs,
-            client=request_client,
-            on_first_delta=getattr(agent, "_codex_on_first_delta", None),
-        )
+        stream_kwargs = {
+            "client": request_client,
+            "on_first_delta": getattr(agent, "_codex_on_first_delta", None),
+        }
+        budget = getattr(agent, "provider_request_budget", None)
+        if budget is not None and budget.enabled is True:
+            stream_kwargs["reserve_request"] = reserve_request
+        return agent._run_codex_stream(api_kwargs, **stream_kwargs)
     if agent.api_mode == "anthropic_messages":
         # #67142: use a request-local Anthropic client so the stale/interrupt
         # watchdog aborts sockets from the stranger thread while the worker
@@ -478,6 +488,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         request_client = make_client(
             "anthropic_messages_request", kind="anthropic_messages"
         )
+        budget = getattr(agent, "provider_request_budget", None)
+        if budget is not None and budget.enabled is True:
+            return agent._anthropic_messages_create(
+                api_kwargs,
+                client=request_client,
+                before_request=reserve_request,
+            )
         return agent._anthropic_messages_create(api_kwargs, client=request_client)
     if agent.api_mode == "bedrock_converse":
         # Bedrock uses boto3 directly — no OpenAI client needed.
@@ -494,6 +511,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
         try:
+            reserve_request(reason="bedrock converse request")
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
             # Evict the cached client on stale-connection failures
@@ -508,6 +526,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    reserve_request(reason="chat completions request")
     return request_client.chat.completions.create(**api_kwargs)
 
 
@@ -570,6 +589,9 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    from agent.provider_request_budget import capture_provider_request_reservation
+
+    reserve_request = capture_provider_request_reservation(agent)
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -601,7 +623,10 @@ def direct_api_call(agent, api_kwargs: dict):
     succeeded = False
     try:
         response = _dispatch_nonstreaming_api_request(
-            agent, api_kwargs, make_client=_make_client
+            agent,
+            api_kwargs,
+            make_client=_make_client,
+            reserve_request=reserve_request,
         )
     except Exception:
         if getattr(agent, "_interrupt_requested", False):
@@ -647,6 +672,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         return direct_api_call(agent, api_kwargs)
 
     result = {"response": None, "error": None}
+    from agent.provider_request_budget import capture_provider_request_reservation
+
+    reserve_request = capture_provider_request_reservation(agent)
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
     # of the guard in interruptible_streaming_api_call.  Quiet-mode /
@@ -744,6 +772,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     ),
                     kind=kind,
                 ),
+                reserve_request=reserve_request,
             )
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
@@ -2075,6 +2104,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
+    from agent.provider_request_budget import (
+        ProviderRequestBudgetExceeded,
+        capture_provider_request_reservation,
+    )
+
+    reserve_request = capture_provider_request_reservation(agent)
+
+    def _anthropic_summary_call(request):
+        budget = getattr(agent, "provider_request_budget", None)
+        if budget is not None and budget.enabled is True:
+            return agent._anthropic_messages_create(
+                request,
+                before_request=reserve_request,
+            )
+        return agent._anthropic_messages_create(request)
 
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
@@ -2293,7 +2337,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _ant_kw = _merge_nous_portal_messages_extra_body(agent, _ant_kw)
                 summary_response = _managed_summary_call(
                     _ant_kw,
-                    agent._anthropic_messages_create,
+                    _anthropic_summary_call,
                     retry_count=0,
                 )
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
@@ -2302,9 +2346,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary"
                 )
+                def _create_summary(request):
+                    reserve_request(reason="iteration limit summary request")
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary,
                     retry_count=0,
                 )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
@@ -2342,7 +2390,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _ant_kw2 = _merge_nous_portal_messages_extra_body(agent, _ant_kw2)
                 retry_response = _managed_summary_call(
                     _ant_kw2,
-                    agent._anthropic_messages_create,
+                    _anthropic_summary_call,
                     retry_count=1,
                 )
                 _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=agent._is_anthropic_oauth)
@@ -2364,9 +2412,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
                 )
+                def _create_summary_retry(request):
+                    reserve_request(reason="iteration limit summary retry")
+                    return summary_client.chat.completions.create(**request)
+
                 summary_response = _managed_summary_call(
                     summary_kwargs,
-                    lambda request: summary_client.chat.completions.create(**request),
+                    _create_summary_retry,
                     retry_count=1,
                 )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
@@ -2383,6 +2435,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             else:
                 final_response = "I reached the iteration limit and couldn't generate a summary."
 
+    except ProviderRequestBudgetExceeded:
+        raise
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
         final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
@@ -2497,6 +2551,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
 
+    from agent.provider_request_budget import capture_provider_request_reservation
+
+    reserve_request = capture_provider_request_reservation(agent)
+
     # Cron and other non-interactive, nested-pool contexts deadlock on the
     # spawned worker thread (#62151). They also have no stream consumer, so the
     # deltas this path produces go nowhere. Delegate to the non-streaming entry
@@ -2571,6 +2629,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
                     try:
+                        reserve_request(reason="bedrock converse stream request")
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
                         # InvokeModel-only policies cannot open a stream. Keep
@@ -2589,6 +2648,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
+                            reserve_request(reason="bedrock converse IAM fallback")
                             return normalize_converse_response(
                                 client.converse(**final_kwargs)
                             )
@@ -3054,6 +3114,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
+            reserve_request(reason="chat completions stream request")
             return request_client.chat.completions.create(**stream_kwargs)
 
         def _stream_created(raw_stream: Any) -> None:
@@ -3538,6 +3599,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
+            reserve_request(reason="anthropic messages stream request")
             manager = request_client.messages.stream(**final_kwargs)
             _stream_context["manager"] = manager
             return manager.__enter__()

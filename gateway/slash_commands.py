@@ -3947,6 +3947,7 @@ class GatewaySlashCommandsMixin:
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
                 session_db=getattr(self._session_db, "_db", self._session_db),
+                provider_request_budget_exempt=True,
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
             # Keep the real source platform during construction so external
