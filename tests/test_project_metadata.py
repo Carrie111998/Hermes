@@ -166,6 +166,23 @@ def test_dingtalk_extra_includes_qrcode_for_qr_auth():
     assert any(dep.startswith("qrcode") for dep in dingtalk_extra)
 
 
+def test_linux_wake_extra_avoids_openwakeword_tflite_metadata():
+    """Linux installs must not resolve openWakeWord's unavailable TFLite wheel."""
+    wake = _load_optional_dependencies()["wake"]
+    openwakeword = next(spec for spec in wake if spec.startswith("openwakeword=="))
+
+    assert "platform_system != 'Linux'" in openwakeword
+    for runtime_dep in ("onnxruntime", "scipy", "scikit-learn", "requests", "tqdm"):
+        assert any(spec.startswith(runtime_dep) for spec in wake)
+
+
+def test_linux_desktop_installer_adds_openwakeword_without_dependencies():
+    installer = Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
+    text = installer.read_text(encoding="utf-8")
+
+    assert 'pip install --no-deps "openwakeword==0.6.0"' in text
+
+
 
 
 
