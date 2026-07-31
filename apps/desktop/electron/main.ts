@@ -143,8 +143,10 @@ import {
   resolveReadinessProbeAuth
 } from './native-auth-decisions'
 import {
+  mergeRefreshedNativeTokenSet,
   nativeRefreshUrl,
   type NativeTokenSet,
+  parseStoredNativeTokenSet,
   parseTokenResponse,
   resolveLoginStrategy,
   tokenNeedsRefresh
@@ -6241,7 +6243,7 @@ function _loadNativeTokens(baseUrl: string): NativeTokenSet | null {
       return null
     }
 
-    const tokens = parseTokenResponse(JSON.parse(plaintext))
+    const tokens = parseStoredNativeTokenSet(JSON.parse(plaintext))
     _nativeTokens.set(baseUrl, tokens)
 
     return tokens
@@ -6306,7 +6308,7 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
       { timeoutMs: 10_000 }
     )
 
-    const rotated = parseTokenResponse(body)
+    const rotated = mergeRefreshedNativeTokenSet(tokens, body)
     _storeNativeTokens(baseUrl, rotated)
 
     return rotated.accessToken

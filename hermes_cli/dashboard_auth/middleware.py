@@ -16,7 +16,11 @@ binds.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
+import threading
+import time
+from collections import OrderedDict
 from typing import Awaitable, Callable
 
 from fastapi import Request
@@ -40,6 +44,26 @@ from hermes_cli.dashboard_auth.cookies import (
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
+
+# A browser can have several authenticated requests in flight when its access
+# token expires. They all carry the same old refresh-token cookie because the
+# first response has not reached the browser yet. Providers such as Nous rotate
+# refresh tokens with reuse detection, so calling the provider once per stale
+# request can turn a healthy rotation into a replay failure whose 401 response
+# clears the newly-issued cookies.
+#
+# Keep the just-rotated Session briefly, keyed by a non-reversible token digest,
+# client address, and provider-registry identity. A stale parallel request then
+# receives the same rotated cookies without replaying the old token upstream.
+# The cache is process-local, bounded, never persisted or logged, and much
+# shorter-lived than either credential.
+_REFRESH_REPLAY_GRACE_SECONDS = 15.0
+_REFRESH_REPLAY_CACHE_MAX_ENTRIES = 256
+_refresh_replay_cache: OrderedDict[
+    tuple[bytes, str, tuple[tuple[str, int], ...]],
+    tuple[float, tuple[object, str]],
+] = OrderedDict()
+_refresh_replay_cache_lock = threading.Lock()
 
 # Prefixes that bypass the auth gate. Match via ``path == prefix`` or
 # ``path.startswith(prefix)`` — so ``/assets/`` (with trailing slash)
@@ -454,7 +478,7 @@ async def gated_auth_middleware(
         # serve the request transparently; only after every provider rejects
         # the RT do we fall through to clear-and-relogin.
         try:
-            refreshed = _attempt_refresh(
+            refreshed = _attempt_refresh_with_replay_grace(
                 request,
                 refresh_token=_rt,
                 provider_hint=provider_hint,
@@ -589,3 +613,72 @@ def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | No
     if unavailable_provider is not None:
         raise ProviderError(unavailable_provider)
     return None
+
+
+def _refresh_replay_key(
+    request: Request,
+    *,
+    refresh_token: str,
+    provider_hint: str | None,
+) -> tuple[bytes, str, tuple[tuple[str, int], ...]]:
+    providers = _ordered_session_providers(provider_hint)
+    provider_scope = tuple((provider.name, id(provider)) for provider in providers)
+    digest = hashlib.sha256(refresh_token.encode("utf-8")).digest()
+    return digest, _client_ip(request), provider_scope
+
+
+def _get_recent_refresh(key):
+    now = time.monotonic()
+    with _refresh_replay_cache_lock:
+        while _refresh_replay_cache:
+            oldest_key, (expires_at, _) = next(iter(_refresh_replay_cache.items()))
+            if expires_at > now:
+                break
+            _refresh_replay_cache.pop(oldest_key, None)
+
+        cached = _refresh_replay_cache.get(key)
+        if cached is None or cached[0] <= now:
+            _refresh_replay_cache.pop(key, None)
+            return None
+
+        _refresh_replay_cache.move_to_end(key)
+        return cached[1]
+
+
+def _remember_recent_refresh(key, refreshed) -> None:
+    with _refresh_replay_cache_lock:
+        _refresh_replay_cache[key] = (
+            time.monotonic() + _REFRESH_REPLAY_GRACE_SECONDS,
+            refreshed,
+        )
+        _refresh_replay_cache.move_to_end(key)
+        while len(_refresh_replay_cache) > _REFRESH_REPLAY_CACHE_MAX_ENTRIES:
+            _refresh_replay_cache.popitem(last=False)
+
+
+def _attempt_refresh_with_replay_grace(
+    request: Request,
+    *,
+    refresh_token,
+    provider_hint: str | None = None,
+):
+    if not refresh_token:
+        return None
+
+    key = _refresh_replay_key(
+        request,
+        refresh_token=refresh_token,
+        provider_hint=provider_hint,
+    )
+    cached = _get_recent_refresh(key)
+    if cached is not None:
+        return cached
+
+    refreshed = _attempt_refresh(
+        request,
+        refresh_token=refresh_token,
+        provider_hint=provider_hint,
+    )
+    if refreshed is not None:
+        _remember_recent_refresh(key, refreshed)
+    return refreshed

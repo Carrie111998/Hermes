@@ -194,6 +194,43 @@ export function parseTokenResponse(body: any): NativeTokenSet {
 }
 
 /**
+ * Validate and restore the camelCase token shape encrypted by the desktop.
+ *
+ * This is deliberately separate from parseTokenResponse: the gateway wire
+ * format is snake_case, while JSON.stringify(NativeTokenSet) persists the
+ * normalized camelCase object. Feeding the latter back through the wire parser
+ * makes every post-restart load look like a missing access token.
+ */
+export function parseStoredNativeTokenSet(body: any): NativeTokenSet {
+  const accessToken = String(body?.accessToken || '')
+
+  if (!accessToken) {
+    throw new Error('Stored native token set missing accessToken')
+  }
+
+  const expiresAt = Number(body?.expiresAt)
+
+  return {
+    accessToken,
+    refreshToken: String(body?.refreshToken || ''),
+    expiresAt: Number.isFinite(expiresAt) ? expiresAt : 0,
+    provider: String(body?.provider || ''),
+    userId: String(body?.userId || '')
+  }
+}
+
+/**
+ * Normalize a refresh response without discarding a still-valid refresh token
+ * when an OAuth provider omits refresh_token. Providers that rotate return a
+ * replacement; providers that do not rotate leave the previous token live.
+ */
+export function mergeRefreshedNativeTokenSet(previous: NativeTokenSet, body: any): NativeTokenSet {
+  const refreshed = parseTokenResponse(body)
+
+  return refreshed.refreshToken ? refreshed : { ...refreshed, refreshToken: previous.refreshToken }
+}
+
+/**
  * True when a stored token set is at/near expiry and should be refreshed
  * before use. `skewSeconds` refreshes slightly early to avoid a race where
  * the token expires in flight (mirrors the server's 60s cookie floor).
