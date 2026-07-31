@@ -882,6 +882,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       });
     });
 
+    // Nerd-font glyphs: xterm measures cell metrics as soon as the first
+    // paint runs. If the bundled 'JetBrainsMono Nerd Font Mono' hasn't
+    // finished loading yet, xterm caches the *fallback* font's metrics and
+    // keeps rendering tofu even after the real font arrives. Force a
+    // re-measure + full repaint once the font is actually available so the
+    // terminal renders the Nerd glyphs (eza/lsd/starship icons).
+    if (
+      typeof document !== "undefined" &&
+      document.fonts &&
+      typeof document.fonts.load === "function"
+    ) {
+      const initialSize = terminalFontSizeForWidth(terminalTierWidthPx(host));
+      void document.fonts
+        .load(`${initialSize}px 'JetBrainsMono Nerd Font Mono'`)
+        .catch(() => undefined)
+        .then(() => {
+          if (unmounting) return;
+          // Re-apply metrics so xterm recomputes cell width/height from the
+          // now-loaded Nerd font, then repaint every row.
+          syncTerminalMetrics();
+          if (term.rows > 0) {
+            try {
+              term.refresh(0, term.rows - 1);
+            } catch {
+              /* ignore */
+            }
+          }
+        });
+    }
+
     // WebSocket. In gated mode (``window.__HERMES_AUTH_REQUIRED__``) this
     // awaits a single-use ticket via /api/auth/ws-ticket before opening;
     // in loopback mode it resolves synchronously against the injected
