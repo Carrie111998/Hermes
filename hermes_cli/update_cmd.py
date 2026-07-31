@@ -3073,14 +3073,36 @@ def _normalize_managed_eol(git_cmd, repo_root):
     probe = git_cmd + ["-c", "core.autocrlf=false"]
 
     def _dirty(*extra):
+        # `--name-only` does not honor `--ignore-cr-at-eol` on git < 2.48 (the
+        # flag is silently dropped), so the "real dirty" set would equal the
+        # full set and `_eol_only()` would always be empty — leaving CRLF churn
+        # uncleared and then writing the pin over it. `--numstat` honors the
+        # ignore options on every supported git version, so use it when an
+        # ignore flag is requested and derive the path set from its records.
+        ignore_eol = "--ignore-cr-at-eol" in extra
+        name_arg = "--numstat" if ignore_eol else "--name-only"
+        args = probe + ["diff", "-z", name_arg, *extra]
         out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
+            args,
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
         if out.returncode != 0:
             return None
+        if ignore_eol:
+            paths = set()
+            for record in out.stdout.split("\0"):
+                if not record:
+                    continue
+                # numstat -z records are "added\tdeleted\tpath" (renames add a
+                # fourth field); the path fields are everything after the two
+                # counts. Binary/unknown counts appear as "-".
+                fields = record.split("\t")
+                for field in fields[2:]:
+                    if field and field != "-":
+                        paths.add(field)
+            return paths
         return {p for p in out.stdout.split("\0") if p}
 
     def _eol_only():
