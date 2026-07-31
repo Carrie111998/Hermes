@@ -155,6 +155,9 @@ def test_default_spawn_claims_exact_owner_and_pins_deterministic_session(
         return FakeReaper(), ready_r
 
     monkeypatch.setattr(kb, "_start_worker_owner_reaper", fake_reaper)
+    # Attestation has its own dedicated tests; this one pins owner identity
+    # and session, and its fake argv names no real interpreter.
+    monkeypatch.setattr(kb, "_attest_worker_admission_hook_armed", lambda **kw: None)
     task = _task(kb)
     pid = kb._default_spawn(task, str(workspace))
 
@@ -299,6 +302,10 @@ else:
     monkeypatch.setattr(
         kb, "_resolve_hermes_argv", lambda: [sys.executable, str(probe)],
     )
+    # Attestation requires the worker to resolve the dispatcher's tree; in a
+    # worktree checkout that means pinning PYTHONPATH, exactly as a matched
+    # install would resolve on its own.
+    monkeypatch.setenv("PYTHONPATH", str(REPO_ROOT))
 
     pid = kb._default_spawn(task, str(workspace))
     for _ in range(200):
@@ -1174,14 +1181,21 @@ def test_attestation_runs_the_real_worker_resolution_chain(monkeypatch, tmp_path
 
     env = dict(os.environ)
     env["HERMES_HOME"] = str(profile)
+    # Pin the worker to this tree, as a matched install would resolve it.
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    argv = [sys.executable, "-m", "hermes_cli.main"]
     # Correctly configured profile: attestation succeeds.
-    kb._attest_worker_admission_hook_armed(profile_home=profile, env=env)
+    kb._attest_worker_admission_hook_armed(
+        profile_home=profile, env=env, worker_argv=argv,
+    )
 
     # Safe mode disarms hooks at registration time — must be refused.
     hostile = dict(env)
     hostile["HERMES_SAFE_MODE"] = "1"
     with pytest.raises(RuntimeError, match="admission hook"):
-        kb._attest_worker_admission_hook_armed(profile_home=profile, env=hostile)
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=hostile, worker_argv=argv,
+        )
 
 
 def test_attestation_refuses_a_profile_without_the_factory_hook(
@@ -1204,5 +1218,184 @@ def test_attestation_refuses_a_profile_without_the_factory_hook(
     )
     env = dict(os.environ)
     env["HERMES_HOME"] = str(profile)
+    env["PYTHONPATH"] = str(REPO_ROOT)
     with pytest.raises(RuntimeError, match="admission hook"):
-        kb._attest_worker_admission_hook_armed(profile_home=profile, env=env)
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=env,
+            worker_argv=[sys.executable, "-m", "hermes_cli.main"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# R2-B2 — a failed owner claim must never leave an openable gate
+# ---------------------------------------------------------------------------
+
+def test_failed_owner_claim_aborts_spawn_and_never_opens_the_gate(
+    monkeypatch, tmp_path,
+):
+    """Claim contention returns False: the gate must stay absent and the
+    wrapper must die, so zero worker bytes can ever run."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    attested: list = []
+
+    _spawn_with_fakes(
+        monkeypatch, kb, captured,
+        attest=lambda **kw: attested.append(kw),
+    )
+    monkeypatch.setattr(kb, "_claim_worker_owner", lambda *a, **k: False)
+
+    with pytest.raises(RuntimeError, match="owner"):
+        kb._default_spawn(_task(kb), str(workspace))
+
+    assert captured.get("terminated") is True, (
+        "a worker whose owner claim lost must be terminated, not left gated"
+    )
+    assert attested == [], "attestation must not run without a won claim"
+    gates = list((kb.worker_logs_dir() ).glob("*.owner-ready-*"))
+    assert gates == [], f"gate file must never exist after a failed claim: {gates}"
+    assert not (registry / "locks" / "HER-118" / "owner.json").exists()
+
+
+def test_gate_file_is_written_only_after_claim_and_attestation(
+    monkeypatch, tmp_path,
+):
+    """Ordering contract: claim wins -> attestation passes -> gate opens."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    order: list = []
+
+    real_claim = kb._claim_worker_owner
+
+    def traced_claim(*args, **kwargs):
+        result = real_claim(*args, **kwargs)
+        order.append(("claim", bool(result)))
+        return result
+
+    def traced_attest(**kwargs):
+        order.append(("attest", True))
+
+    real_open = os.open
+
+    def traced_open(path, *args, **kwargs):
+        if "owner-ready-" in str(path):
+            order.append(("gate", True))
+        return real_open(path, *args, **kwargs)
+
+    _spawn_with_fakes(monkeypatch, kb, captured, attest=traced_attest)
+    monkeypatch.setattr(kb, "_claim_worker_owner", traced_claim)
+    monkeypatch.setattr(os, "open", traced_open)
+
+    kb._default_spawn(_task(kb), str(workspace))
+
+    assert order == [("claim", True), ("attest", True), ("gate", True)], order
+
+
+# ---------------------------------------------------------------------------
+# R2-M3 — attestation must probe the worker's real executable, not the
+# dispatcher's
+# ---------------------------------------------------------------------------
+
+def test_attestation_probes_the_resolved_worker_command(monkeypatch, tmp_path):
+    """The armed check must run through the same argv the worker will use."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    captured: dict = {}
+    seen: dict = {}
+
+    def spy_attest(**kwargs):
+        seen.update(kwargs)
+
+    _spawn_with_fakes(monkeypatch, kb, captured, attest=spy_attest)
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["/opt/custom/hermes"])
+
+    kb._default_spawn(_task(kb), str(workspace))
+
+    assert seen.get("worker_argv", [None])[0] == "/opt/custom/hermes", (
+        "attestation must receive the exact resolved worker argv, otherwise it "
+        "proves the dispatcher's tree rather than the worker's"
+    )
+    assert seen.get("env", {}).get("HERMES_HOME") == str(profile)
+    assert seen.get("cwd") == str(workspace), (
+        "the probe must use the worker's own cwd, not the dispatcher tree"
+    )
+
+
+def test_attestation_aborts_when_worker_runtime_tree_diverges(
+    monkeypatch, tmp_path,
+):
+    """A worker importing hermes_cli from another install must abort the spawn."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    # A foreign tree that shadows hermes_cli/agent on the worker's sys.path.
+    foreign = tmp_path / "foreign-runtime"
+    real_tree = Path(kb.__file__).resolve().parents[1]
+    for package in ("hermes_cli", "agent"):
+        (foreign / package).mkdir(parents=True)
+        (foreign / package / "__init__.py").write_text("", encoding="utf-8")
+    (foreign / "hermes_cli" / "config.py").write_text(
+        "def load_config():\n    return {}\n", encoding="utf-8",
+    )
+    (foreign / "agent" / "shell_hooks.py").write_text(
+        "def register_from_config(cfg, accept_hooks=False):\n    return []\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+    env["PYTHONPATH"] = str(foreign)
+
+    with pytest.raises(RuntimeError, match="different Hermes tree|admission hook"):
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=env, worker_argv=[sys.executable, "-m", "hermes_cli.main"],
+        )
+    assert real_tree.exists()
+
+
+def test_attestation_refuses_an_unattestable_worker_executable(tmp_path):
+    """No interpreter can be proven -> fail closed, never probe the dispatcher."""
+    from hermes_cli import kanban_db as kb
+
+    with pytest.raises(RuntimeError, match="cannot attest"):
+        kb._worker_probe_interpreter(None)
+    with pytest.raises(RuntimeError, match="cannot attest"):
+        kb._worker_probe_interpreter([str(tmp_path / "does-not-exist")])
+    opaque = tmp_path / "opaque-shim"
+    opaque.write_bytes(b"\x7fELF not a script\n")
+    with pytest.raises(RuntimeError, match="names no interpreter"):
+        kb._worker_probe_interpreter([str(opaque)])
+    # A console-script shim resolves through its shebang.
+    shim = tmp_path / "hermes"
+    shim.write_text(f"#!{sys.executable}\nprint('x')\n", encoding="utf-8")
+    assert kb._worker_probe_interpreter([str(shim)]) == sys.executable
+    # A direct interpreter argv resolves to itself.
+    assert kb._worker_probe_interpreter(
+        [sys.executable, "-m", "hermes_cli.main"]
+    ) == sys.executable

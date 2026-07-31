@@ -9046,20 +9046,70 @@ def _code_owner_hook_spec(profile_home: Path) -> Optional[dict[str, str]]:
 _HOOK_DISABLING_ENV_VARS = ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG")
 
 
-def _attest_worker_admission_hook_armed(*, profile_home: Path, env: dict) -> None:
+def _worker_probe_interpreter(worker_argv: "list[str] | None") -> str:
+    """Return the interpreter that will actually run the worker's Hermes tree.
+
+    The dispatcher's own ``sys.executable`` proves nothing about the worker:
+    ``_resolve_hermes_argv`` may resolve ``$HERMES_BIN`` or a ``hermes`` shim
+    from a completely different install. Either the argv names an interpreter
+    directly (``python -m hermes_cli.main``) or it is a console-script whose
+    shebang names one. Anything else cannot be attested and fails closed.
+    """
+    if not worker_argv:
+        raise RuntimeError(
+            "cannot attest the worker admission hook: no resolved worker argv"
+        )
+    head = worker_argv[0]
+    if Path(head).name.lower().startswith("python"):
+        return head
+    try:
+        with open(head, "rb") as handle:
+            first = handle.readline(512)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot attest the worker admission hook: unreadable worker "
+            f"executable {head!r} ({exc})"
+        ) from exc
+    if not first.startswith(b"#!"):
+        raise RuntimeError(
+            "cannot attest the worker admission hook: worker executable "
+            f"{head!r} names no interpreter"
+        )
+    shebang = first[2:].decode("utf-8", "replace").strip().split()
+    if not shebang:
+        raise RuntimeError(
+            "cannot attest the worker admission hook: worker executable "
+            f"{head!r} has an empty interpreter line"
+        )
+    return shebang[-1] if shebang[0].endswith("env") and len(shebang) > 1 else shebang[0]
+
+
+def _attest_worker_admission_hook_armed(
+    *, profile_home: Path, env: dict, worker_argv: "list[str] | None" = None,
+    cwd: "str | None" = None,
+) -> None:
     """Fail closed unless the worker's real chain registers the factory hook.
 
     The dispatcher-side config read (:func:`_code_owner_hook_spec`) proves what
     the profile *declares*; it cannot prove what the worker process will
     actually arm. Safe mode, a disarmed allowlist, or a malformed hooks block
     all yield zero registered hooks at runtime while the declaration still
-    parses. This runs the worker's genuine resolution chain
-    (``load_config`` + ``register_from_config``) in a subprocess carrying the
-    exact env the worker will receive, and refuses to open the gate unless the
-    AI Factory admission hook is among the hooks that ended up registered.
+    parses.
+
+    This runs the worker's genuine resolution chain (``load_config`` +
+    ``register_from_config``) using the interpreter the *worker* will use and
+    the exact env the worker will receive, then refuses to open the gate unless
+    (a) the AI Factory admission hook is among the hooks that ended up
+    registered and (b) the Hermes tree the worker imports is the very tree that
+    ships the hook script this dispatcher validated. A worker resolving to a
+    different install would otherwise be attested against code it never runs.
     """
+    interpreter = _worker_probe_interpreter(worker_argv)
+    dispatcher_tree = str(Path(__file__).resolve().parents[1])
     probe = (
-        "import json,sys\n"
+        "import json\n"
+        "import hermes_cli\n"
+        "from pathlib import Path\n"
         "from hermes_cli.config import load_config\n"
         "from agent.shell_hooks import register_from_config\n"
         "specs = register_from_config(load_config(), accept_hooks=True)\n"
@@ -9069,17 +9119,17 @@ def _attest_worker_admission_hook_armed(*, profile_home: Path, env: dict) -> Non
         "    and 'factory_admission_hook.py' in s.command\n"
         "    and '--require-owned-git' in s.command\n"
         "]\n"
-        "print(json.dumps({'armed': armed}))\n"
+        "tree = str(Path(hermes_cli.__file__).resolve().parents[1])\n"
+        "print(json.dumps({'armed': armed, 'tree': tree}))\n"
     )
-    probe_env = dict(env)
-    for name in _HOOK_DISABLING_ENV_VARS:
-        if name in os.environ and name not in env:
-            probe_env.pop(name, None)
     try:
         result = subprocess.run(
-            [sys.executable, "-c", probe],
-            cwd=str(Path(__file__).resolve().parents[1]),
-            env=probe_env, capture_output=True, text=True,
+            [interpreter, "-c", probe],
+            # The worker's own cwd: anchoring the probe on the dispatcher tree
+            # would bias ``import hermes_cli`` toward the code we are trying to
+            # verify against, hiding a real install divergence.
+            cwd=cwd or str(profile_home),
+            env=dict(env), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -9092,11 +9142,19 @@ def _attest_worker_admission_hook_armed(*, profile_home: Path, env: dict) -> Non
             f"(probe rc={result.returncode}): {result.stderr.strip()[:400]}"
         )
     try:
-        armed = json.loads(result.stdout.strip().splitlines()[-1])["armed"]
+        verdict = json.loads(result.stdout.strip().splitlines()[-1])
+        armed = verdict["armed"]
+        worker_tree = verdict["tree"]
     except (ValueError, KeyError, IndexError) as exc:
         raise RuntimeError(
             "worker AI Factory admission hook attestation returned no verdict"
         ) from exc
+    if Path(worker_tree).resolve() != Path(dispatcher_tree).resolve():
+        raise RuntimeError(
+            "worker resolves a different Hermes tree than the dispatcher "
+            f"({worker_tree} != {dispatcher_tree}); the admission hook this "
+            "dispatcher validated is not the code the worker would run"
+        )
     if not armed:
         raise RuntimeError(
             "worker did not arm the AI Factory admission hook; refusing to "
@@ -9675,6 +9733,17 @@ def _default_spawn(
                 task, workspace, profile_home, proc.pid,
                 process_start_time, str(worker_session_id),
             )
+            if not owner_claimed:
+                # The profile declares the strict Code hook (``owner_hook`` is
+                # not None) yet the exact-owner claim did not win — contention,
+                # a foreign live owner, or a refused freshness gate. Opening the
+                # gate here would run a worker with no owner backing it, which
+                # the admission hook then blocks on every mutation: a guaranteed
+                # dead lane. Abort so the gate is never created.
+                raise RuntimeError(
+                    "exact worker owner claim did not win; refusing to open the "
+                    f"owner gate for task {task.id}"
+                )
             if owner_claimed:
                 reaper_handle = _start_worker_owner_reaper(
                     task=task,
@@ -9694,7 +9763,8 @@ def _default_spawn(
                 # Last gate before the worker may run its first byte: prove the
                 # admission hook actually arms under the worker's exact env.
                 _attest_worker_admission_hook_armed(
-                    profile_home=profile_home, env=env,
+                    profile_home=profile_home, env=env, worker_argv=cmd,
+                    cwd=workspace,
                 )
         gate_fd = os.open(gate_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         os.close(gate_fd)
