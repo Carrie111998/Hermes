@@ -24,17 +24,13 @@ from typing import Any, Dict, Optional
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.relay.adapter import RelayAdapter
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.session import SessionSource
 
 from tests.gateway.relay.stub_connector import StubConnector
-from tests.gateway.test_approve_deny_commands import (
-    _clear_approval_state,
-    _make_runner,
-)
 
 FULL_OPS = (
     "send",
@@ -218,12 +214,17 @@ async def test_prompt_response_resolves_clarify_choice_and_other(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_expired_structured_deny_does_not_resolve_a_newer_approval():
+    from gateway.run import GatewayRunner
     from gateway.session import build_session_key
     from tools.approval import _ApprovalEntry, _gateway_queues
 
-    _clear_approval_state()
+    _gateway_queues.clear()
     adapter, _stub = _adapter()
-    runner = _make_runner()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
+    runner.session_store = None
+    runner._pending_approvals = {}
+    runner.adapters = {Platform.TELEGRAM: adapter}
     adapter.set_message_handler(runner._handle_deny_command)
     event = _event(
         {"prompt_id": "expired-prompt", "option_id": "deny"},
@@ -241,7 +242,7 @@ async def test_expired_structured_deny_does_not_resolve_a_newer_approval():
         assert not fresh.event.is_set()
         assert _gateway_queues[session_key] == [fresh]
     finally:
-        _clear_approval_state()
+        _gateway_queues.clear()
 
 
 # ── Discord type-3 hp1 decode ────────────────────────────────────────────
