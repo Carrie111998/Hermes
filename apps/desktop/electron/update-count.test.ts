@@ -2,7 +2,12 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { resolveBehindCount, shouldCountCommits } from './update-count'
+import {
+  buildChangedPathDiffArgs,
+  resolveActionableBehindCount,
+  resolveBehindCount,
+  shouldCountCommits
+} from './update-count'
 
 // FAIL-BEFORE: pre-fix the function did `Number.parseInt(countStr) || 0`
 // unconditionally, so a shallow checkout with no merge-base surfaced the bogus
@@ -124,5 +129,64 @@ test('skipped-count path resolves via SHA compare, never via empty countStr', ()
       hasMergeBase: false
     }),
     0
+  )
+})
+
+// A passive update check must not advertise an app update when every changed
+// path is documentation-only. This is the exact regression from 2026-07-29:
+// three upstream documentation commits caused a full desktop rebuild.
+test('documentation-only changes do not produce an actionable update', () => {
+  assert.equal(
+    resolveActionableBehindCount({
+      behind: 3,
+      changedPaths: [
+        'SECURITY.md',
+        'SECURITY.es.md',
+        'website/docs/reference/faq.md',
+        'website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/developer-guide/gateway-internals.md'
+      ]
+    }),
+    0
+  )
+})
+
+test('a runtime change keeps the original behind count', () => {
+  assert.equal(
+    resolveActionableBehindCount({
+      behind: 4,
+      changedPaths: ['website/docs/reference/faq.md', 'apps/desktop/electron/main.ts']
+    }),
+    4
+  )
+})
+
+test('unknown or empty changed-path data fails open and keeps the update', () => {
+  assert.equal(resolveActionableBehindCount({ behind: 2, changedPaths: null }), 2)
+  assert.equal(resolveActionableBehindCount({ behind: 2, changedPaths: [] }), 2)
+})
+
+test('an already up-to-date checkout remains up to date', () => {
+  assert.equal(resolveActionableBehindCount({ behind: 0, changedPaths: ['apps/desktop/electron/main.ts'] }), 0)
+})
+
+// Rename detection can collapse a runtime source + website destination to only
+// the destination path. --no-renames makes Git report both paths so deleting or
+// moving executable code can never be hidden as a documentation-only update.
+test('changed-path diff disables rename detection', () => {
+  assert.deepEqual(buildChangedPathDiffArgs('base-sha', 'target-ref'), [
+    'diff',
+    '--no-renames',
+    '--name-only',
+    'base-sha..target-ref'
+  ])
+})
+
+test('runtime source plus documentation destination remains actionable', () => {
+  assert.equal(
+    resolveActionableBehindCount({
+      behind: 1,
+      changedPaths: ['apps/desktop/runtime.ts', 'website/runtime.ts']
+    }),
+    1
   )
 })

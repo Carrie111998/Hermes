@@ -185,7 +185,12 @@ import {
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
-import { resolveBehindCount, shouldCountCommits } from './update-count'
+import {
+  buildChangedPathDiffArgs,
+  resolveActionableBehindCount,
+  resolveBehindCount,
+  shouldCountCommits
+} from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
@@ -198,7 +203,13 @@ import {
   sandboxFallbackFromEnv,
   sandboxPreflight
 } from './update-relaunch'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import {
+  isOfficialSshRemote,
+  isRefspecSafeBranchName,
+  OFFICIAL_REPO_HTTPS_URL,
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
+} from './update-remote'
 import { spawnUpdaterProcess } from './updater-process'
 import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from './venv-blocker-scan'
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
@@ -2430,8 +2441,14 @@ async function resolveHealedBranch(updateRoot, branch) {
   }
 
   const originUrl = await getOriginUrl(updateRoot)
-  const remote = isOfficialSshRemote(originUrl) ? OFFICIAL_REPO_HTTPS_URL : 'origin'
-  const probe = await runGit(['ls-remote', '--exit-code', '--heads', remote, branch], { cwd: updateRoot })
+  const officialSshRemote = isOfficialSshRemote(originUrl)
+  const remote = officialSshRemote ? OFFICIAL_REPO_HTTPS_URL : 'origin'
+  const probeArgs = ['ls-remote', '--exit-code', '--heads', remote, branch]
+
+  const probe = await runGit(officialSshRemote ? officialHttpsOnlyGitArgs(probeArgs) : probeArgs, {
+    cwd: updateRoot,
+    env: officialSshRemote ? officialHttpsOnlyGitEnv(process.env) : undefined
+  })
 
   if (probe.code !== 2) {
     return branch
@@ -2462,47 +2479,54 @@ async function checkUpdates() {
     }
   }
 
-  branch = await resolveHealedBranch(updateRoot, branch)
-  const originUrl = await getOriginUrl(updateRoot)
-
-  if (isOfficialSshRemote(originUrl)) {
-    const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
-
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
-      git(['rev-parse', 'HEAD']),
-      runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
-      git(['status', '--porcelain']),
-      git(['rev-parse', '--abbrev-ref', 'HEAD'])
-    ])
-
-    const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
-
-    if (target.code !== 0 || !targetSha) {
-      return {
-        supported: true,
-        branch,
-        error: 'fetch-failed',
-        message: firstLine(target.stderr) || 'git ls-remote failed.',
-        hermesRoot: updateRoot,
-        fetchedAt: Date.now()
-      }
-    }
-
+  if (!isRefspecSafeBranchName(branch)) {
     return {
       supported: true,
       branch,
-      currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : 1,
-      currentSha,
-      targetSha,
-      commits: [],
-      dirty: dirtyStr.length > 0,
+      error: 'invalid-branch',
+      message: `Invalid update branch: ${branch}`,
       hermesRoot: updateRoot,
       fetchedAt: Date.now()
     }
   }
 
-  const fetched = await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+  const branchCheck = await runGit(['check-ref-format', '--branch', branch], { cwd: updateRoot })
+
+  if (branchCheck.code !== 0) {
+    return {
+      supported: true,
+      branch,
+      error: 'invalid-branch',
+      message: firstLine(branchCheck.stderr) || `Invalid update branch: ${branch}`,
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  branch = await resolveHealedBranch(updateRoot, branch)
+  const originUrl = await getOriginUrl(updateRoot)
+
+  const officialSshRemote = isOfficialSshRemote(originUrl)
+  const targetRef = officialSshRemote ? `refs/hermes/update-check/${branch}` : `origin/${branch}`
+
+  // Official SSH installs use an anonymous HTTPS fetch into a private inspection
+  // ref. This provides the changed-path data needed to reject docs-only updates
+  // without touching origin/* or triggering an SSH/FIDO2 prompt.
+  const fetched = officialSshRemote
+    ? await runGit(
+        officialHttpsOnlyGitArgs([
+          'fetch',
+          '--quiet',
+          '--no-tags',
+          OFFICIAL_REPO_HTTPS_URL,
+          `+refs/heads/${branch}:${targetRef}`
+        ]),
+        {
+          cwd: updateRoot,
+          env: officialHttpsOnlyGitEnv(process.env)
+        }
+      )
+    : await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
 
   if (fetched.code !== 0) {
     return {
@@ -2515,31 +2539,59 @@ async function checkUpdates() {
     }
   }
 
-  const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
-
-  const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr, mergeBaseStr] = await Promise.all([
-    git(['rev-parse', 'HEAD']),
-    git(['rev-parse', `origin/${branch}`]),
-    git(['status', '--porcelain']),
-    git(['rev-parse', '--abbrev-ref', 'HEAD']),
-    git(['rev-parse', '--is-shallow-repository']),
+  const [current, target, dirty, currentBranchResult, shallow, mergeBase] = await Promise.all([
+    runGit(['rev-parse', '--verify', 'HEAD^{commit}'], { cwd: updateRoot }),
+    runGit(['rev-parse', '--verify', `${targetRef}^{commit}`], { cwd: updateRoot }),
+    runGit(['status', '--porcelain'], { cwd: updateRoot }),
+    runGit(['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: updateRoot }),
+    runGit(['rev-parse', '--is-shallow-repository'], { cwd: updateRoot }),
     // merge-base exits non-zero with empty stdout when HEAD shares no common
     // ancestor with the freshly fetched tip — exactly the shallow-clone case.
-    git(['merge-base', 'HEAD', `origin/${branch}`])
+    runGit(['merge-base', 'HEAD', targetRef], { cwd: updateRoot })
   ])
 
+  if (current.code !== 0 || target.code !== 0) {
+    return {
+      supported: true,
+      branch,
+      error: 'git-check-failed',
+      message: firstLine(current.stderr || target.stderr) || 'Unable to verify update commit references.',
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  const currentSha = current.stdout.trim()
+  const targetSha = target.stdout.trim()
+  const dirtyStr = dirty.stdout.trim()
+  const currentBranch = currentBranchResult.stdout.trim()
+  const shallowStr = shallow.stdout.trim()
+  const mergeBaseStr = mergeBase.stdout.trim()
   const isShallow = shallowStr === 'true'
-  const hasMergeBase = Boolean(mergeBaseStr)
+  const hasMergeBase = mergeBase.code === 0 && Boolean(mergeBaseStr)
 
   // Only enumerate the commit count when it is meaningful. On a shallow checkout
   // with no merge-base, `rev-list --count` walks the entire remote ancestry
   // (thousands of commits, see #51922) and resolveBehindCount discards the
   // result anyway in favour of a SHA compare — so skip the expensive query.
-  const countStr = shouldCountCommits({ isShallow, hasMergeBase })
-    ? await git(['rev-list', `HEAD..origin/${branch}`, '--count'])
-    : ''
+  const count = shouldCountCommits({ isShallow, hasMergeBase })
+    ? await runGit(['rev-list', `HEAD..${targetRef}`, '--count'], { cwd: updateRoot })
+    : null
 
-  const behind = resolveBehindCount({
+  if (count && count.code !== 0) {
+    return {
+      supported: true,
+      branch,
+      error: 'git-check-failed',
+      message: firstLine(count.stderr) || 'Unable to count remote update commits.',
+      hermesRoot: updateRoot,
+      fetchedAt: Date.now()
+    }
+  }
+
+  const countStr = count?.stdout.trim() || ''
+
+  const rawBehind = resolveBehindCount({
     countStr,
     currentSha,
     targetSha,
@@ -2547,7 +2599,27 @@ async function checkUpdates() {
     hasMergeBase
   })
 
-  const commits = behind > 0 ? await readCommitLog(updateRoot, branch) : []
+  // Compare the remote side from the merge-base, not the two working trees.
+  // That excludes local carried commits from the changed-path set and asks the
+  // precise question: did upstream change anything executable?
+  const changed =
+    rawBehind > 0
+      ? await runGit(buildChangedPathDiffArgs(hasMergeBase ? mergeBaseStr : currentSha, targetRef), {
+          cwd: updateRoot
+        })
+      : null
+
+  const changedPaths =
+    changed?.code === 0
+      ? changed.stdout
+          .split('\n')
+          .map(file => file.trim())
+          .filter(Boolean)
+      : null
+
+  const behind = resolveActionableBehindCount({ behind: rawBehind, changedPaths })
+
+  const commits = behind > 0 ? await readCommitLog(updateRoot, targetRef) : []
 
   return {
     supported: true,
@@ -2563,12 +2635,12 @@ async function checkUpdates() {
   }
 }
 
-async function readCommitLog(cwd, branch) {
+async function readCommitLog(cwd, targetRef) {
   const SEP = '\x1f'
   const REC = '\x1e'
 
   const { stdout } = await runGit(
-    ['log', `HEAD..origin/${branch}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
+    ['log', `HEAD..${targetRef}`, `--pretty=format:%H${SEP}%s${SEP}%an${SEP}%at${REC}`, '-n', '40'],
     { cwd }
   )
 

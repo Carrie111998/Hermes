@@ -4,9 +4,8 @@
  * A public install can end up with `origin=git@github.com:NousResearch/hermes-agent.git`.
  * If the user's GitHub SSH key is FIDO2/passkey-backed, a background `git fetch
  * origin` triggers an unexplained hardware-touch prompt. For passive checks
- * against the official repo we substitute the public HTTPS `ls-remote` path,
- * which needs no auth and cannot prompt. Active update/apply flows are left
- * unchanged.
+ * against the official repo we substitute the public HTTPS remote, which needs
+ * no auth and cannot prompt. Active update/apply flows are left unchanged.
  *
  * Extracted from main.ts so the security-critical remote detection is unit
  * testable without booting Electron (main.ts requires('electron') at load).
@@ -62,4 +61,29 @@ function isOfficialSshRemote(url) {
   return isSshRemote(url) && canonicalGitHubRemote(url) === OFFICIAL_REPO_CANONICAL
 }
 
-export { canonicalGitHubRemote, isOfficialSshRemote, isSshRemote, OFFICIAL_REPO_CANONICAL, OFFICIAL_REPO_HTTPS_URL }
+function officialHttpsOnlyGitArgs(args: string[]) {
+  return ['-c', 'protocol.allow=never', '-c', 'protocol.https.allow=always', ...args]
+}
+
+function officialHttpsOnlyGitEnv(
+  env: Record<string, string | undefined>
+): Record<string, string | undefined> {
+  return { ...env, GIT_ALLOW_PROTOCOL: 'https' }
+}
+
+function isRefspecSafeBranchName(branch: unknown) {
+  const value = String(branch || '').trim()
+
+  return Boolean(value) && !/[*?:[\]\\]/.test(value)
+}
+
+export {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  isRefspecSafeBranchName,
+  isSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL,
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
+}

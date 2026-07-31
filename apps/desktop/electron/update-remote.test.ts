@@ -22,9 +22,12 @@ import { test } from 'vitest'
 import {
   canonicalGitHubRemote,
   isOfficialSshRemote,
+  isRefspecSafeBranchName,
   isSshRemote,
   OFFICIAL_REPO_CANONICAL,
-  OFFICIAL_REPO_HTTPS_URL
+  OFFICIAL_REPO_HTTPS_URL,
+  officialHttpsOnlyGitArgs,
+  officialHttpsOnlyGitEnv
 } from './update-remote'
 
 test('canonicalGitHubRemote normalizes SSH and HTTPS forms to the same value', () => {
@@ -76,4 +79,42 @@ test('isOfficialSshRemote does NOT match forks, other hosts, or HTTPS', () => {
 test('OFFICIAL_REPO_HTTPS_URL canonicalizes to OFFICIAL_REPO_CANONICAL', () => {
   // Invariant: the URL we substitute in must be the same repo we detect.
   assert.equal(canonicalGitHubRemote(OFFICIAL_REPO_HTTPS_URL), OFFICIAL_REPO_CANONICAL)
+})
+
+test('official HTTPS Git commands deny protocol rewrites to SSH', () => {
+  assert.deepEqual(officialHttpsOnlyGitArgs(['fetch', OFFICIAL_REPO_HTTPS_URL, 'main']), [
+    '-c',
+    'protocol.allow=never',
+    '-c',
+    'protocol.https.allow=always',
+    'fetch',
+    OFFICIAL_REPO_HTTPS_URL,
+    'main'
+  ])
+})
+
+test('official HTTPS Git commands override inherited protocol permissions', () => {
+  const inherited = {
+    PATH: '/usr/bin',
+    GIT_ALLOW_PROTOCOL: 'ssh',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'protocol.ssh.allow',
+    GIT_CONFIG_VALUE_0: 'always'
+  }
+
+  const secured = officialHttpsOnlyGitEnv(inherited)
+
+  assert.equal(secured.PATH, '/usr/bin')
+  assert.equal(secured.GIT_ALLOW_PROTOCOL, 'https')
+})
+
+test('update branch names reject refspec metacharacters', () => {
+  assert.equal(isRefspecSafeBranchName('main'), true)
+  assert.equal(isRefspecSafeBranchName('release/next'), true)
+  assert.equal(isRefspecSafeBranchName('*'), false)
+  assert.equal(isRefspecSafeBranchName('feature/*'), false)
+  assert.equal(isRefspecSafeBranchName('main:refs/heads/pwn'), false)
+  assert.equal(isRefspecSafeBranchName('feature?'), false)
+  assert.equal(isRefspecSafeBranchName('feature[1]'), false)
+  assert.equal(isRefspecSafeBranchName(''), false)
 })
