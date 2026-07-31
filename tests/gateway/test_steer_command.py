@@ -117,6 +117,40 @@ async def test_steer_calls_agent_steer_and_does_not_interrupt():
 
 
 @pytest.mark.asyncio
+async def test_steer_without_payload_returns_usage():
+    runner, _adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    running_agent = MagicMock()
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer"))
+
+    assert result is not None
+    assert "Usage" in result or "usage" in result
+    running_agent.steer.assert_not_called()
+    running_agent.interrupt.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_steer_with_pending_sentinel_falls_back_to_queue():
+    """When the agent hasn't finished booting (sentinel), /steer should
+    queue as a turn-boundary follow-up instead of crashing."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    result = await runner._handle_message(_make_event("/steer wait up"))
+
+    assert result is not None
+    assert "queued" in result.lower() or "starting" in result.lower()
+    # The fallback put the text into the adapter's pending queue.
+    assert sk in adapter._pending_messages
+    assert adapter._pending_messages[sk].text == "wait up"
+
+
+@pytest.mark.asyncio
 async def test_steer_agent_without_steer_method_falls_back():
     """If the running agent somehow lacks the steer() method (older build,
     test stub), the handler must not explode — fall back to /queue."""
@@ -141,6 +175,143 @@ async def test_steer_agent_without_steer_method_falls_back():
         adapter._pending_messages[sk].channel_context
         == "[Thread context]\nAlice: earlier request"
     )
+
+
+@pytest.mark.asyncio
+async def test_steer_rejected_payload_returns_rejection_message():
+    """If agent.steer() returns False (e.g. empty after strip — though
+    the gateway already guards this), surface a rejection message."""
+    runner, _adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    running_agent = MagicMock()
+    running_agent.steer.return_value = False
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer hello"))
+
+    assert result is not None
+    assert "rejected" in result.lower() or "empty" in result.lower()
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for #75164 — /steer fallback must not overwrite the FIFO head.
+#
+# Both /steer fallback branches used to assign the adapter pending slot
+# directly (``adapter._pending_messages[key] = event``), clobbering any
+# previously-queued FIFO head and jumping ahead of the overflow tail. They
+# must route through ``_enqueue_fifo`` so arrival order is preserved.
+# ---------------------------------------------------------------------------
+
+
+def _prequeue_fifo(runner, adapter, sk, *texts):
+    """Queue several messages through the FIFO helper so Q1 is the head and
+    the rest fill the overflow tail. Returns the list of MessageEvents."""
+    events = []
+    for txt in texts:
+        ev = MessageEvent(
+            text=txt,
+            source=_make_source(),
+            message_id=f"m-{txt}",
+        )
+        runner._enqueue_fifo(sk, ev, adapter)
+        events.append(ev)
+    return events
+
+
+def _drain_order(adapter, runner, sk):
+    """Return the FIFO drain order: head slot first, then overflow tail."""
+    order = []
+    head = adapter._pending_messages.get(sk)
+    if head is not None:
+        order.append(head.text)
+    overflow = getattr(runner, "_queued_events", {}).get(sk, [])
+    order.extend(ev.text for ev in overflow)
+    return order
+
+
+@pytest.mark.asyncio
+async def test_steer_sentinel_fallback_preserves_fifo_head():
+    """Layer 1: with Q1 (head) and Q2 (overflow) pre-queued, /steer Q3 while
+    the agent is the PENDING sentinel must NOT clobber Q1. Order must be
+    Q1, Q2, Q3."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    _prequeue_fifo(runner, adapter, sk, "Q1", "Q2")
+
+    result = await runner._handle_message(_make_event("/steer Q3"))
+
+    assert result is not None
+    assert "queued" in result.lower() or "starting" in result.lower()
+    # Head must still be Q1 (not overwritten by Q3).
+    assert adapter._pending_messages[sk].text == "Q1"
+    # Drain order must be Q1, Q2, Q3 — nothing lost, no reordering.
+    assert _drain_order(adapter, runner, sk) == ["Q1", "Q2", "Q3"]
+
+
+@pytest.mark.asyncio
+async def test_steer_no_steer_method_fallback_preserves_fifo_head():
+    """Layer 2: with Q1 (head) and Q2 (overflow) pre-queued, /steer Q3 when
+    the running agent lacks steer() must NOT clobber Q1. Order must be
+    Q1, Q2, Q3."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    running_agent = MagicMock(spec=[])  # no steer()
+    runner._running_agents[sk] = running_agent
+
+    _prequeue_fifo(runner, adapter, sk, "Q1", "Q2")
+
+    result = await runner._handle_message(_make_event("/steer Q3"))
+
+    assert result is not None
+    assert "queued" in result.lower()
+    # Head must still be Q1.
+    assert adapter._pending_messages[sk].text == "Q1"
+    # Drain order preserved.
+    assert _drain_order(adapter, runner, sk) == ["Q1", "Q2", "Q3"]
+
+
+@pytest.mark.asyncio
+async def test_steer_sentinel_fallback_into_empty_queue_still_works():
+    """Edge: when the FIFO is empty (no pre-queued head), /steer Q3 under the
+    sentinel must still place Q3 as the head — the fix must not break the
+    empty-queue case that the original test covers."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+    runner._running_agents[sk] = _AGENT_PENDING_SENTINEL
+
+    result = await runner._handle_message(_make_event("/steer solo"))
+
+    assert result is not None
+    assert "queued" in result.lower() or "starting" in result.lower()
+    assert adapter._pending_messages[sk].text == "solo"
+    # No overflow.
+    assert _drain_order(adapter, runner, sk) == ["solo"]
+
+
+@pytest.mark.asyncio
+async def test_steer_no_steer_method_fallback_into_empty_queue_still_works():
+    """Edge: when the FIFO is empty, /steer Q3 against an agent lacking
+    steer() must place Q3 as the head."""
+    runner, adapter = _make_runner(_session_entry())
+    sk = build_session_key(_make_source())
+
+    running_agent = MagicMock(spec=[])
+    runner._running_agents[sk] = running_agent
+
+    result = await runner._handle_message(_make_event("/steer solo"))
+
+    assert result is not None
+    assert "queued" in result.lower()
+    assert adapter._pending_messages[sk].text == "solo"
+    assert _drain_order(adapter, runner, sk) == ["solo"]
 
 
 if __name__ == "__main__":  # pragma: no cover
