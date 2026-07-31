@@ -75,8 +75,11 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    admission_retry_wait,
+    is_omniroute_admission_error,
     is_zai_coding_overload_error,
     jittered_backoff,
+    omniroute_admission_retry_ceiling,
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
@@ -3662,6 +3665,7 @@ def run_conversation(
 
                 status_code = getattr(api_error, "status_code", None)
                 error_context = agent._extract_api_error_context(api_error)
+                _is_omniroute_admission = is_omniroute_admission_error(api_error)
 
                 # ── Classify the error for structured recovery decisions ──
                 _compressor = getattr(agent, "context_compressor", None)
@@ -3713,12 +3717,14 @@ def run_conversation(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                )
+                recovered_with_pool = False
+                if not _is_omniroute_admission:
+                    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                    )
                 if recovered_with_pool:
                     continue
 
@@ -4275,9 +4281,14 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                if _is_omniroute_admission:
+                    max_retries = max(max_retries, omniroute_admission_retry_ceiling())
                 _should_fallback = (
-                    is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    not _is_omniroute_admission
+                    and (
+                        is_rate_limited
+                        or (_is_transport_failure and retry_count >= 2)
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -5085,7 +5096,7 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                    if not _is_omniroute_admission and not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
                     ):
                         _retry.primary_recovery_attempted = True
@@ -5099,9 +5110,9 @@ def run_conversation(
                         agent._fallback_activated = False
                         continue
                     # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
+                    if not _is_omniroute_admission and agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _is_omniroute_admission and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5299,7 +5310,11 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
-                wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                if _is_omniroute_admission:
+                    _resp_headers = getattr(getattr(api_error, "response", None), "headers", None)
+                    wait_time = admission_retry_wait(retry_count, _resp_headers)
+                else:
+                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
@@ -5309,7 +5324,12 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                if _is_omniroute_admission:
+                    agent._emit_status(
+                        f"⏱️ Local gateway busy. Waiting {wait_time:.1f}s "
+                        f"(attempt {retry_count + 1}/{max_retries})..."
+                    )
+                elif is_rate_limited or _is_zai_coding_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"

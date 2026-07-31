@@ -17,7 +17,7 @@ import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from agent.codex_responses_adapter import _normalize_codex_response
@@ -1622,6 +1622,50 @@ class TestRetryAfterCap:
         # 300s > old 120s cap but < new 600s cap → used verbatim.
         status = self._drive_once(agent, 300)
         assert "Waiting 300.0s" in status
+
+
+class TestOmniRouteAdmissionRetry:
+    def test_structured_admission_503_survives_default_ceiling_without_rotation(
+        self, agent
+    ):
+        class _AdmissionError(Exception):
+            status_code = 503
+            body = {
+                "error": {
+                    "code": "chat_admission_busy",
+                    "message": "Structurally heavy chat request capacity is busy",
+                }
+            }
+            response = SimpleNamespace(headers={"Retry-After": "1"})
+
+            def __str__(self):
+                return "Error code: 503 - admission busy"
+
+        calls = 0
+
+        def _fake_api_call(api_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls <= agent._api_max_retries:
+                raise _AdmissionError()
+            return _mock_response(content="Recovered after admission wait")
+
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._recover_with_credential_pool = Mock(side_effect=AssertionError("rotated credentials"))
+        agent._try_activate_fallback = Mock(side_effect=AssertionError("activated fallback"))
+        agent._try_recover_primary_transport = Mock(side_effect=AssertionError("rebuilt transport"))
+
+        with patch("agent.conversation_loop.time.sleep", return_value=None):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered after admission wait"
+        assert calls == agent._api_max_retries + 1
+        agent._recover_with_credential_pool.assert_not_called()
+        agent._try_activate_fallback.assert_not_called()
+        agent._try_recover_primary_transport.assert_not_called()
 
 
 

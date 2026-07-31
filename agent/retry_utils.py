@@ -34,6 +34,12 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
+# OmniRoute holds admission leases for the lifetime of a heavy streaming
+# response. Give a saturated local queue a bounded two-minute window to drain,
+# while keeping each sleep short enough for useful progress and interrupts.
+_OMNIROUTE_ADMISSION_RETRY_ATTEMPTS = 8
+_OMNIROUTE_ADMISSION_RETRY_AFTER_CAP = 30.0
+
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     """Parse a ``Retry-After`` value into non-negative seconds.
@@ -137,6 +143,57 @@ def _error_text(error: Any) -> str:
         getattr(error, "response", None),
     ]
     return " ".join(str(part) for part in parts if part is not None).lower()
+
+
+def _structured_error_code(error: Any) -> str | None:
+    """Extract an error code from SDK response data without text matching."""
+    candidates = [getattr(error, "body", None)]
+    response = getattr(error, "response", None)
+    if response is not None:
+        json_method = getattr(response, "json", None)
+        if callable(json_method):
+            try:
+                candidates.append(json_method())
+            except Exception:
+                pass
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        detail = payload.get("error", payload)
+        if isinstance(detail, dict) and isinstance(detail.get("code"), str):
+            return detail["code"]
+    return None
+
+
+def is_omniroute_admission_error(error: Any) -> bool:
+    """Return True only for structured OmniRoute admission-busy HTTP 503s."""
+    return (
+        getattr(error, "status_code", None) == 503
+        and _structured_error_code(error) == "chat_admission_busy"
+    )
+
+
+def omniroute_admission_retry_ceiling() -> int:
+    """Retry ceiling for local admission saturation."""
+    return _OMNIROUTE_ADMISSION_RETRY_ATTEMPTS
+
+
+def admission_retry_wait(attempt: int, headers: Any) -> float:
+    """Compute a bounded, jittered admission wait respecting Retry-After.
+
+    Retry-After is treated as a minimum rather than an exact delay so a burst
+    does not synchronize all rejected clients on the same second boundary.
+    """
+    retry_after = parse_retry_after_seconds(headers)
+    if retry_after is not None:
+        retry_after = min(retry_after, _OMNIROUTE_ADMISSION_RETRY_AFTER_CAP)
+    backoff = jittered_backoff(
+        attempt,
+        base_delay=2.0,
+        max_delay=_OMNIROUTE_ADMISSION_RETRY_AFTER_CAP,
+        jitter_ratio=0.2,
+    )
+    return max(retry_after or 0.0, backoff)
 
 
 def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, error: Any) -> bool:
