@@ -38,6 +38,17 @@ describe('backend action helpers are profile-scoped', () => {
     expect(lastProfile()).toBeUndefined()
   })
 
+  it('omits profile for messaging helpers when none is active (no silent global write, #72031)', () => {
+    void getMessagingPlatforms()
+    void updateMessagingPlatform('telegram', { env: { TELEGRAM_BOT_TOKEN: 'x' } })
+    void updateMessagingPlatform('telegram', { enabled: true })
+    void testMessagingPlatform('telegram')
+
+    for (const call of api.mock.calls) {
+      expect(call[0].profile).toBeUndefined()
+    }
+  })
+
   it('forwards the active profile to memory provider config calls', () => {
     setApiRequestProfile('coder')
 

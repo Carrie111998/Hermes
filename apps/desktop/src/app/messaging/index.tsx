@@ -248,6 +248,9 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
       })
     } catch (err) {
       notifyError(err, m.failedSave(platform.name))
+      // Rethrow so the save confirmation dialog can surface the failure
+      // inline and stay open instead of reporting success (#72031 review).
+      throw err
     } finally {
       setSaving(null)
     }
@@ -354,7 +357,7 @@ export function MessagingView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
           confirmLabel={t.common.confirm}
           description={m.saveScopeBody(activeProfile)}
           onClose={() => setPendingSave(null)}
-          onConfirm={() => void commitSave(pendingSave)}
+          onConfirm={() => commitSave(pendingSave)}
           open
           title={m.saveScopeTitle(pendingSave.name)}
         />
