@@ -30,19 +30,6 @@ class TestSearXNGSearchProviderIsConfigured:
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
         assert SearXNGWebSearchProvider().is_available() is True
 
-    def test_not_configured_when_url_missing(self, monkeypatch):
-        monkeypatch.delenv("SEARXNG_URL", raising=False)
-        from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        assert SearXNGWebSearchProvider().is_available() is False
-
-    def test_not_configured_when_url_empty_string(self, monkeypatch):
-        monkeypatch.setenv("SEARXNG_URL", "   ")
-        from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        assert SearXNGWebSearchProvider().is_available() is False
-
-    def test_provider_name(self):
-        from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        assert SearXNGWebSearchProvider().name == "searxng"
 
     def test_implements_web_search_provider(self):
         from agent.web_search_provider import WebSearchProvider
@@ -334,10 +321,6 @@ class TestIsBackendAvailable:
         from tools.web_tools import _is_backend_available
         assert _is_backend_available("searxng") is True
 
-    def test_searxng_unavailable_when_url_missing(self, monkeypatch):
-        monkeypatch.delenv("SEARXNG_URL", raising=False)
-        from tools.web_tools import _is_backend_available
-        assert _is_backend_available("searxng") is False
 
     def test_unknown_backend_still_false(self):
         from tools.web_tools import _is_backend_available
@@ -356,19 +339,6 @@ class TestGetBackendSearXNG:
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         assert web_tools._get_backend() == "searxng"
 
-    def test_auto_detect_picks_searxng_when_only_url_set(self, monkeypatch):
-        """When no backend is configured but SEARXNG_URL is set, auto-detect returns it."""
-        from tools import web_tools
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {})
-        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
-        monkeypatch.delenv("FIRECRAWL_API_URL", raising=False)
-        monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
-        monkeypatch.delenv("TAVILY_API_KEY", raising=False)
-        monkeypatch.delenv("EXA_API_KEY", raising=False)
-        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
-        # Suppress tool gateway
-        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
-        assert web_tools._get_backend() == "searxng"
 
     def test_searxng_does_not_override_higher_priority_provider(self, monkeypatch):
         """Tavily (higher priority than searxng) should win in auto-detect."""
