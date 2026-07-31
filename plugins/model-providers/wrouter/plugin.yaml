@@ -1,0 +1,5 @@
+name: wrouter-provider
+kind: model-provider
+version: 1.0.0
+description: WRouter aggregator
+author: WRouter
