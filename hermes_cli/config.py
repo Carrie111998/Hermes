@@ -3172,6 +3172,9 @@ def write_platform_config_field(
 
 TERMINAL_CONFIG_ENV_MAP = {
     "backend": "TERMINAL_ENV",
+    # Execution authority is read from config by the policy resolver; it must
+    # not be copied into an ambient environment variable.
+    "execution_write_scope": None,
     "modal_mode": "TERMINAL_MODAL_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
@@ -3247,6 +3250,8 @@ def apply_terminal_config_to_env(
 
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
         if cfg_key not in terminal_cfg:
+            continue
+        if env_var is None:
             continue
         value = terminal_cfg[cfg_key]
         if cfg_key == "cwd":

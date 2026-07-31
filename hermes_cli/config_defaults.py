@@ -237,6 +237,7 @@ DEFAULT_CONFIG = {
 
     "terminal": {
         "backend": "local",
+        "execution_write_scope": "legacy",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,

@@ -445,6 +445,7 @@ def load_cli_config() -> Dict[str, Any]:
         },
         "terminal": {
             "env_type": "local",
+            "execution_write_scope": "legacy",
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
             "home_mode": "auto",
             "lifetime_seconds": 300,
@@ -657,6 +658,7 @@ def load_cli_config() -> Dict[str, Any]:
     
     env_mappings = {
         "env_type": "TERMINAL_ENV",
+        "execution_write_scope": None,
         "cwd": "TERMINAL_CWD",
         "timeout": "TERMINAL_TIMEOUT",
         "home_mode": "TERMINAL_HOME_MODE",
@@ -698,6 +700,8 @@ def load_cli_config() -> Dict[str, Any]:
     _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
     for config_key, env_var in env_mappings.items():
         if config_key in terminal_config:
+            if env_var is None:
+                continue
             if env_var == "TERMINAL_CWD":
                 if _is_gateway:
                     continue

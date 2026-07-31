@@ -451,6 +451,12 @@ class BaseEnvironment(ABC):
     interrupt handling, and timeout enforcement.
     """
 
+    def validate_execution_capability(self, policy):
+        """Return the shared policy result before backend execution begins."""
+        from tools.environments.execution_policy import validate_execution_capability
+
+        return validate_execution_capability(policy)
+
     # Subclasses that embed stdin as a heredoc (Modal, Daytona) set this.
     _stdin_mode: str = "pipe"  # "pipe" or "heredoc"
 

@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import contextvars
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 
@@ -1005,7 +1006,7 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
 # a mid-process backend switch rebuilds the string. Kept in-module (not on
 # disk) because the probe captures live backend state that may change
 # across Hermes restarts.
-_BACKEND_PROBE_CACHE: dict[tuple[str, str], str] = {}
+_BACKEND_PROBE_CACHE: dict[tuple[str, str, str], str] = {}
 
 
 _WINDOWS_BASH_SHELL_HINT = (
@@ -1027,23 +1028,39 @@ def _probe_remote_backend(env_type: str) -> str | None:
     per process. Used only for non-local backends where the agent's tools
     operate on a different machine than the host Hermes runs on.
     """
-    cwd_hint = os.getenv("TERMINAL_CWD", "")
-    cache_key = (env_type, cwd_hint)
-    cached = _BACKEND_PROBE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached or None
-
+    env = None
+    cache_key = None
     try:
         # Import locally: tools/ imports are heavy and only relevant when a
         # non-local backend is actually configured.
-        from tools.terminal_tool import _create_environment, _get_env_config  # type: ignore
+        from tools.terminal_tool import (
+            _create_environment,
+            _get_env_config,
+            _resolve_execution_policy_for_task,
+        )
     except Exception as e:
         logger.debug("Backend probe unavailable (import failed): %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
 
     try:
         config = _get_env_config()
+        policy = _resolve_execution_policy_for_task(
+            config,
+            "prompt-backend-probe",
+            env_type=env_type,
+            cwd=config.get("cwd", ""),
+        )
+        cache_key = (
+            env_type,
+            os.getenv("TERMINAL_CWD", ""),
+            policy.fingerprint,
+        )
+        cached = _BACKEND_PROBE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached or None
+        if not policy.capability.supported:
+            _BACKEND_PROBE_CACHE[cache_key] = ""
+            return None
         # Build the environment the same way tools/terminal_tool.py does for a
         # live command: select the backend image, then assemble ssh/container
         # config from the env-derived dict. (There is no `get_environment`
@@ -1075,18 +1092,24 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "container_cpu": config.get("container_cpu", 1),
                 "container_memory": config.get("container_memory", 5120),
                 "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
                 "modal_mode": config.get("modal_mode", "auto"),
                 "docker_volumes": config.get("docker_volumes", []),
-                "docker_mount_cwd_to_workspace": config.get("docker_mount_cwd_to_workspace", False),
+                "docker_mount_cwd_to_workspace": config.get(
+                    "docker_mount_cwd_to_workspace", False
+                ),
                 "docker_forward_env": config.get("docker_forward_env", []),
                 "docker_env": config.get("docker_env", {}),
                 "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
                 "docker_extra_args": config.get("docker_extra_args", []),
-                "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
+                # A prompt probe is a throwaway environment, even when the
+                # selected backend normally persists across Hermes processes.
+                "container_persistent": False,
+                "docker_persist_across_processes": False,
                 "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+                "execution_policy": policy,
             }
 
+        probe_task_id = f"prompt-backend-probe-{uuid.uuid4().hex}"
         env = _create_environment(
             env_type=env_type,
             image=image,
@@ -1094,7 +1117,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
             timeout=config.get("timeout", 180),
             ssh_config=ssh_config,
             container_config=container_config,
-            task_id="prompt-backend-probe",
+            task_id=probe_task_id,
             host_cwd=config.get("host_cwd"),
         )
         # Single-line POSIX probe — works on any Unixy backend. Wrapped in
@@ -1116,8 +1139,28 @@ def _probe_remote_backend(env_type: str) -> str | None:
             return None
     except Exception as e:
         logger.debug("Backend probe failed: %s", e)
-        _BACKEND_PROBE_CACHE[cache_key] = ""
+        if cache_key is not None:
+            _BACKEND_PROBE_CACHE[cache_key] = ""
         return None
+    finally:
+        if env is not None:
+            try:
+                import inspect
+
+                cleanup = getattr(env, "cleanup", None)
+                if callable(cleanup):
+                    if "force_remove" in inspect.signature(cleanup).parameters:
+                        cleanup(force_remove=True)
+                    else:
+                        cleanup()
+            except Exception:
+                logger.debug("Backend probe environment cleanup failed", exc_info=True)
+        try:
+            from tools.environments.execution_policy import clear_execution_workspace
+
+            clear_execution_workspace("prompt-backend-probe")
+        except Exception:
+            logger.debug("Backend probe policy cleanup failed", exc_info=True)
 
     # Parse key=value lines back into a tidy summary.
     parsed: dict[str, str] = {}

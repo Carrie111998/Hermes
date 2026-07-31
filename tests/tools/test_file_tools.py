@@ -6,11 +6,15 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
     PATCH_SCHEMA,
 )
+from tools.environments.execution_policy import ExecutionWriteScopeError
+import tools.file_tools as file_tools
+import tools.terminal_tool as terminal_tool
 
 
 class TestReadFileHandler:
@@ -65,6 +69,7 @@ class TestWriteFileHandler:
         assert "read-only" in result["error"]
         assert any("write_file expected denial" in r.getMessage() for r in caplog.records)
         assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
 
     @patch("tools.file_tools._get_file_ops")
     def test_rejects_read_file_line_numbered_content(self, mock_get):
@@ -126,6 +131,24 @@ class TestWriteFileHandler:
         result = json.loads(_handle_write_file({"path": "/tmp/x.txt", "content": {"nested": "dict"}}))
         assert "error" in result
         assert "string" in result["error"].lower() or "content" in result["error"].lower()
+
+
+class TestExecutionWriteScopeEnvironmentReuse:
+    def test_workspace_local_rejects_file_environment_before_creation(self, monkeypatch, tmp_path):
+        file_tools.clear_file_ops_cache()
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "execution_write_scope": "workspace",
+                "cwd": str(tmp_path),
+                "timeout": 30,
+            },
+        )
+        with pytest.raises(ExecutionWriteScopeError) as excinfo:
+            file_tools._get_file_ops("file-local-workspace")
+        assert excinfo.value.result.code == "unsupported_execution_backend"
 
 
 class TestPatchHandler:

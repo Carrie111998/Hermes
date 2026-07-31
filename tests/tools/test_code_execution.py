@@ -47,6 +47,7 @@ from tools.code_execution_tool import (
     _TOOL_DOC_LINES,
     _execute_remote,
 )
+import tools.terminal_tool as terminal_tool
 
 
 def _mock_handle_function_call(function_name, function_args, task_id=None, user_task=None):
@@ -67,6 +68,29 @@ def _mock_handle_function_call(function_name, function_args, task_id=None, user_
     if function_name == "web_extract":
         return json.dumps("# Extracted content\nSome text from the page.")
     return json.dumps({"error": f"Unknown tool in mock: {function_name}"})
+
+
+class TestExecutionWriteScope:
+    def test_workspace_local_rejects_before_execute_code_dispatch(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(
+            terminal_tool,
+            "_get_env_config",
+            lambda: {
+                "env_type": "local",
+                "execution_write_scope": "workspace",
+                "cwd": str(tmp_path),
+                "timeout": 30,
+            },
+        )
+        result = json.loads(
+            execute_code(
+                "import subprocess; subprocess.run(['echo', 'blocked'])",
+                task_id="code-local-workspace",
+            )
+        )
+
+        assert result["error_code"] == "unsupported_execution_backend"
+        assert result["tool_calls_made"] == 0
 
 
 class TestSandboxRequirements(unittest.TestCase):
