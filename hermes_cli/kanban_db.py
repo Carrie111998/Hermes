@@ -1160,6 +1160,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Exact process start fingerprint of ``worker_pid`` (``ps -o lstart=``).
+    -- PIDs are recycled by the OS, so every termination path proves this
+    -- identity still matches before signalling.
+    worker_start_time    TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -2321,6 +2325,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_start_time" not in cols:
+        # Exact process identity beside the PID: a PID alone is reusable, so
+        # any termination path must be able to prove it is signalling the same
+        # process it recorded (see _terminate_reclaimed_worker).
+        _add_column_if_missing(
+            conn, "tasks", "worker_start_time", "worker_start_time TEXT"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -4340,7 +4351,8 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, claim_lock, worker_pid, worker_start_time, claim_expires, "
+        "last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4402,6 +4414,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            process_start_time=row["worker_start_time"],
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -4471,7 +4484,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, worker_start_time "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -4482,6 +4496,7 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        process_start_time=row["worker_start_time"],
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -5498,7 +5513,7 @@ def _terminate_worker_for_block(
       the live worker belongs to a newer one.
     """
     row = conn.execute(
-        "SELECT status, worker_pid, claim_lock, current_run_id "
+        "SELECT status, worker_pid, worker_start_time, claim_lock, current_run_id "
         "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
@@ -5509,7 +5524,10 @@ def _terminate_worker_for_block(
     pid = int(row["worker_pid"])
     if pid == os.getpid():
         return None
-    return _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
+    return _terminate_reclaimed_worker(
+        pid, row["claim_lock"], signal_fn=signal_fn,
+        process_start_time=row["worker_start_time"],
+    )
 
 
 def block_task(
@@ -6938,8 +6956,17 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    process_start_time: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    ``process_start_time`` is the recorded ``ps -o lstart=`` fingerprint of the
+    worker. The host guard alone only proves the claim was taken on this
+    machine, not that this PID is still the same process: PIDs are recycled, so
+    a stale row could otherwise SIGTERM an unrelated (possibly critical)
+    process. When a fingerprint was recorded it must still match before any
+    signal is sent; a mismatch means the worker is already gone.
+    """
     import signal
 
     info: dict[str, Any] = {
@@ -6956,6 +6983,15 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
+
+    if process_start_time and not _worker_identity_is_alive(
+        int(pid), process_start_time
+    ):
+        # Either the worker exited (nothing to signal) or this PID now belongs
+        # to a different process (must never be signalled). Both are "gone".
+        info["identity_mismatch"] = True
+        info["terminated"] = True
+        return info
 
     kill = signal_fn if signal_fn is not None else (
         os.kill if hasattr(os, "kill") else None
@@ -7313,7 +7349,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.worker_start_time, t.last_heartbeat_at, t.claim_lock, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -7341,6 +7377,7 @@ def detect_stale_running(
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            process_start_time=row["worker_start_time"],
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -7945,10 +7982,16 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
     """
+    # Capture the exact start fingerprint next to the PID: a bare PID is
+    # reusable, so termination paths need a full identity to compare against.
+    try:
+        start_time: Optional[str] = _worker_process_start_time(int(pid))
+    except Exception:
+        start_time = None
     with write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+            "UPDATE tasks SET worker_pid = ?, worker_start_time = ? WHERE id = ?",
+            (int(pid), start_time, task_id),
         )
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:

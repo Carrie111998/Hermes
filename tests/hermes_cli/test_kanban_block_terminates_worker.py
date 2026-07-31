@@ -188,3 +188,76 @@ def test_block_preserves_worktree_wip(kanban_home, tmp_path):
         if proc.poll() is None:
             proc.kill()
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# S-M4 — a recycled PID must never be signalled
+# ---------------------------------------------------------------------------
+
+def test_recorded_start_time_is_persisted_with_the_worker_pid(kanban_home):
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        conn = kb.connect()
+        try:
+            tid = _running_task(conn, pid=proc.pid)
+            row = conn.execute(
+                "SELECT worker_start_time FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            assert row["worker_start_time"] == kb._worker_process_start_time(proc.pid)
+        finally:
+            conn.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_block_never_signals_a_recycled_pid(kanban_home):
+    """A PID whose start-time no longer matches is a different process."""
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    signalled: list = []
+    try:
+        conn = kb.connect()
+        try:
+            tid = _running_task(conn, pid=proc.pid)
+            # Simulate PID recycling: the recorded identity belongs to a
+            # process that already exited; this PID is now somebody else.
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_start_time = ? WHERE id = ?",
+                    ("Mon Jan  1 00:00:00 1990", tid),
+                )
+            termination = kb._terminate_worker_for_block(
+                conn, tid, None, signal_fn=lambda p, s: signalled.append((p, s)),
+            )
+            assert signalled == [], (
+                "a recycled PID must never receive a signal; the recorded "
+                "start-time identity no longer matches this process"
+            )
+            assert not (termination or {}).get("termination_attempted")
+            assert proc.poll() is None
+        finally:
+            conn.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+def test_block_still_terminates_when_start_time_identity_matches(kanban_home):
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        conn = kb.connect()
+        try:
+            tid = _running_task(conn, pid=proc.pid)
+            assert kb.block_task(conn, tid, reason="stop", kind="needs_input")
+            assert _wait_exit(proc)
+            events = kb.list_events(conn, tid)
+            blocked = next(e for e in events if e.kind == "blocked")
+            assert blocked.payload["termination"]["terminated"] is True
+        finally:
+            conn.close()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
