@@ -815,12 +815,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # path (which runs from other tasks like send() and the poll loop)
         # doesn't race us and report the intentional termination as fatal.
         self._shutting_down = True
-        # Cancel pending media batches
-        for task in self._pending_media_batch_tasks.values():
+        # Cancel pending media batches (attribute may not exist in
+        # lightweight test harnesses that skip full __init__)
+        for task in getattr(self, "_pending_media_batch_tasks", {}).values():
             if not task.done():
                 task.cancel()
-        self._pending_media_batches.clear()
-        self._pending_media_batch_tasks.clear()
+        self._pending_media_batches = {}
+        self._pending_media_batch_tasks = {}
         if self._bridge_process:
             try:
                 try:
