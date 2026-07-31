@@ -477,6 +477,11 @@ def test_failed_systemd_restart_restores_prior_owner_hold(
     monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda **_k: None)
     monkeypatch.setattr(
         gateway_cli,
+        "_systemd_main_pid",
+        lambda **_kwargs: 4242,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
         "_migrate_gateway_hygiene_hold_support",
         lambda **_kwargs: None,
     )
@@ -489,7 +494,7 @@ def test_failed_systemd_restart_restores_prior_owner_hold(
     )
     monkeypatch.setattr(
         gateway_cli,
-        "_systemd_service_active_state",
+        "_systemd_active_main_pid",
         lambda **_kwargs: None,
     )
 
@@ -501,6 +506,116 @@ def test_failed_systemd_restart_restores_prior_owner_hold(
     assert restored["target_pid"] == prior["target_pid"]
     assert restored["owner"] == prior["owner"]
     assert restored["reason"] == prior["reason"]
+
+
+def test_systemd_restart_keeps_hold_when_old_process_remains_active(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(status, "_get_process_hermes_home", lambda: tmp_path)
+    prior = status.write_gateway_owner_hold(
+        target_pid=4242,
+        owner="owner stop",
+        reason="keep stopped",
+    )
+    monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda _system: False)
+    monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+    monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda **_k: None)
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_main_pid",
+        lambda **_kwargs: 4242,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_restart_after_owner_unhold",
+        lambda _system: None,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_active_main_pid",
+        lambda **_kwargs: 4242,
+    )
+
+    gateway_cli.systemd_restart()
+
+    restored = status.read_gateway_owner_hold()
+    assert restored is not None
+    assert restored["target_pid"] == 4242
+    assert restored["owner"] == prior["owner"]
+    assert restored["reason"] == prior["reason"]
+
+
+def test_systemd_restart_unknown_replacement_applies_global_hold_without_prior_hold(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(status, "_get_process_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda _system: False)
+    monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+    monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda **_k: None)
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_main_pid",
+        lambda **_kwargs: 4242,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_restart_after_owner_unhold",
+        lambda _system: (_ for _ in ()).throw(
+            TimeoutError("restart replacement unknown")
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_active_main_pid",
+        lambda **_kwargs: None,
+    )
+
+    with pytest.raises(TimeoutError, match="restart replacement unknown"):
+        gateway_cli.systemd_restart()
+
+    hold = status.read_gateway_owner_hold()
+    assert hold is not None
+    assert hold["target_pid"] is None
+    assert hold["owner"] == "hermes gateway restart rollback"
+
+
+def test_systemd_restart_releases_hold_only_for_proven_replacement_pid(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(status, "_get_process_hermes_home", lambda: tmp_path)
+    status.write_gateway_owner_hold(
+        target_pid=4242,
+        owner="owner stop",
+        reason="keep stopped",
+    )
+    monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda _system: False)
+    monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
+    monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda **_k: None)
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_main_pid",
+        lambda **_kwargs: 4242,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_restart_after_owner_unhold",
+        lambda _system: None,
+    )
+    monkeypatch.setattr(
+        gateway_cli,
+        "_systemd_active_main_pid",
+        lambda **_kwargs: 5252,
+    )
+
+    gateway_cli.systemd_restart()
+
+    assert status.read_gateway_owner_hold() is None
 
 
 def test_implicit_gateway_run_is_refused_while_owner_hold_exists(monkeypatch):

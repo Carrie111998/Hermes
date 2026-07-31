@@ -211,6 +211,7 @@ class GatewayStreamConsumer:
         delivery_message_ref: Optional[str] = None,
         delivery_platform: Optional[str] = None,
         delivery_thread_id: Optional[str] = None,
+        delivery_run_receipt_id: Optional[str] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -347,6 +348,12 @@ class GatewayStreamConsumer:
         self._delivery_thread_id = (
             str(delivery_thread_id) if delivery_thread_id is not None else None
         )
+        self._delivery_run_receipt_id = (
+            delivery_run_receipt_id.strip()
+            if isinstance(delivery_run_receipt_id, str)
+            and delivery_run_receipt_id.strip()
+            else None
+        )
         self._delivery_obligation_id: Optional[str] = None
         self._delivery_obligation_content = ""
         self._delivery_ledger_state = ""
@@ -465,6 +472,7 @@ class GatewayStreamConsumer:
                 chat_id=str(self.chat_id),
                 thread_id=self._delivery_thread_id,
                 content=content,
+                run_receipt_id=self._delivery_run_receipt_id,
             )
         except Exception:
             self._final_delivery_ledger_error = (

@@ -90,6 +90,7 @@ class TurnContext:
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     persist_user_platform_message_id: Optional[str] = None
+    run_receipt_id: Optional[str] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

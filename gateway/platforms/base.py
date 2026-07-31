@@ -6064,6 +6064,11 @@ class BasePlatformAdapter(ABC):
                                     chat_id=event.source.chat_id,
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
+                                    run_receipt_id=getattr(
+                                        event,
+                                        "_hermes_run_receipt_id",
+                                        None,
+                                    ),
                                 )
                                 mark_attempting(_obligation_id)
                         except Exception as exc:
@@ -6343,6 +6348,26 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            _cancelled_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _cancelled_receipt_id:
+                try:
+                    from gateway.delivery_ledger import amend_run_terminal_receipt
+
+                    amend_run_terminal_receipt(
+                        _cancelled_receipt_id,
+                        run_terminal_state="cancelled",
+                        run_end_reason="gateway_processing_cancelled",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to persist cancelled run receipt %s",
+                        self.name,
+                        _cancelled_receipt_id,
+                    )
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6350,6 +6375,26 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            _failed_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _failed_receipt_id:
+                try:
+                    from gateway.delivery_ledger import amend_run_terminal_receipt
+
+                    amend_run_terminal_receipt(
+                        _failed_receipt_id,
+                        run_terminal_state="failed",
+                        run_end_reason=f"gateway_delivery_exception:{type(e).__name__}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] Failed to persist failed run receipt %s",
+                        self.name,
+                        _failed_receipt_id,
+                    )
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence

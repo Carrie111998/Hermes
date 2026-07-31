@@ -217,6 +217,8 @@ class RepoSnapshot:
     dirty: bool
     probe_error: str = ""
     status_porcelain: str = ""
+    head_oid: str = ""
+    tree_oid: str = ""
 
 
 @dataclass
@@ -227,6 +229,8 @@ class TurnPolicy:
     repo_snapshots: dict[str, RepoSnapshot] = field(default_factory=dict)
     workspace_probe_error: str = ""
     expected_repo_status: dict[str, str] = field(default_factory=dict)
+    expected_repo_heads: dict[str, str] = field(default_factory=dict)
+    expected_repo_trees: dict[str, str] = field(default_factory=dict)
     repo_drift_block: dict[str, str] = field(default_factory=dict)
     loaded_root_skills: list[str] = field(default_factory=list)
     skill_payload_chars: int = 0
@@ -281,8 +285,72 @@ def _probe_repo(
     if not root_text:
         return None, "git returned an empty repository root"
     root = Path(root_text).resolve(strict=False)
+
+    try:
+        head_result = _run_git(
+            ["git", "-C", str(root), "rev-parse", "--verify", "HEAD"]
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return RepoSnapshot(root=root, dirty=True, probe_error=str(exc)), str(exc)
+    if head_result.returncode == 0 and head_result.stdout.strip():
+        head_oid = head_result.stdout.strip()
+        try:
+            tree_result = _run_git(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "rev-parse",
+                    "--verify",
+                    "HEAD^{tree}",
+                ]
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return RepoSnapshot(
+                root=root,
+                dirty=True,
+                probe_error=str(exc),
+            ), str(exc)
+        if tree_result.returncode != 0 or not tree_result.stdout.strip():
+            error = tree_result.stderr.strip() or "git tree identity probe failed"
+            return RepoSnapshot(
+                root=root,
+                dirty=True,
+                probe_error=error,
+            ), error
+        tree_oid = tree_result.stdout.strip()
+    else:
+        # A newly initialized repository has no commit or tree yet. Preserve
+        # its symbolic branch as a stable committed-state identity rather than
+        # treating every empty repository as an unavailable probe.
+        try:
+            symbolic_result = _run_git(
+                ["git", "-C", str(root), "symbolic-ref", "-q", "HEAD"]
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return RepoSnapshot(
+                root=root,
+                dirty=True,
+                probe_error=str(exc),
+            ), str(exc)
+        if symbolic_result.returncode != 0 or not symbolic_result.stdout.strip():
+            error = head_result.stderr.strip() or "git HEAD identity probe failed"
+            return RepoSnapshot(
+                root=root,
+                dirty=True,
+                probe_error=error,
+            ), error
+        head_oid = f"unborn:{symbolic_result.stdout.strip()}"
+        tree_oid = ""
+
     if not check_dirty:
-        return RepoSnapshot(root=root, dirty=False, status_porcelain=""), ""
+        return RepoSnapshot(
+            root=root,
+            dirty=False,
+            status_porcelain="",
+            head_oid=head_oid,
+            tree_oid=tree_oid,
+        ), ""
     try:
         status_result = _run_git(
             [
@@ -304,6 +372,8 @@ def _probe_repo(
         root=root,
         dirty=bool(status.strip()),
         status_porcelain=status,
+        head_oid=head_oid,
+        tree_oid=tree_oid,
     ), ""
 
 
@@ -361,6 +431,8 @@ def _build_turn_policy(
             key = _repo_key(snapshot.root)
             policy.repo_snapshots[key] = snapshot
             policy.expected_repo_status[key] = snapshot.status_porcelain
+            policy.expected_repo_heads[key] = snapshot.head_oid
+            policy.expected_repo_trees[key] = snapshot.tree_oid
         elif error:
             # A broken/timed-out git probe must not silently disable the guard
             # in the very workspace the agent is about to edit.
@@ -372,6 +444,8 @@ def _build_turn_policy(
             key = _repo_key(snapshot.root)
             policy.repo_snapshots[key] = snapshot
             policy.expected_repo_status[key] = snapshot.status_porcelain
+            policy.expected_repo_heads[key] = snapshot.head_oid
+            policy.expected_repo_trees[key] = snapshot.tree_oid
         policy.workspace_probe_error = error
     return policy
 
@@ -436,6 +510,8 @@ def _snapshot_for_path(policy: TurnPolicy, path: Path) -> Optional[RepoSnapshot]
                 key,
                 snapshot.status_porcelain,
             )
+            policy.expected_repo_heads.setdefault(key, snapshot.head_oid)
+            policy.expected_repo_trees.setdefault(key, snapshot.tree_oid)
         return snapshot
 
 
@@ -1008,7 +1084,18 @@ def _terminal_read_is_proven(command: str) -> bool:
         words = _shell_words(segment)
         if not words:
             return False
-        executable = Path(words[0]).name.lower()
+        raw_executable = words[0]
+        # Trust only a bare executable resolved by the controlled process PATH.
+        # Taking Path(...).name let an attacker-controlled /tmp/git or
+        # C:\temp\cat.exe inherit the trusted basename and execute arbitrary
+        # effects during an investigation.
+        if (
+            "/" in raw_executable
+            or "\\" in raw_executable
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]*", raw_executable)
+        ):
+            return False
+        executable = raw_executable.lower()
         if executable.endswith(".exe"):
             executable = executable[:-4]
         if executable == "git":
@@ -1328,7 +1415,13 @@ def _reprobe_mutation_snapshots(
             key,
             baseline.status_porcelain,
         )
-        if current.status_porcelain != expected:
+        expected_head = policy.expected_repo_heads.get(key, baseline.head_oid)
+        expected_tree = policy.expected_repo_trees.get(key, baseline.tree_oid)
+        if (
+            current.status_porcelain != expected
+            or current.head_oid != expected_head
+            or current.tree_oid != expected_tree
+        ):
             block = (
                 "Repository safety block: the target repository changed after "
                 "this turn's last verified state. Preserve the concurrent work "
@@ -1359,6 +1452,67 @@ def _tool_result_failed(result: Any) -> bool:
     return exit_code is not None and exit_code != 0
 
 
+def _tool_result_mapping(result: Any) -> Optional[dict[str, Any]]:
+    if isinstance(result, dict):
+        return result
+    if not isinstance(result, str):
+        return None
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _tool_effect_is_verified(
+    function_name: str,
+    args: dict[str, Any],
+    result: Any,
+) -> bool:
+    """Accept progression receipts only from known, read-backed tool shapes."""
+
+    parsed = _tool_result_mapping(result)
+    if parsed is None or _tool_result_failed(parsed):
+        return False
+    if function_name == "write_file":
+        return bool(parsed.get("resolved_path")) and bool(
+            parsed.get("files_modified")
+        )
+    if function_name == "patch":
+        return parsed.get("success") is True and bool(
+            parsed.get("files_modified")
+        )
+    if function_name == "terminal":
+        return (
+            args.get("background") is not True
+            and parsed.get("exit_code") == 0
+        )
+    if function_name == "skill_manage":
+        return parsed.get("success") is True
+    return False
+
+
+def _verified_effect_may_change_commit_identity(
+    function_name: str,
+    args: dict[str, Any],
+) -> bool:
+    """Only an explicit successful Git lifecycle command may advance HEAD."""
+
+    if function_name != "terminal":
+        return False
+    command = args.get("command")
+    if not isinstance(command, str):
+        return False
+    return bool(
+        re.search(
+            r"\bgit\s+(?:-C\s+(?:\"[^\"]+\"|'[^']+'|\S+)\s+)?"
+            r"(?:commit|am|cherry-pick|merge|rebase|reset|revert)\b",
+            command,
+            re.IGNORECASE,
+        )
+    )
+
+
 def record_tool_effect_result(
     function_name: str,
     args: dict[str, Any],
@@ -1385,6 +1539,11 @@ def record_tool_effect_result(
         if (snapshot := _snapshot_for_path(policy, target)) is not None
     ]
     failed = _tool_result_failed(result)
+    verified = _tool_effect_is_verified(function_name, args, result)
+    may_change_identity = _verified_effect_may_change_commit_identity(
+        function_name,
+        args,
+    )
     with policy.lock:
         for baseline in {
             _repo_key(snapshot.root): snapshot
@@ -1404,7 +1563,20 @@ def record_tool_effect_result(
                 key,
                 baseline.status_porcelain,
             )
-            if failed and current.status_porcelain != expected:
+            expected_head = policy.expected_repo_heads.get(
+                key,
+                baseline.head_oid,
+            )
+            expected_tree = policy.expected_repo_trees.get(
+                key,
+                baseline.tree_oid,
+            )
+            status_changed = current.status_porcelain != expected
+            identity_changed = (
+                current.head_oid != expected_head
+                or current.tree_oid != expected_tree
+            )
+            if failed and (status_changed or identity_changed):
                 policy.repo_drift_block[key] = (
                     "Repository safety block: a failed or interrupted "
                     f"`{function_name}` changed {baseline.root}. Preserve the "
@@ -1412,8 +1584,31 @@ def record_tool_effect_result(
                     "worktree."
                 )
                 continue
-            if not failed:
+            if (
+                not failed
+                and identity_changed
+                and not may_change_identity
+            ):
+                policy.repo_drift_block[key] = (
+                    "Repository safety block: committed repository identity "
+                    f"changed during `{function_name}` at {baseline.root}, "
+                    "which that verified Hermes effect was not authorized to "
+                    "do. Preserve the concurrent work and continue only in a "
+                    "fresh isolated worktree."
+                )
+                continue
+            if not failed and not verified and (status_changed or identity_changed):
+                policy.repo_drift_block[key] = (
+                    "Repository safety block: repository state changed during "
+                    f"`{function_name}` at {baseline.root}, but Hermes did not "
+                    "receive a verified effect receipt. Preserve the unknown "
+                    "outcome and continue only in a fresh isolated worktree."
+                )
+                continue
+            if not failed and verified:
                 policy.expected_repo_status[key] = current.status_porcelain
+                policy.expected_repo_heads[key] = current.head_oid
+                policy.expected_repo_trees[key] = current.tree_oid
 
 
 def guard_tool_call(

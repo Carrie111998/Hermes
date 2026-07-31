@@ -133,6 +133,139 @@ def _delivery_message_ref(
     return f"internal:{stable_session}:{stable_generation}"
 
 
+def _gateway_run_receipt_identity(
+    *,
+    session_key: str,
+    session_id: str,
+    run_generation: Optional[int],
+    run_index: int,
+    platform_message_id: Optional[str],
+    reply_anchor: Optional[str],
+) -> tuple[str, str]:
+    """Return the durable run receipt id and its delivery message reference."""
+
+    from gateway.delivery_ledger import compute_run_receipt_id
+
+    message_ref = _delivery_message_ref(
+        platform_message_id,
+        reply_anchor,
+        session_id=session_id,
+        run_generation=run_generation,
+    )
+    return (
+        compute_run_receipt_id(
+            session_key,
+            message_ref,
+            run_generation,
+            run_index=run_index,
+        ),
+        message_ref,
+    )
+
+
+def _apply_gateway_terminal_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill terminal fields only when an agent/proxy path did not supply them."""
+
+    state = str(result.get("run_terminal_state") or "").strip().lower()
+    reason = str(
+        result.get("run_end_reason")
+        or result.get("turn_exit_reason")
+        or result.get("failure_reason")
+        or ""
+    ).strip()
+    final_response = result.get("final_response")
+    explicit_generated = result.get("final_generated")
+    final_generated = (
+        bool(explicit_generated)
+        if explicit_generated is not None
+        else bool(
+            isinstance(final_response, str)
+            and final_response.strip()
+            and final_response.strip() != "(empty)"
+        )
+    )
+    reason_lower = reason.lower()
+    if state not in {"done", "blocked", "failed", "cancelled"}:
+        if (
+            result.get("interrupted") is True
+            or "interrupt" in reason_lower
+            or "cancel" in reason_lower
+        ):
+            state = "cancelled"
+        elif result.get("guardrail") is not None or "guardrail" in reason_lower:
+            state = "blocked"
+        elif (
+            result.get("failed") is True
+            or result.get("completed") is False
+            or not final_generated
+        ):
+            state = "failed"
+        else:
+            state = "done"
+    ended_at = result.get("run_ended_at")
+    if not isinstance(ended_at, (int, float)):
+        ended_at = time.time()
+    result["run_terminal_state"] = state
+    result["run_end_reason"] = reason or (
+        "completed" if state == "done" else state
+    )
+    result["run_ended_at"] = float(ended_at)
+    result["final_generated"] = final_generated
+    return result
+
+
+def _record_gateway_run_terminal(
+    result: Dict[str, Any],
+    *,
+    run_receipt_id: str,
+    session_id: str,
+    task_id: str,
+    session_key: str,
+    platform: Any,
+    run_generation: Optional[int],
+    message_ref: str,
+) -> Dict[str, Any]:
+    """Persist and return one gateway terminal result."""
+
+    from gateway.delivery_ledger import record_run_terminal_receipt
+
+    result = _apply_gateway_terminal_fields(result)
+    result["run_receipt_id"] = run_receipt_id
+    record_run_terminal_receipt(
+        run_receipt_id=run_receipt_id,
+        session_id=session_id,
+        task_id=task_id,
+        session_key=session_key,
+        platform=str(getattr(platform, "value", platform) or ""),
+        run_generation=run_generation,
+        message_ref=message_ref,
+        run_terminal_state=result["run_terminal_state"],
+        run_end_reason=result["run_end_reason"],
+        run_ended_at=result["run_ended_at"],
+        final_generated=result["final_generated"],
+    )
+    return result
+
+
+def _gateway_exception_terminal_fields(exc: BaseException) -> Dict[str, Any]:
+    """Return structured terminal truth for a gateway exception/cancellation."""
+
+    attached = getattr(exc, "hermes_terminal_receipt", None)
+    if isinstance(attached, dict):
+        return _apply_gateway_terminal_fields(dict(attached))
+    cancelled = isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, InterruptedError))
+    reason = "gateway_cancelled" if cancelled else f"gateway_exception:{type(exc).__name__}"
+    return {
+        "completed": False,
+        "failed": not cancelled,
+        "interrupted": cancelled,
+        "run_terminal_state": "cancelled" if cancelled else "failed",
+        "run_end_reason": reason,
+        "run_ended_at": time.time(),
+        "final_generated": False,
+    }
+
+
 def _delivery_result_is_unknown(result: Any) -> bool:
     """Return True when a send may have reached the platform without an ACK."""
 
@@ -185,6 +318,7 @@ async def _send_final_with_delivery_proof(
     message_ref: str,
     platform: Any,
     thread_id: Optional[str],
+    run_receipt_id: Optional[str] = None,
 ) -> Any:
     """Send one generated final under the durable delivery-ledger contract."""
 
@@ -213,6 +347,7 @@ async def _send_final_with_delivery_proof(
                 chat_id=str(chat_id),
                 thread_id=str(thread_id) if thread_id is not None else None,
                 content=content,
+                run_receipt_id=run_receipt_id,
             )
             mark_attempting(obligation_id)
     except Exception as exc:
@@ -4449,6 +4584,7 @@ class TurnRunner:
                             ctx.source.platform,
                         ),
                         delivery_thread_id=ctx.source.thread_id,
+                        delivery_run_receipt_id=ctx.run_receipt_id,
                     )
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
@@ -4782,6 +4918,10 @@ class TurnRunner:
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
         agent.status_callback = ctx._status_callback_sync
+        # Carry the pre-registered local receipt identity without widening the
+        # public run_conversation call shape used by alternate/fake runtimes.
+        # AIAgent consumes and clears this value at the start of the turn.
+        agent._pending_run_receipt_id = ctx.run_receipt_id
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via
@@ -5517,6 +5657,11 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "run_terminal_state": result.get("run_terminal_state"),
+                "run_end_reason": result.get("run_end_reason"),
+                "run_ended_at": result.get("run_ended_at"),
+                "final_generated": result.get("final_generated"),
+                "run_receipt_id": result.get("run_receipt_id"),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -5654,6 +5799,11 @@ class TurnRunner:
             # self-persisted (it didn't — see codex_runtime.py).  Default
             # True preserves the skip-db behaviour for the standard runtime.
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
+            "run_terminal_state": result.get("run_terminal_state"),
+            "run_end_reason": result.get("run_end_reason"),
+            "run_ended_at": result.get("run_ended_at"),
+            "final_generated": result.get("final_generated"),
+            "run_receipt_id": result.get("run_receipt_id"),
         }
 
 
@@ -10158,9 +10308,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                sweep_dead_run_receipts,
                 sweep_recoverable,
             )
 
+            try:
+                closed_runs = await asyncio.to_thread(
+                    sweep_dead_run_receipts
+                )
+                if closed_runs:
+                    logger.warning(
+                        "Closed %d run receipt(s) left active by a dead "
+                        "gateway process with explicit unknown outcomes.",
+                        len(closed_runs),
+                    )
+            except Exception:
+                logger.debug(
+                    "dead-owner run receipt sweep failed",
+                    exc_info=True,
+                )
             if not ledger_enabled():
                 return 0
             # Only claim rows we can actually send this boot: self.adapters
@@ -15181,9 +15347,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.started_ts = time.time()
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
+        _run_receipt_id, _run_message_ref = _gateway_run_receipt_identity(
+            session_key=_quick_key,
+            session_id="",
+            run_generation=_run_generation,
+            run_index=0,
+            platform_message_id=getattr(event, "message_id", None),
+            reply_anchor=self._reply_anchor_for_event(event),
+        )
+        from gateway.delivery_ledger import begin_run_receipt
+
+        begin_run_receipt(
+            run_receipt_id=_run_receipt_id,
+            task_id=f"{_quick_key}:{_run_generation}",
+            session_key=_quick_key,
+            platform=str(getattr(source.platform, "value", source.platform) or ""),
+            run_generation=_run_generation,
+            message_ref=_run_message_ref,
+        )
+        setattr(event, "_hermes_run_receipt_id", _run_receipt_id)
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            from gateway.delivery_ledger import get_run_terminal_receipt
+
+            _durable_terminal = get_run_terminal_receipt(_run_receipt_id)
+            if (
+                _durable_terminal is None
+                or _durable_terminal.get("run_terminal_state") == "running"
+            ):
+                _event_terminal = getattr(
+                    event,
+                    "_hermes_run_terminal_fields",
+                    None,
+                )
+                if isinstance(_event_terminal, dict):
+                    _fallback_terminal = dict(_event_terminal)
+                    if isinstance(_agent_result, str):
+                        _fallback_terminal["final_response"] = _agent_result
+                elif isinstance(_agent_result, dict):
+                    _fallback_terminal = dict(_agent_result)
+                else:
+                    _fallback_terminal = {
+                        "final_response": (
+                            _agent_result
+                            if isinstance(_agent_result, str)
+                            else ""
+                        ),
+                        "completed": bool(_agent_result),
+                        "failed": not bool(_agent_result),
+                        "run_end_reason": (
+                            "gateway_response_completed"
+                            if _agent_result
+                            else "gateway_returned_without_terminal_result"
+                        ),
+                    }
+                _record_gateway_run_terminal(
+                    _fallback_terminal,
+                    run_receipt_id=_run_receipt_id,
+                    session_id="",
+                    task_id=f"{_quick_key}:{_run_generation}",
+                    session_key=_quick_key,
+                    platform=source.platform,
+                    run_generation=_run_generation,
+                    message_ref=_run_message_ref,
+                )
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -15213,6 +15441,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
+        except BaseException as exc:
+            try:
+                _record_gateway_run_terminal(
+                    _gateway_exception_terminal_fields(exc),
+                    run_receipt_id=_run_receipt_id,
+                    session_id="",
+                    task_id=f"{_quick_key}:{_run_generation}",
+                    session_key=_quick_key,
+                    platform=source.platform,
+                    run_generation=_run_generation,
+                    message_ref=_run_message_ref,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to finalize outer gateway receipt %s",
+                    _run_receipt_id,
+                )
+            raise
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -16946,6 +17192,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     persist_user_platform_message_id
                 ),
                 message_type=event.message_type,
+                run_receipt_id=getattr(
+                    event,
+                    "_hermes_run_receipt_id",
+                    None,
+                ),
+            )
+            if agent_result.get("run_receipt_id"):
+                setattr(
+                    event,
+                    "_hermes_run_receipt_id",
+                    agent_result["run_receipt_id"],
+                )
+            setattr(
+                event,
+                "_hermes_run_terminal_fields",
+                {
+                    key: agent_result.get(key)
+                    for key in (
+                        "run_terminal_state",
+                        "run_end_reason",
+                        "run_ended_at",
+                        "final_generated",
+                    )
+                },
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -17561,6 +17831,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            _failed_receipt_id = getattr(
+                event,
+                "_hermes_run_receipt_id",
+                None,
+            )
+            if _failed_receipt_id:
+                try:
+                    _failed_session_entry = locals().get("session_entry")
+                    _failed_session_key = (
+                        locals().get("session_key") or _quick_key
+                    )
+                    _failed_session_id = str(
+                        getattr(_failed_session_entry, "session_id", "") or ""
+                    )
+                    _, _failed_message_ref = _gateway_run_receipt_identity(
+                        session_key=_failed_session_key,
+                        session_id=_failed_session_id,
+                        run_generation=run_generation,
+                        run_index=0,
+                        platform_message_id=persist_user_platform_message_id,
+                        reply_anchor=self._reply_anchor_for_event(event),
+                    )
+                    _record_gateway_run_terminal(
+                        _gateway_exception_terminal_fields(e),
+                        run_receipt_id=_failed_receipt_id,
+                        session_id=_failed_session_id,
+                        task_id=f"{_failed_session_key}:{run_generation}",
+                        session_key=_failed_session_key,
+                        platform=source.platform,
+                        run_generation=run_generation,
+                        message_ref=_failed_message_ref,
+                    )
+                    setattr(
+                        event,
+                        "_hermes_run_terminal_fields",
+                        _gateway_exception_terminal_fields(e),
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize handled gateway exception receipt %s",
+                        _failed_receipt_id,
+                    )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -22980,6 +23292,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
         persist_user_platform_message_id: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -23109,6 +23422,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             source.platform,
                         ),
                         delivery_thread_id=source.thread_id,
+                        delivery_run_receipt_id=run_receipt_id,
                     )
             except Exception as _sc_err:
                 logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -23274,6 +23588,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23284,34 +23599,95 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        computed_receipt_id, message_ref = _gateway_run_receipt_identity(
+            session_key=session_key or "",
+            session_id=session_id,
+            run_generation=run_generation,
+            run_index=_interrupt_depth,
+            platform_message_id=persist_user_platform_message_id,
+            reply_anchor=event_message_id,
+        )
+        effective_receipt_id = run_receipt_id or computed_receipt_id
+        task_id = f"{session_id}:{int(_interrupt_depth or 0)}"
+
+        async def _execute() -> Dict[str, Any]:
             return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
+                message,
+                context_prompt,
+                history,
+                source,
+                session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_platform_message_id=(
                     persist_user_platform_message_id
                 ),
                 message_type=message_type,
+                run_receipt_id=effective_receipt_id,
             )
+
+        async def _execute_with_receipt() -> Dict[str, Any]:
+            from gateway.delivery_ledger import begin_run_receipt
+
+            begin_run_receipt(
+                run_receipt_id=effective_receipt_id,
+                session_id=session_id,
+                task_id=task_id,
+                session_key=session_key or "",
+                platform=str(
+                    getattr(source.platform, "value", source.platform) or ""
+                ),
+                run_generation=run_generation,
+                message_ref=message_ref,
+            )
+            try:
+                result = await _execute()
+            except BaseException as exc:
+                try:
+                    _record_gateway_run_terminal(
+                        _gateway_exception_terminal_fields(exc),
+                        run_receipt_id=effective_receipt_id,
+                        session_id=session_id,
+                        task_id=task_id,
+                        session_key=session_key or "",
+                        platform=source.platform,
+                        run_generation=run_generation,
+                        message_ref=message_ref,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to finalize gateway run receipt %s",
+                        effective_receipt_id,
+                    )
+                raise
+
+            return _record_gateway_run_terminal(
+                result,
+                run_receipt_id=effective_receipt_id,
+                session_id=session_id,
+                task_id=task_id,
+                session_key=session_key or "",
+                platform=source.platform,
+                run_generation=run_generation,
+                message_ref=message_ref,
+            )
+
+        if not getattr(
+            getattr(self, "config", None),
+            "multiplex_profiles",
+            False,
+        ):
+            return await _execute_with_receipt()
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_platform_message_id=(
-                    persist_user_platform_message_id
-                ),
-                message_type=message_type,
-            )
+            return await _execute_with_receipt()
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -23434,6 +23810,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23507,6 +23884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_platform_message_id=(
                     persist_user_platform_message_id
                 ),
+                run_receipt_id=run_receipt_id,
             )
 
         from run_agent import AIAgent
@@ -23770,6 +24148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_platform_message_id=(
                 persist_user_platform_message_id
             ),
+            run_receipt_id=run_receipt_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -24480,6 +24859,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "tools": tools_holder[0] or [],
                     "history_offset": 0,
                     "failed": True,
+                    "completed": False,
+                    "run_terminal_state": "failed",
+                    "run_end_reason": "gateway_inactivity_timeout",
+                    "run_ended_at": time.time(),
+                    "final_generated": False,
                 }
 
             # Track fallback model state: if the agent switched to a
@@ -24742,6 +25126,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ),
                                 platform=source.platform,
                                 thread_id=source.thread_id,
+                                run_receipt_id=_delivery_result.get(
+                                    "run_receipt_id"
+                                ),
                             )
                             if not getattr(_first_send_result, "success", False):
                                 logger.warning(

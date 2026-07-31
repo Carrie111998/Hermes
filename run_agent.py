@@ -7108,6 +7108,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        run_receipt_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7136,6 +7137,20 @@ class AIAgent:
         relay_turn_id = (
             f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
         )
+        pending_run_receipt_id = getattr(
+            self,
+            "_pending_run_receipt_id",
+            None,
+        )
+        supplied_run_receipt_id = run_receipt_id or pending_run_receipt_id
+        local_run_receipt_id = (
+            str(supplied_run_receipt_id).strip()
+            if isinstance(supplied_run_receipt_id, str)
+            and supplied_run_receipt_id.strip()
+            else relay_turn_id
+        )
+        if pending_run_receipt_id is not None:
+            self._pending_run_receipt_id = None
         self._relay_pending_turn_id = relay_turn_id
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
@@ -7151,6 +7166,14 @@ class AIAgent:
         task_finished = False
         relay_outcome = "failed"
         try:
+            from gateway.delivery_ledger import begin_run_receipt
+
+            begin_run_receipt(
+                run_receipt_id=local_run_receipt_id,
+                session_id=session_id,
+                task_id=effective_task_id,
+                platform=task_context["platform"],
+            )
             phase_token = push_turn_policy(
                 persist_user_message
                 if persist_user_message is not None
@@ -7217,6 +7240,7 @@ class AIAgent:
                     "Agent run returned without a structured terminal result."
                 )
             result = _apply_run_terminal_receipt(result)
+            result["run_receipt_id"] = local_run_receipt_id
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
@@ -7229,10 +7253,46 @@ class AIAgent:
                 outcome=relay_outcome,
             )
             task_finished = True
+            from gateway.delivery_ledger import record_run_terminal_receipt
+
+            record_run_terminal_receipt(
+                run_receipt_id=local_run_receipt_id,
+                session_id=session_id,
+                task_id=effective_task_id,
+                platform=task_context["platform"],
+                run_terminal_state=result["run_terminal_state"],
+                run_end_reason=result["run_end_reason"],
+                run_ended_at=result["run_ended_at"],
+                final_generated=result["final_generated"],
+            )
             finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
             terminal_receipt = _exception_run_terminal_receipt(exc)
+            terminal_receipt["run_receipt_id"] = local_run_receipt_id
+            try:
+                from gateway.delivery_ledger import record_run_terminal_receipt
+
+                record_run_terminal_receipt(
+                    run_receipt_id=local_run_receipt_id,
+                    session_id=session_id,
+                    task_id=effective_task_id,
+                    platform=task_context["platform"],
+                    run_terminal_state=terminal_receipt[
+                        "run_terminal_state"
+                    ],
+                    run_end_reason=terminal_receipt["run_end_reason"],
+                    run_ended_at=terminal_receipt["run_ended_at"],
+                    final_generated=terminal_receipt["final_generated"],
+                )
+            except Exception:
+                # begin_run_receipt already left durable "running" truth. A
+                # terminal update failure must not hide the original run
+                # exception or replace it with observability machinery.
+                logger.exception(
+                    "Failed to finalize local run terminal receipt %s",
+                    local_run_receipt_id,
+                )
             try:
                 setattr(
                     exc,

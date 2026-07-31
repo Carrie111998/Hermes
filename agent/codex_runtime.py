@@ -86,6 +86,36 @@ def _run_workspace_git(
     return subprocess.run(["git", "-C", str(cwd), *args], **kwargs)
 
 
+def _workspace_commit_identity(cwd: Path) -> tuple[str, str]:
+    """Return the exact committed HEAD and tree identity for a worktree."""
+
+    head_result = _run_workspace_git(
+        cwd,
+        "rev-parse",
+        "--verify",
+        "HEAD",
+        timeout=5.0,
+    )
+    if head_result.returncode != 0 or not head_result.stdout.strip():
+        raise RuntimeError(
+            head_result.stderr.strip()
+            or "could not resolve the worktree HEAD"
+        )
+    tree_result = _run_workspace_git(
+        cwd,
+        "rev-parse",
+        "--verify",
+        "HEAD^{tree}",
+        timeout=5.0,
+    )
+    if tree_result.returncode != 0 or not tree_result.stdout.strip():
+        raise RuntimeError(
+            tree_result.stderr.strip()
+            or "could not resolve the worktree tree"
+        )
+    return head_result.stdout.strip(), tree_result.stdout.strip()
+
+
 def _create_codex_isolated_worktree(
     source_cwd: str,
     *,
@@ -195,19 +225,31 @@ def _select_codex_turn_workspace(
             True,
         )
     source_root = Path(root_result.stdout.strip()).resolve(strict=False)
+    try:
+        source_head, source_tree = _workspace_commit_identity(source_root)
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: source committed "
+            + f"identity could not be verified ({exc}). Remain read-only and "
+            "end with this exact blocker.",
+            True,
+        )
     source_key = os.path.normcase(str(source_root))
     cached_source = getattr(agent, "_codex_isolated_source_cwd", None)
     cached_workspace = getattr(agent, "_codex_isolated_workspace", None)
-    cached_matches_source = (
+    cached_owned_source = (
         cached_source == source_key
         and getattr(agent, "_codex_isolated_workspace_owned", False) is True
         and isinstance(cached_workspace, str)
     )
     preserved_cached_workspace = ""
     cached_reuse_issue = ""
-    if cached_matches_source:
+    if cached_owned_source:
         cached_path = Path(cached_workspace).expanduser().resolve(strict=False)
         if cached_path.is_dir() and (cached_path / ".git").exists():
+            preserved_cached_workspace = str(cached_path)
             try:
                 cached_status = _run_workspace_git(
                     cached_path,
@@ -220,24 +262,76 @@ def _select_codex_turn_workspace(
                 cached_reuse_issue = f"cleanliness check failed: {exc}"
             else:
                 if cached_status.returncode == 0 and not cached_status.stdout.strip():
-                    return (
-                        str(cached_path),
-                        phase_instructions
-                        + " Continue in the freshly revalidated clean "
-                        "owner-isolated Codex worktree; the original checkout "
-                        "remains untouched.",
-                        False,
+                    try:
+                        cached_head, cached_tree = (
+                            _workspace_commit_identity(cached_path)
+                        )
+                    except Exception as exc:
+                        cached_reuse_issue = (
+                            f"committed identity check failed: {exc}"
+                        )
+                    else:
+                        prior_source_identity = (
+                            getattr(
+                                agent,
+                                "_codex_isolated_source_head",
+                                None,
+                            ),
+                            getattr(
+                                agent,
+                                "_codex_isolated_source_tree",
+                                None,
+                            ),
+                        )
+                        prior_lane_identity = (
+                            getattr(
+                                agent,
+                                "_codex_isolated_workspace_head",
+                                None,
+                            ),
+                            getattr(
+                                agent,
+                                "_codex_isolated_workspace_tree",
+                                None,
+                            ),
+                        )
+                        if prior_source_identity != (source_head, source_tree):
+                            cached_reuse_issue = (
+                                "the source repository committed identity "
+                                "advanced"
+                            )
+                        elif prior_lane_identity != (cached_head, cached_tree):
+                            cached_reuse_issue = (
+                                "the cached worktree committed identity changed"
+                            )
+                        elif (cached_head, cached_tree) != (
+                            source_head,
+                            source_tree,
+                        ):
+                            cached_reuse_issue = (
+                                "the cached worktree no longer matches the "
+                                "source committed identity"
+                            )
+                        else:
+                            return (
+                                str(cached_path),
+                                phase_instructions
+                                + " Continue in the freshly revalidated clean "
+                                "owner-isolated Codex worktree at the current "
+                                "source commit; the original checkout remains "
+                                "untouched.",
+                                False,
+                            )
+                else:
+                    cached_reuse_issue = (
+                        "uncommitted or untracked changes are present"
+                        if cached_status.returncode == 0
+                        else (
+                            cached_status.stderr.strip()
+                            or cached_status.stdout.strip()
+                            or "git status failed"
+                        )
                     )
-                cached_reuse_issue = (
-                    "uncommitted or untracked changes are present"
-                    if cached_status.returncode == 0
-                    else (
-                        cached_status.stderr.strip()
-                        or cached_status.stdout.strip()
-                        or "git status failed"
-                    )
-                )
-            preserved_cached_workspace = str(cached_path)
         else:
             cached_reuse_issue = "cached worktree path is no longer valid"
 
@@ -268,6 +362,34 @@ def _select_codex_turn_workspace(
     agent._codex_isolated_source_cwd = source_key
     agent._codex_isolated_workspace = isolated
     agent._codex_isolated_workspace_owned = True
+    agent._codex_isolated_source_head = source_head
+    agent._codex_isolated_source_tree = source_tree
+    try:
+        isolated_head, isolated_tree = _workspace_commit_identity(
+            Path(isolated)
+        )
+    except Exception as exc:
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: the new isolated "
+            + f"worktree identity could not be verified ({exc}). The new "
+            "worktree was preserved for inspection. Remain read-only and end "
+            "with this exact blocker.",
+            True,
+        )
+    if (isolated_head, isolated_tree) != (source_head, source_tree):
+        return (
+            source_cwd,
+            phase_instructions
+            + " Automatic clean-worktree isolation failed: the new isolated "
+            "worktree did not match the source committed identity. The new "
+            "worktree was preserved for inspection. Remain read-only and end "
+            "with this exact blocker.",
+            True,
+        )
+    agent._codex_isolated_workspace_head = isolated_head
+    agent._codex_isolated_workspace_tree = isolated_tree
     replacement_note = (
         " Hermes preserved the prior cached Codex worktree at "
         + preserved_cached_workspace

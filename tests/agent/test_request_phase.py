@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import json
 import subprocess
 from pathlib import Path
@@ -311,8 +310,8 @@ def test_real_registry_loads_complete_router_then_domain_skill(
     from tools import skills_tool
 
     skills_root = tmp_path / "real-skills"
-    router_name = "terrain-operations"
-    router_description = "Top-level router for Terrain and Maione operations."
+    router_name = "maione-canonical-operator"
+    router_description = "Canonical front door for Maione operations."
     router_prefix = (
         "---\n"
         f"name: {router_name}\n"
@@ -367,7 +366,7 @@ def test_real_registry_loads_complete_router_then_domain_skill(
 
     policy = activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
     router = json.loads(
-        skills_tool._skill_view_with_bump({"name": "terrain-operations"})
+        skills_tool._skill_view_with_bump({"name": router_name})
     )
     domain = json.loads(
         skills_tool._skill_view_with_bump(
@@ -382,11 +381,11 @@ def test_real_registry_loads_complete_router_then_domain_skill(
         == router_size
     )
     assert router["payload_budget"]["blocked"] is False
-    assert "# terrain-operations" in router["content"]
+    assert f"# {router_name}" in router["content"]
     assert domain["success"] is True
     assert "# terrain-quote-workflows" in domain["content"]
     assert policy.loaded_root_skills == [
-        "terrain-operations",
+        router_name,
         "terrain-quote-workflows",
     ]
 
@@ -1337,6 +1336,32 @@ def test_concurrent_repository_drift_blocks_before_first_mutation(clean_repo):
     assert (clean_repo / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
+def test_external_clean_commit_drift_blocks_before_first_mutation(clean_repo):
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    (clean_repo / "external.txt").write_text(
+        "another process committed this\n",
+        encoding="utf-8",
+    )
+    _git(clean_repo, "add", "external.txt")
+    _git(clean_repo, "commit", "-q", "-m", "external clean commit")
+    assert _git(clean_repo, "status", "--porcelain").stdout == ""
+
+    block = guard_tool_call(
+        "write_file",
+        {
+            "path": str(clean_repo / "app.py"),
+            "content": "VALUE = 2\n",
+        },
+    )
+
+    assert block is not None
+    assert "changed after this turn's last verified state" in block
+    assert (clean_repo / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
 def test_successful_native_file_effect_advances_verified_repo_state(clean_repo):
     args = {
         "path": str(clean_repo / "app.py"),
@@ -1351,7 +1376,13 @@ def test_successful_native_file_effect_advances_verified_repo_state(clean_repo):
     record_tool_effect_result(
         "write_file",
         args,
-        json.dumps({"success": True}),
+        json.dumps(
+            {
+                "bytes_written": len(args["content"]),
+                "resolved_path": args["path"],
+                "files_modified": [args["path"]],
+            }
+        ),
     )
 
     assert (
@@ -1364,6 +1395,79 @@ def test_successful_native_file_effect_advances_verified_repo_state(clean_repo):
         )
         is None
     )
+
+
+def test_verified_hermes_commit_advances_expected_head_and_tree(clean_repo):
+    write_args = {
+        "path": str(clean_repo / "app.py"),
+        "content": "VALUE = 2\n",
+    }
+    activate_turn_policy(
+        "Implement and commit the requested source change.",
+        cwd=clean_repo,
+    )
+    assert guard_tool_call("write_file", write_args) is None
+    (clean_repo / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+    record_tool_effect_result(
+        "write_file",
+        write_args,
+        json.dumps(
+            {
+                "bytes_written": len(write_args["content"]),
+                "resolved_path": write_args["path"],
+                "files_modified": [write_args["path"]],
+            }
+        ),
+    )
+
+    terminal_args = {
+        "command": "git add app.py; git commit -m verified-effect",
+        "workdir": str(clean_repo),
+    }
+    assert guard_tool_call("terminal", terminal_args) is None
+    _git(clean_repo, "add", "app.py")
+    _git(clean_repo, "commit", "-q", "-m", "verified-effect")
+    record_tool_effect_result(
+        "terminal",
+        terminal_args,
+        json.dumps({"output": "committed", "exit_code": 0}),
+    )
+
+    assert (
+        guard_tool_call(
+            "write_file",
+            {
+                "path": str(clean_repo / "app.py"),
+                "content": "VALUE = 3\n",
+            },
+        )
+        is None
+    )
+
+
+def test_unverified_file_result_cannot_absorb_external_clean_commit(clean_repo):
+    args = {
+        "path": str(clean_repo / "app.py"),
+        "content": "VALUE = 2\n",
+    }
+    activate_turn_policy(
+        "Implement the requested source change.",
+        cwd=clean_repo,
+    )
+    assert guard_tool_call("write_file", args) is None
+    (clean_repo / "external.txt").write_text("external\n", encoding="utf-8")
+    _git(clean_repo, "add", "external.txt")
+    _git(clean_repo, "commit", "-q", "-m", "external during tool")
+
+    record_tool_effect_result(
+        "write_file",
+        args,
+        json.dumps({"success": True}),
+    )
+    block = guard_tool_call("write_file", args)
+
+    assert block is not None
+    assert "committed repository identity changed" in block
 
 
 def test_failed_partial_native_file_effect_blocks_every_later_mutation(
@@ -1627,6 +1731,139 @@ def test_business_api_operation_remains_allowed_even_when_repo_is_dirty(clean_re
     assert block is None
 
 
+@pytest.mark.parametrize("path_qualified_name", ["git", "cat.exe"])
+def test_path_qualified_trusted_terminal_name_never_reaches_handler(
+    clean_repo,
+    tmp_path,
+    monkeypatch,
+    path_qualified_name,
+):
+    from tools import terminal_tool
+    from tools.registry import registry
+
+    fake_executable = tmp_path / path_qualified_name
+    fake_executable.write_text(
+        "attacker-controlled executable\n",
+        encoding="utf-8",
+    )
+    launches = []
+
+    def fake_launch(**kwargs):
+        launches.append(kwargs)
+        return json.dumps({"output": "launched", "exit_code": 0})
+
+    monkeypatch.setattr(terminal_tool, "terminal_tool", fake_launch)
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    result = json.loads(
+        registry.dispatch(
+            "terminal",
+            {
+                "command": f'"{fake_executable}" status',
+                "workdir": str(clean_repo),
+            },
+        )
+    )
+
+    assert result["error_type"] == "request_phase_block"
+    assert launches == []
+
+
+def test_investigation_browser_mutation_is_denied_before_dispatch(
+    clean_repo,
+    monkeypatch,
+):
+    from tools import browser_tool
+    from tools.registry import registry
+
+    calls = []
+    monkeypatch.setattr(
+        browser_tool,
+        "browser_click",
+        lambda **kwargs: calls.append(kwargs) or json.dumps({"success": True}),
+    )
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    result = json.loads(registry.dispatch("browser_click", {"ref": "button-1"}))
+
+    assert result["error_type"] == "request_phase_block"
+    assert calls == []
+
+
+def test_investigation_browser_snapshot_dispatches_as_read_only(
+    clean_repo,
+    monkeypatch,
+):
+    from tools import browser_tool
+    from tools.registry import registry
+
+    calls = []
+    monkeypatch.setattr(
+        browser_tool,
+        "browser_snapshot",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or json.dumps({"success": True, "snapshot": "read-only"})
+        ),
+    )
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    result = json.loads(registry.dispatch("browser_snapshot", {}))
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
+def test_investigation_cron_mutation_is_denied_before_dispatch(
+    clean_repo,
+    monkeypatch,
+):
+    from tools import cronjob_tools
+    from tools.registry import registry
+
+    calls = []
+    monkeypatch.setattr(
+        cronjob_tools,
+        "cronjob",
+        lambda **kwargs: calls.append(kwargs) or json.dumps({"success": True}),
+    )
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    result = json.loads(
+        registry.dispatch(
+            "cronjob",
+            {"action": "create", "name": "must-not-exist", "prompt": "x"},
+        )
+    )
+
+    assert result["error_type"] == "request_phase_block"
+    assert calls == []
+
+
+def test_investigation_cron_list_dispatches_as_read_only(
+    clean_repo,
+    monkeypatch,
+):
+    from tools import cronjob_tools
+    from tools.registry import registry
+
+    calls = []
+    monkeypatch.setattr(
+        cronjob_tools,
+        "cronjob",
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or json.dumps({"success": True, "jobs": []})
+        ),
+    )
+    activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
+
+    result = json.loads(registry.dispatch("cronjob", {"action": "list"}))
+
+    assert result["success"] is True
+    assert len(calls) == 1
+
+
 def test_investigation_cannot_rewrite_skills(clean_repo):
     activate_turn_policy(QUOTE_ANALYSIS_REQUEST, cwd=clean_repo)
 
@@ -1756,13 +1993,33 @@ def test_implementation_parent_may_delegate_implementation(clean_repo):
         reset_turn_policy(token)
 
 
-def test_prompt_requires_smallest_direct_skill_set_and_phase_boundary():
-    source = inspect.getsource(build_skills_system_prompt)
+def test_generated_prompt_requires_smallest_direct_skill_set_and_phase_boundary(
+    monkeypatch,
+    tmp_path,
+):
+    from agent import prompt_builder
 
-    assert "smallest skill set that directly governs" in source
-    assert "merely partially relevant skills" in source
-    assert "always better to have context" not in source
-    assert "even partially relevant" not in source
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "example"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: example\ndescription: Example skill.\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(prompt_builder, "get_skills_dir", lambda: skills_root)
+    monkeypatch.setattr(
+        prompt_builder,
+        "get_all_skills_dirs",
+        lambda: [skills_root],
+    )
+    prompt_builder._SKILLS_PROMPT_CACHE.clear()
+
+    rendered = build_skills_system_prompt()
+
+    assert "smallest skill set that directly governs" in rendered
+    assert "merely partially relevant skills" in rendered
+    assert "always better to have context" not in rendered
+    assert "even partially relevant" not in rendered
     assert "Investigation is read-and-report only" in REQUEST_PHASE_GUIDANCE
     assert "Operation means execute the requested business outcome" in (
         REQUEST_PHASE_GUIDANCE

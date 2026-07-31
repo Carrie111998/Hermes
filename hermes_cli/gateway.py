@@ -2181,6 +2181,53 @@ def _systemd_service_active_state(system: bool = False) -> bool | None:
         return None
 
 
+def _systemd_active_main_pid(system: bool = False) -> int | None:
+    """Return systemd's current active MainPID, or None without exact proof."""
+
+    props = _read_systemd_unit_properties(system=system)
+    if props.get("ActiveState") != "active":
+        return None
+    return _systemd_main_pid_from_props(props)
+
+
+def _systemd_replacement_pid(
+    previous_pid: int | None,
+    *,
+    system: bool = False,
+) -> int | None:
+    """Prove that a restart produced a different active service process."""
+
+    if previous_pid is None:
+        return None
+    current_pid = _systemd_active_main_pid(system=system)
+    if current_pid is None or current_pid == previous_pid:
+        return None
+    return current_pid
+
+
+def _apply_failed_restart_hold(
+    snapshot: tuple[bool, dict | None],
+    *,
+    system: bool = False,
+) -> None:
+    """Contain a failed or uncertain restart, even without a prior hold."""
+
+    from gateway.status import write_gateway_owner_hold
+
+    _active, record = snapshot
+    current_pid = _systemd_active_main_pid(system=system)
+    owner = "hermes gateway restart rollback"
+    reason = "restart failed or replacement process could not be proven"
+    if isinstance(record, dict):
+        owner = str(record.get("owner") or owner)
+        reason = str(record.get("reason") or reason)
+    write_gateway_owner_hold(
+        target_pid=current_pid,
+        owner=owner,
+        reason=reason,
+    )
+
+
 def _restore_hold_unless_service_is_active(
     snapshot: tuple[bool, dict | None],
     *,
@@ -3367,9 +3414,14 @@ def systemd_install(
     force: bool = False,
     system: bool = False,
     run_as_user: str | None = None,
-    enable_on_startup: bool = True,
+    enable_on_startup: bool | None = None,
     non_interactive: bool = False,
 ):
+    if enable_on_startup is None:
+        # Preserve the interactive default while making a direct headless
+        # install inert unless its caller explicitly opts into startup.
+        enable_on_startup = not non_interactive
+
     if system:
         _require_root_for_system_service("install")
 
@@ -3404,12 +3456,28 @@ def systemd_install(
                 f"↻ Repairing outdated {_service_scope_label(system)} systemd service at: {unit_path}"
             )
             refresh_systemd_unit_if_needed(system=system)
-            if enable_on_startup:
-                _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+            _run_systemctl(
+                [
+                    "enable" if enable_on_startup else "disable",
+                    get_service_name(),
+                ],
+                system=system,
+                check=True,
+                timeout=30,
+            )
             print(f"✓ {_service_scope_label(system).capitalize()} service definition updated")
             return
         print(f"Service already installed at: {unit_path}")
         print("Use --force to reinstall")
+        _run_systemctl(
+            [
+                "enable" if enable_on_startup else "disable",
+                get_service_name(),
+            ],
+            system=system,
+            check=True,
+            timeout=30,
+        )
         return
 
     unit_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3420,8 +3488,15 @@ def systemd_install(
     unit_path.write_text(new_unit, encoding="utf-8")
 
     _run_systemctl(["daemon-reload"], system=system, check=True, timeout=30)
-    if enable_on_startup:
-        _run_systemctl(["enable", get_service_name()], system=system, check=True, timeout=30)
+    _run_systemctl(
+        [
+            "enable" if enable_on_startup else "disable",
+            get_service_name(),
+        ],
+        system=system,
+        check=True,
+        timeout=30,
+    )
 
     print()
     enable_label = "installed and enabled" if enable_on_startup else "installed"
@@ -3443,7 +3518,7 @@ def systemd_install(
         configured_user = _read_systemd_user_from_unit(unit_path)
         if configured_user:
             print(f"Configured to run as: {configured_user}")
-    else:
+    elif enable_on_startup:
         _ensure_linger_enabled()
 
     print_systemd_scope_conflict_warning()
@@ -3672,18 +3747,26 @@ def systemd_restart(system: bool = False):
     _migrate_gateway_hygiene_hold_support(system=system)
     from gateway.status import clear_gateway_owner_hold
 
+    # Only systemd's own pre-restart MainPID is authoritative enough to prove
+    # that the process observed after the command is a replacement.
+    previous_pid = _systemd_main_pid(system=system)
     hold_snapshot = _capture_gateway_owner_hold()
     clear_gateway_owner_hold()
+    restart_completed = False
     try:
         _systemd_restart_after_owner_unhold(system)
+        restart_completed = True
     finally:
-        # Every early return and exception reaches this readback. A failed,
-        # timed-out, or otherwise unknown restart restores the prior owner
-        # containment unless the replacement service is provably active.
-        _restore_hold_unless_service_is_active(
-            hold_snapshot,
-            system=system,
+        # An active unit alone is insufficient: the old process may still be
+        # running after a no-op or timed-out restart. Release containment only
+        # after a normal command return and an exact replacement MainPID.
+        replacement_pid = (
+            _systemd_replacement_pid(previous_pid, system=system)
+            if restart_completed
+            else None
         )
+        if replacement_pid is None:
+            _apply_failed_restart_hold(hold_snapshot, system=system)
 
 
 def systemd_status(deep: bool = False, system: bool = False, full: bool = False):
@@ -7042,8 +7125,8 @@ def _gateway_command_inner(args):
                 )
                 print()
             # Honor CLI flags (--start-now / --no-start-now, --start-on-login /
-            # --no-start-on-login).  When not provided, prompt interactively or
-            # fall back to True for non-TTY / headless contexts (SSH, CI, pipes).
+            # --no-start-on-login). When not provided, prompt interactively.
+            # Headless contexts install the definition but leave it inert.
             non_interactive = not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
             _sn = getattr(args, "start_now", None)
             if _sn is not None:
@@ -7051,7 +7134,7 @@ def _gateway_command_inner(args):
             elif not non_interactive:
                 start_now = prompt_yes_no("Start the gateway now after installing the service?", True)
             else:
-                start_now = True
+                start_now = False
 
             _sol = getattr(args, "start_on_login", None)
             if _sol is not None:
@@ -7059,7 +7142,7 @@ def _gateway_command_inner(args):
             elif not non_interactive:
                 start_on_login = prompt_yes_no("Start the gateway automatically on login/boot with systemd?", True)
             else:
-                start_on_login = True
+                start_on_login = False
             systemd_install(
                 force=force,
                 system=system,

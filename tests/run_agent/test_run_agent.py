@@ -2648,11 +2648,71 @@ class TestRunConversation:
         assert isinstance(result["run_ended_at"], float)
         finish_task_run.assert_called_once()
         assert finish_task_run.call_args.kwargs["result"] is result
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(result["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == expected_state
+        assert durable["run_end_reason"] == inner_result["turn_exit_reason"]
+        assert durable["run_ended_at"] == result["run_ended_at"]
+        assert durable["final_generated"] is True
         coordinator.end_turn.assert_called_once_with(
             relay_turn,
             outcome=expected_relay_outcome,
         )
         coordinator.release_conversation.assert_called_once_with(relay_lease)
+
+    def test_telemetry_disabled_still_writes_local_terminal_receipt(
+        self,
+        agent,
+    ):
+        relay_lease = SimpleNamespace(
+            parent_session_id="",
+            profile_key="/profile",
+            session_id=agent.session_id or "",
+        )
+        coordinator = MagicMock()
+        coordinator.acquire_conversation.return_value = relay_lease
+        coordinator.begin_turn.return_value = object()
+
+        with (
+            patch("agent.relay_runtime.SESSION_COORDINATOR", coordinator),
+            patch(
+                "agent.relay_runtime.current_profile_key",
+                return_value="/profile",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+                return_value=None,
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run",
+                return_value=None,
+            ),
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value={
+                    "final_response": "Done with local proof.",
+                    "completed": True,
+                    "failed": False,
+                    "interrupted": False,
+                    "turn_exit_reason": "text_response(finish_reason=stop)",
+                },
+            ),
+        ):
+            result = agent.run_conversation(
+                "hello",
+                task_id="telemetry-disabled",
+            )
+
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(result["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "done"
+        assert durable["run_end_reason"] == result["run_end_reason"]
+        assert durable["run_ended_at"] == result["run_ended_at"]
+        assert durable["final_generated"] is True
 
     def test_exception_path_closes_run_as_explicit_failure(self, agent):
         relay_lease = SimpleNamespace(
@@ -2695,6 +2755,14 @@ class TestRunConversation:
         assert receipt["interrupted"] is False
         assert isinstance(receipt["run_ended_at"], float)
         assert run_error.hermes_terminal_receipt == receipt
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(receipt["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "failed"
+        assert durable["run_end_reason"] == "system_aborted"
+        assert durable["run_ended_at"] == receipt["run_ended_at"]
+        assert durable["final_generated"] is False
         coordinator.end_turn.assert_called_once_with(
             relay_turn,
             outcome="failed",
@@ -2740,6 +2808,14 @@ class TestRunConversation:
         assert receipt["failed"] is False
         assert receipt["interrupted"] is True
         assert run_error.hermes_terminal_receipt == receipt
+        from gateway.delivery_ledger import get_run_terminal_receipt
+
+        durable = get_run_terminal_receipt(receipt["run_receipt_id"])
+        assert durable is not None
+        assert durable["run_terminal_state"] == "cancelled"
+        assert durable["run_end_reason"] == "interrupted_by_user"
+        assert durable["run_ended_at"] == receipt["run_ended_at"]
+        assert durable["final_generated"] is False
         coordinator.end_turn.assert_called_once_with(
             relay_turn,
             outcome="cancelled",
