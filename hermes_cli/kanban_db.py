@@ -10628,7 +10628,7 @@ def publish_provider_recovery_event(
             WHERE w.profile = ?
               AND w.provider = ?
               AND w.credential_generation = ?
-              AND w.waiting_at <= ?
+              AND w.waiting_at < ?
             """,
             (
                 event_id,

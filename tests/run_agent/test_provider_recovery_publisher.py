@@ -78,6 +78,7 @@ def recovery_db(tmp_path: Path):
 def _set_supervised_env(monkeypatch, db_path: Path, *, profile="alpha", generation="7"):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_PROVIDER", "openrouter")
     monkeypatch.setenv(CREDENTIAL_GENERATION_ENV, generation)
 
 
@@ -200,6 +201,33 @@ def test_direct_publication_is_exact_and_idempotent(recovery_db, monkeypatch):
     assert rows[0]["provider_observed_at"] == 1_900_000_000
 
 
+def test_publication_requires_provider_matching_bound_generation(
+    recovery_db, monkeypatch
+):
+    _set_supervised_env(monkeypatch, recovery_db)
+
+    assert publish_successful_live_provider_request(
+        provider="anthropic",
+        request_id="fallback-request",
+        session_id="fallback-session",
+        provider_observed_at=1_900_000_000,
+    ) is False
+    assert _event_rows(recovery_db) == []
+
+    assert publish_successful_live_provider_request(
+        provider="open-router",
+        request_id="primary-request",
+        session_id="primary-session",
+        provider_observed_at=1_900_000_001,
+    ) is True
+    rows = _event_rows(recovery_db)
+    assert len(rows) == 1
+    assert (rows[0]["provider"], rows[0]["credential_generation"]) == (
+        "openrouter",
+        7,
+    )
+
+
 @pytest.mark.parametrize(
     ("db_value", "profile", "generation"),
     [
@@ -216,7 +244,12 @@ def test_direct_publication_is_exact_and_idempotent(recovery_db, monkeypatch):
 def test_missing_malformed_or_unsupervised_scope_publishes_nothing(
     recovery_db, monkeypatch, db_value, profile, generation
 ):
-    for name in ("HERMES_KANBAN_DB", "HERMES_PROFILE", CREDENTIAL_GENERATION_ENV):
+    for name in (
+        "HERMES_KANBAN_DB",
+        "HERMES_PROFILE",
+        "HERMES_PROVIDER",
+        CREDENTIAL_GENERATION_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     if db_value is not None:
         monkeypatch.setenv(
@@ -225,6 +258,7 @@ def test_missing_malformed_or_unsupervised_scope_publishes_nothing(
         )
     if profile is not None:
         monkeypatch.setenv("HERMES_PROFILE", profile)
+    monkeypatch.setenv("HERMES_PROVIDER", "openrouter")
     if generation is not None:
         monkeypatch.setenv(CREDENTIAL_GENERATION_ENV, generation)
 

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 KANBAN_DB_ENV = "HERMES_KANBAN_DB"
 WORKER_PROFILE_ENV = "HERMES_PROFILE"
+BOUND_PROVIDER_ENV = "HERMES_PROVIDER"
 CREDENTIAL_GENERATION_ENV = "HERMES_PROVIDER_CREDENTIAL_GENERATION"
 
 _PUBLISHER_ID = "hermes-agent-core"
@@ -33,12 +34,13 @@ _DB_BUSY_TIMEOUT_MS = 250
 
 def _trusted_scope_from_env(
     environ: Mapping[str, str],
-) -> Optional[tuple[Path, str, int]]:
+) -> Optional[tuple[Path, str, str, int]]:
     """Return strict supervised scope or ``None`` without touching the DB."""
     raw_db_path = environ.get(KANBAN_DB_ENV)
     raw_profile = environ.get(WORKER_PROFILE_ENV)
+    raw_provider = environ.get(BOUND_PROVIDER_ENV)
     raw_generation = environ.get(CREDENTIAL_GENERATION_ENV)
-    if not raw_db_path or not raw_profile or not raw_generation:
+    if not raw_db_path or not raw_profile or not raw_provider or not raw_generation:
         return None
 
     db_path = Path(raw_db_path)
@@ -62,7 +64,16 @@ def _trusted_scope_from_env(
     if generation <= 0:
         return None
 
-    return db_path, normalized_profile, generation
+    try:
+        bound_scope = kb.ProviderRecoveryScope(
+            profile=normalized_profile,
+            provider=raw_provider,
+            credential_generation=generation,
+        )
+    except (TypeError, ValueError):
+        return None
+
+    return db_path, normalized_profile, bound_scope.provider, generation
 
 
 def _stable_proof_id(*, request_id: str, session_id: str) -> Optional[str]:
@@ -114,7 +125,7 @@ def publish_successful_live_provider_request(
     trusted_scope = _trusted_scope_from_env(os.environ)
     if trusted_scope is None:
         return False
-    db_path, profile, generation = trusted_scope
+    db_path, profile, bound_provider, generation = trusted_scope
 
     proof_id = _stable_proof_id(request_id=request_id, session_id=session_id)
     if proof_id is None:
@@ -132,6 +143,8 @@ def publish_successful_live_provider_request(
             provider=provider,
             credential_generation=generation,
         )
+        if scope.provider != bound_provider:
+            return False
         proof = kb.ProviderRecoveryProof(
             stable_proof_id=proof_id,
             scope=scope,

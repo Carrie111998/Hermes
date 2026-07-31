@@ -1409,3 +1409,62 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         conn.close()
 
 
+def test_supervised_worker_failure_persists_one_exact_run_event(
+    kanban_home, monkeypatch, tmp_path
+):
+    from hermes_cli.worker_supervisor import DispatcherWorkerSupervisor
+
+    workspace = tmp_path / "supervision-worktree"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="supervision failure",
+            assignee="worker",
+            session_id="session-supervision",
+        )
+        task = kb.claim_task(conn, task_id, claimer="test:supervision")
+        assert task is not None and task.current_run_id is not None
+
+    real_supervisor = DispatcherWorkerSupervisor(
+        event_root=tmp_path / "lifecycle-events"
+    )
+
+    class FailingSupervisor:
+        def start(self, identity, _launch, *, notifier, **_kwargs):
+            handle = SimpleNamespace(identity=identity)
+            for _ in range(2):
+                real_supervisor._notify_once(
+                    handle,
+                    notifier,
+                    2,
+                    "retry_setup_failure",
+                    -1,
+                    "do-not-persist-credential-bytes",
+                )
+            return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(kb, "_default_spawn", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        kb, "_dispatcher_worker_supervisor", lambda **_kwargs: FailingSupervisor()
+    )
+
+    assert kb._start_supervised_worker(task, str(workspace)) == 4242
+    with kb.connect() as conn:
+        failures = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "worker_supervision_failed"
+        ]
+
+    assert len(failures) == 1
+    assert failures[0].run_id == task.current_run_id
+    assert failures[0].payload == {
+        "attempts": 2,
+        "classification": "retry_setup_failure",
+        "exit_code": -1,
+        "reason": "unspecified",
+        "run_id": task.current_run_id,
+        "session_id": "session-supervision",
+        "task_id": task_id,
+    }

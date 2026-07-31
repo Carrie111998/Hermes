@@ -242,6 +242,37 @@ def test_one_event_fans_out_only_to_all_exact_scope_waiters(recovery_db):
     }
 
 
+def test_recovery_proof_must_be_strictly_later_than_wait_registration(recovery_db):
+    _, conn = recovery_db
+    scope = kb.ProviderRecoveryScope("alpha", "openrouter", 4)
+    task_id, run_id = _running(
+        conn, title="strict-ordering", session_id="session-strict-ordering"
+    )
+    assert kb.register_provider_recovery_wait(
+        conn,
+        evidence=_terminal_evidence(
+            task_id, run_id, "session-strict-ordering"
+        ),
+        scope=scope,
+        waiting_at=100,
+    )
+
+    equal = kb.publish_provider_recovery_event(
+        conn,
+        _proof(scope, stable_proof_id="proof-equal", observed_at=100),
+    )
+    assert kb.list_provider_recovery_deliveries(conn, event_id=equal.id) == []
+
+    later = kb.publish_provider_recovery_event(
+        conn,
+        _proof(scope, stable_proof_id="proof-later", observed_at=101),
+    )
+    assert [
+        (delivery.task_id, delivery.run_id, delivery.session_id)
+        for delivery in kb.list_provider_recovery_deliveries(conn, event_id=later.id)
+    ] == [(task_id, run_id, "session-strict-ordering")]
+
+
 def test_dispatcher_consumes_delivery_and_signals_only_the_matching_run(
     recovery_db, monkeypatch
 ):

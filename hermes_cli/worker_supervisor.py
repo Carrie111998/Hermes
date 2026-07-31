@@ -129,6 +129,34 @@ class LifecycleFailure:
     exit_code: int
     reason: str
 
+    def as_dict(self) -> dict:
+        classifications = {
+            *(item.value for item in TerminalClassification),
+            "callback_failure",
+            "invalid_evidence",
+            "process_exit",
+            "retry_setup_failure",
+        }
+        reasons = classifications | {
+            "cleanup_not_verified",
+            "credential_recovered",
+            "provider_recovered",
+            "recovery_timeout",
+        }
+        return {
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "attempts": self.attempts,
+            "classification": (
+                self.classification
+                if self.classification in classifications
+                else TerminalClassification.SUPERVISOR_FAILURE.value
+            ),
+            "exit_code": self.exit_code,
+            "reason": self.reason if self.reason in reasons else "unspecified",
+        }
+
 
 LaunchWorker = Callable[..., subprocess.Popen]
 ExitCallback = Callable[[AttemptExit], None]
