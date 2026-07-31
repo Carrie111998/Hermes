@@ -81,6 +81,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `events` | No | List of event types to accept (e.g. `["pull_request"]`). If empty, all events are accepted. Event type is read from the route's `event_header` (if set), then `X-GitHub-Event`, `X-GitLab-Event`, or `event_type` / `type` in the payload. |
 | `event_header` | No | Name of the header carrying the event type, for providers with their own header (e.g. `X-Gitea-Event`). Checked before the built-in headers and payload fields. The resolved value drives `events` filtering, `filters` on `event`, and the `{event_type}` template token. |
 | `secret` | **Yes** | HMAC secret for signature validation. Falls back to the global `secret` if not set on the route. Set to `"INSECURE_NO_AUTH"` for testing only (skips validation). |
+| `profile` | No | Profile authorized to execute this route when `gateway.multiplex_profiles` is enabled. Omit it for a default-profile-only route; set a profile name (for example `coder`) to bind the route and its secret to `/p/coder/webhooks/<route>`. |
 | `signature_header` | No | Name of the header that carries the signature/token, for providers the adapter does not recognize natively (e.g. `X-Gitea-Signature`, `X-Hook-Signature`). When set, **only** this header is accepted for the route — the built-in GitHub/GitLab/Svix/generic detection is skipped. See [Custom signature headers](#custom-signature-headers). |
 | `signature_scheme` | No | How the custom header is validated: `hmac-sha256` (default — hex HMAC digest of the raw body), `hmac-sha1` / `hmac-md5` (same, for providers that offer nothing stronger), or `token` (plain constant-time string compare against the secret, GitLab-style). Only valid together with `signature_header`. |
 | `signature_prefix` | No | Prefix the provider puts before the signature value (e.g. `sha256=`). Stripped before validation. Only valid together with `signature_header`. |
@@ -507,6 +508,11 @@ The same options are available on dynamic subscriptions: `hermes webhook subscri
 ### Secret is required
 
 Every route must have a secret — either set directly on the route or inherited from the global `secret`. Routes without a secret cause the adapter to fail at startup with an error. For development/testing only, you can set the secret to `"INSECURE_NO_AUTH"` to skip validation entirely.
+
+When multi-profile routing is enabled, the route's `profile` field also
+binds that secret to one execution target. A route without `profile` is
+default-profile-only. A request carrying a valid route signature is still
+rejected if its `/p/<profile>/` prefix does not match the route binding.
 
 `INSECURE_NO_AUTH` is only accepted when the gateway is bound to a loopback host (`127.0.0.1`, `localhost`, `::1`). If it is combined with a non-loopback bind such as `0.0.0.0` or a LAN IP, the adapter refuses to start — this prevents accidentally exposing an unauthenticated endpoint on a public interface.
 

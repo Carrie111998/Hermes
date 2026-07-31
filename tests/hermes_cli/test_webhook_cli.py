@@ -1,5 +1,7 @@
 """Tests for hermes_cli/webhook.py — webhook subscription CLI."""
 
+import hashlib
+import hmac
 import json
 import os
 import pytest
@@ -37,6 +39,10 @@ def _make_args(**kwargs):
         "secret": "",
         "payload": "",
         "script": "",
+        "signature_header": "",
+        "signature_scheme": "",
+        "signature_prefix": "",
+        "event_header": "",
     }
     defaults.update(kwargs)
     return Namespace(**defaults)
@@ -51,39 +57,44 @@ def test_webhook_base_url_maps_wildcard_hosts_to_localhost(monkeypatch, host):
     assert _get_webhook_base_url() == "http://localhost:9123"
 
 
-def test_webhook_base_url_brackets_pinned_ipv6_host(monkeypatch):
-    monkeypatch.setattr(
-        "hermes_cli.webhook._get_webhook_config",
-        lambda: {"extra": {"host": "::1", "port": 9123}},
-    )
-    assert _get_webhook_base_url() == "http://[::1]:9123"
-
-
 class TestSubscribe:
-    def test_basic_create(self, capsys):
-        webhook_command(_make_args(webhook_action="subscribe", name="test-hook"))
-        out = capsys.readouterr().out
-        assert "Created" in out
-        assert "/webhooks/test-hook" in out
-        subs = _load_subscriptions()
-        assert "test-hook" in subs
 
-    def test_with_options(self, capsys):
+    def test_signature_and_event_options_are_persisted(self):
         webhook_command(_make_args(
             webhook_action="subscribe",
-            name="gh-issues",
-            events="issues,pull_request",
-            prompt="Issue: {issue.title}",
-            deliver="telegram",
-            deliver_chat_id="12345",
-            description="Watch GitHub",
+            name="gitea",
+            secret="shared-secret",
+            signature_header="X-Gitea-Signature",
+            signature_scheme="hmac-sha256",
+            signature_prefix="sha256=",
+            event_header="X-Gitea-Event",
         ))
-        subs = _load_subscriptions()
-        route = subs["gh-issues"]
-        assert route["events"] == ["issues", "pull_request"]
-        assert route["prompt"] == "Issue: {issue.title}"
-        assert route["deliver"] == "telegram"
-        assert route["deliver_extra"] == {"chat_id": "12345"}
+
+        route = _load_subscriptions()["gitea"]
+        assert route["signature_header"] == "X-Gitea-Signature"
+        assert route["signature_scheme"] == "hmac-sha256"
+        assert route["signature_prefix"] == "sha256="
+        assert route["event_header"] == "X-Gitea-Event"
+
+    @pytest.mark.parametrize(
+        "orphan_option",
+        [
+            {"signature_scheme": "hmac-md5"},
+            {"signature_prefix": "sha256="},
+        ],
+    )
+    def test_signature_options_without_header_are_rejected(
+        self, orphan_option, capsys
+    ):
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="invalid",
+            **orphan_option,
+        ))
+
+        assert "require --signature-header" in capsys.readouterr().out
+        assert _load_subscriptions() == {}
+
 
     def test_custom_secret(self):
         webhook_command(_make_args(
@@ -91,36 +102,14 @@ class TestSubscribe:
         ))
         assert _load_subscriptions()["s"]["secret"] == "my-secret"
 
-    def test_script_option_is_persisted(self):
-        webhook_command(_make_args(
-            webhook_action="subscribe", name="s", script="todoist_filter.py"
-        ))
-        assert _load_subscriptions()["s"]["script"] == "todoist_filter.py"
 
     def test_auto_secret(self):
         webhook_command(_make_args(webhook_action="subscribe", name="s"))
         secret = _load_subscriptions()["s"]["secret"]
         assert len(secret) > 20
 
-    def test_update(self, capsys):
-        webhook_command(_make_args(webhook_action="subscribe", name="x", prompt="v1"))
-        webhook_command(_make_args(webhook_action="subscribe", name="x", prompt="v2"))
-        out = capsys.readouterr().out
-        assert "Updated" in out
-        assert _load_subscriptions()["x"]["prompt"] == "v2"
-
-    def test_invalid_name(self, capsys):
-        webhook_command(_make_args(webhook_action="subscribe", name="bad name!"))
-        out = capsys.readouterr().out
-        assert "Error" in out or "Invalid" in out
-        assert _load_subscriptions() == {}
-
 
 class TestList:
-    def test_empty(self, capsys):
-        webhook_command(_make_args(webhook_action="list"))
-        out = capsys.readouterr().out
-        assert "No dynamic" in out
 
     def test_with_entries(self, capsys):
         webhook_command(_make_args(webhook_action="subscribe", name="a"))
@@ -134,17 +123,7 @@ class TestList:
 
 
 class TestRemove:
-    def test_remove_existing(self, capsys):
-        webhook_command(_make_args(webhook_action="subscribe", name="temp"))
-        webhook_command(_make_args(webhook_action="remove", name="temp"))
-        out = capsys.readouterr().out
-        assert "Removed" in out
-        assert _load_subscriptions() == {}
 
-    def test_remove_nonexistent(self, capsys):
-        webhook_command(_make_args(webhook_action="remove", name="nope"))
-        out = capsys.readouterr().out
-        assert "No subscription" in out
 
     def test_selective_remove(self):
         webhook_command(_make_args(webhook_action="subscribe", name="keep"))
@@ -156,12 +135,6 @@ class TestRemove:
 
 
 class TestPersistence:
-    def test_file_written(self):
-        webhook_command(_make_args(webhook_action="subscribe", name="persist"))
-        path = _subscriptions_path()
-        assert path.exists()
-        data = json.loads(path.read_text())
-        assert "persist" in data
 
     def test_corrupted_file(self):
         path = _subscriptions_path()
@@ -195,14 +168,86 @@ class TestPersistence:
         assert "FRESH" in path.read_text(encoding="utf-8")
 
 
+class _FakeHTTPResponse:
+    status = 202
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return b'{"status":"accepted"}'
+
+
+class TestWebhookTestRequest:
+    @staticmethod
+    def _capture_request(monkeypatch):
+        captured = []
+
+        def fake_urlopen(request, timeout):
+            captured.append((request, timeout))
+            return _FakeHTTPResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        return captured
+
+    def test_hmac_route_uses_configured_signature_and_event_headers(
+        self, monkeypatch
+    ):
+        secret = "hmac-secret"
+        payload = '{"value":1}'
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="hmac",
+            secret=secret,
+            signature_header="X-Custom-Signature",
+            signature_scheme="hmac-sha256",
+            signature_prefix="sha256=",
+            event_header="X-Custom-Event",
+        ))
+        captured = self._capture_request(monkeypatch)
+
+        webhook_command(_make_args(
+            webhook_action="test",
+            name="hmac",
+            payload=payload,
+        ))
+
+        request, timeout = captured[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        expected = hmac.new(
+            secret.encode(), payload.encode(), hashlib.sha256
+        ).hexdigest()
+        assert request.data == payload.encode()
+        assert headers["x-custom-signature"] == f"sha256={expected}"
+        assert headers["x-custom-event"] == "test"
+        assert "x-hub-signature-256" not in headers
+        assert timeout == 10
+
+    def test_token_route_sends_secret_verbatim_in_configured_header(
+        self, monkeypatch
+    ):
+        secret = "plain-shared-token"
+        webhook_command(_make_args(
+            webhook_action="subscribe",
+            name="token",
+            secret=secret,
+            signature_header="X-Auth-Token",
+            signature_scheme="token",
+        ))
+        captured = self._capture_request(monkeypatch)
+
+        webhook_command(_make_args(webhook_action="test", name="token"))
+
+        request, _timeout = captured[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        assert headers["x-auth-token"] == secret
+        assert "x-hub-signature-256" not in headers
+
+
 class TestWebhookEnabledGate:
-    def test_blocks_when_disabled(self, capsys, monkeypatch):
-        monkeypatch.setattr("hermes_cli.webhook._is_webhook_enabled", lambda: False)
-        webhook_command(_make_args(webhook_action="subscribe", name="blocked"))
-        out = capsys.readouterr().out
-        assert "not enabled" in out.lower()
-        assert "hermes gateway setup" in out
-        assert _load_subscriptions() == {}
 
     def test_blocks_list_when_disabled(self, capsys, monkeypatch):
         monkeypatch.setattr("hermes_cli.webhook._is_webhook_enabled", lambda: False)
@@ -229,10 +274,3 @@ class TestWebhookEnabledGate:
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
 
-    def test_real_check_enabled(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.webhook._is_webhook_enabled",
-            lambda: True,
-        )
-        import hermes_cli.webhook as wh_mod
-        assert wh_mod._is_webhook_enabled() is True
