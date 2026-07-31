@@ -4,7 +4,7 @@ import json
 import sys
 import types
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -349,6 +349,57 @@ class TestTeamsSend:
         assert result.success is True
         assert result.message_id == "msg-123"
         mock_app.send.assert_awaited_once_with("conv-id", "Hello")
+
+
+class TestTeamsExecApproval:
+    @pytest.mark.anyio
+    async def test_card_action_resolves_exact_approval(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        action = SimpleNamespace(data={
+            "hermes_action": "approve_once",
+            "session_key": "session-1",
+            "approval_id": "approval-1",
+        })
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(id="user-1", aad_object_id="aad-1"),
+            )
+        )
+
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+            response = await adapter._on_card_action(ctx)
+
+        resolve.assert_called_once_with(
+            "session-1", "once", approval_id="approval-1"
+        )
+        assert response.status == 200
+
+    @pytest.mark.anyio
+    async def test_card_action_without_approval_id_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("TEAMS_ALLOW_ALL_USERS", "true")
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+        action = SimpleNamespace(data={
+            "hermes_action": "approve_once",
+            "session_key": "session-1",
+        })
+        ctx = SimpleNamespace(
+            activity=SimpleNamespace(
+                value=SimpleNamespace(action=action),
+                from_=SimpleNamespace(id="user-1", aad_object_id="aad-1"),
+            )
+        )
+
+        with patch("tools.approval.resolve_gateway_approval") as resolve:
+            response = await adapter._on_card_action(ctx)
+
+        resolve.assert_not_called()
+        assert response.status == 200
 
 
 def _make_summary_payload():
@@ -712,5 +763,4 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
 

@@ -87,7 +87,11 @@ def _event(
 async def test_exec_approval_renders_full_option_set():
     adapter, stub = _adapter()
     result = await adapter.send_exec_approval(
-        "c1", "rm -rf /tmp/x", "sess:1", description="deletes files"
+        "c1",
+        "rm -rf /tmp/x",
+        "sess:1",
+        description="deletes files",
+        approval_id="approval-1",
     )
     assert result.success is True
     assert result.message_id == "pm1"
@@ -109,12 +113,23 @@ async def test_exec_approval_renders_full_option_set():
 async def test_exec_approval_smart_denied_and_flag_gating():
     adapter, stub = _adapter()
     await adapter.send_exec_approval(
-        "c1", "cmd", "s", smart_denied=True, allow_permanent=True, allow_session=True
+        "c1",
+        "cmd",
+        "s",
+        smart_denied=True,
+        allow_permanent=True,
+        allow_session=True,
+        approval_id="approval-1",
     )
     ids = [o["id"] for o in stub.sent[-1]["options"]]
     assert ids == ["once", "deny"]  # smart-deny: no session/always
     await adapter.send_exec_approval(
-        "c1", "cmd", "s", allow_session=True, allow_permanent=False
+        "c1",
+        "cmd",
+        "s",
+        allow_session=True,
+        allow_permanent=False,
+        approval_id="approval-2",
     )
     ids = [o["id"] for o in stub.sent[-1]["options"]]
     assert ids == ["once", "session", "deny"]
@@ -255,5 +270,4 @@ async def test_processing_lifecycle_reacts_eyes_then_check():
         ("✅", False),
     ]
     assert all(r["message_id"] == "m42" and r["chat_id"] == "ch1" for r in reacts)
-
 

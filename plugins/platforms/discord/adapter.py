@@ -6793,6 +6793,8 @@ class DiscordAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -6862,6 +6864,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             view = ExecApprovalView(
                 session_key=session_key,
+                approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
                 require_admin=require_admin,
@@ -8134,9 +8137,12 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            *,
+            approval_id: str,
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
+            self.approval_id = approval_id
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             # Opt-in admin gate for exec approval (default off → user-scope,
@@ -8210,7 +8216,11 @@ def _define_discord_view_classes() -> None:
             # must not claim "Approved" — the command was already denied.
             try:
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                count = resolve_gateway_approval(
+                    self.session_key,
+                    choice,
+                    approval_id=self.approval_id,
+                )
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

@@ -104,6 +104,7 @@ def test_component_check_explicit_allow_all_passes(monkeypatch, env_name, env_va
 def test_exec_approval_view_accepts_role_allowlist():
     view = ExecApprovalView(
         session_key="sess-1",
+        approval_id="approval-1",
         allowed_user_ids={"11111"},
         allowed_role_ids={42},
     )
@@ -153,7 +154,9 @@ def test_clarify_choice_view_accepts_role_allowlist():
 @pytest.mark.parametrize(
     "view_factory",
     [
-        lambda: ExecApprovalView(session_key="s", allowed_user_ids=set()),
+        lambda: ExecApprovalView(
+            session_key="s", approval_id="approval-1", allowed_user_ids=set()
+        ),
         lambda: SlashConfirmView(session_key="s", confirm_id="c", allowed_user_ids=set()),
         lambda: UpdatePromptView(session_key="s", allowed_user_ids=set()),
         lambda: ClarifyChoiceView(
@@ -193,7 +196,9 @@ def test_model_picker_view_empty_allowlists_reject_by_default(monkeypatch):
 
 def test_view_empty_allowlists_allow_with_explicit_allow_all(monkeypatch):
     monkeypatch.setenv("DISCORD_ALLOW_ALL_USERS", "true")
-    view = ExecApprovalView(session_key="s", allowed_user_ids=set())
+    view = ExecApprovalView(
+        session_key="s", approval_id="approval-1", allowed_user_ids=set()
+    )
     assert view._check_auth(_interaction(99999)) is True
 
 
@@ -244,6 +249,7 @@ def test_exec_view_gate_on_non_admin_rejected():
     """Gate on: admitted user who is NOT an admin is rejected at the button."""
     view = ExecApprovalView(
         session_key="s",
+        approval_id="approval-1",
         allowed_user_ids={"11111", "22222"},
         require_admin=True,
         admin_user_ids={"11111"},
@@ -258,6 +264,7 @@ def test_exec_view_gate_on_no_admins_fails_closed(caplog):
 
     view = ExecApprovalView(
         session_key="s",
+        approval_id="approval-1",
         allowed_user_ids={"11111"},
         require_admin=True,
         admin_user_ids=set(),
@@ -277,4 +284,3 @@ def test_other_views_not_admin_gated():
         session_key="s", confirm_id="c", allowed_user_ids={"11111"}
     )
     assert sc._check_auth(_interaction(11111)) is True
-

@@ -104,6 +104,7 @@ class TestFeishuExecApproval:
                 command="rm -rf /important",
                 session_key="agent:main:feishu:group:oc_12345",
                 description="dangerous deletion",
+                approval_id="approval-1",
             )
 
         assert result.success is True
@@ -144,11 +145,13 @@ class TestFeishuExecApproval:
                 chat_id="oc_12345",
                 command="echo test",
                 session_key="my-session-key",
+                approval_id="approval-2",
             )
 
         assert len(adapter._approval_state) == 1
         approval_id = list(adapter._approval_state.keys())[0]
         state = adapter._approval_state[approval_id]
+        assert state["backend_approval_id"] == "approval-2"
         assert state["session_key"] == "my-session-key"
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
@@ -208,6 +211,7 @@ class TestResolveApproval:
     async def test_resolves_once(self):
         adapter = _make_adapter()
         adapter._approval_state[1] = {
+            "backend_approval_id": "approval-1",
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
             "chat_id": "oc_12345",
@@ -216,7 +220,11 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345",
+            "once",
+            approval_id="approval-1",
+        )
         assert 1 not in adapter._approval_state
 
 
@@ -225,6 +233,7 @@ class TestResolveApproval:
         adapter = _make_adapter()
         adapter._admins = {"ou_admin"}
         adapter._approval_state[5] = {
+            "backend_approval_id": "approval-5",
             "session_key": "sess-5",
             "message_id": "msg_005",
             "chat_id": "oc_12345",
@@ -311,6 +320,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_bob"}
         adapter._approval_state[1] = {
+            "backend_approval_id": "approval-1",
             "session_key": "sess-1",
             "message_id": "msg-1",
             "chat_id": "oc_12345",
@@ -339,6 +349,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_expired"}
         adapter._approval_state[4] = {
+            "backend_approval_id": "approval-4",
             "session_key": "sess-4",
             "message_id": "msg-4",
             "chat_id": "oc_12345",
@@ -362,6 +373,7 @@ class TestCardActionCallbackResponse:
         adapter._loop.is_closed = MagicMock(return_value=False)
         adapter._allowed_group_users = {"ou_allowed"}
         adapter._approval_state[5] = {
+            "backend_approval_id": "approval-5",
             "session_key": "sess-5",
             "message_id": "msg-5",
             "chat_id": "oc_12345",
@@ -445,5 +457,3 @@ class TestResolveUpdatePrompt:
 
         assert (tmp_path / ".hermes" / ".update_response").read_text() == "y"
         assert 1 not in adapter._update_prompt_state
-
-

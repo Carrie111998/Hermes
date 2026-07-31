@@ -20,7 +20,7 @@ This module provides:
 
 ``button_data`` formats::
 
-    approve:<session_key>:<decision>      # decision = allow-once|allow-always|deny
+    approve:<button_id>:<decision>        # decision = allow-once|allow-always|deny
     update_prompt:<answer>                # answer = y|n
 
 Ported from WideLee's qqbot-agent-sdk v1.2.2 (``approval.py`` + ``dto.py``
@@ -41,11 +41,9 @@ logger = logging.getLogger(__name__)
 APPROVAL_BUTTON_PREFIX = "approve:"
 UPDATE_PROMPT_PREFIX = "update_prompt:"
 
-# Pattern: approve:<session_key>:<decision>
-# session_key may itself contain colons (e.g. agent:main:qqbot:c2c:OPENID),
-# so the session_key group is greedy but trails the decision.
+# Pattern: approve:<button_id>:<decision>
 _APPROVAL_DATA_RE = re.compile(
-    r"^approve:(.+):(allow-once|allow-always|deny)$"
+    r"^approve:([^:]+):(allow-once|allow-always|deny)$"
 )
 
 # Pattern: update_prompt:y | update_prompt:n
@@ -159,11 +157,11 @@ class InlineKeyboard:
 # ── INTERACTION_CREATE parsing ───────────────────────────────────────
 
 def parse_approval_button_data(button_data: str) -> Optional[tuple[str, str]]:
-    """Parse approval ``button_data`` into ``(session_key, decision)``.
+    """Parse approval data into ``(button_id, decision)``.
 
     :param button_data: Raw ``data.resolved.button_data`` from
         ``INTERACTION_CREATE``.
-    :returns: ``(session_key, decision)`` or ``None`` if not an approval button.
+    :returns: Correlated button fields or ``None`` if not an approval button.
     """
     m = _APPROVAL_DATA_RE.match(button_data or "")
     if not m:
@@ -201,31 +199,36 @@ def _make_callback_button(
     )
 
 
-def build_approval_keyboard(session_key: str, *, allow_permanent: bool = True) -> InlineKeyboard:
+def build_approval_keyboard(
+    button_id: str,
+    *,
+    allow_permanent: bool = True,
+) -> InlineKeyboard:
     """Build the approval keyboard, hiding persistent scope when unavailable.
 
     Layout: ``[✅ 允许一次] [⭐ 始终允许] [❌ 拒绝]`` — all three share
     ``group_id='approval'`` so clicking one greys out the rest.
 
-    :param session_key: Embedded into ``button_data`` so the decision
-        routes back to the right pending approval.
+    :param button_id: Short opaque token retained by the adapter so the
+        decision routes to the exact pending approval without embedding the
+        session key or backend approval id in the callback payload.
     """
     buttons = [
         _make_callback_button(
             btn_id="allow", label="✅ 允许一次", visited_label="已允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-once",
+            data=f"{APPROVAL_BUTTON_PREFIX}{button_id}:allow-once",
             style=1, group_id="approval",
         )
     ]
     if allow_permanent:
         buttons.append(_make_callback_button(
             btn_id="always", label="⭐ 始终允许", visited_label="已始终允许",
-            data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:allow-always",
+            data=f"{APPROVAL_BUTTON_PREFIX}{button_id}:allow-always",
             style=1, group_id="approval",
         ))
     buttons.append(_make_callback_button(
         btn_id="deny", label="❌ 拒绝", visited_label="已拒绝",
-        data=f"{APPROVAL_BUTTON_PREFIX}{session_key}:deny",
+        data=f"{APPROVAL_BUTTON_PREFIX}{button_id}:deny",
         style=0, group_id="approval",
     ))
     return InlineKeyboard(content=KeyboardContent(rows=[KeyboardRow(buttons=buttons)]))
@@ -276,6 +279,7 @@ class ApprovalRequest:
     """
     session_key: str
     title: str
+    button_id: str = ""
     description: str = ""
     command_preview: str = ""
     cwd: str = ""
@@ -368,7 +372,7 @@ class ApprovalSender:
         :returns: ``True`` on success, ``False`` on failure.
         """
         text = build_approval_text(req)
-        keyboard = build_approval_keyboard(req.session_key)
+        keyboard = build_approval_keyboard(req.button_id)
 
         logger.info(
             "[%s] Sending approval request to %s:%s (session=%.20s…)",

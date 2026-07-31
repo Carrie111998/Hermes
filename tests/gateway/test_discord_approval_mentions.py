@@ -43,6 +43,7 @@ async def test_exec_approval_mentions_allowed_users_when_enabled(monkeypatch):
         command="make check",
         session_key="session-1",
         description="dangerous command",
+        approval_id="approval-1",
     )
 
     assert result.success is True
@@ -79,5 +80,4 @@ def test_yaml_config_seeds_websocket_health_with_primary_precedence(monkeypatch)
         "websocket_heartbeat_ack_max_age_seconds": 75,
         "websocket_max_latency_seconds": 30,
     }
-
 

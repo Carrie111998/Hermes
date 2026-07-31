@@ -93,6 +93,7 @@ class TestTelegramExecApproval:
             command="rm -rf /important",
             session_key="agent:main:telegram:group:12345:99",
             description="dangerous deletion",
+            approval_id="approval-1",
         )
 
         assert result.success is True
@@ -122,6 +123,7 @@ class TestTelegramExecApproval:
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
             allow_permanent=False,
+            approval_id="approval-1",
         )
 
         assert buttons == ["✅ Allow Once", "✅ Session", "❌ Deny"]
@@ -143,6 +145,7 @@ class TestTelegramExecApproval:
 
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
+            approval_id="approval-1",
         )
 
         assert captured_rows == [
@@ -169,6 +172,7 @@ class TestTelegramExecApproval:
         await adapter.send_exec_approval(
             chat_id="12345", command="curl example.test", session_key="s",
             allow_permanent=False, smart_denied=True,
+            approval_id="approval-1",
         )
 
         assert captured_rows == [
@@ -215,7 +219,10 @@ class TestTelegramApprovalCallback:
         rest of a long-running turn after a button click.
         """
         adapter = _make_adapter()
-        adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state[5] = (
+            "agent:main:telegram:group:12345:99",
+            "approval-5",
+        )
         adapter.pause_typing_for_chat("12345")
         assert "12345" in adapter._typing_paused
 
@@ -234,16 +241,24 @@ class TestTelegramApprovalCallback:
         context = MagicMock()
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
-            with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
                 await adapter._handle_callback_query(update, context)
 
+        resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99",
+            "once",
+            approval_id="approval-5",
+        )
         assert "12345" not in adapter._typing_paused
 
 
     @pytest.mark.asyncio
     async def test_approval_callback_escapes_dynamic_user_name(self):
         adapter = _make_adapter()
-        adapter._approval_state[3] = "agent:main:telegram:group:12345:99"
+        adapter._approval_state[3] = (
+            "agent:main:telegram:group:12345:99",
+            "approval-3",
+        )
 
         query = AsyncMock()
         query.data = "ea:once:3"
@@ -359,4 +374,3 @@ class TestTelegramApprovalCallback:
         assert runner.last_source is not None
         assert runner.last_source.platform == Platform.TELEGRAM
         assert runner.last_source.user_id == "222"
-

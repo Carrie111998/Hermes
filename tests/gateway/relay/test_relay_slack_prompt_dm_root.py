@@ -96,7 +96,12 @@ async def test_exec_approval_flat_mode_posts_at_dm_root():
     adapter, stub = _wire("D1", "dm", scope_id="T1")
     md = {"message_id": "1700000000.000100", "scope_id": "T1"}
     result = await adapter.send_exec_approval(
-        "D1", "rm -rf /tmp/x", "sess:1", description="deletes files", metadata=md
+        "D1",
+        "rm -rf /tmp/x",
+        "sess:1",
+        description="deletes files",
+        metadata=md,
+        approval_id="approval-1",
     )
     assert result.success is True
     frame = _last_prompt(stub)
@@ -127,7 +132,12 @@ async def test_exec_approval_forwards_run_py_thread_stamp_untouched():
         "scope_id": "T1",
     }
     result = await adapter.send_exec_approval(
-        "D1", "rm -rf /tmp/x", "sess:1", description="deletes files", metadata=md
+        "D1",
+        "rm -rf /tmp/x",
+        "sess:1",
+        description="deletes files",
+        metadata=md,
+        approval_id="approval-1",
     )
     assert result.success is True
     frame = _last_prompt(stub)
@@ -182,7 +192,9 @@ async def test_exec_approval_in_real_thread_keeps_thread_id():
         "message_id": "1700000000.000100",
         "scope_id": "T1",
     }
-    await adapter.send_exec_approval("D1", "cmd", "s", metadata=md)
+    await adapter.send_exec_approval(
+        "D1", "cmd", "s", metadata=md, approval_id="approval-1"
+    )
     frame = _last_prompt(stub)
     assert frame["metadata"]["thread_id"] == "1699000000.999000"
 
@@ -196,7 +208,9 @@ async def test_channel_approval_keeps_thread_id():
         "message_id": "1700000000.000400",
         "scope_id": "T1",
     }
-    await adapter.send_exec_approval("C1", "cmd", "s", metadata=md)
+    await adapter.send_exec_approval(
+        "C1", "cmd", "s", metadata=md, approval_id="approval-1"
+    )
     frame = _last_prompt(stub)
     assert frame["metadata"]["thread_id"] == "1700000000.000400"
 
@@ -207,7 +221,9 @@ async def test_non_slack_dm_approval_keeps_thread_id():
     threading semantics)."""
     adapter, stub = _wire("dc1", "dm", platform=Platform.DISCORD)
     md = {"thread_id": "9000", "message_id": "9000"}
-    await adapter.send_exec_approval("dc1", "cmd", "s", metadata=md)
+    await adapter.send_exec_approval(
+        "dc1", "cmd", "s", metadata=md, approval_id="approval-1"
+    )
     frame = _last_prompt(stub)
     assert frame["metadata"]["thread_id"] == "9000"
 

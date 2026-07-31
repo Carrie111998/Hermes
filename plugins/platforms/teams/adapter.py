@@ -1008,14 +1008,15 @@ class TeamsAdapter(BasePlatformAdapter):
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
         """Handle an Adaptive Card Action.Execute button click."""
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        from tools.approval import resolve_gateway_approval
 
         action = ctx.activity.value.action
         data = action.data or {}
         hermes_action = data.get("hermes_action", "")
         session_key = data.get("session_key", "")
+        approval_id = str(data.get("approval_id") or "")
 
-        if not hermes_action or not session_key:
+        if not hermes_action or not session_key or not approval_id:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
@@ -1064,7 +1065,12 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
-        if not has_blocking_approval(session_key):
+        resolved = resolve_gateway_approval(
+            session_key,
+            choice,
+            approval_id=approval_id,
+        )
+        if not resolved:
             return InvokeResponse(
                 status=200,
                 body=AdaptiveCardActionCardResponse(
@@ -1073,8 +1079,6 @@ class TeamsAdapter(BasePlatformAdapter):
                     .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
                 ),
             )
-
-        resolve_gateway_approval(session_key, choice)
 
         label_map = {
             "once": "✅ Allowed (once)",
@@ -1109,6 +1113,8 @@ class TeamsAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """Send an Adaptive Card approval prompt with Allow/Deny buttons."""
         if not self._app:
@@ -1117,6 +1123,7 @@ class TeamsAdapter(BasePlatformAdapter):
         cmd_preview = command[:2000] + "..." if len(command) > 2000 else command
         # Truncated for button data payload — just enough to reconstruct the card body.
         btn_data_base = {
+            "approval_id": approval_id,
             "session_key": session_key,
             "cmd": command[:200] + "..." if len(command) > 200 else command,
             "desc": description,

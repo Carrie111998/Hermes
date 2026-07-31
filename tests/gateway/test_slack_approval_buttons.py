@@ -1,6 +1,7 @@
 """Tests for Slack Block Kit approval buttons and thread context fetching."""
 
 import asyncio
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -95,6 +96,7 @@ class TestSlackExecApproval:
             command="rm -rf /important",
             session_key="agent:main:slack:group:C1:1111",
             description="dangerous deletion",
+            approval_id="approval-1",
         )
 
         assert result.success is True
@@ -117,9 +119,12 @@ class TestSlackExecApproval:
         assert "hermes_approve_session" in action_ids
         assert "hermes_approve_always" in action_ids
         assert "hermes_deny" in action_ids
-        # Each button carries the session key as value
+        # Each button carries the exact request identity.
         for e in elements:
-            assert e["value"] == "agent:main:slack:group:C1:1111"
+            assert json.loads(e["value"]) == {
+                "session_key": "agent:main:slack:group:C1:1111",
+                "approval_id": "approval-1",
+            }
 
     @pytest.mark.asyncio
     async def test_smart_deny_owner_override_hides_persistent_buttons(self):
@@ -130,6 +135,7 @@ class TestSlackExecApproval:
         await adapter.send_exec_approval(
             chat_id="C1", command="rm -rf /", session_key="s",
             allow_permanent=False, smart_denied=True,
+            approval_id="approval-1",
         )
 
         kwargs = mock_client.chat_postMessage.call_args.kwargs
@@ -167,14 +173,22 @@ class TestSlackApprovalAction:
             "channel": {"id": "C1"},
             "user": {"name": "alice", "id": "U_ALICE"},
         }
-        action = {"action_id": "hermes_approve_once", "value": "session-key"}
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": json.dumps(
+                {"session_key": "session-key", "approval_id": "approval-1"}
+            ),
+        }
 
         mock_client = adapter._team_clients["T1"]
         mock_client.chat_update = AsyncMock()
 
-        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+        with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
             await adapter._handle_approval_action(ack, body, action)
 
+        resolve.assert_called_once_with(
+            "session-key", "once", approval_id="approval-1"
+        )
         update_kwargs = mock_client.chat_update.call_args[1]
         section_text = update_kwargs["blocks"][0]["text"]["text"]
         assert len(section_text) <= 3000
@@ -196,7 +210,12 @@ class TestSlackApprovalAction:
         }
         action = {
             "action_id": "hermes_approve_once",
-            "value": "agent:main:slack:group:C1:1111",
+            "value": json.dumps(
+                {
+                    "session_key": "agent:main:slack:group:C1:1111",
+                    "approval_id": "approval-1",
+                }
+            ),
         }
 
         with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
@@ -840,4 +859,3 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
-

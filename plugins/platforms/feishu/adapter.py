@@ -2013,6 +2013,8 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """Send an interactive card with approval buttons.
 
@@ -2024,14 +2026,14 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            approval_id = next(self._approval_counter)
+            button_id = next(self._approval_counter)
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": label},
                     "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                    "value": {"hermes_action": action_name, "approval_id": button_id},
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
@@ -2069,7 +2071,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_exec_approval failed")
             if result.success:
-                self._approval_state[approval_id] = {
+                self._approval_state[button_id] = {
+                    "backend_approval_id": approval_id,
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
@@ -2873,7 +2876,11 @@ class FeishuAdapter(BasePlatformAdapter):
             return
         try:
             from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            count = resolve_gateway_approval(
+                state["session_key"],
+                choice,
+                approval_id=state["backend_approval_id"],
+            )
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,

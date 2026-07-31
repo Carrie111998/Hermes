@@ -160,6 +160,7 @@ class QQAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
     _TYPING_INPUT_SECONDS = 60  # input_notify duration reported to QQ
     _TYPING_DEBOUNCE_SECONDS = 50  # refresh before it expires
+    _APPROVAL_STATE_CACHE_SIZE = 1000
 
     @property
     def _log_tag(self) -> str:
@@ -232,6 +233,7 @@ class QQAdapter(BasePlatformAdapter):
         # Request/response correlation
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._seen_messages: Dict[str, float] = {}
+        self._exec_approval_state: Dict[str, Tuple[str, str]] = {}
 
         # Last inbound message ID per chat — used by send_typing
         self._last_msg_id: Dict[str, str] = {}
@@ -1120,7 +1122,7 @@ class QQAdapter(BasePlatformAdapter):
     ) -> None:
         """Route ``INTERACTION_CREATE`` button clicks to the right subsystem.
 
-        - ``approve:<session_key>:<decision>`` →
+        - ``approve:<button_id>:<decision>`` →
           :func:`tools.approval.resolve_gateway_approval`
           (unblocks the agent thread waiting on a dangerous-command approval).
         - ``update_prompt:<answer>`` →
@@ -1139,7 +1141,16 @@ class QQAdapter(BasePlatformAdapter):
 
         approval = parse_approval_button_data(button_data)
         if approval is not None:
-            session_key, decision = approval
+            button_id, decision = approval
+            approval_state = self._exec_approval_state.get(button_id)
+            if approval_state is None:
+                logger.info(
+                    "[%s] Ignored stale approval button %s",
+                    self._log_tag,
+                    button_id,
+                )
+                return
+            session_key, approval_id = approval_state
             choice = self._APPROVAL_BUTTON_TO_CHOICE.get(decision)
             if choice is None:
                 logger.warning(
@@ -1154,11 +1165,19 @@ class QQAdapter(BasePlatformAdapter):
                     self._log_tag, session_key, event.operator_openid,
                 )
                 return
+            approval_state = self._exec_approval_state.pop(button_id, None)
+            if approval_state is None:
+                return
+            session_key, approval_id = approval_state
             try:
                 # Import lazily to keep the adapter importable in tests that
                 # don't exercise the approval subsystem.
                 from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(session_key, choice)
+                count = resolve_gateway_approval(
+                    session_key,
+                    choice,
+                    approval_id=approval_id,
+                )
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s "
                     "(choice=%s, operator=%s)",
@@ -2656,7 +2675,7 @@ class QQAdapter(BasePlatformAdapter):
             chat_id,
             build_approval_text(req),
             build_approval_keyboard(
-                req.session_key,
+                req.button_id,
                 allow_permanent=getattr(req, "allow_permanent", True),
             ),
             reply_to=reply_to,
@@ -2681,6 +2700,8 @@ class QQAdapter(BasePlatformAdapter):
         allow_permanent: bool = True,
         allow_session: bool = True,
         smart_denied: bool = False,
+        *,
+        approval_id: str,
     ) -> SendResult:
         """Send a button-based exec-approval prompt for a dangerous command.
 
@@ -2698,18 +2719,25 @@ class QQAdapter(BasePlatformAdapter):
         # QQ requires a msg_id on outbound messages to a user we've never
         # seen; the last inbound msg_id is the natural choice.
         msg_id = self._last_msg_id.get(chat_id)
+        button_id = uuid.uuid4().hex[:12]
 
         req = ApprovalRequest(
             session_key=session_key,
+            button_id=button_id,
             title="Execute this command?",
             description=description,
             command_preview=command,
             timeout_sec=self._APPROVAL_TIMEOUT_SECONDS,
             allow_permanent=allow_permanent and not smart_denied,
         )
-        return await self.send_approval_request(
+        result = await self.send_approval_request(
             chat_id, req, reply_to=msg_id,
         )
+        if result.success:
+            self._exec_approval_state[button_id] = (session_key, approval_id)
+            while len(self._exec_approval_state) > self._APPROVAL_STATE_CACHE_SIZE:
+                self._exec_approval_state.pop(next(iter(self._exec_approval_state)))
+        return result
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # matches gateway's default gateway_timeout
 
