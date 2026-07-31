@@ -2,7 +2,7 @@
   "$comment": "GENERATED — do not hand-edit. Regenerate with hermes-agent scripts/generate_conformance_vectors.py; the native renderers are the oracle (executable spec).",
   "oracle": {
     "repo": "NousResearch/hermes-agent",
-    "commit": "40eebc7d70f3d8e95c429c8aa482f31ba6c867f6",
+    "commit": "1a38d5c9151ace11f22e52b447cc87bbb341d7af",
     "generator": "scripts/generate_conformance_vectors.py",
     "generator_version": 1
   },
@@ -139,7 +139,7 @@
       "category": "grid",
       "expect": "divergent",
       "input": "| name | value |\n|------|-------|\n| a    | 1     |\n| b    | 2     |",
-      "native_output": "**a**\n• value: 1\n\n**b**\n• value: 2",
+      "native_output": "```\n┌──────┬───────┐\n│ name │ value │\n├──────┼───────┤\n│ a    │ 1     │\n│ b    │ 2     │\n└──────┴───────┘\n```",
       "note": "native converts GFM tables to bullet groups; connector passes raw markdown through (port deferred — parity report Phase 4/oracle section)"
     },
     {
@@ -245,7 +245,7 @@
       "category": "scar",
       "expect": "divergent",
       "input": "| 名前 | 値 |\n|------|----|\n| 中文 | 42 |\n| b    | 2  |",
-      "native_output": "**中文**\n• 値: 42\n\n**b**\n• 値: 2",
+      "native_output": "```\n┌──────┬─────┐\n│ 名前 │ 値  │\n├──────┼─────┤\n│ 中文 │ 42  │\n│ b    │ 2   │\n└──────┴─────┘\n```",
       "note": "same as table-simple"
     },
     {
