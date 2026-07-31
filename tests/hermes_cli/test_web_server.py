@@ -257,17 +257,77 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_dashboard_remote_access_returns_resolved_public_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: "https://hermes.example.com/agent",
+        )
 
+        resp = self.client.get("/api/dashboard/remote-access")
 
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "public_url": "https://hermes.example.com/agent",
+        }
 
+    def test_dashboard_remote_access_reads_public_url_from_config(self, monkeypatch):
+        """Real path — no resolve_public_url monkeypatch: write
+        dashboard.public_url into the isolated HERMES_HOME's config.yaml and
+        assert the endpoint returns it through real config loading."""
+        from hermes_constants import get_hermes_home
+
+        monkeypatch.delenv("HERMES_DASHBOARD_PUBLIC_URL", raising=False)
+        config_path = get_hermes_home() / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"dashboard": {"public_url": "https://hermes.example.com/agent"}}),
+            encoding="utf-8",
+        )
+
+        resp = self.client.get("/api/dashboard/remote-access")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "public_url": "https://hermes.example.com/agent",
+        }
+
+    def test_dashboard_remote_access_is_not_public(self):
+        from starlette.testclient import TestClient
+
+        from hermes_cli.web_server import app
+
+        with TestClient(app) as unauthenticated:
+            resp = unauthenticated.get("/api/dashboard/remote-access")
+
+        assert resp.status_code == 401
+
+    def test_dashboard_remote_access_scopes_named_profile(self, monkeypatch, tmp_path):
+        import hermes_cli.web_server as web_server
+        from hermes_constants import get_hermes_home
+
+        worker_home = tmp_path / "worker"
+        worker_home.mkdir()
+        monkeypatch.setattr(
+            web_server,
+            "_resolve_profile_dir",
+            lambda name: worker_home if name == "worker" else None,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+            lambda: f"https://{get_hermes_home().name}.example.com",
+        )
+
+        resp = self.client.get("/api/dashboard/remote-access?profile=worker")
+
+        assert resp.status_code == 200
+        assert resp.json() == {"public_url": "https://worker.example.com"}
 
     def test_messaging_platforms_profile_scopes_gateway_reads(self, monkeypatch):
         """?profile=<name> must resolve liveness from the profile's own home.
 
         The gateway status readers resolve process-level paths and ignore the
         HERMES_HOME contextvar override (#56986), so /api/messaging/platforms
-        has to pass the profile directory explicitly — otherwise it reports a
-        DIFFERENT profile's gateway as this profile's, which hides a real
+        has to pass the profile directory explicitly. Otherwise it reports a
+        different profile's gateway as this profile's, which hides a real
         outage behind a false "connected" (issue #71211).
         """
         import hermes_cli.web_server as web_server
@@ -3516,5 +3576,4 @@ class TestDashboardComponentHealth:
         assert self.ws.DASHBOARD_HEALTH.selftest_status == "failing"
         assert self.ws.DASHBOARD_HEALTH.selftest_http_status == 500
         assert self.ws.DASHBOARD_HEALTH.snapshot()["status"] == "degraded"
-
 

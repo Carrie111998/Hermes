@@ -1118,6 +1118,10 @@ export interface StatusResponse {
   version: string
 }
 
+export interface DashboardRemoteAccessResponse {
+  public_url: string
+}
+
 export interface ActionResponse {
   name: string
   ok: boolean

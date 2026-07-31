@@ -1616,6 +1616,16 @@ export interface Translations {
       hideTabBar: string
       openInNewTab: string
       openInSplit: string
+      continueOnPhone: string
+      continueOnPhoneTitle: string
+      continueOnPhoneDesc: string
+      continueOnPhonePreparing: string
+      continueOnPhoneQrAlt: string
+      continueOnPhoneUnavailableTitle: string
+      continueOnPhoneUnavailableDesc: string
+      continueOnPhoneCopyLink: string
+      continueOnPhoneOpenBrowser: string
+      continueOnPhoneOpenFailed: string
       copyIdFailed: string
       sessionActions: string
       sessionRunning: string
