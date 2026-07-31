@@ -11111,14 +11111,29 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     the user's install stays broken no matter how many times they update
     (ryanc's incident, July 2026).
 
+    On Termux (Android) Hermes runs from the system Python with packages
+    installed system-wide rather than inside a project venv.  In that case
+    the health check probes the interpreter that is actually executing
+    Hermes (``sys.executable``) instead of the project venv, avoiding the
+    false-negative "Venv still unhealthy" loop reported in #75148.
+
     Returns ``(healthy, detail)``. Never raises; unknown states report
     healthy so a probe failure can't force needless reinstalls.
     """
+    is_termux = bool(
+        os.environ.get("TERMUX_VERSION") or "com.termux/files/usr" in os.environ.get("PREFIX", "")
+    )
+
     venv_dir = PROJECT_ROOT / "venv"
     python_name = "python.exe" if _is_windows() else "python"
     bin_dir = "Scripts" if _is_windows() else "bin"
     venv_python = venv_dir / bin_dir / python_name
-    if not venv_python.exists():
+
+    # On Termux the packages live in the system Python, not the project
+    # venv.  Probe the interpreter that is actually executing Hermes.
+    if is_termux:
+        probe_python = sys.executable
+    elif not venv_python.exists():
         # No venv interpreter at all. In a dev checkout that's normal (the
         # dev may run hermes from any interpreter), so report healthy to
         # avoid forcing reinstalls. But on a MANAGED install (the Windows
@@ -11134,6 +11149,8 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
         if any(m.exists() for m in managed_markers):
             return False, f"venv python missing ({venv_python})"
         return True, ""
+    else:
+        probe_python = str(venv_python)
 
     # Core web/serve imports plus their newest transitive deps. Import (not
     # just metadata) — a package can have intact dist-info but a missing
@@ -11149,7 +11166,7 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     )
     try:
         result = subprocess.run(
-            [str(venv_python), "-c", check],
+            [probe_python, "-c", check],
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=60,

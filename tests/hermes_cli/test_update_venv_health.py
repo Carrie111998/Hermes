@@ -119,6 +119,70 @@ def test_venv_health_probe_failure_reports_healthy(tmp_path):
     assert healthy is True
 
 
+def test_venv_health_termux_uses_sys_executable(tmp_path):
+    """On Termux the health check must probe sys.executable (system Python)
+    instead of the project venv, since packages are installed system-wide
+    and the venv may be absent or empty (#75148)."""
+    _fake_venv_python(tmp_path)
+
+    fake = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        cli_main.sys, "executable", "/data/data/com.termux/files/usr/bin/python"
+    ) as patched_exec, patch.dict(cli_main.os.environ, {"TERMUX_VERSION": "0.118.0"}, clear=False), patch.object(
+        cli_main.subprocess, "run", return_value=fake
+    ) as mock_run:
+        healthy, detail = cli_main._venv_core_imports_healthy()
+
+    # Must have probed sys.executable, not venv_python
+    assert healthy is True
+    call_args = mock_run.call_args[0][0]
+    assert call_args[0] == patched_exec
+
+
+def test_venv_health_termux_reports_missing_imports_via_sys_executable(tmp_path):
+    """On Termux, a genuinely broken import should still be reported, but
+    probed via sys.executable."""
+    _fake_venv_python(tmp_path)
+
+    fake = SimpleNamespace(
+        returncode=0,
+        stdout="fastapi: No module named 'fastapi'\\n",
+        stderr="",
+    )
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        cli_main.sys, "executable", "/data/data/com.termux/files/usr/bin/python"
+    ) as patched_exec, patch.dict(cli_main.os.environ, {"TERMUX_VERSION": "0.118.0"}, clear=False), patch.object(
+        cli_main.subprocess, "run", return_value=fake
+    ) as mock_run:
+        healthy, detail = cli_main._venv_core_imports_healthy()
+
+    assert healthy is False
+    assert "fastapi" in detail
+    call_args = mock_run.call_args[0][0]
+    assert call_args[0] == patched_exec
+
+
+def test_venv_health_non_termux_uses_venv_python(tmp_path):
+    """On non-Termux systems the health check must still probe the project
+    venv python, not sys.executable."""
+    _fake_venv_python(tmp_path)
+
+    fake = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    venv_python_path = str(tmp_path / "venv" / "bin" / "python")
+
+    with patch.object(cli_main, "PROJECT_ROOT", tmp_path), patch.object(
+        cli_main.subprocess, "run", return_value=fake
+    ) as mock_run:
+        healthy, detail = cli_main._venv_core_imports_healthy()
+
+    assert healthy is True
+    call_args = mock_run.call_args[0][0]
+    assert call_args[0] == venv_python_path
+
+
 # ---------------------------------------------------------------------------
 # _detect_venv_python_processes
 # ---------------------------------------------------------------------------
