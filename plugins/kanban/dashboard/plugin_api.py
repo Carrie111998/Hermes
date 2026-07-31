@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import time
 from dataclasses import asdict
@@ -116,18 +117,64 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
     return normed
 
 
-def _conn(board: Optional[str] = None):
-    """Open a kanban_db connection, creating the schema on first use.
+def _default_boardd_sock() -> str:
+    """Return the canonical boardd Unix socket path."""
+    return os.environ.get(
+        "BOARDD_SOCK",
+        os.path.join(
+            os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")),
+            "kanban", "boardd-run", "boardd.sock",
+        ),
+    )
 
-    Every handler that mutates the DB goes through this so the plugin
-    self-heals on a fresh install (no user-visible "no such table"
-    error if somebody hits POST /tasks before GET /board).
-    ``init_db`` is idempotent.
 
-    ``board`` is the query-param slug (already normalised by
-    :func:`_resolve_board`). When ``None`` the active board is used
-    via the resolution chain (env var → ``current`` file → ``default``).
+def _boardd_active() -> bool:
+    """Check if boardd broker is available and should be used."""
+    sock_path = _default_boardd_sock()
+    if not os.path.exists(sock_path):
+        return False
+    try:
+        from hermes_cli.kb_client import Client
+
+        c = Client(sock_path=sock_path)
+        c.ping()
+        c.close()
+        return True
+    except Exception as exc:
+        raise RuntimeError(
+            f"boardd custody active but broker unreachable ({sock_path}): {exc}"
+        ) from exc
+
+
+def _conn(board: Optional[str] = None) -> Any:
+    """Open a kanban connection, routing through boardd when broker custody is active.
+
+    When boardd is active, all reads and mutations go through the broker
+    via ``hermes_cli.boardd_shim.BrokerConnection``. The shim's interactive
+    transaction support lets the existing ``kanban_db`` write helpers run
+    unchanged through the single writer.
+
+    In standalone mode (no broker socket), this keeps the previous behavior:
+    initialise the local DB and open a direct SQLite connection.
     """
+    if _boardd_active():
+        from hermes_cli.boardd_shim import BrokerConnection
+        from hermes_cli import kb_client
+
+        sock_path = _default_boardd_sock()
+        client = kb_client.Client(sock_path=sock_path)
+        # BrokerConnection resolves the client through kb_client.get_client(),
+        # so pin the current thread's client to the active broker socket.
+        old_client = getattr(kb_client._tl, "client", None)
+        if old_client is not None and old_client is not client:
+            try:
+                old_client.close()
+            except Exception:
+                pass
+        kb_client._tl.client = client
+        return BrokerConnection()
+
+    # Standalone path: direct SQLite on a writable local board.
     try:
         kanban_db.init_db(board=board)
     except Exception as exc:
