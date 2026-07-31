@@ -40,6 +40,7 @@ def _clean_queue_and_context(monkeypatch):
 
     for var in sc._VAR_MAP.values():
         var.set(sc._UNSET)
+    sc._SESSION_SOURCE_SNAPSHOT.set(sc._UNSET)
     sc._SESSION_ASYNC_DELIVERY.set(sc._UNSET)
     # set_current_session_id (invoked by the clobber-reproducing fake child
     # build) writes os.environ directly — scrub it so it can't leak into
@@ -97,8 +98,18 @@ def _patch_delegate(monkeypatch):
         # HERMES_SESSION_ID ContextVar + os.environ, clobbering the spawner's
         # id ~milliseconds before delegate_tool dispatches the batch.
         from gateway.session_context import set_current_session_id
+        import gateway.session_context as sc
 
         set_current_session_id("20260715_child1")
+        sc._SESSION_SOURCE_SNAPSHOT.set({
+            "platform": "api_server",
+            "chat_id": "child-route",
+            "chat_type": "dm",
+            "message_id": "om-child",
+            "profile": "other",
+        })
+        sc._SESSION_MESSAGE_ID.set("om-child")
+        sc._SESSION_PROFILE.set("other")
         return fake_child
 
     monkeypatch.setattr(dt, "_build_child_agent", clobbering_build_child)
@@ -118,6 +129,15 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
         chat_id="raw-sid-7",
         session_key="raw-sid-7",
         session_id="raw-sid-7",
+        message_id="om-parent",
+        profile="coder",
+        source_snapshot={
+            "platform": "api_server",
+            "chat_id": "raw-sid-7",
+            "chat_type": "dm",
+            "message_id": "om-parent",
+            "profile": "coder",
+        },
         async_delivery=False,
     )
 
@@ -138,6 +158,9 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
+    assert evt["origin_message_id"] == "om-parent"
+    assert evt["origin_source"]["chat_id"] == "raw-sid-7"
+    assert evt["origin_profile"] == "coder"
 
 
 # ---------------------------------------------------------------------------

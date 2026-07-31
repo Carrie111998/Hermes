@@ -13160,6 +13160,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         session_entry: SessionEntry,
         pinned_session_id: str,
+        origin_profile: str = "",
     ) -> Optional[SessionEntry]:
         """Resolve an async completion to its verified owning gateway session.
 
@@ -13192,6 +13193,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Async-delegation completion has unknown spawning session %s; "
                 "dropping injection (#55578 fail-closed).",
                 pinned_session_id,
+            )
+            return None
+
+        if origin_profile and not self._async_origin_profile_matches(
+            pinned_row, origin_profile
+        ):
+            logger.warning(
+                "Async-delegation spawning session %s belongs to profile %r, "
+                "not immutable origin profile %r; dropping injection.",
+                pinned_session_id,
+                pinned_row.get("profile_name"),
+                origin_profile,
             )
             return None
 
@@ -13239,6 +13252,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "dropping injection.",
                     target_session_id,
                     "unknown" if tip_row is None else "ended",
+                )
+                return None
+            if origin_profile and not self._async_origin_profile_matches(
+                tip_row, origin_profile
+            ):
+                logger.warning(
+                    "Async-delegation compression continuation %s crossed "
+                    "profiles (%r -> %r); dropping injection.",
+                    target_session_id,
+                    origin_profile,
+                    tip_row.get("profile_name"),
                 )
                 return None
 
@@ -13305,6 +13329,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_entry.session_key,
         )
         return switched
+
+    @staticmethod
+    def _async_origin_profile_matches(row: dict, origin_profile: str) -> bool:
+        """Compare persisted session ownership with an immutable origin profile."""
+        expected = str(origin_profile or "").strip() or "default"
+        actual = str((row or {}).get("profile_name") or "").strip() or "default"
+        return actual == expected
 
     # ------------------------------------------------------------------
     # Mid-run (busy-session) slash command dispatch — "Guard 2".
@@ -15531,9 +15562,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
         if pinned_session_id:
+            origin_profile = str(
+                (getattr(event, "metadata", None) or {}).get(
+                    "gateway_origin_profile"
+                )
+                or ""
+            ).strip()
             resolved_entry = await self._resolve_async_delegation_session(
                 session_entry,
                 pinned_session_id,
+                origin_profile,
             )
             if resolved_entry is None:
                 return
@@ -20250,8 +20288,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (api_server) declare supports_async_delivery=False. Use getattr so
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
-        _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = self._adapter_for_source(context.source)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
             platform=context.source.platform.value,
@@ -20266,6 +20303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            source_snapshot=context.source.to_dict(),
             async_delivery=_async_delivery,
         )
 
@@ -20739,6 +20777,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.session import SessionSource
 
+        origin_payload = evt.get("origin_source")
+        if origin_payload is not None:
+            if not isinstance(origin_payload, dict):
+                logger.warning("Synthetic event has invalid immutable origin source")
+                return None
+            try:
+                source = SessionSource.from_dict(dict(origin_payload))
+            except Exception:
+                logger.warning(
+                    "Synthetic event immutable origin source is corrupt",
+                    exc_info=True,
+                )
+                return None
+            event_profile = str(evt.get("origin_profile") or "").strip()
+            source_profile = str(getattr(source, "profile", None) or "").strip()
+            if event_profile and source_profile and event_profile != source_profile:
+                logger.warning(
+                    "Synthetic event origin profile mismatch: event=%r source=%r",
+                    event_profile,
+                    source_profile,
+                )
+                return None
+            if event_profile and not source_profile:
+                source = dataclasses.replace(source, profile=event_profile)
+            anchor = str(evt.get("origin_message_id") or "").strip()
+            if anchor:
+                source = dataclasses.replace(source, message_id=anchor)
+            return source
+
         session_key = str(evt.get("session_key") or "").strip()
         derived_platform = ""
         derived_chat_type = ""
@@ -20822,6 +20889,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = self._build_process_event_source(evt)
         if not source:
+            if "origin_source" in evt:
+                # New durable producers are authoritative.  A corrupt or
+                # inconsistent snapshot must not silently downgrade to legacy
+                # cache/session-key guessing (or an API self-post) because
+                # that can deliver to a different profile or conversation.
+                logger.warning(
+                    "Dropping synthetic event with unusable immutable origin"
+                )
+                return None
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
             # structured ``agent:main:...`` key, so _build_process_event_source
@@ -20865,11 +20941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
@@ -20901,12 +20973,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+                metadata["gateway_origin_profile"] = str(
+                    evt.get("origin_profile") or ""
+                )
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
-                message_id=str(evt.get("message_id") or "").strip() or None,
+                message_id=(
+                    str(evt.get("origin_message_id") or "").strip()
+                    or str(evt.get("message_id") or "").strip()
+                    or None
+                ),
                 metadata=metadata,
             )
             logger.info(
@@ -20942,7 +21021,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return (evt_type, producer_id, started_at)
         return None
 
-    async def _classify_completion_target(self, parent_session_id: str) -> str:
+    async def _classify_completion_target(
+        self, parent_session_id: str, origin_profile: str = ""
+    ) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
 
         Returns one of:
@@ -20974,6 +21055,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         if parent is None:
             return "terminal"
+        if origin_profile and not self._async_origin_profile_matches(
+            parent, origin_profile
+        ):
+            return "terminal"
         if not parent.get("ended_at"):
             return "deliver"
         if parent.get("end_reason") != "compression":
@@ -20993,6 +21078,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "retry"
         if tip is None or tip.get("ended_at"):
             return "retry"
+        if origin_profile and not self._async_origin_profile_matches(
+            tip, origin_profile
+        ):
+            return "terminal"
         return "deliver"
 
     async def _deliver_completion_notification(
@@ -21034,7 +21123,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would falsely acknowledge the durable row as delivered.
                 # Verify the target here, before acceptance, and give drops an
                 # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
+                verdict = await self._classify_completion_target(
+                    parent_session_id,
+                    str(evt.get("origin_profile") or ""),
+                )
                 if verdict == "terminal":
                     logger.warning(
                         "Async delegation %s targets permanently-gone session %s; "
@@ -21126,15 +21218,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
-        """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
+        """Fill legacy async-delegation routes from their session key.
 
-        Async-delegation completion events only carry ``session_key`` (the
-        daemon worker has no access to the per-message routing metadata the
-        terminal background watcher captures at spawn time). Parse the
-        session_key into the routing fields ``_build_process_event_source``
-        expects. Best-effort: a CLI-origin event (empty session_key) is left
-        as-is and simply won't route on the gateway.
+        New events carry an immutable ``origin_source`` snapshot captured by
+        the dispatching turn and do not need enrichment.  This parser remains
+        only for rows created before that snapshot existed. Best-effort: a
+        CLI-origin event (empty session_key) is left as-is.
         """
+        if evt.get("origin_source"):
+            return
         if evt.get("platform"):
             return  # already enriched
         parsed = _parse_session_key(evt.get("session_key", "") or "")

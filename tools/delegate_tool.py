@@ -2926,9 +2926,28 @@ def delegate_task(
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
     # api_server) is untouched by child construction, so read it here and
     # thread it through the dispatch.
-    from tools.async_delegation import _current_origin_session_id
+    from tools.async_delegation import _current_origin_session_id, capture_current_origin
+    from tools.approval import get_current_session_key
 
     _origin_wake_sid = _current_origin_session_id()
+    _origin_route = capture_current_origin()
+    _origin_session_key = get_current_session_key(default="")
+    _origin_ui_session_id = ""
+    try:
+        from gateway.session_context import get_session_env
+
+        _origin_surface = get_session_env("HERMES_SESSION_SOURCE", "")
+        _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+        if _origin_surface == "tui":
+            _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+            if _agent_session_id:
+                _origin_session_key = _agent_session_id
+    except Exception:
+        _origin_ui_session_id = ""
+    if not _origin_session_key:
+        _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+        if _agent_session_id:
+            _origin_session_key = _agent_session_id
 
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
@@ -3162,7 +3181,6 @@ def delegate_task(
     # keep chatting, get the combined summaries back together at the end.
     if background:
         from tools.async_delegation import dispatch_async_delegation_batch
-        from tools.approval import get_current_session_key
 
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
@@ -3215,40 +3233,11 @@ def delegate_task(
                 )
             return json.dumps(_sync_result, ensure_ascii=False)
 
-        _session_key = get_current_session_key(default="")
-        _origin_ui_session_id = ""
-        try:
-            from gateway.session_context import get_session_env
-
-            _source = get_session_env("HERMES_SESSION_SOURCE", "")
-            _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
-            # In desktop/TUI, the routable session key is the durable
-            # AIAgent.session_id. Context compression can rotate that id during
-            # the same turn before the TUI-side session dict is re-anchored;
-            # if we capture the stale approval/session context key here, the
-            # async completion becomes an orphan and any desktop poller may
-            # consume it. Gateway chats are different: their session_key is the
-            # platform conversation key (agent:main:...), so keep it there.
-            if _source == "tui":
-                _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-                if _agent_session_id:
-                    _session_key = _agent_session_id
-        except Exception:
-            _origin_ui_session_id = ""
-        if not _session_key:
-            # CLI (single-process) path: the approval contextvar is only bound
-            # during gateway/TUI turns and HERMES_SESSION_KEY is not in the CLI
-            # environment, so the key resolves empty here. Since #64240 the CLI
-            # drains completions through a positive-ownership filter keyed on
-            # the durable AIAgent.session_id — an empty session_key would fail
-            # closed and the CLI could never claim its own completions, while
-            # a restored foreign event with an empty key could leak into any
-            # unfiltered consumer (#64484). Stamp the parent's durable session
-            # id instead; compression rotations are handled on the drain side
-            # via resolve_resume_session_id lineage resolution.
-            _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
-            if _agent_session_id:
-                _session_key = _agent_session_id
+        # All routing identity was captured before child construction. Child
+        # initialization mutates session-id context, so reading any origin
+        # field here risks binding the completion to the child or to a later
+        # mutable gateway cache entry.
+        _session_key = _origin_session_key
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
 
@@ -3326,6 +3315,9 @@ def delegate_task(
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
+            origin_message_id=_origin_route["origin_message_id"],
+            origin_source=_origin_route["origin_source"],
+            origin_profile=_origin_route["origin_profile"],
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
