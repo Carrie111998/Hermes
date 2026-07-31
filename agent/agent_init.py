@@ -1147,8 +1147,9 @@ def init_agent(
 
                 client_kwargs["default_headers"] = copilot_default_headers()
             elif base_url_host_matches(effective_base, "api.kimi.com"):
+                from hermes_cli import __version__ as _hermes_ver
                 client_kwargs["default_headers"] = {
-                    "User-Agent": "claude-code/0.1.0",
+                    "User-Agent": f"hermes-cli/{_hermes_ver}",
                 }
             elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()

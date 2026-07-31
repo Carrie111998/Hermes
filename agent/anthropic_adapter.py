@@ -845,12 +845,12 @@ def build_anthropic_client(
     )
 
     if _is_kimi_coding_endpoint(base_url):
-        # Kimi's /coding endpoint requires User-Agent: claude-code/0.1.0
-        # to be recognized as a valid Coding Agent. Without it, returns 403.
+        # Kimi's /coding endpoint requires a valid User-Agent.
         # Check this BEFORE _requires_bearer_auth since both match api.kimi.com/coding.
+        from hermes_cli import __version__ as _hermes_ver
         kwargs["api_key"] = api_key
         kwargs["default_headers"] = {
-            "User-Agent": "claude-code/0.1.0",
+            "User-Agent": f"hermes-cli/{_hermes_ver}",
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
     elif _requires_bearer_auth(normalized_base_url):

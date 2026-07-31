@@ -2283,7 +2283,8 @@ def run_doctor(args):
                 "User-Agent": _HERMES_USER_AGENT,
             }
             if base_url_host_matches(base, "api.kimi.com"):
-                headers["User-Agent"] = "claude-code/0.1.0"
+                # Kimi: keep the hermes-cli User-Agent (no impersonation)
+                pass
             # Google's Generative Language API (generativelanguage.googleapis.com)
             # rejects ``Authorization: Bearer <api-key>`` with 401
             # ``ACCESS_TOKEN_TYPE_UNSUPPORTED`` — that header is reserved for
