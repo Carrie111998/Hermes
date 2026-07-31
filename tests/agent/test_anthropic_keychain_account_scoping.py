@@ -21,11 +21,16 @@ These tests pin the two properties that prevent that:
 from __future__ import annotations
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.anthropic_adapter import _read_claude_code_credentials_from_keychain
+from agent.anthropic_adapter import (
+    _is_oauth_token,
+    _read_claude_code_credentials_from_keychain,
+    resolve_anthropic_token,
+)
 
 # Exercises the reader with explicit platform/subprocess mocks; never touches a
 # real Keychain, so it opts out of the suite-wide guard like its sibling module.
@@ -140,3 +145,72 @@ class TestKeychainAccountScoping:
              patch("agent.anthropic_adapter.subprocess.run") as run:
             assert _read_claude_code_credentials_from_keychain() is None
         run.assert_not_called()
+
+
+# A syntactically valid Console key shape. Never sent anywhere — these tests only
+# observe how the resolver ranks it and how the adapter classifies it.
+CONSOLE_API_KEY = "sk-ant-api03-" + ("A" * 24)
+
+KEYCHAIN_CREDS = {
+    "accessToken": "sk-ant-oat01-real-login-token",
+    "refreshToken": "sk-ant-ort01-refresh",
+    "expiresAt": 4102444800000,  # year 2100 — never treated as expired
+    "source": "macos_keychain",
+}
+
+
+class TestBillingLaneInvariant:
+    """Why the lookup bug matters: it silently changes which account is billed.
+
+    ``resolve_anthropic_token`` ranks the Claude Code credential (source 3) above
+    ``ANTHROPIC_API_KEY`` (source 5). A subscription OAuth token ships as
+    ``Authorization: Bearer`` and draws down the subscription plan allowance; a
+    Console key ships as ``x-api-key`` and draws down that organisation's prepaid
+    API credits. The two are different money.
+
+    So a keychain read that wrongly returns None does not merely fail — when
+    ``ANTHROPIC_API_KEY`` is also present it falls through to source 5 and
+    reroutes the billing lane, with no warning at any log level. These tests pin
+    the ranking that keeps subscription traffic on the subscription.
+    """
+
+    @staticmethod
+    def _resolve(keychain_creds):
+        """Resolve with sources 1, 2 and 4 silenced, so only 3 and 5 are live."""
+        env = {
+            "ANTHROPIC_TOKEN": "",
+            "CLAUDE_CODE_OAUTH_TOKEN": "",
+            "ANTHROPIC_API_KEY": CONSOLE_API_KEY,
+        }
+        with patch.dict(os.environ, env), \
+             patch("agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+                   return_value=keychain_creds), \
+             patch("agent.anthropic_adapter._read_claude_code_credentials_from_file",
+                   return_value=None), \
+             patch("agent.anthropic_adapter._resolve_anthropic_pool_token",
+                   return_value=None):
+            return resolve_anthropic_token()
+
+    def test_keychain_oauth_outranks_env_api_key(self):
+        """With both present, the subscription credential must win."""
+        token = self._resolve(KEYCHAIN_CREDS)
+
+        assert token == "sk-ant-oat01-real-login-token", (
+            "ANTHROPIC_API_KEY outranked the Claude Code login credential — "
+            "subscription traffic would be billed to prepaid API credits"
+        )
+        assert _is_oauth_token(token), "resolved token must ship as Bearer, not x-api-key"
+
+    def test_keychain_miss_falls_through_to_env_api_key(self):
+        """Characterises the blast radius: a miss reroutes the billing lane.
+
+        Not desired behaviour — documented so the ranking above is understood as
+        load-bearing rather than incidental. Before the account-scoped read, an
+        mcpOAuth-only item was enough to land here.
+        """
+        token = self._resolve(None)
+
+        assert token == CONSOLE_API_KEY
+        assert not _is_oauth_token(token), (
+            "a Console API key must never be classified as OAuth"
+        )
