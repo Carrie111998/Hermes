@@ -12,11 +12,19 @@ test('Windows close-to-tray lifecycle policy preserves explicit quit and non-Win
   assert.equal(shouldCreateWindowsTray('win32'), true)
   assert.equal(shouldCreateWindowsTray('darwin'), false)
 
-  assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: false }), true)
-  assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: true }), false)
-  assert.equal(shouldHideMainWindowOnClose({ platform: 'linux', isQuitting: false }), false)
+  assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: false, trayAvailable: true }), true)
+  assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: false, trayAvailable: false }), false)
+  assert.equal(shouldHideMainWindowOnClose({ platform: 'win32', isQuitting: true, trayAvailable: true }), false)
+  assert.equal(shouldHideMainWindowOnClose({ platform: 'linux', isQuitting: false, trayAvailable: true }), false)
 
-  assert.equal(shouldStartMainWindowHidden({ platform: 'win32', argv: ['Hermes.exe', '--hidden'] }), true)
-  assert.equal(shouldStartMainWindowHidden({ platform: 'win32', argv: ['Hermes.exe'] }), false)
-  assert.equal(shouldStartMainWindowHidden({ platform: 'darwin', argv: ['Hermes', '--hidden'] }), false)
+  assert.equal(
+    shouldStartMainWindowHidden({ platform: 'win32', argv: ['Hermes.exe', '--hidden'], trayAvailable: true }),
+    true
+  )
+  assert.equal(
+    shouldStartMainWindowHidden({ platform: 'win32', argv: ['Hermes.exe', '--hidden'], trayAvailable: false }),
+    false
+  )
+  assert.equal(shouldStartMainWindowHidden({ platform: 'win32', argv: ['Hermes.exe'], trayAvailable: true }), false)
+  assert.equal(shouldStartMainWindowHidden({ platform: 'darwin', argv: ['Hermes', '--hidden'], trayAvailable: true }), false)
 })
