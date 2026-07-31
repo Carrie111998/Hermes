@@ -850,8 +850,12 @@ class ProductionCutoverTransport(canary_transport.IapStoppedReleaseTransport):
                 account=account,
                 input_bytes=frame,
                 timeout_seconds=900,
-                maximum_input_bytes=MAX_JSON,
-                maximum_output_bytes=MAX_JSON,
+                maximum_input_bytes=(
+                    canary_transport._STOPPED_RELEASE_REMOTE_INPUT_MAX_BYTES
+                ),
+                maximum_output_bytes=(
+                    canary_transport._STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
+                ),
             )
         else:
             if (
