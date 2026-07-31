@@ -1064,3 +1064,136 @@ class TestStalePortalBaseUrlMigration:
 
         auth_mod.resolve_nous_runtime_credentials()
         assert refresh_calls == [auth_mod.DEFAULT_NOUS_PORTAL_URL]
+
+
+# =============================================================================
+# Device verification URL — prefer /device over manage-subscription (#20605)
+# =============================================================================
+
+
+class TestResolveNousDeviceVerificationUrl:
+    """Portal sometimes returns manage-subscription as verification_uri_complete."""
+
+    def test_rewrites_manage_subscription_complete_uri(self):
+        from hermes_cli.auth import _resolve_nous_device_verification_url
+
+        url, rewritten = _resolve_nous_device_verification_url(
+            {
+                "user_code": "SMCL-97YT",
+                "verification_uri": (
+                    "https://portal.nousresearch.com/manage-subscription"
+                ),
+                "verification_uri_complete": (
+                    "https://portal.nousresearch.com/manage-subscription"
+                    "?user_code=SMCL-97YT"
+                ),
+            },
+            "https://portal.nousresearch.com",
+        )
+
+        assert rewritten is True
+        assert url == (
+            "https://portal.nousresearch.com/device?user_code=SMCL-97YT"
+        )
+
+    def test_prefers_device_verification_uri_over_manage_subscription_complete(self):
+        from hermes_cli.auth import _resolve_nous_device_verification_url
+
+        url, rewritten = _resolve_nous_device_verification_url(
+            {
+                "user_code": "ABCD-1234",
+                "verification_uri": "https://portal.example.com/device",
+                "verification_uri_complete": (
+                    "https://portal.example.com/manage-subscription"
+                    "?user_code=ABCD-1234"
+                ),
+            },
+            "https://portal.example.com",
+        )
+
+        assert rewritten is True
+        assert url == "https://portal.example.com/device?user_code=ABCD-1234"
+
+    def test_keeps_healthy_device_complete_uri(self):
+        from hermes_cli.auth import _resolve_nous_device_verification_url
+
+        url, rewritten = _resolve_nous_device_verification_url(
+            {
+                "user_code": "NOUS-1234",
+                "verification_uri": "https://portal.nousresearch.com/device",
+                "verification_uri_complete": (
+                    "https://portal.nousresearch.com/device?user_code=NOUS-1234"
+                ),
+            },
+            "https://portal.nousresearch.com",
+        )
+
+        assert rewritten is False
+        assert url == (
+            "https://portal.nousresearch.com/device?user_code=NOUS-1234"
+        )
+
+    def test_timeout_message_mentions_captcha_and_retry(self):
+        from hermes_cli.auth import _nous_device_auth_timeout_message
+
+        msg = _nous_device_auth_timeout_message("https://portal.nousresearch.com")
+        assert "CAPTCHA" in msg
+        assert "hermes portal" in msg
+        assert "https://portal.nousresearch.com/device" in msg
+        assert "https://portal.nousresearch.com/login" in msg
+
+
+def test_nous_device_code_login_opens_rewritten_device_url(monkeypatch):
+    """CLI must open /device even when Portal returns manage-subscription."""
+    import hermes_cli.auth as auth_mod
+
+    opened = []
+    printed = []
+
+    monkeypatch.setattr(
+        auth_mod,
+        "_request_device_code",
+        lambda **kwargs: {
+            "device_code": "device",
+            "user_code": "SMCL-97YT",
+            "verification_uri": (
+                "https://portal.nousresearch.com/manage-subscription"
+            ),
+            "verification_uri_complete": (
+                "https://portal.nousresearch.com/manage-subscription"
+                "?user_code=SMCL-97YT"
+            ),
+            "expires_in": 600,
+            "interval": 1,
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "_poll_for_token",
+        lambda **kwargs: {
+            "access_token": _invoke_jwt(seconds=3600),
+            "refresh_token": "refresh-token",
+            "expires_in": 900,
+            "scope": auth_mod.DEFAULT_NOUS_SCOPE,
+        },
+    )
+    monkeypatch.setattr(
+        auth_mod,
+        "refresh_nous_oauth_from_state",
+        lambda state, **kwargs: state,
+    )
+    monkeypatch.setattr(auth_mod.webbrowser, "open", lambda url: opened.append(url) or True)
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+
+    auth_mod._nous_device_code_login(
+        portal_base_url="https://portal.nousresearch.com",
+        inference_base_url="https://inference.example.com/v1",
+        open_browser=True,
+        timeout_seconds=1,
+    )
+
+    assert opened == [
+        "https://portal.nousresearch.com/device?user_code=SMCL-97YT"
+    ]
+    assert any("/device?user_code=SMCL-97YT" in line for line in printed)
+    assert any("manage-subscription" in line for line in printed)

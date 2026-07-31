@@ -55,6 +55,47 @@ def _fake_nous_device_data():
     }
 
 
+def test_nous_dashboard_login_rewrites_manage_subscription_verification_url():
+    """Dashboard must surface /device when Portal returns manage-subscription."""
+    import hermes_cli.web_server as ws
+
+    broken = {
+        "device_code": "device-code",
+        "user_code": "SMCL-97YT",
+        "verification_uri": "https://portal.nousresearch.com/manage-subscription",
+        "verification_uri_complete": (
+            "https://portal.nousresearch.com/manage-subscription"
+            "?user_code=SMCL-97YT"
+        ),
+        "expires_in": 600,
+        "interval": 5,
+    }
+    before_sessions = set(ws._oauth_sessions)
+    with patch(
+        "hermes_cli.auth._request_device_code",
+        return_value=broken,
+    ), patch(
+        "hermes_cli.web_server._nous_poller",
+        return_value=None,
+    ):
+        resp = client.post(
+            "/api/providers/oauth/nous/start",
+            headers=HEADERS,
+        )
+
+    try:
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["flow"] == "device_code"
+        assert body["user_code"] == "SMCL-97YT"
+        assert body["verification_url"] == (
+            "https://portal.nousresearch.com/device?user_code=SMCL-97YT"
+        )
+    finally:
+        for sid in set(ws._oauth_sessions) - before_sessions:
+            ws._oauth_sessions.pop(sid, None)
+
+
 def _invoke_scope_refusal():
     request = httpx.Request("POST", "https://portal.nousresearch.com/oauth/device/code")
     response = httpx.Response(
