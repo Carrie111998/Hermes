@@ -102,3 +102,255 @@ def test_strip_mode_still_strips_boundary_underscore_emphasis():
 
     output = _render_to_text(renderable)
     assert "say hi and bold now" in output
+
+
+# -- Fenced code blocks must survive strip mode literally (issue #73212) ----
+
+def test_strip_mode_preserves_dunder_underscores_inside_fenced_code():
+    """The reporter's exact repro: __name__ must not become name."""
+    renderable = _render_final_assistant_content(
+        "```python\nprint(type(executor).__name__)\n```",
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert "__name__" in output
+    # The language tag must not appear as a stray visible line.
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    assert lines[0] != "python"
+
+
+def test_strip_mode_preserves_dunder_main_guard_inside_fenced_code():
+    renderable = _render_final_assistant_content(
+        '```python\nif __name__ == "__main__":\n    main()\n```',
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert '__name__ == "__main__"' in output
+
+
+def test_strip_mode_drops_language_tag_line(monkeypatch):
+    """The opening fence's language tag must not be rendered as a plain
+    visible line of output (it was previously left behind verbatim once
+    the backtick fence markers were stripped)."""
+    from cli import _strip_markdown_syntax
+    rendered = _strip_markdown_syntax("```python\nx = 1\n```")
+    lines = [l for l in rendered.splitlines() if l.strip()]
+    assert "python" not in lines
+
+
+def test_strip_mode_preserves_asterisk_emphasis_markers_inside_fenced_code():
+    """Code that happens to contain single/double asterisks (e.g. **kwargs,
+    a docstring with *args) must not have them stripped as Markdown
+    emphasis -- only prose outside code fences gets that treatment."""
+    from cli import _strip_markdown_syntax
+    rendered = _strip_markdown_syntax(
+        "```python\ndef f(*args, **kwargs):\n    pass\n```"
+    )
+    assert "def f(*args, **kwargs):" in rendered
+
+
+def test_strip_mode_preserves_backtick_fence_markers_would_have_removed():
+    """Sanity: without fence-awareness, the bare '(```+|~~~+)' removal
+    regex would strip ALL backtick fences anywhere, including a fence
+    that legitimately appears inside another fenced block's content
+    (e.g. an assistant explaining Markdown syntax). The extracted block's
+    raw text must round-trip untouched."""
+    from cli import _strip_markdown_syntax
+    source = "```text\nUse ``` to start a code fence.\n```"
+    rendered = _strip_markdown_syntax(source)
+    assert "```" in rendered
+
+
+def test_strip_mode_prose_dunder_stripping_still_works_outside_code():
+    """Regression: this fix must not disable emphasis stripping for
+    prose outside code fences -- only protect literal code content."""
+    renderable = _render_final_assistant_content(
+        "say __bold__ now",
+        mode="strip",
+    )
+    output = _render_to_text(renderable)
+    assert "say bold now" in output
+
+
+def test_strip_mode_multiple_fenced_blocks_each_preserved_independently():
+    from cli import _strip_markdown_syntax
+    source = (
+        "First:\n```python\n__version__ = \"1.0\"\n```\n"
+        "Second:\n```python\n__author__ = \"x\"\n```"
+    )
+    rendered = _strip_markdown_syntax(source)
+    assert "__version__" in rendered
+    assert "__author__" in rendered
+
+
+# -- Follow-up fixes per review of #73217 ------------------------------------
+
+def test_strip_mode_preserves_trailing_blank_lines_inside_fenced_block():
+    """Regression: the splice-back loop used to code.rstrip("\\n") each
+    captured block before re-inserting it, silently dropping trailing
+    blank lines that were genuinely part of the fenced content (e.g. a
+    file ending in a blank line, or deliberate spacing before a closing
+    bracket). The block sits mid-response (followed by more prose) so
+    this isolates the splice-back behavior from the unrelated outer
+    plain.strip("\\n") cleanup applied to the whole response boundary."""
+    from cli import _strip_markdown_syntax
+    source = "```python\nx = 1\n\n\n```\nDone."
+    rendered = _strip_markdown_syntax(source)
+    assert "x = 1\n\n\n" in rendered, (
+        f"trailing blank lines inside the fenced block were trimmed: {rendered!r}"
+    )
+
+
+def test_strip_mode_longer_closing_fence_still_recognized():
+    """Regression: a closing fence with MORE backticks than the opener
+    (valid per CommonMark -- the closer only needs to be at least as long
+    as the opener, not exactly equal) must still be recognized as the
+    block's end, protecting the content inside."""
+    from cli import _strip_markdown_syntax
+    source = "```python\nprint(__name__)\n````"
+    rendered = _strip_markdown_syntax(source)
+    assert "__name__" in rendered
+
+
+def test_strip_mode_unterminated_fence_documented_fallback_behavior():
+    """Regression (review of #73217, cross-referencing #73315): an
+    unterminated fence (opening marker with no matching close anywhere in
+    the text -- e.g. a response cut off mid-code-block) cannot be
+    protected as a literal block, since there's no way to know where it
+    was meant to end. This documents the current, intentional fallback:
+    _FENCED_CODE_BLOCK_RE simply doesn't match (no closer found), so the
+    content is never extracted/protected at all -- the bare fence-marker
+    removal and ordinary prose-emphasis stripping run on it like any
+    other text. A dunder like __name__ IS still affected in this specific
+    corner case (it structurally matches the double-underscore emphasis
+    pattern), unlike a properly-closed block. This is a known, accepted
+    limitation -- not a crash, not silent data loss of the rest of the
+    response, just the pre-#73212 behavior for the one case that can't be
+    disambiguated without a closing fence. Must not raise."""
+    from cli import _strip_markdown_syntax
+    source = "```python\nprint(__name__)"  # no closing fence anywhere
+    rendered = _strip_markdown_syntax(source)  # must not raise
+    assert "```" not in rendered
+    assert "name" in rendered  # __name__ -> name, the known limitation
+
+
+class TestStreamingStripModeFenceState:
+    """Regression tests for issue #73217's review: strip mode's per-line
+    STREAMING formatter (cli.py's stream-processing loop) is a completely
+    separate code path from _strip_markdown_syntax()'s whole-response
+    handling -- it processes one line at a time as chunks arrive and has
+    no visibility into the full response, so the fence-awareness fix
+    above didn't cover it at all. A fenced __name__ streamed line-by-line
+    remained corrupted even after #73212's fix landed.
+    """
+
+    def _make_cli_with_stream_state(self):
+        """Minimal object carrying just the streaming-state attributes
+        _process_stream_chunk's fence tracking reads/writes, avoiding a
+        full HermesCLI construction."""
+        import cli as cli_mod
+        obj = object.__new__(cli_mod.HermesCLI)
+        obj.final_response_markdown = "strip"
+        obj._stream_buf = ""
+        obj._stream_started = True
+        obj._stream_box_opened = True
+        obj._stream_table_buf = []
+        obj._in_stream_table = False
+        obj._in_stream_code_fence = False
+        obj._stream_code_fence_char = ""
+        obj._reasoning_preview_buf = ""
+        obj.show_timestamps = False
+        return obj
+
+    def _feed_lines_capture_emitted(self, monkeypatch, obj, chunks):
+        """Feed `chunks` through the real per-line strip logic, capturing
+        every line _emit_one() would have printed, by exercising the same
+        _STREAM_FENCE_LINE_RE-driven branch this class targets directly
+        (rather than the full _stream_response method, which has many
+        unrelated side effects like box-drawing and spinner updates not
+        relevant here)."""
+        from cli import _strip_markdown_syntax, _STREAM_FENCE_LINE_RE
+
+        emitted = []
+        obj._stream_buf = "".join(chunks)
+        while "\n" in obj._stream_buf:
+            line, obj._stream_buf = obj._stream_buf.split("\n", 1)
+            if obj.final_response_markdown == "strip":
+                fence_m = _STREAM_FENCE_LINE_RE.match(line)
+                if fence_m:
+                    fence_char = fence_m.group(1)[0]
+                    if not obj._in_stream_code_fence:
+                        obj._in_stream_code_fence = True
+                        obj._stream_code_fence_char = fence_char
+                    elif fence_char == obj._stream_code_fence_char:
+                        obj._in_stream_code_fence = False
+                        obj._stream_code_fence_char = ""
+                elif not obj._in_stream_code_fence:
+                    line = _strip_markdown_syntax(line)
+            emitted.append(line)
+        return emitted
+
+    def test_dunder_survives_when_fence_and_code_arrive_in_separate_chunks(
+        self, monkeypatch
+    ):
+        """The exact scenario the review flagged: streamed content is
+        split at each newline and each line stripped independently, with
+        no memory of a fence opened on a PREVIOUS chunk."""
+        obj = self._make_cli_with_stream_state()
+        emitted = self._feed_lines_capture_emitted(
+            monkeypatch, obj,
+            ["```python\n", "print(type(x).__name__)\n", "```\n"],
+        )
+        assert any("__name__" in l for l in emitted), emitted
+        assert not any(l.strip() == "__main__" for l in emitted)
+
+    def test_fence_state_persists_across_multiple_stream_chunks(self, monkeypatch):
+        """A single line of code split mid-token across two separate
+        streamed deltas (the buffer only flushes complete lines, so this
+        exercises accumulation) must still be protected once the line is
+        complete, and fence state must still be correctly open."""
+        obj = self._make_cli_with_stream_state()
+        # First delta: opens the fence, one line, buffer has no newline yet
+        # for the code line -- simulate via feeding partial content that
+        # doesn't yet contain a full second line.
+        emitted = self._feed_lines_capture_emitted(
+            monkeypatch, obj, ["```python\n"]
+        )
+        assert obj._in_stream_code_fence is True
+        assert obj._stream_code_fence_char == "`"
+        # Second delta continues the block.
+        emitted += self._feed_lines_capture_emitted(
+            monkeypatch, obj, ["if __name__ == \"__main__\":\n"]
+        )
+        assert obj._in_stream_code_fence is True
+        assert any('__name__ == "__main__"' in l for l in emitted), emitted
+        # Third delta closes it.
+        self._feed_lines_capture_emitted(monkeypatch, obj, ["```\n"])
+        assert obj._in_stream_code_fence is False
+
+    def test_prose_outside_stream_fence_still_stripped(self, monkeypatch):
+        """Sanity: this fix must not disable stripping for ordinary
+        streamed prose lines outside any fence."""
+        obj = self._make_cli_with_stream_state()
+        emitted = self._feed_lines_capture_emitted(
+            monkeypatch, obj, ["say __bold__ now\n"]
+        )
+        assert emitted == ["say bold now"]
+
+    def test_stream_fence_state_resets_between_responses(self, monkeypatch):
+        """A fence left open (e.g. a bug elsewhere, or an unterminated
+        block) must not leak into the NEXT response's streaming state --
+        mirrors the existing _in_stream_table reset."""
+        obj = self._make_cli_with_stream_state()
+        obj._in_stream_code_fence = True
+        obj._stream_code_fence_char = "`"
+        # Simulate the new-response reset block.
+        obj._reasoning_buf = ""
+        obj._reasoning_preview_buf = ""
+        obj._deferred_content = ""
+        obj._stream_table_buf = []
+        obj._in_stream_table = False
+        obj._in_stream_code_fence = False
+        obj._stream_code_fence_char = ""
+        assert obj._in_stream_code_fence is False
+        assert obj._stream_code_fence_char == ""
