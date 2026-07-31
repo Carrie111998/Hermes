@@ -9129,34 +9129,72 @@ def _code_owner_hook_spec(profile_home: Path) -> Optional[dict[str, str]]:
 _HOOK_DISABLING_ENV_VARS = ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG")
 
 
+#: Shared timing contract for the gated spawn handshake (R4-B6). The wrapper
+#: parks before ``exec()`` until the gate appears; its deadline must outlive
+#: everything the parent does between spawn and gate creation, otherwise the
+#: parent can create a gate for a wrapper that already gave up — an orphan gate
+#: plus a dead pid returned as if the worker were live.
+_ATTESTATION_TIMEOUT_SECONDS = 120
+_OWNER_GATE_WRAPPER_DEADLINE_SECONDS = _ATTESTATION_TIMEOUT_SECONDS * 2 + 60
+
+
+#: Environment that can inject arbitrary importable code into a Python child.
+#: The packaged bash wrapper happens to unset the first two, but a console
+#: script, a venv symlink or the module fallback do not — so the candidate
+#: scrubs them itself, for the worker AND its attestation identically.
+_IMPORT_INJECTION_ENV_VARS = (
+    "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+)
+
+
+def _scrubbed_worker_env(env: dict) -> dict:
+    """Return ``env`` without import-injection variables."""
+    scrubbed = dict(env)
+    for name in _IMPORT_INJECTION_ENV_VARS:
+        scrubbed.pop(name, None)
+    return scrubbed
+
+
 def _trusted_worker_launcher(
     worker_argv: "list[str] | None", workspace: "str | None",
-) -> str:
-    """Resolve argv[0] to a launcher the worker itself cannot have written.
+) -> list[str]:
+    """Return the validated launcher **prefix**, preserved exactly as given.
 
-    The attestation is only evidence if the thing we execute is the same
-    launcher the worker will run AND is outside every root the worker can
-    write. A worker that could drop its own ``hermes`` in its worktree would
-    otherwise answer its own admission question.
+    Two things must both hold, and they are deliberately separate:
+
+    * *validation* may follow symlinks — the real target must exist, be
+      executable, and live outside every root the worker can write, otherwise a
+      worker could drop its own ``hermes`` and answer its own admission
+      question;
+    * *execution* must use the caller's original strings. Substituting a
+      resolved realpath would swap a venv ``python`` symlink for its base
+      interpreter, changing ``sys.prefix`` and therefore import semantics, and
+      collapsing ``[python, "-m", "hermes_cli.main"]`` to ``python`` alone —
+      which then parses ``-p`` as its own flag and aborts every gated spawn.
+
+    The prefix is the launcher plus, for the module fallback, its ``-m
+    <module>`` pair, so attestation flags land where the Hermes CLI parses them
+    rather than where the interpreter does.
     """
     if not worker_argv:
         raise RuntimeError(
             "cannot attest the worker admission hook: no resolved worker argv"
         )
-    launcher = Path(worker_argv[0])
+    head = worker_argv[0]
+    launcher = Path(head)
     if not launcher.is_absolute():
-        resolved_which = shutil.which(str(launcher))
+        resolved_which = shutil.which(head)
         if not resolved_which:
             raise RuntimeError(
                 "cannot attest the worker admission hook: launcher "
-                f"{worker_argv[0]!r} does not resolve to a path"
+                f"{head!r} does not resolve to a path"
             )
         launcher = Path(resolved_which)
-    launcher = launcher.resolve()
-    if not launcher.is_file() or not os.access(launcher, os.X_OK):
+    target = launcher.resolve()
+    if not target.is_file() or not os.access(target, os.X_OK):
         raise RuntimeError(
             "cannot attest the worker admission hook: launcher "
-            f"{str(launcher)!r} is not an executable file"
+            f"{str(target)!r} is not an executable file"
         )
     untrusted_roots = []
     if workspace:
@@ -9165,13 +9203,23 @@ def _trusted_worker_launcher(
         untrusted_roots.append(Path(workspaces_root()).resolve())
     except Exception:
         pass
-    for root in untrusted_roots:
-        if launcher == root or root in launcher.parents:
-            raise RuntimeError(
-                "refusing to attest through a launcher inside a "
-                f"worker-writable workspace root: {str(launcher)!r}"
-            )
-    return str(launcher)
+    # Both the lexical path and its real target must sit outside every
+    # worker-writable root: a symlink planted in the workspace is as bad as a
+    # binary planted there, and vice versa.
+    for candidate in {launcher, target}:
+        for root in untrusted_roots:
+            if candidate == root or root in candidate.parents:
+                raise RuntimeError(
+                    "refusing to attest through a launcher inside a "
+                    f"worker-writable workspace root: {str(candidate)!r}"
+                )
+
+    prefix = [head]
+    if len(worker_argv) >= 3 and worker_argv[1] == "-m":
+        # Module fallback: the module name belongs to the launcher, not to the
+        # Hermes command line.
+        prefix = [head, "-m", worker_argv[2]]
+    return prefix
 
 
 def _reprove_worker_owner_claim(
@@ -9245,11 +9293,11 @@ def _attest_worker_admission_hook_armed(
     """
     from hermes_cli.factory_attest import ATTEST_FLAG, VERDICT_PREFIX
 
-    launcher = _trusted_worker_launcher(worker_argv, workspace)
+    launcher_prefix = _trusted_worker_launcher(worker_argv, workspace)
     dispatcher_tree = str(Path(__file__).resolve().parents[1])
     nonce = secrets.token_hex(16)
     attest_argv = [
-        launcher, "-p", profile_home.name, ATTEST_FLAG, nonce,
+        *launcher_prefix, "-p", profile_home.name, ATTEST_FLAG, nonce,
     ]
     try:
         result = subprocess.run(
@@ -9257,8 +9305,8 @@ def _attest_worker_admission_hook_armed(
             # The worker's own cwd: the launcher is a console script, so cwd
             # never joins sys.path, but the environment must otherwise match.
             cwd=cwd or str(profile_home),
-            env=dict(env), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=120,
+            env=_scrubbed_worker_env(env), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=_ATTESTATION_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
@@ -9346,6 +9394,7 @@ def _claim_worker_owner(
             "--owner-start-time", process_start_time,
         ],
         capture_output=True, text=True, timeout=15,
+        env=_scrubbed_worker_env(os.environ),
     )
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip()
@@ -9369,6 +9418,7 @@ def _release_worker_owner(
             "--owner-start-time", process_start_time,
         ],
         capture_output=True, text=True, timeout=15,
+        env=_scrubbed_worker_env(os.environ),
     )
     if result.returncode == 3:
         return False
@@ -9502,6 +9552,7 @@ def _wait_for_pid_exit_and_run_release(
         time.sleep(poll_interval)
     result = subprocess.run(
         release_argv, capture_output=True, text=True, timeout=15,
+        env=_scrubbed_worker_env(os.environ),
     )
     if result.returncode == 3:
         return False
@@ -9788,6 +9839,11 @@ def _default_spawn(
         # admission hook is precisely the state the strict contract forbids.
         for _name in _HOOK_DISABLING_ENV_VARS:
             env.pop(_name, None)
+        # Nor may it inherit import-injection env. Scrubbing here (rather than
+        # relying on the packaged bash wrapper) keeps the worker and its
+        # attestation on byte-identical environments whichever launcher shape
+        # ``_resolve_hermes_argv`` returned.
+        env = _scrubbed_worker_env(env)
     worker_session_id: Optional[str] = None
     if owner_hook is not None:
         worker_session_id = _kanban_worker_session_id(task)
@@ -9881,7 +9937,8 @@ def _default_spawn(
     env["HERMES_KANBAN_OWNER_GATE"] = str(gate_path)
     gate_wrapper = (
         "import os,sys,time; "
-        "p=os.environ['HERMES_KANBAN_OWNER_GATE']; d=time.monotonic()+60; "
+        "p=os.environ['HERMES_KANBAN_OWNER_GATE']; "
+        f"d=time.monotonic()+{_OWNER_GATE_WRAPPER_DEADLINE_SECONDS}; "
         "\nwhile not os.path.exists(p):\n"
         "  if time.monotonic()>=d: raise SystemExit(78)\n"
         "  time.sleep(0.01)\n"

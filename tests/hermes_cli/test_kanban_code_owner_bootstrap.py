@@ -1392,11 +1392,12 @@ def test_attestation_refuses_an_unattestable_worker_launcher(tmp_path):
     not_executable.write_text("x\n", encoding="utf-8")
     with pytest.raises(RuntimeError, match="not an executable file"):
         kb._trusted_worker_launcher([str(not_executable)], None)
-    # A real launcher outside every worker-writable root resolves fine.
+    # A real launcher outside every worker-writable root resolves fine, and
+    # the prefix is returned as given (never dereferenced).
     launcher = _launcher_chain(tmp_path)
     assert kb._trusted_worker_launcher(
         [str(launcher)], str(tmp_path / "owned"),
-    ) == str(launcher.resolve())
+    ) == [str(launcher)]
 
 
 # ---------------------------------------------------------------------------
@@ -1760,3 +1761,174 @@ def test_owner_reproof_accepts_the_unchanged_claim(monkeypatch, tmp_path):
 
     assert pid == os.getpid()
     assert not captured.get("terminated")
+
+
+# ---------------------------------------------------------------------------
+# R4-B1 / R4-B2 / R4-B7 — the attestation must execute the worker's exact argv
+# ---------------------------------------------------------------------------
+
+def test_module_fallback_launcher_prefix_is_preserved_intact(tmp_path):
+    """R4-B1: ``python -m hermes_cli.main`` must survive validation.
+
+    Returning only ``argv[0]`` rebuilt the attest call as ``python -p ...``,
+    which the interpreter parses as its own flags — every gated spawn aborts.
+    """
+    from hermes_cli import kanban_db as kb
+
+    argv = [sys.executable, "-m", "hermes_cli.main", "-p", "x", "chat"]
+    prefix = kb._trusted_worker_launcher(argv, str(tmp_path / "ws"))
+    assert prefix == [sys.executable, "-m", "hermes_cli.main"], prefix
+
+
+def test_console_script_launcher_prefix_is_just_the_script(tmp_path):
+    from hermes_cli import kanban_db as kb
+
+    launcher = _launcher_chain(tmp_path)
+    prefix = kb._trusted_worker_launcher(
+        [str(launcher), "-p", "x", "chat"], str(tmp_path / "ws"),
+    )
+    assert prefix == [str(launcher)], prefix
+
+
+def test_venv_symlink_launcher_is_executed_not_dereferenced(tmp_path):
+    """R4-B1: a venv python symlink must not be swapped for its base target.
+
+    Dereferencing changes ``sys.prefix`` and therefore import semantics; the
+    validation may follow the link, the execution may not.
+    """
+    from hermes_cli import kanban_db as kb
+
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    symlink = venv_bin / "python"
+    symlink.symlink_to(sys.executable)
+    prefix = kb._trusted_worker_launcher(
+        [str(symlink), "-m", "hermes_cli.main"], str(tmp_path / "ws"),
+    )
+    assert prefix == [str(symlink), "-m", "hermes_cli.main"], prefix
+
+
+def test_attestation_executes_the_module_fallback_argv_intact(monkeypatch, tmp_path):
+    """R4-B1: ``python -m hermes_cli.main`` must reach the CLI unmodified.
+
+    Asserts the argv actually handed to ``subprocess.run``: the interpreter
+    keeps its ``-m <module>`` pair and the attestation flags land *after* it,
+    where the Hermes CLI parses them rather than the interpreter.
+    """
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.factory_attest import ATTEST_FLAG, VERDICT_PREFIX
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    seen: dict = {}
+    real_run = kb.subprocess.run
+
+    def spy_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["env"] = dict(kwargs.get("env") or {})
+        nonce = argv[-1]
+
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = VERDICT_PREFIX + json.dumps({
+                "nonce": nonce, "armed": ["hook --require-owned-git"],
+                "tree": str(REPO_ROOT), "error": None,
+            })
+
+        return _Result()
+
+    monkeypatch.setattr(kb.subprocess, "run", spy_run)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+    kb._attest_worker_admission_hook_armed(
+        profile_home=profile, env=env,
+        worker_argv=[sys.executable, "-m", "hermes_cli.main", "-p", "x", "chat"],
+        cwd=str(workspace), workspace=str(workspace),
+    )
+    assert real_run is not None
+    assert seen["argv"][:3] == [sys.executable, "-m", "hermes_cli.main"], seen["argv"]
+    assert seen["argv"][3:5] == ["-p", profile.name], seen["argv"]
+    assert seen["argv"][5] == ATTEST_FLAG, seen["argv"]
+    assert len(seen["argv"]) == 7, seen["argv"]
+
+
+@pytest.mark.parametrize("argv", [
+    # R4-B2: the sentinel as ordinary task data must never trigger attest mode.
+    ["-p", "prof", "--cli", "chat", "-q", "--factory-attest-admission"],
+    ["-p", "prof", "chat", "-q", "--factory-attest-admission", "nonce"],
+    ["-p", "prof", "chat", "--", "--factory-attest-admission", "nonce"],
+    ["-p", "prof", "-m", "--factory-attest-admission", "chat", "-q", "hi"],
+    ["-p", "prof", "--skills", "--factory-attest-admission", "chat"],
+])
+def test_sentinel_in_task_data_never_triggers_attest_mode(argv):
+    from hermes_cli.factory_attest import find_attest_nonce
+
+    assert find_attest_nonce(argv) is None, argv
+
+
+@pytest.mark.parametrize("argv,expected", [
+    (["--factory-attest-admission", "abc123"], "abc123"),
+    (["-p", "prof", "--factory-attest-admission", "abc123"], "abc123"),
+    (["--profile", "prof", "--factory-attest-admission", "abc123"], "abc123"),
+])
+def test_attest_mode_is_recognized_only_in_its_exact_grammar(argv, expected):
+    from hermes_cli.factory_attest import find_attest_nonce
+
+    assert find_attest_nonce(argv) == expected
+
+
+@pytest.mark.parametrize("argv", [
+    ["--factory-attest-admission"],                              # missing nonce
+    ["--factory-attest-admission", "a", "b"],                    # trailing junk
+    ["--factory-attest-admission", "a", "--factory-attest-admission", "b"],
+    ["-p", "prof", "--factory-attest-admission", "a", "chat"],   # extra command
+    ["--factory-attest-admission", ""],                          # empty nonce
+])
+def test_malformed_attest_invocations_are_refused(argv):
+    from hermes_cli.factory_attest import find_attest_nonce
+
+    assert find_attest_nonce(argv) is None, argv
+
+
+def test_hostile_python_env_is_scrubbed_in_code_for_worker_and_attestation(
+    monkeypatch, tmp_path,
+):
+    """R4-B7: import-injection env must be scrubbed by us, not by a wrapper.
+
+    Only the packaged bash wrapper unsets PYTHONPATH; a direct console script,
+    a symlink or the module fallback do not. A hostile PYTHONPATH must not
+    reach either the worker or its attestation.
+    """
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(hostile))
+    monkeypatch.setenv("PYTHONHOME", str(hostile))
+    monkeypatch.setenv("PYTHONSTARTUP", str(hostile / "s.py"))
+
+    captured: dict = {}
+    seen: dict = {}
+    _spawn_with_fakes(
+        monkeypatch, kb, captured, attest=lambda **kw: seen.update(kw),
+    )
+    kb._default_spawn(_task(kb), str(workspace))
+
+    for var in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+        assert var not in captured["env"], f"{var} reached the worker"
+        assert var not in seen["env"], f"{var} reached the attestation"
+    # And both must see the *same* environment.
+    assert seen["env"] == captured["env"]

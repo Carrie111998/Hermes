@@ -6,14 +6,17 @@ profile config only proves what the profile *declares*; running a probe with
 the dispatcher's own interpreter only proves the *dispatcher's* install.
 
 This module is the probe, and it lives in the trusted tree on purpose: the
-dispatcher invokes it **through the worker's real launcher** (``hermes -p
-<profile> --factory-attest-admission <nonce>``), so the whole wrapper chain,
-its environment mutations and the install it resolves are exercised exactly as
-the worker will experience them. The verdict is echoed back with the caller's
-challenge nonce so a stale or replayed line cannot be reused.
+dispatcher invokes it **through the worker's own launcher argv**
+(``<launcher prefix> -p <profile> --factory-attest-admission <nonce>``), so the
+whole wrapper chain, its environment mutations and the install it resolves are
+exercised exactly as the worker will experience them. The verdict is echoed
+back with the caller's challenge nonce so a stale or replayed line cannot be
+reused.
 
-Nothing here is user-facing: the flag is intentionally undocumented, takes a
-single opaque argument and prints one machine-readable line.
+The mode is recognized only in an exact, closed argv grammar. A worker task can
+carry arbitrary text — a prompt, a model name, a skill — and any of it could
+equal the sentinel; treating a match anywhere in argv as a mode switch would
+let ordinary task data short-circuit the worker into attest mode and exit 0.
 """
 
 from __future__ import annotations
@@ -26,20 +29,39 @@ from pathlib import Path
 ATTEST_FLAG = "--factory-attest-admission"
 #: Prefix of the single machine-readable output line.
 VERDICT_PREFIX = "HERMES_FACTORY_ATTEST "
+#: The only options allowed to precede the sentinel, with their one value.
+_ALLOWED_LEADING_OPTIONS = {"-p", "--profile"}
 
 
 def find_attest_nonce(argv: list[str]) -> str | None:
-    """Return the challenge nonce when argv requests attestation mode.
+    """Return the challenge nonce only for an exact attest invocation.
 
-    Scans rather than indexing: the dispatcher passes ``-p <profile>`` first so
-    the profile override applies before this runs.
+    Grammar (``argv`` is ``sys.argv[1:]``)::
+
+        [(-p|--profile) VALUE] --factory-attest-admission NONCE
+
+    Nothing may follow the nonce, the sentinel may appear once, and the nonce
+    must be a non-empty value that is not itself the sentinel. Any other shape
+    — including the sentinel appearing as a task value, after ``--``, or as the
+    argument of another option — is ordinary data and returns ``None``.
     """
-    for index, value in enumerate(argv):
-        if value == ATTEST_FLAG:
-            if index + 1 < len(argv):
-                return argv[index + 1]
-            return ""
-    return None
+    if not isinstance(argv, list):
+        return None
+    index = 0
+    while index < len(argv) and argv[index] in _ALLOWED_LEADING_OPTIONS:
+        # The option must carry a value that is not the sentinel itself.
+        if index + 1 >= len(argv) or argv[index + 1] == ATTEST_FLAG:
+            return None
+        index += 2
+    if index >= len(argv) or argv[index] != ATTEST_FLAG:
+        return None
+    # Exactly one nonce, and it must terminate the command line.
+    if len(argv) != index + 2:
+        return None
+    nonce = argv[index + 1]
+    if not nonce or nonce == ATTEST_FLAG:
+        return None
+    return nonce
 
 
 def build_verdict(nonce: str) -> dict:
@@ -53,6 +75,7 @@ def build_verdict(nonce: str) -> dict:
         "armed": [],
         "tree": None,
         "executable": sys.executable,
+        "prefix": sys.prefix,
         "error": None,
     }
     try:
