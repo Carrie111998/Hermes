@@ -92,24 +92,27 @@ aparecieron en los assets rescatados. Si se consiguen, sustituyen el
 
 ### Iconografía e ilustraciones
 
-Sin arte propio de Douglas Agent todavía. Estado actual, punto por punto:
+Sin arte de diseño real de Douglas Agent todavía — todo lo de abajo es un
+placeholder tipográfico generado programáticamente (Pillow, mismo verde
+esmeralda que el resto de la identidad), no diseño encargado. Suficiente
+para no distribuir la marca de un tercero, no para una release pública.
 
 - **`BrandMark`** (`apps/desktop/src/components/brand-mark.tsx`,
-  `apps/bootstrap-installer/src/components/brand-mark.tsx`): placeholder
-  tipográfico "DA" sobre verde esmeralda — ya no usa imagen externa.
-- **Ícono real de la app** (`apps/desktop/assets/icon.{png,ico,icns}`,
-  usado en el `.exe`/`.app`/`.dmg`/taskbar vía `electron-builder`) y los
-  íconos del instalador Tauri (`apps/bootstrap-installer/src-tauri/icons/`):
-  **todavía son la mascota ilustrada de Nous Research** ("nous-girl", con
-  una etiqueta "N" visible). Es el hueco de marca más visible que queda —
-  pendiente de resolución explícita antes de cualquier build pública.
-- **Favicon** (`apps/desktop/public/apple-touch-icon.png`): misma mascota de
-  Nous, usada en las etiquetas `<link>` de `index.html`.
+  `apps/bootstrap-installer/src/components/brand-mark.tsx`): "DA" tipográfico
+  sobre verde esmeralda, sin imagen externa.
+- **Ícono real de la app** (`apps/desktop/assets/icon.{png,ico,icns}`, usado
+  en el `.exe`/`.app`/`.dmg`/taskbar vía `electron-builder`) y los íconos del
+  instalador Tauri (`apps/bootstrap-installer/src-tauri/icons/{128x128,
+  128x128@2x,32x32}.png`, `icon.{ico,icns}`): ya **no** son la mascota de
+  Nous — mismo placeholder "DA" sobre esmeralda, generado en las resoluciones
+  que cada plataforma necesita (incluye un `.icns` escrito a mano con los
+  tipos de ícono modernos basados en PNG, ic07-ic14, porque no había
+  `icnsutil` disponible).
+- **Favicon** (`apps/desktop/public/apple-touch-icon.png`): mismo placeholder,
+  180×180 (el tamaño que pide `index.html`).
 - **Mascota "petdex" de Hermes** (`apps/desktop/public/{hermes.png,
-  hermes-sprite.png,hermes-frames/}` — un personaje pixel-art con casco
-  alado y caduceo): confirmado que **no está referenciada por ningún
-  componente actual** — son archivos huérfanos, seguros de eliminar sin
-  romper nada, pero no eliminados todavía a la espera de confirmación.
+  hermes-sprite.png,hermes-frames/}` — un personaje pixel-art con casco alado
+  y caduceo): eliminada — se confirmó que ningún componente la referenciaba.
 
 ## Estructura
 
