@@ -19,6 +19,8 @@ npub_to_hex = _buzz_mod.npub_to_hex
 _normalize_user_ref = _buzz_mod._normalize_user_ref
 _cli_error_message = _buzz_mod._cli_error_message
 _resolve_private_key = _buzz_mod._resolve_private_key
+_resolve_auth_tag = _buzz_mod._resolve_auth_tag
+_exec_buzz = _buzz_mod._exec_buzz
 check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
@@ -34,6 +36,9 @@ CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 # [] for it (#68871) while `channels list` shows it as name "DM", empty
 # description, indistinguishable from a channel except via message p-tags.
 DM_CHANNEL = "6468cc16-a114-4f23-8b8c-02c1655cbf6b"
+# A second hosted-relay DM: same empty `dms list`, but its kind-9 messages
+# carry only ["h", <dm id>] — no p-tag for the latch to key off.
+HOSTED_DM = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
 
 _ENV_VARS = (
     "BUZZ_RELAY_URL",
@@ -45,7 +50,13 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
 )
+
+# Obviously-fake NIP-OA auth tags (four-string ["auth", …] shape). Never use
+# real credentials in tests.
+FAKE_FILE_AUTH_TAG = json.dumps(["auth", "f" * 64, "", "1" * 128])
+FAKE_ENV_AUTH_TAG = json.dumps(["auth", "e" * 64, "", "2" * 128])
 
 
 @pytest.fixture(autouse=True)
@@ -381,6 +392,274 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(CHANNEL) is False
 
 
+# ── Hosted-relay DMs discovered by kind-44100 membership events ──────────
+#
+# Second flavour of #68871, seen on hosted community relays:
+# `dms list` is empty, the DM only shows up in `channels list` as
+# name "DM"/empty description/no channel_type, AND the owner's kind-9
+# messages carry nothing but ["h", <dm id>] — no p-tag at all.  The p-tag
+# latch can never fire for those, so classification has to come from the
+# authenticated kind-44100 membership event that put the conversation in
+# front of us in the first place.
+
+
+class _RecordingWebSocket:
+    """Captures the frames the adapter sends; no relay round-trip."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+def _membership_event(*, conversation=None, created_at=5000, pubkey=OTHER_PUBKEY):
+    """A kind-44100 channel-membership event p-tagged to us, as delivered on
+    the authenticated (NIP-42) membership subscription."""
+    tags = [["p", SELF_PUBKEY]]
+    if conversation:
+        tags.append(["h", conversation])
+    return {
+        "id": "m1",
+        "pubkey": pubkey,
+        "kind": 44100,
+        "created_at": created_at,
+        "content": "",
+        "tags": tags,
+    }
+
+
+def _h_only_event(event_id, channel, *, content="here's a test message",
+                  pubkey=OTHER_PUBKEY, created_at=5001):
+    """Owner message exactly as the hosted relay emits it inside a DM:
+    kind 9 with a single ["h", <dm id>] tag and no p-tag."""
+    return {
+        "id": event_id,
+        "pubkey": pubkey,
+        "content": content,
+        "created_at": created_at,
+        "kind": 9,
+        "tags": [["h", channel]],
+    }
+
+
+class TestHostedDmMembershipDiscovery:
+
+    def _adapter(self, extra=None):
+        a = _make_adapter(extra)
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        return a
+
+    def _cli(self, *channel_entries):
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])          # hosted relay: always empty
+        cli.script("channels", "list", list(channel_entries))
+        return cli
+
+    @pytest.mark.asyncio
+    async def test_membership_discovered_dm_dispatches_h_only_message(self):
+        """The reported bug end to end: `dms list` empty, DM-shaped fallback
+        metadata, discovery driven by an authenticated membership event, then
+        a kind-9 owner message with no p-tag — it must route as a DM."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates."},
+        )
+        websocket = _RecordingWebSocket()
+        subscriptions = {}
+
+        await a._handle_membership_event(
+            websocket, subscriptions, _membership_event(conversation=HOSTED_DM)
+        )
+
+        # The new conversation is watched and subscribed to over the WS.
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        assert HOSTED_DM in subscriptions.values()
+        assert [f[2]["#h"] for f in websocket.sent if f[0] == "REQ"] == [[HOSTED_DM]]
+        # The real channel is neither watched nor reclassified.
+        assert CHANNEL not in a._channel_state
+
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert [d["message_id"] for d in a._dispatched] == ["e1"]
+        assert a._dispatched[0]["chat_type"] == "dm"
+
+    @pytest.mark.asyncio
+    async def test_real_channel_named_dm_is_not_reclassified(self):
+        """Negative: a real channel that merely calls itself "DM" must not
+        become a DM or escape the mention gate, even when it shows up in the
+        same authenticated membership pass."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            # Real channels carry a channel_type; relay-materialized DMs don't.
+            {"channel_id": CHANNEL, "name": "DM", "description": "",
+             "channel_type": "channel"},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=CHANNEL)
+        )
+
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        await a._handle_event(
+            CHANNEL, a._channel_state[CHANNEL], _h_only_event("e1", CHANNEL)
+        )
+        assert a._dispatched == []
+        # Still reachable the normal way — the mention gate, not a mute.
+        await a._handle_event(
+            CHANNEL, a._channel_state[CHANNEL],
+            _h_only_event("e2", CHANNEL, content="@Chip ping", created_at=5002),
+        )
+        assert [d["chat_type"] for d in a._dispatched] == ["group"]
+
+    @pytest.mark.asyncio
+    async def test_configured_channel_named_dm_is_not_reclassified(self):
+        """A conversation the operator explicitly configured as a watched
+        channel stays a channel, whatever it is named."""
+        a = self._adapter({"channels": [CHANNEL]})
+        a._run_cli = self._cli({"channel_id": CHANNEL, "name": "DM", "description": ""})
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=CHANNEL)
+        )
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_membership_event_only_promotes_the_conversation_it_names(self):
+        """A membership event naming one conversation must not promote some
+        other DM-shaped entry that happens to appear in the same listing."""
+        other_dm = "11111111-2222-3333-4444-555555555555"
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": other_dm, "name": "DM", "description": ""},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        assert a._channel_state[other_dm]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("conversations", [[], [HOSTED_DM, CHANNEL]])
+    async def test_membership_event_that_names_no_single_conversation_promotes_nothing(
+        self, conversations
+    ):
+        """Fail closed on shapes the relay is not known to emit: an event
+        naming no conversation — or several — promotes none of them, however
+        DM-shaped the listing looks."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": CHANNEL, "name": "DM", "description": ""},
+        )
+        event = _membership_event()
+        event["tags"] += [["h", c] for c in conversations]
+
+        await a._handle_membership_event(_RecordingWebSocket(), {}, event)
+
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_typed_conversation_named_dm_is_not_reclassified(self):
+        """A ``channels list`` entry that carries any channel_type at all is
+        not the untyped hosted-DM shape, so it stays a channel."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": "", "channel_type": "dm"},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_discovery_keeps_group_classification(self):
+        """Without a membership event (startup seeding / poll sweeps), the
+        fallback listing alone never unlocks the DM path — name "DM" is not
+        evidence on its own."""
+        a = self._adapter()
+        a._run_cli = self._cli({"channel_id": HOSTED_DM, "name": "DM", "description": ""})
+        await a._discover_dms(seed=False)
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_allowlist_still_gates_membership_discovered_dm(self):
+        """DM classification must not bypass the adapter allow-list."""
+        a = self._adapter()
+        a._allowed_pubkeys = {"b" * 64}
+        a._run_cli = self._cli({"channel_id": HOSTED_DM, "name": "DM", "description": ""})
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_membership_event_classifies_already_watched_hosted_dm(self):
+        """A DM that already existed at gateway start is watched as ``group``
+        by startup seeding, so it is not a *new* find when the membership
+        event lands.  The same two facts still classify it — otherwise every
+        pre-existing hosted DM stays behind the mention gate until the
+        conversation is recreated."""
+        a = self._adapter()
+        a._run_cli = self._cli({"channel_id": HOSTED_DM, "name": "DM", "description": ""})
+        await a._discover_dms(seed=False)          # startup/poll discovery
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert [d["chat_type"] for d in a._dispatched] == ["dm"]
+
+    @pytest.mark.asyncio
+    async def test_membership_event_leaves_already_watched_channel_alone(self):
+        """The same promotion must not reach a watched real channel that a
+        membership event happens to name."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates."},
+        )
+        a._channel_meta[CHANNEL] = {
+            "channel_id": CHANNEL, "name": "general",
+            "description": "General conversation and community updates.",
+        }
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=CHANNEL)
+        )
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        await a._handle_event(
+            CHANNEL, a._channel_state[CHANNEL], _h_only_event("e1", CHANNEL)
+        )
+        assert a._dispatched == []
+
+
 # ── Sending ───────────────────────────────────────────────────────────────
 
 
@@ -482,6 +761,370 @@ class TestCredentialResolution:
         assert _resolve_private_key() == "nsec1fromfile"
 
 
+class TestAuthTagResolution:
+    """The NIP-OA auth tag resolves like the private key: env, then the same
+    credentials JSON (configured or auto-discovered).  A hosted relay that
+    requires NIP-OA attestation rejects the NIP-42 handshake with
+    relay_membership_required when the tag sitting in the credentials file
+    never reaches the auth event."""
+
+    def test_env_auth_tag_wins_over_credentials_file(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+        assert _resolve_auth_tag() == FAKE_ENV_AUTH_TAG
+
+    def test_blank_env_auth_tag_falls_back_to_file(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": f"  {FAKE_FILE_AUTH_TAG}  "}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", "   ")
+        assert _resolve_auth_tag() == FAKE_FILE_AUTH_TAG
+
+    def test_one_credentials_file_serves_key_and_tag(self, monkeypatch, tmp_path):
+        """The documented credentials_file config selects a single source for
+        both the nsec and the auth tag."""
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        extra = {"credentials_file": str(creds)}
+        assert _resolve_private_key(extra) == "nsec1fromfile"
+        assert _resolve_auth_tag(extra) == FAKE_FILE_AUTH_TAG
+
+    def test_auto_discovered_credentials_file(self, monkeypatch, tmp_path):
+        creds_dir = tmp_path / "buzz-config"
+        creds_dir.mkdir()
+        (creds_dir / "hermes_credentials.json").write_text(
+            json.dumps({"nsec": "nsec1discovered", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", creds_dir)
+        assert _resolve_private_key() == "nsec1discovered"
+        assert _resolve_auth_tag() == FAKE_FILE_AUTH_TAG
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            json.dumps({"nsec": "nsec1fromfile"}),          # field absent
+            json.dumps({"auth_tag": ["auth", "f" * 64]}),   # non-string value
+            json.dumps({"auth_tag": "   "}),                # blank string
+            json.dumps(["not", "a", "dict"]),               # non-dict document
+            "{not json at all",                             # malformed
+        ],
+    )
+    def test_unusable_auth_tag_resolves_empty(self, monkeypatch, tmp_path, payload):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(payload, encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        assert _resolve_auth_tag() == ""
+
+    def test_unreadable_credentials_file_resolves_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(tmp_path / "does-not-exist.json"))
+        assert _resolve_auth_tag() == ""
+
+
+@pytest.fixture
+def spawned(monkeypatch):
+    """Capture the env of the subprocess ``_exec_buzz`` would spawn."""
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+
+        async def communicate(self, data=None):
+            return b"[]", b""
+
+    async def fake_spawn(cli_path, *args, **kwargs):
+        captured.update(cli_path=cli_path, args=list(args), env=kwargs.get("env") or {})
+        return _FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+    return captured
+
+
+class TestAuthTagReachesCli:
+    """Every buzz CLI subprocess must inherit the resolved auth tag, so hosted
+    relays accept the CLI's own NIP-42 handshake."""
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_exports_auth_tag(self, spawned):
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"],
+            relay_url="https://r", private_key="nsec1x", auth_tag=FAKE_FILE_AUTH_TAG,
+        )
+        assert spawned["env"]["BUZZ_AUTH_TAG"] == FAKE_FILE_AUTH_TAG
+        assert spawned["env"]["BUZZ_RELAY_URL"] == "https://r"
+        assert spawned["env"]["BUZZ_PRIVATE_KEY"] == "nsec1x"
+        # Credentials travel by env only — never argv.
+        assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in spawned["args"])
+        assert all("nsec1x" not in str(a) for a in spawned["args"])
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_leaves_auth_tag_unset_when_empty(self, monkeypatch, spawned):
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        assert "BUZZ_AUTH_TAG" not in spawned["env"]
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_never_clobbers_inherited_auth_tag(self, monkeypatch, spawned):
+        """An unresolved tag must leave whatever the parent process exports
+        alone rather than blanking it out."""
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        assert spawned["env"]["BUZZ_AUTH_TAG"] == FAKE_ENV_AUTH_TAG
+
+    @pytest.mark.asyncio
+    async def test_run_cli_forwards_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "credentials_file": str(creds)},
+        ))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(private_key=private_key, auth_tag=auth_tag)
+            return 0, "[]", ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        await adapter._run_cli(["users", "get"])
+        assert captured == {"private_key": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}
+
+
+class TestCliSubprocessEnvironment:
+    """The buzz CLI is a third-party binary talking to a third-party relay, so
+    it is spawned with a narrow allowlist (``_CLI_SAFE_ENV_KEYS`` + the
+    parent's own ``BUZZ_*`` settings) instead of a copy of this process's
+    environment — no other provider's key or Hermes internal goes with it.
+    Fake values only; nothing here is a real credential."""
+
+    # Sentinels: a secret-shaped non-BUZZ name, plus a plain unrelated one.
+    FAKE_FOREIGN_SECRET = "sk-fake-not-a-real-key-0000"
+    FAKE_UNRELATED = "hermes-internal-sentinel"
+
+    def _set_parent_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OPENAI_API_KEY", self.FAKE_FOREIGN_SECRET)
+        monkeypatch.setenv("HERMES_HOME", self.FAKE_UNRELATED)
+        monkeypatch.setenv("AWS_SESSION_TOKEN", self.FAKE_FOREIGN_SECRET)
+        monkeypatch.setenv("LANG", "C.UTF-8")
+        monkeypatch.setenv("TMPDIR", str(tmp_path))
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "ca.pem"))
+        monkeypatch.setenv("PATH", "/fake/bin")
+        monkeypatch.delenv("LC_ALL", raising=False)
+        # Unrelated BUZZ_* settings a user exported for the CLI itself.
+        monkeypatch.setenv("BUZZ_TRANSPORT", "poll")
+        monkeypatch.setenv("BUZZ_CHANNELS", CHANNEL)
+
+    @pytest.mark.asyncio
+    async def test_foreign_environment_does_not_reach_the_cli(
+        self, monkeypatch, tmp_path, spawned
+    ):
+        """Unrelated parent variables — including secret-shaped ones — are not
+        handed to the buzz subprocess, by name or by value."""
+        self._set_parent_env(monkeypatch, tmp_path)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"],
+            relay_url="https://r", private_key="nsec1x", auth_tag=FAKE_FILE_AUTH_TAG,
+        )
+        env = spawned["env"]
+
+        assert "OPENAI_API_KEY" not in env
+        assert "HERMES_HOME" not in env
+        assert "AWS_SESSION_TOKEN" not in env
+        assert self.FAKE_FOREIGN_SECRET not in env.values()
+        assert self.FAKE_UNRELATED not in env.values()
+        # Nothing outside the allowlist / BUZZ_* namespace survives at all.
+        assert all(
+            k in _buzz_mod._CLI_SAFE_ENV_KEYS or k.startswith("BUZZ_") for k in env
+        ), sorted(env)
+
+    @pytest.mark.asyncio
+    async def test_runtime_keys_and_buzz_settings_are_preserved(
+        self, monkeypatch, tmp_path, spawned
+    ):
+        """The CLI still needs to find its binary, a temp dir, a locale and the
+        trust store — and the user's own BUZZ_* settings."""
+        self._set_parent_env(monkeypatch, tmp_path)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        env = spawned["env"]
+
+        assert env["PATH"] == "/fake/bin"
+        assert env["LANG"] == "C.UTF-8"
+        assert env["TMPDIR"] == str(tmp_path)
+        assert env["SSL_CERT_FILE"] == str(tmp_path / "ca.pem")
+        assert env["BUZZ_TRANSPORT"] == "poll"
+        assert env["BUZZ_CHANNELS"] == CHANNEL
+        # Allowlisted keys the parent does not set are not invented.
+        assert "LC_ALL" not in env
+
+    @pytest.mark.asyncio
+    async def test_windows_runtime_keys_reach_the_cli(self, monkeypatch, tmp_path, spawned):
+        """The Windows spelling of the same runtime facts is inherited too: a
+        CLI spawned on Windows without SystemRoot / USERPROFILE / TEMP has no
+        system directory, home or temp dir at all.  Foreign variables stay
+        filtered out either way."""
+        self._set_parent_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("SYSTEMROOT", r"C:\Windows")
+        monkeypatch.setenv("USERPROFILE", r"C:\Users\agent")
+        monkeypatch.setenv("TEMP", r"C:\Users\agent\AppData\Local\Temp")
+        monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT")
+
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        env = spawned["env"]
+
+        assert env["SYSTEMROOT"] == r"C:\Windows"
+        assert env["USERPROFILE"] == r"C:\Users\agent"
+        assert env["TEMP"] == r"C:\Users\agent\AppData\Local\Temp"
+        assert env["PATHEXT"] == ".COM;.EXE;.BAT"
+        assert "OPENAI_API_KEY" not in env
+        assert self.FAKE_FOREIGN_SECRET not in env.values()
+
+    @pytest.mark.asyncio
+    async def test_call_specific_values_override_inherited_ones(
+        self, monkeypatch, tmp_path, spawned
+    ):
+        """A resolved relay/key/tag always wins over whatever the parent
+        exported — the adapter's config, not the ambient shell, decides."""
+        self._set_parent_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://inherited.relay")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1inherited")
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"],
+            relay_url="https://resolved.relay", private_key="nsec1resolved",
+            auth_tag=FAKE_FILE_AUTH_TAG,
+        )
+        env = spawned["env"]
+
+        assert env["BUZZ_RELAY_URL"] == "https://resolved.relay"
+        assert env["BUZZ_PRIVATE_KEY"] == "nsec1resolved"
+        assert env["BUZZ_AUTH_TAG"] == FAKE_FILE_AUTH_TAG
+        # Credentials travel by env only — never argv (see also
+        # test_exec_buzz_never_clobbers_inherited_auth_tag for the empty-tag
+        # half of this contract).
+        assert all("nsec1resolved" not in str(a) for a in spawned["args"])
+        assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in spawned["args"])
+
+    @pytest.mark.asyncio
+    async def test_inherited_auth_tag_survives_the_allowlist(
+        self, monkeypatch, tmp_path, spawned
+    ):
+        """An unresolved tag leaves the inherited one in place: the allowlist
+        filters foreign variables, it does not drop BUZZ_* credentials."""
+        self._set_parent_env(monkeypatch, tmp_path)
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        assert spawned["env"]["BUZZ_AUTH_TAG"] == FAKE_ENV_AUTH_TAG
+
+
+class TestAuthTagReachesWebSocket:
+    """The NIP-42 handshake must sign the resolved auth tag — reading only the
+    parent environment loses a tag that lives in the credentials file, which
+    hosted relays answer with 403 relay_membership_required."""
+
+    class _FakeWebSocket:
+        """Replays a NIP-42 handshake: AUTH challenge, then OK for the reply."""
+
+        def __init__(self):
+            self.sent = []
+
+        async def recv(self):
+            if self.sent:
+                return json.dumps(["OK", self.sent[0][1]["id"], True, "authenticated"])
+            return json.dumps(["AUTH", "relay-challenge"])
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+    @pytest.mark.asyncio
+    async def test_auth_event_carries_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "credentials_file": str(creds)},
+        ))
+
+        signed = {}
+
+        def fake_build_auth_event(*, private_key, challenge, relay_url, auth_tag_json=""):
+            signed.update(private_key=private_key, auth_tag_json=auth_tag_json)
+            return {"id": "evt-auth", "kind": 22242}
+
+        monkeypatch.setattr(
+            _buzz_mod, "_load_nostr_auth",
+            lambda: MagicMock(build_auth_event=fake_build_auth_event),
+        )
+
+        async def fake_exec(cli_path, args, **kwargs):
+            return 0, "[]", ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        # The adapter lifecycle resolves credentials before the WS starts.
+        await adapter._run_cli(["users", "get"])
+
+        await adapter._authenticate_websocket(self._FakeWebSocket())
+        assert signed == {"private_key": "nsec1fromfile", "auth_tag_json": FAKE_FILE_AUTH_TAG}
+
+    @pytest.mark.asyncio
+    async def test_malformed_file_auth_tag_fails_the_handshake_without_leaking(
+        self, monkeypatch, tmp_path
+    ):
+        """A credentials file whose auth_tag is a non-blank but unusable
+        string must fail the handshake the same way a bad BUZZ_AUTH_TAG does
+        — the WS loop treats that as a disconnect and `auto` transport falls
+        back to polling — and the rejected value must not reach the error."""
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"private_key_hex": "00" * 31 + "03", "auth_tag": "not-json-at-all"}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "credentials_file": str(creds)},
+        ))
+        adapter._resolve_credentials()
+        assert adapter._auth_tag == "not-json-at-all"
+
+        with pytest.raises(ValueError) as excinfo:
+            await adapter._authenticate_websocket(self._FakeWebSocket())
+        assert "not-json-at-all" not in str(excinfo.value)
+
+
 # ── Env enablement / registration / standalone send ──────────────────────
 
 
@@ -524,7 +1167,8 @@ class TestStandaloneSend:
 
         captured = {}
 
-        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
             captured.update(cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text)
             return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
 
@@ -536,5 +1180,93 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_forwards_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        """Out-of-process cron sends resolve the auth tag the same way the
+        live adapter does."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(private_key=private_key, auth_tag=auth_tag, args=args)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-cron"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi")
+        assert result == {"success": True, "message_id": "evt-cron"}
+        assert captured["private_key"] == "nsec1fromfile"
+        assert captured["auth_tag"] == FAKE_FILE_AUTH_TAG
+        assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_passes_only_paths_from_media_tuples(self, monkeypatch, tmp_path):
+        """``cron/scheduler.py`` and ``send_message_tool`` hand media over as
+        ``(path, is_voice)`` pairs (``BasePlatformAdapter.extract_media`` /
+        ``filter_media_delivery_paths``). Each ``--file`` argument must be the
+        resolved path alone — a stringified pair is an unopenable path to the
+        buzz CLI. A JSON-round-tripped pair (list) and a bare string from
+        callers that never adopted the pair contract keep working."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        report = tmp_path / "report.txt"
+        voice = tmp_path / "voice.ogg"
+        chart = tmp_path / "chart.png"
+        legacy = tmp_path / "legacy.pdf"
+        for f in (report, voice, chart, legacy):
+            f.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(args=args, input_text=input_text)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-media"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            CHANNEL,
+            "here are the files",
+            thread_id="evt-parent",
+            media_files=[
+                (str(report), False),
+                (str(voice), True),
+                [str(chart), False],
+                str(legacy),
+            ],
+        )
+
+        assert result == {"success": True, "message_id": "evt-media"}
+        args = captured["args"]
+        assert [args[i + 1] for i, a in enumerate(args) if a == "--file"] == [
+            str(report), str(voice), str(chart), str(legacy),
+        ]
+        # Ordinary text still rides on stdin, and the reply target on argv.
+        assert captured["input_text"] == "here are the files"
+        assert args[args.index("--reply-to") + 1] == "evt-parent"
+        # Neither the key nor the is_voice flag leaks into argv.
+        assert all("nsec1x" not in str(a) for a in args)
+        assert all("False" not in str(a) and "True" not in str(a) for a in args)
 
 

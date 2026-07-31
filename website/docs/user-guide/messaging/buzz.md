@@ -4,7 +4,7 @@ The Buzz adapter connects Hermes to a [Buzz](https://github.com/block/buzz) comm
 
 Buzz renders markdown, so agent replies keep their formatting. Images are delivered as uploads (local files) or links (URLs). Replies can thread onto an existing message via its event id.
 
-Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON.
+Inbound messages arrive over a persistent NIP-42-authenticated Nostr WebSocket subscription by default (near-instant delivery), with automatic fallback to CLI polling when the WebSocket can't be established. Outbound messages always go through the `buzz` CLI. Control it with `transport` / `BUZZ_TRANSPORT`: `auto` (default), `websocket` (require WS, fail otherwise), or `poll`. If your relay membership uses NIP-OA owner attestation, set `BUZZ_AUTH_TAG` to the four-string auth tag JSON, or put it in the `credentials_file` as `auth_tag` alongside the nsec.
 
 > Run `hermes gateway setup` and pick **Buzz** for a guided walk-through.
 
@@ -33,6 +33,7 @@ gateway:
         poll_interval: 4           # seconds between inbound poll sweeps
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
+                                   #   and optional auth_tag (BUZZ_AUTH_TAG fallback)
         allowed_users: []          # empty = allow all; hex pubkeys or npubs
 ```
 
@@ -77,7 +78,7 @@ gateway:
         home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
         poll_interval: 4                  # seconds between inbound poll sweeps (default 4 — balances latency vs. relay load)
         cli_path: ""                      # buzz binary (default: PATH, then ~/bin/buzz)
-        credentials_file: ""              # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
+        credentials_file: ""              # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback) and optional auth_tag (BUZZ_AUTH_TAG fallback)
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
         require_mention: true             # in channels: only respond when addressed (@name, npub, or hex pubkey); DMs always dispatch regardless
         allow_all_users: false            # set true for community mode (everyone can chat, only owner is admin); false for private mode (only allowed_users)
