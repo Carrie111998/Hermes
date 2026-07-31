@@ -38,6 +38,26 @@ def _redact_telegram_error_text(error: object) -> str:
         return "<telegram error redacted>"
 
 
+def _model_picker_labels(model_ids: list[str]) -> list[str]:
+    """Build readable, unambiguous labels for model-picker buttons.
+
+    Provider-qualified IDs such as ``cc/claude-opus-5`` and
+    ``kr/claude-opus-5`` have the same short suffix. Keep the compact suffix
+    for unambiguous models, but retain the full ID when shortening would make
+    two buttons indistinguishable. The returned labels are display-only; the
+    original IDs remain in the picker state for callbacks.
+    """
+    short_ids = [model_id.rsplit("/", 1)[-1] for model_id in model_ids]
+    counts: dict[str, int] = {}
+    for short_id in short_ids:
+        counts[short_id] = counts.get(short_id, 0) + 1
+
+    return [
+        model_id if counts[short_id] > 1 else short_id
+        for model_id, short_id in zip(model_ids, short_ids)
+    ]
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -5826,13 +5846,18 @@ class TelegramAdapter(BasePlatformAdapter):
         start = page_meta["start"]
 
         buttons: list = []
+        labels = _model_picker_labels(models)
+        displayed_labels: set[str] = set()
         for i, model_id in enumerate(page_models):
             abs_idx = start + i
-            short = model_id.split("/")[-1] if "/" in model_id else model_id
-            if len(short) > 38:
-                short = short[:35] + "..."
+            label = labels[abs_idx]
+            if len(label) > 38:
+                label = label[:35] + "..."
+            if label in displayed_labels:
+                label = f"{label[:32]}...[{abs_idx}]"
+            displayed_labels.add(label)
             buttons.append(
-                InlineKeyboardButton(short, callback_data=f"mm:{abs_idx}")
+                InlineKeyboardButton(label, callback_data=f"mm:{abs_idx}")
             )
 
         rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
