@@ -425,6 +425,183 @@ def test_config_roundtrip(server, tmp_path):
     assert server._load_cfg()["model"] == "test/model"
 
 
+# ── config.set managed-scope write guard ─────────────────────────────
+
+
+@pytest.fixture()
+def managed_gw(server, tmp_path, monkeypatch):
+    """Gateway pointed at a throwaway HERMES_HOME plus a managed scope.
+
+    ``seed()`` rewrites both config files and drops every cache that would
+    otherwise serve a stale (empty) managed config — without the
+    ``invalidate_managed_cache()`` call these tests pass for the wrong reason.
+    """
+    from hermes_cli import managed_scope
+
+    home = tmp_path / "home"
+    home.mkdir()
+    managed = tmp_path / "managed"
+    managed.mkdir()
+
+    previous_home = server._hermes_home
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    server._hermes_home = home
+
+    def _reset_caches():
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        managed_scope.invalidate_managed_cache()
+
+    def seed(user_yaml="theme: dark\n", managed_yaml=""):
+        (home / "config.yaml").write_text(user_yaml, encoding="utf-8")
+        (managed / "config.yaml").write_text(managed_yaml, encoding="utf-8")
+        _reset_caches()
+
+    def user_text():
+        return (home / "config.yaml").read_text(encoding="utf-8")
+
+    seed()
+    yield types.SimpleNamespace(
+        home=home, managed=managed, seed=seed, user_text=user_text
+    )
+    server._hermes_home = previous_home
+    _reset_caches()
+
+
+def _set(server, **params):
+    return server.handle_request({"id": "r1", "method": "config.set", "params": params})
+
+
+@pytest.mark.parametrize(
+    ("managed_yaml", "params", "blocked_key"),
+    [
+        # Funnel path: every _write_config_key() call site at once.
+        (
+            "display:\n  tui_theme: corporate\n",
+            {"key": "theme", "value": "light"},
+            "display.tui_theme",
+        ),
+        # The exact case the review named: `reasoning` mutates and saves
+        # directly, bypassing _write_config_key().
+        (
+            "display:\n  sections:\n    thinking: hidden\n",
+            {"key": "reasoning", "value": "show"},
+            "display.sections.thinking",
+        ),
+        # Second leaf of the same branch.
+        (
+            "display:\n  show_reasoning: false\n",
+            {"key": "reasoning", "value": "hide"},
+            "display.show_reasoning",
+        ),
+        # reasoning_full leaf, written by the full/clamp sub-branches.
+        (
+            "display:\n  reasoning_full: false\n",
+            {"key": "reasoning", "value": "full"},
+            "display.reasoning_full",
+        ),
+        # details_mode fans out to every section leaf — a pinned leaf must
+        # block it even though the head key (display.details_mode) is free.
+        (
+            "display:\n  sections:\n    tools: collapsed\n",
+            {"key": "details_mode", "value": "expanded"},
+            "display.sections.tools",
+        ),
+        # Per-section override, set path.
+        (
+            "display:\n  sections:\n    activity: collapsed\n",
+            {"key": "details_mode.activity", "value": "expanded"},
+            "display.sections.activity",
+        ),
+        # Per-section override, empty-value CLEAR path — clearing a pinned
+        # leaf is just as much a write.
+        (
+            "display:\n  sections:\n    activity: collapsed\n",
+            {"key": "details_mode.activity", "value": ""},
+            "display.sections.activity",
+        ),
+        # Top-level leaf (not under display.).
+        (
+            "custom_prompt: policy prompt\n",
+            {"key": "prompt", "value": "mine"},
+            "custom_prompt",
+        ),
+        # The `prompt` clear path pops the key — still a write.
+        (
+            "custom_prompt: policy prompt\n",
+            {"key": "prompt", "value": "clear"},
+            "custom_prompt",
+        ),
+        # Sibling site: a global model switch persists model.* through
+        # cli.save_config_value, which has no managed guard of its own.
+        (
+            "model:\n  default: acme/pinned\n",
+            {"key": "model", "value": "other/model --global"},
+            "model.default",
+        ),
+    ],
+)
+def test_config_set_refuses_managed_key(
+    server, managed_gw, managed_yaml, params, blocked_key
+):
+    """A managed-pinned leaf must yield 4030 and leave config.yaml untouched."""
+    managed_gw.seed(managed_yaml=managed_yaml)
+    before = managed_gw.user_text()
+
+    resp = _set(server, **params)
+
+    assert "error" in resp, f"expected a refusal, got {resp}"
+    assert resp["error"]["code"] == 4030
+    assert blocked_key in resp["error"]["message"]
+    assert "managed by your administrator" in resp["error"]["message"]
+    # The refusal must be a no-write, not a write plus a warning.
+    assert managed_gw.user_text() == before
+
+
+def test_config_set_allows_unpinned_key_with_managed_scope_present(server, managed_gw):
+    """Negative control: a managed scope that pins something else must not block.
+
+    Without this the suite cannot tell "the guard works" apart from "writes are
+    broken".
+    """
+    managed_gw.seed(managed_yaml="display:\n  tui_theme: corporate\n")
+
+    resp = _set(server, key="density", value="on")
+
+    assert "error" not in resp, resp
+    assert resp["result"]["value"] == "on"
+    assert server._load_cfg_raw()["display"]["tui_compact"] is True
+
+
+def test_config_set_writes_normally_without_managed_scope(
+    server, managed_gw, monkeypatch
+):
+    """Fail-open control: no managed scope configured → unchanged behavior."""
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    managed_gw.seed(managed_yaml="")
+
+    resp = _set(server, key="theme", value="light")
+
+    assert "error" not in resp, resp
+    assert server._load_cfg_raw()["display"]["tui_theme"] == "light"
+
+
+def test_managed_guard_matches_exact_leaf_only(server, managed_gw):
+    """A pinned sibling leaf must not block an unpinned one.
+
+    ``is_key_managed`` is exact dotted-leaf matching, so a managed
+    ``display.show_reasoning`` leaves ``display.tui_theme`` writable.
+    """
+    managed_gw.seed(managed_yaml="display:\n  show_reasoning: true\n")
+
+    resp = _set(server, key="theme", value="light")
+
+    assert "error" not in resp, resp
+    assert server._load_cfg_raw()["display"]["tui_theme"] == "light"
+
+
 # ── _cli_exec_blocked ────────────────────────────────────────────────
 
 
