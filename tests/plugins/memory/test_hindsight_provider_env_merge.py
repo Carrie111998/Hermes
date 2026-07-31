@@ -1,12 +1,10 @@
 """Tests for RC1 (env file merge) and RC3 (spurious-change fix) in #70606."""
 
-import os
 from pathlib import Path
 
 import pytest
 
 from plugins.memory.hindsight import (
-    _build_embedded_profile_env,
     _embedded_config_changed,
     _embedded_profile_env_path,
     _load_simple_env,
@@ -14,15 +12,26 @@ from plugins.memory.hindsight import (
 )
 
 
+@pytest.fixture
+def user_home(tmp_path, monkeypatch):
+    """Redirect the embedded-profile env path into ``tmp_path``.
+
+    ``_embedded_profile_env_path()`` resolves through ``Path.home()``. On
+    Windows that reads USERPROFILE/HOMEDRIVE+HOMEPATH and ignores the POSIX
+    ``HOME`` alias, so patching the env var alone would let these tests write
+    into a real home directory. Patch the API itself — matching the fixture in
+    ``test_hindsight_provider.py`` — and keep ``HOME`` set for any code that
+    reads it directly.
+    """
+    h = tmp_path / "user-home"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: h))
+    return h
+
+
 class TestEmbeddedProfileEnvMerge:
     """RC1: env file write must preserve user-added keys, not clobber them."""
-
-    @pytest.fixture
-    def user_home(self, tmp_path, monkeypatch):
-        h = tmp_path / "user-home"
-        h.mkdir()
-        monkeypatch.setenv("HOME", str(h))
-        return h
 
     def test_fresh_install_writes_hermes_keys(self, user_home):
         config = {
@@ -97,13 +106,6 @@ class TestEmbeddedProfileEnvMerge:
 class TestEmbeddedConfigChanged:
     """RC3: user keys must not trigger spurious daemon restarts."""
 
-    @pytest.fixture
-    def user_home(self, tmp_path, monkeypatch):
-        h = tmp_path / "user-home"
-        h.mkdir()
-        monkeypatch.setenv("HOME", str(h))
-        return h
-
     def test_no_change_when_user_keys_differ(self, user_home):
         config = {
             "profile": "hermes",
@@ -175,13 +177,6 @@ class TestEmbeddedConfigChanged:
 
 class TestEmbeddedConfigPresentToAbsent:
     """RC4: Hermes-owned keys removed from config must be deleted from env file."""
-
-    @pytest.fixture
-    def user_home(self, tmp_path, monkeypatch):
-        h = tmp_path / "user-home"
-        h.mkdir()
-        monkeypatch.setenv("HOME", str(h))
-        return h
 
     def test_detects_removed_base_url(self, user_home):
         """When llm_base_url is removed from config, _embedded_config_changed should return True."""
