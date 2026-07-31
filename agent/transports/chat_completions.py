@@ -389,6 +389,7 @@ class ChatCompletionsTransport(ProviderTransport):
             # Temperature
             fixed_temperature: Any — from _fixed_temperature_for_model()
             omit_temperature: bool
+            temperature: float | None — caller-supplied (global config / per-call)
             # Reasoning
             supports_reasoning: bool
             github_reasoning_extra: dict | None
@@ -434,6 +435,18 @@ class ChatCompletionsTransport(ProviderTransport):
         timeout = params.get("timeout")
         if timeout is not None:
             api_kwargs["timeout"] = timeout
+
+        # Temperature — priority: omit (provider manages server-side) >
+        # provider fixed value > caller-supplied value. Mirrors the profile
+        # path in _build_kwargs_from_profile so both paths agree.
+        if params.get("omit_temperature", False):
+            pass  # Don't include temperature at all
+        elif params.get("fixed_temperature") is not None:
+            api_kwargs["temperature"] = params["fixed_temperature"]
+        else:
+            _user_temp = params.get("temperature")
+            if _user_temp is not None:
+                api_kwargs["temperature"] = _user_temp
 
         # Tools
         if tools:

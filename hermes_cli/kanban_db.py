@@ -959,6 +959,10 @@ class Task:
     # worker runs at that depth regardless of the profile's
     # ``agent.reasoning_effort``. NULL = the worker profile's own setting.
     reasoning_effort: Optional[str] = None
+    # Per-task sampling temperature override (0.0-2.0). When set, the
+    # dispatcher passes ``--temperature <value>`` to the worker, overriding
+    # the profile's configured temperature. NULL = use the profile default.
+    model_temperature: Optional[float] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1065,6 +1069,11 @@ class Task:
             reasoning_effort=(
                 row["reasoning_effort"]
                 if "reasoning_effort" in keys and row["reasoning_effort"]
+                else None
+            ),
+            model_temperature=(
+                row["model_temperature"]
+                if "model_temperature" in keys and row["model_temperature"] is not None
                 else None
             ),
             max_retries=(
@@ -1240,6 +1249,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- passes --reasoning <level> so the worker runs at that depth regardless
     -- of the profile's agent.reasoning_effort. NULL = profile setting.
     reasoning_effort     TEXT,
+    -- Per-task sampling temperature override. When set, the dispatcher
+    -- passes --temperature <value> to the worker, overriding the profile's
+    -- configured temperature. NULL = use the profile default.
+    model_temperature    REAL,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -2435,6 +2448,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "reasoning_effort", "reasoning_effort TEXT"
         )
 
+    if "model_temperature" not in cols:
+        # Per-task sampling temperature override. Existing rows get NULL,
+        # which keeps their current behaviour (profile default temperature).
+        _add_column_if_missing(
+            conn, "tasks", "model_temperature", "model_temperature REAL"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2903,6 +2923,7 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    model_temperature: Optional[float] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
@@ -2939,6 +2960,10 @@ def create_task(
     (``minimal``…``ultra``, or ``none`` to disable thinking), passed as
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
+
+    ``model_temperature`` pins the worker's sampling temperature
+    (dispatcher passes ``--temperature <value>``); None keeps the
+    profile's configured value.
 
     ``project_source_task_id`` is an internal cross-profile fallback for a
     worker-created child. When the active profile cannot resolve ``project_id``
@@ -3216,9 +3241,9 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
+                        reasoning_effort, model_temperature,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3241,6 +3266,7 @@ def create_task(
                         model_override,
                         provider_override,
                         reasoning_effort,
+                        model_temperature,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -9125,6 +9151,9 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
+
+    if task.model_temperature is not None:
+        cmd.extend(["--temperature", str(task.model_temperature)])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])

@@ -2811,6 +2811,7 @@ def build_anthropic_kwargs(
     tools: Optional[List[Dict]],
     max_tokens: Optional[int],
     reasoning_config: Optional[Dict[str, Any]],
+    temperature: Optional[float] = None,
     tool_choice: Optional[str] = None,
     is_oauth: bool = False,
     preserve_dots: bool = False,
@@ -2971,6 +2972,16 @@ def build_anthropic_kwargs(
         elif isinstance(tool_choice, str):
             # Specific tool name
             kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
+
+    # Caller-requested sampling temperature (global config, per-call, or
+    # provider profile). Placed before the thinking/4.7+ logic below so
+    # those contracts can override or strip it:
+    #   * manual thinking on older models forces temperature=1 (below)
+    #   * 4.7+ models strip temperature entirely (below)
+    # None = omit the parameter, keeping kwargs byte-identical to the
+    # pre-universalization behavior.
+    if temperature is not None:
+        kwargs["temperature"] = temperature
 
     # Map reasoning_config to Anthropic's thinking parameter.
     # Claude 4.6+ models use adaptive thinking + output_config.effort.

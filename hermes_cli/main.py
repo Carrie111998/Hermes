@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    temperature: object = None,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            temperature=temperature,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -2277,6 +2279,7 @@ def _launch_tui(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     toolsets: object = None,
+    temperature: Optional[float] = None,
     skills: object = None,
     verbose: Optional[bool] = None,
     quiet: bool = False,
@@ -2339,6 +2342,8 @@ def _launch_tui(
     if provider:
         env["HERMES_TUI_PROVIDER"] = provider
         env["HERMES_INFERENCE_PROVIDER"] = provider
+    if temperature is not None:
+        env["HERMES_TUI_TEMPERATURE"] = str(temperature)
     tui_toolsets = _normalize_tui_toolsets(toolsets)
     if tui_toolsets:
         env["HERMES_TUI_TOOLSETS"] = ",".join(tui_toolsets)
@@ -2689,6 +2694,7 @@ def cmd_chat(args):
             model=getattr(args, "model", None),
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
+            temperature=getattr(args, "temperature", None),
             skills=getattr(args, "skills", None),
             verbose=getattr(args, "verbose", None),
             quiet=getattr(args, "quiet", False),
@@ -2710,6 +2716,7 @@ def cmd_chat(args):
         "provider": getattr(args, "provider", None),
         "reasoning": getattr(args, "reasoning", None),
         "toolsets": args.toolsets,
+        "temperature": getattr(args, "temperature", None),
         "skills": getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
@@ -10608,6 +10615,7 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-r", "--resume",
         "-s", "--skills",
         "--usage-file",
+        "--temperature",
         # ``-c / --continue`` is nargs='?' (optional value). Treat it as
         # value-taking: if the next token is a subcommand-looking word
         # the user almost certainly meant it as the session name, and
@@ -10829,6 +10837,7 @@ def _set_chat_arg_defaults(args) -> None:
         ("model", None),
         ("provider", None),
         ("toolsets", None),
+        ("temperature", None),
         ("verbose", False),
         ("resume", None),
         ("continue_last", None),
@@ -10884,6 +10893,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            temperature=getattr(args, "temperature", None),
         )
 
     if (args.resume or args.continue_last) and args.command is None:

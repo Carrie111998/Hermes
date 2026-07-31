@@ -491,6 +491,7 @@ def init_agent(
     event_callback: Optional[Callable[[str, dict], None]] = None,
     reaction_callback: Optional[Callable[[str], None]] = None,
     max_tokens: int = None,
+    temperature: Optional[float] = None,
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
@@ -550,6 +551,8 @@ def init_agent(
         clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
         max_tokens (int): Maximum tokens for model responses (optional, uses model default if not set)
+        temperature (float): Sampling temperature override (optional, 0.0-2.0). When None,
+            falls back to ``model.temperature`` from config.yaml, then the provider default.
         reasoning_config (Dict): OpenRouter reasoning configuration override (e.g. {"effort": "none"} to disable thinking).
             If None, defaults to {"enabled": True, "effort": "medium"} for OpenRouter. Set to disable/customize reasoning.
         prefill_messages (List[Dict]): Messages to prepend to conversation history as prefilled context.
@@ -822,6 +825,7 @@ def init_agent(
     
     # Model response configuration
     agent.max_tokens = max_tokens  # None = use model default
+    agent.temperature = temperature  # None = use config / provider default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
@@ -1579,6 +1583,7 @@ def init_agent(
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
+        "temperature": temperature,
     }
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
@@ -2100,6 +2105,35 @@ def init_agent(
                     file=sys.stderr,
                 )
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
+
+    # Read explicit model temperature override from config when the caller
+    # did not pass one directly. Mirrors the max_tokens resolution above:
+    # constructor arg wins, then model.temperature from config.yaml, then
+    # the provider default (None = do not send a temperature parameter).
+    if agent.temperature is None and isinstance(_model_cfg, dict):
+        _config_temperature = _model_cfg.get("temperature")
+        if _config_temperature is not None:
+            try:
+                if isinstance(_config_temperature, bool):
+                    raise ValueError
+                _parsed_temperature = float(_config_temperature)
+                if not (0.0 <= _parsed_temperature <= 2.0):
+                    raise ValueError
+                agent.temperature = _parsed_temperature
+            except (TypeError, ValueError):
+                _ra().logger.warning(
+                    "Invalid model.temperature in config.yaml: %r — "
+                    "must be a float between 0.0 and 2.0 (e.g. 0.7). "
+                    "Falling back to provider default.",
+                    _config_temperature,
+                )
+                print(
+                    f"\n⚠ Invalid model.temperature in config.yaml: {_config_temperature!r}\n"
+                    f"  Must be a float between 0.0 and 2.0 (e.g. 0.7).\n"
+                    f"  Falling back to provider default.\n",
+                    file=sys.stderr,
+                )
+    agent._session_init_model_config["temperature"] = agent.temperature
 
     # Read explicit context_length override from model config
     if isinstance(_model_cfg, dict):

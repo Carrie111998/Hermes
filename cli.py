@@ -4216,6 +4216,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         toolsets: List[str] = None,
         provider: str = None,
         reasoning: str = None,
+        temperature: Optional[float] = None,
         api_key: str = None,
         base_url: str = None,
         max_turns: int = None,
@@ -4387,6 +4388,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.max_tokens = _mt if isinstance(_mt, int) else None
         else:
             self.max_tokens = None
+        # Sampling temperature override (CLI --temperature). None = let
+        # config.yaml model.temperature / provider defaults decide inside
+        # agent_init (AIAgent constructor).
+        self.temperature = temperature
         # Auto-detect model from local server if still on default
         if self.model == _DEFAULT_CONFIG_MODEL:
             _base_url = (_model_config.get("base_url") or "") if isinstance(_model_config, dict) else ""
@@ -17958,6 +17963,7 @@ def main(
     model: str = None,
     provider: str = None,
     reasoning: str = None,
+    temperature: float = None,
     api_key: str = None,
     base_url: str = None,
     max_turns: int = None,
@@ -18102,6 +18108,7 @@ def main(
         toolsets=toolsets_list,
         provider=provider,
         reasoning=reasoning,
+        temperature=temperature,
         api_key=api_key,
         base_url=base_url,
         max_turns=max_turns,

@@ -1215,6 +1215,18 @@ def _handle_create(args: dict, **kw) -> str:
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
+    model_override = args.get("model")
+    model_temperature = args.get("model_temperature")
+    if model_temperature is not None:
+        try:
+            model_temperature = float(model_temperature)
+            if not (0.0 <= model_temperature <= 2.0):
+                raise ValueError
+        except (TypeError, ValueError):
+            return tool_error(
+                "model_temperature must be a number between 0.0 and 2.0, "
+                f"got {model_temperature!r}"
+            )
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
@@ -1315,6 +1327,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                model_temperature=model_temperature,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1926,6 +1939,23 @@ KANBAN_CREATE_SCHEMA = {
                     "(e.g. 'researcher-a', 'reviewer', 'writer'). "
                     "Required — tasks without an assignee are never "
                     "dispatched."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for the dispatched worker. "
+                    "When set, the dispatcher passes -m <model> to the "
+                    "worker, overriding the profile's default model."
+                ),
+            },
+            "model_temperature": {
+                "type": "number",
+                "description": (
+                    "Optional sampling temperature override (0.0-2.0) for "
+                    "the dispatched worker. When set, the dispatcher passes "
+                    "--temperature <value> to the worker, overriding the "
+                    "profile's configured temperature."
                 ),
             },
             "body": {

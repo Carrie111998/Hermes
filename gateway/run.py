@@ -22241,6 +22241,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"),
         ("model", "max_tokens"),
+        ("model", "temperature"),
         ("compression", "enabled"),
         ("compression", "progress_notices"),
         ("compression", "threshold"),
