@@ -21,7 +21,8 @@ Env var::
 
 ``SEARXNG_URL`` may include query parameters (e.g. for reverse-proxy
 authentication tokens like Pangolin's ``p_token``).  Any query params
-present in the URL are merged into every search request::
+present in the URL are merged into every search request.  Reserved
+fields (``q``, ``format``, ``pageno``) are never overridden::
 
     SEARXNG_URL=https://search.example.com/?p_token=abc123
 """
@@ -81,14 +82,22 @@ class SearXNGWebSearchProvider(WebSearchProvider):
 
         # Support query params in SEARXNG_URL (e.g. reverse-proxy auth tokens
         # like Pangolin's p_token).  Parse and merge them into every request.
-        from urllib.parse import urlparse, parse_qs
+        from urllib.parse import urlparse, parse_qsl
         parsed = urlparse(raw_url)
         base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
-        # Collect extra query params from the URL (values are lists from parse_qs)
-        extra_params: Dict[str, str] = {}
-        for key, values in parse_qs(parsed.query).items():
-            if values:
-                extra_params[key] = values[0]
+        # parse_qsl preserves order, blank values, and repeated keys (as
+        # separate tuples).  Group repeated keys into lists so httpx emits
+        # them as repeated query params (e.g. ?a=1&a=2).
+        extra_params: Dict[str, Any] = {}
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            if key in extra_params:
+                existing = extra_params[key]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    extra_params[key] = [existing, value]
+            else:
+                extra_params[key] = value
 
         params: Dict[str, Any] = {
             "q": query,

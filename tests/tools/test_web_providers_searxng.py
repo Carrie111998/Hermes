@@ -306,6 +306,42 @@ class TestSearXNGSearchProviderSearch:
         assert captured_params["p_token"] == "abc"
 
 
+    def test_repeated_query_params_preserved_as_list(self, monkeypatch):
+        """Repeated query params (e.g. ?a=1&a=2) should be preserved as a list
+        so httpx emits them as repeated fields in the request."""
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?category=it&category=general&token=abc")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert captured_params["category"] == ["it", "general"]
+        assert captured_params["token"] == "abc"
+
+    def test_blank_query_param_preserved(self, monkeypatch):
+        """Blank query params (e.g. ?empty=) should be preserved, not dropped."""
+        monkeypatch.setenv("SEARXNG_URL", "https://search.example.com/?empty=&p_token=abc")
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+        mock_resp = self._make_mock_response({"results": []})
+
+        captured_params = {}
+        def capture_get(url, **kwargs):
+            captured_params.update(kwargs.get("params", {}))
+            return mock_resp
+
+        with patch("httpx.get", side_effect=capture_get):
+            SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert captured_params.get("empty") == ""
+        assert captured_params.get("p_token") == "abc"
+
+
 # ---------------------------------------------------------------------------
 # Integration: _is_backend_available recognizes "searxng"
 # ---------------------------------------------------------------------------
