@@ -241,6 +241,29 @@ def test_participation_policy_passive_skipped_message_reacts_without_dispatch():
     asyncio.run(_run())
 
 
+def test_participation_policy_passive_can_suppress_reactions_without_dispatch():
+    async def _run():
+        adapter = _make_adapter(
+            require_mention=False,
+            participation_policy={
+                "threads": {"-100:55": "passive"},
+                "passive_reactions": {"-100:55": False},
+            },
+        )
+        update = SimpleNamespace(
+            update_id=1002,
+            message=_group_message("side chatter", thread_id=55),
+            effective_message=None,
+        )
+
+        await adapter._handle_text_message(update, SimpleNamespace())
+
+        adapter._message_handler.assert_not_awaited()
+        adapter._bot.set_message_reaction.assert_not_awaited()
+
+    asyncio.run(_run())
+
+
 def test_hank_participation_command_sets_thread_mode_without_agent_dispatch(monkeypatch):
     async def _run():
         adapter = _make_adapter(participation_policy={})

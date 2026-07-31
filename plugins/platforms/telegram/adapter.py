@@ -7854,10 +7854,24 @@ class TelegramAdapter(BasePlatformAdapter):
             return parsed if isinstance(parsed, dict) else {}
         return {}
 
-    def _telegram_passive_reaction(self) -> str:
+    def _telegram_passive_reaction(self, message: Optional[Message] = None) -> Optional[str]:
         policy = self._telegram_participation_policy()
-        reaction = policy.get("passive_reaction", self.config.extra.get("passive_reaction", "\U0001f440"))
-        return str(reaction or "\U0001f440")
+        scoped_reactions = policy.get("passive_reactions")
+        reaction = None
+        has_scoped_reaction = False
+        if isinstance(scoped_reactions, dict) and message is not None:
+            chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
+            thread_id = self._effective_message_thread_id(message)
+            for key in (self._topic_key(chat_id, thread_id), chat_id):
+                if key in scoped_reactions:
+                    reaction = scoped_reactions[key]
+                    has_scoped_reaction = True
+                    break
+        if not has_scoped_reaction:
+            reaction = policy.get("passive_reaction", self.config.extra.get("passive_reaction", "👀"))
+        if reaction is False or reaction is None:
+            return None
+        return str(reaction or "👀")
 
     @staticmethod
     def _topic_key(chat_id: str, thread_id: Optional[str]) -> str:
@@ -8853,8 +8867,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         chat_id = str(getattr(getattr(message, "chat", None), "id", ""))
         message_id = str(getattr(message, "message_id", ""))
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, self._telegram_passive_reaction())
+        reaction = self._telegram_passive_reaction(message)
+        if chat_id and message_id and reaction:
+            await self._set_reaction(chat_id, message_id, reaction)
 
     def _apply_participation_session_lane(self, message: Message, event: MessageEvent) -> MessageEvent:
         """Route configured participation chats away from stale legacy group sessions.
