@@ -63,6 +63,11 @@ StateProbe = Callable[
     Iterable[ProbeObservation | Mapping[str, Any]],
 ]
 
+# The gateway owns the host-model client and schema registry.  The watcher
+# owns only the ordering boundary: raw email must be classified through the
+# template contract before the deterministic engine is allowed to see it.
+EmailExtractor = Callable[[dict | str, dict], dict]
+
 _STATE_PROBES: dict[str, StateProbe] = {}
 
 
@@ -107,6 +112,95 @@ def registered_state_probes() -> tuple[str, ...]:
 def _json_object(raw: str | None) -> dict[str, Any]:
     value = wf_engine._load_json(raw, {}) or {}
     return value if isinstance(value, dict) else {}
+
+
+def resolve_email_extraction_brief(
+    conn: sqlite3.Connection,
+) -> dict | str | None:
+    """Return the one email extraction contract declared by templates.
+
+    An email ingress event has no correlated instance yet, so selecting a
+    brief from instances would leak candidates across the LM boundary.  The
+    only legal source is the immutable template catalog.  ``email_extraction``
+    is deliberately a top-level template contract: every template that
+    declares it must declare the same canonical object/string.  Missing,
+    malformed, or conflicting contracts return ``None`` and callers fail
+    closed through :func:`wf_engine.extract_event`.
+    """
+
+    contracts: dict[str, dict | str] = {}
+    rows = conn.execute(
+        "SELECT spec FROM wf_template ORDER BY slug, version"
+    ).fetchall()
+    for row in rows:
+        try:
+            spec = wf_engine._load_json(row["spec"], None)
+        except Exception:
+            return None
+        if not isinstance(spec, dict) or "email_extraction" not in spec:
+            continue
+        brief = spec["email_extraction"]
+        if not isinstance(brief, (dict, str)):
+            return None
+        try:
+            # Keep validation of the contract in the engine so watcher and
+            # engine agree about what a schema-bearing brief means.
+            wf_engine._extraction_schema(brief)
+            key = wf_engine._json(brief)
+        except Exception:
+            return None
+        if key is None:
+            return None
+        contracts[key] = brief
+    if len(contracts) != 1:
+        return None
+    return next(iter(contracts.values()))
+
+
+def _missing_email_extractor(_brief: dict | str, _event: dict) -> dict:
+    raise RuntimeError("email extraction runtime is unavailable")
+
+
+def _extract_received_email_events(
+    conn: sqlite3.Connection,
+    *,
+    email_extractor: EmailExtractor | None,
+    email_schema_validator: Any,
+) -> tuple[int, ...]:
+    """Classify every raw email before ``sweep`` can deterministically route it."""
+
+    event_ids = tuple(
+        int(row["id"])
+        for row in conn.execute(
+            """
+            SELECT id
+              FROM wf_event
+             WHERE source = 'email' AND status = 'received'
+             ORDER BY id
+            """
+        ).fetchall()
+    )
+    if not event_ids:
+        return ()
+
+    brief = resolve_email_extraction_brief(conn)
+    extractor = (
+        email_extractor
+        if brief is not None and callable(email_extractor)
+        else _missing_email_extractor
+    )
+    for event_id in event_ids:
+        # extract_event owns durable classification, validation and all
+        # failures.  Do not catch and re-route here: that would create a
+        # second state machine beside the engine's fail-closed path.
+        wf_engine.extract_event(
+            conn,
+            event_id,
+            brief if brief is not None else {},
+            extractor,
+            email_schema_validator,
+        )
+    return event_ids
 
 
 def _probe_targets(conn: sqlite3.Connection) -> dict[str, tuple[ProbeTarget, ...]]:
@@ -219,7 +313,13 @@ def _drive_matched_event(
         return True
 
 
-def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
+def run_tick(
+    conn: sqlite3.Connection,
+    now: int,
+    *,
+    email_extractor: EmailExtractor | None = None,
+    email_schema_validator: Any = None,
+) -> WatchTickResult:
     """Run one complete timer/probe/sweeper cycle against one board."""
 
     timers = tuple(wf_engine.fire_due_timers(conn, int(now)))
@@ -286,6 +386,16 @@ def run_tick(conn: sqlite3.Connection, now: int) -> WatchTickResult:
             if _drive_matched_event(conn, event_id):
                 applied.append(event_id)
 
+    # This precedes sweep by construction.  A raw email cannot become
+    # routed_out merely because deterministic matching has not interpreted
+    # it; absent/bad runtime or contract reaches the engine's needs_review
+    # terminal instead.
+    _extract_received_email_events(
+        conn,
+        email_extractor=email_extractor,
+        email_schema_validator=email_schema_validator,
+    )
+
     swept = wf_engine.sweep(conn, int(now))
     # ``sweep`` classifies before returning.  Include every durable
     # non-create match, not only matches produced in this process, so a
@@ -327,6 +437,7 @@ __all__ = [
     "WatchTickResult",
     "register_state_probe",
     "registered_state_probes",
+    "resolve_email_extraction_brief",
     "run_tick",
     "unregister_state_probe",
 ]
