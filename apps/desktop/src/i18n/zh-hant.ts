@@ -1932,7 +1932,7 @@ export const zhHant = defineLocale({
       ageMin: '分'
     },
     dateDivider: {
-      today: '今天稍早',
+      today: '今天',
       yesterday: '昨天',
       thisWeek: '本週',
       lastWeek: '上週',
