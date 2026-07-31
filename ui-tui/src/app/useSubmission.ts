@@ -9,7 +9,7 @@ import { asRpcResult } from '../lib/rpc.js'
 import { hasInterpolation, INTERPOLATION_RE } from '../protocol/interpolation.js'
 import type { Msg } from '../types.js'
 
-import type { ComposerActions, ComposerRefs, ComposerState } from './interfaces.js'
+import type { ComposerActions, ComposerRefs, ComposerState, ComposerToken } from './interfaces.js'
 import { submitPrompt } from './submissionCore.js'
 import { turnController } from './turnController.js'
 import { getUiState, patchUiState } from './uiStore.js'
@@ -18,6 +18,13 @@ const DOUBLE_ENTER_MS = 450
 
 const spliceMatches = (text: string, matches: RegExpMatchArray[], results: string[]) =>
   matches.reduceRight((acc, m, i) => acc.slice(0, m.index!) + results[i] + acc.slice(m.index! + m[0].length), text)
+
+export const prepareSubmission = (display: string, tokens: ComposerToken[]) => ({
+  display,
+  text: expandTokens(tokens)(display)
+})
+
+export const shouldInterpolateSubmission = (display: string) => hasInterpolation(display)
 
 export function useSubmission(opts: UseSubmissionOptions) {
   const { appendMessage, composerActions, composerRefs, composerState, gw, setLastUserMsg, slashRef, submitRef, sys } =
@@ -56,10 +63,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
   }, [composerState.input, composerState.inputBuf])
 
   const send = useCallback(
-    (text: string, showUserMessage = true, displayText?: string) => {
+    (
+      text: string,
+      showUserMessage = true,
+      displayText?: string,
+      expandOverride?: (value: string) => string
+    ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
-      const expand = expandTokens(composerRefs.tokensRef.current)
+      const expand = expandOverride ?? expandTokens(composerRefs.tokensRef.current)
 
       submitPrompt(
         text,
@@ -213,7 +225,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // nothing — a detached image can't be re-attached by recalling the text.
       // Idempotent on token-free text, so re-submitting a recalled entry is
       // stable.
-      const toHistory = expandTokens(composerRefs.tokensRef.current)(full)
+      const submissionTokens = [...composerRefs.tokensRef.current]
+      const submission = prepareSubmission(full, submissionTokens)
+      const toHistory = submission.text
 
       if (looksLikeSlashCommand(full)) {
         appendMessage({ kind: 'slash', role: 'system', text: full })
@@ -275,13 +289,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return handleBusyInput(full)
       }
 
-      if (hasInterpolation(full)) {
+      if (shouldInterpolateSubmission(full)) {
         patchUiState({ busy: true })
 
-        return interpolate(full, send)
+        return interpolate(full, text =>
+          send(prepareSubmission(text, submissionTokens).text, true, submission.display, value => value)
+        )
       }
 
-      send(full)
+      send(submission.text, true, submission.display, value => value)
     },
     [
       appendMessage,
