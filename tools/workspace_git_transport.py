@@ -39,7 +39,12 @@ class ValidatedWorkspaceBundle:
 
 
 def _git_env() -> dict[str, str]:
-    env = os.environ.copy()
+    from tools.environments.local import build_subprocess_env
+
+    # Secrets are scrubbed on purpose: this broker only ever runs
+    # ``git`` for a confined workspace, so provider credentials must
+    # not travel with it (HER-110 egress isolation).
+    env = build_subprocess_env(scrub_secrets=True, inherit_profile_home=False)
     for key in tuple(env):
         if key.startswith("GIT_"):
             env.pop(key, None)
