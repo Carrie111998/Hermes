@@ -262,7 +262,15 @@ function MarkdownLink({ children, className, href, ...props }: ComponentProps<'a
 
   if (desktopTarget) {
     return (
-      <ExternalLink className={cn('wrap-anywhere', className)} href={desktopTarget} {...props}>
+      <ExternalLink
+        className={cn('wrap-anywhere', className)}
+        href={desktopTarget}
+        onClick={event => {
+          event.preventDefault()
+          void window.hermesDesktop?.openResponseLink?.(desktopTarget)
+        }}
+        {...props}
+      >
         {children}
       </ExternalLink>
     )

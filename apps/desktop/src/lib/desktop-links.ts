@@ -1,5 +1,55 @@
 const DESKTOP_OPEN_PREFIX = '#desktop-open/'
 
+const SAFE_RESPONSE_FILE_EXTENSIONS = new Set([
+  '.bmp',
+  '.csv',
+  '.docx',
+  '.flac',
+  '.gif',
+  '.heic',
+  '.jpeg',
+  '.jpg',
+  '.json',
+  '.log',
+  '.m4a',
+  '.m4v',
+  '.markdown',
+  '.md',
+  '.mov',
+  '.mp3',
+  '.mp4',
+  '.odp',
+  '.ods',
+  '.odt',
+  '.ogg',
+  '.pdf',
+  '.png',
+  '.pptx',
+  '.rtf',
+  '.tif',
+  '.tiff',
+  '.toml',
+  '.txt',
+  '.wav',
+  '.webm',
+  '.webp',
+  '.xlsx',
+  '.yaml',
+  '.yml',
+  '.zip'
+])
+
+function hasSafeResponseFileExtension(url: URL): boolean {
+  try {
+    const pathname = decodeURIComponent(url.pathname).toLowerCase()
+    const extensionIndex = pathname.lastIndexOf('.')
+
+    return extensionIndex >= 0 && SAFE_RESPONSE_FILE_EXTENSIONS.has(pathname.slice(extensionIndex))
+  } catch {
+    return false
+  }
+}
+
 type MarkdownNode = {
   children?: MarkdownNode[]
   type?: string
@@ -15,7 +65,9 @@ function isLocalFileUrl(url: URL): boolean {
     !url.username &&
     !url.password &&
     !url.port &&
-    !url.pathname.startsWith('//')
+    !url.pathname.startsWith('//') &&
+    !/%2f|%5c/i.test(url.pathname) &&
+    hasSafeResponseFileExtension(url)
   )
 }
 

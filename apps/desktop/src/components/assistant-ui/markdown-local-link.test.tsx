@@ -22,13 +22,15 @@ it.each([
   ['Obsidian note', 'obsidian://open?vault=Personal&file=00%20Inbox%2FMy%20Note.md']
 ])('opens a %s response link through the controlled desktop bridge', async (_label, href) => {
   const openExternal = vi.fn().mockResolvedValue(undefined)
+  const openResponseLink = vi.fn().mockResolvedValue(undefined)
 
-  desktopWindow.hermesDesktop = { openExternal } as unknown as Window['hermesDesktop']
+  desktopWindow.hermesDesktop = { openExternal, openResponseLink } as unknown as Window['hermesDesktop']
 
   render(<MarkdownTextContent isRunning={false} text={`[Open note](${href})`} />)
 
   const link = await screen.findByRole('link', { name: 'Open note' })
   fireEvent.click(link)
 
-  await waitFor(() => expect(openExternal).toHaveBeenCalledWith(href))
+  await waitFor(() => expect(openResponseLink).toHaveBeenCalledWith(href))
+  expect(openExternal).not.toHaveBeenCalled()
 })

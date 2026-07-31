@@ -22,7 +22,18 @@ describe('desktop response links', () => {
     'file://///attacker/share/note.md',
     'file://localhost//attacker/share/note.md',
     'obsidian://open@attacker?vault=Personal',
-    'obsidian://open/other-action?vault=Personal'
+    'obsidian://open/other-action?vault=Personal',
+    'file:///C:/Users/example/payload.exe',
+    'file:///C:/Users/example/payload.cmd',
+    'file:///C:/Users/example/payload.bat',
+    'file:///C:/Users/example/installer.msi',
+    'file:///C:/Users/example/shortcut.lnk',
+    'file:///C:/Users/example/website.url',
+    'file:///C:/Users/example/script.ps1',
+    'file:///C:/Users/example/document.pdf.exe',
+    'file:///C:/Users/example/encoded%2Eexe',
+    'file:///C:/Users/example/note%2Fescape.md',
+    'file:///C:/Users/example/note%5Cescape.md'
   ])('does not wrap a disallowed target: %s', target => {
     expect(desktopMarkdownHref(target)).toBeNull()
   })

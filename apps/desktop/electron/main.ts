@@ -90,7 +90,7 @@ import {
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
-import { classifyExternalUrl } from './external-url-policy'
+import { classifyExternalUrl, classifyResponseLinkUrl, wslExternalOpenCommand } from './external-url-policy'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
 import { createFirstRunSetupGate } from './first-run-setup-gate'
@@ -1277,8 +1277,8 @@ function loadWindowUrl(win, url, label) {
   win.loadURL(url).catch(error => rememberLog(`${label} failed to load: ${describeCrashReason(error)}`))
 }
 
-function openExternalUrl(rawUrl) {
-  const target = classifyExternalUrl(rawUrl)
+function openExternalUrl(rawUrl, classify = classifyExternalUrl) {
+  const target = classify(rawUrl)
 
   if (!target) {
     return false
@@ -1325,14 +1325,16 @@ function openExternalUrl(rawUrl) {
   if (IS_WSL) {
     rememberLog(`[link] opening via WSL→Windows: ${url}`)
 
-    const proc = spawn('cmd.exe', ['/c', 'start', '""', url], {
+    const command = wslExternalOpenCommand(url)
+
+    const proc = spawn(command.executable, command.args, {
       detached: true,
       stdio: 'ignore',
       windowsHide: true
     })
 
     proc.on('error', error => {
-      rememberLog(`[link] cmd.exe start failed: ${error.message}; falling back to xdg-open`)
+      rememberLog(`[link] rundll32 URL dispatch failed: ${error.message}; falling back to xdg-open`)
       shell.openExternal(url).catch(fallback => rememberLog(`[link] xdg-open failed: ${fallback.message}`))
     })
     proc.unref()
@@ -10629,6 +10631,12 @@ ipcMain.on('hermes:quick-entry:dismiss', () => hideQuickEntryWindow())
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
+  }
+})
+
+ipcMain.handle('hermes:openResponseLink', (_event, url) => {
+  if (!openExternalUrl(url, classifyResponseLinkUrl)) {
+    throw new Error('Invalid response link URL')
   }
 })
 
