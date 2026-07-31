@@ -245,7 +245,6 @@ _ACTIVE_TURN_POLICY: ContextVar[Optional[TurnPolicy]] = ContextVar(
 
 def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",
@@ -255,7 +254,7 @@ def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
     }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(args, **kwargs)
+    return subprocess.run(args, stdin=subprocess.DEVNULL, **kwargs)
 
 
 def _existing_directory(path: Path) -> Path:

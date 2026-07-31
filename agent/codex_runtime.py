@@ -74,7 +74,6 @@ def _run_workspace_git(
     timeout: float = 30.0,
 ) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",
@@ -84,7 +83,11 @@ def _run_workspace_git(
     }
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(["git", "-C", str(cwd), *args], **kwargs)
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        stdin=subprocess.DEVNULL,
+        **kwargs,
+    )
 
 
 def _workspace_commit_identity(cwd: Path) -> tuple[str, str]:

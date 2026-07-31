@@ -178,10 +178,12 @@ def _install_fake_tools_package():
         def register(self, **kwargs):
             return None
 
-    from tools.registry import tool_error
+    from tools.registry import ToolEffect, tool_error
 
     sys.modules["tools.registry"] = types.SimpleNamespace(
-        registry=_Registry(), tool_error=tool_error,
+        ToolEffect=ToolEffect,
+        registry=_Registry(),
+        tool_error=tool_error,
     )
 
     class _DummyEnvironment:

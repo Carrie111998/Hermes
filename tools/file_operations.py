@@ -891,9 +891,20 @@ class ShellFileOperations(FileOperations):
         )
     
     def _has_command(self, cmd: str) -> bool:
-        """Check if a command exists in the environment (cached)."""
+        """Check if a command is callable in the environment (cached).
+
+        ``command -v`` can return a concrete PATH entry that the current
+        environment cannot execute (for example a non-executable WindowsApps
+        shim visible inside WSL).  Treat shell builtins as available, but
+        require executable permission whenever resolution returns a path.
+        """
         if cmd not in self._command_cache:
-            result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
+            escaped_cmd = self._escape_shell_arg(cmd)
+            result = self._exec(
+                f'resolved="$(command -v {escaped_cmd} 2>/dev/null)" || exit 1; '
+                'case "$resolved" in */*) [ -x "$resolved" ] ;; *) true ;; esac '
+                "&& echo 'yes'"
+            )
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     

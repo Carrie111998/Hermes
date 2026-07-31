@@ -136,6 +136,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 assert self.release.wait(timeout=5)
             self.rows.append(kwargs["content"])
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -4015,7 +4018,9 @@ class TestRunConversation:
             agent.client.chat.completions.create.side_effect = [
                 truncated_resp, good_resp, final_resp,
             ]
-            result = agent.run_conversation("write the report")
+            result = agent.run_conversation(
+                "Implement the report file in the repository."
+            )
 
         # Tool was executed on the retry (good_resp)
         mock_hfc.assert_called_once()
@@ -4057,7 +4062,9 @@ class TestRunConversation:
             agent.client.chat.completions.create.side_effect = [
                 stall1, stall2, good_resp, final_resp,
             ]
-            result = agent.run_conversation("write the report")
+            result = agent.run_conversation(
+                "Implement the report file in the repository."
+            )
 
         # Recovered on the 3rd attempt instead of refusing after the 1st.
         mock_hfc.assert_called_once()
@@ -6057,5 +6064,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
-

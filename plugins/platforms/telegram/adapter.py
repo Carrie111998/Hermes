@@ -289,7 +289,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
-from utils import atomic_replace, env_float, env_int
+from utils import env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 _TELEGRAM_IMAGE_MIME_TO_EXT = {
@@ -8824,20 +8824,20 @@ class TelegramAdapter(BasePlatformAdapter):
         return key
 
     def _persist_participation_policy(self) -> None:
-        try:
-            import yaml
-        except Exception as exc:
-            logger.warning("[%s] Cannot persist Telegram participation policy; PyYAML unavailable: %s", self.name, exc)
-            return
+        from hermes_cli.config import atomic_config_write, read_user_config_raw
+
         config_path = get_hermes_home() / "config.yaml"
         try:
-            data = yaml.safe_load(config_path.read_text()) or {}
+            data = read_user_config_raw(config_path)
             telegram_cfg = data.setdefault("telegram", {})
             extra = telegram_cfg.setdefault("extra", {})
             extra["participation_policy"] = self.config.extra.get("participation_policy", {})
-            tmp = config_path.with_suffix(config_path.suffix + ".tmp")
-            tmp.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
-            atomic_replace(tmp, config_path)
+            atomic_config_write(
+                config_path,
+                data,
+                sort_keys=False,
+                allow_unicode=True,
+            )
         except Exception as exc:
             logger.warning("[%s] Failed to persist Telegram participation policy: %s", self.name, exc)
 
