@@ -50,6 +50,67 @@ intérprete de Python, no lo toques.
 8. Si una decisión admite más de una opción razonable, se presentan las
    opciones con sus trade-offs. No se elige unilateralmente.
 
+## Limitaciones conocidas
+
+Cosas explícitamente pendientes — no silenciadas, documentadas aquí a propósito
+para que ningún agente futuro las redescubra desde cero.
+
+### Wake word sigue diciendo "hey hermes"
+
+`tools/wake_word.py` usa por defecto el motor **openWakeWord** con un modelo
+ONNX/tflite **ya entrenado** específicamente para el patrón acústico de
+"hey hermes" (`tools/wakewords/hey_hermes.onnx`). El texto de configuración
+(`wake_word.phrase`) es **cosmético para este motor** — cambiarlo a
+"hey douglas" sin retrenar el modelo no cambiaría lo que el motor realmente
+escucha, y dejaría la UI diciendo algo que no activa la función. Por eso se
+mantiene "hey hermes" tal cual: es la opción honesta, no un descuido.
+
+**Lo que haría falta para tener "hey douglas" de verdad:**
+1. **Opción rápida, sin entrenar nada**: cambiar el proveedor por defecto a
+   **`sherpa`** (`wake_word.provider: sherpa`) — es open-vocabulary, tokeniza
+   cualquier frase escrita en tiempo real contra un modelo genérico. Funciona
+   con "hey douglas" de inmediato. Contras: descarga única de ~13MB la primera
+   vez, y puede tener precisión/tasa de falsos positivos distinta al modelo
+   `hey_hermes` hecho a medida — no se ha medido esa diferencia todavía.
+2. **Opción con calidad equivalente**: entrenar un modelo openWakeWord nuevo
+   para "hey douglas". openWakeWord soporta esto con datos sintéticos
+   generados por TTS (sin grabar voces reales) vía su propio notebook de
+   entrenamiento (ver [su repo](https://github.com/dscripka/openWakeWord)) —
+   es un proyecto de ML aparte, no una tarea de branding: requiere tiempo de
+   entrenamiento (típicamente horas en una GPU en la nube, el propio proyecto
+   documenta el proceso con Google Colab), evaluación de falsos positivos
+   contra audio ambiente, y empaquetar el `.onnx`/`.tflite` resultante en
+   `tools/wakewords/`.
+
+### Fuente de marca
+
+La cabecera y los títulos usan **Space Grotesk** (SIL OFL, gratuita) en vez
+de la fuente "Dimitri" original del brief — los archivos TTF de Dimitri nunca
+aparecieron en los assets rescatados. Si se consiguen, sustituyen el
+`@font-face` en `apps/desktop/src/styles.css` sin tocar nada más (la variable
+`--dt-font-display` es el único punto de cambio).
+
+### Iconografía e ilustraciones
+
+Sin arte propio de Douglas Agent todavía. Estado actual, punto por punto:
+
+- **`BrandMark`** (`apps/desktop/src/components/brand-mark.tsx`,
+  `apps/bootstrap-installer/src/components/brand-mark.tsx`): placeholder
+  tipográfico "DA" sobre verde esmeralda — ya no usa imagen externa.
+- **Ícono real de la app** (`apps/desktop/assets/icon.{png,ico,icns}`,
+  usado en el `.exe`/`.app`/`.dmg`/taskbar vía `electron-builder`) y los
+  íconos del instalador Tauri (`apps/bootstrap-installer/src-tauri/icons/`):
+  **todavía son la mascota ilustrada de Nous Research** ("nous-girl", con
+  una etiqueta "N" visible). Es el hueco de marca más visible que queda —
+  pendiente de resolución explícita antes de cualquier build pública.
+- **Favicon** (`apps/desktop/public/apple-touch-icon.png`): misma mascota de
+  Nous, usada en las etiquetas `<link>` de `index.html`.
+- **Mascota "petdex" de Hermes** (`apps/desktop/public/{hermes.png,
+  hermes-sprite.png,hermes-frames/}` — un personaje pixel-art con casco
+  alado y caduceo): confirmado que **no está referenciada por ningún
+  componente actual** — son archivos huérfanos, seguros de eliminar sin
+  romper nada, pero no eliminados todavía a la espera de confirmación.
+
 ## Estructura
 
 | Carpeta | Contenido |

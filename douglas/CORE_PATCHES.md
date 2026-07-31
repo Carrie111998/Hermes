@@ -78,3 +78,42 @@ Formato por entrada:
 - **Riesgo de merge:** bajo — misma forma que el cambio en `main.ts`,
   función original preservada como fallback.
 - **Commit:** `feat(compat): add Douglas/Hermes home and env resolution`
+
+## apps/desktop/electron/main.ts (2/2 — normalización DOUGLAS_DESKTOP_*)
+
+- **Qué:** un bloque nuevo, insertado justo antes de la resolución de
+  `HERMES_HOME`, que copia cualquier `DOUGLAS_DESKTOP_<X>` presente a
+  `HERMES_DESKTOP_<X>` en `process.env` (ganando sobre un valor ya
+  presente). Cubre `HERMES_DESKTOP_REMOTE_URL`, `_REMOTE_TOKEN`,
+  `HERMES_DESKTOP_APP_NAME`, y cualquier variable futura con ese
+  prefijo, sin tocar los ~7 sitios que ya leen esas variables
+  (`main.ts`, `hardening.ts`).
+- **Por qué:** mismo patrón que `hermes_bootstrap.py::normalize_douglas_env()`
+  en el lado Python (Paso 2) — normalizar una vez, muy al principio,
+  en vez de envolver cada sitio de lectura individualmente.
+- **Alternativa descartada:** envolver cada uno de los ~7
+  `process.env.HERMES_DESKTOP_*` con un fallback — viola la misma
+  regla de "no tocar los llamadores existentes" que motivó el diseño
+  del Paso 2.
+- **Riesgo de merge:** bajo — bloque nuevo de ~9 líneas, no modifica
+  ninguna línea existente.
+- **Commit:** `fix(brand): resolve Paso 3 follow-up items`
+
+## apps/desktop/electron/main.ts (3/3 — URI scheme `douglas://`)
+
+- **Qué:** `HERMES_PROTOCOL` (constante única) se reemplaza por
+  `DEEP_LINK_PROTOCOLS = ['douglas', 'hermes']` — el registro con el SO
+  (`app.setAsDefaultProtocolClient`) ahora ocurre para ambos schemes, y
+  la detección de un deep link entrante (`_extractDeepLink`) acepta
+  cualquiera de los dos. Al reconstruir un link pendiente
+  (`ipcMain.handle('hermes:deep-link-ready', ...)`) se usa
+  `CANONICAL_DEEP_LINK_PROTOCOL = 'douglas'` — solo se generan links
+  `douglas://` desde ahora, `hermes://` queda como entrada aceptada por
+  compatibilidad con enlaces existentes en docs/dashboard.
+- **Por qué:** pedido explícito — "se añade, no se sustituye".
+- **Alternativa descartada:** ninguna — es la forma directa de añadir
+  un scheme sin romper el existente.
+- **Riesgo de merge:** bajo — mismo patrón que el archivo ya usaba
+  (una constante controla el comportamiento en 3 sitios), solo pasa de
+  string a array e itera.
+- **Commit:** `feat(protocol): register douglas:// alongside hermes:// deep links`
