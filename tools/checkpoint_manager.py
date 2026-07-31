@@ -343,7 +343,6 @@ def _clear_abandoned_lock(
     reason: str,
     *,
     require_stale: bool = True,
-    created_after: Optional[float] = None,
 ) -> bool:
     """Reclaim a git ``.lock`` left behind by a process that is gone.
 
@@ -363,10 +362,11 @@ def _clear_abandoned_lock(
       ``_GIT_TIMEOUT`` times the largest caller multiplier, so nothing older
       than that window can belong to a running call. Used by the recovery
       path, which knows nothing about who created the lock.
-    * ``created_after`` — the lock's mtime falls inside the window of a call
-      whose child we have already reaped. Used by the timeout path: our own
-      child is dead, but a lock that predates our launch is somebody else's
-      and must not be touched.
+    The timeout path passes ``require_stale=False`` because it has already
+    reaped the owning child, and it decides ownership by *observing the lock's
+    absence before launching* rather than by comparing an mtime to the wall
+    clock — filesystem timestamp granularity makes that comparison unreliable
+    (locally the margin is tens of microseconds).
 
     Whichever guard applies, the removal itself is done by *claiming* the
     lock with an atomic rename and then verifying identity. Between judging a
@@ -397,14 +397,6 @@ def _clear_abandoned_lock(
             lock_path, age, _MAX_GIT_CALL_SECONDS,
         )
         return False
-    if created_after is not None and judged.st_mtime < created_after:
-        logger.debug(
-            "Checkpoint lock %s predates this call (%.1fs before it started) "
-            "— it belongs to another process; leaving it.",
-            lock_path, created_after - judged.st_mtime,
-        )
-        return False
-
     claim = lock_path.with_name(f"{lock_path.name}.reclaim-{uuid.uuid4().hex[:8]}")
     try:
         os.rename(lock_path, claim)
@@ -542,7 +534,13 @@ def _run_git(
     cmd = ["git"] + list(args)
     allowed_returncodes = allowed_returncodes or set()
 
-    _started_at = time.time()
+    # Ownership signal for the timeout path below: the lock this command would
+    # take, and whether it was already there before we launched. Observing
+    # absence is exact; comparing an mtime against the wall clock is not,
+    # because filesystem timestamp granularity can round a just-created lock
+    # to before the moment we started.
+    _timeout_lock = _lock_for_timed_out_command(args, store, index_file)
+    _timeout_lock_pre_existed = bool(_timeout_lock and _timeout_lock.exists())
     try:
         result = subprocess.run(
             cmd,
@@ -586,15 +584,15 @@ def _run_git(
         logger.error(msg, exc_info=True)
         # subprocess.run has already killed and reaped the child, so a lock
         # *this* command created is abandoned by definition. Only the lock
-        # this specific command takes is eligible, and only if it appeared
-        # after we launched — a lock predating the call belongs to somebody
-        # else and must survive.
-        _clear_abandoned_lock(
-            _lock_for_timed_out_command(args, store, index_file),
-            f"owning git timed out after {timeout}s",
-            require_stale=False,
-            created_after=_started_at,
-        )
+        # this specific command takes is eligible, and only if it was absent
+        # before we launched — a lock that was already there belongs to
+        # somebody else and must survive.
+        if not _timeout_lock_pre_existed:
+            _clear_abandoned_lock(
+                _timeout_lock,
+                f"owning git timed out after {timeout}s",
+                require_stale=False,
+            )
         return False, "", msg
     except FileNotFoundError as exc:
         missing_target = getattr(exc, "filename", None)
