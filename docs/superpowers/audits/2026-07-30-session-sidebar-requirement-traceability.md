@@ -74,8 +74,9 @@ auditable.
 
 ## Source provenance registry
 
-The July 13 plan is deliberately external to this repository and is not
-vendored here. Validate it from
+The July 13 CH rows are validated from the repo-relative frozen subset
+`sources/2026-07-13-cross-harness-session-bridge.requirements.md`. Its canonical
+external origin is
 `C:\Users\diego\.config\superpowers\worktrees\hermes\session-bridge\docs\superpowers\plans\2026-07-13-cross-harness-session-bridge.md`
 at Git revision `91d5ebe8a081620c0eb854998e071eb1bb65c2cb`; the audited file SHA-256 is
 `8EBA29199E7D56CD762E499DF4BD6404397A844226A983539CC71F2F58778DDA`.
