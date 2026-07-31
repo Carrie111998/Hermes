@@ -231,10 +231,29 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 memory:
   memory_enabled: true
   user_profile_enabled: true
+  builtin_writer_enabled: true  # false = hide built-in MEMORY.md / USER.md writer
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
 ```
+
+## Controlling access to the built-in writer (`builtin_writer_enabled`)
+
+Set `memory.builtin_writer_enabled: false` to hide the built-in `memory` tool
+that writes `MEMORY.md` and `USER.md` from the model. The default is `true` for
+backward compatibility.
+
+This is deliberately narrower than disabling memory:
+
+- existing `MEMORY.md` / `USER.md` content is still read into the prompt;
+- the `memory` toolset remains enabled, so external provider tools such as
+  Hindsight can still be injected; and
+- manual memory-management commands remain available.
+
+Use `memory.memory_enabled: false` or `memory.user_profile_enabled: false` when
+you want to disable the corresponding read injection instead. Use
+`memory.write_approval: true` when the writer should remain available but each
+write must be approved.
 
 ## Controlling memory writes (`write_approval`)
 

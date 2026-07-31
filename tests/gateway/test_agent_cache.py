@@ -134,6 +134,42 @@ class TestExtractCacheBustingConfig:
         assert out["compression.protect_last_n"] == 25
         assert out["compression.codex_app_server_auto"] == "hermes"
 
+    def test_builtin_memory_writer_effective_value_busts_cached_agent(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        config = {"memory": {"builtin_writer_enabled": "${HERMES_TEST_WRITER}"}}
+        monkeypatch.setenv("HERMES_TEST_WRITER", "true")
+        enabled = GatewayRunner._extract_cache_busting_config(config)
+        monkeypatch.setenv("HERMES_TEST_WRITER", "false")
+        disabled = GatewayRunner._extract_cache_busting_config(config)
+
+        assert enabled["memory.builtin_writer_enabled"] is True
+        assert disabled["memory.builtin_writer_enabled"] is False
+        assert enabled != disabled
+
+        runtime = {"provider": "test", "api_key": "test"}
+        enabled_sig = GatewayRunner._agent_config_signature(
+            "test-model", runtime, ["memory"], "", cache_keys=enabled
+        )
+        disabled_sig = GatewayRunner._agent_config_signature(
+            "test-model", runtime, ["memory"], "", cache_keys=disabled
+        )
+        assert enabled_sig != disabled_sig
+
+    def test_malformed_config_hides_writer_in_gateway_signature(self, tmp_path, monkeypatch):
+        import gateway.run as gateway_run
+        from gateway.run import GatewayRunner
+
+        (tmp_path / "config.yaml").write_text(
+            "memory: [unterminated", encoding="utf-8"
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"builtin_writer_enabled": True}}
+        )
+
+        assert out["memory.builtin_writer_enabled"] is False
 
     def test_missing_keys_yield_none(self):
         """Absent config keys must produce None values (still contribute to signature)."""

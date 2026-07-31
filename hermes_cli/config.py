@@ -246,6 +246,10 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# path -> (mtime_ns, size, parseable). Used by fail-closed policy readers that
+# must distinguish a valid empty/default config from the generic loader's
+# fresh-process fallback after malformed YAML.
+_CONFIG_PARSEABILITY_CACHE: Dict[str, Tuple[int, int, bool]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3140,6 +3144,89 @@ def load_config_readonly() -> Dict[str, Any]:
     safety guarantee is purely documented, not enforced — be careful.
     """
     return _load_config_impl(want_deepcopy=False)
+
+
+def _config_file_is_parseable(path: Path) -> bool:
+    """Return whether an optional YAML config file is syntactically usable."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+    path_key = str(path)
+    signature = (stat.st_mtime_ns, stat.st_size)
+    with _CONFIG_LOCK:
+        cached = _CONFIG_PARSEABILITY_CACHE.get(path_key)
+        if cached is not None and cached[:2] == signature:
+            return cached[2]
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            parsed = fast_safe_load(handle)
+        parseable = parsed is None or isinstance(parsed, dict)
+    except Exception:
+        parseable = False
+
+    with _CONFIG_LOCK:
+        if len(_CONFIG_PARSEABILITY_CACHE) >= 32:
+            _CONFIG_PARSEABILITY_CACHE.pop(next(iter(_CONFIG_PARSEABILITY_CACHE)))
+        _CONFIG_PARSEABILITY_CACHE[path_key] = (*signature, parseable)
+    return parseable
+
+
+def resolve_builtin_memory_writer_enabled(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    config_path: Optional[Path] = None,
+) -> bool:
+    """Resolve the effective built-in memory-writer exposure policy.
+
+    ``config=None`` reads the fully merged config (defaults, user config,
+    managed scope, and environment expansion). Gateway callers may pass their
+    already-managed per-profile config; environment references are expanded
+    here so both paths derive the same boolean. Missing or unrecognized values
+    preserve the backward-compatible default of ``True``. Malformed or
+    unreadable policy files hide the mutating schema rather than exposing it.
+    """
+    policy_path = config_path or get_config_path()
+    if not _config_file_is_parseable(policy_path):
+        return False
+    from hermes_cli import managed_scope
+
+    managed_dir = managed_scope.get_managed_dir()
+    if managed_dir is not None and not _config_file_is_parseable(
+        managed_dir / "config.yaml"
+    ):
+        return False
+
+    try:
+        effective = load_config_readonly() if config is None else _expand_env_vars(config)
+        memory_config = effective.get("memory") if isinstance(effective, dict) else None
+        value = (
+            memory_config.get("builtin_writer_enabled", True)
+            if isinstance(memory_config, dict)
+            else True
+        )
+    except Exception:
+        logger.warning(
+            "Could not resolve memory.builtin_writer_enabled; hiding built-in writer",
+            exc_info=True,
+        )
+        return False
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+    return True
 
 
 def write_platform_config_field(

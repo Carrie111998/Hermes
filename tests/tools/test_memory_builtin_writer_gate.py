@@ -22,10 +22,13 @@ def _write_config(memory_config):
     return path
 
 
-def _clear_tool_availability_caches():
+def _reset_initial_state():
+    """Establish one clean baseline; transition assertions must not call this."""
+    import hermes_cli.config as config
     import model_tools
     from tools.registry import invalidate_check_fn_cache
 
+    config._LOAD_CONFIG_CACHE.clear()
     invalidate_check_fn_cache()
     model_tools._clear_tool_defs_cache()
 
@@ -34,22 +37,94 @@ def test_builtin_memory_writer_available_by_default():
     """Back-compat: existing configs keep exposing the built-in writer."""
     from model_tools import get_tool_definitions
 
-    _clear_tool_availability_caches()
+    _reset_initial_state()
     tools = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
 
     assert "memory" in _tool_names(tools)
 
 
-def test_builtin_memory_writer_can_be_disabled_without_disabling_memory_toolset():
-    """``memory.builtin_writer_enabled: false`` hides only the built-in writer."""
+def test_builtin_memory_writer_config_flip_is_immediate_without_cache_clear():
+    """Both flip directions bypass generic check_fn grace and schema-cache staleness."""
     from model_tools import get_tool_definitions
     from tools.memory_tool import check_memory_requirements
 
-    _write_config({"builtin_writer_enabled": False})
-    _clear_tool_availability_caches()
+    _write_config({"builtin_writer_enabled": True})
+    _reset_initial_state()
+    enabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" in _tool_names(enabled)
 
-    assert check_memory_requirements() is False
+    _write_config({"builtin_writer_enabled": False})
+    disabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert check_memory_requirements() is True
+    assert "memory" not in _tool_names(disabled)
+
+    _write_config({"builtin_writer_enabled": True})
+    reenabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" in _tool_names(reenabled)
+
+
+def test_builtin_memory_writer_env_reference_changes_cache_key(monkeypatch):
+    """The effective bool, not only config.yaml stat, keys schema caching."""
+    from model_tools import get_tool_definitions
+
+    monkeypatch.setenv("HERMES_TEST_BUILTIN_WRITER", "true")
+    _write_config({"builtin_writer_enabled": "${HERMES_TEST_BUILTIN_WRITER}"})
+    _reset_initial_state()
+    enabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" in _tool_names(enabled)
+
+    monkeypatch.setenv("HERMES_TEST_BUILTIN_WRITER", "false")
+    disabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" not in _tool_names(disabled)
+
+
+def test_malformed_config_hides_builtin_memory_writer():
+    """A broken policy file must not fall back to exposing a mutating tool."""
+    from hermes_cli.config import get_config_path
+    from model_tools import get_tool_definitions
+
+    get_config_path().write_text("memory: [unterminated", encoding="utf-8")
+    _reset_initial_state()
+
     tools = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+
+    assert "memory" not in _tool_names(tools)
+
+
+def test_builtin_memory_writer_managed_override_changes_cache_key(tmp_path, monkeypatch):
+    """Managed-scope edits take effect even when user config.yaml is unchanged."""
+    from hermes_cli import managed_scope
+    from model_tools import get_tool_definitions
+
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    _write_config({"builtin_writer_enabled": True})
+    (managed_dir / "config.yaml").write_text(
+        yaml.safe_dump({"memory": {"builtin_writer_enabled": True}}),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    _reset_initial_state()
+    enabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" in _tool_names(enabled)
+
+    (managed_dir / "config.yaml").write_text(
+        yaml.safe_dump({"memory": {"builtin_writer_enabled": False}}),
+        encoding="utf-8",
+    )
+    managed_scope.invalidate_managed_cache()
+    disabled = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=True)
+    assert "memory" not in _tool_names(disabled)
+
+
+def test_non_quiet_definitions_apply_builtin_writer_policy():
+    from model_tools import get_tool_definitions
+
+    _write_config({"builtin_writer_enabled": False})
+    _reset_initial_state()
+
+    tools = get_tool_definitions(enabled_toolsets=["memory"], quiet_mode=False)
 
     assert "memory" not in _tool_names(tools)
 
@@ -57,6 +132,7 @@ def test_builtin_memory_writer_can_be_disabled_without_disabling_memory_toolset(
 def test_memory_provider_tools_still_inject_when_builtin_writer_disabled():
     """Provider tools are keyed by the memory toolset, not by the built-in writer."""
     import importlib
+
     import pytest
 
     memory_manager = importlib.import_module("agent.memory_manager")

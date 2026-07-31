@@ -1122,36 +1122,14 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
-def _coerce_config_bool(value: Any, default: bool = True) -> bool:
-    """Coerce common config bool spellings while preserving a safe default."""
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
-            return True
-        if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
-            return False
-    return bool(value)
-
-
 def check_memory_requirements() -> bool:
-    """Return whether the built-in MEMORY.md / USER.md writer is exposed.
+    """The built-in file-memory implementation has no external requirements.
 
-    External memory providers are injected separately. This gates only the
-    built-in ``memory`` tool; prompt-memory read injection remains enabled.
+    Operator policy for exposing its schema is resolved in ``model_tools``;
+    keeping policy out of this availability probe avoids registry TTL and
+    last-good-result caching.
     """
-    try:
-        from hermes_cli.config import load_config
-
-        mem_config = load_config().get("memory") or {}
-    except Exception:
-        mem_config = {}
-    return _coerce_config_bool(
-        mem_config.get("builtin_writer_enabled", True), default=True
-    )
+    return True
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
