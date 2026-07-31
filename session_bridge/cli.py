@@ -759,8 +759,6 @@ class ProductionBackend:
     def serve(self) -> None:
         visibility_stop: threading.Event | None = None
         visibility_thread: threading.Thread | None = None
-        sidebar_recovery_stop: threading.Event | None = None
-        sidebar_recovery_thread: threading.Thread | None = None
         try:
             if self.config.mirrors.automatic_creation:
                 try:
@@ -783,22 +781,6 @@ class ProductionBackend:
                 config=self.config,
                 token=token,
             )
-            if self.config.sidebar.enabled and self.config.sidebar.continuous:
-                sidebar_recovery_backend = ProductionBackend(self.config)
-                sidebar_recovery_stop = threading.Event()
-                sidebar_recovery_thread = threading.Thread(
-                    target=_run_continuous_sidebar_recovery_worker,
-                    kwargs={
-                        "run_once": (
-                            sidebar_recovery_backend.run_sidebar_recovery_once
-                        ),
-                        "close": sidebar_recovery_backend.close,
-                        "stop": sidebar_recovery_stop,
-                    },
-                    name="session-bridge-sidebar-recovery",
-                    daemon=True,
-                )
-                sidebar_recovery_thread.start()
             if (
                 self.config.claude_visibility.enabled
                 and self.config.claude_visibility.continuous
@@ -835,10 +817,6 @@ class ProductionBackend:
                 raise ConfigurationFailure("service_authorization_failed") from exc
             raise ProviderDegraded("service_start_failed") from exc
         finally:
-            if sidebar_recovery_stop is not None:
-                sidebar_recovery_stop.set()
-            if sidebar_recovery_thread is not None:
-                sidebar_recovery_thread.join(timeout=5.0)
             if visibility_stop is not None:
                 visibility_stop.set()
             if visibility_thread is not None:
@@ -1376,56 +1354,10 @@ class ProductionBackend:
         )
 
     def sidebar_run_once(self) -> Mapping[str, Any]:
-        if not self.config.sidebar.enabled:
-            raise RolloutGateBlocked("sidebar_disabled")
-        if self.config.sidebar.continuous:
-            raise RolloutGateBlocked("sidebar_continuous_worker_active")
-        try:
-            return asdict(self._require_sidebar_executor().run_once())
-        except ConfigurationFailure:
-            raise
-        except Exception as exc:
-            raise ProviderDegraded("sidebar_executor_failed") from exc
+        raise RolloutGateBlocked("desktop_broker_required")
 
     def run_sidebar_recovery_once(self) -> Mapping[str, Any]:
-        if not self.config.sidebar.enabled or not self.config.sidebar.continuous:
-            raise RolloutGateBlocked("sidebar_continuous_worker_inactive")
-        try:
-            hydration = self._require_sidebar_hydration_executor().run_once()
-            if hydration.status != "idle":
-                self._record_sidebar_recovery_progress(
-                    lane="hydration",
-                    status=hydration.status,
-                )
-                return {"lane": "hydration", **asdict(hydration)}
-            executor = self._require_sidebar_executor()
-            registration = executor.run_once()
-            if registration.status == "idle":
-                discovery = self._register_sidebar_catalog_once()
-                if discovery.failed:
-                    _LOG.warning(
-                        "continuous sidebar registration skipped %s candidates",
-                        discovery.failed,
-                    )
-                if discovery.queued:
-                    registration = executor.run_once()
-            self._record_sidebar_recovery_progress(
-                lane="registration",
-                status=registration.status,
-            )
-            if (
-                registration.status == "unsettled"
-                and registration.error_code == "codex_tool_unavailable"
-            ) or (
-                registration.status == "retry"
-                and registration.error_code == "bridge_temporarily_unavailable"
-            ):
-                self._recycle_sidebar_delivery_runtime()
-            return {"lane": "registration", **asdict(registration)}
-        except (ConfigurationFailure, RolloutGateBlocked):
-            raise
-        except Exception as exc:
-            raise ProviderDegraded("sidebar_recovery_failed") from exc
+        raise RolloutGateBlocked("desktop_broker_required")
 
     def _register_sidebar_catalog_once(self):
         coordinator = SessionBridgeCoordinator(
@@ -3190,65 +3122,7 @@ class ProductionBackend:
             raise
 
     def _require_sidebar_executor(self) -> SidebarExecutor:
-        if self._sidebar_executor is not None:
-            return self._sidebar_executor
-        try:
-            marker_key = resolve_marker_key()
-            self._apply_sidebar_create_reservation_cutover(
-                marker_secret=marker_key,
-            )
-            codex_command = resolve_cli_executable("codex")
-            if len(codex_command) != 1:
-                raise RuntimeError("codex_direct_runtime_required")
-            if self._sidebar_registration_codex_client is None:
-                registration_args = self._sidebar_registration_runtime_args(
-                    codex_bin=codex_command[0],
-                )
-                self._sidebar_registration_codex_client = CodexAppServerClient(
-                    codex_bin=codex_command[0],
-                    extra_args=registration_args,
-                )
-            source = CodexSourceAdapter(
-                self._sidebar_registration_codex_client,
-                marker_secret=marker_key,
-            )
-            verifier = SidebarThreadVerifier(
-                source,
-                marker_secret=marker_key,
-                reconciliation_interval=self.config.service.reconcile_seconds,
-            )
-
-            def resolve(candidate: SidebarCandidate) -> SidebarPlacement:
-                return resolve_sidebar_placement(
-                    configured_inbox_cwd=cast(str, self.config.sidebar.inbox_cwd),
-                    hermes_home=get_hermes_home(),
-                    placement_generation=self.config.sidebar.placement_generation,
-                    source_cwd=candidate.cwd,
-                )
-
-            self._sidebar_executor = SidebarExecutor(
-                store=self._require_store(),
-                verifier=verifier,
-                native=CodexAppServerSidebarDelivery(
-                    cast(Any, self._sidebar_registration_codex_client),
-                    fresh_client_factory=lambda: cast(
-                        Any,
-                        CodexAppServerClient(codex_bin=codex_command[0]),
-                    ),
-                ),
-                placement_resolver=resolve,
-                marker_secret=marker_key,
-                readable_preview_enabled=(
-                    self.config.sidebar.readable_preview_enabled
-                ),
-                preview_budget_chars=self.config.sidebar.preview_budget_chars,
-            )
-            return self._sidebar_executor
-        except ConfigurationFailure:
-            raise
-        except Exception as exc:
-            self.close()
-            raise ConfigurationFailure("sidebar_executor_unavailable") from exc
+        raise RolloutGateBlocked("desktop_broker_required")
 
     def _sidebar_registration_runtime_args(self, *, codex_bin: str) -> list[str]:
         """Resolve every configured MCP name before launching the lean runtime."""
@@ -3519,7 +3393,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser(
         "sidebar-run-once",
-        help="process at most one native sidebar delivery job",
+        help="diagnostic only; delivery is owned by the pinned Codex Desktop broker",
     )
 
     sidebar_retry_bound = commands.add_parser(
@@ -3733,6 +3607,9 @@ def main(
             return EXIT_CONFIG
         _emit({"status": "installed", "path": str(installed)})
         return EXIT_OK
+    if args.command == "sidebar-run-once":
+        _emit({"error": "desktop_broker_required"})
+        return EXIT_DEGRADED
     try:
         config = config_loader()
         if not isinstance(config, BridgeConfig):
@@ -3828,12 +3705,6 @@ def main(
             payload = dict(backend.sidebar_hydration_status())
             _emit(payload)
             return EXIT_OK
-        if args.command == "sidebar-run-once":
-            payload = _public_sidebar_execution_result(backend.sidebar_run_once())
-            _emit(payload)
-            return (
-                EXIT_OK if payload["status"] in {"idle", "visible"} else EXIT_DEGRADED
-            )
         if args.command == "sidebar-retry-bound":
             payload = _public_sidebar_bound_retry_result(
                 backend.sidebar_retry_bound(

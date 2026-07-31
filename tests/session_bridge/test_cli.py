@@ -1275,59 +1275,30 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
     backend.close()
 
 
-@pytest.mark.parametrize(
-    ("status", "expected_exit"),
-    [
-        ("idle", 0),
-        ("visible", 0),
-        ("retry", 3),
-        ("failed", 3),
-        ("unsettled", 3),
-    ],
-)
-def test_sidebar_run_once_dispatches_once_emits_only_the_sanitized_result_and_closes(
-    status: str,
-    expected_exit: int,
+def test_sidebar_run_once_requires_desktop_broker_before_runtime_startup(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    backend = FakeBackend(
-        sidebar_run_payload={
-            "status": status,
-            "job_id": "sidebar-job-1",
-            "thread_id": "native-thread-1",
-            "error_code": "broker_time_budget" if status == "retry" else None,
-            "private_detail": "C:/private/provider-detail-must-not-render",
-        }
+    calls: list[str] = []
+
+    def forbidden_config_loader() -> BridgeConfig:
+        calls.append("config_loader")
+        raise AssertionError("sidebar diagnostic must not load config")
+
+    def forbidden_backend_factory(_config: BridgeConfig) -> FakeBackend:
+        calls.append("backend_factory")
+        raise AssertionError("sidebar diagnostic must not construct a backend")
+
+    assert (
+        main(
+            ["sidebar-run-once"],
+            config_loader=forbidden_config_loader,
+            backend_factory=forbidden_backend_factory,
+        )
+        == 3
     )
 
-    assert _run(["sidebar-run-once"], backend) == expected_exit
-
-    assert backend.calls == [("sidebar_run_once",), ("close",)]
-    expected = {"status": status}
-    if status == "retry":
-        expected["error_code"] = "broker_time_budget"
-    assert _json_output(capsys) == expected
-
-
-def test_sidebar_run_once_rejects_a_nonfixed_error_code_without_rendering_it(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    private_error = "C:/private/provider-detail-must-not-render"
-    backend = FakeBackend(
-        sidebar_run_payload={
-            "status": "retry",
-            "job_id": "sidebar-job-1",
-            "thread_id": "native-thread-1",
-            "error_code": private_error,
-        }
-    )
-
-    assert _run(["sidebar-run-once"], backend) == 3
-
-    assert backend.calls == [("sidebar_run_once",), ("close",)]
-    rendered = capsys.readouterr().out
-    assert json.loads(rendered) == {"error": "provider_degraded"}
-    assert private_error not in rendered
+    assert _json_output(capsys) == {"error": "desktop_broker_required"}
+    assert calls == []
 
 
 def test_sidebar_retry_bound_requires_exact_authority_and_preserves_ids(
@@ -6040,303 +6011,12 @@ def test_continuous_sidebar_recovery_worker_drains_then_uses_idle_wait() -> None
     assert waits == [0.05, 2.0]
 
 
-def test_production_sidebar_recovery_once_prioritizes_hydration_then_registration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
-    )
-    calls: list[str] = []
-    progress: list[dict[str, object]] = []
-    hydration_results = iter((
-        SidebarHydrationExecutionResult(status="visible"),
-        SidebarHydrationExecutionResult(status="idle"),
-    ))
+def test_production_sidebar_recovery_once_requires_desktop_broker() -> None:
+    backend = ProductionBackend(BridgeConfig())
 
-    class Store:
-        def record_sidebar_recovery_progress(self, **value: object) -> None:
-            progress.append(value)
+    with pytest.raises(RolloutGateBlocked, match="desktop_broker_required"):
+        backend.run_sidebar_recovery_once()
 
-    class HydrationExecutor:
-        def run_once(self) -> SidebarHydrationExecutionResult:
-            calls.append("hydration")
-            return next(hydration_results)
-
-    class RegistrationExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            calls.append("registration")
-            return SidebarExecutionResult(status="idle")
-
-    class RegistrationSummary:
-        queued = 0
-        failed = 0
-
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_hydration_executor",
-        lambda: HydrationExecutor(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_executor",
-        lambda: RegistrationExecutor(),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_register_sidebar_catalog_once",
-        lambda: calls.append("discovery") or RegistrationSummary(),
-    )
-    monkeypatch.setattr(backend, "_require_store", lambda: Store())
-    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
-
-    first = backend.run_sidebar_recovery_once()
-    second = backend.run_sidebar_recovery_once()
-
-    assert first == {
-        "lane": "hydration",
-        "status": "visible",
-        "job_id": None,
-        "error_code": None,
-    }
-    assert second == {
-        "lane": "registration",
-        "status": "idle",
-        "job_id": None,
-        "thread_id": None,
-        "error_code": None,
-    }
-    assert calls == ["hydration", "hydration", "registration", "discovery"]
-    assert progress == [
-        {"lane": "hydration", "status": "visible", "now": 1_000.0},
-        {"lane": "registration", "status": "idle", "now": 1_000.0},
-    ]
-
-
-def test_production_sidebar_recovery_discovers_catalog_only_work_before_idle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
-    )
-    calls: list[str] = []
-    progress: list[dict[str, object]] = []
-    registration_results = iter((
-        SidebarExecutionResult(status="idle"),
-        SidebarExecutionResult(
-            status="visible",
-            job_id="sidebar-job:" + ("b" * 64),
-            thread_id="019f-readable",
-        ),
-    ))
-
-    class Store:
-        def record_sidebar_recovery_progress(self, **value: object) -> None:
-            progress.append(value)
-
-    class HydrationExecutor:
-        def run_once(self) -> SidebarHydrationExecutionResult:
-            calls.append("hydration")
-            return SidebarHydrationExecutionResult(status="idle")
-
-    class RegistrationExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            calls.append("registration")
-            return next(registration_results)
-
-    class RegistrationSummary:
-        queued = 1
-        failed = 0
-
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_hydration_executor",
-        lambda: HydrationExecutor(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_executor",
-        lambda: RegistrationExecutor(),
-    )
-    monkeypatch.setattr(
-        backend,
-        "_register_sidebar_catalog_once",
-        lambda: calls.append("discovery") or RegistrationSummary(),
-    )
-    monkeypatch.setattr(backend, "_require_store", lambda: Store())
-    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 2_000.0)
-
-    assert backend.run_sidebar_recovery_once() == {
-        "lane": "registration",
-        "status": "visible",
-        "job_id": "sidebar-job:" + ("b" * 64),
-        "thread_id": "019f-readable",
-        "error_code": None,
-    }
-    assert calls == [
-        "hydration",
-        "registration",
-        "discovery",
-        "registration",
-    ]
-    assert progress == [
-        {"lane": "registration", "status": "visible", "now": 2_000.0}
-    ]
-
-
-def test_production_sidebar_recovery_progress_write_is_best_effort(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
-    )
-
-    class Store:
-        def record_sidebar_recovery_progress(self, **value: object) -> None:
-            del value
-            raise RuntimeError("database is locked")
-
-    class HydrationExecutor:
-        def run_once(self) -> SidebarHydrationExecutionResult:
-            return SidebarHydrationExecutionResult(status="idle")
-
-    class RegistrationExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            return SidebarExecutionResult(
-                status="visible",
-                job_id="sidebar-job:" + ("a" * 64),
-                thread_id="019f-test",
-            )
-
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_hydration_executor",
-        lambda: HydrationExecutor(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        backend,
-        "_require_sidebar_executor",
-        lambda: RegistrationExecutor(),
-    )
-    monkeypatch.setattr(backend, "_require_store", lambda: Store())
-
-    assert backend.run_sidebar_recovery_once() == {
-        "lane": "registration",
-        "status": "visible",
-        "job_id": "sidebar-job:" + ("a" * 64),
-        "thread_id": "019f-test",
-        "error_code": None,
-    }
-
-
-def test_production_sidebar_recovery_recycles_unavailable_codex_client(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
-    )
-    closed: list[str] = []
-
-    class Client:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def close(self) -> None:
-            closed.append(self.name)
-
-    class Store:
-        def record_sidebar_recovery_progress(self, **value: object) -> None:
-            del value
-
-    class HydrationExecutor:
-        def run_once(self) -> SidebarHydrationExecutionResult:
-            return SidebarHydrationExecutionResult(status="idle")
-
-    class RegistrationExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            return SidebarExecutionResult(
-                status="unsettled",
-                error_code="codex_tool_unavailable",
-            )
-
-    normal_client = Client("normal")
-    registration_client = Client("registration")
-    hydration = HydrationExecutor()
-    registration = RegistrationExecutor()
-    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
-    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
-    backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
-    backend._sidebar_executor = registration
-    monkeypatch.setattr(backend, "_require_store", lambda: Store())
-
-    assert backend.run_sidebar_recovery_once() == {
-        "lane": "registration",
-        "status": "unsettled",
-        "job_id": None,
-        "thread_id": None,
-        "error_code": "codex_tool_unavailable",
-    }
-    assert closed == ["normal", "registration"]
-    assert backend._sidebar_codex_client is None
-    assert backend._sidebar_registration_codex_client is None
-    assert backend._sidebar_hydration_executor is None
-    assert backend._sidebar_executor is None
-
-
-def test_production_sidebar_recovery_recycles_retryable_codex_transport(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
-    )
-    closed: list[str] = []
-
-    class Client:
-        def __init__(self, name: str) -> None:
-            self.name = name
-
-        def close(self) -> None:
-            closed.append(self.name)
-
-    class Store:
-        def record_sidebar_recovery_progress(self, **value: object) -> None:
-            del value
-
-    class HydrationExecutor:
-        def run_once(self) -> SidebarHydrationExecutionResult:
-            return SidebarHydrationExecutionResult(status="idle")
-
-    class RegistrationExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            return SidebarExecutionResult(
-                status="retry",
-                job_id="sidebar-job:" + ("c" * 64),
-                error_code="bridge_temporarily_unavailable",
-            )
-
-    normal_client = Client("normal")
-    registration_client = Client("registration")
-    hydration = HydrationExecutor()
-    registration = RegistrationExecutor()
-    backend._sidebar_codex_client = normal_client  # type: ignore[assignment]
-    backend._sidebar_registration_codex_client = registration_client  # type: ignore[assignment]
-    backend._sidebar_hydration_executor = hydration  # type: ignore[assignment]
-    backend._sidebar_executor = registration
-    monkeypatch.setattr(backend, "_require_store", lambda: Store())
-
-    assert backend.run_sidebar_recovery_once() == {
-        "lane": "registration",
-        "status": "retry",
-        "job_id": "sidebar-job:" + ("c" * 64),
-        "thread_id": None,
-        "error_code": "bridge_temporarily_unavailable",
-    }
-    assert closed == ["normal", "registration"]
-    assert backend._sidebar_codex_client is None
-    assert backend._sidebar_registration_codex_client is None
-    assert backend._sidebar_hydration_executor is None
     assert backend._sidebar_executor is None
 
 
@@ -6378,24 +6058,32 @@ def test_sidebar_hydration_claim_runtime_does_not_start_a_provider_client(
     assert backend._codex_client is None
 
 
-def test_production_serve_owns_one_internal_sidebar_recovery_thread(
+def test_production_serve_does_not_start_local_sidebar_recovery_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    backend = ProductionBackend(
-        BridgeConfig(sidebar=SidebarConfig(enabled=True, continuous=True))
+    config = BridgeConfig(
+        sidebar=SidebarConfig(enabled=True, continuous=True),
     )
-    recovery_calls: list[str] = []
+    backend = ProductionBackend(
+        replace(
+            config,
+            claude_visibility=replace(
+                config.claude_visibility,
+                enabled=True,
+                continuous=True,
+            ),
+        )
+    )
     threads: list[object] = []
 
-    class RecoveryBackend:
-        def run_sidebar_recovery_once(self) -> dict[str, object]:
-            recovery_calls.append("run")
-            return {"lane": "registration", "status": "idle"}
+    class VisibilityBackend:
+        def claude_visibility_run_once(self) -> dict[str, object]:
+            return {"status": "idle"}
 
         def close(self) -> None:
-            recovery_calls.append("close")
+            return None
 
-    recovery_backend = RecoveryBackend()
+    visibility_backend = VisibilityBackend()
 
     class FakeThread:
         def __init__(
@@ -6430,23 +6118,34 @@ def test_production_serve_owns_one_internal_sidebar_recovery_thread(
     monkeypatch.setattr(backend, "_require_store", lambda: object())
     monkeypatch.setattr("session_bridge.cli.resolve_bearer_token", lambda: "token")
     monkeypatch.setattr("session_bridge.cli.create_app", lambda **_kwargs: object())
-    monkeypatch.setattr("session_bridge.cli.ProductionBackend", lambda _config: recovery_backend)
+    monkeypatch.setattr(
+        "session_bridge.cli.ProductionBackend",
+        lambda _config: visibility_backend,
+    )
     monkeypatch.setattr("session_bridge.cli.threading.Thread", FakeThread)
     monkeypatch.setattr("uvicorn.run", lambda *_args, **_kwargs: None)
 
     backend.serve()
 
-    assert len(threads) == 1
-    thread = threads[0]
-    assert thread.name == "session-bridge-sidebar-recovery"
+    started = [thread for thread in threads if thread.started]
+    thread = next(
+        thread
+        for thread in started
+        if thread.name == "session-bridge-claude-visibility"
+    )
+    assert thread.name == "session-bridge-claude-visibility"
     assert thread.daemon is True
     assert thread.started is True
     assert thread.join_timeout == 5.0
-    assert thread.target is cli_module._run_continuous_sidebar_recovery_worker
-    assert thread.kwargs["run_once"] == recovery_backend.run_sidebar_recovery_once
-    assert thread.kwargs["close"] == recovery_backend.close
+    assert thread.target is cli_module._run_continuous_visibility_worker
+    assert thread.kwargs["run_once"] == visibility_backend.claude_visibility_run_once
+    assert thread.kwargs["close"] == visibility_backend.close
     assert thread.kwargs["stop"].is_set() is True
-    assert recovery_calls == []
+    assert all(thread.name != "session-bridge-sidebar-recovery" for thread in started)
+    assert all(
+        thread.target is not cli_module._run_continuous_sidebar_recovery_worker
+        for thread in started
+    )
 
 
 def test_scan_defaults_to_catalog_only_all_history_newest_first(capsys):
@@ -6738,283 +6437,24 @@ def test_production_runtime_wires_real_sidebar_verifier_claim_and_commit(
     assert client.closed is True
 
 
-def test_production_sidebar_run_once_wires_one_executor_cycle_and_closes_client(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    marker_key = b"m" * 32
-    db = SessionDB(tmp_path / "state.db")
-    store = SessionBridgeStore(db)
-    backend = ProductionBackend(
-        replace(BridgeConfig(), sidebar=replace(SidebarConfig(), enabled=True))
-    )
-    backend._db = db
-    backend._store = store
-    backend._catalog = UnifiedCatalog(db, store)
-    executor_calls: list[str] = []
-    construction_order: list[str] = []
-    captured: dict[str, Any] = {}
-    real_cutover = store.apply_sidebar_create_reservation_cutover
+def test_production_sidebar_executor_is_disabled_without_construction() -> None:
+    backend = ProductionBackend(BridgeConfig())
 
-    def record_cutover(**kwargs: Any) -> dict[str, Any]:
-        construction_order.append("cutover")
-        return real_cutover(**kwargs)
-
-    monkeypatch.setattr(
-        store, "apply_sidebar_create_reservation_cutover", record_cutover
-    )
-
-    class ProtocolCodexClient:
-        def __init__(self) -> None:
-            self.closed = False
-            self._initialized = False
-
-        def initialize(self, **kwargs: object) -> dict[str, object]:
-            assert kwargs == {
-                "capabilities": {"experimentalApi": True},
-                "timeout": 30.0,
-            }
-            self._initialized = True
-            return {}
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, object],
-            *,
-            timeout: float,
-        ) -> dict[str, object]:
-            assert method == "config/read"
-            assert params == {
-                "cwd": str(Path.cwd()),
-                "includeLayers": False,
-            }
-            assert timeout == 30.0
-            return {"config": {"mcp_servers": {}}}
-
-        def close(self) -> None:
-            self.closed = True
-
-    client = ProtocolCodexClient()
-
-    class OneCycleExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            executor_calls.append("run_once")
-            return SidebarExecutionResult(status="idle")
-
-    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
-        construction_order.append("executor")
-        captured.update(kwargs)
-        return OneCycleExecutor()
-
-    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
-    monkeypatch.setattr(
-        "session_bridge.cli.resolve_cli_executable",
-        lambda name: (name,),
-    )
-    monkeypatch.setattr(
-        "session_bridge.cli.CodexAppServerClient",
-        lambda **_kwargs: client,
-    )
-    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
-
-    try:
-        result = backend.sidebar_run_once()
-    finally:
-        backend.close()
-
-    assert result == {
-        "status": "idle",
-        "job_id": None,
-        "thread_id": None,
-        "error_code": None,
-    }
-    assert executor_calls == ["run_once"]
-    assert construction_order == ["cutover", "executor"]
-    assert captured["store"] is store
-    assert isinstance(captured["verifier"], SidebarThreadVerifier)
-    assert isinstance(captured["native"], CodexAppServerSidebarDelivery)
-    assert captured["marker_secret"] == marker_key
-    assert client.closed is True
-
-
-def test_production_sidebar_executor_composes_profile_safe_candidate_placement(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    inbox = tmp_path / "profile-home"
-    source = tmp_path / "source-worktree"
-    inbox.mkdir()
-    source.mkdir()
-    db = SessionDB(tmp_path / "state.db")
-    store = SessionBridgeStore(db)
-    backend = ProductionBackend(
-        replace(
-            BridgeConfig(),
-            sidebar=replace(
-                SidebarConfig(),
-                enabled=True,
-                continuous=False,
-                inbox_cwd=str(inbox),
-                placement_generation=1,
-            ),
-        )
-    )
-    backend._db = db
-    backend._store = store
-    backend._catalog = UnifiedCatalog(db, store)
-    captured: dict[str, Any] = {}
-
-    class ProtocolCodexClient:
-        _initialized = False
-
-        def initialize(self, **_kwargs: object) -> dict[str, object]:
-            self._initialized = True
-            return {}
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, object],
-            *,
-            timeout: float,
-        ) -> dict[str, object]:
-            assert method == "config/read"
-            return {"config": {"mcp_servers": {}}}
-
-        def close(self) -> None:
-            return None
-
-    class OneCycleExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            return SidebarExecutionResult(status="idle")
-
-    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
-        captured.update(kwargs)
-        return OneCycleExecutor()
-
-    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
-    monkeypatch.setattr(
-        "session_bridge.cli.resolve_cli_executable",
-        lambda name: (name,),
-    )
-    monkeypatch.setattr(
-        "session_bridge.cli.CodexAppServerClient",
-        lambda **_kwargs: ProtocolCodexClient(),
-    )
-    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
-    monkeypatch.setattr("session_bridge.cli.get_hermes_home", lambda: inbox)
-    candidate = SidebarCandidate(
-        source_session_id="claude:placement-composition",
-        provider=Provider.CLAUDE,
-        bridge_id=sidebar_bridge_id("claude:placement-composition"),
-        title="[Claude] placement composition",
-        cwd=str(source),
-        git_root=None,
-        git_branch=None,
-        git_head=None,
-        worktree_id=None,
-        eligible_at=100.0,
-    )
-
-    try:
+    with pytest.raises(RolloutGateBlocked, match="desktop_broker_required"):
         backend._require_sidebar_executor()
-        resolver = captured["placement_resolver"]
-        placement = resolver(candidate)
-    finally:
-        backend.close()
 
-    assert placement.inbox_cwd == str(inbox)
-    assert placement.runtime_workspace_roots == (str(inbox), str(source))
-    assert placement.placement_generation == 1
-    assert candidate.cwd == str(source)
-
-
-def test_production_sidebar_placement_fails_closed_before_native_dispatch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    configured_inbox = tmp_path / "configured-inbox"
-    active_profile = tmp_path / "active-profile"
-    source = tmp_path / "source"
-    configured_inbox.mkdir()
-    active_profile.mkdir()
-    source.mkdir()
-    backend = ProductionBackend(
-        replace(
-            BridgeConfig(),
-            sidebar=replace(
-                SidebarConfig(),
-                inbox_cwd=str(configured_inbox),
-                placement_generation=1,
-            ),
-        )
-    )
-    captured: dict[str, Any] = {}
-
-    class ProtocolCodexClient:
-        _initialized = False
-
-        def initialize(self, **_kwargs: object) -> dict[str, object]:
-            self._initialized = True
-            return {}
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, object],
-            *,
-            timeout: float,
-        ) -> dict[str, object]:
-            assert method == "config/read"
-            return {"config": {"mcp_servers": {}}}
-
-        def close(self) -> None:
-            return None
-
-    def executor_factory(**kwargs: Any) -> object:
-        captured.update(kwargs)
-        return object()
-
-    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: b"m" * 32)
-    monkeypatch.setattr(
-        "session_bridge.cli.resolve_cli_executable",
-        lambda name: (name,),
-    )
-    monkeypatch.setattr(
-        "session_bridge.cli.CodexAppServerClient",
-        lambda **_kwargs: ProtocolCodexClient(),
-    )
-    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
-    monkeypatch.setattr("session_bridge.cli.get_hermes_home", lambda: active_profile)
-    candidate = SidebarCandidate(
-        source_session_id="claude:placement-mismatch",
-        provider=Provider.CLAUDE,
-        bridge_id=sidebar_bridge_id("claude:placement-mismatch"),
-        title="[Claude] placement mismatch",
-        cwd=str(source),
-        git_root=None,
-        git_branch=None,
-        git_head=None,
-        worktree_id=None,
-        eligible_at=100.0,
-    )
-
-    try:
-        backend._require_sidebar_executor()
-        with pytest.raises(SidebarPlacementError, match="inbox_unavailable"):
-            captured["placement_resolver"](candidate)
-    finally:
-        backend.close()
+    assert backend._sidebar_executor is None
+    assert backend._sidebar_codex_client is None
+    assert backend._sidebar_registration_codex_client is None
 
 
 @pytest.mark.parametrize(
     ("sidebar", "expected_gate"),
     [
-        (SidebarConfig(enabled=False, continuous=False), "sidebar_disabled"),
+        (SidebarConfig(enabled=False, continuous=False), "desktop_broker_required"),
         (
             SidebarConfig(enabled=True, continuous=True),
-            "sidebar_continuous_worker_active",
+            "desktop_broker_required",
         ),
     ],
 )
@@ -7041,166 +6481,6 @@ def test_production_sidebar_run_once_refuses_before_executor_construction(
 
     assert exc_info.value.gate == expected_gate
     assert executor_constructions == []
-
-
-def test_production_sidebar_executor_uses_a_dedicated_codex_transport(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    marker_key = b"m" * 32
-    db = SessionDB(tmp_path / "state.db")
-    store = SessionBridgeStore(db)
-    backend = ProductionBackend(
-        replace(
-            BridgeConfig(),
-            sidebar=replace(SidebarConfig(), enabled=True, continuous=False),
-        )
-    )
-    backend._db = db
-    backend._store = store
-    backend._catalog = UnifiedCatalog(db, store)
-
-    class ProtocolCodexClient:
-        def __init__(self, name: str) -> None:
-            self.name = name
-            self.close_count = 0
-            self._initialized = False
-            self.requests: list[tuple[str, dict[str, object], float]] = []
-
-        def initialize(self, **kwargs: object) -> dict[str, object]:
-            assert kwargs == {
-                "capabilities": {"experimentalApi": True},
-                "timeout": 30.0,
-            }
-            self._initialized = True
-            return {}
-
-        def request(
-            self,
-            method: str,
-            params: dict[str, object],
-            *,
-            timeout: float,
-        ) -> dict[str, object]:
-            self.requests.append((method, dict(params), timeout))
-            assert method == "config/read"
-            return {
-                "config": {
-                    "mcp_servers": {
-                        "session_bridge": {"url": "http://127.0.0.1"},
-                        "gbrain": {"url": "http://127.0.0.1"},
-                    }
-                }
-            }
-
-        def close(self) -> None:
-            self.close_count += 1
-
-    provider_client = ProtocolCodexClient("provider")
-    created: list[tuple[dict[str, object], ProtocolCodexClient]] = []
-
-    def client_factory(**kwargs: object) -> ProtocolCodexClient:
-        client = ProtocolCodexClient(f"sidebar-{len(created)}")
-        created.append((dict(kwargs), client))
-        return client
-
-    monkeypatch.setattr(backend, "_codex_client", provider_client)
-    captured: dict[str, Any] = {}
-
-    class OneCycleExecutor:
-        def run_once(self) -> SidebarExecutionResult:
-            return SidebarExecutionResult(status="idle")
-
-    def executor_factory(**kwargs: Any) -> OneCycleExecutor:
-        captured.update(kwargs)
-        return OneCycleExecutor()
-
-    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_key)
-    monkeypatch.setattr(
-        "session_bridge.cli.resolve_cli_executable",
-        lambda name: (name,),
-    )
-    monkeypatch.setattr(
-        "session_bridge.cli.CodexAppServerClient",
-        client_factory,
-    )
-    monkeypatch.setattr("session_bridge.cli.SidebarExecutor", executor_factory)
-
-    try:
-        assert backend.sidebar_run_once()["status"] == "idle"
-        normal_client = created[0][1]
-        registration_client = created[1][1]
-        assert created[0][0] == {"codex_bin": "codex"}
-        assert normal_client.requests == [
-            (
-                "config/read",
-                {"cwd": str(Path.cwd()), "includeLayers": False},
-                30.0,
-            )
-        ]
-        assert created[1][0] == {
-            "codex_bin": "codex",
-            "extra_args": sidebar_registration_app_server_args(
-                ("gbrain", "session_bridge")
-            ),
-        }
-        assert captured["native"]._client is registration_client
-        assert captured["verifier"]._source_adapter._client is registration_client
-        assert backend._codex_client is provider_client
-        assert backend._sidebar_registration_codex_client is registration_client
-        assert backend._sidebar_codex_client is normal_client
-
-        fresh_client = captured["native"]._fresh_client_factory()
-        assert created[2][0] == {"codex_bin": "codex"}
-        assert fresh_client is created[2][1]
-        fresh_client.close()
-
-        terminal = backend._require_sidebar_terminal_delivery()
-        assert terminal._client is normal_client
-        assert backend._sidebar_codex_client is normal_client
-    finally:
-        backend.close()
-
-    assert provider_client.close_count == 1
-    assert created[0][1].close_count == 1
-    assert created[1][1].close_count == 1
-    assert created[2][1].close_count == 1
-
-
-def test_production_backend_close_closes_both_codex_transports_once_and_resets_lifecycle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = ProductionBackend(BridgeConfig())
-
-    class ProtocolCodexClient:
-        def __init__(self) -> None:
-            self.close_count = 0
-
-        def close(self) -> None:
-            self.close_count += 1
-
-    provider_client = ProtocolCodexClient()
-    sidebar_client = ProtocolCodexClient()
-    registration_client = ProtocolCodexClient()
-    monkeypatch.setattr(backend, "_codex_client", provider_client)
-    monkeypatch.setattr(backend, "_sidebar_codex_client", sidebar_client)
-    monkeypatch.setattr(
-        backend,
-        "_sidebar_registration_codex_client",
-        registration_client,
-    )
-    monkeypatch.setattr(backend, "_sidebar_executor", object())
-
-    backend.close()
-    backend.close()
-
-    assert provider_client.close_count == 1
-    assert sidebar_client.close_count == 1
-    assert registration_client.close_count == 1
-    assert backend._codex_client is None
-    assert backend._sidebar_codex_client is None
-    assert backend._sidebar_registration_codex_client is None
-    assert backend._sidebar_executor is None
 
 
 def test_production_backend_close_attempts_all_cleanup_when_first_client_close_fails(

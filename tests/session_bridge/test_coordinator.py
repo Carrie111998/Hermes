@@ -4720,6 +4720,33 @@ async def test_successful_provider_scan_only_registers_sidebar_in_continuous_mod
 
 
 @pytest.mark.asyncio
+async def test_successful_claude_scan_registers_sidebar_jobs_without_executor() -> None:
+    now = 3_000_000.0
+    source = _paged_sidebar_source(
+        provider=Provider.CLAUDE,
+        native_id="desktop-broker-candidate",
+        content="Queue this source for the Desktop broker",
+        last_active=now,
+    )
+    store = _PagedSidebarStore({None: SidebarSourcePage((source,))})
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert coordinator._sidebar_executor is None
+    assert [candidate.source_session_id for candidate in store.enqueued] == [
+        "claude:desktop-broker-candidate"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_sidebar_executor_does_not_run_when_any_provider_scan_degrades() -> None:
     now = 3_000_000.0
     store = _SidebarScanStore()
