@@ -2733,6 +2733,77 @@ class TestRepairedTranscriptDuplication:
             assert stored2["conversation_history"] == second_transcript
             assert len(stored2["conversation_history"]) == 4
 
+    @pytest.mark.asyncio
+    async def test_repaired_adjacent_user_input_output_boundary(self, adapter):
+        """Multiple user items in input[] become adjacent user messages; repair
+        merges them, breaking exact-prefix detection. Output must still contain
+        only the current turn's assistant reply, not historical tool calls."""
+        prior_history = [
+            {"role": "user", "content": "search the web for X"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "name": "web_search",
+                            "arguments": '{"query": "X"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "results..."},
+            {"role": "assistant", "content": "Here is what I found about X."},
+        ]
+        adapter._response_store.put(
+            "resp_prev",
+            {
+                "response": {"id": "resp_prev", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+
+        # Repair merges the two adjacent user input items into one message.
+        repaired_transcript = prior_history + [
+            {"role": "user", "content": "follow up A\n\nfollow up B"},
+            {"role": "assistant", "content": "reply"},
+        ]
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {
+                        "final_response": "reply",
+                        "messages": list(repaired_transcript),
+                        "_transcript_mode": "full",
+                        "api_calls": 1,
+                    },
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": [
+                            {"role": "user", "content": "follow up A"},
+                            {"role": "user", "content": "follow up B"},
+                        ],
+                        "previous_response_id": "resp_prev",
+                    },
+                )
+
+            assert resp.status == 200
+            data = await resp.json()
+            # Output must contain only the current turn's assistant message,
+            # not replay the historical function_call / function_call_output.
+            output_types = [item["type"] for item in data["output"]]
+            assert output_types == ["message"]
+            stored = adapter._response_store.get(data["id"])
+            assert stored["conversation_history"] == repaired_transcript
+
 
 class TestRunAgentTranscriptMode:
     """Unit tests for the _transcript_mode annotation applied by _run_agent."""

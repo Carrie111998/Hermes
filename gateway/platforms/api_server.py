@@ -5614,6 +5614,18 @@ class APIServerAdapter(BasePlatformAdapter):
             return len(expected_prefix)
         if prior and agent_messages[:len(prior)] == prior:
             return len(prior)
+
+        # _run_agent explicitly marks authoritative full transcripts.  When
+        # repair or other in-place rewriting has changed the prefix, the
+        # exact-prefix comparison fails; fall back to a reverse anchor on the
+        # last user message in the transcript, which corresponds to this turn's
+        # user input (possibly merged with adjacent prior user messages by
+        # repair_message_sequence).
+        if result.get("_transcript_mode") == "full":
+            for i in range(len(agent_messages) - 1, -1, -1):
+                if agent_messages[i].get("role") == "user":
+                    return i + 1
+
         return 0
 
     @classmethod
