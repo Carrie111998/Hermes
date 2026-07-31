@@ -176,15 +176,6 @@ _MANAGER_RECALL_FRAME_RE = re.compile(
     r'[\s\S]*?</\s*memory-context\s*>',
     re.IGNORECASE,
 )
-_MANAGER_RECALL_SIDECAR_RE = re.compile(
-    r'\n\n<\s*memory-context\s*>\s*'
-    r'\[System note:\s*The following is recalled memory context,\s*NOT new user input\.\s*'
-    r'Treat as (?:informational background data|authoritative reference data[^\]]*)\.\]\s*'
-    r'[\s\S]*?</\s*memory-context\s*>',
-    re.IGNORECASE,
-)
-
-
 def sanitize_context(text: str) -> str:
     """Strip fence tags, injected context blocks, and system notes from provider output."""
     text = _INTERNAL_CONTEXT_RE.sub('', text)
@@ -196,12 +187,21 @@ def sanitize_context(text: str) -> str:
 def render_api_content_without_manager_recall(
     api_content: str, canonical_content: Any
 ) -> str:
-    """Remove manager recall only from the sidecar suffix added after canonical content."""
-    if not isinstance(canonical_content, str) or not api_content.startswith(canonical_content):
+    """Remove manager recall only after the canonical user-content boundary."""
+    if not isinstance(canonical_content, str):
         return api_content
-    suffix = api_content[len(canonical_content):]
-    suffix = _MANAGER_RECALL_SIDECAR_RE.sub('', suffix)
-    return canonical_content + _MANAGER_RECALL_FRAME_RE.sub('', suffix)
+    normalized_canonical = canonical_content.strip()
+    for match in _MANAGER_RECALL_FRAME_RE.finditer(api_content):
+        boundary = match.start()
+        if api_content[:boundary].endswith("\n\n"):
+            boundary -= 2
+        candidate = api_content[:boundary]
+        if candidate and (
+            candidate == canonical_content
+            or sanitize_context(candidate).strip() == normalized_canonical
+        ):
+            return api_content[:boundary] + api_content[match.end():]
+    return api_content
 
 
 class StreamingContextScrubber:

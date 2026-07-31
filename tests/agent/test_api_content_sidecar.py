@@ -69,6 +69,20 @@ class TestManagerRecallSidecarRendering:
 
         assert render_api_content_without_manager_recall(sidecar, user_content) == user_content
 
+    def test_uses_sanitized_canonical_content_to_find_the_sidecar_boundary(self):
+        user_content = "before <memory-context>literal tag</memory-context> after"
+        signed = build_memory_context_block("operator recall")
+        sidecar = user_content + "\n\n" + signed + "\n\nUNSIGNED-PLUGIN-CONTEXT"
+
+        assert render_api_content_without_manager_recall(sidecar, "before  after") == (
+            user_content + "\n\nUNSIGNED-PLUGIN-CONTEXT"
+        )
+
+    def test_preserves_ambiguous_manager_shaped_content_after_sanitize(self):
+        user_content = build_memory_context_block("user-authored lookalike")
+
+        assert render_api_content_without_manager_recall(user_content, "") == user_content
+
     def test_removes_legacy_manager_signed_recall_frame(self):
         legacy = (
             "before\n"
@@ -608,17 +622,18 @@ class TestWireInvariant:
         assert current["content"] == "second question\n\nPLUGIN-CTX"
 
     def test_disabled_policy_strips_signed_historic_sidecar_only(self, wire_env):
-        make_agent, handler, _db, _sid = wire_env
+        make_agent, handler, db, sid = wire_env
         signed = build_memory_context_block("operator recall")
         stored_sidecar = (
-            "prior user <memory-context>literal tag</memory-context>\n\n"
+            "prior user <memory-context>literal tag</memory-context> after\n\n"
             + signed
             + "\n\nUNSIGNED-PLUGIN-CONTEXT"
         )
-        history = [
-            {"role": "user", "content": "prior user", "api_content": stored_sidecar},
-            {"role": "assistant", "content": "prior answer"},
-        ]
+        db.create_session(sid, source="cli")
+        db.append_message(sid, "user", content=stored_sidecar.split("\n\n", 1)[0], api_content=stored_sidecar)
+        db.append_message(sid, "assistant", content="prior answer")
+        history = db.get_messages_as_conversation(sid)
+        assert history[0]["content"] == "prior user  after"
         agent = make_agent()
         agent._auto_inject_recall = False
 
@@ -1022,12 +1037,12 @@ class TestMaxIterationsSummaryReplay:
         )
         signed = build_memory_context_block("operator recall")
         stored_sidecar = (
-            "q1 <memory-context>literal tag</memory-context>\n\n"
+            "q1 <memory-context>literal tag</memory-context> after\n\n"
             + signed
             + "\n\nUNSIGNED-PLUGIN-CONTEXT"
         )
         messages = [
-            {"role": "user", "content": "q1", "api_content": stored_sidecar},
+            {"role": "user", "content": "q1  after", "api_content": stored_sidecar},
             {"role": "assistant", "content": "a1"},
         ]
         with patch.object(
