@@ -57,7 +57,15 @@ from hermes_cli import kanban_diagnostics as kd
 try:
     from hermes_cli import boardd_shim
 except ImportError:
+    if os.environ.get("HERMES_KANBAN_BROKER") == "1":
+        raise
     boardd_shim = None  # type: ignore
+
+# Install the broker-aware connection delegates while the process declares
+# boardd custody.  This covers nested helpers such as kanban_specify and
+# kanban_decompose, which open their own connections instead of using _conn().
+if boardd_shim is not None and boardd_shim.enabled():
+    boardd_shim.install_rebind(kanban_db)
 
 log = logging.getLogger(__name__)
 
@@ -138,32 +146,22 @@ def _default_boardd_sock() -> str:
 def _boardd_active(board: Optional[str] = None) -> bool:
     """Check if boardd broker custody is active for the requested board.
 
-    Custody is active when the requested board resolves to the fleet DB
-    (the canonical production signal used by ``boardd_shim``) or when its
-    DB path lives under ``/var/lib/boardd/``.  When custody is active, the
-    broker must be reachable; otherwise we fail closed rather than silently
-    opening the read-only mirror.
+    Custody is active only when the process-level broker flag is enabled and
+    the requested board resolves to the canonical fleet DB.  When custody is
+    active, the broker must be reachable; otherwise we fail closed rather than
+    silently opening the local mirror.
     """
-    if boardd_shim is None:
+    if boardd_shim is None or not boardd_shim.enabled():
         return False
 
-    custody = False
     try:
         is_fleet, _req, _fleet = boardd_shim.routes_to_fleet(board=board)
-        if is_fleet:
-            custody = True
-    except Exception:
-        pass
+    except Exception as exc:
+        raise boardd_shim.BoarddUnavailableError(
+            f"boardd custody routing could not be resolved: {exc}"
+        ) from exc
 
-    if not custody:
-        try:
-            req_path = kanban_db.kanban_db_path(board=board)
-            if str(req_path.resolve()).startswith("/var/lib/boardd/"):
-                custody = True
-        except Exception:
-            pass
-
-    if not custody:
+    if not is_fleet:
         return False
 
     sock_path = _default_boardd_sock()
@@ -172,11 +170,20 @@ def _boardd_active(board: Optional[str] = None) -> bool:
             f"boardd custody active but broker socket missing: {sock_path}"
         )
     try:
-        from hermes_cli.kb_client import Client
+        from hermes_cli import kb_client
 
-        c = Client(sock_path=sock_path)
-        c.ping()
-        c.close()
+        client = kb_client.Client(sock_path=sock_path)
+        client.ping()
+        # BrokerConnection resolves through the thread-local client. Pin the
+        # exact socket that passed the liveness probe for _conn() and nested
+        # helper opens alike.
+        old_client = getattr(kb_client._tl, "client", None)
+        if old_client is not None and old_client is not client:
+            try:
+                old_client.close()
+            except Exception:
+                pass
+        kb_client._tl.client = client
         return True
     except Exception as exc:
         raise boardd_shim.BoarddUnavailableError(
@@ -197,19 +204,6 @@ def _conn(board: Optional[str] = None) -> Any:
     """
     if _boardd_active(board=board):
         from hermes_cli.boardd_shim import BrokerConnection
-        from hermes_cli import kb_client
-
-        sock_path = _default_boardd_sock()
-        client = kb_client.Client(sock_path=sock_path)
-        # BrokerConnection resolves the client through kb_client.get_client(),
-        # so pin the current thread's client to the active broker socket.
-        old_client = getattr(kb_client._tl, "client", None)
-        if old_client is not None and old_client is not client:
-            try:
-                old_client.close()
-            except Exception:
-                pass
-        kb_client._tl.client = client
         return BrokerConnection()
 
     # Standalone path: direct SQLite on a writable local board.
@@ -249,12 +243,11 @@ def register_boardd_exception_handlers(app: Any) -> None:
     app.add_exception_handler(
         boardd_shim.BoarddUnavailableError, _boardd_unavailable_handler
     )
-    try:
+    unavailable = getattr(boardd_shim.kb_client, "BoarddUnavailable", None)
+    if isinstance(unavailable, type):
         app.add_exception_handler(
-            boardd_shim.kb_client.BoarddUnavailable, _boardd_unavailable_handler
+            unavailable, _boardd_unavailable_handler
         )
-    except Exception:
-        pass
 
 
 # Auto-register on the production dashboard app if we are being loaded from it.

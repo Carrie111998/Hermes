@@ -162,7 +162,7 @@ def _c():
 
 
 # --------------------------------------------------------------------------- #
-# FLEET-ONLY routing gate (rev7 re-scope — council GO-FLEET-ONLY).
+# FLAG-AND-FLEET routing gate (rev7 re-scope — council GO-FLEET-ONLY).
 #
 # The broker exists to serialize writers to the ONE live+corrupting board: fleet
 # (~/.hermes/kanban/boards/fleet/kanban.db, the board `current` points at, which
@@ -437,12 +437,14 @@ class BrokerConnection:
 # module so callers are unchanged.
 # --------------------------------------------------------------------------- #
 def connect(db_path=None, *, board=None):
-    """FLEET-GATED connect. Routes to the boardd broker ONLY when the requested
-    open resolves to the fleet DB; every other board passes through to the
-    original local sqlite connect(). Mirrors the real connect() signature so all
-    existing callers (positional db_path, keyword board, no-arg) are unchanged."""
+    """FLAG-AND-FLEET-GATED connect.
+
+    Routes to boardd only when process custody is enabled and the requested open
+    resolves to the fleet DB. Every other request passes through to the original
+    SQLite connect. The signature mirrors the real connect() surface.
+    """
     is_fleet, req, fleet = routes_to_fleet(db_path=db_path, board=board)
-    if is_fleet:
+    if enabled() and is_fleet:
         _route_log.info("boardd route=BROKER db=%s (fleet=%s)", req, fleet)
         return BrokerConnection()
     orig = _ORIG_CONNECT
@@ -458,7 +460,7 @@ def connect(db_path=None, *, board=None):
 
 @contextlib.contextmanager
 def connect_closing(db_path=None, *, board=None):
-    """FLEET-GATED connect_closing. Delegates path routing to the gated connect()
+    """FLAG-AND-FLEET-GATED connect_closing. Delegates to the gated connect()
     (broker for fleet, real sqlite for everything else) and guarantees close on
     exit — identical close semantics to the real connect_closing (BrokerConnection
     and sqlite3.Connection both honor .close())."""

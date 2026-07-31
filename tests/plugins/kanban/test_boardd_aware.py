@@ -1,316 +1,351 @@
-"""Boardd-aware routing tests for the kanban dashboard plugin API layer.
+"""End-to-end boardd custody tests for the kanban dashboard plugin.
 
-These tests verify that ``plugins.kanban.dashboard.plugin_api._conn``:
-  * opens a direct SQLite connection when no boardd broker is active;
-  * routes through ``hermes_cli.boardd_shim.BrokerConnection`` when a boardd
-    broker is listening on the canonical socket and the requested board is the
-    fleet board (custody-active);
-  * fails closed (raises) when custody is active but the broker is not
-    reachable, rather than silently falling back to SQLite.
+The broker in these tests is the vendored production ``scripts/fleet/boardd.py``
+running in a separate process against an isolated fleet board.  No in-process
+socket fake is used.
 """
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
-import socket
 import sqlite3
-import threading
+import subprocess
+import sys
 import time
-import uuid
 from pathlib import Path
-from typing import Iterator
+from types import SimpleNamespace
 
 import pytest
 
-# Keep retry/backoff short so a missing broker fails fast instead of retrying
-# for the default 90 seconds.
-os.environ.setdefault("KB_CLIENT_RETRY_DEADLINE_S", "1")
-os.environ.setdefault("KB_CLIENT_CONNECT_TIMEOUT_S", "1")
-os.environ.setdefault("KB_CLIENT_READ_TIMEOUT_S", "2")
+# These are read when kb_client is imported. Keep loss tests bounded even when
+# this module is collected outside scripts/run_tests.sh.
+os.environ.setdefault("KB_CLIENT_RETRY_DEADLINE_S", "0.4")
+os.environ.setdefault("KB_CLIENT_CONNECT_TIMEOUT_S", "0.2")
+os.environ.setdefault("KB_CLIENT_READ_TIMEOUT_S", "1")
 
 from hermes_cli import boardd_shim, kb_client
 from hermes_cli import kanban_db as kb
-
-# Import the unit under test.  Importing it sets up the plugin module, so we
-# keep this at module level.
 from plugins.kanban.dashboard import plugin_api
 
 
-@pytest.fixture
-def isolated_hermes_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point HERMES_HOME at a temp directory so tests never touch ~/.hermes."""
+REPO_ROOT = Path(__file__).resolve().parents[3]
+BOARDD = REPO_ROOT / "scripts" / "fleet" / "boardd.py"
+
+
+class TemporaryBoardd:
+    """A real boardd subprocess with deterministic startup and teardown."""
+
+    def __init__(self, db_path: Path, sock_path: Path) -> None:
+        self.db_path = db_path
+        self.sock_path = sock_path
+        self.proc: subprocess.Popen[bytes] | None = None
+
+    def start(self) -> None:
+        assert BOARDD.is_file(), BOARDD
+        env = os.environ.copy()
+        # The daemon owns SQLite directly. Broker custody is a client-process
+        # declaration and must not recursively route the daemon back to itself.
+        env.pop("HERMES_KANBAN_BROKER", None)
+        env["BOARDD_DISKGUARD_MIN_FREE_BYTES"] = "0"
+        env["BOARDD_BACKUP_INTERVAL_S"] = "3600"
+        env["BOARDD_CHECKPOINT_INTERVAL_S"] = "3600"
+        self.proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(BOARDD),
+                "--db",
+                str(self.db_path),
+                "--sock",
+                str(self.sock_path),
+                "--import-schema",
+                "--log-level",
+                "WARNING",
+            ],
+            cwd=str(REPO_ROOT),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        deadline = time.monotonic() + 8
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            if self.proc.poll() is not None:
+                stderr = (self.proc.stderr.read() if self.proc.stderr else b"").decode(
+                    "utf-8", "replace"
+                )
+                raise RuntimeError(f"boardd exited during startup: {stderr}")
+            try:
+                client = kb_client.Client(sock_path=str(self.sock_path))
+                client.ping()
+                client.close()
+                return
+            except Exception as exc:  # broker socket may not exist yet
+                last_error = exc
+                time.sleep(0.03)
+        self.stop()
+        raise RuntimeError(f"boardd did not become ready: {last_error}")
+
+    def stop(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def _reset_thread_client() -> None:
+    client = getattr(kb_client._tl, "client", None)
+    if client is not None:
+        client.close()
+    kb_client._tl.client = None
+
+
+@pytest.fixture(autouse=True)
+def short_client_deadline(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(kb_client, "_RETRY_DEADLINE_S", 0.4)
+    monkeypatch.setattr(kb_client, "_CONNECT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(kb_client, "_READ_TIMEOUT_S", 1.0)
+    _reset_thread_client()
+    yield
+    _reset_thread_client()
+
+
+def _make_fleet_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    kb.init_db()
-    return home
-
-
-@pytest.fixture
-def fleet_board(isolated_hermes_home: Path) -> None:
-    """Create a fleet board and make it the current board.
-
-    The plugin routes the fleet board through boardd when custody is active;
-    non-fleet boards continue to use direct SQLite.
-    """
+    monkeypatch.delenv("HERMES_KANBAN_BROKER", raising=False)
+    monkeypatch.delenv("BOARDD_SOCK", raising=False)
     kb.create_board("fleet")
     kb.set_current_board("fleet")
-
-
-@pytest.fixture(autouse=True)
-def clear_boardd_sock_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Make sure BOARDD_SOCK from the outer shell does not leak into tests.
-
-    Tests that need a temp socket set it explicitly via monkeypatch.
-    """
-    monkeypatch.delenv("BOARDD_SOCK", raising=False)
-
-
-class _FakeBoardd(threading.Thread):
-    """Minimal in-process boardd that answers ``ping`` and ``query``."""
-
-    def __init__(self, db_path: str, sock_path: str) -> None:
-        super().__init__(daemon=True)
-        self.db_path = db_path
-        self.sock_path = sock_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._txn_token: str | None = None
-        self._stop_event = threading.Event()
-        self._server: socket.socket | None = None
-        self._ready = threading.Event()
-        self._error: Exception | None = None
-
-    def run(self) -> None:
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.bind(self.sock_path)
-            s.listen(4)
-            s.settimeout(0.2)
-            self._server = s
-            self._ready.set()
-            while not self._stop_event.is_set():
-                try:
-                    conn, _ = s.accept()
-                except socket.timeout:
-                    continue
-                self._handle(conn)
-        except Exception as exc:  # noqa: BLE001
-            self._error = exc
-            self._ready.set()
-
-    def _handle(self, conn: socket.socket) -> None:
-        rfile = conn.makefile("r", encoding="utf-8")
-        wfile = conn.makefile("w", encoding="utf-8")
-        try:
-            for line in rfile:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    req = json.loads(line)
-                    resp = self._dispatch(req)
-                except Exception as exc:  # noqa: BLE001
-                    resp = {"ok": False, "error": str(exc)}
-                wfile.write(json.dumps(resp) + "\n")
-                wfile.flush()
-        finally:
-            try:
-                rfile.close()
-            except Exception:
-                pass
-            try:
-                wfile.close()
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    def _dispatch(self, req: dict) -> dict:
-        op = req.get("op")
-        if op == "ping":
-            return {"ok": True, "result": {"pong": True}}
-
-        if op == "query":
-            args = req.get("args", {})
-            cur = self._conn.execute(args.get("sql", ""), args.get("params") or [])
-            rows = [dict(row) for row in cur.fetchall()]
-            return {"ok": True, "result": rows}
-
-        if op == "exec":
-            args = req.get("args", {})
-            cur = self._conn.execute(args.get("sql", ""), args.get("params") or [])
-            return {
-                "ok": True,
-                "result": {
-                    "rowcount": cur.rowcount,
-                    "lastrowid": cur.lastrowid,
-                },
-            }
-
-        if op == "txn_begin":
-            self._conn.execute("BEGIN IMMEDIATE")
-            self._txn_token = uuid.uuid4().hex
-            return {"ok": True, "result": {"txn": self._txn_token}}
-
-        if op == "txn_commit":
-            self._conn.execute("COMMIT")
-            self._txn_token = None
-            return {"ok": True, "result": {}}
-
-        if op == "txn_rollback":
-            self._conn.execute("ROLLBACK")
-            self._txn_token = None
-            return {"ok": True, "result": {}}
-
-        if op == "txn_exec":
-            args = req.get("args", {})
-            token = args.get("txn")
-            if token != self._txn_token:
-                return {
-                    "ok": False,
-                    "error": "stale transaction",
-                    "etype": "OperationalError",
-                }
-            cur = self._conn.execute(args.get("sql", ""), args.get("params") or [])
-            rows = [dict(row) for row in cur.fetchall()]
-            return {
-                "ok": True,
-                "result": {
-                    "rows": rows,
-                    "rowcount": cur.rowcount,
-                    "lastrowid": cur.lastrowid,
-                },
-            }
-
-        if op in ("integrity_check", "quick_check"):
-            return {"ok": True, "result": ["ok"]}
-
-        return {"ok": False, "error": f"unknown op {op}", "etype": "ValueError"}
-
-    def start_and_wait(self, timeout: float = 5.0) -> None:
-        self.start()
-        if not self._ready.wait(timeout):
-            raise RuntimeError("fake boardd did not become ready")
-        if self._error is not None:
-            raise self._error
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self.join(timeout=5.0)
-        if self._server is not None:
-            try:
-                self._server.close()
-            except Exception:
-                pass
-        try:
-            self._conn.close()
-        except Exception:
-            pass
-        try:
-            os.unlink(self.sock_path)
-        except FileNotFoundError:
-            pass
+    return home, kb.kanban_db_path(board="fleet")
 
 
 @pytest.fixture
-def boardd_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[str, _FakeBoardd]]:
-    """Start a temporary in-process boardd broker and yield (sock_path, broker).
+def broker_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _home, db_path = _make_fleet_home(tmp_path, monkeypatch)
+    sock_path = tmp_path / "boardd.sock"
+    broker = TemporaryBoardd(db_path, sock_path)
+    broker.start()
+    monkeypatch.setenv("HERMES_KANBAN_BROKER", "1")
+    monkeypatch.setenv("BOARDD_SOCK", str(sock_path))
 
-    The broker is torn down after the test.  We poll the socket with a raw
-    kb_client.Client before yielding so callers get a ready broker.
-    """
-    db_path = str(tmp_path / "kanban.db")
-    sock_path = str(tmp_path / "boardd.sock")
-    monkeypatch.setenv("BOARDD_SOCK", sock_path)
-
-    broker = _FakeBoardd(db_path, sock_path)
-    broker.start_and_wait()
+    # Reload under the custody declaration. Import-time install_rebind is the
+    # behavior under review, and must cover helpers imported elsewhere.
+    mod = importlib.reload(plugin_api)
+    assert kb.connect is boardd_shim.connect
+    # Pin the runtime socket exactly as the dashboard's first custodied request
+    # does. kb_client may have been imported before this fixture set BOARDD_SOCK.
+    assert mod._boardd_active(board="fleet") is True
     try:
-        # Final readiness check using the real client.
-        deadline = time.monotonic() + 5
-        last_exc: Exception | None = None
-        while time.monotonic() < deadline:
-            try:
-                c = kb_client.Client(sock_path=sock_path)
-                c.ping()
-                c.close()
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                time.sleep(0.05)
-        else:
-            raise RuntimeError(f"fake boardd did not become ready: {last_exc}")
-
-        yield sock_path, broker
+        yield mod, broker, db_path
     finally:
         broker.stop()
 
 
-def _close_plugin_conn(conn) -> None:
-    """Close a connection returned by ``plugin_api._conn``.
+def _create_task(*, title: str, triage: bool = False) -> str:
+    with kb.connect_closing(board="fleet") as conn:
+        return kb.create_task(conn, title=title, triage=triage)
 
-    For broker connections we also close the thread-local client because
-    BrokerConnection.close() intentionally leaves the client socket open.
-    """
+
+def _fake_llm(payload: dict) -> SimpleNamespace:
+    message = SimpleNamespace(content=json.dumps(payload))
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+
+def test_standalone_fleet_board_uses_sqlite_without_custody_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standalone board named fleet remains ordinary writable SQLite."""
+    _make_fleet_home(tmp_path, monkeypatch)
+    mod = importlib.reload(plugin_api)
+    conn = mod._conn(board="fleet")
     try:
-        conn.close()
-    except Exception:
-        pass
-    client = getattr(kb_client._tl, "client", None)
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
-        kb_client._tl.client = None
-
-
-def test_standalone_uses_sqlite(isolated_hermes_home: Path) -> None:
-    """When no boardd socket exists, _conn returns a real sqlite3 connection."""
-    conn = plugin_api._conn(board=None)
-    assert isinstance(conn, sqlite3.Connection), type(conn)
-    try:
-        row = conn.execute("SELECT 1 AS n").fetchone()
-        assert row["n"] == 1
+        assert isinstance(conn, sqlite3.Connection)
+        assert conn.execute("SELECT 1 AS n").fetchone()["n"] == 1
     finally:
         conn.close()
 
 
 @pytest.mark.live_system_guard_bypass
-def test_boardd_active_uses_broker_connection(
-    isolated_hermes_home: Path,
-    fleet_board: None,
-    boardd_process: tuple[str, _FakeBoardd],
-) -> None:
-    """When boardd is listening and the fleet board is current, _conn returns a BrokerConnection."""
-    sock_path, _proc = boardd_process
-    assert os.environ.get("BOARDD_SOCK") == sock_path
-
-    conn = plugin_api._conn(board=None)
-    assert type(conn).__name__ == "BrokerConnection", type(conn)
+def test_broker_active_routes_through_real_boardd(broker_runtime) -> None:
+    mod, _broker, _db_path = broker_runtime
+    conn = mod._conn(board="fleet")
     try:
+        assert isinstance(conn, boardd_shim.BrokerConnection)
         row = conn.execute("SELECT 1 AS n").fetchone()
+        assert row is not None
         assert row["n"] == 1
     finally:
-        _close_plugin_conn(conn)
+        conn.close()
+
+    task_id = _create_task(title="broker-owned")
+    with kb.connect_closing(board="fleet") as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.title == "broker-owned"
 
 
-def test_fail_closed_when_broker_socket_exists_but_broker_down(
-    isolated_hermes_home: Path,
-    fleet_board: None,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+def test_custody_fails_closed_when_real_broker_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A stale broker socket for the fleet board must not silently fall back to SQLite."""
-    stale_sock = tmp_path / "stale-boardd.sock"
-    # Create a socket file so _boardd_active considers custody active.
-    stale_sock.write_text("")
-    monkeypatch.setenv("BOARDD_SOCK", str(stale_sock))
+    _make_fleet_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_BROKER", "1")
+    monkeypatch.setenv("BOARDD_SOCK", str(tmp_path / "missing.sock"))
+    mod = importlib.reload(plugin_api)
+    with pytest.raises(
+        boardd_shim.BoarddUnavailableError,
+        match="broker socket missing",
+    ):
+        mod._conn(board="fleet")
 
-    with pytest.raises(Exception, match="boardd custody active but broker unreachable"):
-        plugin_api._conn(board=None)
+
+def test_custody_resolver_failure_is_not_sqlite_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _make_fleet_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_KANBAN_BROKER", "1")
+    mod = importlib.reload(plugin_api)
+
+    def broken_resolver(*_args, **_kwargs):
+        raise RuntimeError("resolver exploded")
+
+    monkeypatch.setattr(boardd_shim, "routes_to_fleet", broken_resolver)
+    with pytest.raises(
+        boardd_shim.BoarddUnavailableError,
+        match="custody routing could not be resolved.*resolver exploded",
+    ):
+        mod._conn(board="fleet")
+
+
+@pytest.mark.live_system_guard_bypass
+def test_nested_specify_and_decompose_helpers_use_real_broker(
+    broker_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod, _broker, _db_path = broker_runtime
+    specify_id = _create_task(title="rough", triage=True)
+    decompose_id = _create_task(title="split me", triage=True)
+
+    # If either nested helper bypasses the import-time rebind, this sentinel is
+    # reached instead of boardd and the test fails immediately.
+    def no_local_connect(*_args, **_kwargs):
+        raise AssertionError("nested helper attempted direct SQLite")
+
+    monkeypatch.setattr(boardd_shim, "_ORIG_CONNECT", no_local_connect)
+
+    from agent import auxiliary_client
+    from hermes_cli import kanban_decompose
+
+    responses = {
+        "triage_specifier": {
+            "title": "Specified through boardd",
+            "body": "broker-routed body",
+        },
+        "kanban_decomposer": {
+            "fanout": True,
+            "rationale": "one child proves the nested transaction path",
+            "tasks": [
+                {
+                    "title": "Broker child",
+                    "body": "created through boardd",
+                    "assignee": "worker",
+                    "parents": [],
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(
+        auxiliary_client,
+        "call_llm",
+        lambda *, task, **_kwargs: _fake_llm(responses[task]),
+    )
+    monkeypatch.setattr(
+        kanban_decompose,
+        "_load_config",
+        lambda: {
+            "kanban": {
+                "orchestrator_profile": "orchestrator",
+                "default_assignee": "worker",
+                "auto_promote_children": True,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        kanban_decompose,
+        "_build_roster",
+        lambda: ([], {"orchestrator", "worker"}),
+    )
+    monkeypatch.setattr(
+        kanban_decompose, "_resolve_orchestrator_profile", lambda _cfg: "orchestrator"
+    )
+    monkeypatch.setattr(
+        kanban_decompose, "_resolve_default_assignee", lambda _cfg: "worker"
+    )
+
+    specified = mod.specify_task_endpoint(
+        specify_id, mod.SpecifyBody(author="test"), board="fleet"
+    )
+    decomposed = mod.decompose_task_endpoint(
+        decompose_id, mod.DecomposeBody(author="test"), board="fleet"
+    )
+    assert specified["ok"] is True
+    assert decomposed["ok"] is True
+    assert len(decomposed["child_ids"]) == 1
+
+    with kb.connect_closing(board="fleet") as conn:
+        specified_task = kb.get_task(conn, specify_id)
+        assert specified_task is not None
+        assert specified_task.title == "Specified through boardd"
+        child = kb.get_task(conn, decomposed["child_ids"][0])
+        assert child is not None
+        assert child.title == "Broker child"
+
+
+@pytest.mark.live_system_guard_bypass
+def test_mid_bulk_real_broker_loss_never_falls_back_to_sqlite(
+    broker_runtime, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod, broker, db_path = broker_runtime
+    first = _create_task(title="first")
+    second = _create_task(title="second")
+    original_get_task = kb.get_task
+    calls = 0
+
+    def stop_before_second(conn, task_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            broker.stop()
+        return original_get_task(conn, task_id)
+
+    monkeypatch.setattr(kb, "get_task", stop_before_second)
+    result = mod.bulk_update(
+        mod.BulkTaskBody(ids=[first, second], priority=77), board="fleet"
+    )
+    assert result["results"][0] == {"id": first, "ok": True}
+    assert result["results"][1]["ok"] is False
+    assert "boardd" in result["results"][1]["error"].lower()
+
+    # Read the stopped broker's DB directly only after process teardown. The
+    # first item committed through boardd; the second was never written locally.
+    conn = sqlite3.connect(str(db_path))
+    try:
+        priorities = dict(
+            conn.execute(
+                "SELECT id, priority FROM tasks WHERE id IN (?, ?)",
+                (first, second),
+            ).fetchall()
+        )
+    finally:
+        conn.close()
+    assert priorities[first] == 77
+    assert priorities[second] != 77
