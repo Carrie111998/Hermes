@@ -289,3 +289,27 @@ def test_huggingface_hub_lazy_pin_inside_transformers_window():
         "range (>=1.5.0,<2). The lazy refresh would downgrade the shared "
         "package and break Hindsight local embeddings (#60783)."
     )
+
+
+def test_wake_sherpa_declares_text2token_runtime_deps():
+    """sherpa_onnx.text2token imports sentencepiece + pypinyin before any
+    tokens_type branching, but sherpa-onnx does not declare them. Both the
+    ``[wake]`` extra (eager desktop) and ``LAZY_DEPS['wake.sherpa']`` (CLI
+    lazy path) must carry those pins so ``ensure("wake.sherpa")`` actually
+    installs them into Hermes' env (#74719 / #75241).
+    """
+    from tools.lazy_deps import LAZY_DEPS
+
+    optional_dependencies = _load_optional_dependencies()
+    wake_extra = optional_dependencies["wake"]
+    lazy_specs = LAZY_DEPS["wake.sherpa"]
+
+    for package in ("sentencepiece", "pypinyin"):
+        assert any(
+            dep == package or dep.startswith(f"{package}==") or dep.startswith(f"{package}[")
+            for dep in wake_extra
+        ), f"[wake] extra missing text2token runtime dep {package!r}"
+        assert any(
+            spec == package or spec.startswith(f"{package}==") or spec.startswith(f"{package}[")
+            for spec in lazy_specs
+        ), f"LAZY_DEPS['wake.sherpa'] missing text2token runtime dep {package!r}"

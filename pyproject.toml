@@ -202,6 +202,8 @@ wake = [
   "onnxruntime==1.27.0",
   "sherpa-onnx==1.13.4",
   "sentencepiece==0.2.2",
+  # Undeclared text2token runtime dep (same reason as sentencepiece) — #74719/#75241.
+  "pypinyin==0.55.0",
   "pvporcupine==4.0.3",
   "sounddevice==0.5.5",
   "numpy==2.4.3",

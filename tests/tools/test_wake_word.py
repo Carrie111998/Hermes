@@ -624,3 +624,44 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         if process.is_alive():
             process.terminate()
         process.join(10)
+
+
+def test_sherpa_text2token_missing_module_targets_hermes_executable(monkeypatch, tmp_path):
+    """Regression #75241: if text2token raises ModuleNotFoundError after
+    ensure(), the remessage must name ``sys.executable -m pip`` — never bare
+    Homebrew ``pip install`` (PEP 668 / wrong environment).
+    """
+    model_dir = tmp_path / "sherpa-model"
+    model_dir.mkdir()
+    (model_dir / "tokens.txt").write_text("a\n", encoding="utf-8")
+    (model_dir / "bpe.model").write_text("bpe", encoding="utf-8")
+    for name in ("encoder-x.onnx", "decoder-x.onnx", "joiner-x.onnx"):
+        (model_dir / name).write_bytes(b"onnx")
+
+    fake_sherpa = types.ModuleType("sherpa_onnx")
+
+    def _boom(*_a, **_k):
+        raise ModuleNotFoundError("No module named 'pypinyin'", name="pypinyin")
+
+    fake_sherpa.text2token = _boom
+    fake_sherpa.KeywordSpotter = object  # unused if text2token fails first
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake_sherpa)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    monkeypatch.setattr(ww, "enrolled_profile_phrases", lambda: {})
+
+    with pytest.raises(ModuleNotFoundError) as ei:
+        ww._SherpaKwsEngine(
+            {
+                "provider": "sherpa",
+                "phrase": "hey hermes",
+                "sherpa": {"model_dir": str(model_dir)},
+            }
+        )
+
+    msg = str(ei.value)
+    assert "pypinyin" in msg
+    assert f"{sys.executable} -m pip install pypinyin" in msg
+    assert f"uv pip install --python {sys.executable} pypinyin" in msg
+    assert "Do not use system/Homebrew pip" in msg
+    # Must not recommend bare Homebrew/system pip as the primary command.
+    assert "Please run `pip install pypinyin`" not in msg
