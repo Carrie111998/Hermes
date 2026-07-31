@@ -3516,26 +3516,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
+                # ff-only failed — local and remote have diverged.  Never
+                # reset --hard here: that silently destroys local commits,
+                # including durable user fixes.  Rebase the local commits onto
+                # the fetched upstream instead.  The working tree was already
+                # stashed above, so this path is safe for both committed and
+                # uncommitted local customisations.
                 print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                    "  ⚠ Fast-forward not possible (history diverged), preserving local commits via rebase..."
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                rebase_result = subprocess.run(
+                    git_cmd + ["rebase", f"origin/{branch}"],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                if rebase_result.returncode != 0:
+                    subprocess.run(
+                        git_cmd + ["rebase", "--abort"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                        check=False,
+                    )
+                    print(f"✗ Local commits conflict with origin/{branch}; rebase aborted safely.")
+                    if rebase_result.stderr.strip():
+                        print(f"  {rebase_result.stderr.strip().splitlines()[0]}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        "  No local commits were discarded. Resolve the conflict manually, "
+                        "then re-run `hermes update`."
                     )
                     sys.exit(1)
+                print("  ✓ Local commits preserved and rebased onto upstream.")
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

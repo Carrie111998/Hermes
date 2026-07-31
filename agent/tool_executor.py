@@ -18,6 +18,8 @@ from pathlib import Path
 import logging
 import os
 import random
+import shutil
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -51,6 +53,62 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+# Gateway-owned TTS playback.  The model-facing MEDIA tag is only a delivery
+# hint on some platforms; it is not a speaker action in the desktop/TUI path.
+# Keep the player process here, immediately after the TTS tool returns, so
+# speech delivery cannot be forgotten by the model.
+_tts_playback_lock = threading.Lock()
+_tts_playback_process: subprocess.Popen | None = None
+
+
+def _autoplay_tts_result(function_name: str, result: Any) -> None:
+    """Play a successful ``text_to_speech`` result through the local speakers.
+
+    This is intentionally in the executor rather than the prompt/skill layer.
+    It handles both sequential and concurrent tool execution and uses argv
+    execution (not a shell string), so a generated path cannot become a shell
+    injection.  A new turn replaces stale playback to prevent overlapping
+    voices.
+    """
+    global _tts_playback_process
+    if function_name != "text_to_speech":
+        return
+    try:
+        payload = json.loads(result) if isinstance(result, str) else result
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            return
+        file_path = payload.get("file_path")
+        if not isinstance(file_path, str) or not file_path:
+            logger.warning("TTS succeeded without a playable file_path")
+            return
+        path = Path(file_path).expanduser()
+        if not path.is_file() or path.stat().st_size <= 0:
+            logger.warning("TTS playback skipped; audio file is missing or empty: %s", path)
+            return
+        afplay = shutil.which("afplay")
+        if not afplay:
+            logger.warning("TTS playback skipped; afplay is not available")
+            return
+        with _tts_playback_lock:
+            if _tts_playback_process is not None and _tts_playback_process.poll() is None:
+                _tts_playback_process.terminate()
+                try:
+                    _tts_playback_process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    _tts_playback_process.kill()
+            _tts_playback_process = subprocess.Popen(
+                [afplay, str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        logger.info("TTS autoplay started: %s (pid=%s)", path, _tts_playback_process.pid)
+    except Exception:
+        # Playback must never turn a successful TTS tool call into a failed
+        # model turn; log the failure and leave the generated file intact.
+        logger.exception("Gateway TTS autoplay failed")
 
 
 def _ensure_file_checkpoint(
@@ -839,6 +897,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     authorization_gate=authorization_gate,
                 )
                 result = managed.result
+                _autoplay_tts_result(function_name, result)
                 function_args = managed.args
                 middleware_trace = managed.middleware_trace
                 blocked = managed.blocked
@@ -1800,6 +1859,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        _autoplay_tts_result(function_name, function_result)
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
