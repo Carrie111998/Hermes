@@ -77,6 +77,31 @@ class TestResolvePluginKey:
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
 
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_exact_manifest_name_precedes_ambiguous_leaf(self, mock_entries, tmp_path):
+        from hermes_cli.plugins_cmd import _resolve_plugin_key
+
+        mock_entries.return_value = [
+            (
+                "openai",
+                "",
+                "",
+                "bundled",
+                tmp_path / "image_gen" / "openai",
+                "image_gen/openai",
+            ),
+            (
+                "other-openai",
+                "",
+                "",
+                "bundled",
+                tmp_path / "model-providers" / "openai",
+                "model-providers/openai",
+            ),
+        ]
+
+        assert _resolve_plugin_key("openai") == "image_gen/openai"
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable / cmd_disable — write the canonical key
@@ -134,6 +159,126 @@ class TestEnableDisableNested:
         cmd_enable("disk-cleanup", allow_tool_override=False)
         saved = mock_save_en.call_args[0][0]
         assert "disk-cleanup" in saved
+
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"web-exa"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"web/exa"})
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_enable_repairs_dashboard_alias_residue(
+        self, mock_entries, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        entry = (
+            "web-exa", "", "", "bundled", tmp_path / "web" / "exa", "web/exa",
+        )
+        mock_entries.return_value = [entry]
+
+        cmd_enable("web/exa", allow_tool_override=False)
+
+        assert mock_save_en.call_args[0][0] == {"web/exa"}
+        assert mock_save_dis.call_args[0][0] == set()
+
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"nous"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_loader_alias_cleanup_ignores_legacy_alias_collision(
+        self, mock_entries, mock_en, mock_dis, mock_save_en, mock_save_dis, tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        mock_entries.return_value = [
+            (
+                "nous", "", "", "bundled",
+                tmp_path / "dashboard_auth" / "nous", "dashboard_auth/nous",
+            ),
+            (
+                "nous-provider", "", "", "user",
+                tmp_path / "model-providers" / "nous", "model-providers/nous",
+            ),
+        ]
+
+        cmd_enable("dashboard_auth/nous", allow_tool_override=False)
+
+        assert mock_save_en.call_args[0][0] == {"dashboard_auth/nous"}
+        assert mock_save_dis.call_args[0][0] == set()
+
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"shared"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"one/plugin"})
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_enable_preserves_ambiguous_deny_alias(
+        self, mock_entries, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import cmd_enable
+
+        mock_entries.return_value = [
+            ("shared", "", "", "user", tmp_path / "one" / "plugin", "one/plugin"),
+            ("shared", "", "", "user", tmp_path / "two" / "plugin", "two/plugin"),
+        ]
+
+        with pytest.raises(SystemExit):
+            cmd_enable("one/plugin", allow_tool_override=False)
+
+        mock_save_en.assert_not_called()
+        mock_save_dis.assert_not_called()
+
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_directory_alias_resolves_only_when_unique(self, mock_entries, tmp_path):
+        from hermes_cli.plugins_cmd import _resolve_plugin_key
+
+        mock_entries.return_value = [
+            ("declared-name", "", "", "user", tmp_path / "directory-name", "declared-name"),
+        ]
+
+        assert _resolve_plugin_key("directory-name") == "declared-name"
+
+
+class TestBasicAuthConfig:
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_basic_auth_removes_unique_bundled_aliases(self, mock_entries, tmp_path):
+        from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
+
+        mock_entries.return_value = [
+            (
+                "basic",
+                "",
+                "",
+                "bundled",
+                tmp_path / "dashboard_auth" / "basic",
+                "dashboard_auth/basic",
+            ),
+        ]
+        config = {"plugins": {"disabled": ["basic", "dashboard_auth/basic"]}}
+
+        assert ensure_basic_auth_plugin_enabled_in_config(config) is True
+        assert config["plugins"]["disabled"] == []
+
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_basic_auth_preserves_ambiguous_sibling_alias(self, mock_entries, tmp_path):
+        from hermes_cli.plugins_cmd import ensure_basic_auth_plugin_enabled_in_config
+
+        mock_entries.return_value = [
+            (
+                "basic",
+                "",
+                "",
+                "bundled",
+                tmp_path / "dashboard_auth" / "basic",
+                "dashboard_auth/basic",
+            ),
+            ("basic", "", "", "user", tmp_path / "basic", "basic"),
+        ]
+        config = {"plugins": {"disabled": ["basic"]}}
+
+        assert ensure_basic_auth_plugin_enabled_in_config(config) is False
+        assert config["plugins"]["disabled"] == ["basic"]
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +342,58 @@ class TestEnableToolOverrideConsent:
         mock_set_flag.assert_not_called()
 
 
+class TestDashboardPluginActivation:
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value={"web-exa"})
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"web/exa"})
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_dashboard_enable_clears_stale_deny_alias(
+        self, mock_entries, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        mock_toggle, tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+        mock_entries.return_value = [
+            ("web-exa", "", "", "bundled", tmp_path / "web" / "exa", "web/exa"),
+        ]
+
+        result = dashboard_set_agent_plugin_enabled("web-exa", enabled=True)
+
+        assert result == {"ok": True, "name": "web-exa", "unchanged": False}
+        assert mock_save_en.call_args[0][0] == {"web/exa"}
+        assert mock_save_dis.call_args[0][0] == set()
+        mock_toggle.assert_called_once_with(
+            "web/exa", enable=True, entries=mock_entries.return_value,
+        )
+
+    @patch("hermes_cli.plugins_cmd._toggle_plugin_toolset")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch("hermes_cli.plugins_cmd._get_disabled_set", return_value=set())
+    @patch("hermes_cli.plugins_cmd._get_enabled_set", return_value={"web/exa"})
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    def test_dashboard_disable_writes_canonical_key(
+        self, mock_entries, mock_en, mock_dis, mock_save_en, mock_save_dis,
+        mock_toggle, tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+        mock_entries.return_value = [
+            ("web-exa", "", "", "bundled", tmp_path / "web" / "exa", "web/exa"),
+        ]
+
+        result = dashboard_set_agent_plugin_enabled("web-exa", enabled=False)
+
+        assert result["ok"] is True
+        assert mock_save_en.call_args[0][0] == set()
+        assert mock_save_dis.call_args[0][0] == {"web/exa"}
+        mock_toggle.assert_called_once_with(
+            "web/exa", enable=False, entries=mock_entries.return_value,
+        )
+
+
 class TestCompositeMenuWritesCanonicalKey:
     """#40190 follow-up: the interactive `hermes plugins` menu must persist
     the CANONICAL KEY (``web/firecrawl``), never the bare manifest name
@@ -230,4 +427,51 @@ class TestCompositeMenuWritesCanonicalKey:
         saved_dis = mock_save_dis.call_args[0][0]
         assert "web/firecrawl" in saved_dis      # canonical key persisted
         assert "web-firecrawl" not in saved_dis   # never the bare name
+
+    @patch("hermes_cli.curses_ui.flush_stdin")
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    @patch("hermes_cli.plugins_cmd._save_disabled_set")
+    @patch("hermes_cli.plugins_cmd._save_enabled_set")
+    @patch(
+        "hermes_cli.plugins_cmd._get_enabled_set",
+        return_value={"canonical-key", "removed-thing"},
+    )
+    def test_curses_persistence_clears_stale_alias(
+        self,
+        mock_en,
+        mock_save_en,
+        mock_save_dis,
+        mock_entries,
+        mock_flush,
+        tmp_path,
+        capsys,
+    ):
+        from hermes_cli.plugins_cmd import _run_composite_ui
+        from rich.console import Console
+
+        mock_entries.return_value = [
+            (
+                "declared-name", "", "", "user", tmp_path / "canonical-key", "canonical-key",
+            ),
+        ]
+
+        class FakeCurses:
+            @staticmethod
+            def wrapper(callback):
+                return None
+
+        _run_composite_ui(
+            FakeCurses(),
+            ["canonical-key"],
+            ["declared-name"],
+            {0},
+            {"declared-name"},
+            [],
+            Console(),
+        )
+
+        assert mock_save_en.call_args[0][0] == {"canonical-key", "removed-thing"}
+        assert mock_save_dis.call_args[0][0] == set()
+        mock_entries.assert_called_once_with()
+        assert "General plugins: 1 enabled, 0 disabled." in capsys.readouterr().out
 

@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -200,6 +201,17 @@ class TestReadManifest:
         result = _read_manifest(tmp_path)
         assert result == {}
 
+    def test_plugin_yml_is_read_when_yaml_is_absent(self, tmp_path):
+        (tmp_path / "plugin.yml").write_text("name: declared-name\n")
+
+        assert _read_manifest(tmp_path) == {"name": "declared-name"}
+
+    def test_plugin_yaml_takes_precedence_over_plugin_yml(self, tmp_path):
+        (tmp_path / "plugin.yaml").write_text("name: yaml-name\n")
+        (tmp_path / "plugin.yml").write_text("name: yml-name\n")
+
+        assert _read_manifest(tmp_path) == {"name": "yaml-name"}
+
 
 # ── cmd_install tests ─────────────────────────────────────────────────────────
 
@@ -222,6 +234,195 @@ class TestCmdInstall:
         with pytest.raises(SystemExit) as exc_info:
             cmd_install("invalid")
         assert exc_info.value.code == 1
+
+    def test_install_auto_enable_normalizes_distinct_canonical_key(self, tmp_path):
+        from hermes_cli.plugins_cmd import cmd_install
+
+        target = tmp_path / "category" / "canonical-key"
+        target.mkdir(parents=True)
+        (target / "plugin.yml").write_text("name: declared-name\n")
+        entry = (
+            "declared-name", "", "", "user", target, "category/canonical-key",
+        )
+
+        with patch(
+            "hermes_cli.plugins_cmd._resolve_git_url",
+            return_value=("https://example.test/plugin.git", None),
+        ), patch(
+            "hermes_cli.plugins_cmd._install_plugin_core",
+            return_value=(target, {"name": "declared-name"}, "declared-name"),
+        ), patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=[entry]), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set",
+            return_value={"declared-name", "checkout"},
+        ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+            "hermes_cli.plugins_cmd._save_disabled_set"
+        ) as save_disabled, patch(
+            "hermes_cli.plugins_cmd._prompt_plugin_env_vars"
+        ), patch("hermes_cli.plugins_cmd._display_after_install"):
+            cmd_install("owner/repo", enable=True)
+
+        assert save_enabled.call_args[0][0] == {"category/canonical-key"}
+        assert save_disabled.call_args[0][0] == {"checkout"}
+
+    @patch("hermes_cli.plugins_cmd._discover_all_plugins")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins.discover_plugins")
+    @patch("hermes_cli.plugins.get_plugin_manager")
+    @patch("tools.registry.registry")
+    def test_toolset_fallback_uses_discovered_directory_after_disabled_entry(
+        self,
+        mock_registry,
+        mock_manager,
+        mock_discover,
+        mock_bundled_dir,
+        mock_plugins_dir,
+        mock_discover_all_plugins,
+        tmp_path,
+    ):
+        from hermes_cli.plugins_cmd import _get_plugin_toolset_key
+
+        target = tmp_path / "ping_island"
+        target.mkdir()
+        (target / "plugin.yml").write_text(
+            "name: ping-island\nprovides_tools:\n  - ping_tool\n",
+            encoding="utf-8",
+        )
+        entry = ("ping-island", "", "", "user", target, "ping-island")
+        mock_discover_all_plugins.return_value = [entry]
+        mock_manager.return_value = SimpleNamespace(
+            _plugins={
+                "ping-island": SimpleNamespace(
+                    manifest=SimpleNamespace(name="ping-island", key="ping-island"),
+                    tools_registered=[],
+                )
+            }
+        )
+        mock_bundled_dir.return_value = tmp_path / "bundled"
+        mock_plugins_dir.return_value = tmp_path / "plugins"
+        mock_registry.get_entry.return_value = SimpleNamespace(toolset="ping-island")
+
+        assert _get_plugin_toolset_key("ping-island") == "ping-island"
+
+    def test_dashboard_install_auto_enable_normalizes_distinct_canonical_key(self, tmp_path):
+        from hermes_cli.plugins_cmd import dashboard_install_plugin
+
+        target = tmp_path / "category" / "canonical-key"
+        target.mkdir(parents=True)
+        (target / "plugin.yml").write_text("name: declared-name\n")
+        entry = (
+            "declared-name", "", "", "user", target, "category/canonical-key",
+        )
+
+        with patch(
+            "hermes_cli.plugins_cmd._resolve_git_url",
+            return_value=("https://example.test/plugin.git", None),
+        ), patch(
+            "hermes_cli.plugins_cmd._install_plugin_core",
+            return_value=(target, {"name": "declared-name"}, "declared-name"),
+        ), patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=[entry]), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set",
+            return_value={"declared-name", "checkout"},
+        ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+            "hermes_cli.plugins_cmd._save_disabled_set"
+        ) as save_disabled:
+            result = dashboard_install_plugin("owner/repo", force=False, enable=True)
+
+        assert result["ok"] is True
+        assert save_enabled.call_args[0][0] == {"category/canonical-key"}
+        assert save_disabled.call_args[0][0] == {"checkout"}
+
+    def test_install_manifestless_auto_enable_keeps_legacy_success(self, tmp_path, capsys):
+        from hermes_cli.plugins_cmd import cmd_install
+
+        target = tmp_path / "manifestless"
+        target.mkdir()
+
+        with patch(
+            "hermes_cli.plugins_cmd._resolve_git_url",
+            return_value=("https://example.test/plugin.git", None),
+        ), patch(
+            "hermes_cli.plugins_cmd._install_plugin_core",
+            return_value=(target, {}, "manifestless"),
+        ), patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=[]), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set", return_value={"manifestless"}
+        ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+            "hermes_cli.plugins_cmd._save_disabled_set"
+        ) as save_disabled, patch(
+            "hermes_cli.plugins_cmd._prompt_plugin_env_vars"
+        ), patch("hermes_cli.plugins_cmd._display_after_install"):
+            cmd_install("owner/repo", enable=True)
+
+        assert save_enabled.call_args[0][0] == {"manifestless"}
+        assert save_disabled.call_args[0][0] == set()
+        assert "Plugin manifestless enabled." in capsys.readouterr().out
+
+    def test_dashboard_install_manifestless_auto_enable_keeps_legacy_success(self, tmp_path):
+        from hermes_cli.plugins_cmd import dashboard_install_plugin
+
+        target = tmp_path / "manifestless"
+        target.mkdir()
+
+        with patch(
+            "hermes_cli.plugins_cmd._resolve_git_url",
+            return_value=("https://example.test/plugin.git", None),
+        ), patch(
+            "hermes_cli.plugins_cmd._install_plugin_core",
+            return_value=(target, {}, "manifestless"),
+        ), patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=[]), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set", return_value={"manifestless"}
+        ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+            "hermes_cli.plugins_cmd._save_disabled_set"
+        ) as save_disabled:
+            result = dashboard_install_plugin("owner/repo", force=False, enable=True)
+
+        assert result["ok"] is True
+        assert save_enabled.call_args[0][0] == {"manifestless"}
+        assert save_disabled.call_args[0][0] == set()
+
+    def test_install_rejects_ambiguous_manifest_alias(self, tmp_path, capsys):
+        from hermes_cli.plugins_cmd import cmd_install
+
+        target = tmp_path / "category" / "shared"
+        sibling = tmp_path / "other" / "sibling"
+        target.mkdir(parents=True)
+        sibling.mkdir(parents=True)
+        (target / "plugin.yml").write_text("name: shared\n")
+        entries = [
+            ("shared", "", "", "user", target, "category/shared"),
+            ("shared", "", "", "user", sibling, "other/sibling"),
+        ]
+
+        with patch(
+            "hermes_cli.plugins_cmd._resolve_git_url",
+            return_value=("https://example.test/plugin.git", None),
+        ), patch(
+            "hermes_cli.plugins_cmd._install_plugin_core",
+            return_value=(target, {"name": "shared"}, "shared"),
+        ), patch("hermes_cli.plugins_cmd._discover_all_plugins", return_value=entries), patch(
+            "hermes_cli.plugins_cmd._get_enabled_set", return_value=set()
+        ), patch(
+            "hermes_cli.plugins_cmd._get_disabled_set", return_value={"shared"}
+        ), patch("hermes_cli.plugins_cmd._save_enabled_set") as save_enabled, patch(
+            "hermes_cli.plugins_cmd._save_disabled_set"
+        ) as save_disabled, patch("hermes_cli.plugins_cmd._prompt_plugin_env_vars"), patch(
+            "hermes_cli.plugins_cmd._display_after_install"
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_install("owner/repo", enable=True)
+
+        assert exc_info.value.code == 1
+        assert "activation alias is ambiguous" in capsys.readouterr().out
+        save_enabled.assert_not_called()
+        save_disabled.assert_not_called()
 
     @patch("hermes_cli.plugins_cmd._display_after_install")
     @patch("hermes_cli.plugins_cmd.shutil.move")
