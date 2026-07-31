@@ -318,11 +318,38 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
+    app.router.add_post("/v1/responses/{response_id}/approval", adapter._handle_response_approval)
     app.router.add_post(
         "/api/platforms/{platform}/events",
         adapter._handle_platform_event_callback,
     )
     return app
+
+
+class _ApprovalRequest:
+    def __init__(self, response_id: str, body: dict):
+        self.headers = {"Authorization": "Bearer sk-secret"}
+        self.match_info = {"response_id": response_id}
+        self._body = body
+        self.method = "POST"
+        self.path_qs = f"/v1/responses/{response_id}/approval"
+        self.transport = None
+        self.remote = ""
+
+    async def json(self):
+        return self._body
+
+
+async def _wait_for_gateway_approval_state(approval_mod, response_id: str) -> None:
+    for _ in range(200):
+        with approval_mod._lock:
+            if (
+                response_id in approval_mod._gateway_notify_cbs
+                and approval_mod._gateway_queues.get(response_id)
+            ):
+                return
+        await asyncio.sleep(0.01)
+    pytest.fail(f"approval worker did not register state for {response_id}")
 
 
 class _FakeGoogleChatAdapter:
@@ -391,6 +418,70 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+    @pytest.mark.asyncio
+    async def test_response_approval_registration_cleans_up_on_completion_and_failure(self, adapter):
+        from tools import approval as approval_mod
+
+        callback = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="conversation",
+                gateway_session_key="shared",
+                approval_notify_callback=callback,
+                approval_session_key="resp_complete",
+            )
+        with approval_mod._lock:
+            assert "resp_complete" not in approval_mod._gateway_notify_cbs
+            assert "resp_complete" not in approval_mod._gateway_queues
+
+        with patch.object(adapter, "_create_agent", side_effect=RuntimeError("create failed")):
+            with pytest.raises(RuntimeError, match="create failed"):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="conversation",
+                    gateway_session_key="shared",
+                    approval_notify_callback=callback,
+                    approval_session_key="resp_failed",
+                )
+        with approval_mod._lock:
+            assert "resp_failed" not in approval_mod._gateway_notify_cbs
+            assert "resp_failed" not in approval_mod._gateway_queues
+
+    @pytest.mark.asyncio
+    async def test_response_worker_clears_session_approval_state(self, adapter):
+        from tools import approval as approval_mod
+
+        response_id = "resp_session_cleanup"
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        def run_conversation(**_kwargs):
+            approval_mod.approve_session(response_id, "execute_code")
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = run_conversation
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="conversation",
+                approval_notify_callback=lambda _event: None,
+                approval_session_key=response_id,
+            )
+
+        with approval_mod._lock:
+            assert response_id not in approval_mod._session_approved
 
 
 class TestRunEventCallback:
@@ -1109,6 +1200,8 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+            assert "approval_notify_callback" not in mock_run.call_args.kwargs
+            assert "approval_session_key" not in mock_run.call_args.kwargs
 
 
     @pytest.mark.asyncio
@@ -1357,7 +1450,440 @@ class TestResponsesEndpoint:
             assert data["output"][0]["content"][0]["text"] != f"provider auth failed OPENAI_API_KEY={raw_secret}"
 
 
+class TestResponseApprovalEndpoint:
+    @pytest.mark.asyncio
+    async def test_root_and_profile_routes_resolve_by_response_id(self, adapter):
+        adapter._response_approval_sessions["resp_owned"] = "default"
+        app = web.Application()
+        for method, path, handler in adapter._http_route_table():
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+
+        assert any(
+            method == "POST" and path == "/v1/responses/{response_id}/approval"
+            for method, path, _handler in adapter._http_route_table()
+        )
+        with patch("tools.approval.resolve_gateway_approval", return_value=2) as resolve:
+            async with TestClient(TestServer(app)) as cli:
+                root = await cli.post(
+                    "/v1/responses/resp_owned/approval",
+                    json={"choice": "approve", "resolve_all": True},
+                )
+
+        assert root.status == 200
+        resolve.assert_called_once_with("resp_owned", "once", resolve_all=True)
+
+    @pytest.mark.asyncio
+    async def test_sibling_profile_cannot_resolve_response_approval(self, auth_adapter):
+        import gateway.platforms.api_server as api_mod
+
+        response_id = "resp_default_owned"
+        auth_adapter._response_approval_sessions[response_id] = "default"
+
+        @web.middleware
+        async def profile_scope(request, handler):
+            token = api_mod._api_request_profile.set("work")
+            try:
+                return await handler(request)
+            finally:
+                api_mod._api_request_profile.reset(token)
+
+        app = web.Application(middlewares=[profile_scope])
+        for method, path, handler in auth_adapter._http_route_table():
+            app.router.add_route(method, path, handler)
+            app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+
+        with (
+            patch.object(auth_adapter, "_expected_api_key", return_value="sk-work"),
+            patch("tools.approval.resolve_gateway_approval") as resolve,
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    f"/p/work/v1/responses/{response_id}/approval",
+                    headers={"Authorization": "Bearer sk-work"},
+                    json={"choice": "once"},
+                )
+                body = await response.json()
+
+        assert response.status == 403
+        assert body["error"]["code"] == "approval_profile_mismatch"
+        resolve.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_aliases_errors_and_inactive_response(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            inactive = await cli.post(
+                "/v1/responses/missing/approval",
+                json={"choice": "once"},
+            )
+            adapter._response_approval_sessions["resp_errors"] = "default"
+            non_object = await cli.post(
+                "/v1/responses/resp_errors/approval",
+                json=[],
+            )
+            invalid = await cli.post(
+                "/v1/responses/resp_errors/approval",
+                json={"choice": "later"},
+            )
+            no_pending = await cli.post(
+                "/v1/responses/resp_errors/approval",
+                json={"choice": "once"},
+            )
+            no_pending_body = await no_pending.json()
+
+        assert inactive.status == 409
+        assert non_object.status == 400
+        assert invalid.status == 400
+        assert no_pending.status == 409
+        assert no_pending_body["error"]["code"] == "approval_not_pending"
+
+
 class TestResponsesStreaming:
+
+    def test_response_approval_key_flows_through_production_seams(self):
+        import inspect
+
+        from gateway.platforms import api_server
+
+        source = inspect.getsource(api_server.APIServerAdapter)
+        required = (
+            "def _response_stream_callbacks(",
+            "stream_loop.is_closed()",
+            "stream_loop.call_soon_threadsafe(_put_if_open)",
+            "self._response_approval_sessions[response_id] = self._normalized_request_profile()",
+            '"approval_notify_callback": _on_approval_request',
+            "approval_session_key=response_id",
+            "register_gateway_notify(approval_session_key, approval_notify_callback)",
+            "set_current_session_key(approval_session_key)",
+            "unregister_gateway_notify(approval_session_key)",
+            "self._response_approval_sessions.get(response_id)",
+            "resolve_gateway_approval(\n                response_id,",
+            "resolve_all=resolve_all",
+        )
+        for fragment in required:
+            assert fragment in source, f"missing response-owned approval flow: {fragment}"
+
+    def test_response_stream_callbacks_ignore_closed_loop(self, adapter):
+        stream_loop = asyncio.new_event_loop()
+        try:
+            callbacks = adapter._response_stream_callbacks(
+                response_id="resp_closed_loop",
+                stream_q=asyncio.Queue(),
+                stream_loop=stream_loop,
+                stream_open=[True],
+            )
+            stream_loop.close()
+            callbacks["stream_delta_callback"]("late delta")
+        finally:
+            if not stream_loop.is_closed():
+                stream_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_stream_sse_approval_payload_redacts_credentials(self, adapter):
+        raw_secret = "sk-proj-" + "X" * 40
+        raw_command = "curl -H 'Authorization: Bearer " + raw_secret + "' https://example.test"
+        app = _create_app(adapter)
+
+        async def _fake_run_agent(**kwargs):
+            kwargs["approval_notify_callback"]({
+                "command": raw_command,
+                "description": "credential-shaped approval",
+                "allow_permanent": True,
+            })
+            return (
+                {"final_response": "done", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_fake_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "approve", "stream": True},
+                )
+                payload = await response.text()
+
+        assert response.status == 200
+        assert raw_secret not in payload
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in payload.splitlines()
+            if line.startswith("data: ")
+        ]
+        approval_event = next(
+            event for event in events if event["type"] == "response.approval.requested"
+        )
+        approval = approval_event["approval"]
+        assert approval_event["response_id"].startswith("resp_")
+        assert approval["response_id"] == approval_event["response_id"]
+        from gateway.run import _redact_approval_command
+        assert approval["command"] == _redact_approval_command(raw_command)
+        assert approval["command"] != raw_command
+        assert approval["description"] == "credential-shaped approval"
+        assert approval["choices"] == ["once", "session", "always", "deny"]
+
+    @pytest.mark.asyncio
+    async def test_stream_approval_prompt_progresses_with_one_default_executor_worker(self, adapter):
+        from concurrent.futures import ThreadPoolExecutor
+        from tools import approval as approval_mod
+
+        app = _create_app(adapter)
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1)
+        previous_executor = getattr(loop, "_default_executor", None)
+        loop.set_default_executor(executor)
+
+        class _BlockingAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def __init__(self):
+                self.stream_delta_callback = None
+
+            def interrupt(self, _reason):
+                return None
+
+            def run_conversation(self, **_kwargs):
+                result = approval_mod.check_execute_code_guard("print('approval')", "local")
+                return {
+                    "final_response": "approved" if result["approved"] else "blocked",
+                    "messages": [],
+                }
+        try:
+            with (
+                patch.object(adapter, "_create_agent", return_value=_BlockingAgent()),
+                patch.object(approval_mod, "_get_approval_mode", return_value="ask"),
+                patch.object(approval_mod, "_get_approval_timeout", return_value=10),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    response = await cli.post(
+                        "/v1/responses",
+                        json={"model": "hermes-agent", "input": "approve", "stream": True},
+                    )
+                    assert response.status == 200
+
+                    approval_event = None
+                    while approval_event is None:
+                        line = await asyncio.wait_for(response.content.readline(), timeout=2)
+                        assert line
+                        if line.startswith(b"data: "):
+                            event = json.loads(line.removeprefix(b"data: "))
+                            if event["type"] == "response.approval.requested":
+                                approval_event = event
+
+                    response_id = approval_event["response_id"]
+                    assert approval_event["approval"]["response_id"] == response_id
+                    assert approval_mod.resolve_gateway_approval(response_id, "once") == 1
+                    assert b"response.completed" in await response.read()
+        finally:
+            loop._default_executor = previous_executor
+            executor.shutdown(wait=True)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_streams_isolate_approval_queues_and_resolve_all(self, auth_adapter):
+        from tools import approval as approval_mod
+        adapter = auth_adapter
+
+        class _BlockingAgent:
+            session_id = "shared-session"
+            session_prompt_tokens = 1
+            session_completion_tokens = 1
+
+            def run_conversation(self, **kwargs):
+                result = approval_mod.check_execute_code_guard("print('approval')", "local")
+                return {
+                    "final_response": "approved" if result["approved"] else "blocked",
+                    "messages": [],
+                    "api_calls": 1,
+                }
+
+        app = _create_app(adapter)
+        client_tasks = []
+        try:
+            with (
+                patch.object(adapter, "_create_agent", side_effect=lambda **_: _BlockingAgent()),
+                patch.object(approval_mod, "_get_approval_mode", return_value="ask"),
+                patch.object(approval_mod, "_get_approval_timeout", return_value=10),
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    headers = {
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "shared-session",
+                    }
+                    client_tasks = [
+                        asyncio.create_task(cli.post(
+                            "/v1/responses",
+                            headers=headers,
+                            json={"model": "hermes-agent", "input": "one", "stream": True},
+                        )),
+                        asyncio.create_task(cli.post(
+                            "/v1/responses",
+                            headers=headers,
+                            json={"model": "hermes-agent", "input": "two", "stream": True},
+                        )),
+                    ]
+
+                    for _ in range(200):
+                        with approval_mod._lock:
+                            queue_keys = set(approval_mod._gateway_queues)
+                        response_ids = set(adapter._response_approval_sessions)
+                        if len(response_ids) >= 2 and len(queue_keys & response_ids) >= 2:
+                            break
+                        await asyncio.sleep(0.01)
+                    else:
+                        pytest.fail("both streaming response approval queues did not start")
+
+                    response_ids = list(adapter._response_approval_sessions)[:2]
+                    with approval_mod._lock:
+                        assert all(response_id in approval_mod._gateway_notify_cbs for response_id in response_ids)
+                        assert all(
+                            len(approval_mod._gateway_queues[response_id]) >= 1
+                            for response_id in response_ids
+                        )
+
+                    first = await adapter._handle_response_approval(
+                        _ApprovalRequest(response_ids[0], {"choice": "once", "resolve_all": True})
+                    )
+                    assert first.status == 200
+                    with approval_mod._lock:
+                        assert response_ids[0] not in approval_mod._gateway_queues
+                        assert len(approval_mod._gateway_queues[response_ids[1]]) == 1
+
+                    second = await adapter._handle_response_approval(
+                        _ApprovalRequest(response_ids[1], {"choice": "allow", "all": True})
+                    )
+                    assert second.status == 200
+                    responses = await asyncio.wait_for(asyncio.gather(*client_tasks), timeout=10)
+                    assert [response.status for response in responses] == [200, 200]
+                    for _ in range(200):
+                        with approval_mod._lock:
+                            clean = all(
+                                response_id not in approval_mod._gateway_notify_cbs
+                                and response_id not in approval_mod._gateway_queues
+                                for response_id in response_ids
+                            )
+                        if clean and all(
+                            response_id not in adapter._response_approval_sessions
+                            for response_id in response_ids
+                        ):
+                            break
+                        await asyncio.sleep(0.01)
+                    assert all(
+                        response_id not in adapter._response_approval_sessions
+                        for response_id in response_ids
+                    )
+                    with approval_mod._lock:
+                        assert all(
+                            response_id not in approval_mod._gateway_notify_cbs
+                            for response_id in response_ids
+                        )
+                        assert all(
+                            response_id not in approval_mod._gateway_queues
+                            for response_id in response_ids
+                        )
+        finally:
+            for task in client_tasks:
+                if not task.done():
+                    task.cancel()
+            if client_tasks:
+                await asyncio.gather(*client_tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_response_prepare_failure_releases_owned_approval_state(self, adapter):
+        from tools import approval as approval_mod
+        import gateway.platforms.api_server as api_mod
+        response_id = "resp_prepare_failure"
+        adapter._response_approval_sessions[response_id] = "default"
+        approval_mod.register_gateway_notify(response_id, lambda _: None)
+        stream_q = asyncio.Queue()
+        never = asyncio.Event()
+
+        async def _agent_coro():
+            await never.wait()
+
+        agent_task = asyncio.create_task(_agent_coro())
+
+        class _FailingStreamResponse:
+            async def prepare(self, request):
+                raise RuntimeError("prepare failed")
+
+        request = MagicMock()
+        request.headers = {}
+        with patch.object(api_mod.web, "StreamResponse", return_value=_FailingStreamResponse()):
+            with pytest.raises(RuntimeError, match="prepare failed"):
+                await adapter._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=[None],
+                    conversation_history=[],
+                    user_message="prepare",
+                    instructions=None,
+                    conversation=None,
+                    store=False,
+                    session_id="conversation",
+                )
+
+        assert response_id not in adapter._response_approval_sessions
+        with approval_mod._lock:
+            assert response_id not in approval_mod._gateway_notify_cbs
+            assert response_id not in approval_mod._gateway_queues
+
+    @pytest.mark.asyncio
+    async def test_cancellation_before_executor_submission_releases_response_state(self, adapter):
+        import gateway.platforms.api_server as api_mod
+        from tools import approval as approval_mod
+        response_id = "resp_cancel_before_executor"
+        adapter._response_approval_sessions[response_id] = "default"
+        agent_task = asyncio.create_task(adapter._run_agent(
+            user_message="cancel",
+            conversation_history=[],
+            session_id="conversation",
+            approval_notify_callback=lambda _: None,
+            approval_session_key=response_id,
+        ))
+        agent_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await agent_task
+
+        class _StreamResponse:
+            async def prepare(self, request):
+                return None
+
+            async def write(self, payload):
+                return None
+
+        stream_q = asyncio.Queue()
+        stream_q.put_nowait(None)
+        request = MagicMock()
+        request.headers = {}
+        with patch.object(api_mod.web, "StreamResponse", return_value=_StreamResponse()):
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=[None],
+                    conversation_history=[],
+                    user_message="cancel",
+                    instructions=None,
+                    conversation=None,
+                    store=False,
+                    session_id="conversation",
+                )
+
+        assert response_id not in adapter._response_approval_sessions
+        with approval_mod._lock:
+            assert response_id not in approval_mod._gateway_notify_cbs
+            assert response_id not in approval_mod._gateway_queues
 
 
     @pytest.mark.asyncio
@@ -1379,17 +1905,14 @@ class TestResponsesStreaming:
                 coro.close()
                 return fake_task
 
+            mock_run = AsyncMock(
+                return_value=(
+                    {"final_response": "ok", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+            )
             with (
-                patch.object(
-                    adapter,
-                    "_run_agent",
-                    new=AsyncMock(
-                        return_value=(
-                            {"final_response": "ok", "messages": [], "api_calls": 1},
-                            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-                        )
-                    ),
-                ),
+                patch.object(adapter, "_run_agent", new=mock_run),
                 patch("gateway.platforms.api_server.asyncio.ensure_future", side_effect=_fake_ensure_future),
                 patch.object(adapter, "_write_sse_responses", new_callable=AsyncMock) as mock_write_sse,
             ):
@@ -1404,7 +1927,15 @@ class TestResponsesStreaming:
             stream_q = mock_write_sse.call_args.kwargs["stream_q"]
             assert stream_q.empty()
             fake_task.callbacks[0](fake_task)
+            await asyncio.sleep(0)
             assert stream_q.get_nowait() is None
+
+            mock_write_sse.call_args.kwargs["stream_open"][0] = False
+            callbacks = mock_run.call_args.kwargs
+            callbacks["stream_delta_callback"]("late delta")
+            callbacks["tool_start_callback"]("late-call", "shell", {})
+            callbacks["approval_notify_callback"]({"command": "late"})
+            assert stream_q.empty()
 
 
     @pytest.mark.asyncio
@@ -1419,11 +1950,14 @@ class TestResponsesStreaming:
         handler, which makes end-to-end assertion on the final stored
         snapshot flaky).
         """
+        from tools import approval as approval_mod
+
         # Build a minimal fake request + stream queue the writer understands.
         fake_request = MagicMock()
         fake_request.headers = {}
 
         written_payloads: list = []
+        partial_written = asyncio.Event()
 
         class _FakeStreamResponse:
             async def prepare(self, req):
@@ -1431,41 +1965,81 @@ class TestResponsesStreaming:
 
             async def write(self, payload):
                 written_payloads.append(payload)
+                if b"response.output_text.delta" in payload:
+                    partial_written.set()
 
         # Patch web.StreamResponse for the duration of the writer call.
         import gateway.platforms.api_server as api_mod
-        import queue as _q
-
-        stream_q: _q.Queue = _q.Queue()
-
-        async def _agent_coro():
-            # Feed one partial delta into the stream queue...
-            stream_q.put("partial output")
-            # ...then give the drain loop a moment to pick it up before
-            # raising CancelledError to simulate a server-side cancel.
-            await asyncio.sleep(0.01)
-            raise asyncio.CancelledError()
-
-        agent_task = asyncio.ensure_future(_agent_coro())
+        stream_q = asyncio.Queue()
+        stream_open = [True]
+        loop = asyncio.get_running_loop()
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        stream_callbacks = adapter._response_stream_callbacks(
+            response_id=response_id,
+            stream_q=stream_q,
+            stream_loop=loop,
+            stream_open=stream_open,
+        )
+        stream_callbacks.pop("enqueue_stream_item")
 
-        with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
-            with pytest.raises(asyncio.CancelledError):
-                await adapter._write_sse_responses(
+        class _BlockingAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def interrupt(self, _reason):
+                return None
+
+            def run_conversation(self, **kwargs):
+                self.stream_delta_callback("partial output")
+                approval_mod.check_execute_code_guard("print('approval')", "local")
+                return {"final_response": "done", "messages": [], "api_calls": 1}
+
+        def _create_agent(**kwargs):
+            agent = _BlockingAgent()
+            agent.stream_delta_callback = kwargs["stream_delta_callback"]
+            return agent
+
+        adapter._response_approval_sessions[response_id] = "default"
+        agent_ref = [None]
+        with (
+            patch.object(adapter, "_create_agent", side_effect=_create_agent),
+            patch.object(approval_mod, "_get_approval_mode", return_value="ask"),
+            patch.object(approval_mod, "_get_approval_timeout", return_value=10),
+        ):
+            agent_task = asyncio.create_task(adapter._run_agent(
+                user_message="will be cancelled",
+                conversation_history=[],
+                session_id=None,
+                agent_ref=agent_ref,
+                stream_delta_callback=stream_callbacks["stream_delta_callback"],
+                approval_notify_callback=stream_callbacks["approval_notify_callback"],
+                approval_session_key=response_id,
+            ))
+            await _wait_for_gateway_approval_state(approval_mod, response_id)
+
+            with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
+                writer_task = asyncio.create_task(adapter._write_sse_responses(
                     request=fake_request,
                     response_id=response_id,
                     model="hermes-agent",
                     created_at=int(time.time()),
                     stream_q=stream_q,
                     agent_task=agent_task,
-                    agent_ref=[None],
+                    agent_ref=agent_ref,
                     conversation_history=[],
                     user_message="will be cancelled",
                     instructions=None,
                     conversation=None,
                     store=True,
                     session_id=None,
-                )
+                    stream_open=stream_open,
+                ))
+                await partial_written.wait()
+                writer_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await writer_task
+            await asyncio.gather(agent_task, return_exceptions=True)
 
         # The in_progress snapshot was persisted on response.created,
         # and the CancelledError handler must have updated it to
@@ -1481,6 +2055,10 @@ class TestResponsesStreaming:
             for part in item.get("content", [])
         )
         assert "partial output" in output_text
+        assert response_id not in adapter._response_approval_sessions
+        with approval_mod._lock:
+            assert response_id not in approval_mod._gateway_notify_cbs
+            assert response_id not in approval_mod._gateway_queues
 
     @pytest.mark.asyncio
     async def test_stream_client_disconnect_persists_incomplete_snapshot(self, adapter):
@@ -1505,40 +2083,86 @@ class TestResponsesStreaming:
                     raise ConnectionResetError("simulated client disconnect")
 
         import gateway.platforms.api_server as api_mod
-        import queue as _q
+        from tools import approval as approval_mod
 
-        stream_q: _q.Queue = _q.Queue()
-        stream_q.put("some streamed text")
-        stream_q.put(None)  # EOS sentinel
-
-        async def _agent_coro():
-            await asyncio.sleep(0.01)
-            return ({"final_response": "", "messages": [], "api_calls": 0},
-                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
-
-        agent_task = asyncio.ensure_future(_agent_coro())
+        stream_q = asyncio.Queue()
+        stream_open = [True]
+        loop = asyncio.get_running_loop()
         response_id = f"resp_{uuid.uuid4().hex[:28]}"
+        stream_callbacks = adapter._response_stream_callbacks(
+            response_id=response_id,
+            stream_q=stream_q,
+            stream_loop=loop,
+            stream_open=stream_open,
+        )
+        stream_enqueue = stream_callbacks.pop("enqueue_stream_item")
 
-        with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
-            await adapter._write_sse_responses(
-                request=fake_request,
-                response_id=response_id,
-                model="hermes-agent",
-                created_at=int(time.time()),
-                stream_q=stream_q,
-                agent_task=agent_task,
-                agent_ref=[None],
-                conversation_history=[],
+        class _BlockingAgent:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_total_tokens = 0
+
+            def __init__(self):
+                self.stream_delta_callback = None
+
+            def interrupt(self, _reason):
+                return None
+
+            def run_conversation(self, **kwargs):
+                self.stream_delta_callback("some streamed text")
+                approval_mod.check_execute_code_guard("print('approval')", "local")
+                return {"final_response": "", "messages": [], "api_calls": 0}
+
+        def _create_agent(**kwargs):
+            agent = _BlockingAgent()
+            agent.stream_delta_callback = kwargs["stream_delta_callback"]
+            return agent
+
+        adapter._response_approval_sessions[response_id] = "default"
+        agent_ref = [None]
+        with (
+            patch.object(adapter, "_create_agent", side_effect=_create_agent),
+            patch.object(approval_mod, "_get_approval_mode", return_value="ask"),
+            patch.object(approval_mod, "_get_approval_timeout", return_value=10),
+        ):
+            agent_task = asyncio.create_task(adapter._run_agent(
                 user_message="will disconnect",
-                instructions=None,
-                conversation=None,
-                store=True,
+                conversation_history=[],
                 session_id=None,
-            )
+                agent_ref=agent_ref,
+                stream_delta_callback=stream_callbacks["stream_delta_callback"],
+                approval_notify_callback=stream_callbacks["approval_notify_callback"],
+                approval_session_key=response_id,
+            ))
+            await _wait_for_gateway_approval_state(approval_mod, response_id)
+            stream_enqueue(None)  # EOS sentinel through the production handoff
+
+            with patch.object(api_mod.web, "StreamResponse", return_value=_DisconnectingStreamResponse()):
+                await adapter._write_sse_responses(
+                    request=fake_request,
+                    response_id=response_id,
+                    model="hermes-agent",
+                    created_at=int(time.time()),
+                    stream_q=stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=[],
+                    user_message="will disconnect",
+                    instructions=None,
+                    conversation=None,
+                    store=True,
+                    session_id=None,
+                    stream_open=stream_open,
+                )
+            await asyncio.gather(agent_task, return_exceptions=True)
 
         stored = adapter._response_store.get(response_id)
         assert stored is not None, "snapshot must survive client disconnect"
         assert stored["response"]["status"] == "incomplete"
+        assert response_id not in adapter._response_approval_sessions
+        with approval_mod._lock:
+            assert response_id not in approval_mod._gateway_notify_cbs
+            assert response_id not in approval_mod._gateway_queues
 
 
 # ---------------------------------------------------------------------------
@@ -2616,5 +3240,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
-
