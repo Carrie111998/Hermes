@@ -504,6 +504,76 @@ def test_projects_reads_are_scoped_to_the_requested_profile(monkeypatch, tmp_pat
     assert [s["id"] for s in lane["sessions"]] == ["coder-session"]
 
 
+def test_projects_tree_is_scoped_to_the_requested_profile(monkeypatch, tmp_path):
+    """``projects.tree`` on its own reads the requested profile's stores.
+
+    Split out from the combined read test deliberately: there the
+    ``projects.list`` assertion fires first, so a tree-only scoping regression
+    would never reach the tree assertions.
+    """
+    launch_home = _profile_dir(tmp_path, "launch")
+    coder_home = _profile_dir(tmp_path, "coder")
+    launch_repo = tmp_path / "repos" / "tree-launch"
+    coder_repo = tmp_path / "repos" / "tree-coder"
+    launch_repo.mkdir(parents=True)
+    coder_repo.mkdir(parents=True)
+    _bind_profiles(monkeypatch, tmp_path, {"default": launch_home, "coder": coder_home})
+
+    _create_project(launch_home, "Launch", launch_repo, use=True)
+    _create_project(coder_home, "Coder", coder_repo, use=True)
+    _create_session(launch_home, "tree-launch-session", launch_repo)
+    _create_session(coder_home, "tree-coder-session", coder_repo)
+
+    with _serving_launch_profile(launch_home):
+        coder_tree = _call("projects.tree", {"profile": "coder"})
+        launch_tree = _call("projects.tree")
+
+    assert [p["label"] for p in coder_tree["projects"]] == ["Coder"]
+    assert coder_tree["scoped_session_ids"] == ["tree-coder-session"]
+    assert [p["label"] for p in launch_tree["projects"]] == ["Launch"]
+    assert launch_tree["scoped_session_ids"] == ["tree-launch-session"]
+
+
+def test_project_sessions_is_scoped_to_the_requested_profile(monkeypatch, tmp_path):
+    """``projects.project_sessions`` on its own hydrates from the requested profile.
+
+    Same reason as the tree test: drill-in must be provably scoped by itself,
+    not behind an earlier ``projects.list`` assertion.
+    """
+    launch_home = _profile_dir(tmp_path, "launch")
+    coder_home = _profile_dir(tmp_path, "coder")
+    launch_repo = tmp_path / "repos" / "drill-launch"
+    coder_repo = tmp_path / "repos" / "drill-coder"
+    launch_repo.mkdir(parents=True)
+    coder_repo.mkdir(parents=True)
+    _bind_profiles(monkeypatch, tmp_path, {"default": launch_home, "coder": coder_home})
+
+    launch_project = _create_project(launch_home, "Launch", launch_repo, use=True)
+    coder_project = _create_project(coder_home, "Coder", coder_repo, use=True)
+    _create_session(launch_home, "drill-launch-session", launch_repo)
+    _create_session(coder_home, "drill-coder-session", coder_repo)
+
+    with _serving_launch_profile(launch_home):
+        coder_drill = _call(
+            "projects.project_sessions",
+            {"profile": "coder", "project_id": coder_project["id"]},
+        )
+        launch_drill = _call(
+            "projects.project_sessions", {"project_id": launch_project["id"]}
+        )
+
+    # The coder project id is absent from launch's projects.db, so an unscoped
+    # handler answers None here instead of the hydrated project.
+    assert coder_drill["project"] is not None
+    assert coder_drill["project"]["id"] == coder_project["id"]
+    coder_lane = coder_drill["project"]["repos"][0]["groups"][0]
+    assert [s["id"] for s in coder_lane["sessions"]] == ["drill-coder-session"]
+
+    assert launch_drill["project"]["id"] == launch_project["id"]
+    launch_lane = launch_drill["project"]["repos"][0]["groups"][0]
+    assert [s["id"] for s in launch_lane["sessions"]] == ["drill-launch-session"]
+
+
 def test_record_repos_writes_to_the_requested_profiles_projects_db(monkeypatch, tmp_path):
     """The scan cache is per-profile: a scoped write must not land on launch."""
     launch_home = _profile_dir(tmp_path, "launch")
