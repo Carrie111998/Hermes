@@ -2238,6 +2238,7 @@ export const zh: Translations = {
       '/memory': '审核待处理的记忆写入 / 切换审批门控',
       '/moa': '通过混合 Agent 预设运行 prompt，然后恢复模型',
       '/model': '切换模型（--global 持久化保存）',
+      '/new': '开始新桌面对话',
       '/paste': '从剪贴板附加图片',
       '/personality': '设置预设人格',
       '/pet': '切换或领养 petdex 吉祥物',
