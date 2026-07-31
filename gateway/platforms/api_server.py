@@ -2401,6 +2401,7 @@ class APIServerAdapter(BasePlatformAdapter):
             _resolve_runtime_agent_kwargs,
             _resolve_gateway_model,
             _load_gateway_config,
+            _load_gateway_runtime_config,
             GatewayRunner,
         )
         from hermes_cli.tools_config import _get_platform_tools
@@ -2435,7 +2436,27 @@ class APIServerAdapter(BasePlatformAdapter):
         request_reasoning_config = _request_reasoning_config(model_options)
         if request_reasoning_config is not None:
             reasoning_config = request_reasoning_config
+
+        # OpenRouter provider-routing prefs from config.yaml. Read through the
+        # runtime loader so profile-scoped configs and ``${VAR}`` refs resolve,
+        # matching gateway/run.py's own runtime reads.
+        runtime_config = _load_gateway_runtime_config()
+        raw_provider_routing = runtime_config.get("provider_routing")
+        if raw_provider_routing is None:
+            provider_routing = {}
+        elif isinstance(raw_provider_routing, dict):
+            provider_routing = raw_provider_routing
+        else:
+            logger.warning(
+                "Ignoring invalid provider_routing config: expected an object, got %s",
+                type(raw_provider_routing).__name__,
+            )
+            provider_routing = {}
+
+        service_tier = GatewayRunner._load_service_tier()
         request_service_tier = _request_service_tier(model_options)
+        if request_service_tier is not _REQUEST_OPTION_MISSING:
+            service_tier = request_service_tier
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2639,6 +2660,19 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_fallback_model()
         )
 
+        # ``service_tier`` stays on the agent for turn reporting, but the
+        # attribute alone is inert: provider transports read
+        # ``request_overrides``. Translate through the shared resolver so an
+        # unsupported model doesn't advertise a tier it can't use.
+        request_overrides = {}
+        if service_tier == "priority":
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides
+
+                request_overrides = resolve_fast_mode_overrides(model) or {}
+            except Exception:
+                request_overrides = {}
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
@@ -2657,10 +2691,18 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
+            "service_tier": service_tier,
+            "request_overrides": request_overrides,
+            "providers_allowed": provider_routing.get("only"),
+            "providers_ignored": provider_routing.get("ignore"),
+            "providers_order": provider_routing.get("order"),
+            "provider_sort": provider_routing.get("sort"),
+            "provider_require_parameters": provider_routing.get(
+                "require_parameters", False
+            ),
+            "provider_data_collection": provider_routing.get("data_collection"),
             "gateway_session_key": gateway_session_key,
         }
-        if request_service_tier is not _REQUEST_OPTION_MISSING:
-            agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {
