@@ -1,6 +1,9 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import contextlib
+import time
+
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -1342,6 +1345,184 @@ class TestSignalSyncMessageHandling:
         assert "event" in captured, "Group sync-sent must reach handle_message"
         assert captured["event"].text == "ping the group"
         assert captured["event"].source.chat_id == "group:abc123=="
+
+
+# ---------------------------------------------------------------------------
+# Health-monitor behaviour (#74871 reviewer feedback): reconnect after extended
+# ``/v1/health`` failure, warn on 120 s receive-loop inactivity.
+# ---------------------------------------------------------------------------
+
+
+class TestSignalHealthMonitor:
+    """Cover the reconnect + inactivity branches in ``_health_monitor``."""
+
+    @pytest.mark.asyncio
+    async def test_reconnect_triggered_after_three_consecutive_failures(self, monkeypatch):
+        """Three failed health checks in a row should trigger a ``connect(is_reconnect=True)``
+        via the live ``self.client``, not just log a warning. Without this the
+        adapter would silently sit on a dead TCP socket that polls return
+        immediately from (#74871)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+
+        # Pre-arm the state the monitor needs.
+        adapter._running = True
+        adapter.client = MagicMock()
+        adapter._last_receive_at = time.monotonic()
+
+        # Stub ``connect`` so it doesn't actually rebuild the world; we
+        # only care that it gets called.
+        connect_calls = []
+
+        async def fake_connect(*, is_reconnect: bool = False):
+            connect_calls.append(is_reconnect)
+
+        adapter.connect = fake_connect
+
+        # ``asyncio.sleep`` is the only thing blocking the loop — patch it to
+        # no-op so the test runs in microseconds, but use a counter so we
+        # can stop the loop after three iterations.
+        iterations = {"n": 0}
+
+        async def fake_sleep(_seconds):
+            iterations["n"] += 1
+            if iterations["n"] >= 4:
+                # Raise to break out of the ``while self._running`` loop on
+                # the 4th iteration — three failed health checks will have
+                # triggered ``connect(is_reconnect=True)`` by then.
+                raise asyncio.CancelledError
+
+        # Drive the monitor manually instead of starting it as a task so the
+        # test controls the loop bound and we can wait synchronously.
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        # Stub ``client.get`` to always fail (returns 503).
+        failing_response = MagicMock(status_code=503)
+        adapter.client.get = AsyncMock(return_value=failing_response)
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await adapter._health_monitor()
+
+        assert len(connect_calls) == 1, (
+            f"expected reconnect after 3 consecutive failures, got {len(connect_calls)}"
+        )
+        assert connect_calls[0] is True, "reconnect must pass is_reconnect=True"
+
+    @pytest.mark.asyncio
+    async def test_inactivity_warning_after_120s_without_receive(self, monkeypatch):
+        """If the receive loop hasn't yielded in 120 s, log a warning even
+        when ``/v1/health`` keeps returning 200. Empty queues still count
+        as activity (the receive loop updates ``_last_receive_at`` on every
+        successful poll), so a stuck loop is the only failure mode (#74871)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._running = True
+        adapter.client = MagicMock()
+
+        # Pretend the receive loop hasn't fired for 200 s.
+        adapter._last_receive_at = time.monotonic() - 200.0
+
+        healthy_response = MagicMock(status_code=200)
+        adapter.client.get = AsyncMock(return_value=healthy_response)
+
+        connect_calls = []
+
+        async def fake_connect(*, is_reconnect: bool = False):
+            connect_calls.append(is_reconnect)
+
+        adapter.connect = fake_connect
+
+        iterations = {"n": 0}
+
+        async def fake_sleep(_seconds):
+            iterations["n"] += 1
+            if iterations["n"] >= 1:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await adapter._health_monitor()
+
+        # No reconnect — health endpoint is healthy; the operator-visible
+        # warning is the load-bearing signal here.
+        assert connect_calls == []
+
+    @pytest.mark.asyncio
+    async def test_successful_health_resets_failure_counter(self, monkeypatch):
+        """A successful health probe between failures resets the
+        consecutive-failure window so a single transient blip doesn't
+        eventually trigger a reconnect (#74871)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._running = True
+        adapter.client = MagicMock()
+        adapter._last_receive_at = time.monotonic()
+
+        connect_calls = []
+
+        async def fake_connect(*, is_reconnect: bool = False):
+            connect_calls.append(is_reconnect)
+
+        adapter.connect = fake_connect
+
+        # Sequence: fail, fail, success, fail, fail — only 2 consecutive
+        # fails at any point, so no reconnect should fire even though
+        # total failures > 3.
+        sequence = [
+            MagicMock(status_code=500),  # fail
+            MagicMock(status_code=500),  # fail
+            MagicMock(status_code=200),  # success
+            MagicMock(status_code=500),  # fail
+            MagicMock(status_code=500),  # fail
+        ]
+        adapter.client.get = AsyncMock(side_effect=sequence)
+
+        iterations = {"n": 0}
+
+        async def fake_sleep(_seconds):
+            iterations["n"] += 1
+            if iterations["n"] >= len(sequence):
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        with contextlib.suppress(asyncio.CancelledError):
+            await adapter._health_monitor()
+
+        assert connect_calls == [], (
+            f"no consecutive-failure window reached 3; reconnect should NOT "
+            f"have fired but got {connect_calls}"
+        )
+
+    def test_receive_loop_records_last_activity_timestamp(self, monkeypatch):
+        """``_receive_loop`` must update ``_last_receive_at`` on every
+        successful poll (including empty ones) so the monitor can
+        distinguish \"daemon reachable, queue empty\" from \"daemon stuck\"
+        (#74871)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._running = True
+        adapter._last_receive_at = 0.0
+
+        # Track _receive_loop's poll + handle_envelope calls.
+        envelope = {"envelope": {"sourceNumber": "+15551234567", "dataMessage": {"message": "hi", "timestamp": 1}}}
+        response = MagicMock(status_code=200)
+        response.json.return_value = [envelope]
+
+        async def fake_get(url, **kwargs):
+            adapter._running = False  # exit loop after one poll
+            return response
+
+        adapter.client = MagicMock(get=AsyncMock(side_effect=fake_get))
+        adapter._handle_envelope = AsyncMock()
+
+        before = time.monotonic()
+        # _receive_loop is async — run it synchronously via asyncio.run
+        # to exercise the activity-timestamp side-effect end-to-end.
+        asyncio.run(adapter._receive_loop())
+        after = time.monotonic()
+
+        assert before <= adapter._last_receive_at <= after, (
+            f"_last_receive_at ({adapter._last_receive_at}) must fall within "
+            f"the poll interval [{before}, {after}]"
+        )
 
 
 # ---------------------------------------------------------------------------

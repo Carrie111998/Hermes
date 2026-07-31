@@ -67,6 +67,17 @@ SIGNAL_MAX_ATTACHMENT_SIZE = 100 * 1024 * 1024  # 100 MB
 MAX_MESSAGE_LENGTH = 8000  # Signal message size limit
 TYPING_INTERVAL = 8.0  # seconds between typing indicator refreshes
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
+# Health-monitor reconnect threshold: after this many consecutive
+# ``/v1/health`` failures the monitor rebuilds the receive loop via
+# ``connect(is_reconnect=True)`` instead of just logging (#74871 reviewer
+# feedback — the old behaviour left Hermes connected to a dead TCP socket
+# that polls return immediately from, silently dropping inbound).
+HEALTH_MONITOR_MAX_CONSECUTIVE_FAILURES = 3
+# Receive-loop inactivity threshold: warn if the receive poll hasn't
+# completed (success or transport error) for this many seconds. Empty
+# polls still count as activity because they confirm the daemon is
+# reachable (#74871).
+HEALTH_MONITOR_INACTIVITY_SECONDS = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +317,11 @@ class SignalAdapter(BasePlatformAdapter):
         self._typing_skip_until: Dict[str, float] = {}
         self._running = False
 
+        # Receive-loop activity timestamp (monotonic seconds). Updated by
+        # ``_receive_loop`` after every successful poll and read by
+        # ``_health_monitor`` to warn on extended inactivity (#74871).
+        self._last_receive_at: float = 0.0
+
         # Normalize account for self-message filtering
         self._account_normalized = self.account.strip()
 
@@ -428,6 +444,12 @@ class SignalAdapter(BasePlatformAdapter):
             try:
                 response = await self.client.get(url, timeout=10.0)
                 response.raise_for_status()
+                # Record the timestamp of every successful poll (including
+                # empty lists) so ``_health_monitor`` can warn on
+                # 120 s of inactivity. Without this the monitor can't
+                # distinguish "daemon is reachable, queue is empty" from
+                # "daemon is stuck and not yielding" (#74871).
+                self._last_receive_at = time.monotonic()
                 data = response.json()
                 envelopes = data if isinstance(data, list) else [data]
                 for envelope in envelopes:
@@ -446,17 +468,88 @@ class SignalAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _health_monitor(self) -> None:
-        """Periodically verify daemon health."""
+        """Periodically verify daemon health and reconnect on extended failure.
+
+        Replaces a pure-log health loop (#74871 reviewer feedback). On
+        every ``HEALTH_CHECK_INTERVAL`` (30 s) we:
+
+        1. Probe ``GET /v1/health``. A 200/204 is healthy; anything else
+           (or a transport error) is a failed check.
+        2. Track consecutive failures. After ``HEALTH_MONITOR_MAX_CONSECUTIVE_FAILURES``
+           (3) the loop calls ``connect(is_reconnect=True)`` to rebuild
+           the receive task + health monitor from the live ``self.client``.
+           Without this, a daemon restart leaves Hermes connected to a
+           dead TCP socket that polls return immediately from, silently
+           dropping every inbound message.
+        3. Track time since the last successful ``/v1/receive/{number}``
+           poll. After ``HEALTH_MONITOR_INACTIVITY_SECONDS`` (120 s) without
+           any envelope (live or empty), log a warning so an operator
+           investigating a stuck bot can see the receive loop hasn't
+           yielded a turn.
+        """
+        _consecutive_failures = 0
+        _last_receive_at = time.monotonic()
         while self._running:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
             if not self._running:
                 break
+
+            # 1) Health probe
+            healthy = False
             try:
-                resp = await self.client.get(f"{self.http_url}/v1/health", timeout=10.0)
-                if resp.status_code not in (200, 204):
-                    logger.warning("Signal: health check failed (%d)", resp.status_code)
+                resp = await self.client.get(
+                    f"{self.http_url}/v1/health", timeout=10.0,
+                )
+                healthy = resp.status_code in (200, 204)
+                if not healthy:
+                    logger.warning(
+                        "Signal: health check failed (%d)", resp.status_code,
+                    )
             except Exception as e:
                 logger.warning("Signal: health check error: %s", e)
+
+            if healthy:
+                _consecutive_failures = 0
+            else:
+                _consecutive_failures += 1
+                if (
+                    _consecutive_failures
+                    >= HEALTH_MONITOR_MAX_CONSECUTIVE_FAILURES
+                ):
+                    logger.warning(
+                        "Signal: %d consecutive health-check failures; "
+                        "triggering reconnect",
+                        _consecutive_failures,
+                    )
+                    try:
+                        await self.connect(is_reconnect=True)
+                    except Exception as e:
+                        logger.error(
+                            "Signal: reconnect attempt failed: %s", e,
+                        )
+                    # Reset the failure window + receive clock so the
+                    # newly-started receive loop starts with a clean
+                    # slate; the next iteration re-probes.
+                    _consecutive_failures = 0
+                    _last_receive_at = time.monotonic()
+                    continue
+
+            # 3) Inactivity detector — only relevant when the receive loop
+            # is actually polling. ``_receive_loop`` updates
+            # ``self._last_receive_at`` after every successful iteration
+            # (including empty polls); we compare against ``now`` and warn
+            # if we haven't seen activity in 120 s. Empty polls still count
+            # as activity because they confirm the daemon is reachable.
+            now = time.monotonic()
+            last_at = getattr(self, "_last_receive_at", None)
+            if last_at is not None and (now - last_at) > HEALTH_MONITOR_INACTIVITY_SECONDS:
+                logger.warning(
+                    "Signal: no receive-loop activity for %ds "
+                    "(last seen %.0fs ago); daemon may be stuck or "
+                    "the inbound queue may be empty",
+                    HEALTH_MONITOR_INACTIVITY_SECONDS,
+                    now - last_at,
+                )
 
 
     # ------------------------------------------------------------------
