@@ -65,6 +65,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # DeepSeek
     ("deepseek/deepseek-v4-pro",               ""),
     ("deepseek/deepseek-v4-flash",             ""),
+    ("deepseek/deepseek-v4-flash-0731",        "re-post-trained 2026-07-31 build; improved agentic + coding"),
     # Qwen
     ("qwen/qwen3.7-max",                       ""),
     # MoonshotAI
