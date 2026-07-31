@@ -19,9 +19,11 @@ import asyncio
 import inspect
 import logging
 import queue
+import re
 import threading
 import time
 from dataclasses import dataclass
+from typing import Any, Callable, Optional
 
 # Internal tool-trace banner lines — stripped from streaming output so
 # finalized split-message chunks don't permanently expose diagnostics.
@@ -29,7 +31,6 @@ _TOOL_TRACE_RE = re.compile(
     r"^[ \t]*(?:⚠️?\s*)?(?:🛠️?\s*)?`[^`]+`\s+failed\s*$",
     re.MULTILINE,
 )
-from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
@@ -810,10 +811,17 @@ class GatewayStreamConsumer:
                 ):
                     should_edit = False
                 if should_edit and self._accumulated:
+                    # The complete display buffer must be sanitized BEFORE any
+                    # overflow split. Sanitizing each chunk later is unsafe: a
+                    # credential that crosses the boundary is unrecognizable in
+                    # either fragment but reconstructable by the recipient.
+                    # Keep the raw buffer for normal edits so _clean_for_display's
+                    # trailing-whitespace normalization cannot alter future deltas.
+                    display_accumulated = self._clean_for_display(self._accumulated)
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
                     if (
-                        _len_fn(self._accumulated) > _safe_limit
+                        _len_fn(display_accumulated) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -824,13 +832,13 @@ class GatewayStreamConsumer:
                         # updating in-place as later streamed deltas arrive
                         # instead of posting every split as an immutable message.
                         chunks = self._truncate_for_stream(
-                            self._accumulated, _safe_limit, _len_fn,
+                            display_accumulated, _safe_limit, _len_fn,
                         )
                         if len(chunks) <= 1:
                             # A malformed/legacy adapter result must not leave
                             # this overflow branch with an unsplittable payload.
                             chunks = self._split_text_chunks(
-                                self._accumulated, _safe_limit, _len_fn,
+                                display_accumulated, _safe_limit, _len_fn,
                             )
                         chunks_delivered = False
                         reply_to = self._initial_reply_to_id
@@ -899,17 +907,17 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        _len_fn(self._accumulated) > _safe_limit
+                        _len_fn(display_accumulated) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
                         _cp_budget = _custom_unit_to_cp(
-                            self._accumulated, _safe_limit, _len_fn,
+                            display_accumulated, _safe_limit, _len_fn,
                         )
-                        split_at = self._accumulated.rfind("\n", 0, _cp_budget)
+                        split_at = display_accumulated.rfind("\n", 0, _cp_budget)
                         if split_at < _cp_budget // 2:
                             split_at = _cp_budget
-                        chunk = self._accumulated[:split_at]
+                        chunk = display_accumulated[:split_at]
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
                         # sealed chunk will never be edited again — _message_id
@@ -930,7 +938,7 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        self._accumulated = display_accumulated[split_at:].lstrip("\n")
                         self._message_id = None
                         self._last_sent_text = ""
 

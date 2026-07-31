@@ -8,7 +8,36 @@ never edited again.
 
 from __future__ import annotations
 
-from gateway.stream_consumer import GatewayStreamConsumer
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+
+
+_BOUNDARY_SECRET = "sk-abc123def456ghi789jkl012mno345pqr678stu"
+
+
+def _overflow_adapter() -> MagicMock:
+    """Return an adapter that records the real streaming send/edit paths."""
+    adapter = MagicMock()
+    adapter.MAX_MESSAGE_LENGTH = 601  # run() clamps its safe streaming limit to 500.
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="sent"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="edited"))
+    return adapter
+
+
+def _delivered_text(adapter: MagicMock) -> str:
+    """Reconstruct visible text in platform delivery order."""
+    sent = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    edited = [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+    return "".join((*edited, *sent))
+
+
+def _boundary_crossing_response() -> str:
+    """Place a redactable token across the consumer's 500-character split."""
+    return "x" * 496 + " " + _BOUNDARY_SECRET + "\ncomplete"
 
 
 class TestCleanForDisplaySecretRedaction:
@@ -36,10 +65,10 @@ class TestCleanForDisplaySecretRedaction:
 
     def test_api_key_redacted(self):
         """API keys in streamed text must be redacted."""
-        text = "Here is your key: sk-abc123def456ghi789jkl012mno345pqr678stu"
+        text = f"Here is your key: {_BOUNDARY_SECRET}"
         result = GatewayStreamConsumer._clean_for_display(text)
         # The redactor preserves first 6 + last 4 chars for long tokens
-        assert "sk-abc123def456" not in result
+        assert _BOUNDARY_SECRET not in result
         assert "sk-abc" in result  # prefix preserved
         assert "8stu" in result  # suffix preserved
 
@@ -59,3 +88,39 @@ class TestCleanForDisplaySecretRedaction:
         """Whitespace-only text returns empty string after rstrip."""
         result = GatewayStreamConsumer._clean_for_display("   \n\n  ")
         assert result == ""
+
+
+class TestOverflowSecretRedaction:
+    """Overflow must sanitize the complete buffer before splitting it."""
+
+    def test_first_message_overflow_cannot_reconstruct_cross_boundary_secret(self):
+        """The no-message overflow branch never delivers reconstructable fragments."""
+        adapter = _overflow_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_1",
+            StreamConsumerConfig(buffer_threshold=1),
+        )
+        consumer.on_delta(_boundary_crossing_response())
+        consumer.finish()
+
+        asyncio.run(consumer.run())
+
+        assert _BOUNDARY_SECRET not in _delivered_text(adapter)
+
+    def test_existing_message_overflow_cannot_reconstruct_cross_boundary_secret(self):
+        """The existing-message overflow branch never delivers reconstructable fragments."""
+        adapter = _overflow_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_1",
+            StreamConsumerConfig(buffer_threshold=1),
+        )
+        consumer._message_id = "preview"
+        consumer._already_sent = True
+        consumer.on_delta(_boundary_crossing_response())
+        consumer.finish()
+
+        asyncio.run(consumer.run())
+
+        assert _BOUNDARY_SECRET not in _delivered_text(adapter)
