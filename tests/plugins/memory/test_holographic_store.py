@@ -368,6 +368,32 @@ class TestSupersededRecallFilter:
         assert old_id not in ids
         assert new_id in ids
 
+    def test_contradict_excludes_superseded(self, store):
+        """Without this filter the two versions of one fact contradict each
+        other: they share every entity and their wording diverges by design, so
+        each correction would manufacture a permanent false contradiction."""
+        old_id, new_id = self._two_versions(store)
+        # Entity extraction needs a model, so link one shared entity directly,
+        # which is the state real extraction produces for two versions of a fact.
+        store._conn.execute("INSERT INTO entities (name) VALUES ('project hermes')")
+        entity_id = store._conn.execute(
+            "SELECT entity_id FROM entities WHERE name = 'project hermes'"
+        ).fetchone()["entity_id"]
+        for fact_id in (old_id, new_id):
+            store._conn.execute(
+                "INSERT INTO fact_entities (fact_id, entity_id) VALUES (?, ?)",
+                (fact_id, entity_id),
+            )
+        store._conn.commit()
+
+        seen = {
+            value["fact_id"]
+            for pair in FactRetriever(store).contradict(threshold=0.0, limit=50)
+            for value in pair.values()
+            if isinstance(value, dict) and "fact_id" in value
+        }
+        assert old_id not in seen
+
 
 class TestRemoveFactLineageCleanup:
     """remove_fact() drops the fact's fact_supersedes edges so no dangling

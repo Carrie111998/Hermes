@@ -356,7 +356,7 @@ class FactRetriever:
         conn = self.store._conn
 
         # Get all facts with vectors and their linked entities
-        where = "WHERE f.hrr_vector IS NOT NULL"
+        where = "WHERE f.hrr_vector IS NOT NULL AND f.superseded_at IS NULL"
         params: list = []
         if category:
             where += " AND f.category = ?"
