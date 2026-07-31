@@ -629,6 +629,25 @@ class GatewaySlashCommandsMixin:
         model_name = model_name or _clean_str(session_row.get("model"))
         provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
         base_url = base_url or _clean_str(session_row.get("billing_base_url"))
+
+        # billing_provider can be NULL when the session's first calls went
+        # through a proxy that never returns streaming usage chunks (e.g.
+        # FreeLLMAPI's OpenCode route).  Fall back to the live gateway_runtime
+        # recorded on the session row — it reflects the active routing,
+        # including fallback provider switches.
+        if not provider_name:
+            try:
+                mc_raw = session_row.get("model_config")
+                if mc_raw:
+                    import json
+                    mc = json.loads(mc_raw) if isinstance(mc_raw, str) else mc_raw
+                    rt = mc.get("gateway_runtime") if isinstance(mc, dict) else None
+                    if isinstance(rt, dict):
+                        provider_name = provider_name or _clean_str(rt.get("provider"))
+                        base_url = base_url or _clean_str(rt.get("base_url"))
+            except Exception:
+                pass
+
         context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
         user_config: dict[str, Any] = {}
