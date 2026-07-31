@@ -34,6 +34,7 @@ export const HOTKEYS: [string, string][] = [
   ['Home/End', 'start / end of line'],
   ['Shift+Enter / Alt+Enter', 'insert newline'],
   ['\\+Enter', 'multi-line continuation (fallback)'],
+  ['@<id> <text>', 'steer a running agent by its panel id (e.g. @b7c2 check the retry budget)'],
   ['!<cmd>', 'run a shell command (e.g. !ls, !git status)'],
   ['{!<cmd>}', 'interpolate shell output inline (e.g. "branch is {!git branch --show-current}")']
 ]

@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 
+import { getAsyncDelegations } from '../app/delegationStore.js'
 import type { CompletionItem } from '../app/interfaces.js'
+import { getTurnState } from '../app/turnStore.js'
 import { inlineSlashTrigger, looksLikeSlashCommand } from '../domain/slash.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { CompletionResponse } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
+import { steerCompletions, steerTokenPrefix } from '../lib/subagentSteer.js'
 import { listWidgetApps } from '../sdk/registry.js'
 
 /** Client-side widget apps live in the TUI's registry, not the gateway — so
@@ -25,6 +28,21 @@ export function mergeWidgetAppItems(input: string, items: CompletionItem[]): Com
 }
 
 const TAB_PATH_RE = /((?:["']?(?:[A-Za-z]:[\\/]|\.{1,2}\/|~\/|\/|@|[^"'`\s]+\/))[^\s]*)$/
+
+/** Local (no-RPC) completions for the `@<id>` steer shorthand. `@` also starts
+ * a path word, so this must win before the path branch or typing `@b7` would
+ * ask the gateway to complete a filename. Returns null when the input isn't in
+ * the id position, and an empty list when it is but nothing is steerable — the
+ * latter still suppresses the path request. */
+export function steerCompletionsForInput(
+  input: string,
+  subagents = getTurnState().subagents,
+  delegations = getAsyncDelegations()
+): CompletionItem[] | null {
+  const prefix = steerTokenPrefix(input)
+
+  return prefix === null ? null : steerCompletions(prefix, subagents, delegations)
+}
 
 export function completionRequestForInput(
   input: string
@@ -97,6 +115,18 @@ export function useCompletion(input: string, blocked: boolean, gw: GatewayClient
     }
 
     ref.current = input
+
+    // Agent ids are already in the client's stores, so this needs no RPC and no
+    // debounce — it lands on the same keystroke that typed the character.
+    const steerItems = steerCompletionsForInput(input)
+
+    if (steerItems) {
+      setCompletions(steerItems)
+      setCompIdx(0)
+      setCompReplace(0)
+
+      return
+    }
 
     const request = completionRequestForInput(input)
 

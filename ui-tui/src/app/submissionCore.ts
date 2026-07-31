@@ -1,5 +1,11 @@
 import type { GatewayClient } from '../gatewayClient.js'
-import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
+import type {
+  DelegationSendResponse,
+  InputDetectDropResponse,
+  PromptSubmitResponse,
+  SubagentSendResponse
+} from '../gatewayTypes.js'
+import { asRpcResult } from '../lib/rpc.js'
 import type { Msg } from '../types.js'
 
 import { turnController } from './turnController.js'
@@ -36,6 +42,55 @@ export interface SubmitPromptDeps {
 // submit, queue-edit picks, and the drain effect all funnel through here.
 export function markSubmitting(): void {
   patchUiState({ busy: true, status: 'running…' })
+}
+
+export interface SteerDispatchDeps {
+  appendMessage: (msg: Msg) => void
+  clearIn: () => void
+  gw: GatewayClient
+  pushHistory: (text: string) => void
+  sys: (text: string) => void
+}
+
+// Route `@<id> text` to a live subagent (subagent.send) or a background
+// delegation (delegation.send) instead of the main turn.
+//
+// Returns false when the token resolves to neither, so the caller falls through
+// to an ordinary prompt ("@john ping me" must still submit normally).
+//
+// Steered text never enters the main transcript through prompt.submit, so this
+// is the ONLY place that can record it: without the echo below the session
+// shows `delivered → @b7c2` and no trace of what was actually sent.
+export function dispatchSteer(
+  cmd: { body: string; token: string },
+  target: { delegationId?: string | null; subagentId?: string | null },
+  toHistory: string,
+  deps: SteerDispatchDeps
+): boolean {
+  const call = target.subagentId
+    ? { method: 'subagent.send', params: { subagent_id: target.subagentId, text: cmd.body } }
+    : target.delegationId
+      ? { method: 'delegation.send', params: { delegation_id: target.delegationId, text: cmd.body } }
+      : null
+
+  if (!call) {
+    return false
+  }
+
+  deps.pushHistory(toHistory)
+  deps.clearIn()
+  deps.appendMessage({ role: 'user', text: `@${cmd.token} ${cmd.body}` })
+
+  deps.gw
+    .request<SubagentSendResponse | DelegationSendResponse>(call.method, call.params)
+    .then(raw => {
+      const r = asRpcResult<SubagentSendResponse | DelegationSendResponse>(raw)
+
+      deps.sys(r?.delivered ? `delivered → @${cmd.token}` : `@${cmd.token} already finished`)
+    })
+    .catch(() => deps.sys(`steer failed — @${cmd.token} unreachable`))
+
+  return true
 }
 
 // Submit a ready prompt (already resolved to be neither a slash command nor a

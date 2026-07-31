@@ -203,6 +203,38 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
+def send_to_subagent(subagent_id: str, text: str) -> bool:
+    """Deliver a steering message into a single running subagent.
+
+    Mirrors ``interrupt_subagent``: looks the child up in the live registry
+    and calls ``AIAgent.steer(text)`` on it.  ``steer`` queues the text onto
+    the child's pending-steer slot, which the child drains at its next
+    iteration boundary and appends as a clean user turn — never spliced
+    between a tool-result and an assistant message, so prompt-cache and role
+    alternation stay intact.  Returns True when a matching live subagent
+    accepted the message; False for a dead/unknown id or empty text.
+
+    Trust model matches ``interrupt_subagent``: possession of the subagent_id
+    is authority.  The live registry carries no session key, so there is no
+    per-session ownership check here (same posture as interrupt).
+    """
+    if not text or not text.strip():
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+    if not record:
+        return False
+    agent = record.get("agent")
+    steer = getattr(agent, "steer", None)
+    if not callable(steer):
+        return False
+    try:
+        return bool(steer(text))
+    except Exception as exc:
+        logger.debug("send_to_subagent(%s) failed: %s", subagent_id, exc)
+        return False
+
+
 def list_active_subagents() -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
@@ -2415,6 +2447,26 @@ def _run_single_child(
                 else 0.0
             ),
         }
+
+        # A steer can race the child's final answer: send_to_subagent() only
+        # queues onto _pending_steer, and the queue drains at the next tool
+        # batch (agent.agent_runtime_helpers.apply_pending_steer_to_tool_results).
+        # If the model's last response has no tool_calls, there is no future
+        # drain point — turn_finalizer hands the unconsumed text back as
+        # result["pending_steer"] instead of dropping it (mirrors the main
+        # turn's leftover-steer handling). A delegated child has no "next
+        # turn" to inject it into, so surface it on the entry instead of
+        # letting it vanish — the TUI reported "delivered" before the race
+        # was decided, and this is the only place that can correct the record.
+        _missed_steer = result.get("pending_steer")
+        if _missed_steer:
+            logger.warning(
+                "Subagent %d finished before draining a pending steer "
+                "(delegate_task task_index=%d): text never reached the model",
+                task_index, task_index,
+            )
+            entry["missed_steer"] = _missed_steer
+
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
@@ -3282,6 +3334,14 @@ def delegate_task(
                 except Exception:
                     pass
 
+        def _batch_steer(text: str) -> bool:
+            delivered = False
+            for _c in _child_agents:
+                _sid = getattr(_c, "_subagent_id", None)
+                if isinstance(_sid, str) and send_to_subagent(_sid, text):
+                    delivered = True
+            return delivered
+
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the
             # combined (api_call_count, current_tool, last_activity_ts) of
@@ -3329,10 +3389,18 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            steer_fn=_batch_steer,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
+            # The children this one batch record stands for. The TUI joins on
+            # these so a batch never double-counts its own live subagents.
+            subagent_ids=[
+                _sid
+                for _sid in (getattr(_c, "_subagent_id", None) for _c in _child_agents)
+                if isinstance(_sid, str)
+            ],
             progress_fn=_batch_progress,
         )
 

@@ -2809,6 +2809,81 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 
+@method("delegation.async_list")
+def _(rid, params: dict) -> dict:
+    """Read projection of the async-delegation registry for the docked panel.
+
+    Pure snapshot — no state change. ``list_async_delegations`` already strips
+    the non-serialisable ``interrupt_fn``/``steer_fn``/``progress_fn`` and
+    returns running + recently completed records; ``active_count`` is the
+    header's "N running".
+
+    The raw record also carries the whole dispatch spec — ``context`` (the
+    full prompt hand-off, unbounded), the per-child ``goals`` list, the
+    ``result``/``summary`` payload of finished runs and session routing keys.
+    The TUI paints five short cells and never reads any of it, but this poll
+    runs every 1.5s per client, so the record is projected down to the fields
+    the panel actually uses before it goes on the wire.
+    """
+    from tools.async_delegation import active_count, list_async_delegations
+
+    return _ok(
+        rid,
+        {
+            "delegations": [
+                _project_async_delegation(d) for d in list_async_delegations()
+            ],
+            "running": active_count(),
+        },
+    )
+
+
+@method("subagent.send")
+def _(rid, params: dict) -> dict:
+    """Steer a running subagent by id: deliver ``text`` as a fresh user turn.
+
+    Reuses the child's existing ``AIAgent.steer`` drain (the same
+    iteration-boundary channel /steer uses for the main turn), so the text
+    lands on the child's next tool result without violating role alternation
+    or splicing into an in-flight tool. Returns ``delivered=false`` for a
+    dead/unknown id.
+
+    ``delivered=true`` only confirms the text was accepted onto the child's
+    pending-steer slot — not that the child actually saw it. If the child's
+    current LLM call turns out to be its last (no further tool_calls), the
+    drain point this queue relies on never arrives; ``_run_single_child``
+    then surfaces the unconsumed text as ``missed_steer`` on the delegation's
+    completion event so the record self-corrects once the true outcome is
+    known, instead of the initial "delivered" staying uncontested.
+    """
+    from tools.delegate_tool import send_to_subagent
+
+    subagent_id = str(params.get("subagent_id") or "").strip()
+    text = str(params.get("text") or "")
+    if not subagent_id or not text.strip():
+        return _err(rid, 4000, "subagent_id and text required")
+    delivered = send_to_subagent(subagent_id, text)
+    return _ok(rid, {"delivered": delivered, "subagent_id": subagent_id})
+
+
+@method("delegation.send")
+def _(rid, params: dict) -> dict:
+    """Steer every running child owned by an async delegation.
+
+    Same best-effort semantics as ``subagent.send`` — see its docstring for
+    the child-final-response race and how ``missed_steer`` corrects for it
+    on the completion event.
+    """
+    from tools.async_delegation import steer_async_delegation
+
+    delegation_id = str(params.get("delegation_id") or "").strip()
+    text = str(params.get("text") or "")
+    if not delegation_id or not text.strip():
+        return _err(rid, 4000, "delegation_id and text required")
+    delivered = steer_async_delegation(delegation_id, text)
+    return _ok(rid, {"delivered": delivered, "delegation_id": delegation_id})
+
+
 @method("spawn_tree.save")
 def _(rid, params: dict) -> dict:
     session_id = str(params.get("session_id") or "").strip()

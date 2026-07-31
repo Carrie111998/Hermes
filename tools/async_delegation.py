@@ -634,6 +634,7 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    steer_fn: Optional[Callable[[str], bool]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
@@ -696,6 +697,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "steer_fn": steer_fn,
         "progress_fn": progress_fn,
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None,
@@ -793,6 +795,7 @@ def _begin_finalization(
         record["completed_at"] = time.time()
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
+        record["steer_fn"] = None
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
 
@@ -855,6 +858,12 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    # A steer accepted while this child was running but never actually
+    # drained into its transcript (see _run_single_child's missed_steer
+    # comment) — surface it on the completion so the earlier "delivered"
+    # RPC response gets corrected once the true outcome is known.
+    if result.get("missed_steer"):
+        evt["missed_steer"] = result["missed_steer"]
     # Structured stall metadata (#51690) — additive, present only on
     # stall-monitor finalizations.
     for _k in (
@@ -889,8 +898,10 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    steer_fn: Optional[Callable[[str], bool]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
+    subagent_ids: Optional[List[str]] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
@@ -936,7 +947,13 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "steer_fn": steer_fn,
         "is_batch": True,
+        # Ids of the live children this ONE record stands for. The TUI's docked
+        # panel joins on these to drop the batch row while its children are
+        # still emitting live subagent events — otherwise a 3-child batch
+        # paints 4 rows (3 children + the batch) and claims 4 agents running.
+        "subagent_ids": [s for s in (subagent_ids or []) if isinstance(s, str)],
         "progress_fn": progress_fn,
         "_progress_token": None,
         "_progress_ts": dispatched_at,
@@ -1319,7 +1336,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item = {
                 k: v
                 for k, v in r.items()
-                if k not in {"interrupt_fn", "progress_fn"}
+                if k not in {"interrupt_fn", "steer_fn", "progress_fn"}
                 and not k.startswith("_")
             }
             status = r.get("status")
@@ -1356,6 +1373,24 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
+
+
+def steer_async_delegation(delegation_id: str, text: str) -> bool:
+    """Queue steering text on every running child in one async unit."""
+    if not text or not text.strip():
+        return False
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if not record or record.get("status") != "running":
+            return False
+        steer_fn = record.get("steer_fn")
+    if not callable(steer_fn):
+        return False
+    try:
+        return bool(steer_fn(text.strip()))
+    except Exception as exc:
+        logger.debug("steer_async_delegation(%s) failed: %s", delegation_id, exc)
+        return False
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
