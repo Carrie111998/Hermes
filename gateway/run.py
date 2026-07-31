@@ -5622,6 +5622,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_task: Optional[asyncio.Task] = None
         self._executor_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        # Lock release after a hygiene timeout must not queue behind the
+        # potentially hung hygiene workers occupying the loop's default pool.
+        self._hygiene_lock_release_executor: Optional[
+            concurrent.futures.ThreadPoolExecutor
+        ] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
@@ -16216,6 +16221,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # successful compaction as a timeout.
                                             _compressed, _ = await _hyg_future
                                         else:
+                                            # Cancellation won before mutation. Release only
+                                            # this worker's holder-qualified compression lock
+                                            # off-loop before the live agent starts; the
+                                            # synchronous summary call remains alive and owns
+                                            # its clients until deferred cleanup below.
+                                            await loop.run_in_executor(
+                                                self._get_hygiene_lock_release_executor(),
+                                                _hyg_commit_fence.release_cancelled_compression_lock,
+                                            )
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
                                                 _hyg_agent,
@@ -20304,8 +20318,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._executor = executor
             return executor
 
+    def _get_hygiene_lock_release_executor(
+        self,
+    ) -> concurrent.futures.ThreadPoolExecutor:
+        """Return reserved capacity for timed-out hygiene lock releases.
+
+        Hygiene compression itself runs in the loop's default executor and may
+        remain blocked in a synchronous provider call after cancellation. Its
+        holder-qualified database release must therefore use an independent
+        pool or it can starve behind the workers whose locks it must release.
+        """
+        lock = getattr(self, "_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._executor_lock = lock
+
+        with lock:
+            if getattr(self, "_executor_closing", False):
+                raise RuntimeError("Gateway is shutting down; executor unavailable")
+            executor = getattr(self, "_hygiene_lock_release_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="hermes-hygiene-lock-release",
+                )
+                self._hygiene_lock_release_executor = executor
+            return executor
+
     def _shutdown_executor(self) -> None:
-        """Stop the gateway-owned executor without touching the loop default."""
+        """Stop gateway-owned executors without touching the loop default."""
         lock = getattr(self, "_executor_lock", None)
         if lock is None:
             return
@@ -20313,15 +20354,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with lock:
             self._executor_closing = True
             executor = getattr(self, "_executor", None)
+            release_executor = getattr(
+                self, "_hygiene_lock_release_executor", None
+            )
             self._executor = None
+            self._hygiene_lock_release_executor = None
 
-        if executor is None:
-            return
-
-        try:
-            executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
-            executor.shutdown(wait=False)
+        for owned_executor in (executor, release_executor):
+            if owned_executor is None:
+                continue
+            try:
+                owned_executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                owned_executor.shutdown(wait=False)
 
     def _decide_image_input_mode(
         self,

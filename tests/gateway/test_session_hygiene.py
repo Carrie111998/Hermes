@@ -9,6 +9,7 @@ so CLI and messaging platforms behave identically.
 """
 
 import asyncio
+import concurrent.futures
 import importlib
 import sys
 import threading
@@ -416,67 +417,115 @@ async def test_session_hygiene_preserves_transcript_when_in_place_configured_but
 async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
     """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
 
-    The worker remains alive long enough to cross the old race window. The
-    timeout must fence its eventual commit, continue to the live agent, and
-    clean up the temporary agent only after the worker actually returns.
+    The worker pauses after its real durable acquire but before publishing the
+    release hook, then remains alive in the auxiliary call. Timeout cancellation
+    must wait for hook publication, release the old holder before continuing to
+    the live agent even when the default executor is saturated, fence the late
+    commit, and defer helper cleanup. Every barrier is unwound on assertion
+    failure so the RED run is deterministic and leaves no orphan future.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
 
+    from hermes_state import SessionDB
+    from run_agent import AIAgent as RealAIAgent
+
     worker_started = threading.Event()
+    worker_finished = threading.Event()
+    lock_acquired_before_hook = threading.Event()
+    allow_acquire_return = threading.Event()
+    cancel_attempted = threading.Event()
+    cancel_results = []
     release_worker = threading.Event()
     cleanup_done = threading.Event()
-    fake_db = MagicMock()
+    live_agent_started = threading.Event()
+    teardown_started = threading.Event()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "sess-timeout"
+    live_holder = "live-turn-holder"
+    db.create_session(session_id, source="telegram")
+    real_try_acquire = db.try_acquire_compression_lock
 
-    class SlowCompressAgent:
+    def _gated_try_acquire(lock_session_id, holder, ttl_seconds=300.0):
+        acquired = real_try_acquire(
+            lock_session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+        )
+        if holder != live_holder and acquired:
+            lock_acquired_before_hook.set()
+            assert allow_acquire_return.wait(timeout=10)
+        return acquired
+
+    db.try_acquire_compression_lock = _gated_try_acquire
+    archive_spy = MagicMock(wraps=db.archive_and_compact)
+    db.archive_and_compact = archive_spy
+    live_lock_attempts = []
+
+    class SlowCompressAgent(RealAIAgent):
         last_instance = None
 
         def __init__(self, **kwargs):
-            self.session_id = kwargs.get("session_id", "fake-session")
-            self._session_db = kwargs.get("session_db")
-            self._last_compaction_in_place = False
-            self.context_compressor = SimpleNamespace(
-                bind_session_state=MagicMock(),
-                _last_compress_aborted=False,
-                _last_aux_model_failure_model=None,
-            )
+            super().__init__(**kwargs)
+            compressor = MagicMock()
+
+            def _slow_summary(*_args, **_kwargs):
+                worker_started.set()
+                try:
+                    assert release_worker.wait(timeout=10)
+                    return [
+                        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                        {"role": "user", "content": "tail"},
+                    ]
+                finally:
+                    worker_finished.set()
+
+            compressor.compress.side_effect = _slow_summary
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor._last_aux_model_failure_model = None
+            compressor._last_aux_model_failure_error = None
+            compressor._last_compression_made_progress = True
+            compressor._last_summary_fallback_used = False
+            self.context_compressor = compressor
+            self._compression_feasibility_checked = True
+            self._cached_system_prompt = "sys"
             self.shutdown_memory_provider = MagicMock()
             self.close = MagicMock(side_effect=cleanup_done.set)
             type(self).last_instance = self
 
-        def _compress_context(
-            self, messages, *_args, commit_fence=None, **_kwargs
-        ):
-            worker_started.set()
-            assert release_worker.wait(timeout=2)
-            if commit_fence is not None and not commit_fence.begin_commit():
-                return (messages, None)
-            try:
-                self._session_db.archive_and_compact(
-                    self.session_id,
-                    [{"role": "assistant", "content": "too late"}],
-                )
-                self._last_compaction_in_place = True
-                return ([{"role": "assistant", "content": "too late"}], None)
-            finally:
-                if commit_fence is not None:
-                    commit_fence.finish_commit()
-
-    fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = SlowCompressAgent
-    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    run_agent_module = sys.modules["run_agent"]
+    monkeypatch.setattr(run_agent_module, "AIAgent", SlowCompressAgent)
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
         "compression:\n"
         "  enabled: true\n"
-        "  hygiene_timeout_seconds: 0.01\n"
+        "  hygiene_timeout_seconds: 0.1\n"
         "  hygiene_failure_cooldown_seconds: 120\n"
     )
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    from agent.conversation_compression import CompressionCommitFence
+
+    original_try_cancel = CompressionCommitFence.try_cancel_before_commit
+
+    def _tracked_try_cancel(fence):
+        result = original_try_cancel(fence)
+        cancel_results.append(result)
+        cancel_attempted.set()
+        return result
+
+    monkeypatch.setattr(
+        CompressionCommitFence,
+        "try_cancel_before_commit",
+        _tracked_try_cancel,
+    )
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -502,18 +551,38 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
-    runner._session_db = SimpleNamespace(_db=fake_db)
+    runner._session_db = SimpleNamespace(_db=db)
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "test/model",
+        {
+            "api_key": "test-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "skip_context_files": True,
+        },
+    )
+
+    async def _run_live_agent(**_kwargs):
+        assert lock_acquired_before_hook.is_set()
+        if not teardown_started.is_set():
+            assert not worker_finished.is_set(), (
+                "the hygiene worker finished before the live agent started; this "
+                "does not exercise early cancellation lock release"
+            )
+            live_agent_started.set()
+        live_lock_attempts.append(
+            db.try_acquire_compression_lock(session_id, live_holder)
+        )
+        return {
             "final_response": "ok",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
         }
-    )
+
+    runner._run_agent = AsyncMock(side_effect=_run_live_agent)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
@@ -533,32 +602,114 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
         message_id="1",
     )
 
-    started = time.monotonic()
-    result = await runner._handle_message(event)
-    elapsed = time.monotonic() - started
+    loop = asyncio.get_running_loop()
+    saturated_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="hygiene-saturation-test",
+    )
+    real_run_in_executor = loop.run_in_executor
 
-    assert result == "ok"
-    # Loose wall-clock bound per flake policy: this asserts the handler did
-    # NOT block on the hygiene-compression timeout path (which would take
-    # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
-    # busy CI shards twice on 2026-07-23.
-    assert elapsed < 2.0
-    assert worker_started.is_set()
-    assert runner._run_agent.await_count == 1
-    assert runner._hygiene_compression_failure_cooldowns["sess-timeout"] > time.time()
-    timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
-    assert len(timeout_warnings) == 1
-    fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_not_called()
+    def _route_default_executor(executor, func, *args):
+        return real_run_in_executor(
+            saturated_executor if executor is None else executor,
+            func,
+            *args,
+        )
 
-    release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+    monkeypatch.setattr(loop, "run_in_executor", _route_default_executor)
 
-    # The late worker observed cancellation at the commit fence, so it never
-    # mutated the live session after the new turn began. Cleanup still ran once
-    # it was safe to tear down the helper agent's clients/providers.
-    fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_called_once()
+    async def _wait_for_event(event, timeout):
+        deadline = loop.time() + timeout
+        while not event.is_set():
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.001)
+        return True
+
+    handler_task = None
+    try:
+        handler_task = asyncio.create_task(runner._handle_message(event))
+        assert await _wait_for_event(lock_acquired_before_hook, 15)
+        assert await _wait_for_event(cancel_attempted, 10)
+        assert cancel_results[0] is None
+        assert runner._run_agent.await_count == 0
+        allow_acquire_return.set()
+
+        assert await _wait_for_event(live_agent_started, 2), (
+            "holder-qualified release starved behind the blocked hygiene "
+            "worker in the saturated default executor"
+        )
+        assert await _wait_for_event(worker_started, 2)
+        assert not worker_finished.is_set()
+        assert runner._run_agent.await_count == 1
+        assert runner._hygiene_compression_failure_cooldowns["sess-timeout"] > time.time()
+        timeout_warnings = [
+            s for s in adapter.sent if "Context compression timed out" in s["content"]
+        ]
+        assert len(timeout_warnings) == 1
+        archive_spy.assert_not_called()
+        SlowCompressAgent.last_instance.close.assert_not_called()
+        assert live_lock_attempts == [True], (
+            "the timed-out hygiene worker still held the compression lock when "
+            "the live agent started"
+        )
+        assert db.get_compression_lock_holder(session_id) == live_holder
+
+        release_worker.set()
+        assert await _wait_for_event(cleanup_done, 10)
+        assert worker_finished.is_set()
+        result = await asyncio.wait_for(handler_task, timeout=15)
+        assert result == "ok"
+
+        # The late worker observed cancellation at the commit fence, so it never
+        # mutated the live session after the new turn began. Cleanup still ran once
+        # it was safe to tear down the helper agent's clients/providers. Its
+        # idempotent holder-qualified cleanup must not release the live turn's lock.
+        archive_spy.assert_not_called()
+        SlowCompressAgent.last_instance.close.assert_called_once()
+        assert db.get_compression_lock_holder(session_id) == live_holder
+    finally:
+        teardown_started.set()
+        allow_acquire_return.set()
+        release_worker.set()
+        if handler_task is not None:
+            if not handler_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(handler_task), timeout=15)
+                except Exception:
+                    handler_task.cancel()
+            try:
+                await handler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        GatewayRunner._shutdown_executor(runner)
+        saturated_executor.shutdown(wait=True, cancel_futures=True)
+        if db.get_compression_lock_holder(session_id) == live_holder:
+            db.release_compression_lock(session_id, live_holder)
+        db.close()
+
+
+def test_compression_commit_fence_closes_lock_hook_publication_race():
+    """Timeout cancellation cannot win while lock cleanup is unpublished."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    fence = CompressionCommitFence()
+    released = threading.Event()
+
+    assert fence.begin_lock_setup() is True
+    assert fence.try_cancel_before_commit() is None
+    assert fence.register_cancelled_lock_release(released.set) is False
+    fence.finish_lock_setup()
+
+    assert fence.try_cancel_before_commit() is True
+    fence.release_cancelled_compression_lock()
+    assert released.is_set()
+
+    # If cancellation wins before setup starts, the worker is fenced from
+    # acquiring a durable lock and therefore needs no late release hook.
+    early_cancel = CompressionCommitFence()
+    assert early_cancel.try_cancel_before_commit() is True
+    assert early_cancel.begin_lock_setup() is False
 
 
 @pytest.mark.asyncio

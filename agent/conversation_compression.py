@@ -40,7 +40,7 @@ import uuid
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -221,6 +221,9 @@ class CompressionCommitFence:
         self._lock = threading.Lock()
         self._cancelled = False
         self._commit_started = False
+        self._lock_release_guard = threading.Lock()
+        self._cancelled_lock_release: Optional[Callable[[], None]] = None
+        self._cancelled_lock_release_requested = False
         # Forward-progress telemetry: the compression worker touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -282,6 +285,58 @@ class CompressionCommitFence:
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
         self._lock.release()
+
+    def begin_lock_setup(self) -> bool:
+        """Fence durable-lock acquisition and release-hook publication.
+
+        The caller keeps the fence until it has either published the exact
+        holder-qualified release hook or established that no lock was
+        acquired. A timeout cannot therefore win in the gap between acquiring
+        the durable lock and making its cancellation cleanup callable.
+        """
+        self._lock.acquire()
+        if self._cancelled:
+            self._lock.release()
+            return False
+        return True
+
+    def finish_lock_setup(self) -> None:
+        """Leave a lock setup boundary entered by :meth:`begin_lock_setup`."""
+        self._lock.release()
+
+    def register_cancelled_lock_release(
+        self, release: Callable[[], None]
+    ) -> bool:
+        """Publish the timed-out worker's holder-qualified lock release.
+
+        Returns whether cancellation cleanup was requested before publication.
+        In that race, the release runs synchronously before this method returns.
+        """
+        with self._lock_release_guard:
+            self._cancelled_lock_release = release
+            requested = self._cancelled_lock_release_requested
+        if requested:
+            release()
+        return requested
+
+    def clear_cancelled_lock_release(self, release: Callable[[], None]) -> None:
+        """Forget ``release`` after the worker's normal cleanup finishes."""
+        with self._lock_release_guard:
+            if self._cancelled_lock_release is release:
+                self._cancelled_lock_release = None
+
+    def release_cancelled_compression_lock(self) -> None:
+        """Release the cancelled worker's lock without finalizing its clients.
+
+        Callers invoke this only after :meth:`try_cancel_before_commit` returns
+        ``True``. A request that races ahead of lock-hook publication is retained
+        and fulfilled synchronously when the worker publishes the hook.
+        """
+        with self._lock_release_guard:
+            self._cancelled_lock_release_requested = True
+            release = self._cancelled_lock_release
+        if release is not None:
+            release()
 
 
 def _lock_api_is_absent_on_session_db(lock_db: Any) -> bool:
@@ -1505,6 +1560,15 @@ def compress_context(
         _lock_ttl = 300.0
     _lock_refresh_interval = getattr(agent, "_compression_lock_refresh_interval", None)
     _lock_refresher: Optional[_CompressionLockLeaseRefresher] = None
+    _lock_setup_entered = False
+
+    def _finish_lock_setup() -> None:
+        nonlocal _lock_setup_entered
+        if not _lock_setup_entered or commit_fence is None:
+            return
+        _lock_setup_entered = False
+        commit_fence.finish_lock_setup()
+
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
         if _lock_lookup_error is not None:
@@ -1533,6 +1597,27 @@ def compress_context(
                 )
             _lock_acquired = True  # acquired-but-unlocked compatibility path
         else:
+            if commit_fence is not None:
+                _lock_setup_entered = commit_fence.begin_lock_setup()
+                if not _lock_setup_entered:
+                    logger.info(
+                        "Compression commit cancelled before lock acquisition "
+                        "(session=%s).",
+                        agent.session_id or "none",
+                    )
+                    agent._last_compaction_in_place = False
+                    _existing_sp = getattr(agent, "_cached_system_prompt", None)
+                    if not _existing_sp:
+                        _existing_sp = agent._build_system_prompt(system_message)
+                    _emit_compression_attempt_telemetry(
+                        agent,
+                        started_at=_attempt_started_at,
+                        commit_status="aborted",
+                        split_status="aborted",
+                        failure_class="commit_fence_cancelled",
+                    )
+                    _complete_compaction_lifecycle()
+                    return messages, _existing_sp
             try:
                 _lock_acquired = _try_acquire_lock(
                     _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
@@ -1560,6 +1645,7 @@ def compress_context(
                 )
                 _lock_acquired = False
         if not _lock_acquired:
+            _finish_lock_setup()
             try:
                 existing = _lock_db.get_compression_lock_holder(_lock_sid)
             except Exception:
@@ -1604,29 +1690,74 @@ def compress_context(
             _complete_compaction_lifecycle()
             return messages, _existing_sp
     _lock_released = False
+    _lock_release_guard = threading.Lock()
+
+    def _release_lock_holder_only() -> None:
+        """Stop this holder's refresher and release only its durable lock."""
+        nonlocal _lock_released
+        with _lock_release_guard:
+            if _lock_released:
+                return
+            _lock_released = True
+            if getattr(agent, "_active_compression_lock_holder", None) == _lock_holder:
+                agent._active_compression_lock_holder = None
+            if _lock_refresher is not None:
+                try:
+                    _lock_refresher.stop()
+                except Exception as _stop_err:
+                    logger.debug("compression lock refresher stop failed: %s", _stop_err)
+            if _lock_db is not None and _lock_sid and _lock_holder:
+                try:
+                    _lock_db.release_compression_lock(_lock_sid, _lock_holder)
+                except Exception as _rel_err:
+                    logger.debug("compression lock release failed: %s", _rel_err)
 
     def _release_lock() -> None:
-        """Release the lock keyed on the OLD session_id (before rotation)."""
-        nonlocal _lock_released
-        _complete_compaction_lifecycle()
-        if _lock_released:
-            return
-        _lock_released = True
-        if getattr(agent, "_active_compression_lock_holder", None) == _lock_holder:
-            agent._active_compression_lock_holder = None
-        if _lock_refresher is not None:
+        """Finish lifecycle cleanup and release the OLD session lock once."""
+        try:
+            _complete_compaction_lifecycle()
+        finally:
             try:
-                _lock_refresher.stop()
-            except Exception as _stop_err:
-                logger.debug("compression lock refresher stop failed: %s", _stop_err)
-        if _lock_db is not None and _lock_sid and _lock_holder:
-            try:
-                _lock_db.release_compression_lock(_lock_sid, _lock_holder)
-            except Exception as _rel_err:
-                logger.debug("compression lock release failed: %s", _rel_err)
+                _release_lock_holder_only()
+            finally:
+                try:
+                    if commit_fence is not None:
+                        commit_fence.clear_cancelled_lock_release(
+                            _release_lock_holder_only
+                        )
+                finally:
+                    _finish_lock_setup()
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
+        if (
+            commit_fence is not None
+            and commit_fence.register_cancelled_lock_release(
+                _release_lock_holder_only
+            )
+        ):
+            logger.info(
+                "Compression commit cancelled before summary dispatch "
+                "(session=%s).",
+                agent.session_id or "none",
+            )
+            agent._last_compaction_in_place = False
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="commit_fence_cancelled",
+            )
+            _release_lock()
+            return messages, _existing_sp
+
+    # Publish the holder-qualified release hook before a timeout can win the
+    # fence. If no durable lock was acquired there is no hook to publish.
+    _finish_lock_setup()
 
     # A delayed contender can acquire the parent lock after the winning path
     # has released it and completed rotation. The lock serializes work but does
@@ -1693,14 +1824,21 @@ def compress_context(
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     try:
         if _lock_holder is not None:
-            _lock_refresher = _CompressionLockLeaseRefresher(
+            _candidate_refresher = _CompressionLockLeaseRefresher(
                 _lock_db,
                 _lock_sid,
                 _lock_holder,
                 _lock_ttl,
                 _lock_refresh_interval,
             )
-            _lock_refresher.start()
+            # Cancellation may release the holder after hook publication but
+            # before this refresher starts. Serialize that check/start with the
+            # idempotent release path so a refresher is never started for an
+            # already-released lock.
+            with _lock_release_guard:
+                if not _lock_released:
+                    _lock_refresher = _candidate_refresher
+                    _lock_refresher.start()
 
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
