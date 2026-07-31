@@ -22,6 +22,7 @@ import { ListRow, SectionHeading, SettingsContent } from './primitives'
 import { UninstallSection } from './uninstall-section'
 
 const RELEASE_NOTES_URL = 'https://github.com/NousResearch/hermes-agent/releases'
+const HERMES_REPO_URL = 'https://github.com/NousResearch/hermes-agent'
 
 function relativeTime(ms: number | undefined, a: Translations['settings']['about']) {
   if (!ms) {
@@ -175,6 +176,23 @@ export function AboutSettings() {
           hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
           title={a.automaticUpdates}
         />
+
+        <div className="mt-6 rounded-xl border border-border/70 bg-muted/20 px-4 py-3 text-center text-xs text-muted-foreground">
+          <p>{a.attribution}</p>
+          <a
+            className="mt-1 inline-flex items-center gap-1 text-primary hover:underline"
+            href={HERMES_REPO_URL}
+            onClick={event => {
+              event.preventDefault()
+              void window.hermesDesktop?.openExternal?.(HERMES_REPO_URL)
+            }}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {a.attributionLink}
+            <ExternalLink className="size-3" />
+          </a>
+        </div>
 
         <UninstallSection />
       </div>

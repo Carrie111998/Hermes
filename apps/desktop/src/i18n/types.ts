@@ -436,6 +436,8 @@ export interface Translations {
       automaticUpdates: string
       automaticUpdatesDesc: string
       branchCommit: (branch: string, commit: string) => string
+      attribution: string
+      attributionLink: string
       never: string
       justNow: string
       minAgo: (count: number) => string

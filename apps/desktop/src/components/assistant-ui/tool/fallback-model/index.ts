@@ -907,7 +907,7 @@ function cronjobSubtitle(argsRecord: Record<string, unknown>, resultRecord: Reco
   const name = firstStringField(resultRecord, ['name']) || firstStringField(argsRecord, ['name', 'job_id'])
   const label = capitalize(action)
 
-  return name ? `${label} ${name}` : `Cron ${action}`
+  return name ? `${label} ${name}` : `BPA ${action}`
 }
 
 function cronjobDetail(argsRecord: Record<string, unknown>, resultRecord: Record<string, unknown>): string {
