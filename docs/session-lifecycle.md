@@ -278,9 +278,14 @@ def is_shared_multi_user_session(source, *, group_sessions_per_user, thread_sess
     return not isolate_user
 ```
 
-This tracks `build_session_key()` exactly (`gateway/session.py`): the group
-setting is the base, and a thread only stays per-user isolated when both
-`group_sessions_per_user` and `thread_sessions_per_user` are enabled.
+This tracks `build_session_key()`'s group/thread isolation **precedence** — not
+its full key string (`gateway/session.py`): the group setting is the base, and a
+thread only stays per-user isolated when both `group_sessions_per_user` and
+`thread_sessions_per_user` are enabled. The helper deliberately stays
+configuration-scoped: when no `user_id_alt`/`user_id` is present,
+`build_session_key()` omits the per-user identifier it would otherwise append
+and the key is shared by construction, so the helper reports that configuration
+decision rather than reconstructing the literal key.
 
 ### Summary
 
