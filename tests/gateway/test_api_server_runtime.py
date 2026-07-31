@@ -21,6 +21,7 @@ from gateway.api_server_runtime import (
     _pin_run_model,
     _resume_runtime_history,
     _runtime_attachment_parts,
+    _runtime_allowed_skill_digests,
     _runtime_image_paths,
     _runtime_allowed_skill_names,
     _runtime_video_paths,
@@ -30,6 +31,19 @@ from gateway.api_server_runtime import (
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_emits_private_heartbeat_while_agent_is_quiet(monkeypatch):
+    monkeypatch.setattr(runtime_module, "_RUNTIME_STREAM_HEARTBEAT_SECONDS", 0.01)
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    heartbeat = await runtime_module._next_runtime_stream_event(queue)
+    assert heartbeat == {"type": "heartbeat", "payload": {}}
+
+    event = {"type": "text_delta", "payload": {"delta": "ready"}}
+    queue.put_nowait(event)
+    assert await runtime_module._next_runtime_stream_event(queue) is event
 
 
 class _RuntimeAdapter(APIServerRuntimeMixin):
@@ -246,6 +260,36 @@ def test_runtime_attachment_parts_require_private_image_directory():
             "mime_type": "image/png",
             "data": base64.b64encode(b"image-bytes").decode(),
         }])
+
+
+def test_runtime_attachment_parts_materialize_generated_output_reference(tmp_path):
+    image = base64.b64encode(b"generated-pixels").decode()
+    parts = _runtime_attachment_parts([{
+        "role": "generated_output",
+        "reference_id": "output_board",
+        "filename": "output_board.png",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "data": image,
+    }], image_dir=tmp_path)
+    image_path = _runtime_image_paths(parts)[0]
+    assert image_path.name == hashlib.sha256(b"output_board").hexdigest()[:24] + ".png"
+    assert image_path.read_bytes() == b"generated-pixels"
+    assert "reference_id=output_board" in parts[0]["text"]
+    assert "asset_id=" not in parts[0]["text"]
+
+
+def test_runtime_attachment_parts_reject_mismatched_asset_and_reference_ids(tmp_path):
+    with pytest.raises(ValueError, match="attachment identity"):
+        _runtime_attachment_parts([{
+            "role": "generated_output",
+            "reference_id": "output_board",
+            "asset_id": "asset_other",
+            "filename": "output_board.png",
+            "media_type": "image",
+            "mime_type": "image/png",
+            "data": base64.b64encode(b"generated-pixels").decode(),
+        }], image_dir=tmp_path)
 
 
 
@@ -581,6 +625,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         digest = "sha256:" + hashlib.sha256(
             f"{version}\n{mode}\n{stable}\n{turn}".encode("utf-8"),
         ).hexdigest()
+        package_digest = "sha256:" + hashlib.sha256(b"complete skill bundle").hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_test",
             "runtime": "hermes",
@@ -598,8 +643,11 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "resolution_id": "resolution-test",
                 "manifest_digest": "sha256:test",
                 "skills": [
-                    {"runtime_alias": "media-qa"},
-                    {"runtime_alias": "planning-only"},
+                    {"runtime_alias": "media-qa", "content_digest": package_digest},
+                    {
+                        "runtime_alias": "planning-only",
+                        "content_digest": "sha256:" + hashlib.sha256(b"planning bundle").hexdigest(),
+                    },
                 ],
             },
             "tools": [{
@@ -664,9 +712,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "name": "skill_view",
                 "status": "completed",
                 "arguments": {
-                    "digest": "sha256:" + hashlib.sha256(
-                        b"workflow instructions",
-                    ).hexdigest(),
+                    "digest": package_digest,
                 },
             },
         }
@@ -677,9 +723,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
         assert tool_request["type"] == "tool_request"
         expected_proof = {
             "name": "media-qa",
-            "digest": "sha256:" + hashlib.sha256(
-                b"workflow instructions",
-            ).hexdigest(),
+            "digest": package_digest,
         }
         assert tool_request["payload"]["skill"] == expected_proof
         assert tool_request["payload"]["skills"] == [expected_proof]
@@ -700,14 +744,16 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
 
 
 def test_runtime_skill_manifest_is_visibility_source_of_truth():
+    tool_digest = "sha256:" + "a" * 64
+    planning_digest = "sha256:" + "b" * 64
     definitions = [{
         "name": "media.generate_image",
         "allowed_skills": ["tool-guided"],
     }]
     manifest = {
         "skills": [
-            {"runtime_alias": "tool-guided"},
-            {"runtime_alias": "planning-only"},
+            {"runtime_alias": "tool-guided", "content_digest": tool_digest},
+            {"runtime_alias": "planning-only", "content_digest": planning_digest},
         ],
     }
 
@@ -715,19 +761,27 @@ def test_runtime_skill_manifest_is_visibility_source_of_truth():
         "tool-guided",
         "planning-only",
     }
+    assert _runtime_allowed_skill_digests(definitions, manifest) == {
+        "tool-guided": tool_digest,
+        "planning-only": planning_digest,
+    }
     with pytest.raises(
         ValueError,
         match="tool skill scope unavailable in skill_manifest: tool-guided",
     ):
         _runtime_allowed_skill_names(definitions, {
-            "skills": [{"runtime_alias": "planning-only"}],
+            "skills": [{"runtime_alias": "planning-only", "content_digest": planning_digest}],
         })
     with pytest.raises(ValueError, match="duplicate runtime_alias"):
         _runtime_allowed_skill_names([], {
             "skills": [
-                {"runtime_alias": "duplicate"},
-                {"runtime_alias": "duplicate"},
+                {"runtime_alias": "duplicate", "content_digest": tool_digest},
+                {"runtime_alias": "duplicate", "content_digest": planning_digest},
             ],
+        })
+    with pytest.raises(ValueError, match="content_digest is invalid for tool-guided"):
+        _runtime_allowed_skill_digests(definitions, {
+            "skills": [{"runtime_alias": "tool-guided"}],
         })
 
 

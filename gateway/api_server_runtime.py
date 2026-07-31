@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -62,6 +63,7 @@ _TERMINAL_PLATFORM_ERROR_CODES = {
 # default executor. Runs use a dedicated bounded pool gated before streaming.
 _RUNTIME_MAX_CONCURRENT_ENV = "HERMES_RUNTIME_MAX_CONCURRENT"
 _RUNTIME_MAX_CONCURRENT_DEFAULT = 8
+_RUNTIME_STREAM_HEARTBEAT_SECONDS = 15.0
 # Safety cap for pending.ready.wait when the run carries no explicit deadline;
 # prevents a lost tool result from pinning an executor thread forever.
 _UNBOUNDED_TOOL_WAIT_CAP_SECONDS = 3600.0
@@ -73,6 +75,19 @@ _RUNTIME_EXECUTOR: ThreadPoolExecutor | None = None
 _ACTIVE_RUN_COUNT = 0
 _SWEEPERS: dict[int, tuple[asyncio.AbstractEventLoop, "asyncio.Task[None]"]] = {}
 _NO_SKILL_MANIFEST = object()
+
+
+async def _next_runtime_stream_event(
+    queue: "asyncio.Queue[dict[str, Any] | None]",
+) -> dict[str, Any] | None:
+    """Return the next bridge event or a transport-only keepalive frame."""
+    try:
+        return await asyncio.wait_for(
+            queue.get(),
+            timeout=_RUNTIME_STREAM_HEARTBEAT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return {"type": "heartbeat", "payload": {}}
 
 
 def _runtime_max_concurrent() -> int:
@@ -334,14 +349,22 @@ def _runtime_allowed_skill_names(
     skill_manifest: Any = _NO_SKILL_MANIFEST,
 ) -> set[str]:
     """Resolve the immutable Run Skill scope, with legacy Tool fallback."""
+    return set(_runtime_allowed_skill_digests(definitions, skill_manifest))
+
+
+def _runtime_allowed_skill_digests(
+    definitions: list[dict[str, Any]],
+    skill_manifest: Any = _NO_SKILL_MANIFEST,
+) -> dict[str, str]:
+    """Resolve Runtime aliases to the immutable package digests they prove."""
     if skill_manifest is _NO_SKILL_MANIFEST:
-        return _allowed_skill_names(definitions)
+        return {name: "" for name in _allowed_skill_names(definitions)}
     if not isinstance(skill_manifest, dict):
         raise ValueError("skill_manifest must be an object")
     skills = skill_manifest.get("skills")
     if not isinstance(skills, list):
         raise ValueError("skill_manifest.skills must be an array")
-    names: set[str] = set()
+    digests: dict[str, str] = {}
     for skill in skills:
         if not isinstance(skill, dict):
             raise ValueError("skill_manifest.skills must contain only objects")
@@ -353,16 +376,22 @@ def _runtime_allowed_skill_names(
         ):
             raise ValueError("skill_manifest runtime_alias is invalid")
         name = name.strip()
-        if name in names:
+        if name in digests:
             raise ValueError("skill_manifest contains duplicate runtime_alias")
-        names.add(name)
-    outside_manifest = _allowed_skill_names(definitions) - names
+        digest = skill.get("content_digest")
+        if (
+            not isinstance(digest, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+        ):
+            raise ValueError(f"skill_manifest content_digest is invalid for {name}")
+        digests[name] = digest
+    outside_manifest = _allowed_skill_names(definitions) - set(digests)
     if outside_manifest:
         raise ValueError(
             "tool skill scope unavailable in skill_manifest: "
             + ", ".join(sorted(outside_manifest))
         )
-    return names
+    return digests
 
 
 def _discover_skill_metadata() -> list[dict[str, Any]]:
@@ -432,13 +461,22 @@ def _runtime_attachment_parts(
         if not isinstance(item, dict):
             raise ValueError("attachments must contain only objects")
         asset_id = str(item.get("asset_id") or "").strip()
+        reference_id = str(item.get("reference_id") or asset_id).strip()
         role = str(item.get("role") or "").strip()
         filename = str(item.get("filename") or "").strip()
         media_type = str(item.get("media_type") or "").strip()
         mime_type = str(item.get("mime_type") or "").strip().lower()
         encoded = item.get("data")
-        if not asset_id or not role or not filename or not isinstance(encoded, str):
+        if (
+            not reference_id
+            or (asset_id and item.get("reference_id") and reference_id != asset_id)
+            or not role
+            or not filename
+            or not isinstance(encoded, str)
+        ):
             raise ValueError("attachment identity, role, filename, and data are required")
+
+        identity_label = "asset_id" if asset_id else "reference_id"
         try:
             data = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error) as exc:
@@ -454,7 +492,7 @@ def _runtime_attachment_parts(
             directory = Path(image_dir).resolve()
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             image_path = directory / (
-                hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:24]
+                hashlib.sha256(reference_id.encode("utf-8")).hexdigest()[:24]
                 + _RUNTIME_IMAGE_SUFFIXES[mime_type]
             )
             image_path.write_bytes(data)
@@ -462,7 +500,8 @@ def _runtime_attachment_parts(
             parts.append({
                 "type": "text",
                 "text": (
-                    f"[Attached image: {filename}; role={role}; asset_id={asset_id}. "
+                    f"[Attached image: {filename}; role={role}; "
+                    f"{identity_label}={reference_id}. "
                     "When pixel analysis is required, call image_analyze with "
                     f"image_url={image_path}. Keep this private runtime path out "
                     "of the final answer.]"
@@ -482,7 +521,7 @@ def _runtime_attachment_parts(
             directory = Path(video_dir).resolve()
             directory.mkdir(mode=0o700, parents=True, exist_ok=True)
             video_path = directory / (
-                hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:24]
+                hashlib.sha256(reference_id.encode("utf-8")).hexdigest()[:24]
                 + _RUNTIME_VIDEO_SUFFIXES[mime_type]
             )
             video_path.write_bytes(data)
@@ -490,7 +529,8 @@ def _runtime_attachment_parts(
             parts.append({
                 "type": "text",
                 "text": (
-                    f"[Attached video: {filename}; role={role}; asset_id={asset_id}. "
+                    f"[Attached video: {filename}; role={role}; "
+                    f"{identity_label}={reference_id}. "
                     "Analyze the complete source video with video_analyze using "
                     f"video_url={video_path} and include_transcript=true. "
                     "Representative frames, when present, "
@@ -774,6 +814,7 @@ class RuntimeBridgeSession:
         deadline_ms: int,
         agent_session_id: str,
         allowed_skill_names: set[str] | None = None,
+        allowed_skill_digests: dict[str, str] | None = None,
         allowed_image_paths: set[str] | None = None,
         allowed_video_paths: set[str] | None = None,
     ) -> None:
@@ -788,6 +829,7 @@ class RuntimeBridgeSession:
             if allowed_skill_names is not None
             else _allowed_skill_names(definitions)
         )
+        self.allowed_skill_digests = dict(allowed_skill_digests or {})
         self.allowed_image_paths = {
             str(Path(path).resolve())
             for path in (allowed_image_paths or set())
@@ -847,11 +889,18 @@ class RuntimeBridgeSession:
         name = str(args.get("name") or args.get("skill") or "").strip()
         if not self.is_skill_allowed(name):
             return
-        digest = _skill_body_digest(args, result)
+        digest = self.loaded_skill_digest(name, args, result)
         if not digest:
             return
         with self.lock:
             self.loaded_skills[name] = digest
+
+    def loaded_skill_digest(self, name: str, args: Any, result: Any) -> str:
+        """Return the bound package digest after a successful root body load."""
+        body_digest = _skill_body_digest(args, result)
+        if not body_digest or not self.is_skill_allowed(name):
+            return ""
+        return self.allowed_skill_digests.get(name) or body_digest
 
     def start_local_activity(self, call_id: str, name: str, args: Any) -> None:
         if not call_id or name not in _LOCAL_ACTIVITY_TOOLS:
@@ -886,7 +935,12 @@ class RuntimeBridgeSession:
                 "retryable": False,
             }
         elif name == "skill_view":
-            digest = _skill_body_digest(args, result)
+            skill_name = (
+                str(args.get("name") or args.get("skill") or "").strip()
+                if isinstance(args, dict)
+                else ""
+            )
+            digest = self.loaded_skill_digest(skill_name, args, result)
             if digest:
                 payload["arguments"] = {"digest": digest}
         self.emit("activity_completed", payload)
@@ -1167,10 +1221,11 @@ class APIServerRuntimeMixin:
                 if "skill_manifest" in body
                 else _NO_SKILL_MANIFEST
             )
-            allowed_skill_names = _runtime_allowed_skill_names(
+            allowed_skill_digests = _runtime_allowed_skill_digests(
                 definitions,
                 skill_manifest,
             )
+            allowed_skill_names = set(allowed_skill_digests)
             instructions = (
                 _replacement_system_prompt(system_context)
                 + _allowed_skills_prompt(allowed_skill_names)
@@ -1231,7 +1286,11 @@ class APIServerRuntimeMixin:
             if media_temp_dir is not None:
                 media_temp_dir.cleanup()
             return web.json_response({"error": {"code": "invalid_param", "message": str(exc)}}, status=422)
-        response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
+        response = web.StreamResponse(status=200, headers={
+            "Content-Type": "application/x-ndjson",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
         await response.prepare(request)
         queue: "asyncio.Queue[dict[str, Any] | None]" = asyncio.Queue()
         context = body.get("context") if isinstance(body.get("context"), dict) else {}
@@ -1244,6 +1303,7 @@ class APIServerRuntimeMixin:
             int(body.get("deadline_ms") or 0),
             agent_session_id,
             allowed_skill_names=allowed_skill_names,
+            allowed_skill_digests=allowed_skill_digests,
             allowed_image_paths={str(path) for path in runtime_image_paths},
             allowed_video_paths={str(path) for path in runtime_video_paths},
         )
@@ -1315,7 +1375,7 @@ class APIServerRuntimeMixin:
 
         async def pump() -> None:
             while True:
-                event = await queue.get()
+                event = await _next_runtime_stream_event(queue)
                 if event is None:
                     return
                 try:
