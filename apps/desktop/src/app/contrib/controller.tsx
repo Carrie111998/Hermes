@@ -68,6 +68,7 @@ import {
   watchSessionTiles,
   WorkspaceTabMenu
 } from '../chat/session-tile'
+import { GROUP_CONTRIBUTIONS } from '../groups/contribution'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
@@ -134,6 +135,7 @@ const workspaceTabDrag = (event: ReactPointerEvent<HTMLElement>, onTap: () => vo
 }
 
 registry.registerMany([
+  ...GROUP_CONTRIBUTIONS,
   {
     id: 'sessions',
     area: 'panes',

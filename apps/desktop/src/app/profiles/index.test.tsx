@@ -52,6 +52,7 @@ vi.mock('@/store/profile', () => ({
   $activeGatewayProfile: activeGateway,
   $profileColors,
   normalizeProfileKey: (name: null | string | undefined) => (name ?? '').trim() || 'default',
+  profileDisplayName: (profile: ProfileInfo) => profile.display_name?.trim() || profile.name,
   refreshProfiles: vi.fn(async () => [] as ProfileInfo[]),
   selectProfile: vi.fn(),
   setActiveProfile: vi.fn()

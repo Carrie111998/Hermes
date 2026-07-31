@@ -9,7 +9,7 @@
 
 import { useStore } from '@nanostores/react'
 import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
-import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useParams } from 'react-router-dom'
 
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
@@ -33,7 +33,6 @@ import type { SidebarActions, WiringActions } from './types'
 // full-page views the workspace route table mounts live here; overlay views
 // (agents/settings/…) are the controller's and stay in wiring.tsx.
 const ArtifactsView = lazy(async () => ({ default: (await import('../artifacts')).ArtifactsView }))
-const GroupsView = lazy(async () => ({ default: (await import('../groups')).GroupsView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
 const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
 
@@ -41,18 +40,6 @@ export function LegacySessionRedirect() {
   const { sessionId } = useParams()
 
   return <Navigate replace to={sessionId ? sessionRoute(sessionId) : NEW_CHAT_ROUTE} />
-}
-
-function GroupRoomRoute({
-  navigate,
-  request
-}: {
-  navigate: (path: string) => void
-  request: WiringActions['requestGateway']
-}) {
-  const { roomId } = useParams<{ roomId: string }>()
-
-  return <GroupsView navigate={navigate} request={request} roomId={roomId ?? null} />
 }
 
 export const SidebarSurface = memo(function SidebarSurface({
@@ -128,7 +115,6 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 }) {
   const activeGatewayProfile = useStore($activeGatewayProfile)
   const gatewayState = useStore($gatewayState)
-  const navigate = useNavigate()
   useContributions(ROUTES_AREA)
   const routeContributions = contributedRoutes()
 
@@ -180,14 +166,6 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={chatView} path=":sessionId" />
       <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
-      <Route
-        element={page(<GroupsView navigate={path => navigate(path)} request={actions.requestGateway} roomId={null} />)}
-        path="groups"
-      />
-      <Route
-        element={page(<GroupRoomRoute navigate={path => navigate(path)} request={actions.requestGateway} />)}
-        path="groups/:roomId"
-      />
       <Route element={page(<ArtifactsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="artifacts" />
       <Route element={null} path="agents" />
       <Route element={null} path="command-center" />

@@ -44,7 +44,6 @@ export type AppRouteId =
   | 'artifacts'
   | 'command-center'
   | 'cron'
-  | 'groups'
   | 'messaging'
   | 'new'
   | 'profiles'
@@ -67,7 +66,6 @@ export const APP_ROUTES = [
   { id: 'messaging', path: MESSAGING_ROUTE, view: 'messaging' },
   { id: 'webhooks', path: WEBHOOKS_ROUTE, view: 'webhooks' },
   { id: 'artifacts', path: ARTIFACTS_ROUTE, view: 'artifacts' },
-  { id: 'groups', path: GROUPS_ROUTE, view: 'groups' },
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },
   { id: 'profiles', path: PROFILES_ROUTE, view: 'profiles' },
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' },
@@ -87,7 +85,7 @@ export const ROUTES_AREA = 'routes'
 
 /** Payload of a `routes` contribution's `data`. */
 export interface RouteContribution {
-  /** Absolute path, e.g. `/kanban`. One segment; no params. */
+  /** Absolute path, e.g. `/kanban`; may end in one React Router segment param such as `/groups/:roomId`. */
   path: string
 }
 
@@ -104,7 +102,18 @@ export function contributedRoutes(): Array<{ key: string; path: string; title?: 
 }
 
 function isContributedPath(pathname: string): boolean {
-  return contributedRoutes().some(route => route.path === pathname)
+  return contributedRoutes().some(route => {
+    const parameterIndex = route.path.indexOf('/:')
+
+    if (parameterIndex !== -1 && parameterIndex === route.path.lastIndexOf('/')) {
+      const base = route.path.slice(0, parameterIndex)
+      const suffix = pathname.startsWith(`${base}/`) ? pathname.slice(base.length + 1) : ''
+
+      return Boolean(suffix && !suffix.includes('/'))
+    }
+
+    return route.path === pathname
+  })
 }
 
 // ── Contributed sidebar nav — the `sidebar.nav` registry area ────────────────
@@ -190,11 +199,13 @@ export function sessionRoute(sessionId: string): string {
 }
 
 export function groupRoomId(pathname: string): string | null {
-  if (!pathname.startsWith(`${GROUPS_ROUTE}/`)) {
+  const path = routePathname(pathname)
+
+  if (!path.startsWith(`${GROUPS_ROUTE}/`)) {
     return null
   }
 
-  const id = pathname.slice(GROUPS_ROUTE.length + 1)
+  const id = path.slice(GROUPS_ROUTE.length + 1)
 
   return id && !id.includes('/') ? decodeURIComponent(id) : null
 }

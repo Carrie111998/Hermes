@@ -101,7 +101,6 @@ import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/st
 import {
   type AppView,
   ARTIFACTS_ROUTE,
-  GROUPS_ROUTE,
   MESSAGING_ROUTE,
   SIDEBAR_NAV_AREA,
   type SidebarNavContribution,
@@ -157,19 +156,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     route: SKILLS_ROUTE,
     keybindActionId: 'nav.skills'
   },
-
   {
     id: 'messaging',
     label: '',
     icon: props => <Codicon name="comment" {...props} />,
     route: MESSAGING_ROUTE,
     keybindActionId: 'nav.messaging'
-  },
-  {
-    id: 'groups',
-    label: '',
-    icon: props => <Codicon name="organization" {...props} />,
-    route: GROUPS_ROUTE
   },
   {
     id: 'artifacts',
@@ -1141,10 +1133,9 @@ export function ChatSidebar({
                 const active =
                   (item.id === 'skills' && currentView === 'skills') ||
                   (item.id === 'messaging' && currentView === 'messaging') ||
-                  (item.id === 'groups' && currentView === 'groups') ||
                   (item.id === 'artifacts' && currentView === 'artifacts') ||
-                  // Contributed rows light up at their own route.
-                  (Boolean(item.route) && pathname === item.route)
+                  // Contributed rows light up at their route and its nested pages.
+                  (Boolean(item.route) && (pathname === item.route || pathname.startsWith(`${item.route}/`)))
 
                 const isNewSession = item.id === 'new-session'
 

@@ -7,6 +7,7 @@ describe('group routes', () => {
     expect(appViewForPath('/groups')).toBe('groups')
     expect(appViewForPath('/groups/room%201')).toBe('groups')
     expect(groupRoomId('/groups/room%201')).toBe('room 1')
+    expect(groupRoomId('/groups/room%201?tab=history')).toBe('room 1')
     expect(groupRoomRoute('room 1')).toBe('/groups/room%201')
   })
 })
