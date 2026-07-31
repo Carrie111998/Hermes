@@ -7407,6 +7407,14 @@ def test_sidebar_hydration_reservation_survives_ambiguity_and_never_resends(db) 
     )
     assert failed["state"] == SidebarHydrationState.RETRY.value
     assert failed["send_reserved_at"] == 126.0
+    assert store.sidebar_hydration_status(now=128.0)["health_counts"] == {
+        "pending": 0,
+        "leased": 0,
+        "retry": 0,
+        "committed": 0,
+        "ambiguous": 1,
+        "failed": 0,
+    }
 
     assert store.claim_sidebar_hydration_jobs(now=129.0, limit=1) == []
     reclaimed = store.claim_sidebar_hydration_jobs(now=143.0, limit=1)[0]
@@ -10270,6 +10278,39 @@ def test_sidebar_broker_heartbeat_recovers_malformed_ephemeral_state(db) -> None
     store.record_sidebar_broker_heartbeat(now=123.0)
 
     assert store.get_state("session-bridge:sidebar:broker-heartbeat") == {"at": 123.0}
+
+
+def test_sidebar_delivery_status_counts_ambiguity_attention_and_projectless_legacy(
+    db: SessionDB,
+) -> None:
+    store, candidate, failed, _reservation = _failed_bound_ambiguous_sidebar(
+        db,
+        native_id="status-ambiguous",
+        token="status-ambiguous-token",
+        thread_id="status-ambiguous-thread",
+    )
+    visible = _sidebar_candidate(db, native_id="status-projectless")
+    store.enqueue_sidebar_job(visible)
+    lease = store.claim_sidebar_jobs(now=200.0, limit=1)[0]
+    store.commit_sidebar_job(
+        lease_token=lease["lease_token"],
+        codex_thread_id="status-projectless-thread",
+        now=210.0,
+    )
+
+    status = store.sidebar_delivery_status(now=220.0)
+
+    assert status["counts"]["ambiguous"] == 1
+    assert status["counts"]["needs_attention"] == 1
+    assert status["counts"]["projectless_legacy_count"] == 1
+
+    _acknowledge_terminal_resolution(store, failed, now=230.0)
+    _seed_sidebar_codex_target(store, visible, "status-projectless-thread")
+
+    status = store.sidebar_delivery_status(now=240.0)
+    assert status["counts"]["ambiguous"] == 1
+    assert status["counts"]["needs_attention"] == 0
+    assert status["counts"]["projectless_legacy_count"] == 0
 
 
 def test_sidebar_lease_lookup_authenticates_active_and_completed_digest_minimally(

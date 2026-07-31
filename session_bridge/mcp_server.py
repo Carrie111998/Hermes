@@ -1597,8 +1597,20 @@ def _sidebar_status(value: object) -> dict[str, Any]:
             for provider in (Provider.CLAUDE.value, Provider.HERMES.value)
         },
         "counts": {
-            state.value: _nonnegative_status_int(state_counts.get(state.value), 0)
-            for state in SidebarJobState
+            **{
+                state.value: _nonnegative_status_int(
+                    state_counts.get(state.value), 0
+                )
+                for state in SidebarJobState
+            },
+            **{
+                field: _nonnegative_status_int(state_counts.get(field), 0)
+                for field in (
+                    "ambiguous",
+                    "needs_attention",
+                    "projectless_legacy_count",
+                )
+            },
         },
         "blocking_failed_count": blocking_failed_count,
         "terminally_resolved_failed_count": terminally_resolved_failed_count,
@@ -1706,12 +1718,42 @@ def _sidebar_placement_status(value: object) -> dict[str, Any] | None:
 def _hydration_status(value: object, *, enabled: bool) -> dict[str, Any]:
     source = _status_mapping(value)
     raw_counts = _status_mapping(source.get("counts"))
+    health_counts = _status_mapping(source.get("health_counts"))
     recent = source.get("recent_error_codes")
     return {
         "enabled": enabled is True,
         "counts": {
-            state.value: _nonnegative_status_int(raw_counts.get(state.value), 0)
-            for state in SidebarHydrationState
+            "pending": _nonnegative_status_int(
+                health_counts.get(
+                    "pending", raw_counts.get(SidebarHydrationState.PENDING.value)
+                ),
+                0,
+            ),
+            "leased": _nonnegative_status_int(
+                health_counts.get(
+                    "leased", raw_counts.get(SidebarHydrationState.LEASED.value)
+                ),
+                0,
+            ),
+            "retry": _nonnegative_status_int(
+                health_counts.get(
+                    "retry", raw_counts.get(SidebarHydrationState.RETRY.value)
+                ),
+                0,
+            ),
+            "committed": _nonnegative_status_int(
+                health_counts.get(
+                    "committed", raw_counts.get(SidebarHydrationState.VISIBLE.value)
+                ),
+                0,
+            ),
+            "ambiguous": _nonnegative_status_int(health_counts.get("ambiguous"), 0),
+            "failed": _nonnegative_status_int(
+                health_counts.get(
+                    "failed", raw_counts.get(SidebarHydrationState.FAILED.value)
+                ),
+                0,
+            ),
         },
         "oldest_pending_age_seconds": _finite_status_number(
             source.get("oldest_pending_age_seconds")

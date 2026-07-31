@@ -8190,10 +8190,60 @@ class SessionBridgeStore:
                     "placement_mismatch",
                 ),
             ).fetchone()
+            health_counts = conn.execute(
+                """SELECT
+                       SUM(CASE
+                               WHEN job.state = ? AND job.error_code = ?
+                               THEN 1 ELSE 0
+                           END) AS ambiguous,
+                       SUM(CASE
+                               WHEN job.state = ?
+                                AND COALESCE(
+                                    terminal.resolution_code,
+                                    precreate.resolution_code,
+                                    unbound.resolution_code
+                                ) IS NULL
+                               THEN 1 ELSE 0
+                           END) AS needs_attention,
+                       SUM(CASE
+                               WHEN job.state = ?
+                                AND job.codex_thread_id IS NOT NULL
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                      FROM external_sessions AS target_external
+                                      JOIN sessions AS target
+                                        ON target.id = target_external.session_id
+                                     WHERE target_external.provider = ?
+                                       AND target_external.native_id = job.codex_thread_id
+                                       AND target.cwd IS NOT NULL
+                                       AND trim(target.cwd) != ''
+                                )
+                               THEN 1 ELSE 0
+                           END) AS projectless_legacy_count
+                     FROM session_sidebar_jobs AS job
+                     LEFT JOIN session_sidebar_terminal_resolutions AS terminal
+                       ON terminal.job_id = job.id
+                     LEFT JOIN session_sidebar_precreate_resolutions AS precreate
+                       ON precreate.job_id = job.id
+                     LEFT JOIN session_sidebar_unbound_resolutions AS unbound
+                       ON unbound.job_id = job.id""",
+                (
+                    SidebarJobState.FAILED.value,
+                    "native_create_ambiguous",
+                    SidebarJobState.FAILED.value,
+                    SidebarJobState.VISIBLE.value,
+                    Provider.CODEX.value,
+                ),
+            ).fetchone()
 
         expired_leases = int(expired_row["job_count"])
         counts[SidebarJobState.LEASED.value] -= expired_leases
         counts[SidebarJobState.RETRY.value] += expired_leases
+        counts["ambiguous"] = int(health_counts["ambiguous"] or 0)
+        counts["needs_attention"] = int(health_counts["needs_attention"] or 0)
+        counts["projectless_legacy_count"] = int(
+            health_counts["projectless_legacy_count"] or 0
+        )
 
         eligible_by_provider = {
             Provider.CLAUDE.value: 0,
@@ -9172,6 +9222,32 @@ class SessionBridgeStore:
                    FROM session_sidebar_hydration_jobs GROUP BY state"""
             ).fetchall():
                 counts[row["state"]] = int(row["count"])
+            health_counts_row = conn.execute(
+                """SELECT
+                       SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS pending,
+                       SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS leased,
+                       SUM(CASE
+                               WHEN state = ? AND error_code != ?
+                               THEN 1 ELSE 0
+                           END) AS retry,
+                       SUM(CASE WHEN state = ? THEN 1 ELSE 0 END) AS committed,
+                       SUM(CASE WHEN error_code = ? THEN 1 ELSE 0 END) AS ambiguous,
+                       SUM(CASE
+                               WHEN state = ? AND (error_code IS NULL OR error_code != ?)
+                               THEN 1 ELSE 0
+                           END) AS failed
+                     FROM session_sidebar_hydration_jobs""",
+                (
+                    SidebarHydrationState.PENDING.value,
+                    SidebarHydrationState.LEASED.value,
+                    SidebarHydrationState.RETRY.value,
+                    "hydration_send_ambiguous",
+                    SidebarHydrationState.VISIBLE.value,
+                    "hydration_send_ambiguous",
+                    SidebarHydrationState.FAILED.value,
+                    "hydration_send_ambiguous",
+                ),
+            ).fetchone()
             active = conn.execute(
                 """SELECT 1 FROM session_sidebar_hydration_jobs
                    WHERE state = ? AND lease_expires_at > ? LIMIT 1""",
@@ -9210,6 +9286,17 @@ class SessionBridgeStore:
                 recent_codes.append(code)
         return {
             "counts": counts,
+            "health_counts": {
+                key: int(health_counts_row[key] or 0)
+                for key in (
+                    "pending",
+                    "leased",
+                    "retry",
+                    "committed",
+                    "ambiguous",
+                    "failed",
+                )
+            },
             "active_lease": active is not None,
             "reserved_reconciliation": int(reserved_reconciliation["count"]),
             "oldest_pending_age_seconds": (

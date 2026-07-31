@@ -3862,6 +3862,12 @@ class _HeartbeatClaimStore:
     def record_sidebar_broker_heartbeat(self, *, now: float) -> None:
         self.heartbeats.append(now)
 
+    def claim_sidebar_hydration_jobs(
+        self, *, now: float, limit: int
+    ) -> list[dict[str, Any]]:
+        assert limit == 1
+        return []
+
 
 class _EmptySidebarVerifier:
     def find_by_marker(
@@ -3904,6 +3910,50 @@ async def test_sidebar_delivery_records_heartbeat_only_after_successful_empty_cl
     with pytest.raises(RuntimeError, match="claim failed"):
         await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
     assert failing.heartbeats == []
+
+
+@pytest.mark.asyncio
+async def test_sidebar_hydration_empty_claim_records_broker_heartbeat() -> None:
+    store = _HeartbeatClaimStore()
+    coordinator = SessionBridgeCoordinator(
+        config=replace(
+            _sidebar_config(),
+            sidebar=replace(
+                _sidebar_config().sidebar,
+                legacy_hydration_enabled=True,
+            ),
+        ),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 500.0,
+    )
+
+    assert await coordinator.claim_sidebar_hydration_for_delivery(limit=1) == ()
+    assert store.heartbeats == [500.0]
+
+
+@pytest.mark.asyncio
+async def test_disabled_sidebar_claim_paths_record_broker_heartbeat_before_return() -> None:
+    store = _HeartbeatClaimStore()
+    coordinator = SessionBridgeCoordinator(
+        config=replace(
+            _sidebar_config(),
+            sidebar=replace(
+                _sidebar_config().sidebar,
+                enabled=False,
+                legacy_hydration_enabled=False,
+            ),
+        ),
+        store=store,
+        adapters={},
+        target_adapters={},
+        clock=lambda: 501.0,
+    )
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=501.0, limit=1) == ()
+    assert await coordinator.claim_sidebar_hydration_for_delivery(limit=1) == ()
+    assert store.heartbeats == [501.0, 501.0]
 
 
 @pytest.mark.asyncio

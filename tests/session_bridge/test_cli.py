@@ -3309,6 +3309,49 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
     assert fresh_pending.sidebar_status()["healthy"] is True
 
 
+def test_sidebar_status_exposes_fixed_health_counts_without_private_payloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    private = "C:/private/source.jsonl HERMES_SESSION_BRIDGE_V1:secret"
+    backend = _production_sidebar_backend({
+        "counts": {
+            "sidebar_pending": 1,
+            "sidebar_leased": 2,
+            "sidebar_retry": 3,
+            "sidebar_visible": 4,
+            "sidebar_failed": 5,
+            "ambiguous": 2,
+            "needs_attention": 1,
+            "projectless_legacy_count": 3,
+            "source_payload": private,
+        },
+        "oldest_eligible_age_seconds": 10.0,
+        "oldest_pending_age_seconds": 5.0,
+        "last_heartbeat_at": 999.0,
+        "last_visible_task_id": "private-task-identity",
+        "delivery_latency_seconds": {"p50": 1.0, "p95": 2.0, "p99": 3.0},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["counts"] == {
+        "sidebar_pending": 1,
+        "sidebar_leased": 2,
+        "sidebar_visible": 4,
+        "sidebar_retry": 3,
+        "sidebar_failed": 5,
+        "sidebar_excluded": 0,
+        "ambiguous": 2,
+        "needs_attention": 1,
+        "projectless_legacy_count": 3,
+    }
+    rendered = json.dumps(status)
+    assert private not in rendered
+    assert "private-task-identity" not in rendered
+    assert "HERMES_SESSION_BRIDGE_V1" not in rendered
+
+
 def test_sidebar_status_exposes_only_sanitized_placement_health(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

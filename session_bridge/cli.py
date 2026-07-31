@@ -4303,6 +4303,8 @@ def _public_sidebar_status(
         for state in SidebarJobState
     }
     state_counts["sidebar_excluded"] = _status_count(counts.get("sidebar_excluded", 0))
+    for field in ("ambiguous", "needs_attention", "projectless_legacy_count"):
+        state_counts[field] = _status_count(counts.get(field, 0))
     blocking_failed_count = _status_count(
         raw.get(
             "blocking_failed_count",
@@ -4659,13 +4661,41 @@ def _public_sidebar_hydration_status(
 ) -> dict[str, Any]:
     raw_counts = raw.get("counts")
     counts = raw_counts if isinstance(raw_counts, Mapping) else {}
+    raw_health_counts = raw.get("health_counts")
+    health_counts = (
+        raw_health_counts if isinstance(raw_health_counts, Mapping) else {}
+    )
     raw_codes = raw.get("recent_error_codes")
     allowed_codes = HYDRATION_RETRYABLE_ERRORS | HYDRATION_FATAL_ERRORS
     return {
         "enabled": enabled is True,
         "counts": {
-            state.value: _status_count(counts.get(state.value, 0))
-            for state in SidebarHydrationState
+            "pending": _status_count(
+                health_counts.get(
+                    "pending", counts.get(SidebarHydrationState.PENDING.value, 0)
+                )
+            ),
+            "leased": _status_count(
+                health_counts.get(
+                    "leased", counts.get(SidebarHydrationState.LEASED.value, 0)
+                )
+            ),
+            "retry": _status_count(
+                health_counts.get(
+                    "retry", counts.get(SidebarHydrationState.RETRY.value, 0)
+                )
+            ),
+            "committed": _status_count(
+                health_counts.get(
+                    "committed", counts.get(SidebarHydrationState.VISIBLE.value, 0)
+                )
+            ),
+            "ambiguous": _status_count(health_counts.get("ambiguous", 0)),
+            "failed": _status_count(
+                health_counts.get(
+                    "failed", counts.get(SidebarHydrationState.FAILED.value, 0)
+                )
+            ),
         },
         "oldest_pending_age_seconds": _optional_status_number(
             raw.get("oldest_pending_age_seconds")

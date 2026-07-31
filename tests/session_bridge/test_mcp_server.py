@@ -2302,11 +2302,12 @@ def test_session_status_exposes_only_sanitized_hydration_observability(
     assert hydration == {
         "enabled": True,
         "counts": {
-            "hydration_pending": 2,
-            "hydration_leased": 1,
-            "hydration_retry": 3,
-            "hydration_visible": 4,
-            "hydration_failed": 5,
+            "pending": 2,
+            "leased": 1,
+            "retry": 3,
+            "committed": 4,
+            "ambiguous": 0,
+            "failed": 5,
         },
         "oldest_pending_age_seconds": 42.5,
         "active_lease": True,
