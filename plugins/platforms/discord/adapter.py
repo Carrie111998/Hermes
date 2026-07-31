@@ -719,9 +719,16 @@ class VoiceReceiver:
         the NaCl-decrypted bytes are already the Opus payload and are used
         as-is.
         """
+        session = self._dave_session
+        if session is None:
+            # Callers only reach here inside `if self._dave_session:`.  Stay
+            # explicit anyway: without a session the payload is already the
+            # Opus payload, and swallowing an AttributeError below would
+            # drop the packet with no usable diagnostic.
+            return payload
         try:
             import davey
-            return self._dave_session.decrypt(
+            return session.decrypt(
                 user_id, davey.MediaType.audio, payload
             )
         except Exception as e:
