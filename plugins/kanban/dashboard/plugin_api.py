@@ -36,11 +36,9 @@ the port.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
-import socket
 import sqlite3
 import time
 from dataclasses import asdict
@@ -58,7 +56,7 @@ from hermes_cli import kanban_diagnostics as kd
 # vendored in hermes_cli for canonical fleet custody.
 try:
     from hermes_cli import boardd_shim
-except Exception:
+except ImportError:
     boardd_shim = None  # type: ignore
 
 log = logging.getLogger(__name__)
@@ -2401,7 +2399,7 @@ def _board_counts(slug: str) -> dict[str, int]:
         path = kanban_db.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        conn = kanban_db.connect(board=slug)
+        conn = _conn(board=slug)
         try:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
@@ -2911,7 +2909,7 @@ async def stream_events(ws: WebSocket):
             ws_board = None
 
         def _fetch_new(cursor_val: int) -> tuple[int, list[dict]]:
-            conn = kanban_db.connect(board=ws_board)
+            conn = _conn(board=ws_board)
             try:
                 rows = conn.execute(
                     "SELECT id, task_id, run_id, kind, payload, created_at "

@@ -26,13 +26,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-# Use a fixed, test-file-local socket so the plugin's copy of kb_client resolves
-# the broker consistently across all tests in this file.  Each test run is in a
-# fresh subprocess, so this path is isolated from other test files.
-_TEST_SOCKET = os.environ.get(
-    "BOARDD_SOCK",
-    "/tmp/test-kanban-dashboard-boardd.sock",
-)
+import tempfile
+
+_TEST_SOCKET = str(Path(tempfile.mkdtemp()) / "test-boardd.sock")
+os.environ.pop("BOARDD_SOCK", None)
 os.environ["BOARDD_SOCK"] = _TEST_SOCKET
 # Keep retry/backoff short so a missing broker fails fast instead of retrying
 # for the default 90 seconds.
