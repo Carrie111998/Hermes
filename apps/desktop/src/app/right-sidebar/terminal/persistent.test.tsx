@@ -2,6 +2,8 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { PANE_HIDDEN_ATTR } from '@/components/pane-shell/pane-visibility'
+
 import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('./terminals', () => ({
@@ -308,5 +310,70 @@ describe('PersistentTerminal rect tracking', () => {
     act(() => window.dispatchEvent(new Event('focus')))
 
     expect(raf.pending()).toBe(1)
+  })
+
+  it('hides the overlay when the terminal slot sits on an inactive keep-alive tab', () => {
+    const raf = installRaf()
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
+
+    // Keep-alive tabs preserve layout size under data-pane-hidden, so a full
+    // rect alone must not keep the fixed overlay painted over Session/Review.
+    const layer = document.createElement('div')
+    document.body.append(layer)
+    container = document.createElement('div')
+    layer.append(container)
+    root = createRoot(container)
+
+    try {
+      act(() => {
+        root!.render(<Harness />)
+      })
+
+      act(() => {
+        raf.runNext()
+      })
+
+      const overlay = container!.lastElementChild as HTMLElement
+      expect(overlay.style.visibility).toBe('visible')
+      expect(overlay.style.width).toBe('200px')
+
+      act(() => {
+        layer.setAttribute(PANE_HIDDEN_ATTR, '')
+        mutationObserverCallback?.([], {} as MutationObserver)
+      })
+
+      act(() => {
+        raf.runNext()
+      })
+
+      expect(overlay.style.visibility).toBe('hidden')
+      expect(overlay.style.width).toBe('0px')
+      expect(overlay.style.height).toBe('0px')
+      expect(overlay.style.pointerEvents).toBe('none')
+
+      act(() => {
+        layer.removeAttribute(PANE_HIDDEN_ATTR)
+        mutationObserverCallback?.([], {} as MutationObserver)
+      })
+
+      act(() => {
+        raf.runNext()
+      })
+
+      expect(overlay.style.visibility).toBe('visible')
+      expect(overlay.style.width).toBe('200px')
+    } finally {
+      cleanup()
+      layer.remove()
+    }
+  })
+
+  it('watches data-pane-hidden on ancestors so tab switches remeasure', () => {
+    installRaf()
+    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
+
+    render(<Harness />)
+
+    expect(mutationObserveCalls.some(call => call.options?.attributeFilter?.includes(PANE_HIDDEN_ATTR))).toBe(true)
   })
 })
