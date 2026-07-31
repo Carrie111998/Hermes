@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
-# Patterns for sanitizing skill names into clean hyphen-separated slugs.
-_SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
+# Patterns for sanitizing skill names into command-safe slugs.
+# Telegram accepts underscores in bot command names, so preserve them.
+_SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9_-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
 
 # ---------------------------------------------------------------------------
@@ -424,7 +425,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # Normalize to hyphen-separated slug, stripping
                     # non-alnum chars (e.g. +, /) to avoid invalid
                     # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
+                    cmd_name = name.lower().replace(' ', '-')
                     cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
@@ -550,20 +551,21 @@ def reload_skills() -> Dict[str, Any]:
 def resolve_skill_command_key(command: str) -> Optional[str]:
     """Resolve a user-typed /command to its canonical skill_cmds key.
 
-    Skills are always stored with hyphens — ``scan_skill_commands`` normalizes
-    spaces and underscores to hyphens when building the key. Hyphens and
-    underscores are treated interchangeably in user input: this matches
-    ``_check_unavailable_skill`` and accommodates Telegram bot-command names
-    (which disallow hyphens, so ``/claude-code`` is registered as
-    ``/claude_code`` and comes back in the underscored form).
+    Commands preserve valid underscores from skill names. Existing hyphenated
+    command keys remain resolvable from Telegram's underscored form, whose bot
+    commands cannot contain hyphens.
 
     Returns the matching ``/slug`` key from ``get_skill_commands()`` or
     ``None`` if no match.
     """
     if not command:
         return None
-    cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_commands() else None
+    commands = get_skill_commands()
+    exact_key = f"/{command}"
+    if exact_key in commands:
+        return exact_key
+    hyphenated_key = f"/{command.replace('_', '-')}"
+    return hyphenated_key if hyphenated_key in commands else None
 
 
 def build_skill_invocation_message(
