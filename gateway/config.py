@@ -955,6 +955,11 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Harness dispatcher integration (Phase 2.6).  When set, the gateway
+    # forwards certain slash commands to the dispatcher via Unix socket.
+    dispatcher_socket: Optional[str] = None
+    dispatcher_commands: Optional[list] = None
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1214,6 +1219,8 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            dispatcher_socket=data.get("dispatcher_socket"),
+            dispatcher_commands=data.get("dispatcher_commands"),
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1358,6 +1365,17 @@ def load_gateway_config() -> GatewayConfig:
                 _pr = gateway_section.get("profile_routes")
             if isinstance(_pr, list):
                 gw_data["profile_routes"] = _pr
+
+            # Harness dispatcher integration.  Accept either top-level
+            # ``dispatcher:`` or nested ``gateway.dispatcher:`` form.
+            _disp = yaml_cfg.get("dispatcher")
+            if _disp is None and isinstance(gateway_section, dict):
+                _disp = gateway_section.get("dispatcher")
+            if isinstance(_disp, dict):
+                if "socket" in _disp:
+                    gw_data["dispatcher_socket"] = _disp["socket"]
+                if "commands" in _disp and isinstance(_disp["commands"], list):
+                    gw_data["dispatcher_commands"] = _disp["commands"]
 
             if isinstance(gateway_section, dict):
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
