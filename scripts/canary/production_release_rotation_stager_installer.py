@@ -166,10 +166,21 @@ def _git_environment() -> Mapping[str, str]:
     }
 
 
+def _git_command(source: Path, *arguments: str) -> tuple[str, ...]:
+    return (
+        "/usr/bin/git",
+        "-c",
+        f"safe.directory={source}",
+        "-C",
+        str(source),
+        *arguments,
+    )
+
+
 def _git(source: Path, *arguments: str, maximum: int = 64 * 1024 * 1024) -> bytes:
     try:
         completed = subprocess.run(
-            ("/usr/bin/git", "-C", str(source), *arguments),
+            _git_command(source, *arguments),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

@@ -129,6 +129,17 @@ def _git_environment() -> Mapping[str, str]:
     }
 
 
+def _git_command(source: Path, *arguments: str) -> tuple[str, ...]:
+    return (
+        "/usr/bin/git",
+        "-c",
+        f"safe.directory={source}",
+        "-C",
+        str(source),
+        *arguments,
+    )
+
+
 def _git(
     source: Path,
     *arguments: str,
@@ -136,7 +147,7 @@ def _git(
 ) -> bytes:
     try:
         completed = subprocess.run(
-            ("/usr/bin/git", "-C", str(source), *arguments),
+            _git_command(source, *arguments),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -178,7 +189,7 @@ def _write_git_blobs(
     try:
         with tempfile.TemporaryFile() as errors:
             process = subprocess.Popen(
-                ("/usr/bin/git", "-C", str(source), "cat-file", "--batch"),
+                _git_command(source, "cat-file", "--batch"),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=errors,

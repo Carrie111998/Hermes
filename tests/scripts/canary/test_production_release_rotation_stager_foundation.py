@@ -215,6 +215,22 @@ def test_author_rejects_symlinked_job_parent_and_git_replacements(
     assert installer._git_environment()["GIT_NO_REPLACE_OBJECTS"] == "1"
 
 
+def test_privileged_git_reads_trust_only_the_selected_checkout() -> None:
+    source = Path("/opt/adventico-ai-platform/hermes-agent-release")
+    expected = (
+        "/usr/bin/git",
+        "-c",
+        f"safe.directory={source}",
+        "-C",
+        str(source),
+        "cat-file",
+        "--batch",
+    )
+
+    assert author._git_command(source, "cat-file", "--batch") == expected
+    assert installer._git_command(source, "cat-file", "--batch") == expected
+
+
 def _installer_source(tmp_path: Path) -> tuple[Path, str]:
     files = {
         relative: (ROOT / relative).read_bytes()
