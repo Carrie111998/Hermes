@@ -1197,7 +1197,13 @@ class TestRepairBedrockModelId:
             )
         assert result == "eu.anthropic.claude-fable-5"
 
-    def test_falls_back_to_first_candidate_without_geo_or_global(self):
+    def test_fails_open_instead_of_foreign_geo_profile(self):
+        """A US endpoint must not be repaired onto a jp.* profile.
+
+        AWS rejects geo-prefixed profiles invoked from endpoints outside
+        their geography, so swapping a broken bare ID for a foreign profile
+        trades one failure for another. Fail open instead.
+        """
         from agent import bedrock_adapter
 
         with patch.object(
@@ -1206,6 +1212,19 @@ class TestRepairBedrockModelId:
         ):
             result = bedrock_adapter.repair_bedrock_model_id(
                 "anthropic.claude-fable-5", region="us-east-1"
+            )
+        assert result == "anthropic.claude-fable-5"
+
+    def test_falls_back_to_routable_candidate_without_geo_or_global(self):
+        """jp.* IS routable from ap-* endpoints, so fallback may use it."""
+        from agent import bedrock_adapter
+
+        with patch.object(
+            bedrock_adapter, "discover_bedrock_models",
+            return_value=self._discovered("jp.anthropic.claude-fable-5"),
+        ):
+            result = bedrock_adapter.repair_bedrock_model_id(
+                "anthropic.claude-fable-5", region="ap-northeast-1"
             )
         assert result == "jp.anthropic.claude-fable-5"
 
@@ -1220,6 +1239,7 @@ class TestRepairBedrockModelId:
                 "global.anthropic.claude-fable-5",
                 "us.anthropic.claude-haiku-4-5-20251001-v1:0",
                 "apac.anthropic.claude-fable-5",
+                "au.anthropic.claude-fable-5",
                 "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-v2",
             ):
                 assert bedrock_adapter.repair_bedrock_model_id(

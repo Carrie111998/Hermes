@@ -407,7 +407,8 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
 # Full inference-profile prefix roster for repair checks: repair must never
 # re-prefix an already-prefixed ID from ANY geography.
 _REPAIR_PROFILE_PREFIXES = (
-    "global.", "us.", "eu.", "ap.", "apac.", "jp.", "ca.", "sa.", "me.", "af.",
+    "global.", "us.", "eu.", "ap.", "apac.", "au.", "jp.", "ca.", "sa.", "me.",
+    "af.",
 )
 
 
@@ -425,14 +426,18 @@ def repair_bedrock_model_id(model_id: str, region: str = "") -> str:
     This helper is the load-time repair: given a model ID, return the
     inference-profile ID that covers it when live discovery confirms one
     exists, preferring the region's own geo prefix, then ``global.``, then
-    the first covering profile discovered. The result is the SAME model —
+    the first covering profile that is routable from the endpoint's
+    geography. The result is the SAME model —
     only the ID form changes — so applying it silently at load is a repair,
     not a model substitution.
 
     Fail-open: returns *model_id* unchanged when it is already
     profile-prefixed or an ARN, does not look like a Bedrock foundation-model
     ID, discovery is unavailable (no IAM ``bedrock:ListInferenceProfiles``,
-    no network), or no covering profile exists. Discovery results are cached
+    no network), no covering profile exists, or every covering profile
+    belongs to a foreign geography AWS would reject from this endpoint
+    (a broken bare ID is better than a differently-broken foreign one).
+    Discovery results are cached
     (1h per region), and already-prefixed IDs return without any AWS call.
     """
     mid = (model_id or "").strip()
@@ -461,18 +466,30 @@ def repair_bedrock_model_id(model_id: str, region: str = "") -> str:
         return model_id
 
     geo = ""
+    routable = candidates
     try:
-        from hermes_cli.model_setup_flows import bedrock_region_geo_prefix
+        from hermes_cli.model_setup_flows import (
+            bedrock_model_routable_from_region,
+            bedrock_region_geo_prefix,
+        )
         geo = bedrock_region_geo_prefix(region)
+        routable = [
+            c for c in candidates
+            if bedrock_model_routable_from_region(c, region)
+        ]
     except Exception:
         pass
     for preferred in (geo, "global."):
         if not preferred:
             continue
-        for candidate in candidates:
+        for candidate in routable:
             if candidate.startswith(preferred):
                 return candidate
-    return candidates[0]
+    # Never repair onto a profile AWS would reject from this endpoint's
+    # geography (e.g. jp.* from a us-east-1 endpoint) — fail open instead.
+    if routable:
+        return routable[0]
+    return model_id
 
 
 # ---------------------------------------------------------------------------
