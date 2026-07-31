@@ -65,13 +65,19 @@ identical across MCP additions, removals, equal-count swaps, and schema edits.
 The model still needs to know which deferred capabilities exist. Hermes attaches
 a compact, skills-style catalog snapshot to the API copy of the first real user
 turn. The stored user text stays clean, and the exact API copy is retained for
-byte-identical cache replay. A full-schema fingerprint identifies the snapshot.
-When membership, descriptions, or parameter schemas change, Hermes attaches a
-new snapshot to the next real user turn and explicitly supersedes older ones.
-The rendered manifest form is part of the identifier too, so a budget change
-that exposes a richer or more compact listing is also announced. Hermes never
-inserts a standalone synthetic user message, so strict role alternation is
-preserved.
+byte-identical cache replay. Building the snapshot does **not** wait for every
+MCP server: it lists the tools currently ready plus the names of in-scope
+servers still initializing. On surfaces that start discovery in the background,
+those pending names keep unavailable-yet domains discoverable without putting
+MCP startup latency back on the chat critical path.
+
+A full-schema fingerprint identifies the snapshot. When membership,
+descriptions, parameter schemas, or pending-server state changes, Hermes
+attaches a new snapshot to the next real user turn and explicitly supersedes
+older ones. The rendered manifest form is part of the identifier too, so a
+budget change that exposes a richer or more compact listing is also announced.
+Hermes never inserts a standalone synthetic user message, so strict role
+alternation is preserved.
 
 The snapshot uses the same size fallbacks as the earlier embedded listing:
 names plus short descriptions, names only, then per-server summaries. The live
@@ -149,10 +155,16 @@ to any progressive-disclosure design, not specific to this implementation:
   session-scoped view from the current registry. Tool changes therefore take
   effect immediately without replacing the model-facing bridge schemas.
 - **Catalog hints are append-only.** Snapshot metadata rides on a real user
-  turn and is fingerprinted from the full scoped schemas. A resumed agent reads
-  the prior `api_content` sidecar and does not repeat an unchanged snapshot. If
-  the supplied history no longer contains the current snapshot, Hermes attaches
-  it again at the append-only edge.
+  turn and is fingerprinted from the full scoped schemas, rendered manifest,
+  and pending MCP server names. A resumed agent reads the prior `api_content`
+  sidecar and does not repeat an unchanged snapshot. If the supplied history no
+  longer contains the current snapshot, Hermes attaches it again at the
+  append-only edge.
+- **Slow MCP startup does not gate the snapshot.** The first snapshot reflects
+  the catalog ready when the user turn is assembled and marks slower in-scope
+  servers as initializing. When they finish, the next real user turn carries a
+  superseding snapshot; bridge calls always consult the live registry in the
+  meantime.
 - **The catalog is scoped to the session's toolsets.** `tool_search`,
   `tool_describe`, and `tool_call` only ever see and invoke tools the
   session was actually granted. A subagent, kanban worker, or gateway

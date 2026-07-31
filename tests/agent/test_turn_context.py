@@ -179,7 +179,11 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+    with patch(
+        "agent.auxiliary_client.set_runtime_main", lambda *a, **k: None
+    ), patch(
+        "hermes_cli.config.read_raw_config", return_value={}
+    ):
         yield
 
 
@@ -576,6 +580,99 @@ def test_same_agent_reannounces_snapshot_when_history_is_absent():
         assert "[HERMES TOOL CATALOG SNAPSHOT" in second.messages[-1]["content"]
     finally:
         registry.deregister(name)
+
+
+def test_pending_mcp_server_names_respect_status_and_session_scope():
+    from agent.turn_context import _pending_mcp_server_names
+
+    raw_config = {
+        "mcp_servers": {
+            "connecting": {"enabled": True},
+            "configured": {},
+            "ready": {},
+            "failed": {},
+            "disabled": {"enabled": False},
+        }
+    }
+    statuses = [
+        {"name": "connecting", "status": "connecting"},
+        {"name": "configured", "status": "configured"},
+        {"name": "ready", "status": "connected"},
+        {"name": "failed", "status": "failed"},
+    ]
+    with patch(
+        "hermes_cli.config.read_raw_config", return_value=raw_config
+    ), patch(
+        "tools.mcp_tool.get_mcp_status", return_value=statuses
+    ):
+        assert _pending_mcp_server_names(None, None) == (
+            "configured",
+            "connecting",
+        )
+        assert _pending_mcp_server_names(["connecting"], None) == ("connecting",)
+        assert _pending_mcp_server_names(
+            ["connecting", "configured"],
+            ["mcp-connecting"],
+        ) == ("configured",)
+
+
+def test_pending_mcp_server_probe_does_not_import_mcp_stack():
+    import sys
+
+    from agent.turn_context import _pending_mcp_server_names
+
+    with patch(
+        "hermes_cli.config.read_raw_config",
+        return_value={"mcp_servers": {"slow-server": {}}},
+    ), patch.dict(
+        sys.modules,
+        {"tools.mcp_tool": None},
+    ):
+        assert _pending_mcp_server_names(None, None) == ("slow-server",)
+
+
+def test_pending_mcp_resolution_publishes_superseding_snapshot():
+    from tools.tool_search import (
+        BRIDGE_TOOL_NAMES,
+        ToolSearchConfig,
+        catalog_snapshot_id_from_text,
+    )
+
+    agent = _FakeAgent()
+    agent._skip_mcp_refresh = True
+    agent.valid_tool_names = set(BRIDGE_TOOL_NAMES)
+    agent.context_compressor.context_length = 200_000
+    config = ToolSearchConfig.from_raw({"listing": "auto"})
+
+    with patch(
+        "agent.turn_context._pending_mcp_server_names",
+        side_effect=[("slow-github",), ()],
+    ), patch(
+        "model_tools.get_tool_definitions", return_value=[]
+    ) as get_defs, patch(
+        "tools.tool_search.load_config", return_value=config
+    ):
+        first = _build(agent)
+        first_content = first.messages[-1]["content"]
+        history = [
+            {
+                "role": "user",
+                "content": "hello",
+                "api_content": first_content,
+            },
+            {"role": "assistant", "content": "done"},
+        ]
+        second = _build(agent, conversation_history=history)
+
+    second_content = second.messages[-1]["content"]
+    assert "MCP servers still initializing (1): `slow-github`" in first_content
+    assert "not included in the ready catalog yet" in first_content
+    assert "[HERMES TOOL CATALOG SNAPSHOT" in second_content
+    assert "MCP servers still initializing" not in second_content
+    assert catalog_snapshot_id_from_text(first_content) != (
+        catalog_snapshot_id_from_text(second_content)
+    )
+    assert get_defs.call_count == 2
 
 
 def test_schema_change_appends_superseding_catalog_snapshot():

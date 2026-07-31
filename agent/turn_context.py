@@ -26,11 +26,12 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
@@ -73,6 +74,76 @@ def prepend_user_note(content: Any, note: str) -> Any:
                 return parts
         return [{"type": "text", "text": note}, *parts]
     return content
+
+
+def _pending_mcp_server_names(
+    enabled_toolsets: Optional[List[str]],
+    disabled_toolsets: Optional[List[str]],
+) -> Tuple[str, ...]:
+    """Return in-scope MCP servers that have not finished discovery.
+
+    This must stay non-blocking: it reads config directly and only consults
+    ``tools.mcp_tool`` when that module is already present in ``sys.modules``.
+    If the background discovery thread is still importing the MCP stack, all
+    configured/in-scope servers are conservatively reported as pending.
+    """
+    try:
+        from hermes_cli.config import read_raw_config
+
+        raw_servers = (read_raw_config() or {}).get("mcp_servers")
+    except Exception:
+        return ()
+    if not isinstance(raw_servers, dict) or not raw_servers:
+        return ()
+
+    enabled_scope = (
+        {str(name) for name in enabled_toolsets}
+        if enabled_toolsets is not None
+        else None
+    )
+    disabled_scope = {str(name) for name in disabled_toolsets or []}
+
+    status_by_name: Dict[str, str] = {}
+    mcp_module = sys.modules.get("tools.mcp_tool")
+    status_getter = getattr(mcp_module, "get_mcp_status", None)
+    if callable(status_getter):
+        try:
+            status_by_name = {
+                str(row.get("name")): str(row.get("status") or "")
+                for row in status_getter() or []
+                if isinstance(row, dict) and row.get("name")
+            }
+        except Exception:
+            logger.debug("MCP status probe for catalog snapshot failed", exc_info=True)
+
+    pending = []
+    for raw_name, raw_server_cfg in raw_servers.items():
+        name = str(raw_name)
+        server_cfg = raw_server_cfg if isinstance(raw_server_cfg, dict) else {}
+        enabled_raw = server_cfg.get("enabled", True)
+        if isinstance(enabled_raw, str):
+            server_enabled = enabled_raw.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+            }
+        else:
+            server_enabled = bool(enabled_raw)
+        if not server_enabled:
+            continue
+
+        scope_aliases = {name, f"mcp-{name}"}
+        if scope_aliases & disabled_scope:
+            continue
+        if enabled_scope is not None and not scope_aliases & enabled_scope:
+            continue
+
+        status = status_by_name.get(name, "configured")
+        if status in {"configured", "connecting", "starting", "reconnecting"}:
+            pending.append(name)
+
+    return tuple(sorted(set(pending)))
 
 
 def build_tool_catalog_turn_note(
@@ -131,6 +202,10 @@ def build_tool_catalog_turn_note(
             config_fingerprint = None
         enabled_toolsets = getattr(agent, "enabled_toolsets", None)
         disabled_toolsets = getattr(agent, "disabled_toolsets", None)
+        pending_mcp_servers = _pending_mcp_server_names(
+            enabled_toolsets,
+            disabled_toolsets,
+        )
         try:
             from agent.delegation_context import is_delegated_child_context
 
@@ -144,6 +219,7 @@ def build_tool_catalog_turn_note(
             config_fingerprint,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             delegated_child,
+            pending_mcp_servers,
         )
         known_id = getattr(agent, "_tool_catalog_snapshot_id", None)
         known_notice = getattr(agent, "_tool_catalog_snapshot_notice", None)
@@ -172,6 +248,7 @@ def build_tool_catalog_turn_note(
         snapshot = build_catalog_snapshot(
             current_defs,
             max_tokens=listing_token_budget(config, context_length),
+            pending_mcp_servers=pending_mcp_servers,
         )
 
         agent._tool_catalog_snapshot_id = snapshot.snapshot_id

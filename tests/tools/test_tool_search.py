@@ -733,6 +733,7 @@ class TestUserTurnCatalogSnapshot:
 
         snapshot = build_catalog_snapshot([])
         assert snapshot.count == 0
+        assert snapshot.pending_mcp_servers == ()
         assert "No deferred MCP/plugin tools" in snapshot.notice
         assert catalog_snapshot_id_from_text(snapshot.notice) == snapshot.snapshot_id
         assert (
@@ -742,6 +743,29 @@ class TestUserTurnCatalogSnapshot:
             ])
             == snapshot.snapshot_id
         )
+
+    def test_pending_servers_are_deterministic_and_change_snapshot_id(self):
+        from tools.tool_search import build_catalog_snapshot
+
+        pending = build_catalog_snapshot(
+            [],
+            pending_mcp_servers=["slow-slack", "slow-github", "slow-slack"],
+        )
+        reversed_order = build_catalog_snapshot(
+            [],
+            pending_mcp_servers=["slow-github", "slow-slack"],
+        )
+        ready = build_catalog_snapshot([])
+
+        assert pending == reversed_order
+        assert pending.pending_mcp_servers == ("slow-github", "slow-slack")
+        assert pending.snapshot_id != ready.snapshot_id
+        assert "pending_servers=2" in pending.notice
+        assert (
+            "MCP servers still initializing (2): `slow-github`, `slow-slack`"
+            in pending.notice
+        )
+        assert "live catalog may expand during this turn" in pending.notice
 
 
 class TestDeferredCallSchemaProbe:

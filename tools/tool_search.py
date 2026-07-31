@@ -464,6 +464,7 @@ class CatalogSnapshot:
 
     snapshot_id: str
     count: int
+    pending_mcp_servers: Tuple[str, ...]
     listing_form: str
     notice: str
 
@@ -594,6 +595,7 @@ def _catalog_snapshot_id(
     deferrable: List[Dict[str, Any]],
     listing: Optional[str],
     listing_form: str,
+    pending_mcp_servers: Tuple[str, ...],
 ) -> str:
     """Fingerprint full schemas and their rendered manifest representation."""
     ordered = sorted(
@@ -606,13 +608,14 @@ def _catalog_snapshot_id(
                 "schemas": ordered,
                 "listing": listing,
                 "listing_form": listing_form,
+                "pending_mcp_servers": pending_mcp_servers,
             },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
     except (TypeError, ValueError):
-        payload = repr((ordered, listing, listing_form))
+        payload = repr((ordered, listing, listing_form, pending_mcp_servers))
     return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
@@ -620,6 +623,7 @@ def build_catalog_snapshot(
     current_tool_defs: List[Dict[str, Any]],
     *,
     max_tokens: int = 20000,
+    pending_mcp_servers: Iterable[str] = (),
 ) -> CatalogSnapshot:
     """Build the API-only catalog snapshot attached to a real user turn.
 
@@ -628,22 +632,37 @@ def build_catalog_snapshot(
     catalog bytes out of the provider's model-facing ``tools=`` prefix.
     """
     _, deferrable = classify_tools(current_tool_defs)
+    pending_servers = tuple(
+        sorted(
+            {
+                str(server_name).strip()
+                for server_name in pending_mcp_servers
+                if str(server_name).strip()
+            }
+        )
+    )
     # Reserve room for the framing and instructions around the manifest.
     listing, listing_form = build_catalog_listing_with_form(
         deferrable,
         max_tokens=max(0, max_tokens - 220),
     )
-    snapshot_id = _catalog_snapshot_id(deferrable, listing, listing_form)
+    snapshot_id = _catalog_snapshot_id(
+        deferrable,
+        listing,
+        listing_form,
+        pending_servers,
+    )
 
     lines = [
-        f"[HERMES TOOL CATALOG SNAPSHOT id={snapshot_id} count={len(deferrable)}",
+        f"[HERMES TOOL CATALOG SNAPSHOT id={snapshot_id} "
+        f"count={len(deferrable)} pending_servers={len(pending_servers)}",
         "Runtime metadata; this is not part of the user's request. This snapshot "
         "supersedes every earlier tool-catalog snapshot in the conversation.",
     ]
     if not deferrable:
         lines.append(
-            "No deferred MCP/plugin tools are currently available. The stable "
-            "bridge remains present so later catalog changes do not alter tools=."
+            "No deferred MCP/plugin tools are currently ready. The stable bridge "
+            "remains present so later catalog changes do not alter tools=."
         )
     elif listing is None:
         lines.append(
@@ -664,10 +683,20 @@ def build_catalog_snapshot(
                 "the capability unavailable."
             )
         lines.append(listing)
+    if pending_servers:
+        rendered_servers = ", ".join(f"`{name.replace('`', '')}`" for name in pending_servers)
+        lines.append(
+            f"MCP servers still initializing ({len(pending_servers)}): "
+            f"{rendered_servers}. Their tools are not included in the ready "
+            "catalog yet. The live catalog may expand during this turn; use or "
+            f"re-run `{TOOL_SEARCH_NAME}` before concluding that one of these "
+            "capabilities is unavailable."
+        )
     lines.append("END HERMES TOOL CATALOG SNAPSHOT]")
     return CatalogSnapshot(
         snapshot_id=snapshot_id,
         count=len(deferrable),
+        pending_mcp_servers=pending_servers,
         listing_form=listing_form,
         notice="\n".join(lines),
     )
