@@ -237,6 +237,14 @@ class GatewayStreamConsumer:
         # the run-wide set for fresh-final bookkeeping, but a failure recovery
         # must never delete an earlier finalized preamble/commentary message.
         self._segment_preview_message_ids: "set[str]" = set()
+        initial_stream_message_id = None
+        if isinstance(metadata, dict):
+            initial_stream_message_id = metadata.get("_stream_message_id")
+        if initial_stream_message_id:
+            self._message_id = str(initial_stream_message_id)
+            self._message_created_ts = time.monotonic()
+            self._preview_message_ids.add(self._message_id)
+            self._segment_preview_message_ids.add(self._message_id)
         self._already_sent = False
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
