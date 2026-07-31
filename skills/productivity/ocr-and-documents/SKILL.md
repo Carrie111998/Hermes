@@ -107,7 +107,7 @@ python scripts/extract_liteparse.py document.pdf --ocr       # enable OCR (slowe
 
 **Smoke test against a local text PDF**:
 ```bash
-python scripts/extract_liteparse.py path/to/text.pdf --max-pages 1 | head
+python scripts/extract_liteparse.py path/to/text.pdf --max-pages 1
 ```
 
 Expected result: the command prints first-page Markdown. If `liteparse` is missing, use one of the project/virtual-environment commands above. If the output needs more reliable structure, OCR quality, equation handling, or complex layout semantics, switch back to `pymupdf4llm` or `marker-pdf`.

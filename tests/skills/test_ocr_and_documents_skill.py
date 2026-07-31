@@ -189,6 +189,7 @@ def test_ocr_skill_docs_use_realistic_liteparse_guidance():
         assert 'output_format="markdown"' in text
         assert "reconstruction quality varies with document complexity" in text
         assert "path/to/text.pdf" in text
+        assert "| head" not in text
         assert "uv add 'liteparse==2.10.1'" in text
         assert "uv venv && uv pip install 'liteparse==2.10.1'" in text
 
