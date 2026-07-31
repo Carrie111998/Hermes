@@ -18065,49 +18065,49 @@ def main():
             # Detect terminal width for dynamic title sizing
             import shutil as _shutil
             term_w = _shutil.get_terminal_size((80, 24)).columns
-            fixed_w = 3 + 7 + 10 + 10 + 14 + 10
-            title_w = max(20, term_w - fixed_w)
+            fixed_w = 3 + 10 + 10 + 10 + 8 + 20 + 12 + 14
+            title_w = max(16, term_w - fixed_w)
+            def _fmt_tok(n):
+                if n is None:
+                    return "—"
+                if n >= 1_000_000:
+                    return f"{n/1_000_000:.1f}M"
+                if n >= 1_000:
+                    return f"{n//1000}k"
+                return str(n)
 
             print(f"⚙️  sessions search {query}\n")
-            print(f"  {'#':>2}  {'Title':<{title_w}} {'U/A':>7}  {'Created':<10} {'Last Active':<10} {'ID'}")
-            print(f"  {'─'*2}  {'─'*title_w} {'─'*7}  {'─'*10} {'─'*10} {'─'*14}")
+            print(f"  {'#':>2}  {'Title':<{title_w}} {'Model':<10} {'Tok':>10}  {'Created':<10} {'Last':<8} {'Preview':<20} {'ID'}")
+            print(f"  {'─'*2}  {'─'*title_w} {'─'*10} {'─'*10}  {'─'*10} {'─'*8} {'─'*20} {'─'*12}")
             for idx, (sid, r) in enumerate(seen.items(), 1):
                 meta = db.get_session(sid) or {}
                 title = (meta.get("title") or "—")[:title_w]
+                model_raw = (r.get("model") or "—")
+                model = model_raw.split("/")[-1] if "/" in model_raw else model_raw
+                if len(model) > 10:
+                    model = model[:9] + "…"
+                inp = meta.get("input_tokens")
+                out = meta.get("output_tokens")
+                tok_str = f"{_fmt_tok(inp)}/{_fmt_tok(out)}"
                 started = meta.get("started_at")
                 created = _dt.fromtimestamp(started).strftime("%Y-%m-%d") if started else "?"
-                last_active_ts = sid_latest.get(sid)
-                if last_active_ts:
-                    age = int(_time.time() - last_active_ts)
+                last_active = sid_latest.get(sid)
+                if last_active:
+                    age = int(_time.time() - last_active)
                     if age < 60:
-                        when = f"{age}s ago"
+                        when = f"{age}s"
                     elif age < 3600:
-                        when = f"{age // 60}m ago"
+                        when = f"{age // 60}m"
                     elif age < 86400:
-                        when = f"{age // 3600}h ago"
+                        when = f"{age // 3600}h"
                     else:
-                        when = f"{age // 86400}d ago"
+                        when = f"{age // 86400}d"
                 else:
                     when = "?"
-                cwd = meta.get("cwd") or ""
-                if cwd:
-                    home = _os.environ.get("HOME", "")
-                    if cwd.startswith(home):
-                        cwd = "~" + cwd[len(home):]
-                    if len(cwd) > 10:
-                        cwd = "…" + cwd[-(9):]
-                else:
-                    cwd = "—"
-                rc = role_counts.get(sid, {})
-                u = rc.get("user", 0)
-                a = rc.get("assistant", 0)
-                ua_str = f"{u}u/{a}a" if u or a else "—"
-                pv = (root_preview_cache.get(sid) or "")[:28]
-                if len(root_preview_cache.get(sid) or "") >= 28:
-                    pv = pv[:27] + "…"
-                print(f"  {idx:>2}  {title:<{title_w}} {ua_str:>7}  {created:<10} {when:<10} {sid[:14]}")
-                if pv:
-                    print(f"     {pv}")
+                pv = (root_preview_cache.get(sid) or "")[:18]
+                if len(root_preview_cache.get(sid) or "") >= 18:
+                    pv = pv[:17] + "…"
+                print(f"  {idx:>2}  {title:<{title_w}} {model:<10} {tok_str:>10}  {created:<10} {when:<8} {pv:<20} {sid[:12]}")
             print()
             print("  Use /resume <id> from an interactive Hermes session to continue.")
 
