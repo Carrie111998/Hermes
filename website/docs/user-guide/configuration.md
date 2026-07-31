@@ -1867,7 +1867,7 @@ display:
   spinner_token_flow: true # CLI only: append live cumulative turn tokens to the spinner timer
   runtime_footer:         # Gateway: append a runtime-context footer to final replies
     enabled: false
-    fields: ["model", "context_pct", "cwd"]  # also: provider, account, context, quota; optional underline: true
+    fields: ["model", "context_pct", "cwd"]  # also: provider, account, context, quota, reasoning; optional underline: true
   file_mutation_verifier: true    # Append an advisory footer when write_file/patch calls failed this turn
   credits_notices: true   # Nous credits status-bar notices (usage bands, grant-spent, depleted). false = silence them; /usage still works
   cli_rebuild_scrollback_on_redraw: false  # Classic CLI: also wipe terminal scrollback (CSI 3J) on /redraw / Ctrl+L / width-change resize recovery. Enable when a terminal/tmux stack stamps stale prompt chrome into scrollback on maximize/restore.
@@ -1976,7 +1976,7 @@ When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-cont
 display:
   runtime_footer:
     enabled: true
-    fields: ["provider", "account", "model", "context", "quota"]
+    fields: ["provider", "account", "model", "reasoning", "context", "quota"]
     underline: true
 ```
 
@@ -1985,6 +1985,7 @@ Supported `fields` (order is preserved; omit any field to hide it):
 | Field | What it shows |
 |-------|---------------|
 | `model` | Model id used for the turn |
+| `reasoning` | Compact reasoning-effort abbreviation (`off`/`min`/`low`/`med`/`high`/`xhi`/`max`/`ult`) |
 | `provider` | Provider / auth path that served the turn |
 | `account` | Compact account/plan label when available |
 | `context` | Absolute context usage (`used/limit`) |
@@ -2001,6 +2002,7 @@ Notes:
 - `quota` only renders windows a provider actually returns; providers without usage APIs stay silent for that field.
 - Account/quota lookups use the exact runtime credential that served the turn, so credential-pool rotation does not show another account's limits.
 - Quota results are cached briefly per credential so footer rendering does not hit provider usage APIs on every message.
+- `reasoning` shows the live turn effort from the agent runtime (including `/reasoning` overrides), abbreviated for mobile footers.
 - Unknown field names are ignored.
 - Per-platform overrides live under `display.platforms.<platform>.runtime_footer`.
 
@@ -2010,7 +2012,7 @@ Example footer appended to a Telegram/Discord/Slack/Feishu reply:
 
 ```
 ──────────────
-xai-oauth · lance*** · grok-4.5 · ctx 18.2k/256k · 5h 72% · 7d 41%
+xai-oauth · lance*** · grok-4.5 · ult · ctx 18.2k/256k · 5h 72% · 7d 41%
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean. When streaming already delivered the final text piecemeal, the footer may be sent as a separate trailing message.
