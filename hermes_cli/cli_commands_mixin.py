@@ -875,7 +875,10 @@ class CLICommandsMixin:
                     try:
                         parsed_limit = min(int(tokens[i + 1]), 100)
                     except ValueError:
-                        pass
+                        _cprint(
+                            f"  Invalid --limit value '{tokens[i + 1]}'; "
+                            f"using default {default_limit}."
+                        )
                     i += 2
                     continue
                 clean.append(tokens[i])

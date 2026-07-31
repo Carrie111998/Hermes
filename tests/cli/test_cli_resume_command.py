@@ -117,6 +117,22 @@ class TestResumeArmingRealDb:
         assert consumed is True
         assert cli_obj.session_id == "sess_001"
 
+    def test_invalid_limit_warns_and_uses_default(self, cli_db):
+        """`--limit abc` must warn instead of failing silently, keep the
+        default page size, and still consume the flag+value tokens (F12)."""
+        cli_obj, db = cli_db
+        with (
+            patch("hermes_cli.main._resolve_session_by_name_or_id", return_value=None),
+            patch("cli._cprint") as mock_cprint,
+        ):
+            cli_obj._handle_resume_command("/resume --limit abc")
+        printed = " ".join(str(call) for call in mock_cprint.call_args_list)
+        assert "Invalid --limit" in printed
+        assert "abc" in printed
+        # Flag consumed; the empty target armed the default page-1 listing.
+        assert cli_obj._pending_resume_limit == 10
+        assert len(cli_obj._pending_resume_sessions) == 10
+
 
 class TestCliResumeCommand:
     def test_show_recent_sessions_includes_indexes_and_resume_hint(self, capsys):
