@@ -13,14 +13,14 @@ Source file: `hermes_state.py`
 ~/.hermes/state.db (SQLite, WAL mode)
 ├── sessions              — Session metadata, token counts, billing
 ├── messages              — Full message history per session
-├── session_model_usage   — Per-model/per-task usage attribution rows
+├── session_model_usage   — Per-model and per-task token/cost attribution
 ├── messages_fts          — FTS5 virtual table (content + tool_name + tool_calls)
 ├── messages_fts_trigram  — FTS5 virtual table with trigram tokenizer (CJK / substring search)
-├── messages_fts_cjk      — FTS5 virtual table with cjk_unicode61 tokenizer
+├── messages_fts_cjk      — Optional CJK-bigram FTS5 index when the native tokenizer is available
 ├── state_meta            — Key/value metadata table
-├── gateway_routing       — Gateway routing metadata
-├── compression_locks     — Cross-process compression locking
-├── async_delegations     — Async delegation bookkeeping
+├── gateway_routing       — Canonical gateway conversation routing index
+├── compression_locks     — Cross-process compression leases
+├── async_delegations     — Durable asynchronous delegation state
 └── schema_version        — Single-row table tracking migration state
 ```
 
@@ -48,6 +48,13 @@ CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     user_id TEXT,
+    session_key TEXT,
+    chat_id TEXT,
+    chat_type TEXT,
+    thread_id TEXT,
+    display_name TEXT,
+    origin_json TEXT,
+    expiry_finalized INTEGER DEFAULT 0,
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
@@ -62,6 +69,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_read_tokens INTEGER DEFAULT 0,
     cache_write_tokens INTEGER DEFAULT 0,
     reasoning_tokens INTEGER DEFAULT 0,
+    cwd TEXT,
+    git_branch TEXT,
+    git_repo_root TEXT,
     billing_provider TEXT,
     billing_base_url TEXT,
     billing_mode TEXT,
@@ -77,8 +87,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
+CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_session_key
+    ON sessions(session_key, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer
+    ON sessions(source, user_id, chat_id, chat_type, thread_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
+    ON sessions(handoff_state, started_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique
     ON sessions(title) WHERE title IS NOT NULL;
 ```
@@ -98,6 +115,7 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
+    effect_disposition TEXT,
     timestamp REAL NOT NULL,
     token_count INTEGER,
     finish_reason TEXT,
@@ -110,6 +128,10 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_active
+    ON messages(session_id, active, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_active_null
+    ON messages(active) WHERE active IS NULL;
 ```
 
 Notes:
@@ -119,7 +141,21 @@ Notes:
 - `api_content` is a byte-fidelity sidecar: the exact content string sent to the API for this message when it differs from `content` (ephemeral memory/plugin injections, persist overrides). It preserves the wire bytes for prompt-cache-stable replay — stored as sent, except lone surrogates, which sqlite3 cannot bind and which the conversation loop scrubs from every outgoing payload anyway. `NULL` means `content` was sent verbatim.
 - Timestamps are Unix epoch floats (`time.time()`)
 
+### Supporting Tables
+
+- `session_model_usage` attributes calls, tokens, and cost by session, model,
+  billing route, and task.
+- `gateway_routing` stores each gateway routing entry as JSON, keyed by
+  `(scope, session_key)`. It is the canonical routing index; `sessions.json`
+  is only a compatibility mirror/fallback.
+- `compression_locks` coordinates compression leases across processes.
+- `async_delegations` persists delegation lifecycle, result, ownership, and
+  delivery state.
+
 ### FTS5 Full-Text Search
+
+Fresh schema-v23 databases use an external-content FTS table, so searchable
+text is not duplicated inside the base index:
 
 ```sql
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -131,11 +167,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
 );
 ```
 
-The FTS5 table is kept in sync via three triggers that fire on INSERT, UPDATE,
-and DELETE of the `messages` table. The current triggers are gated on the
-`fts_rebuild_high_water` / `fts_rebuild_progress` markers in `state_meta` (so a
-background FTS rebuild can proceed without double-indexing) and cover all three
-indexed columns — see `SCHEMA_SQL` in `hermes_state.py` for the exact SQL.
+INSERT, UPDATE, and DELETE triggers keep `content`, `tool_name`, and
+`tool_calls` synchronized. During a rebuild, the triggers use
+`fts_rebuild_high_water` and `fts_rebuild_progress` markers in `state_meta` so
+they only mutate rows already represented in the index.
+
+The trigram index—and the optional native CJK-bigram replacement—read through
+views that exclude `role='tool'` rows to avoid indexing large machine payloads
+twice. Tool rows remain searchable through `messages_fts`.
+
+Existing pre-v23 databases retain the working v22 inline FTS layout until the
+user explicitly runs `hermes sessions optimize-storage`. The FTS layout is
+tracked independently in `state_meta.fts_storage_version`, so opting out of
+the storage rewrite does not block later main-schema migrations. See
+`FTS_SQL`, `FTS_TRIGRAM_SQL`, and `FTS_CJK_*_SQL` in `hermes_state.py` for the
+complete trigger definitions.
 
 
 ## Schema Version and Migrations
@@ -160,12 +206,12 @@ The `schema_version` table stores a single integer. Simple column additions are 
 | 16 | Tag delegate subagent rows in `model_config` (`$._delegate_from`) so session pickers stay clean after parent deletes orphan them |
 | 18 | Gateway metadata consolidation — backfill `display_name` / `origin_json` / `expiry_finalized` from `sessions.json` |
 | 20 | Per-model usage attribution — seed `session_model_usage` rows from historical per-session aggregate totals |
-| 22 | Task-dimension usage attribution — rebuild `session_model_usage` so the `task` column participates in the PRIMARY KEY |
-| 23 | FTS storage redesign — external-content FTS tables replacing the v11 inline-mode copies (opt-in transition for existing DBs) |
+| 22 | Task-dimension usage attribution — rebuild `session_model_usage` so `task` participates in the primary key; preserve historical rows as main-loop usage (`task=''`) |
+| 23 | FTS storage redesign — fresh databases use external-content indexes; existing databases keep the v22 inline layout until `hermes sessions optimize-storage`, with FTS layout versioned independently in `state_meta` |
 
 Versions not listed above were declarative column additions handled by `_reconcile_columns()` (version bump only, no data migration).
 
-Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The version number is bumped after each successful migration block.
+Declarative column adds use `ALTER TABLE ADD COLUMN` wrapped in try/except to handle the column-already-exists case (idempotent). The stored main schema marker advances to `SCHEMA_VERSION` after required schema setup. Since v23, the optional FTS storage rewrite has its own `fts_storage_version` marker and does not hold back `schema_version`.
 
 
 ## Write Contention Handling
