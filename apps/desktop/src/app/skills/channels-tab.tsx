@@ -1,7 +1,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type { Dispatch, SetStateAction } from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -42,16 +42,21 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
   const [enabledToolsets, setEnabledToolsets] = useState<Set<string>>(new Set())
   const [mcpMode, setMcpMode] = useState<ChannelMcpMode>('all')
   const [mcpServers, setMcpServers] = useState<Set<string>>(new Set())
-  const [saving, setSaving] = useState(false)
+  const [savingProfile, setSavingProfile] = useState<string | null>(null)
+  const saveGeneration = useRef(0)
+  const activeProfileRef = useRef(profileKey)
+  activeProfileRef.current = profileKey
+  const saving = savingProfile === profileKey
 
   // A profile swap changes the backend authority. Drop every local draft
   // before another click can route profile A's selections to profile B.
   useOnProfileSwitch(() => {
+    saveGeneration.current += 1
     setSelected(null)
     setEnabledToolsets(new Set())
     setMcpMode('all')
     setMcpServers(new Set())
-    setSaving(false)
+    setSavingProfile(null)
   })
 
   const visibleChannels = useMemo(() => {
@@ -117,7 +122,13 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
       return
     }
 
-    setSaving(true)
+    const requestProfile = profileKey
+    const requestGeneration = ++saveGeneration.current
+    setSavingProfile(requestProfile)
+
+    const isCurrentRequest = () =>
+      saveGeneration.current === requestGeneration &&
+      activeProfileRef.current === requestProfile
 
     try {
       await updateChannelCapabilities(active.platform, {
@@ -125,6 +136,11 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
         mcp_mode: mcpMode,
         mcp_servers: mcpMode === 'allowlist' ? [...mcpServers].sort() : []
       })
+
+      if (!isCurrentRequest()) {
+        return
+      }
+
       await queryClient.invalidateQueries({
         queryKey: [...CHANNEL_CAPABILITIES_QUERY_KEY, profileKey]
       })
@@ -134,9 +150,14 @@ export function ChannelsTab({ query }: ChannelsTabProps) {
         message: t.skills.channels.savedMessage(active.label)
       })
     } catch (error) {
-      notifyError(error, t.skills.channels.saveFailed(active.label))
+      if (isCurrentRequest()) {
+        notifyError(error, t.skills.channels.saveFailed(active.label))
+      }
     } finally {
-      setSaving(false)
+
+      if (isCurrentRequest()) {
+        setSavingProfile(null)
+      }
     }
   }
 

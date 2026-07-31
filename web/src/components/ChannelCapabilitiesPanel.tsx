@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { Dispatch, SetStateAction } from "react";
 import { AlertTriangle, Network, ShieldCheck } from "lucide-react";
 
@@ -17,6 +17,11 @@ interface Props {
   query: string;
   onError: (message: string) => void;
   onSaved: (message: string) => void;
+}
+
+interface SaveRequest {
+  generation: number;
+  profile: string;
 }
 
 const HIGH_IMPACT = new Set([
@@ -64,10 +69,20 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
   const [channels, setChannels] = useState<ChannelCapability[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [loadedProfile, setLoadedProfile] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [savingRequest, setSavingRequest] = useState<SaveRequest | null>(null);
   const [toolsets, setToolsets] = useState<Set<string>>(new Set());
   const [mcpMode, setMcpMode] = useState<ChannelMcpPolicy["mode"]>("all");
   const [mcpServers, setMcpServers] = useState<Set<string>>(new Set());
+  const saveGeneration = useRef(0);
+  const activeProfileRef = useRef(profileKey);
+  const saving = savingRequest?.profile === profileKey;
+
+  useLayoutEffect(() => {
+    // Invalidate save completions before the new profile can receive input.
+    // The request token lets an obsolete completion clean up only itself.
+    saveGeneration.current += 1;
+    activeProfileRef.current = profileKey;
+  }, [profileKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -147,7 +162,15 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
 
   const save = async () => {
     if (!channel || saving) return;
-    setSaving(true);
+    const requestProfile = profileKey;
+    const request = {
+      generation: ++saveGeneration.current,
+      profile: requestProfile,
+    };
+    setSavingRequest(request);
+    const isCurrentRequest = () =>
+      saveGeneration.current === request.generation &&
+      activeProfileRef.current === requestProfile;
     try {
       const result = await api.updateChannelCapabilities(
         channel.platform,
@@ -158,6 +181,7 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
         },
         profile,
       );
+      if (!isCurrentRequest()) return;
       setChannels((rows) =>
         rows.map((row) =>
           row.platform === result.channel.platform ? result.channel : row,
@@ -165,9 +189,9 @@ export function ChannelCapabilitiesPanel({ profile, query, onError, onSaved }: P
       );
       onSaved(channelText(t.skills, "channelCapabilitiesSaved"));
     } catch {
-      onError(loadFailed);
+      if (isCurrentRequest()) onError(loadFailed);
     } finally {
-      setSaving(false);
+      setSavingRequest((current) => (current === request ? null : current));
     }
   };
 

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesApi from '@/hermes'
 import { queryClient } from '@/lib/query-client'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import { ChannelsTab } from './channels-tab'
 
@@ -19,6 +20,11 @@ const selectToolsetProvider = vi.fn()
 const getUsageAnalytics = vi.fn()
 const getChannelCapabilities = vi.fn()
 const updateChannelCapabilities = vi.fn()
+
+const { notify, notifyError } = vi.hoisted(() => ({
+  notify: vi.fn(),
+  notifyError: vi.fn()
+}))
 
 // Partial mock: keep the real module (SkillsView pulls in @/store/profile,
 // whose import-time subscription calls setApiRequestProfile) and stub only the
@@ -39,8 +45,8 @@ vi.mock('@/hermes', async importOriginal => ({
 
 // Notifications hit nanostores/timers we don't care about here.
 vi.mock('@/store/notifications', () => ({
-  notify: vi.fn(),
-  notifyError: vi.fn()
+  notify,
+  notifyError
 }))
 
 // The vision detail navigates to Settings → Models via useNavigate; spy on it
@@ -130,6 +136,7 @@ async function renderChannels(query = '') {
 }
 
 beforeEach(() => {
+  $activeGatewayProfile.set('default')
   getSkills.mockResolvedValue([])
   getToolsets.mockResolvedValue([toolset()])
   setToolsetEnabled.mockResolvedValue({ ok: true, name: 'web', enabled: false })
@@ -142,6 +149,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+  $activeGatewayProfile.set('default')
   // Shared singleton client — drop cached skills/toolsets so each test refetches.
   queryClient.clear()
 })
@@ -277,5 +285,48 @@ describe('ChannelsTab channel boundaries', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Telegram' })).toHaveProperty('disabled', false)
     )
+  })
+
+  it('ignores a prior profile save while the active profile is saving', async () => {
+    const primary = channelCapability({ label: 'Primary Email', platform: 'email' })
+    const review = channelCapability({ label: 'Review Telegram', platform: 'telegram' })
+    getChannelCapabilities.mockImplementation(() =>
+      Promise.resolve($activeGatewayProfile.get() === 'review' ? [review] : [primary])
+    )
+
+    let finishPrimary: (() => void) | undefined
+    let finishReview: (() => void) | undefined
+    updateChannelCapabilities.mockImplementation(platform =>
+      new Promise<void>(resolve => {
+        if (platform === 'email') {
+          finishPrimary = resolve
+        } else {
+          finishReview = resolve
+        }
+      })
+    )
+
+    await renderChannels()
+    fireEvent.click(await screen.findByRole('button', { name: 'Save abilities' }))
+    await waitFor(() => expect(updateChannelCapabilities).toHaveBeenCalledTimes(1))
+
+    await act(async () => {
+      $activeGatewayProfile.set('review')
+    })
+    await screen.findByRole('button', { name: 'Review Telegram' })
+
+    const reviewSave = screen.getByRole('button', { name: 'Save abilities' })
+    expect(reviewSave).toHaveProperty('disabled', false)
+    fireEvent.click(reviewSave)
+    await waitFor(() => expect(updateChannelCapabilities).toHaveBeenCalledTimes(2))
+
+    finishPrimary?.()
+    await waitFor(() => expect(reviewSave).toHaveProperty('disabled', true))
+    expect(screen.getByRole('button', { name: 'Review Telegram' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Primary Email' })).toBeNull()
+    expect(notify).not.toHaveBeenCalled()
+
+    finishReview?.()
+    await waitFor(() => expect(reviewSave).toHaveProperty('disabled', false))
   })
 })
