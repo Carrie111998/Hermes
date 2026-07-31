@@ -1,6 +1,7 @@
 """Tests for toolsets.py — toolset resolution, validation, and composition."""
 
 from tools.registry import ToolRegistry
+from tools.web_tools import WEB_EXTRACT_SCHEMA
 from toolsets import (
     TOOLSETS,
     get_toolset,
@@ -26,6 +27,11 @@ def _make_schema(name: str, description: str = "test tool"):
 
 
 class TestGetToolset:
+    def test_web_extract_schema_does_not_reference_unavailable_browser_tool(self):
+        description = WEB_EXTRACT_SCHEMA["description"]
+        assert "browser tool" not in description
+        assert "do not claim the page was extracted" in description
+
     def test_known_toolset(self):
         ts = get_toolset("web")
         assert ts is not None
