@@ -74,6 +74,7 @@ def _run_workspace_git(
     timeout: float = 30.0,
 ) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",

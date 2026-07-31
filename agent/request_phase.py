@@ -245,6 +245,7 @@ _ACTIVE_TURN_POLICY: ContextVar[Optional[TurnPolicy]] = ContextVar(
 
 def _run_git(args: list[str]) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
         "capture_output": True,
         "text": True,
         "encoding": "utf-8",

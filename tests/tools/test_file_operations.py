@@ -507,8 +507,9 @@ class TestPatchReplacePostWriteVerification:
             "Silent persistence failure must surface as error, got: "
             f"success={result.success}, diff={result.diff}"
         )
-        assert "verification failed" in result.error.lower()
-        assert "did not persist" in result.error.lower()
+        assert "post-write verification failed" in result.error.lower()
+        assert "write outcome is unknown" in result.error.lower()
+        assert "re-read the file before retrying" in result.error.lower()
 
 
     def test_patch_replace_fails_when_verify_read_errors(self, mock_env):
@@ -536,7 +537,9 @@ class TestPatchReplacePostWriteVerification:
         ops = ShellFileOperations(mock_env)
         result = ops.patch_replace("/tmp/test/a.py", "hello", "hi")
         assert result.error is not None
-        assert "could not re-read" in result.error.lower()
+        assert "post-write verification failed" in result.error.lower()
+        assert "write outcome is unknown" in result.error.lower()
+        assert "re-read the file before retrying" in result.error.lower()
 
 
 # =========================================================================
