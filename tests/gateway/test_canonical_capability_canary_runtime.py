@@ -725,6 +725,7 @@ def test_plan_renders_exact_model_owned_first_wave():
         "background_review_enabled": False,
         "verification_ledger_enabled": False,
         "verify_on_stop": False,
+        "disabled_toolsets": ["bfl"],
     }
     assert config["tools"] == {"tool_search": {"enabled": "off"}}
     assert all(

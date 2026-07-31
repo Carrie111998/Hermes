@@ -329,7 +329,7 @@ def _validate_node_lock(release: Path) -> Mapping[str, Any]:
         raise RuntimeDependencyError("runtime_dependency_node_lock_invalid") from exc
     item = lock.get("packages", {}).get("node_modules/agent-browser", {})
     if (
-        package.get("dependencies", {}).get("agent-browser") != "^0.26.0"
+        package.get("dependencies", {}).get("agent-browser") != AGENT_BROWSER_VERSION
         or item.get("version") != AGENT_BROWSER_VERSION
         or item.get("integrity") != AGENT_BROWSER_INTEGRITY
         or item.get("bin") != {"agent-browser": "bin/agent-browser.js"}
