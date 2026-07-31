@@ -29,6 +29,11 @@ RUN apk add --no-cache \
     bash-completion \
     jq
 
+WORKDIR /opt/hermes
+
+# Non-root user for runtime (must exist before any chown)
+RUN adduser -u 10000 -D -h /opt/hermes hermes
+
 # Nginx setup
 RUN mkdir -p /run/nginx /var/log/nginx /var/www && \
     chown -R hermes:hermes /run/nginx /var/log/nginx /var/www /etc/nginx
@@ -42,10 +47,6 @@ ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 ENV HERMES_TUI_DIR=/opt/hermes/ui-tui
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
-
-WORKDIR /opt/hermes
-# Non-root user for runtime
-RUN adduser -u 10000 -D -h /opt/hermes hermes
 
 
 # Layer-cached dependency install
