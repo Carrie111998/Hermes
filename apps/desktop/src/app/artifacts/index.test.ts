@@ -67,6 +67,27 @@ describe('collectArtifactsForSession', () => {
     })
   })
 
+  it('converts unix-seconds message timestamps to milliseconds for display', () => {
+    const artifacts = collectArtifactsForSession(makeSession({ last_active: 1, started_at: 1 }), [
+      {
+        content: 'https://example.com/ms',
+        role: 'assistant',
+        timestamp: 1785496833
+      }
+    ])
+
+    expect(artifacts[0].timestamp).toBe(1785496833000)
+  })
+
+  it('falls back to session timestamps (seconds) when a message has none', () => {
+    const artifacts = collectArtifactsForSession(
+      makeSession({ last_active: 1785496000, started_at: 1785490000 }),
+      [{ content: 'https://example.com/fallback', role: 'assistant' }]
+    )
+
+    expect(artifacts[0].timestamp).toBe(1785496000000)
+  })
+
   it('resolves remote image artifact thumbnails through the desktop fs bridge', async () => {
     const api = vi.fn(async ({ path }: { path: string }) => {
       if (path.startsWith('/api/fs/read-data-url?')) {

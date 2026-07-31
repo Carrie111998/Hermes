@@ -273,7 +273,7 @@ export function collectArtifactsForSession(session: SessionInfo, messages: Sessi
         label: artifactLabel(value),
         sessionId: session.id,
         sessionTitle: title,
-        timestamp: message.timestamp || session.last_active || session.started_at || Date.now()
+        timestamp: Math.round((message.timestamp || session.last_active || session.started_at || Date.now() / 1000) * 1000)
       })
     })
   }
