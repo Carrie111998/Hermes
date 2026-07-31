@@ -1,8 +1,8 @@
 ---
 name: x402engine
-description: Discover and buy x402 pay-per-call APIs through the x402engine MCP.
+description: Discover and buy pay-per-call APIs with USDC.
 version: 0.1.0
-author: x402engine, Hermes Agent
+author: __agentc1__ (@agentc22), Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
