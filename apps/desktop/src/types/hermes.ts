@@ -767,19 +767,26 @@ export interface AnalyticsTotals {
 export interface CronJob {
   deliver?: null | string
   enabled: boolean
+  enabled_toolsets?: null | string[]
   id: string
   last_error?: null | string
+  last_status?: null | string
   last_run_at?: null | string
   model?: null | string
   name?: null | string
   next_run_at?: null | string
   no_agent?: boolean
+  paused_reason?: null | string
   prompt?: null | string
   provider?: null | string
+  repeat?: null | { completed?: null | number; times?: null | number }
   schedule?: CronJobSchedule
   schedule_display?: null | string
+  skill?: null | string
+  skills?: string[]
   script?: null | string
   state?: null | string
+  workdir?: null | string
 }
 
 export interface CronJobCreatePayload {

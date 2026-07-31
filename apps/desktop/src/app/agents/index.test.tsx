@@ -94,4 +94,30 @@ describe('AgentsView local agents board', () => {
     expect(within(article!).getByText('openai/gpt-5.5')).toBeTruthy()
     expect(within(article!).getByText('script')).toBeTruthy()
   })
+
+  it('adds custom known-job affordances while preserving metadata fallback details', async () => {
+    vi.mocked(getProfiles).mockResolvedValue({ profiles: [profile('default', true)] })
+    vi.mocked(getCronJobs).mockResolvedValue([
+      cronJob({
+        enabled_toolsets: ['terminal', 'file'],
+        id: '2637149857cd',
+        last_status: 'ok',
+        name: 'local-agents-ui-driver-loop',
+        prompt: 'You are el-zachariah running a durable goal loop for zo-el.',
+        repeat: { completed: 5, times: 240 },
+        skills: ['github-workflows'],
+        workdir: '/home/zachariah/.hermes/hermes-agent'
+      })
+    ])
+
+    await renderAgentsView()
+
+    const article = (await screen.findByText('2637149857cd')).closest('article')
+    expect(article).not.toBeNull()
+    expect(within(article!).getByText('Driver loop')).toBeTruthy()
+    expect(within(article!).getByText(/produce progress, controlled wait, blocker, or terminal done/i)).toBeTruthy()
+    expect(within(article!).getByText(/5\/240 runs/)).toBeTruthy()
+    expect(within(article!).getByText(/tools: terminal, file/)).toBeTruthy()
+    expect(within(article!).getByText(/skills: github-workflows/)).toBeTruthy()
+  })
 })

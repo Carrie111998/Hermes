@@ -139,6 +139,99 @@ function modelText(job: CronJob, a: Translations['agents']): string {
   return [asText(job.provider).trim(), asText(job.model).trim()].filter(Boolean).join('/') || a.defaultModel
 }
 
+type CronJobViewKind =
+  | 'attention'
+  | 'driver'
+  | 'inbox'
+  | 'revenue'
+  | 'sentinel'
+  | 'trading'
+  | 'watchdog'
+  | 'default'
+
+const CUSTOM_JOB_VIEW: Record<Exclude<CronJobViewKind, 'default'>, { accent: string; description: string; label: string }> = {
+  attention: {
+    accent: 'border-sky-500/35 bg-sky-500/10 text-sky-700 dark:text-sky-300',
+    description: 'Attention monitor: verify live notifications/review requests before taking action.',
+    label: 'GitHub attention'
+  },
+  driver: {
+    accent: 'border-violet-500/35 bg-violet-500/10 text-violet-700 dark:text-violet-300',
+    description: 'Durable driver loop: produce progress, controlled wait, blocker, or terminal done.',
+    label: 'Driver loop'
+  },
+  inbox: {
+    accent: 'border-cyan-500/35 bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+    description: 'Inbox monitor: private metadata triage with action-only reporting.',
+    label: 'Inbox monitor'
+  },
+  revenue: {
+    accent: 'border-emerald-500/35 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+    description: 'Revenue loop: track concrete customer/revenue progress and human-only gates.',
+    label: 'Revenue operator'
+  },
+  sentinel: {
+    accent: 'border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+    description: 'Sentinel/guard: script-only health checks should stay silent unless state changes.',
+    label: 'Sentinel guard'
+  },
+  trading: {
+    accent: 'border-orange-500/35 bg-orange-500/10 text-orange-700 dark:text-orange-300',
+    description: 'Paper research lane: read-only/paper-only market experiments and summaries.',
+    label: 'Paper trading research'
+  },
+  watchdog: {
+    accent: 'border-rose-500/35 bg-rose-500/10 text-rose-700 dark:text-rose-300',
+    description: 'Watchdog: self-heal or alert only on concrete health changes.',
+    label: 'Watchdog'
+  }
+}
+
+function jobViewKind(job: CronJob): CronJobViewKind {
+  const text = [job.name, job.prompt, job.script, job.skill, ...(job.skills ?? [])].filter(Boolean).join(' ').toLowerCase()
+
+  if (text.includes('driver loop') || text.includes('active project driver') || text.includes('durable goal loop')) {
+    return 'driver'
+  }
+
+  if (text.includes('github') && (text.includes('attention') || text.includes('review') || text.includes('pr '))) {
+    return 'attention'
+  }
+
+  if (text.includes('proton') || text.includes('inbox') || text.includes('email')) {
+    return 'inbox'
+  }
+
+  if (text.includes('first-dollar') || text.includes('revenue') || text.includes('customer acquisition')) {
+    return 'revenue'
+  }
+
+  if (text.includes('sentinel') || text.includes('health guard') || text.includes('monitor.sh')) {
+    return 'sentinel'
+  }
+
+  if (text.includes('polymarket') || text.includes('paper-only') || text.includes('trader')) {
+    return 'trading'
+  }
+
+  if (text.includes('watchdog') || text.includes('self-heal')) {
+    return 'watchdog'
+  }
+
+  return 'default'
+}
+
+function repeatText(job: CronJob): string {
+  const completed = job.repeat?.completed
+  const times = job.repeat?.times
+
+  if (completed === undefined && times === undefined) {
+    return ''
+  }
+
+  return `${completed ?? 0}/${times ?? '∞'} runs`
+}
+
 function LocalAgentsBoard() {
   const { t } = useI18n()
   const a = t.agents
@@ -341,6 +434,15 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
   const state = jobState(job)
   const prompt = jobPrompt(job)
   const flags = [job.no_agent ? a.modeScriptOnly : '', job.script ? a.modeScript : ''].filter(Boolean)
+  const custom = jobViewKind(job)
+  const customView = custom === 'default' ? null : CUSTOM_JOB_VIEW[custom]
+  const meta = [
+    repeatText(job),
+    asText(job.last_status) ? `last: ${asText(job.last_status)}` : '',
+    job.enabled_toolsets?.length ? `tools: ${job.enabled_toolsets.join(', ')}` : '',
+    job.skills?.length ? `skills: ${job.skills.join(', ')}` : '',
+    asText(job.workdir) ? `cwd: ${asText(job.workdir)}` : ''
+  ].filter(Boolean)
 
   return (
     <article className="grid min-w-0 gap-3 rounded-lg border border-border/60 bg-muted/10 p-3">
@@ -355,6 +457,13 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
         </span>
       </div>
 
+      {customView ? (
+        <div className={cn('rounded-md border px-3 py-2 text-xs leading-relaxed', customView.accent)}>
+          <p className="font-semibold">{customView.label}</p>
+          <p className="mt-0.5 opacity-85">{customView.description}</p>
+        </div>
+      ) : null}
+
       <div className="grid gap-2 sm:grid-cols-2">
         <DetailStat label={a.statSchedule} value={scheduleText(job)} />
         <DetailStat label={a.statNextRun} value={formatDateTime(job.next_run_at)} />
@@ -364,6 +473,12 @@ function CronJobDefaultCard({ job }: { job: CronJob }) {
         <DetailStat label={a.statMode} value={flags.join(' · ') || a.modeAgent} />
       </div>
 
+      {meta.length > 0 ? <p className="text-[0.68rem] text-muted-foreground/70">{meta.join(' · ')}</p> : null}
+      {job.paused_reason ? (
+        <p className="rounded-md border border-amber-500/25 bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">
+          {job.paused_reason}
+        </p>
+      ) : null}
       {prompt ? <p className="line-clamp-3 text-xs leading-relaxed text-muted-foreground/80">{prompt}</p> : null}
       {job.last_error ? (
         <p className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">

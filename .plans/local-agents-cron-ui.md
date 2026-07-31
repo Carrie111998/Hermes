@@ -40,13 +40,19 @@ Tasks:
 
 ## Slice 3: custom views / cron optimizations
 Files likely:
-- `apps/desktop/src/app/agents/cron-job-views.tsx` (new)
-- `cron/suggestion_catalog.py` or job metadata producers only if needed.
+- `apps/desktop/src/app/agents/index.tsx`
+- `apps/desktop/src/types/hermes.ts`
+- `cron/suggestion_catalog.py` or job metadata producers only if needed later.
 
 Tasks:
 - Detect known local cron patterns by stable metadata (`script`, `skills`, `name`, `schedule.kind`, `no_agent`).
 - Add custom renderers for known built-ins such as curator/skill maintenance, gateway health, inbox urgency classifiers, and software durable-goal loops when metadata is present.
 - If metadata is insufficient, add non-breaking backend fields that make custom views stable without parsing prompts.
+
+Implemented in the first PR slice where feasible:
+- Added typed cron metadata fields already emitted by `jobs.json`: `skills`, `skill`, `enabled_toolsets`, `repeat`, `workdir`, `last_status`, and `paused_reason`.
+- Added default metadata rows for repeat progress, last status, toolsets, skills, and workdir.
+- Added lightweight custom cards for detected driver loops, GitHub attention monitors, inbox monitors, revenue operators, sentinel guards, paper trading research, and watchdogs. These are intentionally pattern-based until backend job categories exist; unknown jobs continue to get the default card.
 
 ## Review gate
 Open a GitHub PR per slice when repository permission allows, request el-micaiah review, fix requested changes, merge only after approval/mergeability/check verification.
