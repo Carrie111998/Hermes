@@ -9160,10 +9160,25 @@ _IMPORT_INJECTION_ENV_VARS = (
 
 
 def _scrubbed_worker_env(env: dict) -> dict:
-    """Return ``env`` without import-injection variables."""
+    """Return ``env`` with safe import semantics pinned.
+
+    Scrubbing the injection variables is not enough for the ``python -m
+    hermes_cli.main`` fallback: CPython puts the current directory on
+    ``sys.path`` for ``-m``, and the worker's cwd *is* its own worktree, which
+    it may legitimately write to. A planted ``hermes_cli/main.py`` would then
+    be imported instead of the trusted install — forging the attestation with
+    the fresh nonce and afterwards running as an unsecured worker.
+
+    ``PYTHONSAFEPATH`` (CPython 3.11+) removes that implicit entry. It is set
+    for the gated worker and its attestation alike, so the proof and the thing
+    it proves execute under identical import semantics; the attestation also
+    requires the verdict to *report* safe-path as active rather than assuming
+    the interpreter honoured it.
+    """
     scrubbed = dict(env)
     for name in _IMPORT_INJECTION_ENV_VARS:
         scrubbed.pop(name, None)
+    scrubbed["PYTHONSAFEPATH"] = "1"
     return scrubbed
 
 
@@ -9341,6 +9356,12 @@ def _attest_worker_admission_hook_armed(
         raise RuntimeError(
             "worker AI Factory admission hook attestation failed the challenge "
             "nonce; the verdict is stale, replayed or forged"
+        )
+    if verdict.get("safe_path") is not True:
+        raise RuntimeError(
+            "worker attestation ran without CPython safe-path import "
+            "semantics; the workspace could shadow the trusted install, so "
+            "the verdict proves nothing"
         )
     worker_tree = verdict.get("tree")
     if not worker_tree or Path(worker_tree).resolve() != Path(dispatcher_tree).resolve():

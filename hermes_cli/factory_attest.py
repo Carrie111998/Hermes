@@ -76,6 +76,10 @@ def build_verdict(nonce: str) -> dict:
         "tree": None,
         "executable": sys.executable,
         "prefix": sys.prefix,
+        # Reported, never assumed: the dispatcher refuses a verdict produced
+        # without safe-path semantics, because the worker's own worktree would
+        # then be able to shadow the trusted install.
+        "safe_path": bool(getattr(sys.flags, "safe_path", False)),
         "error": None,
     }
     try:

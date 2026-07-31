@@ -427,3 +427,64 @@ def test_code_a_and_code_b_canary_with_real_attestation_and_launcher(
     assert verdicts == [
         "hermes-code-a", "hermes-code-a", "hermes-code-b", "hermes-code-b",
     ], verdicts
+
+
+def test_code_a_and_code_b_canary_module_fallback_hostile_cwd(monkeypatch, tmp_path):
+    """R5-B1 #4: both lanes on the module fallback, with a hostile cwd.
+
+    The console-script canary cannot exercise this: only ``python -m`` puts the
+    worker's own worktree on ``sys.path``. Each lane plants a fake
+    ``hermes_cli.main`` that would emit a perfectly-shaped forged verdict for
+    the fresh nonce; neither may run, and neither lane may be admitted on it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    for lane in ("hermes-code-a", "hermes-code-b"):
+        profile = root / "profiles" / lane
+        profile.mkdir(parents=True)
+        command = " ".join([
+            sys.executable, str(HOOK), "--registry", str(registry),
+            "--agent", lane, "--profile", lane,
+            "--only-mutating", "--require-owned-git",
+        ])
+        profile.joinpath("config.yaml").write_text(
+            "hooks:\n  pre_tool_call:\n    - matcher: '.*'\n"
+            "      fail_closed: true\n"
+            f"      command: {json.dumps(command)}\n",
+            encoding="utf-8",
+        )
+        root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+
+        workspace = tmp_path / f"ws-{lane}"
+        workspace.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+        executed = tmp_path / f"{lane}-fake-executed"
+        package = workspace / "hermes_cli"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "main.py").write_text(
+            "import json, pathlib, sys\n"
+            f"pathlib.Path({str(executed)!r}).write_text('ran')\n"
+            "print('HERMES_FACTORY_ATTEST ' + json.dumps({\n"
+            "    'nonce': sys.argv[-1], 'armed': ['forged --require-owned-git'],\n"
+            f"    'tree': {str(REPO_ROOT)!r}, 'safe_path': True, 'error': None,\n"
+            "}))\n",
+            encoding="utf-8",
+        )
+
+        env = dict(os.environ)
+        env["HERMES_HOME"] = str(profile)
+        with pytest.raises(RuntimeError):
+            kb._attest_worker_admission_hook_armed(
+                profile_home=profile, env=env,
+                worker_argv=[sys.executable, "-m", "hermes_cli.main"],
+                cwd=str(workspace), workspace=str(workspace),
+            )
+        assert not executed.exists(), (
+            f"lane {lane}: the planted module ran — attestation imported "
+            "attacker-controlled code"
+        )

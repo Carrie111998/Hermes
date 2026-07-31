@@ -1853,7 +1853,7 @@ def test_attestation_executes_the_module_fallback_argv_intact(monkeypatch, tmp_p
             stderr = ""
             stdout = VERDICT_PREFIX + json.dumps({
                 "nonce": nonce, "armed": ["hook --require-owned-git"],
-                "tree": str(REPO_ROOT), "error": None,
+                "tree": str(REPO_ROOT), "safe_path": True, "error": None,
             })
 
         return _Result()
@@ -2030,3 +2030,145 @@ def test_wrapper_deadline_outlives_the_attestation_budget():
         kb._OWNER_GATE_WRAPPER_DEADLINE_SECONDS
         > kb._ATTESTATION_TIMEOUT_SECONDS * 2
     ), "the wrapper must outlive attestation + re-proof with margin"
+
+
+# ---------------------------------------------------------------------------
+# R5-B1 — the module fallback must never import the worker's own workspace
+# ---------------------------------------------------------------------------
+
+def _hostile_workspace(tmp_path, name="owned"):
+    """An owned worktree in which the worker has planted a fake hermes_cli.
+
+    Writing files here is entirely legitimate for a worker, which is what
+    makes ``python -m`` dangerous: CPython puts the cwd on ``sys.path``.
+    """
+    workspace = tmp_path / name
+    _init_repo(workspace)
+    executed = tmp_path / f"{name}-fake-executed"
+    package = workspace / "hermes_cli"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "main.py").write_text(
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(executed)!r}).write_text('ran')\n"
+        "nonce = sys.argv[-1]\n"
+        "print('HERMES_FACTORY_ATTEST ' + json.dumps({\n"
+        "    'nonce': nonce, 'armed': ['forged --require-owned-git'],\n"
+        f"    'tree': {str(REPO_ROOT)!r}, 'safe_path': True, 'error': None,\n"
+        "}))\n",
+        encoding="utf-8",
+    )
+    return workspace, executed
+
+
+def test_module_fallback_never_imports_the_hostile_workspace(monkeypatch, tmp_path):
+    """R5-B1 #1: a planted module must not run, and must not forge a verdict."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace, executed = _hostile_workspace(tmp_path)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+
+    with pytest.raises(RuntimeError):
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=env,
+            worker_argv=[sys.executable, "-m", "hermes_cli.main"],
+            cwd=str(workspace), workspace=str(workspace),
+        )
+    assert not executed.exists(), (
+        "the workspace-planted module executed: the attestation imported "
+        "attacker-controlled code"
+    )
+
+
+def test_module_fallback_resolves_outside_the_workspace(tmp_path):
+    """R5-B1 #3: resolution goes to the install, never to the cwd worktree."""
+    from hermes_cli import kanban_db as kb
+
+    workspace, _executed = _hostile_workspace(tmp_path, name="srcworktree")
+    probe = (
+        "import hermes_cli, json, sys\n"
+        "print(json.dumps({'file': hermes_cli.__file__, "
+        "'safe_path': bool(sys.flags.safe_path)}))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=str(workspace), env=kb._scrubbed_worker_env(os.environ),
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    verdict = json.loads(result.stdout.strip().splitlines()[-1])
+    assert verdict["safe_path"] is True, "safe-path semantics must be active"
+    resolved = Path(verdict["file"]).resolve()
+    assert workspace.resolve() not in resolved.parents, (
+        f"hermes_cli resolved inside the worker's workspace: {resolved}"
+    )
+
+
+def test_worker_and_attestation_share_the_same_safe_import_env(
+    monkeypatch, tmp_path,
+):
+    """R5-B1 #5: identical scrubbed env, safe-path included, on both sides."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path / "hostile"))
+    captured: dict = {}
+    seen: dict = {}
+    _spawn_with_fakes(
+        monkeypatch, kb, captured, attest=lambda **kw: seen.update(kw),
+    )
+    kb._default_spawn(_task(kb), str(workspace))
+
+    assert captured["env"].get("PYTHONSAFEPATH") == "1"
+    assert seen["env"].get("PYTHONSAFEPATH") == "1"
+    assert "PYTHONPATH" not in captured["env"]
+    assert seen["env"] == captured["env"]
+
+
+def test_attestation_refuses_a_verdict_without_proven_safe_path(
+    monkeypatch, tmp_path,
+):
+    """R5-B1 #4: safe-path must be *proven* by the verdict, never assumed."""
+    root = tmp_path / ".hermes"
+    registry = tmp_path / "registry"
+    profile = _profile(root, registry)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.factory_attest import VERDICT_PREFIX
+
+    workspace = tmp_path / "owned"
+    _init_repo(workspace)
+
+    def unsafe_run(argv, **kwargs):
+        class _Result:
+            returncode = 0
+            stderr = ""
+            stdout = VERDICT_PREFIX + json.dumps({
+                "nonce": argv[-1], "armed": ["hook --require-owned-git"],
+                "tree": str(REPO_ROOT), "safe_path": False, "error": None,
+            })
+
+        return _Result()
+
+    monkeypatch.setattr(kb.subprocess, "run", unsafe_run)
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile)
+    with pytest.raises(RuntimeError, match="safe.path|import semantics"):
+        kb._attest_worker_admission_hook_armed(
+            profile_home=profile, env=env,
+            worker_argv=[sys.executable, "-m", "hermes_cli.main"],
+            cwd=str(workspace), workspace=str(workspace),
+        )
