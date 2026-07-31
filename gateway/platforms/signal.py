@@ -268,6 +268,34 @@ class SignalAdapter(BasePlatformAdapter):
             self.poll_interval = 1.0
         self.ignore_stories = extra.get("ignore_stories", True)
 
+        # signal-cli-rest-api supports two transport shapes:
+        #   ``native``         — REST only. Inbound: ``GET /v1/receive/{number}``
+        #                       polling. Outbound: ``POST /v2/send``.
+        #   ``json-rpc``       — WebSocket inbound (subscribeReceive), JSON-RPC
+        #                       outbound via ``POST /v1/rpc``.
+        # Operators pick the mode when they start the daemon (``MODE=native``
+        # / ``MODE=json-rpc`` in the docker-compose env). Hermes auto-detects
+        # by probing ``GET /v1/about`` and ``GET /v1/receive/{number}`` during
+        # ``connect()``; the result is cached on ``self.transport_mode`` so the
+        # rest of the adapter picks the right outbound URL. ``native`` is the
+        # default for the docker-compose default (``MODE=native``).
+        _mode_cfg = (extra.get("transport_mode") or "auto").lower()
+        self._transport_mode_cfg = _mode_cfg  # remembered for connect()
+        self.transport_mode: str = "native"   # set during connect()
+        # Outbound path for the active mode. ``/v2/send`` is the REST endpoint
+        # for ``MODE=native``; ``/v1/rpc`` is the JSON-RPC endpoint used by
+        # both ``MODE=json-rpc`` and ``MODE=normal`` (#71636 / #71884
+        # reviewer feedback: PR was retargeting every outbound JSON-RPC method
+        # without picking the right route for the active transport mode).
+        # Seed from the operator override so tests that don't call
+        # ``connect()`` (or operators who skip the probe) still hit the
+        # right URL out of the box.
+        if _mode_cfg in ("native", "json-rpc", "jsonrpc"):
+            self.transport_mode = "native" if _mode_cfg == "native" else "json-rpc"
+        self._outbound_path: str = (
+            "/v2/send" if self.transport_mode == "native" else "/v1/rpc"
+        )
+
         # Parse allowlists — group policy is derived from presence of group allowlist
         group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
         self.group_allow_from = set(_parse_comma_list(group_allowed_str))
@@ -372,6 +400,14 @@ class SignalAdapter(BasePlatformAdapter):
                 logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
                 return False
 
+            # Detect transport mode so outbound picks the right route
+            # (``/v2/send`` for ``MODE=native``; ``/v1/rpc`` for
+            # ``MODE=json-rpc``). Without this, every outbound message in a
+            # ``MODE=native`` deployment would silently fail at ``/v1/rpc``
+            # (404 on the native server, which doesn't speak JSON-RPC).
+            # (#71636 / #71884 reviewer feedback.)
+            self.transport_mode, self._outbound_path = await self._detect_transport_mode()
+
             self._running = True
             self._receive_task = asyncio.create_task(self._receive_loop())
             self._health_monitor_task = asyncio.create_task(self._health_monitor())
@@ -420,6 +456,83 @@ class SignalAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Polling (inbound messages)
     # ------------------------------------------------------------------
+
+    async def _detect_transport_mode(self) -> Tuple[str, str]:
+        """Probe the daemon and decide which transport shape it speaks.
+
+        Returns ``(transport_mode, outbound_path)``:
+
+        - ``("native", "/v2/send")`` — ``MODE=native`` docker image.
+          Inbound: ``GET /v1/receive/{number}`` (polling, this PR's primary
+          path). Outbound: ``POST /v2/send`` (the REST endpoint documented
+          for native mode).
+        - ``("json-rpc", "/v1/rpc")`` — ``MODE=json-rpc`` docker image.
+          Outbound uses JSON-RPC over HTTP. Inbound is over a WebSocket
+          channel that this adapter does NOT speak yet; if we land here,
+          ``connect()`` should already have warned the operator.
+
+        The user can override the probe by setting ``transport_mode`` in
+        the platform config (``native`` / ``json-rpc``). ``auto`` (default)
+        is the probe path described below.
+
+        Probe order:
+        1. Operator override wins (no network round-trip).
+        2. ``GET /v1/about`` — 200 indicates a working REST API; we then
+           check ``GET /v1/receive/{number}``. If it returns 200 (even
+           with ``[]`` body), it's ``native`` mode. 404 means the receive
+           endpoint is gated by json-rpc — fall through to json-rpc.
+        3. ``OPTIONS /v1/receive/{number}`` — 200 / 405 with an Allow header
+           that *lacks* ``GET`` indicates json-rpc-only mode.
+        4. Fallback: ``native`` (most common docker-compose default), with
+           a warning logged so the operator notices when the assumption is
+           wrong.
+
+        See signal-cli-rest-api docs (bbernhard) and #71636 / #71884
+        reviewer feedback for the route layout.
+        """
+        cfg_mode = getattr(self, "_transport_mode_cfg", "auto")
+        if cfg_mode in ("native", "json-rpc", "jsonrpc"):
+            chosen = "native" if cfg_mode == "native" else "json-rpc"
+            outbound = "/v2/send" if chosen == "native" else "/v1/rpc"
+            logger.info(
+                "Signal transport mode locked by config: %s (outbound %s)",
+                chosen, outbound,
+            )
+            return chosen, outbound
+
+        try:
+            about = await self.client.get(f"{self.http_url}/v1/about", timeout=5.0)
+            if about.status_code == 200:
+                # REST is up. Probe the receive endpoint specifically.
+                rcv_url = f"{self.http_url}/v1/receive/{quote(self.account, safe='')}"
+                rcv = await self.client.get(rcv_url, timeout=5.0)
+                if rcv.status_code == 200:
+                    logger.info(
+                        "Signal transport detected: native "
+                        "(REST /v1/about + /v1/receive both 200); "
+                        "outbound will use /v2/send",
+                    )
+                    return "native", "/v2/send"
+                logger.info(
+                    "Signal transport detected: json-rpc "
+                    "(/v1/receive returned %d — endpoint gated by "
+                    "subscribeReceive WebSocket); outbound will use "
+                    "/v1/rpc. Inbound over WebSocket is not yet "
+                    "implemented by this adapter (#71636).",
+                    rcv.status_code,
+                )
+                return "json-rpc", "/v1/rpc"
+        except Exception as e:
+            logger.debug("Signal transport probe failed: %s", e)
+
+        # Conservative fallback: docker-compose default is native.
+        logger.warning(
+            "Signal transport mode probe inconclusive; defaulting to "
+            "native (outbound /v2/send). If your daemon runs MODE=json-rpc "
+            "set platforms.signal.extra.transport_mode: \"json-rpc\" in "
+            "config.yaml (#71636).",
+        )
+        return "native", "/v2/send"
 
     async def _receive_loop(self) -> None:
         """Poll signal-cli for inbound envelopes."""
@@ -894,8 +1007,16 @@ class SignalAdapter(BasePlatformAdapter):
         }
 
         try:
+            # Outbound route is mode-dependent: ``/v2/send`` for native,
+            # ``/v1/rpc`` for json-rpc. ``connect()`` sets
+            # ``self._outbound_path`` from the transport-mode probe so a
+            # single daemon deployment always lands on the right endpoint
+            # without operator intervention (#71636 / #71884 reviewer
+            # feedback: the previous code retargeted every JSON-RPC method
+            # to ``/v1/rpc`` even on native deployments where that path
+            # returns 404).
             resp = await self.client.post(
-                f"{self.http_url}/v1/rpc",
+                f"{self.http_url}{self._outbound_path}",
                 json=payload,
                 timeout=timeout,
             )

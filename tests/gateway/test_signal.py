@@ -23,8 +23,15 @@ def _reset_signal_scheduler():
 # Shared Helpers
 # ---------------------------------------------------------------------------
 
-def _make_signal_adapter(monkeypatch, account="+15551234567", **extra):
-    """Create a SignalAdapter with sensible test defaults."""
+def _make_signal_adapter(monkeypatch, account="+15551234567", transport_mode="json-rpc", **extra):
+    """Create a SignalAdapter with sensible test defaults.
+
+    ``transport_mode`` defaults to ``"json-rpc"`` so the legacy outbound
+    RPC tests (which assert ``POST /v1/rpc``) keep working without
+    operator intervention. Native-mode tests must pass
+    ``transport_mode="native"`` explicitly to verify the
+    ``/v2/send`` route (#71636 / #71884 reviewer feedback).
+    """
     monkeypatch.setenv("SIGNAL_GROUP_ALLOWED_USERS", extra.pop("group_allowed", ""))
     from gateway.platforms.signal import SignalAdapter
     config = PlatformConfig()
@@ -32,6 +39,7 @@ def _make_signal_adapter(monkeypatch, account="+15551234567", **extra):
     config.extra = {
         "http_url": "http://localhost:8080",
         "account": account,
+        "transport_mode": transport_mode,
         **extra,
     }
     return SignalAdapter(config)
@@ -1495,6 +1503,120 @@ class TestSignalOutboundRpcRoutes:
         assert send_calls[0]["payload"]["method"] == "send"
         assert send_calls[0]["payload"]["params"]["attachments"] == [str(file_path)]
         assert send_calls[0]["payload"]["params"]["message"] == "report"
+
+
+# ---------------------------------------------------------------------------
+# Transport-mode routing (#71636 / #71884):
+#   - ``MODE=native``  docker image → outbound ``POST /v2/send``,
+#     inbound ``GET /v1/receive/{number}`` polling.
+#   - ``MODE=json-rpc`` docker image → outbound ``POST /v1/rpc`` JSON-RPC,
+#     inbound over a WebSocket channel that this adapter does not yet speak.
+# The adapter picks the route automatically during ``connect()`` via
+# ``_detect_transport_mode()`` and the operator can lock the choice with
+# ``extra.transport_mode`` in config.yaml.
+# ---------------------------------------------------------------------------
+
+
+class TestSignalTransportModeDetection:
+    """Cover the mode-probe branches in ``_detect_transport_mode``."""
+
+    @pytest.mark.asyncio
+    async def test_native_mode_uses_v2_send(self, monkeypatch):
+        """``transport_mode="native"`` pins outbound to ``/v2/send``."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        adapter._stop_typing_indicator = AsyncMock()
+
+        captured = []
+
+        async def mock_post(url, **kwargs):
+            captured.append({"url": url, "payload": kwargs.get("json", {})})
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {"result": {"timestamp": 12345}}
+            return resp
+
+        adapter.client = MagicMock(post=AsyncMock(side_effect=mock_post))
+
+        result = await adapter.send(chat_id="+155****4567", content="hi")
+
+        assert result.success is True
+        assert len(captured) == 1
+        assert captured[0]["url"] == "http://localhost:8080/v2/send", (
+            f"native mode should post to /v2/send, got {captured[0]['url']!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_detect_mode_native_when_receive_endpoint_returns_200(self, monkeypatch):
+        """``GET /v1/receive/{number}`` returning 200 ⇒ native mode."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="auto")
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/v1/about"):
+                resp.status_code = 200
+            elif "/v1/receive/" in url:
+                resp.status_code = 200
+            else:
+                resp.status_code = 404
+            return resp
+
+        adapter.client = AsyncMock(get=fake_get)
+        mode, path = await adapter._detect_transport_mode()
+
+        assert mode == "native"
+        assert path == "/v2/send"
+
+    @pytest.mark.asyncio
+    async def test_detect_mode_jsonrpc_when_receive_endpoint_returns_404(self, monkeypatch):
+        """``GET /v1/receive/{number}`` returning 404 ⇒ json-rpc mode
+        (the receive endpoint is gated by the WebSocket subscribeReceive
+        channel in json-rpc deployments)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="auto")
+
+        async def fake_get(url, **kwargs):
+            resp = MagicMock()
+            if url.endswith("/v1/about"):
+                resp.status_code = 200
+            elif "/v1/receive/" in url:
+                resp.status_code = 404
+            else:
+                resp.status_code = 404
+            return resp
+
+        adapter.client = AsyncMock(get=fake_get)
+        mode, path = await adapter._detect_transport_mode()
+
+        assert mode == "json-rpc"
+        assert path == "/v1/rpc"
+
+    @pytest.mark.asyncio
+    async def test_detect_mode_explicit_native_override(self, monkeypatch):
+        """Config ``transport_mode="native"`` skips the probe entirely."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="native")
+        # Even with a client that would otherwise time out, the override wins.
+        adapter.client = MagicMock(get=AsyncMock(side_effect=AssertionError("probe should not run")))
+        mode, path = await adapter._detect_transport_mode()
+        assert mode == "native"
+        assert path == "/v2/send"
+
+    @pytest.mark.asyncio
+    async def test_detect_mode_falls_back_to_native_on_probe_failure(self, monkeypatch):
+        """When both /v1/about and /v1/receive fail (timeout, refused),
+        fall back to native (the docker-compose default) and log a
+        warning. The adapter will still attempt the native routes
+        (``/v2/send`` outbound + ``/v1/receive/{number}`` inbound polling)
+        so an operator on the most common deployment gets the right
+        behaviour without configuration (#71636)."""
+        adapter = _make_signal_adapter(monkeypatch, transport_mode="auto")
+
+        async def fake_get(url, **kwargs):
+            raise RuntimeError("connection refused")
+
+        adapter.client = AsyncMock(get=fake_get)
+        mode, path = await adapter._detect_transport_mode()
+        assert mode == "native"
+        assert path == "/v2/send"
 
 
 class TestRecentSentTimestampRing:
