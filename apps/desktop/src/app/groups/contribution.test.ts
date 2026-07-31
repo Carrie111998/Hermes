@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { registry } from '@/contrib/registry'
 
-import { contributedRoutes, ROUTES_AREA, SIDEBAR_NAV_AREA } from '../routes'
+import { contributedRoutes, ROUTES_AREA, routeSessionId, SIDEBAR_NAV_AREA } from '../routes'
 
 import { GROUP_CONTRIBUTIONS } from './contribution'
 
@@ -30,6 +30,8 @@ describe('group chat contributions', () => {
 
     try {
       expect(contributedRoutes().map(route => route.path)).toEqual(expect.arrayContaining(['/groups', '/groups/:roomId']))
+      expect(routeSessionId('/groups/room')).toBeNull()
+      expect(routeSessionId('/groups/room/extra')).toBeNull()
     } finally {
       dispose()
     }

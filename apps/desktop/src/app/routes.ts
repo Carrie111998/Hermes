@@ -1,5 +1,6 @@
 import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
+import { matchPath } from 'react-router-dom'
 
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { registry } from '@/contrib/registry'
@@ -102,18 +103,7 @@ export function contributedRoutes(): Array<{ key: string; path: string; title?: 
 }
 
 function isContributedPath(pathname: string): boolean {
-  return contributedRoutes().some(route => {
-    const parameterIndex = route.path.indexOf('/:')
-
-    if (parameterIndex !== -1 && parameterIndex === route.path.lastIndexOf('/')) {
-      const base = route.path.slice(0, parameterIndex)
-      const suffix = pathname.startsWith(`${base}/`) ? pathname.slice(base.length + 1) : ''
-
-      return Boolean(suffix && !suffix.includes('/'))
-    }
-
-    return route.path === pathname
-  })
+  return contributedRoutes().some(route => Boolean(matchPath({ path: route.path, end: true }, pathname)))
 }
 
 // ── Contributed sidebar nav — the `sidebar.nav` registry area ────────────────
