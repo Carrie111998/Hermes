@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import re
 import secrets
 import sqlite3
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing, write_txn
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -42,12 +43,105 @@ from hermes_constants import get_hermes_home
 
 
 def projects_db_path() -> Path:
-    """The per-profile projects DB path (``$HERMES_HOME/projects.db``).
+    """The machine-level projects DB path (``<process HERMES_HOME>/projects.db``).
 
-    Profile-aware: ``get_hermes_home()`` already points at the active profile's
-    home. Tests pass an explicit ``db_path`` to :func:`connect`.
+    Projects are intentionally shared across profiles (a Project may *bind*
+    a kanban board and span every profile's session history) so the store
+    resolves the *process* Hermes home — the value the gateway / agent
+    backend / CLI subprocess were launched with — instead of the active
+    profile's home. ``get_process_hermes_home()`` ignores the per-request
+    ``set_hermes_home_override()`` context so a profile-switch mid-session
+    does not move the projects DB on disk (#75308).
+
+    On startup, if a legacy per-profile DB already has projects and the
+    machine-level DB is empty, copy the legacy store into place so existing
+    installs (which created Projects before this fix) keep their data.
+    The copy runs lazily on first access; subsequent reads land on the
+    machine-level file. Idempotent — second call is a no-op.
+
+    Tests pass an explicit ``db_path`` to :func:`connect` to skip resolution.
     """
-    return get_hermes_home() / "projects.db"
+    path = get_process_hermes_home() / "projects.db"
+    _migrate_legacy_per_profile_db(path)
+    return path
+
+# Cache migration attempts per process so subsequent calls are a cheap no-op.
+_LEGACY_MIGRATION_DONE: set[str] = set()
+
+
+def _legacy_per_profile_db_path() -> Path | None:
+    """Return the legacy per-profile projects DB path, if it differs from the
+    machine-level path. ``None`` when the active profile IS the process home
+    (no migration needed) so a test running with the default profile never
+    moves its own DB on disk.
+    """
+    try:
+        process_home = get_process_hermes_home()
+    except Exception:
+        return None
+    try:
+        profile_home = get_hermes_home()
+    except Exception:
+        return None
+    if process_home.resolve() == profile_home.resolve():
+        return None
+    return profile_home / "projects.db"
+
+
+def _migrate_legacy_per_profile_db(target: Path) -> None:
+    """Copy a legacy per-profile ``projects.db`` into the machine-level home
+    the first time it is needed (#75308). Safe to call repeatedly: the
+    ``_LEGACY_MIGRATION_DONE`` cache, the empty-target check, and the
+    ``shutil.copy2`` short-circuit make repeat calls a cheap no-op.
+
+    Only copies when:
+      * the legacy file exists and is non-empty, and
+      * the target file does not exist, and
+      * the legacy DB has at least one row in ``projects`` (skips empty
+        legacy stores — those would just shadow a populated machine-level
+        store created by another profile).
+    """
+    # ``os.path.realpath`` follows symlinks so /tmp vs /private/tmp land on
+    # the same cache entry (macOS resolves /tmp -> /private/tmp); a plain
+    # ``Path.resolve()`` would produce two different keys for the same file
+    # and re-trigger the copy.
+    target_key = os.path.realpath(target)
+    if target_key in _LEGACY_MIGRATION_DONE:
+        return
+    legacy = _legacy_per_profile_db_path()
+    if legacy is None:
+        _LEGACY_MIGRATION_DONE.add(target_key)
+        return
+    try:
+        if not legacy.exists() or legacy.stat().st_size == 0:
+            _LEGACY_MIGRATION_DONE.add(target_key)
+            return
+        if target.exists():
+            _LEGACY_MIGRATION_DONE.add(target_key)
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Cheap row-count probe BEFORE the copy so empty legacy stores do
+        # not shadow a populated machine-level one. ``SELECT 1 FROM projects
+        # LIMIT 1`` short-circuits on the first row, no schema awareness
+        # required.
+        probe = sqlite3.connect(f"file:{legacy}?mode=ro", uri=True)
+        try:
+            has_rows = probe.execute(
+                "SELECT 1 FROM projects LIMIT 1"
+            ).fetchone() is not None
+        finally:
+            probe.close()
+        if not has_rows:
+            _LEGACY_MIGRATION_DONE.add(target_key)
+            return
+        shutil.copy2(str(legacy), str(target))
+    except Exception:
+        # Migration is best-effort: a failure must not block the caller
+        # from opening an empty machine-level DB. The next call retries
+        # until it succeeds.
+        return
+    _LEGACY_MIGRATION_DONE.add(target_key)
+
 
 
 # ---------------------------------------------------------------------------
