@@ -17102,14 +17102,21 @@ def main():
 
             _page = max(1, getattr(args, "page", 1) or 1)
             _offset = (_page - 1) * args.limit
-            sessions = db.list_sessions_rich(
-                source=args.source, exclude_sources=_exclude, limit=args.limit, offset=_offset
-            )
-
             # Workspace filter: match a session by its workspace key (git repo
             # root, else cwd) — path substring or exact basename.
             _ws_filter = (getattr(args, "workspace", None) or "").strip()
             if _ws_filter:
+                # The workspace key is derived (repo root / cwd), not a DB
+                # column, so filtering happens in Python. Fetch a superset
+                # WITHOUT the SQL offset, filter, then slice — applying the
+                # offset first would silently skip workspace matches on
+                # page > 1 (same filter-then-offset ordering as
+                # query_session_listing).
+                sessions = db.list_sessions_rich(
+                    source=args.source,
+                    exclude_sources=_exclude,
+                    limit=max((args.limit + _offset) * 4, args.limit + _offset),
+                )
                 _needle = _ws_filter.lower()
 
                 def _in_workspace(s):
@@ -17119,6 +17126,14 @@ def main():
                     )
 
                 sessions = [s for s in sessions if _in_workspace(s)]
+                sessions = sessions[_offset : _offset + args.limit]
+            else:
+                sessions = db.list_sessions_rich(
+                    source=args.source,
+                    exclude_sources=_exclude,
+                    limit=args.limit,
+                    offset=_offset,
+                )
 
             if not sessions:
                 print("No sessions found.")
