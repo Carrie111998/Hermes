@@ -22,6 +22,7 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.codex_tool_names import normalize_codex_tool_name
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -323,10 +324,10 @@ def _codex_item_to_tool_name(item: dict) -> str:
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
         if server == _INTERNAL_MCP_SERVER:
-            return tool
-        return f"mcp.{server}.{tool}"
+            return normalize_codex_tool_name(tool)
+        return normalize_codex_tool_name(f"mcp__{server}__{tool}")
     if item_type == "dynamicToolCall":
-        return item.get("tool") or "dynamic"
+        return normalize_codex_tool_name(item.get("tool"), default="dynamic")
     if item_type == "webSearch":
         return "web_search"
     return item_type or "unknown"

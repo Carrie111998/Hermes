@@ -186,8 +186,44 @@ class TestMcpToolCallProjection:
         msgs = CodexEventProjector().project(
             {"method": "item/completed", "params": {"item": item}}
         ).messages
-        assert msgs[0]["tool_calls"][0]["function"]["name"] == "mcp.obsidian.search_notes"
+        assert (
+            msgs[0]["tool_calls"][0]["function"]["name"]
+            == "mcp__obsidian__search_notes"
+        )
         assert "found" in msgs[1]["content"]
+
+    def test_mcp_tool_name_replaces_responses_incompatible_characters(self) -> None:
+        item = {
+            "type": "mcpToolCall",
+            "id": "m3",
+            "server": "codex.apps",
+            "tool": "notion/fetch",
+            "arguments": {},
+            "result": None,
+        }
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+
+        assert (
+            messages[0]["tool_calls"][0]["function"]["name"]
+            == "mcp__codex_apps__notion_fetch"
+        )
+
+    def test_dynamic_tool_name_replaces_responses_incompatible_characters(self) -> None:
+        item = {
+            "type": "dynamicToolCall",
+            "id": "d2",
+            "tool": "notion.fetch",
+            "arguments": {},
+            "contentItems": [],
+            "success": True,
+        }
+        messages = CodexEventProjector().project(
+            {"method": "item/completed", "params": {"item": item}}
+        ).messages
+
+        assert messages[0]["tool_calls"][0]["function"]["name"] == "notion_fetch"
 
     def test_mcp_error_surfaced(self) -> None:
         item = {

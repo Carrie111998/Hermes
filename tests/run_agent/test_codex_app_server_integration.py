@@ -730,7 +730,7 @@ class TestCodexToolProgressBridge:
             _codex_item_to_tool_name,
         )
         mcp = {"type": "mcpToolCall", "server": "fs", "tool": "read", "arguments": {"p": 1}}
-        assert _codex_item_to_tool_name(mcp) == "mcp.fs.read"
+        assert _codex_item_to_tool_name(mcp) == "mcp__fs__read"
         assert _codex_item_to_args(mcp) == {"p": 1}
 
         dyn = {"type": "dynamicToolCall", "tool": "web_search", "arguments": {"q": "x"}}
