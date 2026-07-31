@@ -62,3 +62,54 @@ intérprete de Python, no lo toques.
 | `history/` | Documentos de planeación/diagnóstico previos, conservados como referencia histórica |
 | `compat.py` | Helpers de resolución de home/env/config con alias Douglas→Hermes |
 | `CORE_PATCHES.md` | Registro de cada toque al núcleo de Hermes: ruta, motivo, alternativa descartada |
+
+## Cadena canónica de resolución Douglas/Hermes
+
+Fuente única de verdad. `hermes_bootstrap.py` (Python), `apps/desktop/electron/main.ts`
+(`resolveHermesHome()`) y `apps/bootstrap-installer/src-tauri/src/paths.rs`
+(`hermes_home()`) implementan esta misma cadena por separado — no pueden
+compartir código porque corren en tres runtimes distintos (Python, el
+proceso principal de Electron en Node, y un instalador nativo en Rust que
+se ejecuta *antes* de que exista Python) — y cada uno referencia esta
+sección por comentario (`// Mirrors douglas/README.md` / `# Mirrors
+douglas/README.md`), siguiendo el mismo patrón que el propio Hermes ya usa
+para mantener sincronizados `hermes_constants.py`, `main.ts` y `paths.rs`
+entre sí.
+
+**Variables de entorno — regla genérica:** cualquier `DOUGLAS_<X>` presente
+y no vacía sobrescribe `HERMES_<X>` en el entorno del proceso, para
+cualquier `<X>`. Esto pasa una sola vez, muy al principio del proceso, así
+que los ~200 sitios existentes que ya leen `HERMES_<X>` funcionan sin
+tocarlos.
+
+**Directorio home:**
+
+| Orden | Windows | macOS / Linux |
+|---|---|---|
+| 1 | `%DOUGLAS_HOME%` si está seteada | `$DOUGLAS_HOME` si está seteada |
+| 2 | `%HERMES_HOME%` si está seteada | `$HERMES_HOME` si está seteada |
+| 3 | `%LOCALAPPDATA%\douglas` si el directorio existe | `~/.douglas` si el directorio existe |
+| 4 | `%LOCALAPPDATA%\hermes` si el directorio existe (instalación previa de Hermes) | `~/.hermes` si el directorio existe (instalación previa de Hermes) |
+| 5 | `~/.hermes` si existe (legado pre-`%LOCALAPPDATA%`, mismo caso que ya maneja `main.ts`) | *(no aplica — no existe un legado equivalente en macOS/Linux)* |
+| 6 | `%LOCALAPPDATA%\douglas` (instalación nueva, se crea) | `~/.douglas` (instalación nueva, se crea) |
+
+Los pasos 3-6 solo se evalúan cuando ni `DOUGLAS_HOME` ni `HERMES_HOME`
+están seteadas — si cualquiera de las dos lo está, gana y no se mira el
+disco.
+
+**Nota de alcance**: en Electron, la resolución también consulta el
+registro de Windows (`HKCU`) para `DOUGLAS_HOME`/`HERMES_HOME` antes del
+paso 3, porque una app GUI lanzada desde el Explorador hereda el bloque de
+entorno capturado en el login y no ve variables seteadas después vía
+`setx` (issue #45471 de Hermes). El lado Python **no** replica esta lectura
+de registro: un proceso Python siempre se lanza desde una shell con el
+entorno vigente, o como hijo de Electron, que ya le pasa `HERMES_HOME`
+explícito al spawnearlo (`main.ts`, sección "Explicitly pin HERMES_HOME for
+the child") — el problema que la lectura de registro resuelve no existe en
+ese caso.
+
+**`ContextVar` de perfiles**: `get_hermes_home_override()` (usado por
+`hermes_cli/profiles.py` para aislar perfiles) se comprueba antes que
+cualquier variable de entorno y siempre gana cuando está activo. Esta
+cadena solo determina el valor *por defecto* del proceso — nunca compite
+con un override de perfil activo.
