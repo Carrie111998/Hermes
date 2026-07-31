@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { I18nProvider } from '@/i18n'
 import type { HermesConfigRecord } from '@/types/hermes'
 
 import { VoiceCommandProviderAction, VoiceCommandProviderDialog } from './voice-command-provider-dialog'
@@ -12,6 +13,21 @@ const config: HermesConfigRecord = {
 }
 
 describe('VoiceCommandProviderDialog', () => {
+  it('renders all dialog copy from the active locale', () => {
+    render(
+      <I18nProvider configClient={null} initialLocale="zh">
+        <VoiceCommandProviderAction config={config} onApply={vi.fn()} />
+      </I18nProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '添加本地 STT 提供方' }))
+
+    expect(screen.getByRole('dialog', { name: '添加本地 STT 提供方' })).toBeTruthy()
+    expect(screen.getByLabelText('提供方名称')).toBeTruthy()
+    expect(screen.getByLabelText('命令')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '添加提供方' })).toBeTruthy()
+  })
+
   it('opens from the Voice settings action', () => {
     render(<VoiceCommandProviderAction config={config} onApply={vi.fn()} />)
 

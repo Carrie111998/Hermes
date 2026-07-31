@@ -13,6 +13,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { useI18n } from '@/i18n'
 import { Mic, Plus } from '@/lib/icons'
 import type { HermesConfigRecord } from '@/types/hermes'
 
@@ -42,13 +43,15 @@ export function VoiceCommandProviderAction({
   onApply: (config: HermesConfigRecord) => void
 }) {
   const [open, setOpen] = useState(false)
+  const { t } = useI18n()
+  const copy = t.settings.voiceCommandProvider
 
   return (
     <>
       <div className="mb-3 flex justify-end">
         <Button onClick={() => setOpen(true)} size="sm" type="button" variant="outline">
           <Plus />
-          Add local STT provider
+          {copy.add}
         </Button>
       </div>
       <VoiceCommandProviderDialog config={config} onApply={onApply} onOpenChange={setOpen} open={open} />
@@ -67,6 +70,8 @@ export function VoiceCommandProviderDialog({
   onOpenChange: (open: boolean) => void
   onApply: (config: HermesConfigRecord) => void
 }) {
+  const { t } = useI18n()
+  const copy = t.settings.voiceCommandProvider
   const [draft, setDraft] = useState<SttCommandProviderDraft>(EMPTY_DRAFT)
   const [errors, setErrors] = useState<SttCommandProviderErrors>({})
 
@@ -86,7 +91,7 @@ export function VoiceCommandProviderDialog({
   }
 
   const addProvider = () => {
-    const nextErrors = validateSttCommandProvider(config, draft)
+    const nextErrors = validateSttCommandProvider(config, draft, copy.errors)
 
     if (Object.keys(nextErrors).length > 0) {
       setErrors(nextErrors)
@@ -102,16 +107,13 @@ export function VoiceCommandProviderDialog({
     <Dialog onOpenChange={onOpenChange} open={open}>
       <DialogContent className="max-w-xl">
         <DialogHeader>
-          <DialogTitle icon={Mic}>Add local STT provider</DialogTitle>
-          <DialogDescription>
-            Run a trusted local command for speech recognition. Hermes supplies the audio path and reads the transcript
-            your command writes; the command runs with your full user permissions.
-          </DialogDescription>
+          <DialogTitle icon={Mic}>{copy.add}</DialogTitle>
+          <DialogDescription>{copy.description}</DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-3">
           <div className="grid gap-1.5 text-xs text-muted-foreground">
-            <label htmlFor="stt-provider-name">Provider name</label>
+            <label htmlFor="stt-provider-name">{copy.providerName}</label>
             <Input
               aria-describedby={errors.name ? 'stt-provider-name-error' : undefined}
               aria-invalid={Boolean(errors.name)}
@@ -129,7 +131,7 @@ export function VoiceCommandProviderDialog({
           </div>
 
           <div className="grid gap-1.5 text-xs text-muted-foreground">
-            <label htmlFor="stt-provider-command">Command</label>
+            <label htmlFor="stt-provider-command">{copy.command}</label>
             <Textarea
               aria-describedby={errors.command ? 'stt-provider-command-error' : 'stt-provider-command-help'}
               aria-invalid={Boolean(errors.command)}
@@ -145,25 +147,25 @@ export function VoiceCommandProviderDialog({
               </span>
             ) : (
               <span className="text-[0.6875rem] leading-4" id="stt-provider-command-help">
-                Required: {'{input_path}'} and either {'{output_path}'} or {'{output_dir}'}.
+                {copy.commandHelp}
               </span>
             )}
           </div>
 
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="grid gap-1.5 text-xs text-muted-foreground">
-              Language
+              {copy.language}
               <Input
                 onChange={event => update('language', event.target.value)}
-                placeholder="Optional"
+                placeholder={copy.optional}
                 value={draft.language}
               />
             </label>
             <label className="grid gap-1.5 text-xs text-muted-foreground">
-              Model
+              {copy.model}
               <Input
                 onChange={event => update('model', event.target.value)}
-                placeholder="Optional"
+                placeholder={copy.optional}
                 value={draft.model}
               />
             </label>
@@ -171,7 +173,7 @@ export function VoiceCommandProviderDialog({
 
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="grid gap-1.5 text-xs text-muted-foreground">
-              Transcript format
+              {copy.transcriptFormat}
               <Select onValueChange={value => update('format', value as SttCommandFormat)} value={draft.format}>
                 <SelectTrigger>
                   <SelectValue />
@@ -186,13 +188,13 @@ export function VoiceCommandProviderDialog({
               </Select>
             </label>
             <label className="grid gap-1.5 text-xs text-muted-foreground">
-              Timeout
+              {copy.timeout}
               <Input
                 min={1}
                 onChange={event =>
                   update('timeout', event.target.value === '' ? undefined : Number(event.target.value))
                 }
-                placeholder="300 seconds"
+                placeholder={copy.timeoutPlaceholder}
                 type="number"
                 value={draft.timeout ?? ''}
               />
@@ -203,12 +205,12 @@ export function VoiceCommandProviderDialog({
         <DialogFooter>
           <DialogClose asChild>
             <Button size="sm" type="button" variant="ghost">
-              Cancel
+              {t.common.cancel}
             </Button>
           </DialogClose>
           <Button onClick={addProvider} size="sm" type="button">
             <Plus />
-            Add provider
+            {copy.addProvider}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -218,6 +218,22 @@ export interface SttCommandProviderErrors {
   command?: string
 }
 
+export interface SttCommandProviderValidationMessages {
+  invalidName: string
+  reservedName: string
+  duplicateName: string
+  missingInput: string
+  missingOutput: string
+}
+
+const DEFAULT_STT_COMMAND_PROVIDER_VALIDATION_MESSAGES: SttCommandProviderValidationMessages = {
+  invalidName: 'Use a lowercase name starting with a letter; numbers, hyphens, and underscores are allowed.',
+  reservedName: 'That name is reserved for a built-in STT provider.',
+  duplicateName: 'A provider with that name already exists.',
+  missingInput: 'The command must include {input_path}.',
+  missingOutput: 'The command must include {output_path} or {output_dir}.'
+}
+
 const STT_COMMAND_PROVIDER_NAME = /^[a-z][a-z0-9_-]*$/
 
 function sttConfigNames(config: HermesConfigRecord): Set<string> {
@@ -240,24 +256,25 @@ function sttConfigNames(config: HermesConfigRecord): Set<string> {
 
 export function validateSttCommandProvider(
   config: HermesConfigRecord,
-  draft: SttCommandProviderDraft
+  draft: SttCommandProviderDraft,
+  messages: SttCommandProviderValidationMessages = DEFAULT_STT_COMMAND_PROVIDER_VALIDATION_MESSAGES
 ): SttCommandProviderErrors {
   const errors: SttCommandProviderErrors = {}
   const name = draft.name.trim()
   const command = draft.command.trim()
 
   if (!STT_COMMAND_PROVIDER_NAME.test(name)) {
-    errors.name = 'Use a lowercase name starting with a letter; numbers, hyphens, and underscores are allowed.'
+    errors.name = messages.invalidName
   } else if (BUILTIN_STT_PROVIDERS.has(name)) {
-    errors.name = 'That name is reserved for a built-in STT provider.'
+    errors.name = messages.reservedName
   } else if (sttConfigNames(config).has(name)) {
-    errors.name = 'A provider with that name already exists.'
+    errors.name = messages.duplicateName
   }
 
   if (!command.includes('{input_path}')) {
-    errors.command = 'The command must include {input_path}.'
+    errors.command = messages.missingInput
   } else if (!command.includes('{output_path}') && !command.includes('{output_dir}')) {
-    errors.command = 'The command must include {output_path} or {output_dir}.'
+    errors.command = messages.missingOutput
   }
 
   return errors
