@@ -1105,12 +1105,16 @@ class CLICommandsMixin:
                 import re as _re
                 from datetime import datetime as _dt
 
+                # Diagnostic: log what we're about to do
+                _cprint(f"  [debug] searching for: {search_query}")
+
                 raw = self._session_db.search_messages(
                     query=search_query,
                     role_filter=["user", "assistant"],
                     exclude_sources=["tool", "subagent", "cron"],
                     limit=40,
                 )
+                _cprint(f"  [debug] raw results: {len(raw)}")
             except Exception as e:
                 _cprint(f"  Search failed: {e}")
                 return
@@ -1125,6 +1129,7 @@ class CLICommandsMixin:
                     seen[sid] = r
                 if len(seen) >= 10:
                     break
+            _cprint(f"  [debug] unique sessions (excluding current): {len(seen)}")
 
             if not seen:
                 _cprint(f"  No sessions matching \"{search_query}\".")
