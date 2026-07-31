@@ -336,18 +336,22 @@ def render_sessions_table(
         sid = s.get("id")
         if not sid or sid in previews:
             continue
-        root_id = sid
-        if db is not None and s.get("parent_session_id"):
-            current = sid
-            hops = 0
-            while current and hops < 20:
-                m = db.get_session(current) or {}
-                parent = m.get("parent_session_id")
-                if not parent:
-                    break
-                current = parent
-                hops += 1
-            root_id = current
+        # Projected compression rows carry _lineage_root_id (the chain's
+        # deepest ancestor); the merge keeps the root's parent_session_id
+        # (None), so the parent walk below would never fire for them.
+        root_id = s.get("_lineage_root_id") or sid
+        if db is not None and (s.get("_lineage_root_id") or s.get("parent_session_id")):
+            if not s.get("_lineage_root_id"):
+                current = sid
+                hops = 0
+                while current and hops < 20:
+                    m = db.get_session(current) or {}
+                    parent = m.get("parent_session_id")
+                    if not parent:
+                        break
+                    current = parent
+                    hops += 1
+                root_id = current
         if root_id == sid and s.get("preview"):
             previews[sid] = s["preview"]
         elif db is not None:

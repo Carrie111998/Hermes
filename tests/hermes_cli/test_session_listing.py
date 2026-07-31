@@ -285,3 +285,55 @@ class TestChainTokenTotals:
             }
         finally:
             db.close()
+
+
+class TestRenderPreviewLineage:
+    """Projected compression rows must preview the chain root's first user
+    message — never the tip's own first message, which is the compaction
+    banner on a continuation with no real user turns.
+
+    Regression coverage for the plain listing leaking
+    `[CONTEXT COMPACTION — REFERENCE ONLY]` into the Preview column: the
+    projection keeps the root's parent_session_id (None), so the renderer's
+    parent-walk fallback never fired and the tip's banner preview won.
+    """
+
+    def _render(self, db, rows):
+        lines = []
+        from hermes_cli.session_listing import render_sessions_table
+
+        render_sessions_table(rows, out=lines.append, db=db)
+        return "\n".join(lines)
+
+    def test_projected_tip_previews_root_first_user_message(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "pv.db")
+        db.create_session("pv_root", "cli")
+        db.append_message("pv_root", "user", "Original conversation opener", timestamp=1.0)
+        db.end_session("pv_root", end_reason="compression")
+        db.create_session("pv_tip", "cli", parent_session_id="pv_root")
+        db.append_message(
+            "pv_tip", "user", "[CONTEXT COMPACTION — REFERENCE ONLY]", timestamp=2.0
+        )
+        try:
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            assert [r["id"] for r in rows] == ["pv_tip"]
+            output = self._render(db, rows)
+            assert "Original conversation opener" in output
+            assert "COMPACTION" not in output
+        finally:
+            db.close()
+
+    def test_standalone_row_previews_own_first_user_message(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "pv2.db")
+        db.create_session("pv_standalone", "cli")
+        db.append_message("pv_standalone", "user", "Standalone opener", timestamp=1.0)
+        try:
+            rows = db.list_sessions_rich(source="cli", include_children=False)
+            output = self._render(db, rows)
+            assert "Standalone opener" in output
+        finally:
+            db.close()
