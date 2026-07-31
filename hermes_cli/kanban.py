@@ -366,6 +366,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument(
+        "--governance-contract",
+        default=None,
+        metavar="JSON|@PATH",
+        help=(
+            "Governance contract as a JSON object or @path to a UTF-8 JSON file. "
+            "Required for newly governed boards such as Kwilo."
+        ),
+    )
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -798,6 +807,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_ctx.add_argument("task_id")
 
+    # --- governed dispatch readback ---
+    p_readback = sub.add_parser(
+        "readback",
+        help="Read the immutable governed dispatch snapshot and digest.",
+    )
+    p_readback.add_argument("task_id")
+    p_readback.add_argument("--json", action="store_true")
+
+    p_admit = sub.add_parser(
+        "admit",
+        help=(
+            "Admit a governed task using a digest from a separate readback. "
+            "Admission does not unblock a deliberately blocked card."
+        ),
+    )
+    p_admit.add_argument("task_id")
+    p_admit.add_argument("digest", help="Exact digest printed by `kanban readback`")
+    p_admit.add_argument(
+        "--actor",
+        default=None,
+        help="Operator identity recorded on the admission event",
+    )
+    p_admit.add_argument("--json", action="store_true")
+
     # --- specify --- (triage → todo via auxiliary LLM)
     p_specify = sub.add_parser(
         "specify",
@@ -1020,6 +1053,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "notify-list":        _cmd_notify_list,
             "notify-unsubscribe": _cmd_notify_unsubscribe,
             "context":  _cmd_context,
+            "readback": _cmd_readback,
+            "admit":    _cmd_admit,
             "specify":  _cmd_specify,
             "decompose":  _cmd_decompose,
             "gc":       _cmd_gc,
@@ -1283,6 +1318,32 @@ def _parse_duration(val) -> Optional[int]:
     raise ValueError(f"malformed duration {val!r} (expected 30s, 5m, 2h, 1d, or a number)")
 
 
+def _parse_governance_contract(value: Any) -> Optional[dict[str, Any]]:
+    """Parse a governed task contract from inline JSON or ``@path``."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("must not be empty")
+    if raw.startswith("@"):
+        path_value = raw[1:].strip()
+        if not path_value:
+            raise ValueError("@path must name a JSON file")
+        try:
+            raw = Path(path_value).expanduser().read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"cannot read {path_value!r}: {exc}") from exc
+    try:
+        contract = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON: {exc.msg}") from exc
+    if not isinstance(contract, dict):
+        raise ValueError("must decode to a JSON object")
+    return contract
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     path = kb.init_db()
     print(f"Kanban DB initialized at {path}")
@@ -1366,6 +1427,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"kanban: --max-runtime: {exc}", file=sys.stderr)
         return 2
+    try:
+        governance_contract = _parse_governance_contract(
+            getattr(args, "governance_contract", None)
+        )
+    except ValueError as exc:
+        print(f"kanban: --governance-contract: {exc}", file=sys.stderr)
+        return 2
     max_retries = getattr(args, "max_retries", None)
     if max_retries is not None and max_retries < 1:
         print(
@@ -1396,6 +1464,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            governance_contract=governance_contract,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2713,6 +2782,42 @@ def _cmd_context(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         text = kb.build_worker_context(conn, args.task_id)
     print(text)
+    return 0
+
+
+def _cmd_readback(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_readback(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(f"Task:      {args.task_id}")
+        print(f"Required:  {str(bool(result['required'])).lower()}")
+        print(f"Admitted:  {str(bool(result['admitted'])).lower()}")
+        print(f"Digest:    {result.get('digest') or '-'}")
+        print(f"Admitted by: {result.get('admitted_by') or '-'}")
+        if result.get("snapshot") is not None:
+            print("Snapshot:")
+            print(json.dumps(result["snapshot"], indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_admit(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        result = kb.admit_dispatch_readback(
+            conn,
+            args.task_id,
+            expected_digest=args.digest,
+            actor=actor,
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Admitted dispatch readback for {args.task_id} "
+            f"({result.get('digest')}, actor={result.get('admitted_by') or actor})"
+        )
     return 0
 
 

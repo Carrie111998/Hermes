@@ -2722,6 +2722,45 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _workspace_matches_repository(
+    workspace_path: str,
+    repository_root: str,
+    workspace_kind: str,
+) -> bool:
+    """Whether a governed workspace is anchored to its manifest repository."""
+    requested = Path(workspace_path).expanduser().resolve(strict=False)
+    repo_root = Path(repository_root).expanduser().resolve(strict=False)
+    if requested == repo_root:
+        return True
+    if workspace_kind == "worktree":
+        if requested.exists():
+            if not _is_linked_worktree_checkout(requested):
+                return False
+            requested_common = _git_common_dir(requested)
+            repo_common = _git_common_dir(repo_root)
+            return (
+                requested_common is not None
+                and requested_common == repo_common
+            )
+        try:
+            relative_target = requested.relative_to(repo_root / ".worktrees")
+            return len(relative_target.parts) == 1
+        except ValueError:
+            return False
+    if requested.exists() and repo_root.exists():
+        requested_top = _git_toplevel(requested)
+        requested_common = _git_common_dir(requested)
+        repo_common = _git_common_dir(repo_root)
+        if (
+            requested_top is not None
+            and requested == requested_top
+            and requested_common is not None
+            and requested_common == repo_common
+        ):
+            return True
+    return False
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2796,6 +2835,8 @@ def create_task(
     # path is absolute (profile-independent) and the branch name is pure, so the
     # cross-profile dispatcher needs no projects.db access at dispatch time.
     project_obj = None
+    requested_project_id = str(project_id).strip() if project_id is not None else None
+    requested_project_id = requested_project_id or None
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
     project_repo: Optional[str] = None
@@ -2877,9 +2918,60 @@ def create_task(
         skills_list = cleaned
 
     now = int(time.time())
+    requested_governance_contract = governance_contract
     governed_contract: Optional[dict] = None
+    governed_repository_root: Optional[Path] = None
     if _kwilo.governance_required(conn, board=board, created_at=now):
-        governed_contract = _kwilo.validate_contract(assignee, governance_contract)
+        governed_contract = _kwilo.validate_contract(
+            assignee, requested_governance_contract
+        )
+        expected_workspace_kind = governed_contract["workspace_kind"]
+        if workspace_kind == "scratch" and expected_workspace_kind != "scratch":
+            # ``scratch`` is the generic API/CLI default. For governed cards,
+            # the manifest-backed workspace class is authoritative.
+            workspace_kind = expected_workspace_kind
+        elif workspace_kind != expected_workspace_kind:
+            raise ValueError(
+                f"workspace_class {governed_contract['workspace_class']!r} "
+                f"requires workspace_kind {expected_workspace_kind!r}, "
+                f"got {workspace_kind!r}"
+            )
+
+        contract_project_id = str(
+            governed_contract.get("project_id") or ""
+        ).strip() or None
+        if requested_project_id and requested_project_id != contract_project_id:
+            raise ValueError(
+                f"task project {requested_project_id!r} does not match governance "
+                f"project_id {contract_project_id!r}"
+            )
+        project_id = contract_project_id
+
+        repository_root = governed_contract.get("repository_local_root")
+        if repository_root and workspace_kind in {"worktree", "dir"}:
+            governed_repository_root = (
+                Path(str(repository_root)).expanduser().resolve(strict=False)
+            )
+            if workspace_path is None:
+                workspace_path = str(repository_root)
+            elif not _workspace_matches_repository(
+                workspace_path, str(repository_root), workspace_kind
+            ):
+                raise ValueError(
+                    f"repository workspace {workspace_path!r} is not bound to "
+                    f"manifest local_root {repository_root!r}"
+                )
+            if project_repo and not _workspace_matches_repository(
+                project_repo, str(repository_root), "dir"
+            ):
+                raise ValueError(
+                    f"task project repository {project_repo!r} does not match "
+                    f"manifest local_root {repository_root!r}"
+                )
+    elif requested_governance_contract is not None:
+        raise ValueError(
+            "governance_contract was supplied on a board that does not enforce governance"
+        )
     governed_requires_readback = bool(
         governed_contract is not None
         and _kwilo.dispatch_readback_required(assignee, governed_contract)
@@ -2958,9 +3050,68 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    if workspace_path is not None and workspace_kind in {"dir", "worktree"}:
+        persistent_path = Path(workspace_path).expanduser()
+        if not persistent_path.is_absolute():
+            raise ValueError(
+                f"{workspace_kind} workspace path {workspace_path!r} must be absolute"
+            )
+        workspace_path = str(persistent_path.resolve(strict=False))
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        task_workspace_path = workspace_path
+        task_branch_name = branch_name
+        is_existing_worktree = False
+        if workspace_kind == "worktree" and task_workspace_path:
+            requested = Path(task_workspace_path).expanduser()
+            requested_resolved = requested.resolve(strict=False)
+            is_existing_worktree = (
+                requested.exists()
+                and _is_linked_worktree_checkout(requested)
+            )
+            if requested.exists() and not is_existing_worktree:
+                requested_toplevel = _git_toplevel(requested)
+                is_repository_root = (
+                    requested_toplevel is not None
+                    and requested_resolved == requested_toplevel
+                )
+                if not is_repository_root:
+                    raise ValueError(
+                        f"worktree path {requested} must name a Git checkout root, "
+                        "not a container or subdirectory"
+                    )
+            if is_existing_worktree:
+                actual_branch = _git_current_branch(requested)
+                if not actual_branch:
+                    raise ValueError(
+                        f"existing worktree {requested} has detached or unknown HEAD"
+                    )
+                if task_branch_name and task_branch_name != actual_branch:
+                    raise ValueError(
+                        f"existing worktree {requested} is on branch "
+                        f"{actual_branch!r}, not requested branch {task_branch_name!r}"
+                    )
+                task_branch_name = actual_branch
+            if requested.is_absolute() and not is_existing_worktree:
+                repo_root = _git_toplevel(requested)
+                anchor_root = (
+                    repo_root
+                    if repo_root is not None and requested_resolved == repo_root
+                    else governed_repository_root
+                    if governed_repository_root is not None
+                    and requested_resolved == governed_repository_root
+                    else None
+                )
+                if anchor_root is not None:
+                    # Persist the final task-specific path before governance
+                    # readback hashes the card. Dispatch must not rewrite a
+                    # repo-root anchor after admission and invalidate its own
+                    # digest on the first run.
+                    task_workspace_path = str(
+                        anchor_root / ".worktrees" / task_id
+                    )
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -3009,18 +3160,49 @@ def create_task(
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
+                    if project_repo and not task_workspace_path:
+                        task_workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if not task_branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
-                            branch_name = _pdb.branch_name_for(
+                            task_branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
                         except Exception:
-                            branch_name = None
+                            task_branch_name = None
+
+                if workspace_kind == "worktree" and not task_branch_name:
+                    task_branch_name = f"wt/{task_id}"
+
+                if workspace_kind == "worktree" and task_workspace_path:
+                    requested_owner_path = os.path.normcase(
+                        str(
+                            Path(task_workspace_path)
+                            .expanduser()
+                            .resolve(strict=False)
+                        )
+                    )
+                    active_worktrees = conn.execute(
+                        "SELECT id, workspace_path FROM tasks "
+                        "WHERE workspace_kind = 'worktree' "
+                        "AND status NOT IN ('done', 'archived') "
+                        "AND workspace_path IS NOT NULL"
+                    ).fetchall()
+                    for active in active_worktrees:
+                        active_path = os.path.normcase(
+                            str(
+                                Path(active["workspace_path"])
+                                .expanduser()
+                                .resolve(strict=False)
+                            )
+                        )
+                        if active_path == requested_owner_path:
+                            raise ValueError(
+                                f"active task {active['id']} already owns worktree "
+                                f"{task_workspace_path!r}"
+                            )
 
                 conn.execute(
                     """
@@ -3042,8 +3224,8 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
-                        branch_name,
+                        task_workspace_path,
+                        task_branch_name,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -3083,7 +3265,7 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
-                        "branch_name": branch_name,
+                        "branch_name": task_branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                     },
@@ -6287,6 +6469,10 @@ def _git_current_branch(path: Path) -> Optional[str]:
 
 
 def _is_linked_worktree_checkout(path: Path) -> bool:
+    resolved = path.expanduser().resolve(strict=False)
+    toplevel = _git_toplevel(path)
+    if toplevel is None or resolved != toplevel:
+        return False
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
     if git_dir is None or common_dir is None:
@@ -6316,10 +6502,18 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
+    if target.exists():
         target_common = _git_common_dir(target)
-        if target_common == repo_common:
+        if (
+            repo_common is not None
+            and target_common == repo_common
+            and _is_linked_worktree_checkout(target)
+        ):
             return
+        raise RuntimeError(
+            f"worktree target {target} already exists but is not the root of "
+            "a linked worktree for the requested repository"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -6395,7 +6589,16 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
-        return requested_resolved, actual_branch or branch_name
+        if not actual_branch:
+            raise ValueError(
+                f"existing worktree {requested} has detached or unknown HEAD"
+            )
+        if task.branch_name and task.branch_name != actual_branch:
+            raise ValueError(
+                f"existing worktree {requested} is on branch {actual_branch!r}, "
+                f"not persisted branch {task.branch_name!r}"
+            )
+        return requested_resolved, actual_branch
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:

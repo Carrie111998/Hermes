@@ -2172,9 +2172,10 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         )
         task = kb.get_task(conn, t)
         assert task is not None
+        expected = repo / ".worktrees" / t
+        assert Path(task.workspace_path) == expected
         ws = kb.resolve_workspace(task)
 
-    expected = repo / ".worktrees" / t
     assert ws == expected
     assert ws.exists()
     repo_common = subprocess.run(
@@ -2196,7 +2197,7 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{t}" in listed
 
 
@@ -2215,9 +2216,10 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
         )
         task = kb.get_task(conn, t)
         assert task is not None
+        expected = repo / ".worktrees" / t
+        assert Path(task.workspace_path) == expected
         ws = kb.resolve_workspace(task, board="wt-default-board")
 
-    expected = repo / ".worktrees" / t
     assert ws == expected
     assert ws.exists()
     assert ws != repo  # not the shared default verbatim
@@ -2280,8 +2282,170 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
+
+
+def test_worktree_workspace_existing_linked_checkout_is_reused(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "existing"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "existing", str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reuse existing",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="existing",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert Path(task.workspace_path) == target
+        workspace = kb.resolve_workspace(task)
+
+    assert workspace == target
+    assert not (target / ".worktrees" / task_id).exists()
+
+
+@pytest.mark.parametrize("workspace_kind", ["dir", "worktree"])
+def test_persistent_workspace_rejects_relative_path(kanban_home, workspace_kind):
+    with kb.connect() as conn, pytest.raises(ValueError, match="must be absolute"):
+        kb.create_task(
+            conn,
+            title="reject relative persistent path",
+            workspace_kind=workspace_kind,
+            workspace_path="relative/workspace",
+        )
+
+
+def test_existing_worktree_rejects_wrong_branch_and_subdirectories(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    (repo / "main-subdir").mkdir()
+    target = repo / ".worktrees" / "existing"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "existing", str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (target / "linked-subdir").mkdir()
+
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="not requested branch"):
+            kb.create_task(
+                conn,
+                title="wrong branch",
+                workspace_kind="worktree",
+                workspace_path=str(target),
+                branch_name="different",
+            )
+        for bad_path in [
+            repo / "main-subdir",
+            repo / ".worktrees",
+            target / "linked-subdir",
+        ]:
+            with pytest.raises(ValueError, match="checkout root"):
+                kb.create_task(
+                    conn,
+                    title=f"reject {bad_path.name}",
+                    workspace_kind="worktree",
+                    workspace_path=str(bad_path),
+                )
+
+
+def test_active_worktree_path_cannot_be_owned_by_two_tasks(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / ".worktrees" / "existing"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "existing", str(target)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="first owner",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        with pytest.raises(ValueError, match="active task.*already owns worktree"):
+            kb.create_task(
+                conn,
+                title="second owner",
+                workspace_kind="worktree",
+                workspace_path=str(target).replace("\\", "/"),
+            )
+
+        assert kb.complete_task(conn, first)
+        second = kb.create_task(
+            conn,
+            title="sequential owner",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        assert second != first
+
+
+def test_unmaterialized_custom_worktree_path_has_one_active_owner(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "custom-worktree"
+
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn,
+            title="first custom owner",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        with pytest.raises(ValueError, match="active task.*already owns worktree"):
+            kb.create_task(
+                conn,
+                title="second custom owner",
+                workspace_kind="worktree",
+                workspace_path=str(target).replace("\\", "/"),
+            )
+
+        first_task = kb.get_task(conn, first)
+        assert first_task is not None
+        assert kb.resolve_workspace(first_task) == target
+
+
+def test_concurrent_custom_worktree_creation_has_one_owner(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    target = repo / "concurrent-worktree"
+
+    def create(title: str) -> tuple[str, str]:
+        try:
+            with kb.connect() as conn:
+                task_id = kb.create_task(
+                    conn,
+                    title=title,
+                    workspace_kind="worktree",
+                    workspace_path=str(target),
+                )
+            return "created", task_id
+        except ValueError as exc:
+            return "rejected", str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(create, ["owner one", "owner two"]))
+
+    assert [status for status, _ in results].count("created") == 1
+    assert [status for status, _ in results].count("rejected") == 1
+    assert any("already owns worktree" in detail for _, detail in results)
 
 
 def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
@@ -2319,7 +2483,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
@@ -2378,8 +2542,8 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         capture_output=True,
         text=True,
     ).stdout
-    assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert listed.count(f"worktree {expected.as_posix()}\n") == 1
+    assert f"worktree {expected.as_posix()}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
 
 

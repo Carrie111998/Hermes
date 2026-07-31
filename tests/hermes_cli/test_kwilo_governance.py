@@ -1,8 +1,10 @@
 """Kwilo-only governance admission and semantic dependency tests."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -25,7 +27,7 @@ def kwilo_home(tmp_path, monkeypatch):
                 "role": "software-engineer",
                 "lane": "app-general",
                 "repositories": ["kwilo-app"],
-                "workspace_classes": ["isolated-worktree"],
+                "workspace_classes": ["isolated-worktree", "declared-dirty-continuation"],
                 "configured_cli_toolsets": ["file", "kanban", "terminal"],
                 "configured_parent_skills": ["test-driven-development"],
                 "configured_connectors": ["context7"],
@@ -51,7 +53,7 @@ def kwilo_home(tmp_path, monkeypatch):
             "kwilo-sentinel": {
                 "role": "independent-code-security-review",
                 "lane": "cross-repository-review",
-                "repositories": ["kwilo-app"],
+                "repositories": ["kwilo-app", "kwilo-site"],
                 "workspace_classes": ["isolated-read-only-worktree"],
                 "configured_cli_toolsets": ["file", "kanban", "terminal"],
                 "configured_parent_skills": ["github-code-review"],
@@ -64,7 +66,7 @@ def kwilo_home(tmp_path, monkeypatch):
             "kwilo-tess": {
                 "role": "independent-qa",
                 "lane": "cross-repository-qa",
-                "repositories": ["kwilo-app"],
+                "repositories": ["kwilo-app", "kwilo-site"],
                 "workspace_classes": ["isolated-read-only-worktree"],
                 "configured_cli_toolsets": ["file", "kanban", "terminal"],
                 "configured_parent_skills": ["test-driven-development"],
@@ -76,7 +78,14 @@ def kwilo_home(tmp_path, monkeypatch):
             },
         },
         "repositories": {
-            "kwilo-app": {"canonical": "Hello-Kwilo/Kwilo"},
+            "kwilo-app": {
+                "canonical": "Hello-Kwilo/Kwilo",
+                "local_root": str(tmp_path / "kwilo-app"),
+            },
+            "kwilo-site": {
+                "canonical": "Hello-Kwilo/Kwilo-Site",
+                "local_root": str(tmp_path / "kwilo-site"),
+            },
         },
     }
     manifest_path = governance / "profile-capabilities-v1.0.0.json"
@@ -181,7 +190,13 @@ def kwilo_home(tmp_path, monkeypatch):
     return home, governance, manifest_path
 
 
-def _contract(*, profile="kwilo-forge", phase="implementation", candidate="a" * 40):
+def _contract(
+    *,
+    profile="kwilo-forge",
+    phase="implementation",
+    candidate="a" * 40,
+    repository="kwilo-app",
+):
     review = profile in {"kwilo-patch", "kwilo-sentinel", "kwilo-tess"}
     tess = profile == "kwilo-tess"
     deterministic = profile == "kwilo-patch"
@@ -191,8 +206,8 @@ def _contract(*, profile="kwilo-forge", phase="implementation", candidate="a" * 
         "acceptance_owner": "gavin",
         "role": "independent-qa" if tess else ("agent-tooling-maintainer" if deterministic else ("independent-code-security-review" if review else "software-engineer")),
         "lane": "cross-repository-qa" if tess else ("internal-tooling" if deterministic else ("cross-repository-review" if review else "app-general")),
-        "repository": "kwilo-app",
-        "project_id": "kwilo-app-project",
+        "repository": repository,
+        "project_id": f"{repository}-project",
         "mode": "read-only-qa" if tess else ("verification" if deterministic else ("read-only-review" if review else "implementation")),
         "workspace_class": "isolated-read-only-worktree" if review else "isolated-worktree",
         "required_toolsets": ["file", "kanban", "terminal"],
@@ -214,6 +229,40 @@ def _contract(*, profile="kwilo-forge", phase="implementation", candidate="a" * 
             "sentinel-review",
         ],
     }
+
+
+def _parse_kanban_cli(argv: list[str]) -> argparse.Namespace:
+    from hermes_cli import kanban as kb_cli
+
+    root = argparse.ArgumentParser()
+    subparsers = root.add_subparsers(dest="command")
+    kb_cli.build_parser(subparsers)
+    return root.parse_args(["kanban", *argv])
+
+
+def _init_git_repo(repo: Path) -> None:
+    repo.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "kwilo@example.com"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Kwilo Test"],
+        check=True, capture_output=True, text=True,
+    )
+    (repo / "README.md").write_text("hello\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "README.md"],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True, capture_output=True, text=True,
+    )
 
 
 def _rewrite_manifest(governance: Path, manifest_path: Path, manifest: dict) -> None:
@@ -256,12 +305,392 @@ def test_kwilo_creation_requires_and_persists_governance_contract(kwilo_home):
     assert semantics["contract"]["acceptance_owner"] == "gavin"
 
 
-def test_non_kwilo_board_remains_legacy_compatible(kwilo_home):
+def test_kwilo_cli_create_accepts_and_persists_governance_contract(kwilo_home, monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "kwilo")
+    contract = _contract(profile="kwilo-tess", phase="tess-qa")
+    args = _parse_kanban_cli([
+        "create", "governed CLI task",
+        "--assignee", "kwilo-tess",
+        "--workspace", "worktree",
+        "--initial-status", "blocked",
+        "--governance-contract", json.dumps(contract),
+        "--json",
+    ])
+
+    assert kb_cli.kanban_command(args) == 0
+    created = json.loads(capsys.readouterr().out)
+    with kb.connect(board="kwilo") as conn:
+        semantics = kb.get_task_semantics(conn, created["id"])
+
+    assert semantics["phase"] == "tess-qa"
+    assert semantics["candidate_value"] == "a" * 40
+    assert {
+        key: semantics["contract"][key]
+        for key in contract
+    } == contract
+    assert semantics["contract"]["repository_id"] == "Hello-Kwilo/Kwilo"
+
+
+def test_kwilo_cli_governance_contract_supports_at_file(kwilo_home, monkeypatch, tmp_path, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "kwilo")
+    contract = _contract(profile="kwilo-tess", phase="tess-qa")
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8-sig")
+    args = _parse_kanban_cli([
+        "create", "file governed CLI task",
+        "--assignee", "kwilo-tess",
+        "--workspace", "worktree",
+        "--initial-status", "blocked",
+        "--max-retries", "1",
+        "--governance-contract", f"@{contract_path}",
+        "--json",
+    ])
+
+    assert kb_cli.kanban_command(args) == 0
+    created = json.loads(capsys.readouterr().out)
+    with kb.connect(board="kwilo") as conn:
+        semantics = kb.get_task_semantics(conn, created["id"])
+
+    assert {
+        key: semantics["contract"][key]
+        for key in contract
+    } == contract
+    assert semantics["contract"]["repository_id"] == "Hello-Kwilo/Kwilo"
+
+
+def test_kwilo_cli_governance_contract_rejects_invalid_input_without_creating_task(
+    kwilo_home, monkeypatch, tmp_path, capsys
+):
+    from hermes_cli import kanban as kb_cli
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "kwilo")
+    invalid_utf8 = tmp_path / "invalid-utf8.json"
+    invalid_utf8.write_bytes(b"\xff")
+    cases = [
+        ("", "must not be empty"),
+        ("@", "@path must name a JSON file"),
+        ("{", "invalid JSON"),
+        ("[]", "must decode to a JSON object"),
+        (f"@{tmp_path / 'missing.json'}", "cannot read"),
+        (f"@{invalid_utf8}", "cannot read"),
+    ]
+
+    for value, expected_error in cases:
+        args = _parse_kanban_cli([
+            "create", "invalid governed task",
+            "--assignee", "kwilo-tess",
+            "--workspace", "worktree",
+            "--governance-contract", value,
+        ])
+        assert kb_cli.kanban_command(args) == 2
+        assert expected_error in capsys.readouterr().err
+        with kb.connect(board="kwilo") as conn:
+            assert kb.list_tasks(conn) == []
+
+
+def test_kwilo_cli_dispatch_readback_requires_separate_admission(kwilo_home, monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
+    _, governance, manifest_path = kwilo_home
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["profiles"]["kwilo-tess"]["requires_dispatch_readback"] = True
+    _rewrite_manifest(governance, manifest_path, manifest)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "kwilo")
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="readback governed CLI task",
+            assignee="kwilo-tess",
+            board="kwilo",
+            workspace_kind="worktree",
+            initial_status="blocked",
+            governance_contract=_contract(profile="kwilo-tess", phase="tess-qa"),
+        )
+
+    readback_args = _parse_kanban_cli(["readback", task_id, "--json"])
+    assert kb_cli.kanban_command(readback_args) == 0
+    readback = json.loads(capsys.readouterr().out)
+    assert readback["required"] is True
+    assert readback["admitted"] is False
+    assert readback["snapshot"]["task"]["id"] == task_id
+    assert readback["snapshot"]["governance_contract"]["phase"] == "tess-qa"
+
+    wrong_digest = _parse_kanban_cli([
+        "admit", task_id, "0" * 64, "--actor", "test-operator", "--json",
+    ])
+    assert kb_cli.kanban_command(wrong_digest) == 1
+    assert "digest" in capsys.readouterr().err
+
+    with kb.connect(board="kwilo") as conn:
+        assert kb.dispatch_readback(conn, task_id)["admitted"] is False
+        conn.execute("UPDATE tasks SET body = ? WHERE id = ?", ("changed", task_id))
+        conn.commit()
+
+    stale_digest = _parse_kanban_cli([
+        "admit", task_id, readback["digest"], "--actor", "test-operator", "--json",
+    ])
+    assert kb_cli.kanban_command(stale_digest) == 1
+    assert "digest" in capsys.readouterr().err
+
+    current_args = _parse_kanban_cli(["readback", task_id, "--json"])
+    assert kb_cli.kanban_command(current_args) == 0
+    current = json.loads(capsys.readouterr().out)
+    assert current["digest"] != readback["digest"]
+
+    admit_args = _parse_kanban_cli([
+        "admit", task_id, current["digest"],
+        "--actor", "test-operator", "--json",
+    ])
+    assert kb_cli.kanban_command(admit_args) == 0
+    admitted = json.loads(capsys.readouterr().out)
+    assert admitted["admitted"] is True
+    assert admitted["admitted_by"] == "test-operator"
+
+    with kb.connect(board="kwilo") as conn:
+        assert kb.dispatch_readback(conn, task_id)["admitted"] is True
+
+
+def test_governed_worktree_digest_is_stable_across_first_materialization(
+    kwilo_home, tmp_path
+):
+    _, governance, manifest_path = kwilo_home
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["profiles"]["kwilo-tess"]["requires_dispatch_readback"] = True
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    manifest["repositories"]["kwilo-app"]["local_root"] = str(repo)
+    _rewrite_manifest(governance, manifest_path, manifest)
+    kb.write_board_metadata("kwilo", default_workdir=str(repo))
+
+    with kb.connect(board="kwilo") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="stable governed worktree",
+            assignee="kwilo-tess",
+            board="kwilo",
+            workspace_kind="worktree",
+            initial_status="blocked",
+            governance_contract=_contract(profile="kwilo-tess", phase="tess-qa"),
+        )
+        expected = repo / ".worktrees" / task_id
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert Path(task.workspace_path) == expected
+        assert task.branch_name == f"wt/{task_id}"
+        before = kb.dispatch_readback(conn, task_id)
+        kb.admit_dispatch_readback(
+            conn, task_id, expected_digest=before["digest"], actor="test-operator"
+        )
+        assert kb.unblock_task(conn, task_id)
+        dispatched = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace, board=None: None,
+            board="kwilo",
+        )
+        assert dispatched.spawned == [
+            (task_id, "kwilo-tess", str(expected))
+        ]
+        assert kb.complete_task(
+            conn,
+            task_id,
+            semantic_evidence=_evidence(phase="tess-qa"),
+        )
+        after = kb.dispatch_readback(conn, task_id)
+
+    assert after["digest"] == before["digest"]
+    assert after["admitted"] is True
+
+
+def test_governed_repository_routes_to_manifest_root_and_rejects_mismatches(
+    kwilo_home, tmp_path
+):
+    _, governance, manifest_path = kwilo_home
+    app_repo = tmp_path / "app-repo"
+    site_repo = tmp_path / "site-repo"
+    _init_git_repo(app_repo)
+    _init_git_repo(site_repo)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["repositories"]["kwilo-app"]["local_root"] = str(app_repo)
+    manifest["repositories"]["kwilo-site"]["local_root"] = str(site_repo)
+    _rewrite_manifest(governance, manifest_path, manifest)
+    kb.write_board_metadata("kwilo", default_workdir=str(app_repo))
+
+    site_contract = _contract(
+        profile="kwilo-tess",
+        phase="tess-qa",
+        repository="kwilo-site",
+    )
+    with kb.connect(board="kwilo") as conn:
+        for unsafe_target in [
+            site_repo / ".worktrees",
+            site_repo / ".worktrees" / "nested" / "target",
+        ]:
+            assert not unsafe_target.exists()
+            with pytest.raises(ValueError, match="repository workspace"):
+                kb.create_task(
+                    conn,
+                    title="reject unsafe worktree shape",
+                    assignee="kwilo-tess",
+                    board="kwilo",
+                    workspace_kind="worktree",
+                    workspace_path=str(unsafe_target),
+                    governance_contract=site_contract,
+                )
+
+        task_id = kb.create_task(
+            conn,
+            title="site review",
+            assignee="kwilo-tess",
+            board="kwilo",
+            workspace_kind="worktree",
+            governance_contract=site_contract,
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert Path(task.workspace_path) == site_repo / ".worktrees" / task_id
+
+        with pytest.raises(ValueError, match="workspace_class.*requires.*worktree"):
+            kb.create_task(
+                conn,
+                title="wrong workspace kind",
+                assignee="kwilo-tess",
+                board="kwilo",
+                workspace_kind="dir",
+                governance_contract=site_contract,
+            )
+
+        with pytest.raises(ValueError, match="repository.*workspace"):
+            kb.create_task(
+                conn,
+                title="wrong repository root",
+                assignee="kwilo-tess",
+                board="kwilo",
+                workspace_kind="worktree",
+                workspace_path=str(app_repo),
+                governance_contract=site_contract,
+            )
+
+
+def test_governed_existing_worktree_without_branch_keeps_admitted_digest(
+    kwilo_home, tmp_path
+):
+    _, governance, manifest_path = kwilo_home
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    existing = repo / ".worktrees" / "existing"
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-b", "existing", str(existing)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["profiles"]["kwilo-tess"]["requires_dispatch_readback"] = True
+    manifest["repositories"]["kwilo-app"]["local_root"] = str(repo)
+    _rewrite_manifest(governance, manifest_path, manifest)
+
+    with kb.connect(board="kwilo") as conn:
+        with pytest.raises(ValueError, match="not requested branch"):
+            kb.create_task(
+                conn,
+                title="reject stale branch contract",
+                assignee="kwilo-tess",
+                board="kwilo",
+                workspace_kind="worktree",
+                workspace_path=str(existing),
+                branch_name="different",
+                initial_status="blocked",
+                governance_contract=_contract(
+                    profile="kwilo-tess", phase="tess-qa"
+                ),
+            )
+        task_id = kb.create_task(
+            conn,
+            title="reuse admitted worktree",
+            assignee="kwilo-tess",
+            board="kwilo",
+            workspace_kind="worktree",
+            workspace_path=str(existing / ".." / "existing"),
+            initial_status="blocked",
+            governance_contract=_contract(profile="kwilo-tess", phase="tess-qa"),
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert Path(task.workspace_path) == existing
+        assert task.branch_name == "existing"
+        before = kb.dispatch_readback(conn, task_id)
+        kb.admit_dispatch_readback(
+            conn, task_id, expected_digest=before["digest"], actor="test-operator"
+        )
+        assert kb.unblock_task(conn, task_id)
+        dispatched = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace, board=None: None,
+            board="kwilo",
+        )
+        assert dispatched.spawned == [
+            (task_id, "kwilo-tess", str(existing))
+        ]
+        assert kb.complete_task(
+            conn,
+            task_id,
+            semantic_evidence=_evidence(phase="tess-qa"),
+        )
+        after = kb.dispatch_readback(conn, task_id)
+
+    assert after["digest"] == before["digest"]
+    assert after["admitted"] is True
+
+
+def test_non_kwilo_board_remains_legacy_compatible(kwilo_home, monkeypatch, capsys):
+    from hermes_cli import kanban as kb_cli
+
     kb.init_db(board="ordinary")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "ordinary")
+    rejected = _parse_kanban_cli([
+        "create", "misrouted governed card", "--assignee", "alice",
+        "--governance-contract", json.dumps(_contract()), "--json",
+    ])
+    assert kb_cli.kanban_command(rejected) == 1
+    assert "does not enforce governance" in capsys.readouterr().err
     with kb.connect(board="ordinary") as conn:
-        task_id = kb.create_task(conn, title="legacy", assignee="alice", board="ordinary")
+        assert kb.list_tasks(conn) == []
+
+    args = _parse_kanban_cli([
+        "create", "legacy", "--assignee", "alice", "--json",
+    ])
+    assert kb_cli.kanban_command(args) == 0
+    task_id = json.loads(capsys.readouterr().out)["id"]
+    with kb.connect(board="ordinary") as conn:
         assert kb.get_task(conn, task_id).status == "ready"
         assert kb.get_task_semantics(conn, task_id) is None
+
+    readback_args = _parse_kanban_cli(["readback", task_id, "--json"])
+    assert kb_cli.kanban_command(readback_args) == 0
+    readback = json.loads(capsys.readouterr().out)
+    assert readback["required"] is False
+    assert readback["admitted"] is True
+    assert readback["snapshot"] is None
+
+    admit_args = _parse_kanban_cli(["admit", task_id, "0" * 64])
+    assert kb_cli.kanban_command(admit_args) == 1
+    assert "does not require dispatch readback" in capsys.readouterr().err
+
+
+def test_kwilo_cli_help_exposes_governance_readback_commands(capsys):
+    for argv, expected in [
+        (["create", "--help"], "--governance-contract"),
+        (["readback", "--help"], "task_id"),
+        (["admit", "--help"], "digest"),
+    ]:
+        with pytest.raises(SystemExit) as exc:
+            _parse_kanban_cli(argv)
+        assert exc.value.code == 0
+        assert expected in capsys.readouterr().out
 
 
 def test_file_backed_kwilo_connection_outranks_mismatched_ambient_board(kwilo_home, monkeypatch):
@@ -464,12 +893,16 @@ def test_strict_dispatch_requires_separate_readback_admission_before_claim(
 
 
 def test_dispatch_readback_treats_windows_path_separators_as_equivalent(
-    kwilo_home,
+    kwilo_home, tmp_path,
 ):
     _, governance, manifest_path = kwilo_home
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["profiles"]["kwilo-forge"]["requires_dispatch_readback"] = True
+    repository_root = tmp_path / "repository"
+    manifest["repositories"]["kwilo-app"]["local_root"] = str(repository_root)
     _rewrite_manifest(governance, manifest_path, manifest)
+    contract = _contract()
+    contract["workspace_class"] = "declared-dirty-continuation"
 
     with kb.connect(board="kwilo") as conn:
         task_id = kb.create_task(
@@ -478,8 +911,8 @@ def test_dispatch_readback_treats_windows_path_separators_as_equivalent(
             assignee="kwilo-forge",
             board="kwilo",
             workspace_kind="dir",
-            workspace_path="C:/Hermes/workspaces/candidate",
-            governance_contract=_contract(),
+            workspace_path=repository_root.as_posix(),
+            governance_contract=contract,
         )
         readback = kb.dispatch_readback(conn, task_id)
         kb.admit_dispatch_readback(
@@ -492,7 +925,7 @@ def test_dispatch_readback_treats_windows_path_separators_as_equivalent(
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET workspace_path = ? WHERE id = ?",
-                (r"C:\Hermes\workspaces\candidate", task_id),
+                (str(repository_root), task_id),
             )
 
         after_resolution = kb.dispatch_readback(conn, task_id)
@@ -501,12 +934,16 @@ def test_dispatch_readback_treats_windows_path_separators_as_equivalent(
 
 
 def test_dispatch_readback_accepts_precanonical_windows_admission_digest(
-    kwilo_home,
+    kwilo_home, tmp_path,
 ):
     _, governance, manifest_path = kwilo_home
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["profiles"]["kwilo-forge"]["requires_dispatch_readback"] = True
+    repository_root = tmp_path / "repository"
+    manifest["repositories"]["kwilo-app"]["local_root"] = str(repository_root)
     _rewrite_manifest(governance, manifest_path, manifest)
+    contract = _contract()
+    contract["workspace_class"] = "declared-dirty-continuation"
 
     with kb.connect(board="kwilo") as conn:
         task_id = kb.create_task(
@@ -515,8 +952,8 @@ def test_dispatch_readback_accepts_precanonical_windows_admission_digest(
             assignee="kwilo-forge",
             board="kwilo",
             workspace_kind="dir",
-            workspace_path=r"C:\Hermes\workspaces\candidate",
-            governance_contract=_contract(),
+            workspace_path=str(repository_root),
+            governance_contract=contract,
         )
         readback = kb.dispatch_readback(conn, task_id)
         assert readback["legacy_digest"]

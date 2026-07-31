@@ -52,6 +52,15 @@ VALID_CANDIDATE_KINDS = frozenset({
 VALID_LINK_KINDS = frozenset({
     "completion", "evidence-gate", "supervision", "informational",
 })
+WORKSPACE_KIND_BY_CLASS = {
+    "isolated-worktree": "worktree",
+    "isolated-read-only-worktree": "worktree",
+    "declared-dirty-continuation": "dir",
+    "shared-read-only": "dir",
+    "owned-scratch": "scratch",
+    "owned-test-fixture": "scratch",
+    "isolated-tooling-copy": "scratch",
+}
 _REQUIRED_CONTRACT_FIELDS = (
     "requester", "authoriser", "acceptance_owner", "role", "lane",
     "repository", "mode", "workspace_class", "required_toolsets",
@@ -612,6 +621,26 @@ def validate_contract(
     workspace_class = str(contract["workspace_class"]).strip()
     if workspace_class not in _string_set(profile.get("workspace_classes", []), "profile.workspace_classes"):
         raise ValueError(f"workspace_class {workspace_class!r} is not admitted for profile {assignee}")
+    workspace_kind = WORKSPACE_KIND_BY_CLASS.get(workspace_class)
+    if workspace_kind is None:
+        raise ValueError(
+            f"workspace_class {workspace_class!r} has no governed workspace-kind binding"
+        )
+
+    repository_local_root: Optional[str] = None
+    if repo_key:
+        repo_entry = repositories[repo_key]
+        local_root = str(repo_entry.get("local_root") or "").strip()
+        if not local_root:
+            raise ValueError(
+                f"repository {repo_key!r} has no local_root in the capability manifest"
+            )
+        local_root_path = Path(local_root).expanduser()
+        if not local_root_path.is_absolute():
+            raise ValueError(
+                f"repository {repo_key!r} local_root must be absolute"
+            )
+        repository_local_root = str(local_root_path.resolve(strict=False))
 
     comparisons = (
         ("required_toolsets", "configured_cli_toolsets"),
@@ -674,6 +703,8 @@ def validate_contract(
     canonical["repository_id"] = (
         str(repositories[repo_key].get("canonical") or repo_key) if repo_key else "none"
     )
+    canonical["repository_local_root"] = repository_local_root
+    canonical["workspace_kind"] = workspace_kind
     return canonical
 
 
@@ -795,6 +826,7 @@ def dispatch_readback(
             "digest": None,
             "admitted_at": None,
             "admitted_by": None,
+            "snapshot": None,
         }
     required = dispatch_readback_required(row["assignee"], semantics["contract"])
     if not required:
@@ -804,6 +836,7 @@ def dispatch_readback(
             "digest": None,
             "admitted_at": semantics.get("dispatch_readback_at"),
             "admitted_by": semantics.get("dispatch_readback_by"),
+            "snapshot": _dispatch_snapshot(conn, task_id, semantics),
         }
     snapshot = _dispatch_snapshot(conn, task_id, semantics)
     payload = json.dumps(
@@ -841,6 +874,7 @@ def dispatch_readback(
         "admitted_digest": admitted_digest or None,
         "admitted_at": semantics.get("dispatch_readback_at"),
         "admitted_by": semantics.get("dispatch_readback_by"),
+        "snapshot": snapshot,
     }
 
 
