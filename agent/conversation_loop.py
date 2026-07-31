@@ -6154,6 +6154,10 @@ def run_conversation(
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
+                    # Refund the api_call_count too so execute-code-only iterations
+                    # don't count against the max_iterations cap.
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
                 
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the

@@ -455,7 +455,7 @@ def init_agent(
     command: str = None,
     args: list[str] | None = None,
     model: str = "",
-    max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
+    max_iterations: int = 500,  # Default tool-calling iterations; each subagent gets its own independent budget
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     save_trajectories: bool = False,
@@ -528,7 +528,7 @@ def init_agent(
         requested_provider (str): Original provider identity before runtime canonicalization
         api_mode (str): API mode override: "chat_completions" or "codex_responses"
         model (str): Model name to use (default: "anthropic/claude-opus-4.6")
-        max_iterations (int): Maximum number of tool calling iterations (default: 90)
+        max_iterations (int): Maximum number of tool calling iterations (default: 500)
         enabled_toolsets (List[str]): Only enable tools from these toolsets (optional)
         disabled_toolsets (List[str]): Disable tools from these toolsets (optional)
         save_trajectories (bool): Whether to save conversation trajectories to JSONL files (default: False)
@@ -570,9 +570,8 @@ def init_agent(
     _install_safe_stdio()
 
     agent.model = model
+    # Subagent gets its own independent budget (set by parent via delegation config).
     agent.max_iterations = max_iterations
-    # Shared iteration budget — parent creates, children inherit.
-    # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     agent.save_trajectories = save_trajectories
     agent.verbose_logging = verbose_logging
