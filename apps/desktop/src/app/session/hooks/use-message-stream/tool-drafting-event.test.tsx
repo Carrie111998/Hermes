@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $subagentsBySession, upsertSubagent } from '@/store/subagents'
+import { $subagentsBySession, interruptSessionSubagents, upsertSubagent } from '@/store/subagents'
 import { $draftingToolSessions } from '@/store/tool-drafting'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -96,6 +96,7 @@ describe('drafting-tool label lifecycle', () => {
 
   it('accepts a terminal subagent update after stop without accepting progress', async () => {
     upsertSubagent(SID, { goal: 'initial', status: 'running', subagent_id: 'child', task_index: 0 })
+    interruptSessionSubagents(SID)
     sessionStates.set(SID, { ...createClientSessionState(), interrupted: true })
     await mountStream()
 
