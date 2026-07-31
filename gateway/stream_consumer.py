@@ -32,6 +32,130 @@ _TOOL_TRACE_RE = re.compile(
     re.MULTILINE,
 )
 
+# --- Streaming redaction holdback -----------------------------------------
+#
+# The Tirith redactor (`agent.redact.redact_sensitive_text`) is stateless:
+# it scans a finished string for whole credential-shaped tokens.  Its prefix
+# patterns require a minimum run of credential characters (e.g. ``sk-`` must
+# be followed by ``[A-Za-z0-9_-]{10,}`` to match).  During incremental
+# streaming, a delta that crosses the platform split boundary while ending
+# inside an unresolved credential prefix (" sk-" with <10 trailing chars,
+# " ghp_" alone, " gAA" beginning "gAAAA…", …) is sanitized and sealed into
+# an immutable, finalize=True message BEFORE a later delta supplies the suffix
+# that would have made the full token recognizable.  The recipient can then
+# reconstruct the raw credential across the sealed head and the next message.
+#
+# Holdback rule: BEFORE sealing any overflowing head, split the sanitized
+# display buffer so that the sealable head never ends with a suffix that could
+# still resolve to a credential prefix.  Any such suffix stays in the mutable
+# tail (``self._accumulated``) until either a delimiting character or
+# end-of-stream (got_done) proves it cannot grow into a credential.
+#
+# The seed list is derived from the same ``_PREFIX_SUBSTRINGS`` the redactor
+# itself uses, plus every proper prefix of those substrings ("sk-", "sk", "s"
+# would over-match — we deliberately start from real credential starts like
+# "sk-", "ghp_", "gAAAA", … and also keep their partial tails like "sk" only
+# when not already prefixed by a digit-or-letter continuation).  This keeps
+# the behavior crisp: " chairs" never triggers holdback; " ch AirSk" doesn't
+# either; " sk-" does.
+
+def _build_streaming_credential_prefix_tail_re() -> "re.Pattern[str]":
+    """Compile a regex matching a trailing credential-prefix candidate.
+
+    Matches any tail of ``text`` that (a) begins at a word boundary or right
+    after whitespace, and (b) is a non-empty proper prefix (or full prefix)
+    of one of the credential vocabulary seeds, NOT yet followed by a full
+    qualifying token.  Returns the longest such match's end position, or -1.
+    """
+    try:
+        from agent.redact import _PREFIX_SUBSTRINGS
+        seeds = list(_PREFIX_SUBSTRINGS)
+    except Exception:
+        # Fail-open to the documented common prefixes if the redactor is
+        # ever unavailable; production always imports it (see _clean_for_display
+        # try/except below).
+        seeds = [
+            "sk-", "ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_",
+            "xapp-", "xox", "AIza", "pplx-", "fal_", "fc-", "bb_live_",
+            "gAAAA", "AKIA", "sk_live_", "sk_test_", "rk_live_", "SG.",
+            "hf_", "r8_", "npm_", "pypi-", "dop_v1_", "doo_v1_", "am_",
+            "sk_", "tvly-", "exa_", "gsk_", "syt_", "retaindb_", "hsk-",
+            "mem0_", "brv_", "xai-", "ntn_", "fw-", "fw_", "fpk_",
+        ]
+    # Build a set of distinct literal seeds plus their proper prefixes that
+    # could still extend into a full credential prefix.  Only keep partials
+    # that are at least 2 chars long so a lone "s" or "g" can't hold back
+    # ordinary text.
+    candidates: "set[str]" = set()
+    for seed in seeds:
+        if not seed:
+            continue
+        candidates.add(seed)
+        for i in range(2, len(seed)):
+            candidates.add(seed[:i])
+    # Escape each candidate and join as alternation, longest first so the
+    # longest viable prefix wins the match (greedy alternation already does,
+    # but explicit sort keeps it deterministic and doc-readable).
+    alt = "|".join(sorted((re.escape(c) for c in candidates), key=len, reverse=True))
+    # Anchor at start-of-tail: allow only whitespace or punctuation upstream
+    # — a letter/digit immediately before would mean the candidate is part of
+    # a longer token that already extends beyond it (e.g. "Xsk-" where the
+    # leading "X" means the credential prefix is not at a boundary).  Use a
+    # lookbehind for the common safe-left cases; the (?<!...) makes the
+    # candidate match only when not preceded by a token-continuation char.
+    # We accept the candidate ending anywhere (no lookahead): the caller
+    # decides whether to retain it based on whether subsequent text could
+    # extend it into a recognizable credential.
+    return re.compile(
+        r"(?<![A-Za-z0-9_])(" + alt + r")[A-Za-z0-9_=-]{0,40}\Z",
+    )
+
+
+_CREDENTIAL_PREFIX_TAIL_RE = _build_streaming_credential_prefix_tail_re()
+
+
+def _hold_back_credential_prefix_tail(text: str, *, finalize: bool = False) -> "tuple[str, str]":
+    """Split a sanitized display buffer into (sealable_head, holdback_tail).
+
+    The holdback tail is the trailing substring of ``text`` that could still
+    grow into a recognizable credential prefix once a future streaming delta
+    arrives.  The sealable head is everything before it and may be finalized
+    into an immutable split-message chunk without leaking a credential.
+
+    When ``finalize=True`` the stream is over (``got_done``), so there is no
+    future delta to grow the prefix — return ``(text, "")`` and let the caller
+    redact the still-partial prefix as part of the final buffer (the redactor
+    will leave a too-short fragment untouched, which is the safe outcome:
+    a fragment too short to be a real credential is not a credential).
+
+    The split point is chosen so the head never ends mid-token inside a
+    potential credential: we find the LAST trailing credential-prefix
+    candidate in ``text`` and hold back from its first character.  Any
+    characters between that candidate and the end of ``text`` stay in the
+    tail; the next delta appends to the tail and the whole tail is re-tested
+    next iteration.
+    """
+    if finalize or not text:
+        return text, ""
+    # Find the start of the trailing credential-prefix candidate.  The regex
+    # above matches a trailing run starting at a non-token-continuation
+    # boundary.  m.start(1) is the index where the candidate seed itself
+    # begins inside the overall match; we hold back from there so any leading
+    # whitespace before the seed stays in the sealed head (it is safe to seal
+    # whitespace — it cannot be part of a credential).
+    m = _CREDENTIAL_PREFIX_TAIL_RE.search(text)
+    if not m:
+        return text, ""
+    # m.start() is the start of the whole match (the candidate+trailing-run);
+    # the candidate seed starts at m.start(1).  Keep a small safety margin:
+    # also keep one character upstream of the seed so a sealed head never
+    # ends flush against the holdback when that character would visually
+    # "snap" the candidate into the prior token.  This is cosmetic — the
+    # security boundary is m.start(1).
+    start = m.start(1)
+    return text[:start], text[start:]
+
+
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -818,10 +942,36 @@ class GatewayStreamConsumer:
                     # Keep the raw buffer for normal edits so _clean_for_display's
                     # trailing-whitespace normalization cannot alter future deltas.
                     display_accumulated = self._clean_for_display(self._accumulated)
+                    # Streaming redaction holdback: never seal a head chunk
+                    # whose tail could still resolve to a credential prefix
+                    # once the next delta arrives.  The Tirith redactor is
+                    # stateless and rejects short prefixes (e.g. ``sk-`` with
+                    # <10 trailing chars), so the overflow split would
+                    # otherwise seal ``" sk-"`` into an immutable
+                    # ``finalize=True`` message before the next delta supplies
+                    # the qualifying suffix — re-creating the raw credential
+                    # across the sealed head and the continuation.  We split
+                    # the sanitized buffer into a sealable head (everything up
+                    # to the trailing credential-prefix candidate) and a
+                    # holdback tail (the candidate itself); the tail stays
+                    # mutable in ``self._accumulated`` until a delimiter or
+                    # end-of-stream proves it cannot grow into a credential.
+                    # When ``got_done`` is set there is no future delta, so the
+                    # holdback is a no-op and the full sanitized buffer is
+                    # handled by the got_done path below (which redacts the
+                    # finished buffer as a whole).
+                    if not got_done:
+                        _sealable_head, _holdback_tail = _hold_back_credential_prefix_tail(
+                            display_accumulated, finalize=False,
+                        )
+                    else:
+                        _sealable_head, _holdback_tail = display_accumulated, ""
                     # Split overflow: if accumulated text exceeds the platform
-                    # limit, split into properly sized chunks.
+                    # limit, split into properly sized chunks.  Operate on the
+                    # sealable head so any sealed head chunk ends before the
+                    # trailing credential-prefix candidate.
                     if (
-                        _len_fn(display_accumulated) > _safe_limit
+                        _len_fn(_sealable_head) > _safe_limit
                         and self._message_id is None
                     ):
                         # No existing message to edit (first message or after a
@@ -832,13 +982,13 @@ class GatewayStreamConsumer:
                         # updating in-place as later streamed deltas arrive
                         # instead of posting every split as an immutable message.
                         chunks = self._truncate_for_stream(
-                            display_accumulated, _safe_limit, _len_fn,
+                            _sealable_head, _safe_limit, _len_fn,
                         )
                         if len(chunks) <= 1:
                             # A malformed/legacy adapter result must not leave
                             # this overflow branch with an unsplittable payload.
                             chunks = self._split_text_chunks(
-                                display_accumulated, _safe_limit, _len_fn,
+                                _sealable_head, _safe_limit, _len_fn,
                             )
                         chunks_delivered = False
                         reply_to = self._initial_reply_to_id
@@ -860,7 +1010,11 @@ class GatewayStreamConsumer:
                             reply_to = new_id
 
                         if all_heads_delivered:
-                            self._accumulated = chunks[-1]
+                            # Keep the trailing chunk plus the credential-prefix
+                            # holdback in _accumulated so the next delta can
+                            # grow the candidate into a recognizable (and thus
+                            # redactable) credential.
+                            self._accumulated = chunks[-1] + _holdback_tail
                             # The head chunks are sealed.  Clear the edit target
                             # so the remaining tail is sent as a fresh active
                             # chunk, then edited by subsequent deltas.
@@ -907,17 +1061,17 @@ class GatewayStreamConsumer:
                     # Existing message: edit it with the first chunk, then
                     # start a new message for the overflow remainder.
                     while (
-                        _len_fn(display_accumulated) > _safe_limit
+                        _len_fn(_sealable_head) > _safe_limit
                         and self._message_id is not None
                         and self._edit_supported
                     ):
                         _cp_budget = _custom_unit_to_cp(
-                            display_accumulated, _safe_limit, _len_fn,
+                            _sealable_head, _safe_limit, _len_fn,
                         )
-                        split_at = display_accumulated.rfind("\n", 0, _cp_budget)
+                        split_at = _sealable_head.rfind("\n", 0, _cp_budget)
                         if split_at < _cp_budget // 2:
                             split_at = _cp_budget
-                        chunk = display_accumulated[:split_at]
+                        chunk = _sealable_head[:split_at]
                         # finalize=True so the adapter applies platform-specific
                         # rich-text markup (e.g. Telegram MarkdownV2). This
                         # sealed chunk will never be edited again — _message_id
@@ -938,7 +1092,10 @@ class GatewayStreamConsumer:
                             # fallback final-send path can deliver the remaining
                             # continuation without dropping content.
                             break
-                        self._accumulated = display_accumulated[split_at:].lstrip("\n")
+                        # Preserve any credential-prefix holdback in the
+                        # mutable tail so the next delta can resolve it into
+                        # a recognizable (and thus redactable) credential.
+                        self._accumulated = _sealable_head[split_at:].lstrip("\n") + _holdback_tail
                         self._message_id = None
                         self._last_sent_text = ""
 
