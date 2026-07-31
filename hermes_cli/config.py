@@ -1853,6 +1853,7 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
+    "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
     "session_reset",         # top-level form read by gateway/config.py + setup
     "group_sessions_per_user",   # top-level form bridged by gateway/config.py
     "thread_sessions_per_user",  # top-level form bridged by gateway/config.py
@@ -3180,6 +3181,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
     "modal_image": "TERMINAL_MODAL_IMAGE",
     "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+    "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
     "ssh_host": "TERMINAL_SSH_HOST",
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
@@ -4314,6 +4316,9 @@ def show_config():
         print(f"  Daytona image: {terminal.get('daytona_image', 'nikolaik/python-nodejs:python3.11-nodejs20')}")
         daytona_key = get_env_value('DAYTONA_API_KEY')
         print(f"  API key:      {'configured' if daytona_key else '(not set)'}")
+    elif terminal.get('backend') == 'vercel_sandbox':
+        print(f"  Vercel runtime: {terminal.get('vercel_runtime', 'node24')}")
+        print(f"  Vercel auth:    {'configured' if get_env_value('VERCEL_OIDC_TOKEN') or (get_env_value('VERCEL_TOKEN') and get_env_value('VERCEL_PROJECT_ID') and get_env_value('VERCEL_TEAM_ID')) else '(not set)'}")
     elif terminal.get('backend') == 'ssh':
         ssh_host = get_env_value('TERMINAL_SSH_HOST')
         ssh_user = get_env_value('TERMINAL_SSH_USER')

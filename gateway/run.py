@@ -1340,6 +1340,7 @@ _AUTO_APPEND_MEDIA_TOOL_NAMES = {
     "text_to_speech",
     "text_to_speech_tool",
     "image_generate",
+    "bfl_flux3_get_result",
 }
 
 # ---- helpers: detect interrupted tool tails & auto-continue noise ----------
@@ -1506,6 +1507,19 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
     """
     paths: set = set()
     tool_name_by_call_id: Dict[str, str] = {}
+
+    def _add_text_media_paths(content: str) -> None:
+        for match in _TOOL_MEDIA_RE.finditer(content):
+            path = match.group(1).strip().rstrip('",}')
+            if path:
+                paths.add(path)
+        # The regex alone misses quoted and spaced paths that the delivery
+        # pipeline's extract_media grammar accepts — collect through the same
+        # extractor so the dedup set sees every path that could actually have
+        # been delivered.
+        media_files, _ = BasePlatformAdapter.extract_media(content)
+        paths.update(path for path, _is_voice in media_files)
+
     for msg in agent_history:
         if msg.get("role") == "assistant":
             for call in msg.get("tool_calls") or []:
@@ -1519,19 +1533,13 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
         if role == "assistant":
             content = str(msg.get("content", "") or "")
             if "MEDIA:" in content:
-                for match in _TOOL_MEDIA_RE.finditer(content):
-                    p = match.group(1).strip().rstrip('",}')
-                    if p:
-                        paths.add(p)
+                _add_text_media_paths(content)
             continue
         if role not in {"tool", "function"}:
             continue
         content = str(msg.get("content", "") or "")
         if "MEDIA:" in content:
-            for match in _TOOL_MEDIA_RE.finditer(content):
-                p = match.group(1).strip().rstrip('",}')
-                if p:
-                    paths.add(p)
+            _add_text_media_paths(content)
             continue
         cid = str(msg.get("tool_call_id") or msg.get("call_id") or "")
         if tool_name_by_call_id.get(cid) == "image_generate":
@@ -1907,6 +1915,7 @@ if _config_path.exists():
                 "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
                 "modal_image": "TERMINAL_MODAL_IMAGE",
                 "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+                "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
                 "ssh_host": "TERMINAL_SSH_HOST",
                 "ssh_user": "TERMINAL_SSH_USER",
                 "ssh_port": "TERMINAL_SSH_PORT",
@@ -18231,11 +18240,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             (voice_mode == "all")
             or (voice_mode == "voice_only" and is_voice_input)
             # ``voice.auto_tts`` is synced into the adapter on gateway startup.
-            # Treat it as "voice accompanies text replies" unless a chat was
-            # explicitly turned off. The base adapter's own auto-TTS path only
-            # covers voice-input replies, so final text replies need the runner
-            # path here.
-            or (voice_mode != "off" and adapter_auto_tts)
+            # It is the fallback only when the chat has no explicit mode;
+            # otherwise the chat-level all/voice_only/off choice takes precedence.
+            or (voice_mode is None and adapter_auto_tts)
         )
         if not should:
             logger.debug(
