@@ -43,6 +43,29 @@
 }
 
 /* ------------------------------------------------------------------ */
+/* JetBrains Mono Nerd Font Mono — bundled so the embedded terminal     */
+/* (xterm.js) renders Nerd glyphs (eza/lsd/starship icons) even when    */
+/* Electron's Chromium fails to resolve the user's *system* Nerd font   */
+/* via fontconfig. xterm.js picks this up via ChatPage's `fontFamily`.  */
+/* Converted from ~/.fonts JetBrainsMonoNerdFontMono-*.ttf (SIL OFL).   */
+/* ------------------------------------------------------------------ */
+
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts-terminal/JetBrainsMonoNerdFontMono-Regular.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrainsMono Nerd Font Mono';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts-terminal/JetBrainsMonoNerdFontMono-SemiBold.woff2') format('woff2');
+}
+
+/* ------------------------------------------------------------------ */
 /* Hermes Agent — Nous DS with the LENS_0 (Hermes teal) palette applied
    statically as the default dashboard theme. */
 /* ------------------------------------------------------------------ */
