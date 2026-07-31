@@ -5616,6 +5616,7 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_choice_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        buttons_per_row: int = 2,
     ) -> SendResult:
         """Send a flat inline-keyboard choice picker (one tap → one value).
 
@@ -5637,9 +5638,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
             if not buttons:
                 return SendResult(success=False, error="No choices")
-            # Two buttons per row keeps labels readable on mobile.
+            row_width = max(1, min(int(buttons_per_row), 8))
             keyboard = InlineKeyboardMarkup(
-                [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+                [buttons[i:i + row_width] for i in range(0, len(buttons), row_width)]
             )
 
             thread_id = metadata.get("thread_id") if metadata else None
