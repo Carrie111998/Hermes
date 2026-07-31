@@ -69,6 +69,10 @@ from .sidebar_placement import (
     placement_paths_equivalent,
     resolve_sidebar_placement,
 )
+from .sidebar_reconciliation import (
+    SidebarReconciliationEvidence,
+    SidebarReconciliationState,
+)
 from .preview import build_session_preview
 from .store import (
     SIDEBAR_EXCLUSION_REASONS,
@@ -125,10 +129,12 @@ class SidebarDeliveryClaim:
     lease_token: str
     source_session_id: str
     bridge_id: str
-    reconcile_required: bool
+    reconciliation_state: SidebarReconciliationState
+    reconciliation_generation: str
+    reconciliation_proof_digest: str
+    recovered_thread_id: str | None
+    create_eligible: bool
     rename_required: bool
-    recovered_thread: VerifiedSidebarThread | None
-    reserved_thread_id: str | None = None
     create_reserved: bool = False
 
 
@@ -866,9 +872,13 @@ class _SidebarVerifier(Protocol):
         self, *, thread_id: str, expected: BridgeMarkerPayload
     ) -> VerifiedSidebarThread: ...
 
-    def find_by_marker(
-        self, expected: BridgeMarkerPayload
-    ) -> VerifiedSidebarThread | None: ...
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence: ...
 
 
 class _SidebarExecutor(Protocol):
@@ -1339,59 +1349,114 @@ class SessionBridgeCoordinator:
                         )
                         continue
                     create_reserved = reservation is not None
-                recovered = None
-                if reserved_thread_id is None:
-                    try:
-                        recovered = await asyncio.to_thread(
-                            verifier.find_by_marker,
-                            expected,
-                        )
-                    except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
-                        raise
-                    except SidebarVerificationError as exc:
-                        if exc.code == "native_task_not_indexed":
-                            recovered = None
-                        else:
-                            code = (
-                                exc.code
-                                if exc.code
-                                in {
-                                    "marker_conflict",
-                                    "source_identity_mismatch",
-                                    "provider_mismatch",
-                                }
-                                else "bridge_temporarily_unavailable"
-                            )
-                            await self._fail_sidebar_delivery_claim(lease_token, code)
-                            continue
-                    except Exception:
-                        await self._fail_sidebar_delivery_claim(
-                            lease_token,
-                            "bridge_temporarily_unavailable",
-                        )
-                        continue
-                if recovered is not None and (
-                    recovered.source_session_id != source_session_id
-                    or recovered.bridge_id != bridge_id
-                ):
+                try:
+                    reconcile_method = getattr(verifier, "reconcile_marker")
+                    if not callable(reconcile_method):
+                        raise TypeError("sidebar reconciler is unavailable")
+                    evidence = await asyncio.to_thread(
+                        reconcile_method,
+                        expected,
+                        now=claim_time,
+                        ttl_seconds=min(
+                            30.0,
+                            float(self._config.service.reconcile_seconds),
+                        ),
+                    )
+                    if not isinstance(evidence, SidebarReconciliationEvidence):
+                        raise TypeError("sidebar reconciliation evidence is malformed")
+                    proof = await asyncio.to_thread(
+                        _call,
+                        self._store,
+                        "record_sidebar_reconciliation_proof",
+                        lease_token=lease_token,
+                        evidence=evidence,
+                        marker_digest=evidence.marker_digest,
+                        placement_generation=self._config.sidebar.placement_generation,
+                        delivery_generation=1,
+                        now=claim_time,
+                    )
+                    if not isinstance(proof, Mapping):
+                        raise TypeError("sidebar reconciliation proof is malformed")
+                    proof_digest = _exact_sidebar_claim_text(
+                        proof.get("proof_digest"),
+                        "reconciliation proof digest",
+                    )
+                    proof_generation = _exact_sidebar_claim_text(
+                        proof.get("reconciliation_generation"),
+                        "reconciliation generation",
+                    )
+                    if (
+                        proof_generation != evidence.generation
+                        or proof.get("state") != evidence.state.value
+                        or proof.get("recovered_thread_id")
+                        != evidence.recovered_thread_id
+                    ):
+                        raise ValueError("sidebar reconciliation proof mismatch")
+                except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                    raise
+                except SidebarVerificationError as exc:
                     await self._fail_sidebar_delivery_claim(
                         lease_token,
-                        "source_identity_mismatch",
+                        _sidebar_reconciliation_failure_code(exc.code),
+                        codex_thread_id=reserved_thread_id,
                     )
                     continue
-                if recovered is not None:
-                    reserved_thread_id = _exact_sidebar_claim_text(
-                        recovered.thread_id,
+                except Exception:
+                    await self._fail_sidebar_delivery_claim(
+                        lease_token,
+                        "bridge_temporarily_unavailable",
+                        codex_thread_id=reserved_thread_id,
+                    )
+                    continue
+
+                if evidence.state is SidebarReconciliationState.BLOCKED:
+                    assert evidence.fixed_reason is not None
+                    await self._fail_sidebar_delivery_claim(
+                        lease_token,
+                        _sidebar_reconciliation_failure_code(evidence.fixed_reason),
+                        codex_thread_id=reserved_thread_id,
+                    )
+                    continue
+                if evidence.state is SidebarReconciliationState.ABSENCE_PROVEN:
+                    if create_reserved:
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "native_create_ambiguous",
+                        )
+                        continue
+                    if reserved_thread_id is not None:
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "source_identity_mismatch",
+                            codex_thread_id=reserved_thread_id,
+                        )
+                        continue
+                    recovered_thread_id = None
+                    create_eligible = True
+                    rename_required = False
+                elif evidence.state is SidebarReconciliationState.RECOVERED:
+                    recovered_thread_id = _exact_sidebar_claim_text(
+                        evidence.recovered_thread_id,
                         "recovered Codex thread ID",
                     )
-                    known_thread_ids[lease_token] = reserved_thread_id
+                    if (
+                        reserved_thread_id is not None
+                        and reserved_thread_id != recovered_thread_id
+                    ):
+                        await self._fail_sidebar_delivery_claim(
+                            lease_token,
+                            "source_identity_mismatch",
+                            codex_thread_id=reserved_thread_id,
+                        )
+                        continue
+                    known_thread_ids[lease_token] = recovered_thread_id
                     try:
                         await asyncio.to_thread(
                             _call,
                             self._store,
                             "bind_sidebar_thread",
                             lease_token=lease_token,
-                            codex_thread_id=reserved_thread_id,
+                            codex_thread_id=recovered_thread_id,
                             now=claim_time,
                         )
                     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
@@ -1400,19 +1465,30 @@ class SessionBridgeCoordinator:
                         await self._fail_sidebar_delivery_claim(
                             lease_token,
                             "bridge_temporarily_unavailable",
-                            codex_thread_id=reserved_thread_id,
+                            codex_thread_id=recovered_thread_id,
                         )
                         continue
+                    create_eligible = False
+                    rename_required = True
+                else:
+                    await self._fail_sidebar_delivery_claim(
+                        lease_token,
+                        "bridge_temporarily_unavailable",
+                        codex_thread_id=reserved_thread_id,
+                    )
+                    continue
                 delivery.append(
                     SidebarDeliveryClaim(
                         lease_token=lease_token,
                         source_session_id=source_session_id,
                         bridge_id=bridge_id,
-                        reconcile_required=True,
-                        rename_required=reserved_thread_id is not None,
-                        recovered_thread=recovered,
-                        reserved_thread_id=reserved_thread_id,
-                        create_reserved=create_reserved,
+                        reconciliation_state=evidence.state,
+                        reconciliation_generation=proof_generation,
+                        reconciliation_proof_digest=proof_digest,
+                        recovered_thread_id=recovered_thread_id,
+                        create_eligible=create_eligible,
+                        rename_required=rename_required,
+                        create_reserved=False,
                     )
                 )
             return tuple(delivery)
@@ -4777,6 +4853,18 @@ def _exact_sidebar_claim_text(value: object, label: str) -> str:
     if any(character in value for character in "\r\n"):
         raise ValueError(f"sidebar claim {label} is malformed")
     return value
+
+
+def _sidebar_reconciliation_failure_code(code: object) -> str:
+    if code in {
+        "marker_conflict",
+        "source_identity_mismatch",
+        "provider_mismatch",
+        "codex_thread_conflict",
+        "placement_mismatch",
+    }:
+        return cast(str, code)
+    return "bridge_temporarily_unavailable"
 
 
 def _raise_detached_cancelled(cancelled: asyncio.CancelledError) -> NoReturn:

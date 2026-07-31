@@ -54,11 +54,45 @@ from session_bridge.sidebar import (
     encode_hydration_marker,
     sidebar_bridge_id,
 )
+from session_bridge.sidebar_reconciliation import SidebarReconciliationState
 from session_bridge.store import SessionBridgeStore
 
 
 TOKEN = "bridge-test-token-with-at-least-32-bytes"
 MARKER_KEY = b"marker-key-material-with-at-least-32-bytes"
+
+
+def _sidebar_delivery_claim(
+    *,
+    lease_token: str,
+    source_session_id: str,
+    bridge_id: str,
+    recovered_thread_id: str | None = None,
+    create_eligible: bool | None = None,
+    rename_required: bool = False,
+    create_reserved: bool = False,
+) -> SidebarDeliveryClaim:
+    state = (
+        SidebarReconciliationState.RECOVERED
+        if recovered_thread_id is not None
+        else SidebarReconciliationState.ABSENCE_PROVEN
+    )
+    return SidebarDeliveryClaim(
+        lease_token=lease_token,
+        source_session_id=source_session_id,
+        bridge_id=bridge_id,
+        reconciliation_state=state,
+        reconciliation_generation="scan:1",
+        reconciliation_proof_digest="3" * 64,
+        recovered_thread_id=recovered_thread_id,
+        create_eligible=(
+            recovered_thread_id is None
+            if create_eligible is None
+            else create_eligible
+        ),
+        rename_required=rename_required,
+        create_reserved=create_reserved,
+    )
 
 
 @pytest.fixture
@@ -291,13 +325,10 @@ def _seed_claimed_sidebar_pair(
         candidates.append(candidate)
     raw_claims = store.claim_sidebar_jobs(now=now, limit=2)
     claims = tuple(
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token=raw["lease_token"],
             source_session_id=raw["source_session_id"],
             bridge_id=raw["bridge_id"],
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         )
         for raw in raw_claims
     )
@@ -856,13 +887,10 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="plaintext-opaque-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         ),
     )
 
@@ -887,9 +915,12 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
         "git_branch",
         "git_head",
         "worktree_id",
-        "reconcile_required",
+        "reconciliation_state",
+        "reconciliation_generation",
+        "reconciliation_proof_digest",
         "rename_required",
         "recovered_thread_id",
+        "create_eligible",
         "create_reserved",
     }
     assert job["lease_token"] == "plaintext-opaque-lease"
@@ -900,10 +931,15 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
     assert job["git_branch"] == "main"
     assert job["git_head"] is None
     assert job["worktree_id"] is None
-    assert job["reconcile_required"] is True
+    assert job["reconciliation_state"] == "absence_proven"
+    assert job["reconciliation_generation"] == "scan:1"
+    assert job["reconciliation_proof_digest"] == "3" * 64
     assert job["rename_required"] is False
     assert job["recovered_thread_id"] is None
+    assert job["create_eligible"] is True
     assert job["create_reserved"] is False
+    assert "reconcile_required" not in job
+    assert "search_required" not in job
     prompt = job["registration_prompt"]
     assert prompt.startswith("# Imported Claude Code Session")
     assert prompt.index("## Last 5 Messages") < prompt.index("## Bridge Registration")
@@ -921,6 +957,39 @@ def test_session_sidebar_pending_accepts_exactly_one_and_returns_only_broker_fie
         Provider.CODEX,
         1,
     )
+
+
+@pytest.mark.parametrize("malformation", ["blocked", "missing_proof"])
+def test_session_sidebar_pending_never_exposes_non_authoritative_claim(
+    db: SessionDB,
+    malformation: str,
+) -> None:
+    store, candidate = _seed_sidebar_source(db)
+    coordinator = _FakeCoordinator(
+        bridge_id=candidate.bridge_id,
+        source_id=candidate.source_session_id,
+        target_id="codex:unused",
+    )
+    leased = store.claim_sidebar_jobs(now=time.time(), limit=1)[0]
+    claim = _sidebar_delivery_claim(
+        lease_token=leased["lease_token"],
+        source_session_id=candidate.source_session_id,
+        bridge_id=candidate.bridge_id,
+    )
+    if malformation == "blocked":
+        claim = replace(
+            claim,
+            reconciliation_state=SidebarReconciliationState.BLOCKED,
+            create_eligible=False,
+        )
+    else:
+        claim = replace(claim, reconciliation_proof_digest="")
+    coordinator.sidebar_claims = (claim,)
+
+    with _test_client(_create_test_app(db, store, coordinator)) as client:
+        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+
+    assert response == {"jobs": []}
 
 
 def test_session_sidebar_pending_uses_snapshot_title_not_candidate_title(
@@ -954,13 +1023,10 @@ def test_session_sidebar_pending_uses_snapshot_title_not_candidate_title(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="snapshot-title-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         ),
     )
 
@@ -984,13 +1050,10 @@ def test_session_sidebar_pending_ignores_disabled_preview_flag_and_stays_readabl
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="disabled-preview-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         ),
     )
 
@@ -1061,14 +1124,12 @@ def test_session_sidebar_pending_returns_durable_reserved_thread_id(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="reserved-opaque-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
             rename_required=True,
-            recovered_thread=None,
-            reserved_thread_id="44444444-4444-4444-8444-444444444444",
+            recovered_thread_id="44444444-4444-4444-8444-444444444444",
         ),
     )
 
@@ -1337,13 +1398,10 @@ def test_session_sidebar_pending_exposes_durable_create_boundary(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="create-reserved-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
             create_reserved=True,
         ),
     )
@@ -1393,13 +1451,10 @@ def test_session_sidebar_pending_returns_only_bounded_redacted_readable_preview(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token="bounded-candidate-lease",
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         ),
     )
 
@@ -1454,13 +1509,10 @@ def test_session_sidebar_pending_settles_legacy_job_missing_delivery_candidate(
         target_id="codex:unused",
     )
     coordinator.sidebar_claims = (
-        SidebarDeliveryClaim(
+        _sidebar_delivery_claim(
             lease_token=claims[0]["lease_token"],
             source_session_id=candidate.source_session_id,
             bridge_id=candidate.bridge_id,
-            reconcile_required=True,
-            rename_required=False,
-            recovered_thread=None,
         ),
     )
 

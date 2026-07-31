@@ -132,16 +132,20 @@ class FakeSidebarStore:
         create_reserved: bool = False,
         reservation_error: Exception | None = None,
         bind_error: Exception | None = None,
+        proof_error: Exception | None = None,
     ) -> None:
         self.claim_after = claim_after
         self.reserved_thread_id = reserved_thread_id
         self.create_reserved = create_reserved
         self.reservation_error = reservation_error
         self.bind_error = bind_error
+        self.proof_error = proof_error
         self.failures: list[tuple[str, str, float]] = []
         self.failure_thread_ids: list[str | None] = []
         self.binds: list[tuple[str, str, float]] = []
         self.commits: list[tuple[str, str, float]] = []
+        self.proofs: list[SidebarReconciliationEvidence] = []
+        self.current_proof_digest = "3" * 64
 
     def claim_sidebar_jobs(
         self, *, now: float, limit: int, lease_seconds: int
@@ -216,11 +220,44 @@ class FakeSidebarStore:
             "reserved_at": 90.0,
         }
 
+    def record_sidebar_reconciliation_proof(
+        self,
+        *,
+        lease_token: str,
+        evidence: SidebarReconciliationEvidence,
+        marker_digest: str,
+        placement_generation: int,
+        delivery_generation: int,
+        now: float,
+    ) -> dict[str, Any]:
+        assert lease_token == "opaque-lease-token"
+        assert marker_digest == evidence.marker_digest
+        assert placement_generation == 1
+        assert delivery_generation == 1
+        if self.proof_error is not None:
+            raise self.proof_error
+        self.proofs.append(evidence)
+        return {
+            "proof_digest": self.current_proof_digest,
+            "reconciliation_generation": evidence.generation,
+            "state": evidence.state.value,
+            "recovered_thread_id": evidence.recovered_thread_id,
+        }
+
 
 class FakeVerifier:
-    def __init__(self, result: VerifiedSidebarThread | None | Exception) -> None:
+    def __init__(
+        self,
+        result: (
+            VerifiedSidebarThread
+            | SidebarReconciliationEvidence
+            | None
+            | Exception
+        ),
+    ) -> None:
         self.result = result
         self.find_calls: list[BridgeMarkerPayload] = []
+        self.reconcile_calls: list[tuple[BridgeMarkerPayload, float, float]] = []
         self.verify_calls: list[tuple[str, BridgeMarkerPayload]] = []
 
     def find_by_marker(
@@ -230,6 +267,22 @@ class FakeVerifier:
         if isinstance(self.result, Exception):
             raise self.result
         return self.result
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        self.reconcile_calls.append((expected, now, ttl_seconds))
+        if isinstance(self.result, Exception):
+            raise self.result
+        if isinstance(self.result, SidebarReconciliationEvidence):
+            return self.result
+        if isinstance(self.result, VerifiedSidebarThread):
+            return _recovered_evidence(self.result.thread_id)
+        return _absence_evidence()
 
     def verify_thread(
         self, *, thread_id: str, expected: BridgeMarkerPayload
@@ -255,6 +308,18 @@ class BlockingVerifier(FakeVerifier):
         self.started.set()
         assert self.release.wait(timeout=5)
         return None
+
+    def reconcile_marker(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        self.reconcile_calls.append((expected, now, ttl_seconds))
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return _absence_evidence()
 
 
 class ForbiddenTargetAdapter:
@@ -289,6 +354,50 @@ def _verified() -> VerifiedSidebarThread:
     return VerifiedSidebarThread(THREAD, SOURCE, BRIDGE)
 
 
+def _recovered_evidence(thread_id: str = THREAD) -> SidebarReconciliationEvidence:
+    return SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.RECOVERED,
+        generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=1,
+        recovered_thread_id=thread_id,
+        fixed_reason=None,
+    )
+
+
+def _absence_evidence() -> SidebarReconciliationEvidence:
+    return SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.ABSENCE_PROVEN,
+        generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=0,
+        recovered_thread_id=None,
+        fixed_reason=None,
+    )
+
+
+def _blocked_evidence(
+    reason: str = "marker_conflict",
+) -> SidebarReconciliationEvidence:
+    return SidebarReconciliationEvidence.create(
+        state=SidebarReconciliationState.BLOCKED,
+        generation="scan:1",
+        completed_at=100.0,
+        expires_at=130.0,
+        inventory_digest="2" * 64,
+        marker_digest="1" * 64,
+        match_count=2,
+        recovered_thread_id=None,
+        fixed_reason=reason,
+    )
+
+
 def test_verified_sidebar_thread_is_frozen() -> None:
     verified = _verified()
     with pytest.raises(FrozenInstanceError):
@@ -296,20 +405,18 @@ def test_verified_sidebar_thread_is_frozen() -> None:
 
 
 @pytest.mark.asyncio
-async def test_reserved_create_with_zero_marker_is_returned_as_no_create_boundary() -> (
+async def test_claim_with_prior_reservation_and_zero_match_never_leases_creation() -> (
     None
 ):
-    coordinator = _coordinator(
-        FakeSidebarStore(create_reserved=True),
-        FakeVerifier(None),
-    )
+    store = FakeSidebarStore(create_reserved=True)
+    coordinator = _coordinator(store, FakeVerifier(_absence_evidence()))
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
 
-    assert len(claims) == 1
-    assert claims[0].create_reserved is True
-    assert claims[0].reserved_thread_id is None
-    assert claims[0].recovered_thread is None
+    assert claims == ()
+    assert store.failures == [
+        ("opaque-lease-token", "native_create_ambiguous", 100.0)
+    ]
 
 
 @pytest.mark.asyncio
@@ -360,11 +467,13 @@ async def test_lost_commit_recovers_one_authenticated_thread_without_creation() 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
 
     assert len(claims) == 1
-    assert claims[0].recovered_thread == _verified()
-    assert claims[0].reconcile_required is True
+    assert claims[0].reconciliation_state is SidebarReconciliationState.RECOVERED
+    assert claims[0].recovered_thread_id == THREAD
+    assert claims[0].create_eligible is False
+    assert claims[0].reconciliation_proof_digest == store.current_proof_digest
     assert claims[0].rename_required is True
-    assert verifier.find_calls == [
-        BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1)
+    assert verifier.reconcile_calls == [
+        (BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1), 100.0, 30.0)
     ]
     assert store.binds == [("opaque-lease-token", THREAD, 100.0)]
     assert store.failures == []
@@ -421,20 +530,22 @@ async def test_cancellation_during_recovered_bind_settles_with_exact_id() -> Non
 
 
 @pytest.mark.asyncio
-async def test_reserved_thread_id_forces_exact_recovery_without_marker_search() -> None:
+async def test_reserved_thread_id_requires_matching_authoritative_recovery() -> None:
     store = FakeSidebarStore(reserved_thread_id=THREAD)
-    verifier = FakeVerifier(None)
+    verifier = FakeVerifier(_recovered_evidence())
     coordinator = _coordinator(store, verifier)
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
 
     assert len(claims) == 1
-    assert claims[0].reserved_thread_id == THREAD
-    assert claims[0].recovered_thread is None
-    assert claims[0].reconcile_required is True
+    assert claims[0].recovered_thread_id == THREAD
+    assert claims[0].reconciliation_state is SidebarReconciliationState.RECOVERED
+    assert claims[0].create_eligible is False
     assert claims[0].rename_required is True
-    assert verifier.find_calls == []
-    assert store.binds == []
+    assert verifier.reconcile_calls == [
+        (BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1), 100.0, 30.0)
+    ]
+    assert store.binds == [("opaque-lease-token", THREAD, 100.0)]
     assert store.failures == []
 
 
@@ -449,20 +560,34 @@ async def test_zero_match_permits_retry_only_after_previous_lease_expiry() -> No
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=300.0, limit=1)
     assert len(claims) == 1
-    assert claims[0].recovered_thread is None
-    assert claims[0].reconcile_required is True
+    assert claims[0].reconciliation_state is SidebarReconciliationState.ABSENCE_PROVEN
+    assert claims[0].recovered_thread_id is None
+    assert claims[0].create_eligible is True
+    assert claims[0].reconciliation_proof_digest == store.current_proof_digest
     assert claims[0].rename_required is False
+
+
+@pytest.mark.asyncio
+async def test_missing_durable_proof_settles_fail_closed() -> None:
+    store = FakeSidebarStore(proof_error=RuntimeError("proof unavailable"))
+    coordinator = _coordinator(store, FakeVerifier(_absence_evidence()))
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
 
 
 @pytest.mark.asyncio
 async def test_multiple_authenticated_matches_are_fatal_and_never_delivered() -> None:
     store = FakeSidebarStore()
-    verifier = FakeVerifier(SidebarVerificationError("marker_conflict"))
+    verifier = FakeVerifier(_blocked_evidence())
     coordinator = _coordinator(store, verifier)
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
 
     assert claims == ()
+    assert store.proofs == [_blocked_evidence()]
     assert store.failures == [("opaque-lease-token", "marker_conflict", 100.0)]
     assert store.commits == []
 
@@ -489,13 +614,7 @@ async def test_related_near_match_is_persisted_fatal_and_never_exposed(
 @pytest.mark.asyncio
 async def test_mismatched_verifier_candidate_id_is_never_durably_bound() -> None:
     store = FakeSidebarStore()
-    verifier = FakeVerifier(
-        VerifiedSidebarThread(
-            thread_id=THREAD,
-            source_session_id="claude:wrong-source",
-            bridge_id=BRIDGE,
-        )
-    )
+    verifier = FakeVerifier(_blocked_evidence("source_identity_mismatch"))
     coordinator = _coordinator(store, verifier)
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
@@ -527,13 +646,10 @@ async def test_native_not_indexed_defers_reconciliation_to_native_broker() -> No
 
     claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
 
-    assert len(claims) == 1
-    assert claims[0].source_session_id == SOURCE
-    assert claims[0].bridge_id == BRIDGE
-    assert claims[0].reconcile_required is True
-    assert claims[0].rename_required is False
-    assert claims[0].recovered_thread is None
-    assert store.failures == []
+    assert claims == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
     assert store.commits == []
 
 
@@ -547,13 +663,12 @@ async def test_recovered_rename_failure_renames_same_thread_before_verified_comm
     coordinator = _coordinator(store, verifier, clock=lambda: 101.0)
 
     claim = (await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1))[0]
-    assert claim.recovered_thread == _verified()
-    assert claim.recovered_thread is not None
+    assert claim.recovered_thread_id == THREAD
 
-    events.append(("rename", claim.recovered_thread.thread_id))
+    events.append(("rename", claim.recovered_thread_id))
     committed = await coordinator.commit_sidebar_job(
         lease_token=claim.lease_token,
-        codex_thread_id=claim.recovered_thread.thread_id,
+        codex_thread_id=claim.recovered_thread_id,
     )
     events.append(("commit", committed["codex_thread_id"]))
 

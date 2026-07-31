@@ -45,6 +45,7 @@ from .sidebar import (
     sidebar_create_recovery_key,
     validate_sidebar_create_reservation,
 )
+from .sidebar_reconciliation import SidebarReconciliationState
 from .store import (
     HYDRATION_FATAL_ERRORS,
     HYDRATION_RETRYABLE_ERRORS,
@@ -1888,15 +1889,43 @@ def _build_sidebar_broker_job(
         getattr(claim, "source_session_id", None), "source session ID"
     )
     bridge_id = _exact_sidebar_text(getattr(claim, "bridge_id", None), "bridge ID")
-    reconcile_required = getattr(claim, "reconcile_required", None)
+    reconciliation_state = getattr(claim, "reconciliation_state", None)
+    reconciliation_generation = _exact_sidebar_text(
+        getattr(claim, "reconciliation_generation", None),
+        "reconciliation generation",
+    )
+    reconciliation_proof_digest = _exact_sidebar_text(
+        getattr(claim, "reconciliation_proof_digest", None),
+        "reconciliation proof digest",
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", reconciliation_proof_digest) is None:
+        raise ValueError("sidebar reconciliation proof digest is malformed")
+    recovered_thread_id_value = getattr(claim, "recovered_thread_id", None)
+    recovered_thread_id = (
+        None
+        if recovered_thread_id_value is None
+        else _exact_sidebar_text(
+            recovered_thread_id_value,
+            "recovered thread ID",
+        )
+    )
+    create_eligible = getattr(claim, "create_eligible", None)
     rename_required = getattr(claim, "rename_required", None)
     create_reserved = getattr(claim, "create_reserved", None)
     if (
-        type(reconcile_required) is not bool
+        type(create_eligible) is not bool
         or type(rename_required) is not bool
         or type(create_reserved) is not bool
     ):
         raise ValueError("sidebar claim flags are malformed")
+    if reconciliation_state is SidebarReconciliationState.RECOVERED:
+        if recovered_thread_id is None or create_eligible:
+            raise ValueError("recovered sidebar reconciliation shape is malformed")
+    elif reconciliation_state is SidebarReconciliationState.ABSENCE_PROVEN:
+        if recovered_thread_id is not None:
+            raise ValueError("absent sidebar reconciliation shape is malformed")
+    else:
+        raise ValueError("sidebar reconciliation state is not broker deliverable")
     candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
     if candidate.bridge_id != bridge_id:
         raise ValueError("sidebar claim bridge identity is malformed")
@@ -1909,28 +1938,6 @@ def _build_sidebar_broker_job(
         ),
         marker_key,
     )
-    recovered = getattr(claim, "recovered_thread", None)
-    reserved_thread_id = getattr(claim, "reserved_thread_id", None)
-    recovered_thread_id = (
-        None
-        if reserved_thread_id is None
-        else _exact_sidebar_text(reserved_thread_id, "reserved thread ID")
-    )
-    if recovered is not None:
-        verified_thread_id = _exact_sidebar_text(
-            getattr(recovered, "thread_id", None), "recovered thread ID"
-        )
-        if (
-            getattr(recovered, "source_session_id", None) != source_session_id
-            or getattr(recovered, "bridge_id", None) != bridge_id
-        ):
-            raise ValueError("recovered sidebar identity is malformed")
-        if (
-            recovered_thread_id is not None
-            and recovered_thread_id != verified_thread_id
-        ):
-            raise ValueError("recovered sidebar thread identity is malformed")
-        recovered_thread_id = verified_thread_id
     snapshot = store.get_sidebar_preview_source(source_session_id)
     if (
         snapshot.get("source_session_id") != source_session_id
@@ -1958,7 +1965,7 @@ def _build_sidebar_broker_job(
         worktree_id=candidate.worktree_id,
         budget_chars=preview_budget_chars,
     )
-    return {
+    job = {
         "lease_token": lease_token,
         "registration_prompt": build_registration_prompt(
             candidate,
@@ -1972,11 +1979,17 @@ def _build_sidebar_broker_job(
         "git_branch": candidate.git_branch,
         "git_head": candidate.git_head,
         "worktree_id": candidate.worktree_id,
-        "reconcile_required": reconcile_required,
         "rename_required": rename_required,
-        "recovered_thread_id": recovered_thread_id,
-        "create_reserved": create_reserved,
     }
+    job.update({
+        "reconciliation_state": reconciliation_state.value,
+        "reconciliation_generation": reconciliation_generation,
+        "reconciliation_proof_digest": reconciliation_proof_digest,
+        "recovered_thread_id": recovered_thread_id,
+        "create_eligible": create_eligible,
+        "create_reserved": create_reserved,
+    })
+    return job
 
 
 def _build_sidebar_hydration_broker_job(
